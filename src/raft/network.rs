@@ -4,10 +4,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut, BufMut};
-use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable,
-};
+use bytes::{BufMut, Bytes, BytesMut};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -110,15 +108,16 @@ impl RaftNetworkConnection {
         })?;
 
         // Connect with TLS
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
 
         let connector = TlsConnector::from(self.tls_config.client_config());
         let server_name = "localhost".try_into().unwrap();
-        let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
+        let mut tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
 
         // Serialize request
         let body = bincode::serialize(request).map_err(|e| {
@@ -134,24 +133,28 @@ impl RaftNetworkConnection {
         buf.put_u32(body.len() as u32);
         buf.put_slice(&body);
 
-        tls_stream.write_all(&buf).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
-        tls_stream.flush().await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
+        tls_stream
+            .write_all(&buf)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+        tls_stream
+            .flush()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
 
         // Read response: [len: u32][body]
         let mut len_buf = [0u8; 4];
-        tls_stream.read_exact(&mut len_buf).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
+        tls_stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
         let mut resp_buf = vec![0u8; len];
-        tls_stream.read_exact(&mut resp_buf).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
-        })?;
+        tls_stream
+            .read_exact(&mut resp_buf)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
 
         // Deserialize response
         let resp: Resp = bincode::deserialize(&resp_buf).map_err(|e| {
@@ -211,8 +214,7 @@ impl RaftRpcHandler {
 
         match msg_type {
             MessageType::Vote => {
-                let req: VoteRequest =
-                    bincode::deserialize(body).map_err(|e| e.to_string())?;
+                let req: VoteRequest = bincode::deserialize(body).map_err(|e| e.to_string())?;
                 let resp = self.raft.vote(req).await.map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
@@ -220,7 +222,11 @@ impl RaftRpcHandler {
             MessageType::AppendEntries => {
                 let req: AppendEntriesRequest =
                     bincode::deserialize(body).map_err(|e| e.to_string())?;
-                let resp = self.raft.append_entries(req).await.map_err(|e| e.to_string())?;
+                let resp = self
+                    .raft
+                    .append_entries(req)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }

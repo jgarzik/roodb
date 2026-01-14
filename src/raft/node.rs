@@ -57,9 +57,15 @@ impl RaftNode {
         let sm_storage = MemStorage::new();
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
-        let raft = Raft::new(id, config, network.clone(), log_storage.clone(), sm_storage.clone())
-            .await
-            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        let raft = Raft::new(
+            id,
+            config,
+            network.clone(),
+            log_storage.clone(),
+            sm_storage.clone(),
+        )
+        .await
+        .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
         Ok(Self {
             id,

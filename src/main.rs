@@ -19,20 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI args (minimal for now)
     let args: Vec<String> = env::args().collect();
 
-    let node_id: u64 = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let node_id: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
 
-    let mysql_port: u16 = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3307);
+    let mysql_port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3307);
 
-    let raft_port: u16 = args
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5000);
+    let raft_port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5000);
 
     let data_dir = args
         .get(4)
@@ -49,13 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./certs/server.key"));
 
-    tracing::info!(
-        node_id,
-        mysql_port,
-        raft_port,
-        ?data_dir,
-        "Starting RooDB"
-    );
+    tracing::info!(node_id, mysql_port, raft_port, ?data_dir, "Starting RooDB");
 
     // Load TLS config
     let tls_config = TlsConfig::from_files(&cert_path, &key_path).await?;

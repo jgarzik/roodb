@@ -11,8 +11,8 @@ use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapsho
 use parking_lot::RwLock;
 
 use crate::raft::types::{
-    Command, CommandResponse, Entry, LogId, LogState,
-    Snapshot, SnapshotMeta, StorageError, StoredMembership, TypeConfig, Vote,
+    Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
+    StoredMembership, TypeConfig, Vote,
 };
 
 /// In-memory log storage
@@ -182,7 +182,8 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                     results.push(resp);
                 }
                 EntryPayload::Membership(ref m) => {
-                    sm.last_membership = StoredMembership::new(Some(*entry.get_log_id()), m.clone());
+                    sm.last_membership =
+                        StoredMembership::new(Some(*entry.get_log_id()), m.clone());
                     results.push(CommandResponse::Ok(None));
                 }
             }
