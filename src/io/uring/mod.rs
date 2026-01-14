@@ -90,9 +90,10 @@ impl AsyncIO for UringIO {
 
         ring.submit_and_wait(1)?;
 
-        let cqe = ring.completion().next().ok_or_else(|| {
-            IoError::Io(std::io::Error::other("io_uring completion missing"))
-        })?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -133,9 +134,10 @@ impl AsyncIO for UringIO {
 
         ring.submit_and_wait(1)?;
 
-        let cqe = ring.completion().next().ok_or_else(|| {
-            IoError::Io(std::io::Error::other("io_uring completion missing"))
-        })?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -159,9 +161,10 @@ impl AsyncIO for UringIO {
 
         ring.submit_and_wait(1)?;
 
-        let cqe = ring.completion().next().ok_or_else(|| {
-            IoError::Io(std::io::Error::other("io_uring completion missing"))
-        })?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
 
         let result = cqe.result();
         if result < 0 {

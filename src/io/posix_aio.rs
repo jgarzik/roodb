@@ -84,9 +84,7 @@ impl AsyncIO for PosixIO {
             Ok::<(Vec<u8>, usize), std::io::Error>((temp, bytes_read))
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::other(e.to_string()))
-        })??;
+        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
 
         let (temp, bytes_read) = result;
         buf.as_mut_slice()[..bytes_read].copy_from_slice(&temp[..bytes_read]);
@@ -110,9 +108,7 @@ impl AsyncIO for PosixIO {
             Ok::<usize, std::io::Error>(write_len)
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::other(e.to_string()))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
         .map_err(IoError::from)
     }
 
@@ -124,9 +120,7 @@ impl AsyncIO for PosixIO {
             file.sync_all()
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::other(e.to_string()))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
         .map_err(IoError::from)
     }
 
@@ -138,9 +132,7 @@ impl AsyncIO for PosixIO {
             file.metadata().map(|m| m.len())
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::other(e.to_string()))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
         .map_err(IoError::from)
     }
 
@@ -152,9 +144,7 @@ impl AsyncIO for PosixIO {
             file.set_len(size)
         })
         .await
-        .map_err(|e| {
-            IoError::Io(std::io::Error::other(e.to_string()))
-        })?
+        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
         .map_err(IoError::from)
     }
 }

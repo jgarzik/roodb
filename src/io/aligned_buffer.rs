@@ -34,8 +34,8 @@ impl AlignedBuffer {
             });
         }
 
-        let layout = Layout::from_size_align(capacity, PAGE_SIZE)
-            .map_err(|_| IoError::Alignment {
+        let layout =
+            Layout::from_size_align(capacity, PAGE_SIZE).map_err(|_| IoError::Alignment {
                 expected: PAGE_SIZE,
                 actual: 0,
             })?;
