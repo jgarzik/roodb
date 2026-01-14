@@ -9,3 +9,4 @@ pub mod io;
 pub mod raft;
 pub mod server;
 pub mod tls;
+pub mod wal;
