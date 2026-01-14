@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast checks first
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  # Build
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  # RooDB Integration Test Suite - runs all 4 configurations
+  roodb-tests:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Install mysql client (used to connect to RooDB)
+      - name: Install mysql client (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mysql-client
+
+      - name: Install mysql client (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install mysql-client && echo "$(brew --prefix mysql-client)/bin" >> $GITHUB_PATH
+
+      # Run the full RooDB test suite
+      # On Linux: runs single_uring, single_posix, cluster_uring, cluster_posix
+      # On macOS: runs single_posix, cluster_posix (io_uring not available)
+      - name: Run RooDB test suite
+        run: cargo test --release

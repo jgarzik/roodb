@@ -1,0 +1,80 @@
+[package]
+name = "roodb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time", "process"] }
+
+# Error handling
+thiserror = "1.0"
+
+# Platform detection
+cfg-if = "1.0"
+
+# Low-level OS interface
+libc = "0.2"
+
+# Raft consensus
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Checksums
+crc32fast = "1.3"
+
+# Async traits
+async-trait = "0.1"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# TLS (required - no plaintext networking)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+
+# Bytes handling
+bytes = "1.0"
+
+# Synchronization primitives
+parking_lot = "0.12"
+
+# Compression
+lz4_flex = "0.11"
+
+# SQL parsing
+sqlparser = { version = "0.50", features = ["visitor"] }
+
+# Ordered floats for sorting
+ordered-float = "4.2"
+
+# MySQL protocol support
+sha1 = "0.10"
+rand = "0.8"
+bitflags = "2.4"
+
+# io_uring (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# MySQL client for integration tests (uses rustls with ring)
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "ring"] }
+
+[lib]
+name = "roodb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roodb"
+path = "src/main.rs"
