@@ -93,8 +93,14 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         // Get file metadata
         let size = std::fs::metadata(&path)?.len();
         let all_entries = mem.iter();
-        let min_key = all_entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-        let max_key = all_entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+        let min_key = all_entries
+            .first()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
+        let max_key = all_entries
+            .last()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
 
         // Add to manifest
         manifest.add_sstable(
@@ -169,7 +175,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 }
 
 #[async_trait]
-impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine for LsmEngine<IO, F> {
+impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
+    for LsmEngine<IO, F>
+{
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
@@ -215,11 +223,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine 
         Ok(())
     }
 
-    async fn scan(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> StorageResult<Vec<KeyValue>> {
+    async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
         }

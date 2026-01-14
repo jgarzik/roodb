@@ -5,6 +5,7 @@
 //! - MySQL wire protocol compatibility
 //! - io_uring on Linux, POSIX fallback elsewhere
 
+pub mod catalog;
 pub mod io;
 pub mod raft;
 pub mod server;

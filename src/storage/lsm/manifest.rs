@@ -48,10 +48,22 @@ impl Default for ManifestData {
         Self {
             sequence: 0,
             levels: vec![
-                LevelInfo { level: 0, files: vec![] },
-                LevelInfo { level: 1, files: vec![] },
-                LevelInfo { level: 2, files: vec![] },
-                LevelInfo { level: 3, files: vec![] },
+                LevelInfo {
+                    level: 0,
+                    files: vec![],
+                },
+                LevelInfo {
+                    level: 1,
+                    files: vec![],
+                },
+                LevelInfo {
+                    level: 2,
+                    files: vec![],
+                },
+                LevelInfo {
+                    level: 3,
+                    files: vec![],
+                },
             ],
         }
     }
@@ -70,9 +82,8 @@ impl Manifest {
 
         let data = if manifest_path.exists() {
             let content = std::fs::read_to_string(&manifest_path)?;
-            serde_json::from_str(&content).map_err(|e| {
-                StorageError::Manifest(format!("failed to parse manifest: {}", e))
-            })?
+            serde_json::from_str(&content)
+                .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {}", e)))?
         } else {
             ManifestData::default()
         };
@@ -86,9 +97,8 @@ impl Manifest {
     /// Save manifest to disk
     pub fn save(&self) -> StorageResult<()> {
         let manifest_path = self.dir.join(MANIFEST_FILE);
-        let content = serde_json::to_string_pretty(&self.data).map_err(|e| {
-            StorageError::Manifest(format!("failed to serialize manifest: {}", e))
-        })?;
+        let content = serde_json::to_string_pretty(&self.data)
+            .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
         std::fs::write(&manifest_path, content)?;
         Ok(())
     }
@@ -166,7 +176,11 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("roodb_manifest_test_{}_{}", name, std::process::id()));
+        path.push(format!(
+            "roodb_manifest_test_{}_{}",
+            name,
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path

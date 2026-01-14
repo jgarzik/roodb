@@ -33,11 +33,7 @@ pub trait StorageEngine: Send + Sync {
     /// Returns key-value pairs in sorted order where `start <= key < end`.
     /// If `start` is `None`, scan from the beginning.
     /// If `end` is `None`, scan to the end.
-    async fn scan(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> StorageResult<Vec<KeyValue>>;
+    async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>>;
 
     /// Flush all pending writes to disk
     async fn flush(&self) -> StorageResult<()>;

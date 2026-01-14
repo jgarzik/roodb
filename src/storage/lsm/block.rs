@@ -104,7 +104,11 @@ impl Entry {
         let value_len_raw = u16::from_be_bytes([buf[2], buf[3]]);
 
         let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
-        let value_len = if is_tombstone { 0 } else { value_len_raw as usize };
+        let value_len = if is_tombstone {
+            0
+        } else {
+            value_len_raw as usize
+        };
 
         let total_len = ENTRY_HEADER_SIZE + key_len + value_len;
         if buf.len() < total_len {
@@ -213,8 +217,12 @@ impl BlockReader {
         }
 
         // Verify CRC32
-        let stored_crc =
-            u32::from_be_bytes([buf[BLOCK_SIZE - 4], buf[BLOCK_SIZE - 3], buf[BLOCK_SIZE - 2], buf[BLOCK_SIZE - 1]]);
+        let stored_crc = u32::from_be_bytes([
+            buf[BLOCK_SIZE - 4],
+            buf[BLOCK_SIZE - 3],
+            buf[BLOCK_SIZE - 2],
+            buf[BLOCK_SIZE - 1],
+        ]);
         let computed_crc = crc32fast::hash(&buf[..BLOCK_SIZE - BLOCK_FOOTER_SIZE]);
 
         if stored_crc != computed_crc {

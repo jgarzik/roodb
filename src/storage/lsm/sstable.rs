@@ -251,10 +251,7 @@ pub struct SstableReader<IO: AsyncIO> {
 
 impl<IO: AsyncIO> SstableReader<IO> {
     /// Open an existing SSTable
-    pub async fn open<F: AsyncIOFactory<IO = IO>>(
-        factory: &F,
-        path: &Path,
-    ) -> StorageResult<Self> {
+    pub async fn open<F: AsyncIOFactory<IO = IO>>(factory: &F, path: &Path) -> StorageResult<Self> {
         let io = factory.open(path, false).await?;
 
         // Read file size
@@ -278,7 +275,11 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Parse index
         let index = Self::parse_index(&index_buf)?;
 
-        Ok(Self { io, metadata, index })
+        Ok(Self {
+            io,
+            metadata,
+            index,
+        })
     }
 
     /// Parse footer from buffer
@@ -340,20 +341,22 @@ impl<IO: AsyncIO> SstableReader<IO> {
         offset += 8;
 
         // Num blocks
-        let num_blocks =
-            u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]);
+        let num_blocks = u32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]);
         offset += 4;
 
         // Min key
-        let min_key_len =
-            u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+        let min_key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
         offset += 2;
         let min_key = buf[offset..offset + min_key_len].to_vec();
         offset += min_key_len;
 
         // Max key
-        let max_key_len =
-            u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+        let max_key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
         offset += 2;
         let max_key = buf[offset..offset + max_key_len].to_vec();
 
@@ -377,11 +380,12 @@ impl<IO: AsyncIO> SstableReader<IO> {
         ]);
         let computed_crc = crc32fast::hash(&buf[..BLOCK_SIZE - 4]);
         if stored_crc != computed_crc {
-            return Err(StorageError::InvalidSstable("index CRC mismatch".to_string()));
+            return Err(StorageError::InvalidSstable(
+                "index CRC mismatch".to_string(),
+            ));
         }
 
-        let num_entries =
-            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let num_entries = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
 
         let mut entries = Vec::with_capacity(num_entries);
         let mut offset = 4;

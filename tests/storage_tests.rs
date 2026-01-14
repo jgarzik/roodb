@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use roodb::io::PosixIOFactory;
-use roodb::storage::lsm::{LsmEngine};
 use roodb::storage::lsm::engine::LsmConfig;
+use roodb::storage::lsm::LsmEngine;
 use roodb::storage::StorageEngine;
 
 #[cfg(target_os = "linux")]
@@ -13,7 +13,11 @@ use roodb::io::UringIOFactory;
 
 fn test_dir(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("roodb_storage_test_{}_{}", name, std::process::id()));
+    path.push(format!(
+        "roodb_storage_test_{}_{}",
+        name,
+        std::process::id()
+    ));
     path
 }
 
@@ -129,9 +133,18 @@ async fn test_sstable_write_read() {
     {
         let mut writer = SstableWriter::create(&factory, &path).await.unwrap();
 
-        writer.add(b"apple".to_vec(), Some(b"red".to_vec())).await.unwrap();
-        writer.add(b"banana".to_vec(), Some(b"yellow".to_vec())).await.unwrap();
-        writer.add(b"cherry".to_vec(), Some(b"red".to_vec())).await.unwrap();
+        writer
+            .add(b"apple".to_vec(), Some(b"red".to_vec()))
+            .await
+            .unwrap();
+        writer
+            .add(b"banana".to_vec(), Some(b"yellow".to_vec()))
+            .await
+            .unwrap();
+        writer
+            .add(b"cherry".to_vec(), Some(b"red".to_vec()))
+            .await
+            .unwrap();
         writer.add(b"date".to_vec(), None).await.unwrap(); // Tombstone
 
         writer.finish().await.unwrap();
@@ -178,7 +191,10 @@ async fn test_sstable_large() {
         for i in 0..1000u32 {
             let key = format!("key{:06}", i);
             let value = format!("value{:06}", i);
-            writer.add(key.into_bytes(), Some(value.into_bytes())).await.unwrap();
+            writer
+                .add(key.into_bytes(), Some(value.into_bytes()))
+                .await
+                .unwrap();
         }
 
         writer.finish().await.unwrap();
@@ -320,7 +336,9 @@ async fn test_lsm_recovery() {
 
     // Write and flush
     {
-        let engine = LsmEngine::open(factory.clone(), config.clone()).await.unwrap();
+        let engine = LsmEngine::open(factory.clone(), config.clone())
+            .await
+            .unwrap();
 
         for i in 0..50 {
             let key = format!("key{:04}", i);
@@ -392,7 +410,10 @@ async fn test_uring_sstable_write_read() {
         for i in 0..100u32 {
             let key = format!("key{:04}", i);
             let value = format!("val{:04}", i);
-            writer.add(key.into_bytes(), Some(value.into_bytes())).await.unwrap();
+            writer
+                .add(key.into_bytes(), Some(value.into_bytes()))
+                .await
+                .unwrap();
         }
 
         writer.finish().await.unwrap();
