@@ -142,11 +142,7 @@ fn test_verify_empty_password() {
 fn test_verify_password_wrong_length() {
     let scramble = [0u8; 20];
     // Non-empty password should have 20-byte response
-    assert!(!verify_native_password(
-        &scramble,
-        "secret",
-        &[1, 2, 3]
-    ));
+    assert!(!verify_native_password(&scramble, "secret", &[1, 2, 3]));
 }
 
 #[test]
@@ -307,7 +303,10 @@ fn test_datatype_to_protocol() {
     assert_eq!(datatype_to_protocol(&DataType::TinyInt), ColumnType::Tiny);
     assert_eq!(datatype_to_protocol(&DataType::SmallInt), ColumnType::Short);
     assert_eq!(datatype_to_protocol(&DataType::Int), ColumnType::Long);
-    assert_eq!(datatype_to_protocol(&DataType::BigInt), ColumnType::LongLong);
+    assert_eq!(
+        datatype_to_protocol(&DataType::BigInt),
+        ColumnType::LongLong
+    );
     assert_eq!(datatype_to_protocol(&DataType::Float), ColumnType::Float);
     assert_eq!(datatype_to_protocol(&DataType::Double), ColumnType::Double);
     assert_eq!(

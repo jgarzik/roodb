@@ -202,7 +202,10 @@ mod tests {
     fn test_datatype_to_protocol() {
         assert_eq!(datatype_to_protocol(&DataType::Boolean), ColumnType::Tiny);
         assert_eq!(datatype_to_protocol(&DataType::Int), ColumnType::Long);
-        assert_eq!(datatype_to_protocol(&DataType::BigInt), ColumnType::LongLong);
+        assert_eq!(
+            datatype_to_protocol(&DataType::BigInt),
+            ColumnType::LongLong
+        );
         assert_eq!(datatype_to_protocol(&DataType::Double), ColumnType::Double);
         assert_eq!(
             datatype_to_protocol(&DataType::Varchar(255)),

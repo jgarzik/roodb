@@ -292,27 +292,15 @@ mod tests {
         assert_eq!(auth_response.len(), 20);
 
         // Correct password should verify
-        assert!(verify_native_password(
-            scramble,
-            password,
-            &auth_response
-        ));
+        assert!(verify_native_password(scramble, password, &auth_response));
 
         // Wrong password should fail
-        assert!(!verify_native_password(
-            scramble,
-            "wrong",
-            &auth_response
-        ));
+        assert!(!verify_native_password(scramble, "wrong", &auth_response));
 
         // Corrupted response should fail
         let mut bad_response = auth_response.clone();
         bad_response[0] ^= 0xff;
-        assert!(!verify_native_password(
-            scramble,
-            password,
-            &bad_response
-        ));
+        assert!(!verify_native_password(scramble, password, &bad_response));
     }
 
     #[test]
