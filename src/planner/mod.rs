@@ -28,6 +28,9 @@ pub mod logical;
 pub mod optimizer;
 pub mod physical;
 
+#[cfg(test)]
+pub mod test_utils;
+
 pub use cost::{Cost, CostEstimator};
 pub use error::{PlannerError, PlannerResult};
 pub use explain::ExplainOutput;

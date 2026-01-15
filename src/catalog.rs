@@ -88,18 +88,21 @@ impl ColumnDef {
     }
 
     /// Set nullable
+    #[must_use]
     pub fn nullable(mut self, nullable: bool) -> Self {
         self.nullable = nullable;
         self
     }
 
     /// Set default value
+    #[must_use]
     pub fn default(mut self, default: impl Into<String>) -> Self {
         self.default = Some(default.into());
         self
     }
 
     /// Set auto-increment
+    #[must_use]
     pub fn auto_increment(mut self) -> Self {
         self.auto_increment = true;
         self
@@ -145,12 +148,14 @@ impl TableDef {
     }
 
     /// Add a column
+    #[must_use]
     pub fn column(mut self, col: ColumnDef) -> Self {
         self.columns.push(col);
         self
     }
 
     /// Add a constraint
+    #[must_use]
     pub fn constraint(mut self, constraint: Constraint) -> Self {
         self.constraints.push(constraint);
         self
@@ -202,6 +207,7 @@ impl IndexDef {
     }
 
     /// Set unique
+    #[must_use]
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Error, Debug)]
 pub enum TlsError {
@@ -62,7 +63,9 @@ impl TlsConfig {
         // Build client config with the same cert as root CA (self-signed scenario)
         let mut root_store = RootCertStore::empty();
         for cert in &certs {
-            root_store.add(cert.clone()).ok();
+            if let Err(e) = root_store.add(cert.clone()) {
+                warn!("Failed to add cert to root store: {}", e);
+            }
         }
 
         let client_config = ClientConfig::builder()

@@ -676,21 +676,8 @@ impl LogicalPlanBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
+    use crate::planner::test_utils::test_catalog;
     use crate::sql::{Parser, Resolver, TypeChecker};
-
-    fn test_catalog() -> Catalog {
-        let mut catalog = Catalog::new();
-
-        let users = TableDef::new("users")
-            .column(ColumnDef::new("id", DataType::Int).nullable(false))
-            .column(ColumnDef::new("name", DataType::Varchar(100)))
-            .column(ColumnDef::new("age", DataType::Int))
-            .constraint(Constraint::PrimaryKey(vec!["id".to_string()]));
-
-        catalog.create_table(users).unwrap();
-        catalog
-    }
 
     #[test]
     fn test_build_simple_select() {

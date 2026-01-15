@@ -33,8 +33,6 @@ impl Default for LsmConfig {
 
 /// LSM-Tree storage engine
 pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
-    #[allow(dead_code)]
-    config: LsmConfig,
     factory: Arc<F>,
     /// Active memtable for writes
     memtable: Arc<Memtable>,
@@ -58,7 +56,6 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         let manifest = Manifest::open(&config.dir)?;
 
         Ok(Self {
-            config,
             factory,
             memtable: Arc::new(Memtable::new()),
             imm_memtables: RwLock::new(Vec::new()),

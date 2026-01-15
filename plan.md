@@ -314,6 +314,35 @@ cargo clippy --all-targets
 
 ---
 
+## Phase 14: Code Cleanup ✓ COMPLETE
+**Goal**: Systematic cleanup after rapid development
+
+### 1. Dead Code Removal
+- [x] `storage/lsm/engine.rs` - Remove unused `config` field
+- [x] `protocol/roodb/prepared.rs` - Remove unused `next_id` field → unit struct
+
+### 2. Duplicate Code Consolidation
+- [x] `protocol/roodb/mod.rs` - Extract `verify_auth()` helper
+- [x] `protocol/roodb/mod.rs` - Consolidate txn begin (single match with read_only flag)
+- [x] `server/listener.rs` - SKIP (acceptable duplication, different control flow)
+
+### 3. Duplicate Test Helpers
+- [x] Create `planner/test_utils.rs` with shared `test_catalog()`
+- [x] Updated 5 files: builder.rs, optimizer.rs, physical.rs, cost.rs, explain.rs
+
+### 4. Error Handling
+- [x] `tls.rs` - Log warning on cert store add failure
+- [x] `planner/explain.rs` - SKIP (writeln to String is infallible)
+
+### 5. #[must_use] Attributes
+- [x] `catalog.rs` - Added to ColumnDef, TableDef, IndexDef builder methods
+- [x] `server/session.rs` - SKIP (unlikely to discard new()/status_flags())
+
+### 6. Minor Optimizations
+- [x] SKIP - Low impact items
+
+---
+
 ## Decisions Made
 - **Storage**: LSM-Tree first, B+Tree later
 - **Raft**: Auto-bootstrap single-node as leader

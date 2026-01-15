@@ -160,33 +160,7 @@ where
         self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
 
         // Verify authentication
-        let auth_plugin = response
-            .auth_plugin_name
-            .as_deref()
-            .unwrap_or(AUTH_PLUGIN_NAME);
-
-        if auth_plugin != AUTH_PLUGIN_NAME {
-            warn!(plugin = auth_plugin, "Unsupported auth plugin");
-            return self
-                .send_auth_error("Unsupported authentication plugin")
-                .await;
-        }
-
-        // Check username and password
-        if response.username != ROOT_USER {
-            warn!(username = %response.username, "Unknown user");
-            return self.send_auth_error("Access denied").await;
-        }
-
-        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
-            warn!("Password verification failed");
-            return self.send_auth_error("Access denied").await;
-        }
-
-        // Store database if provided
-        if let Some(db) = response.database {
-            self.database = Some(db);
-        }
+        self.verify_auth(&response).await?;
 
         // Send OK
         self.writer.set_sequence(3);
@@ -227,33 +201,7 @@ where
         self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
 
         // Verify authentication
-        let auth_plugin = response
-            .auth_plugin_name
-            .as_deref()
-            .unwrap_or(AUTH_PLUGIN_NAME);
-
-        if auth_plugin != AUTH_PLUGIN_NAME {
-            warn!(plugin = auth_plugin, "Unsupported auth plugin");
-            return self
-                .send_auth_error("Unsupported authentication plugin")
-                .await;
-        }
-
-        // Check username and password
-        if response.username != ROOT_USER {
-            warn!(username = %response.username, "Unknown user");
-            return self.send_auth_error("Access denied").await;
-        }
-
-        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
-            warn!("Password verification failed");
-            return self.send_auth_error("Access denied").await;
-        }
-
-        // Store database if provided
-        if let Some(db) = response.database {
-            self.database = Some(db);
-        }
+        self.verify_auth(&response).await?;
 
         // Send OK
         self.writer.set_sequence(2);
@@ -277,6 +225,37 @@ where
         self.writer.write_packet(&err_packet).await?;
         self.writer.flush().await?;
         Err(ProtocolError::AuthFailed(message.to_string()))
+    }
+
+    /// Verify authentication from handshake response
+    async fn verify_auth(&mut self, response: &HandshakeResponse41) -> ProtocolResult<()> {
+        let auth_plugin = response
+            .auth_plugin_name
+            .as_deref()
+            .unwrap_or(AUTH_PLUGIN_NAME);
+
+        if auth_plugin != AUTH_PLUGIN_NAME {
+            warn!(plugin = auth_plugin, "Unsupported auth plugin");
+            return self
+                .send_auth_error("Unsupported authentication plugin")
+                .await;
+        }
+
+        if response.username != ROOT_USER {
+            warn!(username = %response.username, "Unknown user");
+            return self.send_auth_error("Access denied").await;
+        }
+
+        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
+            warn!("Password verification failed");
+            return self.send_auth_error("Access denied").await;
+        }
+
+        if let Some(ref db) = response.database {
+            self.database = Some(db.clone());
+        }
+
+        Ok(())
     }
 
     /// Run the command loop
@@ -657,47 +636,26 @@ where
                 .await;
         }
 
-        // Check if we can write (not on replica)
-        if self.session.is_read_only {
-            // Read-only transactions are allowed on replicas
-            match self.txn_manager.begin(self.session.isolation_level, true) {
-                Ok(txn) => {
-                    self.session.begin_transaction(txn.txn_id);
-                    debug!(
-                        connection_id = self.connection_id,
-                        txn_id = txn.txn_id,
-                        "Started read-only transaction"
-                    );
-                }
-                Err(e) => {
-                    return self
-                        .send_error(
-                            codes::ER_UNKNOWN_ERROR,
-                            states::GENERAL_ERROR,
-                            &e.to_string(),
-                        )
-                        .await;
-                }
+        // Read-only mode (replica) requires read-only transactions
+        let read_only = self.session.is_read_only;
+        match self.txn_manager.begin(self.session.isolation_level, read_only) {
+            Ok(txn) => {
+                self.session.begin_transaction(txn.txn_id);
+                debug!(
+                    connection_id = self.connection_id,
+                    txn_id = txn.txn_id,
+                    read_only = read_only,
+                    "Started transaction"
+                );
             }
-        } else {
-            match self.txn_manager.begin(self.session.isolation_level, false) {
-                Ok(txn) => {
-                    self.session.begin_transaction(txn.txn_id);
-                    debug!(
-                        connection_id = self.connection_id,
-                        txn_id = txn.txn_id,
-                        "Started transaction"
-                    );
-                }
-                Err(e) => {
-                    return self
-                        .send_error(
-                            codes::ER_UNKNOWN_ERROR,
-                            states::GENERAL_ERROR,
-                            &e.to_string(),
-                        )
-                        .await;
-                }
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &e.to_string(),
+                    )
+                    .await;
             }
         }
 

@@ -29,15 +29,12 @@ pub fn unsupported_prepared_stmt_error() -> Vec<u8> {
 }
 
 /// Placeholder for future prepared statement manager
-pub struct PreparedStatementManager {
-    #[allow(dead_code)]
-    next_id: u32,
-}
+pub struct PreparedStatementManager;
 
 impl PreparedStatementManager {
     /// Create a new prepared statement manager
     pub fn new() -> Self {
-        PreparedStatementManager { next_id: 1 }
+        PreparedStatementManager
     }
 
     /// Prepare a statement (returns error for now)

@@ -159,24 +159,11 @@ impl CostEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnDef, Constraint, DataType, TableDef};
     use crate::planner::logical::LogicalPlanBuilder;
     use crate::planner::optimizer::Optimizer;
     use crate::planner::physical::PhysicalPlanner;
+    use crate::planner::test_utils::test_catalog;
     use crate::sql::{Parser, Resolver, TypeChecker};
-
-    fn test_catalog() -> Catalog {
-        let mut catalog = Catalog::new();
-
-        let users = TableDef::new("users")
-            .column(ColumnDef::new("id", DataType::Int).nullable(false))
-            .column(ColumnDef::new("name", DataType::Varchar(100)))
-            .column(ColumnDef::new("age", DataType::Int))
-            .constraint(Constraint::PrimaryKey(vec!["id".to_string()]));
-
-        catalog.create_table(users).unwrap();
-        catalog
-    }
 
     #[test]
     fn test_cost_estimate_simple_scan() {
