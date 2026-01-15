@@ -210,10 +210,10 @@ mod tests {
         let result = insert.next().await.unwrap().unwrap();
         assert_eq!(result.get(0).unwrap().as_int(), Some(1)); // 1 row inserted
 
+        insert.close().await.unwrap();
+
         // Verify data was stored
         let data = storage.data.lock().unwrap();
         assert_eq!(data.len(), 1);
-
-        insert.close().await.unwrap();
     }
 }

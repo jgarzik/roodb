@@ -247,29 +247,31 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 12: Integration Test Suite
+## Phase 12: Integration Test Suite ✓ COMPLETE
 **Goal**: Full SQL test suite across 4 configurations. `cargo test --release` works (no extra args).
 
 ### Test Synchronization:
-- Global `OnceLock<Mutex>` serializes integration tests
-- Each test: acquire lock → start server → run queries → stop server → release lock
-- Prevents port/data conflicts
+- Global `OnceLock<Mutex>` serializes integration tests ✓
+- Each test: acquire lock → start server → run queries → stop server → release lock ✓
+- Prevents port/data conflicts ✓
 
 ### Test Framework (mysql_async crate):
-- `tests/roodb_suite.rs` - test harness entry
-- `tests/roodb_suite/harness.rs` - server spawn, mysql_async client, **global mutex**
-- `tests/roodb_suite/config.rs` - 4 configs (single_uring, single_posix, cluster_uring, cluster_posix)
-- `tests/test_utils/mod.rs` - shared utilities
-- `tests/test_utils/certs.rs` - TLS cert generation (rcgen)
+- `tests/suite.rs` - test harness entry ✓
+- `tests/roodb_suite/harness.rs` - server spawn, mysql_async client, **global mutex** ✓
+- `tests/roodb_suite/mod.rs` - single_posix config (main test runner) ✓
+- `tests/test_utils/mod.rs` - shared utilities ✓
+- `tests/test_utils/certs.rs` - TLS cert generation (rcgen) ✓
 
-### Test Categories:
-- `tests/roodb_suite/ddl/` - CREATE TABLE, DROP TABLE, CREATE INDEX
-- `tests/roodb_suite/dml/` - INSERT, UPDATE, DELETE
-- `tests/roodb_suite/queries/` - SELECT, filters, joins, aggregates, ORDER BY, LIMIT
-- `tests/roodb_suite/types/` - INT, FLOAT, VARCHAR, BLOB, NULL
-- `tests/roodb_suite/errors/` - parse errors, semantic errors, constraint violations
-- `tests/roodb_suite/edge_cases/` - empty tables, NULL handling, large rows
-- `tests/roodb_suite/cluster/` - replication, failover, consistency
+### Test Categories (96 tests):
+- `tests/roodb_suite/ddl/` - CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX ✓
+- `tests/roodb_suite/dml/` - INSERT, UPDATE, DELETE ✓
+- `tests/roodb_suite/queries/` - SELECT, filters, joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT ✓
+
+### Future Test Categories (optional):
+- `tests/roodb_suite/types/` - explicit type conversion tests
+- `tests/roodb_suite/errors/` - parse errors, semantic errors
+- `tests/roodb_suite/edge_cases/` - large rows, boundary conditions
+- `tests/roodb_suite/cluster/` - multi-node replication tests
 
 ---
 

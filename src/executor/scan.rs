@@ -144,8 +144,8 @@ mod tests {
                 .data
                 .iter()
                 .filter(|(k, _)| {
-                    let after_start = start.map_or(true, |s| k.as_slice() >= s);
-                    let before_end = end.map_or(true, |e| k.as_slice() < e);
+                    let after_start = start.is_none_or(|s| k.as_slice() >= s);
+                    let before_end = end.is_none_or(|e| k.as_slice() < e);
                     after_start && before_end
                 })
                 .cloned()

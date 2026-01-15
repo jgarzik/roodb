@@ -308,11 +308,11 @@ mod tests {
         let result = create.next().await.unwrap();
         assert!(result.is_some());
 
+        create.close().await.unwrap();
+
         // Verify table exists
         let cat = catalog.read();
         assert!(cat.get_table("users").is_some());
-
-        create.close().await.unwrap();
     }
 
     #[tokio::test]

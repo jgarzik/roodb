@@ -168,8 +168,8 @@ mod tests {
             let filtered: Vec<_> = data
                 .iter()
                 .filter(|(k, _)| {
-                    let after_start = start.map_or(true, |s| k.as_slice() >= s);
-                    let before_end = end.map_or(true, |e| k.as_slice() < e);
+                    let after_start = start.is_none_or(|s| k.as_slice() >= s);
+                    let before_end = end.is_none_or(|e| k.as_slice() < e);
                     after_start && before_end
                 })
                 .cloned()
@@ -227,11 +227,11 @@ mod tests {
         let result = delete.next().await.unwrap().unwrap();
         assert_eq!(result.get(0).unwrap().as_int(), Some(2)); // 2 rows deleted
 
+        delete.close().await.unwrap();
+
         // Verify only row 1 remains
         let data = storage.data.lock().unwrap();
         assert_eq!(data.len(), 1);
-
-        delete.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -258,10 +258,10 @@ mod tests {
         let result = delete.next().await.unwrap().unwrap();
         assert_eq!(result.get(0).unwrap().as_int(), Some(2));
 
+        delete.close().await.unwrap();
+
         // Verify all deleted
         let data = storage.data.lock().unwrap();
         assert!(data.is_empty());
-
-        delete.close().await.unwrap();
     }
 }
