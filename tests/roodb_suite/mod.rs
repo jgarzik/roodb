@@ -12,8 +12,12 @@
 
 mod harness;
 
+pub mod cluster;
 pub mod ddl;
 pub mod dml;
+pub mod edge_cases;
+pub mod errors;
 pub mod queries;
+pub mod types;
 
 pub use harness::TestServer;

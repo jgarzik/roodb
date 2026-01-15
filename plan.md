@@ -262,16 +262,14 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 - `tests/test_utils/mod.rs` - shared utilities ✓
 - `tests/test_utils/certs.rs` - TLS cert generation (rcgen) ✓
 
-### Test Categories (96 tests):
+### Test Categories (132 tests):
 - `tests/roodb_suite/ddl/` - CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX ✓
 - `tests/roodb_suite/dml/` - INSERT, UPDATE, DELETE ✓
 - `tests/roodb_suite/queries/` - SELECT, filters, joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT ✓
-
-### Future Test Categories (optional):
-- `tests/roodb_suite/types/` - explicit type conversion tests
-- `tests/roodb_suite/errors/` - parse errors, semantic errors
-- `tests/roodb_suite/edge_cases/` - large rows, boundary conditions
-- `tests/roodb_suite/cluster/` - multi-node replication tests
+- `tests/roodb_suite/types/` - Boolean, TinyInt, SmallInt, Int, BigInt, Float, Double, Varchar, Text, Blob, Timestamp, NULL ✓
+- `tests/roodb_suite/errors/` - syntax errors, table/column not found, type mismatch, duplicate table ✓
+- `tests/roodb_suite/edge_cases/` - empty strings, large varchar, special chars, unicode, case sensitivity, boundaries ✓
+- `tests/roodb_suite/cluster/` - Raft leader election, replication consistency, follower reads ✓
 
 ---
 
