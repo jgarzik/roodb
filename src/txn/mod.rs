@@ -89,8 +89,8 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             idle_in_transaction_timeout: Duration::from_secs(600), // 10 minutes
-            statement_timeout: Duration::ZERO,                      // disabled
-            lock_timeout: Duration::ZERO,                           // disabled
+            statement_timeout: Duration::ZERO,                     // disabled
+            lock_timeout: Duration::ZERO,                          // disabled
         }
     }
 }

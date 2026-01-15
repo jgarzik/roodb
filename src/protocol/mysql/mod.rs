@@ -492,10 +492,9 @@ where
             (Some(TransactionContext::new(txn_id, read_view)), None)
         } else if !returns_rows && self.session.autocommit {
             // Autocommit DML - create implicit transaction
-            let txn = self.txn_manager.begin(
-                self.session.isolation_level,
-                self.session.is_read_only,
-            )?;
+            let txn = self
+                .txn_manager
+                .begin(self.session.isolation_level, self.session.is_read_only)?;
             let read_view = self.txn_manager.create_read_view(txn.txn_id);
             (
                 Some(TransactionContext::new(txn.txn_id, read_view)),
@@ -662,10 +661,7 @@ where
         // Check if we can write (not on replica)
         if self.session.is_read_only {
             // Read-only transactions are allowed on replicas
-            match self
-                .txn_manager
-                .begin(self.session.isolation_level, true)
-            {
+            match self.txn_manager.begin(self.session.isolation_level, true) {
                 Ok(txn) => {
                     self.session.begin_transaction(txn.txn_id);
                     debug!(
@@ -676,15 +672,16 @@ where
                 }
                 Err(e) => {
                     return self
-                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .send_error(
+                            codes::ER_UNKNOWN_ERROR,
+                            states::GENERAL_ERROR,
+                            &e.to_string(),
+                        )
                         .await;
                 }
             }
         } else {
-            match self
-                .txn_manager
-                .begin(self.session.isolation_level, false)
-            {
+            match self.txn_manager.begin(self.session.isolation_level, false) {
                 Ok(txn) => {
                     self.session.begin_transaction(txn.txn_id);
                     debug!(
@@ -695,7 +692,11 @@ where
                 }
                 Err(e) => {
                     return self
-                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .send_error(
+                            codes::ER_UNKNOWN_ERROR,
+                            states::GENERAL_ERROR,
+                            &e.to_string(),
+                        )
                         .await;
                 }
             }
@@ -719,7 +720,11 @@ where
                 Err(e) => {
                     self.session.end_transaction();
                     return self
-                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .send_error(
+                            codes::ER_UNKNOWN_ERROR,
+                            states::GENERAL_ERROR,
+                            &e.to_string(),
+                        )
                         .await;
                 }
             }
@@ -743,7 +748,11 @@ where
                 Err(e) => {
                     self.session.end_transaction();
                     return self
-                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .send_error(
+                            codes::ER_UNKNOWN_ERROR,
+                            states::GENERAL_ERROR,
+                            &e.to_string(),
+                        )
                         .await;
                 }
             }
@@ -804,7 +813,11 @@ where
     }
 
     /// Send OK packet with session-aware status flags
-    async fn send_ok_with_status(&mut self, affected_rows: u64, last_insert_id: u64) -> ProtocolResult<()> {
+    async fn send_ok_with_status(
+        &mut self,
+        affected_rows: u64,
+        last_insert_id: u64,
+    ) -> ProtocolResult<()> {
         let status = self.session.status_flags();
         self.writer.set_sequence(1);
         let ok = encode_ok_packet(affected_rows, last_insert_id, status, 0);

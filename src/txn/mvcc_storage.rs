@@ -72,8 +72,11 @@ impl MvccStorage {
         }
 
         let txn_id = u64::from_le_bytes(encoded[TXN_ID_OFFSET..TXN_ID_OFFSET + 8].try_into().ok()?);
-        let roll_ptr =
-            u64::from_le_bytes(encoded[ROLL_PTR_OFFSET..ROLL_PTR_OFFSET + 8].try_into().ok()?);
+        let roll_ptr = u64::from_le_bytes(
+            encoded[ROLL_PTR_OFFSET..ROLL_PTR_OFFSET + 8]
+                .try_into()
+                .ok()?,
+        );
         let deleted = encoded[DELETED_OFFSET] != 0;
         let data = &encoded[ROW_HEADER_SIZE..];
 
@@ -161,12 +164,7 @@ impl MvccStorage {
     /// Put a row with MVCC tracking
     ///
     /// This creates a new version of the row and logs to the undo log.
-    pub async fn put(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: u64,
-    ) -> TransactionResult<()> {
+    pub async fn put(&self, key: &[u8], value: &[u8], txn_id: u64) -> TransactionResult<()> {
         // Check if row exists (for undo log)
         let existing = self.inner.get(key).await?;
 
@@ -288,8 +286,7 @@ mod tests {
         let data = b"hello world";
         let encoded = MvccStorage::encode_row(42, 100, false, data);
 
-        let (txn_id, roll_ptr, deleted, decoded_data) =
-            MvccStorage::decode_row(&encoded).unwrap();
+        let (txn_id, roll_ptr, deleted, decoded_data) = MvccStorage::decode_row(&encoded).unwrap();
 
         assert_eq!(txn_id, 42);
         assert_eq!(roll_ptr, 100);

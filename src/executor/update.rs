@@ -74,7 +74,9 @@ impl Executor for Update {
 
         // Use MVCC scan with visibility filtering if we have a transaction context
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc.scan(Some(&prefix), Some(&end), &ctx.read_view).await?
+            self.mvcc
+                .scan(Some(&prefix), Some(&end), &ctx.read_view)
+                .await?
         } else {
             self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
         };
@@ -237,13 +239,7 @@ mod tests {
         )];
 
         // No txn_context = use raw storage (legacy mode)
-        let mut update = Update::new(
-            "users".to_string(),
-            assignments,
-            Some(filter),
-            mvcc,
-            None,
-        );
+        let mut update = Update::new("users".to_string(), assignments, Some(filter), mvcc, None);
         update.open().await.unwrap();
 
         let result = update.next().await.unwrap().unwrap();

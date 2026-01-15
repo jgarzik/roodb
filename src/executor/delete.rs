@@ -70,7 +70,9 @@ impl Executor for Delete {
 
         // Use MVCC scan with visibility filtering if we have a transaction context
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc.scan(Some(&prefix), Some(&end), &ctx.read_view).await?
+            self.mvcc
+                .scan(Some(&prefix), Some(&end), &ctx.read_view)
+                .await?
         } else {
             self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
         };

@@ -108,9 +108,7 @@ impl PurgeTask {
 ///
 /// Returns the task and a shutdown sender.
 #[allow(dead_code)]
-pub fn create_purge_task(
-    txn_manager: Arc<TransactionManager>,
-) -> (PurgeTask, watch::Sender<bool>) {
+pub fn create_purge_task(txn_manager: Arc<TransactionManager>) -> (PurgeTask, watch::Sender<bool>) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task = PurgeTask::new(
         txn_manager,
@@ -141,12 +139,9 @@ mod tests {
         let mgr = Arc::new(TransactionManager::new());
 
         // Add some undo records
-        mgr.undo_log()
-            .log_insert(10, "test".to_string(), vec![1]);
-        mgr.undo_log()
-            .log_insert(20, "test".to_string(), vec![2]);
-        mgr.undo_log()
-            .log_insert(30, "test".to_string(), vec![3]);
+        mgr.undo_log().log_insert(10, "test".to_string(), vec![1]);
+        mgr.undo_log().log_insert(20, "test".to_string(), vec![2]);
+        mgr.undo_log().log_insert(30, "test".to_string(), vec![3]);
 
         assert_eq!(mgr.undo_log().record_count(), 3);
 
