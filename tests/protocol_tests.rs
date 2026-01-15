@@ -1,4 +1,4 @@
-//! MySQL protocol tests
+//! RooDB protocol tests
 //!
 //! Tests for packet encoding/decoding, handshake, auth, and result sets.
 
@@ -14,21 +14,21 @@ use roodb::executor::datum::Datum;
 use roodb::executor::row::Row;
 use roodb::io::PosixIOFactory;
 use roodb::planner::logical::OutputColumn;
-use roodb::protocol::mysql::auth::{verify_mysql_native_password, HandshakeResponse41};
-use roodb::protocol::mysql::command::{parse_command, Command, ParsedCommand};
-use roodb::protocol::mysql::handshake::{
+use roodb::protocol::roodb::auth::{verify_native_password, HandshakeResponse41};
+use roodb::protocol::roodb::command::{parse_command, Command, ParsedCommand};
+use roodb::protocol::roodb::handshake::{
     capabilities, HandshakeV10, AUTH_PLUGIN_NAME, SERVER_VERSION,
 };
-use roodb::protocol::mysql::packet::{
+use roodb::protocol::roodb::packet::{
     decode_length_encoded_int, decode_length_encoded_string, decode_null_terminated_string,
     encode_length_encoded_bytes, encode_length_encoded_int, encode_length_encoded_string,
     encode_null_terminated_string,
 };
-use roodb::protocol::mysql::resultset::{
+use roodb::protocol::roodb::resultset::{
     encode_column_count, encode_eof_packet, encode_err_packet, encode_ok_packet, encode_text_row,
     ColumnDefinition41,
 };
-use roodb::protocol::mysql::types::{datatype_to_mysql, datum_to_text_bytes, ColumnType};
+use roodb::protocol::roodb::types::{datatype_to_protocol, datum_to_text_bytes, ColumnType};
 use roodb::server::listener::start_test_server;
 use roodb::storage::lsm::{LsmConfig, LsmEngine};
 use roodb::storage::StorageEngine;
@@ -134,15 +134,15 @@ fn test_handshake_v10_encode() {
 #[test]
 fn test_verify_empty_password() {
     let scramble = [0u8; 20];
-    assert!(verify_mysql_native_password(&scramble, "", &[]));
-    assert!(!verify_mysql_native_password(&scramble, "", &[1, 2, 3]));
+    assert!(verify_native_password(&scramble, "", &[]));
+    assert!(!verify_native_password(&scramble, "", &[1, 2, 3]));
 }
 
 #[test]
 fn test_verify_password_wrong_length() {
     let scramble = [0u8; 20];
     // Non-empty password should have 20-byte response
-    assert!(!verify_mysql_native_password(
+    assert!(!verify_native_password(
         &scramble,
         "secret",
         &[1, 2, 3]
@@ -302,22 +302,22 @@ fn test_column_definition_encoding() {
 // ============================================================================
 
 #[test]
-fn test_datatype_to_mysql() {
-    assert_eq!(datatype_to_mysql(&DataType::Boolean), ColumnType::Tiny);
-    assert_eq!(datatype_to_mysql(&DataType::TinyInt), ColumnType::Tiny);
-    assert_eq!(datatype_to_mysql(&DataType::SmallInt), ColumnType::Short);
-    assert_eq!(datatype_to_mysql(&DataType::Int), ColumnType::Long);
-    assert_eq!(datatype_to_mysql(&DataType::BigInt), ColumnType::LongLong);
-    assert_eq!(datatype_to_mysql(&DataType::Float), ColumnType::Float);
-    assert_eq!(datatype_to_mysql(&DataType::Double), ColumnType::Double);
+fn test_datatype_to_protocol() {
+    assert_eq!(datatype_to_protocol(&DataType::Boolean), ColumnType::Tiny);
+    assert_eq!(datatype_to_protocol(&DataType::TinyInt), ColumnType::Tiny);
+    assert_eq!(datatype_to_protocol(&DataType::SmallInt), ColumnType::Short);
+    assert_eq!(datatype_to_protocol(&DataType::Int), ColumnType::Long);
+    assert_eq!(datatype_to_protocol(&DataType::BigInt), ColumnType::LongLong);
+    assert_eq!(datatype_to_protocol(&DataType::Float), ColumnType::Float);
+    assert_eq!(datatype_to_protocol(&DataType::Double), ColumnType::Double);
     assert_eq!(
-        datatype_to_mysql(&DataType::Varchar(255)),
+        datatype_to_protocol(&DataType::Varchar(255)),
         ColumnType::Varchar
     );
-    assert_eq!(datatype_to_mysql(&DataType::Text), ColumnType::Blob);
-    assert_eq!(datatype_to_mysql(&DataType::Blob), ColumnType::Blob);
+    assert_eq!(datatype_to_protocol(&DataType::Text), ColumnType::Blob);
+    assert_eq!(datatype_to_protocol(&DataType::Blob), ColumnType::Blob);
     assert_eq!(
-        datatype_to_mysql(&DataType::Timestamp),
+        datatype_to_protocol(&DataType::Timestamp),
         ColumnType::Datetime
     );
 }
@@ -379,7 +379,7 @@ fn cleanup_dir(path: &PathBuf) {
     let _ = std::fs::remove_dir_all(path);
 }
 
-/// End-to-end integration test: start server, connect via mysql_async, run SQL
+/// End-to-end integration test: start server, connect via client, run SQL
 #[tokio::test]
 async fn test_server_integration_e2e() {
     use mysql_async::prelude::*;
@@ -419,7 +419,7 @@ async fn test_server_integration_e2e() {
     // Give server time to bind
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Build MySQL client with TLS (accept invalid certs for self-signed)
+    // Build client with TLS (accept invalid certs for self-signed)
     // Set max_allowed_packet and wait_timeout to avoid init queries for @@variables
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
 

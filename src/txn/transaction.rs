@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::ReadView;
 
-/// Transaction isolation levels (MySQL/InnoDB compatible)
+/// Transaction isolation levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
     /// Dirty reads allowed - can see uncommitted changes from other transactions

@@ -1,4 +1,4 @@
-//! Connection handler for MySQL protocol
+//! Connection handler for RooDB client protocol
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,12 +9,12 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
 use crate::catalog::Catalog;
-use crate::protocol::mysql::starttls::starttls_handshake;
-use crate::protocol::mysql::MySqlConnection;
+use crate::protocol::roodb::starttls::starttls_handshake;
+use crate::protocol::roodb::RooDbConnection;
 use crate::storage::StorageEngine;
 use crate::txn::TransactionManager;
 
-/// Handle a MySQL client connection with STARTTLS
+/// Handle a RooDB client connection with STARTTLS
 ///
 /// Performs STARTTLS handshake, then runs authentication and command loop.
 pub async fn handle_connection(
@@ -37,8 +37,8 @@ pub async fn handle_connection(
         }
     };
 
-    // Create MySQL connection on TLS stream
-    let mut conn = MySqlConnection::new_with_scramble(
+    // Create RooDB connection on TLS stream
+    let mut conn = RooDbConnection::new_with_scramble(
         tls_stream,
         connection_id,
         scramble,

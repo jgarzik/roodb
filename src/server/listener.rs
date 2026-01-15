@@ -1,4 +1,4 @@
-//! TCP listener and MySQL server
+//! TCP listener and RooDB server
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,8 +24,8 @@ pub enum ServerError {
     Tls(String),
 }
 
-/// MySQL-compatible server with STARTTLS support
-pub struct MySqlServer {
+/// RooDB server with STARTTLS support
+pub struct RooDbServer {
     addr: SocketAddr,
     tls_acceptor: TlsAcceptor,
     storage: Arc<dyn StorageEngine>,
@@ -34,8 +34,8 @@ pub struct MySqlServer {
     next_conn_id: AtomicU32,
 }
 
-impl MySqlServer {
-    /// Create a new MySQL server
+impl RooDbServer {
+    /// Create a new RooDB server
     pub fn new(
         addr: SocketAddr,
         tls_config: TlsConfig,
@@ -53,7 +53,7 @@ impl MySqlServer {
         }
     }
 
-    /// Create a new MySQL server with custom transaction manager
+    /// Create a new RooDB server with custom transaction manager
     pub fn with_txn_manager(
         addr: SocketAddr,
         tls_config: TlsConfig,
@@ -90,7 +90,7 @@ impl MySqlServer {
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
-        tracing::info!(addr = %self.addr, "MySQL server listening (STARTTLS enabled)");
+        tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -128,7 +128,7 @@ impl MySqlServer {
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
-        tracing::info!(addr = %self.addr, "MySQL server listening (STARTTLS enabled)");
+        tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
 
         loop {
             tokio::select! {
@@ -153,7 +153,7 @@ impl MySqlServer {
                     });
                 }
                 _ = &mut shutdown_rx => {
-                    tracing::info!("MySQL server shutting down");
+                    tracing::info!("RooDB server shutting down");
                     break;
                 }
             }
@@ -185,7 +185,7 @@ pub async fn start_test_server(
 ) -> Result<ServerHandle, ServerError> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = MySqlServer::new(addr, tls_config, storage, catalog);
+    let server = RooDbServer::new(addr, tls_config, storage, catalog);
     let actual_addr = server.addr();
 
     tokio::spawn(async move {

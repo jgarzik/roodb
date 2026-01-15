@@ -1,10 +1,10 @@
-//! MySQL command handling
+//! Command handling
 //!
-//! Parses and handles MySQL command packets.
+//! Parses and handles command packets.
 
 use super::error::{ProtocolError, ProtocolResult};
 
-/// MySQL command codes
+/// Protocol command codes
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {

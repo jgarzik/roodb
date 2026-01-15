@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 
 use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
-use roodb::server::listener::MySqlServer;
+use roodb::server::listener::RooDbServer;
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::TlsConfig;
 use tracing_subscriber::EnvFilter;
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI args (minimal for now)
     let args: Vec<String> = env::args().collect();
 
-    let mysql_port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3307);
+    let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3307);
 
     let data_dir = args
         .get(2)
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./certs/server.key"));
 
-    tracing::info!(mysql_port, ?data_dir, "Starting RooDB");
+    tracing::info!(port, ?data_dir, "Starting RooDB");
 
     // Load TLS config
     let tls_config = TlsConfig::from_files(&cert_path, &key_path).await?;
@@ -55,9 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize catalog
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
-    // Start MySQL-compatible server
-    let mysql_addr: SocketAddr = format!("0.0.0.0:{}", mysql_port).parse()?;
-    let server = MySqlServer::new(mysql_addr, tls_config, storage, catalog);
+    // Start RooDB server
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let server = RooDbServer::new(addr, tls_config, storage, catalog);
     server.run().await?;
 
     Ok(())

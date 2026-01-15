@@ -1,13 +1,13 @@
 # RooDB
 
-A distributed SQL database written in Rust, featuring Raft consensus, MySQL wire protocol compatibility, and high-performance I/O.
+A distributed SQL database written in Rust, featuring Raft consensus, TLS-secured client protocol, and high-performance I/O.
 
 ## Goals
 
-* Easy, highly available distributed SQL
-* General purpose, works for most workloads
-* Near-zero config
+* A general SQL database for Unix-like OS's
+* General purpose, Highly available
 * Single node or multi-node (leader+replicas) configurations
+* Near-zero config
 
 roodb should be high performance for all but the most massive,
 sharded-cluster workloads.
@@ -16,9 +16,10 @@ sharded-cluster workloads.
 
 - **Raft Consensus**: Distributed replication via OpenRaft for high availability
 - **LSM Storage Engine**
-- **MySQL Wire Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
+- **RooDB Client Protocol**: Connect using standard `mysql` CLI or compatible client libraries (TLS required)
 - **SQL Support**: Parser (sqlparser-rs), query planner with optimizer, Volcano-style executor
 - **Cross-Platform I/O**: io_uring on Linux, async POSIX fallback on other platforms
+- **MySQL Wire Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
 
 ## Quick Start
 
@@ -41,7 +42,7 @@ cargo test --release test_name
 cargo clippy --all-targets
 ```
 
-### Connect with MySQL Client
+### Connect with Client
 
 ```bash
 mysql -h 127.0.0.1 -P 3307 -u root --ssl-mode=REQUIRED --ssl-ca=ca.pem
@@ -55,7 +56,7 @@ src/
 ├── executor/      # Volcano-style query executor
 ├── io/            # Cross-platform async I/O (io_uring / POSIX)
 ├── planner/       # Query planner and optimizer
-├── protocol/      # MySQL wire protocol implementation
+├── protocol/      # RooDB client protocol implementation
 ├── raft/          # Raft consensus layer (OpenRaft)
 ├── server/        # TCP listener, connection handling
 ├── sql/           # SQL parsing and AST
@@ -76,7 +77,7 @@ RooDB includes a comprehensive integration test suite that validates the full SQ
 | `cluster_uring` | 3-node Raft | io_uring (Linux only) |
 | `cluster_posix` | 3-node Raft | POSIX |
 
-Tests use the `mysql` CLI to execute SQL against RooDB's MySQL wire protocol.
+Tests use the `mysql` CLI to execute SQL against RooDB's client protocol.
 
 ## Known Limitations
 

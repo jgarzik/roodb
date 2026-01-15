@@ -1,6 +1,6 @@
-//! MySQL authentication
+//! RooDB authentication
 //!
-//! Implements mysql_native_password authentication.
+//! Implements native password authentication.
 
 use sha1::{Digest, Sha1};
 
@@ -198,11 +198,11 @@ impl HandshakeResponse41 {
     }
 }
 
-/// Verify mysql_native_password authentication
+/// Verify native password authentication
 ///
 /// The auth response is computed as:
 /// SHA1(password) XOR SHA1(scramble || SHA1(SHA1(password)))
-pub fn verify_mysql_native_password(scramble: &[u8], password: &str, auth_response: &[u8]) -> bool {
+pub fn verify_native_password(scramble: &[u8], password: &str, auth_response: &[u8]) -> bool {
     if password.is_empty() {
         // Empty password = empty auth response
         return auth_response.is_empty();
@@ -240,7 +240,7 @@ pub fn verify_mysql_native_password(scramble: &[u8], password: &str, auth_respon
     expected == auth_response
 }
 
-/// Compute mysql_native_password auth response (for testing)
+/// Compute native password auth response (for testing)
 #[cfg(test)]
 pub fn compute_auth_response(scramble: &[u8], password: &str) -> Vec<u8> {
     if password.is_empty() {
@@ -279,8 +279,8 @@ mod tests {
     #[test]
     fn test_verify_empty_password() {
         let scramble = [0u8; 20];
-        assert!(verify_mysql_native_password(&scramble, "", &[]));
-        assert!(!verify_mysql_native_password(&scramble, "", &[1, 2, 3]));
+        assert!(verify_native_password(&scramble, "", &[]));
+        assert!(!verify_native_password(&scramble, "", &[1, 2, 3]));
     }
 
     #[test]
@@ -292,14 +292,14 @@ mod tests {
         assert_eq!(auth_response.len(), 20);
 
         // Correct password should verify
-        assert!(verify_mysql_native_password(
+        assert!(verify_native_password(
             scramble,
             password,
             &auth_response
         ));
 
         // Wrong password should fail
-        assert!(!verify_mysql_native_password(
+        assert!(!verify_native_password(
             scramble,
             "wrong",
             &auth_response
@@ -308,7 +308,7 @@ mod tests {
         // Corrupted response should fail
         let mut bad_response = auth_response.clone();
         bad_response[0] ^= 0xff;
-        assert!(!verify_mysql_native_password(
+        assert!(!verify_native_password(
             scramble,
             password,
             &bad_response

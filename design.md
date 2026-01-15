@@ -24,7 +24,7 @@ This document outlines the architecture and design of a generalized, distributed
 ### SQL Frontend
 - **Parser**: [`sqlparser`](https://github.com/sqlparser-rs/sqlparser-rs)
 - **Planner/Optimizer**: Custom, rule-based with cost hints and pluggable optimizations.
-- **Wire Protocol**: MySQL-compatible protocol for ecosystem compatibility (clients, connectors, drivers).
+- **Wire Protocol**: RooDB client protocol for ecosystem compatibility (clients, connectors, drivers).
 
 ### Consensus Layer
 - **Raft**: Strongly consistent replication across nodes.

@@ -1,6 +1,6 @@
-//! MySQL result set encoding
+//! Result set encoding
 //!
-//! Encodes query results into MySQL wire protocol format.
+//! Encodes query results into RooDB wire protocol format.
 
 use crate::executor::row::Row;
 use crate::planner::logical::OutputColumn;
@@ -8,11 +8,11 @@ use crate::planner::logical::OutputColumn;
 use super::handshake::status_flags;
 use super::packet::{encode_length_encoded_int, encode_length_encoded_string};
 use super::types::{
-    charset, datatype_column_length, datatype_flags, datatype_to_mysql, datum_to_text_bytes,
+    charset, datatype_column_length, datatype_flags, datatype_to_protocol, datum_to_text_bytes,
     ColumnType,
 };
 
-/// MySQL column definition packet (Protocol 4.1)
+/// Column definition packet (Protocol 4.1)
 #[derive(Debug)]
 pub struct ColumnDefinition41 {
     /// Catalog (always "def")
@@ -51,7 +51,7 @@ impl ColumnDefinition41 {
             org_name: col.name.clone(),
             character_set: charset::UTF8MB4_GENERAL_CI as u16,
             column_length: datatype_column_length(&col.data_type),
-            column_type: datatype_to_mysql(&col.data_type),
+            column_type: datatype_to_protocol(&col.data_type),
             flags: datatype_flags(&col.data_type, col.nullable),
             decimals: 0,
         }

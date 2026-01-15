@@ -1,4 +1,4 @@
-//! MySQL handshake protocol
+//! RooDB handshake protocol
 //!
 //! Implements the initial handshake sequence (server greeting).
 

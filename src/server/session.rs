@@ -1,4 +1,4 @@
-//! Session state for MySQL connections
+//! Session state for RooDB connections
 
 use crate::txn::{IsolationLevel, TimeoutConfig};
 
@@ -83,9 +83,9 @@ impl Session {
         self.isolation_level = level;
     }
 
-    /// Get the MySQL status flags for this session
+    /// Get the protocol status flags for this session
     pub fn status_flags(&self) -> u16 {
-        use crate::protocol::mysql::status_flags;
+        use crate::protocol::roodb::status_flags;
 
         let mut flags = 0u16;
 

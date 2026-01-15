@@ -1,6 +1,6 @@
-//! MySQL protocol implementation
+//! RooDB client protocol implementation
 //!
-//! Implements the MySQL wire protocol with STARTTLS support.
+//! Implements the RooDB client wire protocol with STARTTLS support.
 
 pub mod auth;
 pub mod command;
@@ -33,7 +33,7 @@ use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
 use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
 
-use self::auth::{verify_mysql_native_password, HandshakeResponse41};
+use self::auth::{verify_native_password, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
@@ -54,8 +54,8 @@ enum PlanError {
     Planner(crate::planner::PlannerError),
 }
 
-/// MySQL connection handler
-pub struct MySqlConnection<S>
+/// RooDB connection handler
+pub struct RooDbConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -83,11 +83,11 @@ where
     txn_manager: Arc<TransactionManager>,
 }
 
-impl<S> MySqlConnection<S>
+impl<S> RooDbConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    /// Create a new MySQL connection from a TLS stream
+    /// Create a new RooDB connection from a TLS stream
     pub fn new(
         stream: S,
         connection_id: u32,
@@ -97,7 +97,7 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        MySqlConnection {
+        RooDbConnection {
             reader: PacketReader::new(read_half),
             writer: PacketWriter::new(write_half),
             connection_id,
@@ -112,7 +112,7 @@ where
         }
     }
 
-    /// Create a new MySQL connection with pre-established scramble (for STARTTLS)
+    /// Create a new RooDB connection with pre-established scramble (for STARTTLS)
     ///
     /// Used after STARTTLS handshake where the scramble was already sent in the
     /// plaintext greeting.
@@ -126,7 +126,7 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        MySqlConnection {
+        RooDbConnection {
             reader: PacketReader::new(read_half),
             writer: PacketWriter::new(write_half),
             connection_id,
@@ -179,7 +179,7 @@ where
             return self.send_auth_error("Access denied").await;
         }
 
-        if !verify_mysql_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
+        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
             warn!("Password verification failed");
             return self.send_auth_error("Access denied").await;
         }
@@ -204,11 +204,11 @@ where
         Ok(())
     }
 
-    /// Perform the MySQL handshake (non-STARTTLS, for testing)
+    /// Perform the RooDB handshake (non-STARTTLS, for testing)
     pub async fn handshake(&mut self) -> ProtocolResult<()> {
         info!(
             connection_id = self.connection_id,
-            "Starting MySQL handshake"
+            "Starting RooDB handshake"
         );
 
         // Send server greeting
@@ -246,7 +246,7 @@ where
             return self.send_auth_error("Access denied").await;
         }
 
-        if !verify_mysql_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
+        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
             warn!("Password verification failed");
             return self.send_auth_error("Access denied").await;
         }
@@ -729,7 +729,7 @@ where
                 }
             }
         }
-        // COMMIT without BEGIN is a no-op in MySQL
+        // COMMIT without BEGIN is a no-op
         self.send_ok_with_status(0, 0).await
     }
 
@@ -757,7 +757,7 @@ where
                 }
             }
         }
-        // ROLLBACK without BEGIN is a no-op in MySQL
+        // ROLLBACK without BEGIN is a no-op
         self.send_ok_with_status(0, 0).await
     }
 
@@ -870,7 +870,7 @@ where
                 "interactive_timeout" => "28800",
                 "net_write_timeout" => "60",
                 "net_read_timeout" => "30",
-                "socket" => "/tmp/mysql.sock",
+                "socket" => "/tmp/roodb.sock",
                 "character_set_client" => "utf8mb4",
                 "character_set_connection" => "utf8mb4",
                 "character_set_results" => "utf8mb4",

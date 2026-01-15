@@ -1,4 +1,4 @@
-//! MySQL protocol error types
+//! RooDB protocol error types
 
 use std::fmt;
 use std::io;
@@ -8,7 +8,7 @@ use crate::planner::PlannerError;
 use crate::sql::SqlError;
 use crate::txn::TransactionError;
 
-/// MySQL protocol errors
+/// Protocol errors
 #[derive(Debug)]
 pub enum ProtocolError {
     /// I/O error during read/write
@@ -98,7 +98,7 @@ impl From<TransactionError> for ProtocolError {
 
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
-/// MySQL error codes
+/// Error codes
 pub mod codes {
     pub const ER_SYNTAX_ERROR: u16 = 1064;
     pub const ER_NO_SUCH_TABLE: u16 = 1146;

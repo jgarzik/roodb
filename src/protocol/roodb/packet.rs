@@ -1,6 +1,6 @@
-//! MySQL packet reading and writing
+//! Protocol packet reading and writing
 //!
-//! MySQL packets have a 4-byte header:
+//! Packets have a 4-byte header:
 //! - 3 bytes: payload length (little-endian)
 //! - 1 byte: sequence ID
 //!
@@ -14,7 +14,7 @@ use super::error::{ProtocolError, ProtocolResult};
 /// Maximum payload size for a single packet (2^24 - 1)
 pub const MAX_PACKET_SIZE: usize = 16_777_215;
 
-/// Reads MySQL packets from an async stream
+/// Reads protocol packets from an async stream
 pub struct PacketReader<R> {
     reader: R,
     sequence_id: u8,
@@ -93,7 +93,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     }
 }
 
-/// Writes MySQL packets to an async stream
+/// Writes protocol packets to an async stream
 pub struct PacketWriter<W> {
     writer: W,
     sequence_id: u8,

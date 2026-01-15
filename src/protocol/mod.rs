@@ -1,7 +1,7 @@
 //! Wire protocol implementations
 //!
-//! Currently supports MySQL protocol over TLS.
+//! Currently supports RooDB client protocol over TLS.
 
-pub mod mysql;
+pub mod roodb;
 
-pub use mysql::MySqlConnection;
+pub use roodb::RooDbConnection;

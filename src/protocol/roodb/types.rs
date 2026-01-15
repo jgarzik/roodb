@@ -1,11 +1,11 @@
-//! MySQL type mapping
+//! Protocol type mapping
 //!
-//! Maps between RooDB DataType/Datum and MySQL wire protocol types.
+//! Maps between RooDB DataType/Datum and wire protocol types.
 
 use crate::catalog::DataType;
 use crate::executor::datum::Datum;
 
-/// MySQL column types (protocol codes)
+/// Protocol column types (wire protocol codes)
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
@@ -60,8 +60,8 @@ pub mod column_flags {
     pub const NUM: u16 = 0x8000;
 }
 
-/// Convert RooDB DataType to MySQL ColumnType
-pub fn datatype_to_mysql(dt: &DataType) -> ColumnType {
+/// Convert RooDB DataType to protocol ColumnType
+pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
     match dt {
         DataType::Boolean => ColumnType::Tiny,
         DataType::TinyInt => ColumnType::Tiny,
@@ -144,14 +144,14 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         Datum::String(s) => encode_length_encoded_string(s),
         Datum::Bytes(b) => super::packet::encode_length_encoded_bytes(b),
         Datum::Timestamp(ts) => {
-            // Convert unix millis to MySQL datetime format
+            // Convert unix millis to datetime format
             let datetime = format_timestamp(*ts);
             encode_length_encoded_string(&datetime)
         }
     }
 }
 
-/// Format a unix timestamp (milliseconds) as MySQL datetime string
+/// Format a unix timestamp (milliseconds) as datetime string
 fn format_timestamp(ts_millis: i64) -> String {
     // Simple formatting - in production would use chrono
     let secs = ts_millis / 1000;
@@ -199,16 +199,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_datatype_to_mysql() {
-        assert_eq!(datatype_to_mysql(&DataType::Boolean), ColumnType::Tiny);
-        assert_eq!(datatype_to_mysql(&DataType::Int), ColumnType::Long);
-        assert_eq!(datatype_to_mysql(&DataType::BigInt), ColumnType::LongLong);
-        assert_eq!(datatype_to_mysql(&DataType::Double), ColumnType::Double);
+    fn test_datatype_to_protocol() {
+        assert_eq!(datatype_to_protocol(&DataType::Boolean), ColumnType::Tiny);
+        assert_eq!(datatype_to_protocol(&DataType::Int), ColumnType::Long);
+        assert_eq!(datatype_to_protocol(&DataType::BigInt), ColumnType::LongLong);
+        assert_eq!(datatype_to_protocol(&DataType::Double), ColumnType::Double);
         assert_eq!(
-            datatype_to_mysql(&DataType::Varchar(255)),
+            datatype_to_protocol(&DataType::Varchar(255)),
             ColumnType::Varchar
         );
-        assert_eq!(datatype_to_mysql(&DataType::Blob), ColumnType::Blob);
+        assert_eq!(datatype_to_protocol(&DataType::Blob), ColumnType::Blob);
     }
 
     #[test]

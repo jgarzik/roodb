@@ -29,13 +29,13 @@ cargo fmt --check
 RooDB is a distributed SQL database in Rust with these key design decisions:
 
 - **TLS-Only**: All network communication requires TLS (no plaintext)
-- **MySQL Wire Protocol**: Clients connect via standard MySQL protocol
+- **RooDB Client Protocol**: Clients connect via RooDB protocol over TLS
 - **Raft Consensus**: OpenRaft for distributed replication
 - **Volcano Executor**: Iterator-based query execution model
 
 ### Key Types
 
-- `MySqlServer` (`src/server/listener.rs`) - Main server entry point
+- `RooDbServer` (`src/server/listener.rs`) - Main server entry point
 - `ConnectionHandler` (`src/server/handler.rs`) - Per-connection state machine
 - `ExecutorEngine` (`src/executor/engine.rs`) - Query execution
 - `BTreeEngine` (`src/storage/btree/engine.rs`) - Storage backend
@@ -57,7 +57,7 @@ SQL string
 
 ### Integration Tests (roodb_suite)
 
-The primary test infrastructure runs SQL tests via `mysql` CLI across 4 configurations:
+The primary test infrastructure runs SQL tests via client CLI across 4 configurations:
 
 | Config | Nodes | I/O Backend |
 |--------|-------|-------------|

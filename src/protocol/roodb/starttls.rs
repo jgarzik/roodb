@@ -1,4 +1,4 @@
-//! STARTTLS handshake for MySQL protocol
+//! STARTTLS handshake for RooDB protocol
 //!
 //! Handles the initial plaintext handshake and TLS upgrade sequence.
 
