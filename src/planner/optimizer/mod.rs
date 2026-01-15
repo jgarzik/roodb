@@ -23,10 +23,7 @@ impl Optimizer {
     /// Create a new optimizer with default rules
     pub fn new() -> Self {
         Self {
-            rules: vec![
-                Box::new(FilterMerge),
-                Box::new(PredicatePushdown),
-            ],
+            rules: vec![Box::new(FilterMerge), Box::new(PredicatePushdown)],
         }
     }
 

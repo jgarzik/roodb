@@ -3,8 +3,8 @@
 //! Converts resolved SQL statements into logical query plans.
 
 use crate::sql::{
-    JoinType, Literal, ResolvedExpr, ResolvedOrderByItem, ResolvedSelect,
-    ResolvedSelectItem, ResolvedStatement, ResolvedTableRef,
+    JoinType, Literal, ResolvedExpr, ResolvedOrderByItem, ResolvedSelect, ResolvedSelectItem,
+    ResolvedStatement, ResolvedTableRef,
 };
 
 use super::expr::{AggregateFunc, OutputColumn};
@@ -189,10 +189,7 @@ impl LogicalPlanBuilder {
         match expr {
             ResolvedExpr::Function { name, .. } => {
                 let upper = name.to_uppercase();
-                matches!(
-                    upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                )
+                matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
             }
             ResolvedExpr::BinaryOp { left, right, .. } => {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
@@ -214,9 +211,7 @@ impl LogicalPlanBuilder {
         for (idx, item) in columns.iter().enumerate() {
             if let ResolvedSelectItem::Expr { expr, alias } = item {
                 if let Some(agg) = Self::extract_aggregate(expr) {
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| format!("agg_{}", idx));
+                    let name = alias.clone().unwrap_or_else(|| format!("agg_{}", idx));
                     aggregates.push((agg, name));
                 }
             }
@@ -264,9 +259,7 @@ impl LogicalPlanBuilder {
         for (idx, item) in columns.iter().enumerate() {
             match item {
                 ResolvedSelectItem::Expr { expr, alias } => {
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| Self::expr_name(expr, idx));
+                    let name = alias.clone().unwrap_or_else(|| Self::expr_name(expr, idx));
                     expressions.push((expr.clone(), name));
                 }
                 ResolvedSelectItem::Columns(cols) => {

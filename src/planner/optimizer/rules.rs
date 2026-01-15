@@ -32,10 +32,7 @@ impl PredicatePushdown {
     fn transform(&self, plan: LogicalPlan) -> LogicalPlan {
         match plan {
             // Push filter into scan
-            LogicalPlan::Filter {
-                input,
-                predicate,
-            } => {
+            LogicalPlan::Filter { input, predicate } => {
                 let transformed_input = self.transform(*input);
                 match transformed_input {
                     // Merge filter into scan if scan has no filter
@@ -286,7 +283,13 @@ mod tests {
         match result {
             LogicalPlan::Filter { input, predicate } => {
                 assert!(matches!(*input, LogicalPlan::Scan { .. }));
-                assert!(matches!(predicate, ResolvedExpr::BinaryOp { op: BinaryOp::And, .. }));
+                assert!(matches!(
+                    predicate,
+                    ResolvedExpr::BinaryOp {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ));
             }
             _ => panic!("Expected Filter"),
         }

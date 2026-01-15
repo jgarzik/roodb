@@ -129,7 +129,7 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 8: Executor (Volcano)
+## Phase 8: Executor (Volcano) ✓ COMPLETE
 **Goal**: Iterator-based query execution
 
 ### Files:
@@ -150,6 +150,11 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 - `src/executor/aggregate.rs` - GROUP BY, aggregates (COUNT, SUM, AVG, MIN, MAX)
 - `src/executor/sort.rs` - ORDER BY
 - `src/executor/limit.rs` - LIMIT/OFFSET
+- `src/executor/distinct.rs` - HashDistinct operator
+- `src/executor/ddl.rs` - DDL operators (CreateTable, DropTable, CreateIndex, DropIndex)
+
+### Tests:
+- `tests/executor_tests.rs` - unit tests for datum, row, encoding; integration tests for all operators
 
 ---
 

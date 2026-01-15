@@ -34,7 +34,12 @@ pub struct AggregateFunc {
 
 impl AggregateFunc {
     /// Create a new aggregate function
-    pub fn new(name: impl Into<String>, args: Vec<ResolvedExpr>, distinct: bool, result_type: DataType) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        args: Vec<ResolvedExpr>,
+        distinct: bool,
+        result_type: DataType,
+    ) -> Self {
         Self {
             name: name.into(),
             args,

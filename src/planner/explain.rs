@@ -27,7 +27,14 @@ impl ExplainOutput {
                 filter,
             } => {
                 let col_names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
-                writeln!(out, "{}TableScan: {} [{}]", prefix, table, col_names.join(", ")).unwrap();
+                writeln!(
+                    out,
+                    "{}TableScan: {} [{}]",
+                    prefix,
+                    table,
+                    col_names.join(", ")
+                )
+                .unwrap();
                 if let Some(f) = filter {
                     writeln!(out, "{}  filter: {:?}", prefix, f).unwrap();
                 }

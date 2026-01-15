@@ -67,12 +67,9 @@ pub enum PhysicalPlan {
     },
 
     /// Hash-based distinct
-    HashDistinct {
-        input: Box<PhysicalPlan>,
-    },
+    HashDistinct { input: Box<PhysicalPlan> },
 
     // ============ DML Operations ============
-
     /// INSERT rows into a table
     Insert {
         table: String,
@@ -95,7 +92,6 @@ pub enum PhysicalPlan {
     },
 
     // ============ DDL Operations ============
-
     /// CREATE TABLE
     CreateTable {
         name: String,
@@ -105,10 +101,7 @@ pub enum PhysicalPlan {
     },
 
     /// DROP TABLE
-    DropTable {
-        name: String,
-        if_exists: bool,
-    },
+    DropTable { name: String, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
@@ -119,9 +112,7 @@ pub enum PhysicalPlan {
     },
 
     /// DROP INDEX
-    DropIndex {
-        name: String,
-    },
+    DropIndex { name: String },
 }
 
 impl PhysicalPlan {
@@ -132,18 +123,16 @@ impl PhysicalPlan {
 
             PhysicalPlan::Filter { input, .. } => input.output_columns(),
 
-            PhysicalPlan::Project { expressions, .. } => {
-                expressions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (expr, alias))| OutputColumn {
-                        id: i,
-                        name: alias.clone(),
-                        data_type: expr.data_type(),
-                        nullable: expr.is_nullable(),
-                    })
-                    .collect()
-            }
+            PhysicalPlan::Project { expressions, .. } => expressions
+                .iter()
+                .enumerate()
+                .map(|(i, (expr, alias))| OutputColumn {
+                    id: i,
+                    name: alias.clone(),
+                    data_type: expr.data_type(),
+                    nullable: expr.is_nullable(),
+                })
+                .collect(),
 
             PhysicalPlan::NestedLoopJoin { left, right, .. } => {
                 let mut cols = left.output_columns();

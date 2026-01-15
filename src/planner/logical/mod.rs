@@ -67,12 +67,9 @@ pub enum LogicalPlan {
     },
 
     /// Remove duplicate rows
-    Distinct {
-        input: Box<LogicalPlan>,
-    },
+    Distinct { input: Box<LogicalPlan> },
 
     // ============ DML Operations ============
-
     /// INSERT rows into a table
     Insert {
         table: String,
@@ -95,7 +92,6 @@ pub enum LogicalPlan {
     },
 
     // ============ DDL Operations (passthrough) ============
-
     /// CREATE TABLE
     CreateTable {
         name: String,
@@ -105,10 +101,7 @@ pub enum LogicalPlan {
     },
 
     /// DROP TABLE
-    DropTable {
-        name: String,
-        if_exists: bool,
-    },
+    DropTable { name: String, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
@@ -119,9 +112,7 @@ pub enum LogicalPlan {
     },
 
     /// DROP INDEX
-    DropIndex {
-        name: String,
-    },
+    DropIndex { name: String },
 }
 
 impl LogicalPlan {
@@ -132,18 +123,16 @@ impl LogicalPlan {
 
             LogicalPlan::Filter { input, .. } => input.output_columns(),
 
-            LogicalPlan::Project { expressions, .. } => {
-                expressions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (expr, alias))| OutputColumn {
-                        id: i,
-                        name: alias.clone(),
-                        data_type: expr.data_type(),
-                        nullable: expr.is_nullable(),
-                    })
-                    .collect()
-            }
+            LogicalPlan::Project { expressions, .. } => expressions
+                .iter()
+                .enumerate()
+                .map(|(i, (expr, alias))| OutputColumn {
+                    id: i,
+                    name: alias.clone(),
+                    data_type: expr.data_type(),
+                    nullable: expr.is_nullable(),
+                })
+                .collect(),
 
             LogicalPlan::Join { left, right, .. } => {
                 let mut cols = left.output_columns();

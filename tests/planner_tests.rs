@@ -182,7 +182,10 @@ fn test_plan_count_star() {
             _ => false,
         }
     }
-    assert!(contains_aggregate(&physical), "Should contain HashAggregate");
+    assert!(
+        contains_aggregate(&physical),
+        "Should contain HashAggregate"
+    );
 }
 
 #[test]
@@ -234,10 +237,7 @@ fn test_plan_cross_join() {
 #[test]
 fn test_plan_insert() {
     let catalog = test_catalog();
-    let physical = plan_query(
-        &catalog,
-        "INSERT INTO users (id, name) VALUES (1, 'Alice')",
-    );
+    let physical = plan_query(&catalog, "INSERT INTO users (id, name) VALUES (1, 'Alice')");
 
     match physical {
         PhysicalPlan::Insert { table, values, .. } => {
@@ -286,8 +286,7 @@ fn test_plan_delete() {
 #[test]
 fn test_plan_create_table() {
     let catalog = test_catalog();
-    let stmt =
-        Parser::parse_one("CREATE TABLE test (id INT NOT NULL, name VARCHAR(100))").unwrap();
+    let stmt = Parser::parse_one("CREATE TABLE test (id INT NOT NULL, name VARCHAR(100))").unwrap();
     let resolver = Resolver::new(&catalog);
     let resolved = resolver.resolve(stmt).unwrap();
 
@@ -340,7 +339,10 @@ fn test_optimizer_predicate_pushdown() {
         LogicalPlan::Project { input, .. } => matches!(**input, LogicalPlan::Filter { .. }),
         _ => false,
     };
-    assert!(has_filter_node, "Before optimization: Filter should be separate");
+    assert!(
+        has_filter_node,
+        "Before optimization: Filter should be separate"
+    );
 
     let optimized = Optimizer::new().optimize(logical);
 

@@ -6,6 +6,7 @@
 //! - io_uring on Linux, POSIX fallback elsewhere
 
 pub mod catalog;
+pub mod executor;
 pub mod io;
 pub mod planner;
 pub mod raft;
