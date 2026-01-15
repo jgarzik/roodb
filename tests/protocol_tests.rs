@@ -476,3 +476,270 @@ async fn test_server_integration_e2e() {
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);
 }
+
+/// Test explicit transactions with BEGIN/COMMIT
+#[tokio::test]
+async fn test_transaction_begin_commit() {
+    use mysql_async::prelude::*;
+    use mysql_async::{Opts, OptsBuilder, SslOpts};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("roodb=debug")
+        .try_init();
+
+    let tls_config = test_utils::certs::test_tls_config();
+    let data_dir = test_dir("txn_commit");
+    cleanup_dir(&data_dir);
+
+    let factory = Arc::new(PosixIOFactory);
+    let config = LsmConfig {
+        dir: data_dir.clone(),
+    };
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+        .await
+        .expect("Failed to start test server");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .ssl_opts(ssl_opts)
+        .max_allowed_packet(Some(16_777_216))
+        .wait_timeout(Some(28800))
+        .into();
+
+    let pool = mysql_async::Pool::new(opts);
+    let mut conn = pool.get_conn().await.expect("Failed to connect");
+
+    // Create table
+    conn.query_drop("CREATE TABLE txn_test (id INT, value VARCHAR(50))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Begin transaction
+    conn.query_drop("BEGIN").await.expect("BEGIN failed");
+
+    // Insert within transaction
+    conn.query_drop("INSERT INTO txn_test (id, value) VALUES (1, 'first')")
+        .await
+        .expect("INSERT failed");
+
+    // Query within same transaction should see the row
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, value FROM txn_test WHERE id = 1")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (1, "first".to_string()));
+
+    // Commit transaction
+    conn.query_drop("COMMIT").await.expect("COMMIT failed");
+
+    // After commit, row should still be visible
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, value FROM txn_test WHERE id = 1")
+        .await
+        .expect("SELECT after commit failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (1, "first".to_string()));
+
+    // Cleanup
+    conn.query_drop("DROP TABLE txn_test")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+    handle.shutdown();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    storage.close().await.unwrap();
+    cleanup_dir(&data_dir);
+}
+
+/// Test transaction ROLLBACK
+#[tokio::test]
+async fn test_transaction_rollback() {
+    use mysql_async::prelude::*;
+    use mysql_async::{Opts, OptsBuilder, SslOpts};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("roodb=debug")
+        .try_init();
+
+    let tls_config = test_utils::certs::test_tls_config();
+    let data_dir = test_dir("txn_rollback");
+    cleanup_dir(&data_dir);
+
+    let factory = Arc::new(PosixIOFactory);
+    let config = LsmConfig {
+        dir: data_dir.clone(),
+    };
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+        .await
+        .expect("Failed to start test server");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .ssl_opts(ssl_opts)
+        .max_allowed_packet(Some(16_777_216))
+        .wait_timeout(Some(28800))
+        .into();
+
+    let pool = mysql_async::Pool::new(opts);
+    let mut conn = pool.get_conn().await.expect("Failed to connect");
+
+    // Create table and insert initial data
+    conn.query_drop("CREATE TABLE rollback_test (id INT, value VARCHAR(50))")
+        .await
+        .expect("CREATE TABLE failed");
+    conn.query_drop("INSERT INTO rollback_test (id, value) VALUES (1, 'original')")
+        .await
+        .expect("Initial INSERT failed");
+
+    // Begin transaction
+    conn.query_drop("BEGIN").await.expect("BEGIN failed");
+
+    // Insert within transaction
+    conn.query_drop("INSERT INTO rollback_test (id, value) VALUES (2, 'will_rollback')")
+        .await
+        .expect("INSERT failed");
+
+    // Row should be visible within transaction
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, value FROM rollback_test ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+
+    // Rollback
+    conn.query_drop("ROLLBACK").await.expect("ROLLBACK failed");
+
+    // After rollback, only original row should exist
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, value FROM rollback_test ORDER BY id")
+        .await
+        .expect("SELECT after rollback failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (1, "original".to_string()));
+
+    // Cleanup
+    conn.query_drop("DROP TABLE rollback_test")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+    handle.shutdown();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    storage.close().await.unwrap();
+    cleanup_dir(&data_dir);
+}
+
+/// Test autocommit mode (each statement is implicitly committed)
+#[tokio::test]
+async fn test_autocommit() {
+    use mysql_async::prelude::*;
+    use mysql_async::{Opts, OptsBuilder, SslOpts};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("roodb=debug")
+        .try_init();
+
+    let tls_config = test_utils::certs::test_tls_config();
+    let data_dir = test_dir("autocommit");
+    cleanup_dir(&data_dir);
+
+    let factory = Arc::new(PosixIOFactory);
+    let config = LsmConfig {
+        dir: data_dir.clone(),
+    };
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+        .await
+        .expect("Failed to start test server");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .ssl_opts(ssl_opts)
+        .max_allowed_packet(Some(16_777_216))
+        .wait_timeout(Some(28800))
+        .into();
+
+    let pool = mysql_async::Pool::new(opts.clone());
+    let mut conn1 = pool.get_conn().await.expect("Failed to connect");
+
+    // Create table
+    conn1
+        .query_drop("CREATE TABLE autocommit_test (id INT, value VARCHAR(50))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Insert in autocommit mode (no explicit BEGIN)
+    conn1
+        .query_drop("INSERT INTO autocommit_test (id, value) VALUES (1, 'auto')")
+        .await
+        .expect("INSERT failed");
+
+    // Open second connection and verify data is visible
+    // (proving the first insert was auto-committed)
+    let mut conn2 = pool.get_conn().await.expect("Failed to get second conn");
+    let rows: Vec<(i32, String)> = conn2
+        .query("SELECT id, value FROM autocommit_test WHERE id = 1")
+        .await
+        .expect("SELECT from conn2 failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (1, "auto".to_string()));
+
+    // Cleanup
+    conn1
+        .query_drop("DROP TABLE autocommit_test")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn1);
+    drop(conn2);
+    pool.disconnect().await.unwrap();
+    handle.shutdown();
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    storage.close().await.unwrap();
+    cleanup_dir(&data_dir);
+}

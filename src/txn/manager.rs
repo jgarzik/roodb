@@ -154,13 +154,11 @@ impl TransactionManager {
 
         // For now, we keep UPDATE/DELETE undo logs for MVCC visibility
         // INSERT undo logs can be removed since the row now exists
-        // In a full implementation, we'd write a COMMIT record to WAL here
-
-        // TODO: Write COMMIT record to WAL for durability
-        // if let Some(wal) = &self.wal {
-        //     wal.write_commit(txn_id).await?;
-        //     wal.sync().await?;
-        // }
+        //
+        // Note: WAL-based commit logging (Record::commit) is available but not
+        // yet integrated. Currently, commit durability is achieved via storage.flush()
+        // which syncs the storage engine to disk. For a full WAL-based recovery
+        // system, we would write a COMMIT record to WAL before marking committed.
 
         // Flush storage to ensure durability
         if let Some(storage) = &self.storage {

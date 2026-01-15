@@ -34,6 +34,8 @@ pub enum RecordType {
     Checkpoint = 2,
     /// Segment end marker
     SegmentEnd = 3,
+    /// Transaction commit marker
+    Commit = 4,
 }
 
 impl TryFrom<u8> for RecordType {
@@ -44,6 +46,7 @@ impl TryFrom<u8> for RecordType {
             1 => Ok(Self::Data),
             2 => Ok(Self::Checkpoint),
             3 => Ok(Self::SegmentEnd),
+            4 => Ok(Self::Commit),
             _ => Err(WalError::InvalidHeader),
         }
     }
@@ -91,6 +94,35 @@ impl Record {
             record_type: RecordType::SegmentEnd,
             lsn,
             data: Vec::new(),
+        }
+    }
+
+    /// Create a commit record for a transaction
+    ///
+    /// The data contains the transaction ID as 8 bytes big-endian.
+    pub fn commit(lsn: u64, txn_id: u64) -> Self {
+        Self {
+            record_type: RecordType::Commit,
+            lsn,
+            data: txn_id.to_be_bytes().to_vec(),
+        }
+    }
+
+    /// Extract transaction ID from a commit record
+    pub fn txn_id(&self) -> Option<u64> {
+        if self.record_type == RecordType::Commit && self.data.len() >= 8 {
+            Some(u64::from_be_bytes([
+                self.data[0],
+                self.data[1],
+                self.data[2],
+                self.data[3],
+                self.data[4],
+                self.data[5],
+                self.data[6],
+                self.data[7],
+            ]))
+        } else {
+            None
         }
     }
 
@@ -210,5 +242,17 @@ mod tests {
         let data = vec![0u8; MAX_RECORD_SIZE + 1];
         let result = Record::new(1, data);
         assert!(matches!(result, Err(WalError::RecordTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_commit_record() {
+        let txn_id = 12345u64;
+        let record = Record::commit(50, txn_id);
+        let encoded = record.encode();
+        let decoded = Record::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.record_type, RecordType::Commit);
+        assert_eq!(decoded.lsn, 50);
+        assert_eq!(decoded.txn_id(), Some(txn_id));
     }
 }
