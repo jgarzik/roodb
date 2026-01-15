@@ -88,9 +88,10 @@ fn test_parse_select_with_join() {
 
 #[test]
 fn test_parse_select_with_group_by() {
-    let stmt =
-        Parser::parse_one("SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 5")
-            .unwrap();
+    let stmt = Parser::parse_one(
+        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 5",
+    )
+    .unwrap();
     match stmt {
         Statement::Select(select) => {
             assert_eq!(select.group_by.len(), 1);
@@ -153,8 +154,7 @@ fn test_parse_insert_multiple_rows() {
 
 #[test]
 fn test_parse_update() {
-    let stmt =
-        Parser::parse_one("UPDATE users SET name = 'Bob', age = 30 WHERE id = 1").unwrap();
+    let stmt = Parser::parse_one("UPDATE users SET name = 'Bob', age = 30 WHERE id = 1").unwrap();
     match stmt {
         Statement::Update {
             table,

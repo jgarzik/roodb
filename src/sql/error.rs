@@ -16,10 +16,7 @@ pub enum SqlError {
     /// Column is ambiguous (exists in multiple tables)
     AmbiguousColumn(String),
     /// Type mismatch in expression
-    TypeMismatch {
-        expected: DataType,
-        found: DataType,
-    },
+    TypeMismatch { expected: DataType, found: DataType },
     /// Invalid operation
     InvalidOperation(String),
     /// Unsupported SQL feature
@@ -36,7 +33,11 @@ impl fmt::Display for SqlError {
                 write!(f, "Column '{}' is ambiguous", name)
             }
             SqlError::TypeMismatch { expected, found } => {
-                write!(f, "Type mismatch: expected {:?}, found {:?}", expected, found)
+                write!(
+                    f,
+                    "Type mismatch: expected {:?}, found {:?}",
+                    expected, found
+                )
             }
             SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),

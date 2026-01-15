@@ -50,10 +50,7 @@ fn convert_statement(stmt: &sp::Statement) -> SqlResult<Statement> {
         } => convert_update(table, assignments, selection),
         sp::Statement::Delete(delete) => convert_delete(delete),
         sp::Statement::Query(query) => convert_query(query),
-        _ => Err(SqlError::Unsupported(format!(
-            "Statement type: {:?}",
-            stmt
-        ))),
+        _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
     }
 }
 
@@ -166,17 +163,14 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
             ..
         } => {
             let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-            let ref_cols: Vec<String> =
-                referred_columns.iter().map(|c| c.value.clone()).collect();
+            let ref_cols: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
             Ok(Some(Constraint::ForeignKey {
                 columns: cols,
                 ref_table: foreign_table.to_string(),
                 ref_columns: ref_cols,
             }))
         }
-        sp::TableConstraint::Check { expr, .. } => {
-            Ok(Some(Constraint::Check(expr.to_string())))
-        }
+        sp::TableConstraint::Check { expr, .. } => Ok(Some(Constraint::Check(expr.to_string()))),
         _ => Ok(None),
     }
 }
@@ -282,9 +276,12 @@ fn convert_update(
 /// Extract column name from assignment target
 fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String> {
     match target {
-        sp::AssignmentTarget::ColumnName(names) => {
-            Ok(names.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."))
-        }
+        sp::AssignmentTarget::ColumnName(names) => Ok(names
+            .0
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".")),
         sp::AssignmentTarget::Tuple(_) => {
             Err(SqlError::Unsupported("Tuple assignment".to_string()))
         }
@@ -294,18 +291,14 @@ fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String>
 /// Convert DELETE
 fn convert_delete(delete: &sp::Delete) -> SqlResult<Statement> {
     let table = match &delete.from {
-        sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => {
-            match &tables[0].relation {
-                sp::TableFactor::Table { name, .. } => name.to_string(),
-                _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-            }
-        }
-        sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => {
-            match &tables[0].relation {
-                sp::TableFactor::Table { name, .. } => name.to_string(),
-                _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-            }
-        }
+        sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => match &tables[0].relation {
+            sp::TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+        },
+        sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => match &tables[0].relation {
+            sp::TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+        },
         _ => return Err(SqlError::Parse("DELETE requires a table".to_string())),
     };
 

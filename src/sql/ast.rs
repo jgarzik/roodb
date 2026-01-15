@@ -51,10 +51,7 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// Column reference (optionally qualified with table name)
-    Column {
-        table: Option<String>,
-        name: String,
-    },
+    Column { table: Option<String>, name: String },
     /// Literal value
     Literal(Literal),
     /// Binary operation
@@ -64,10 +61,7 @@ pub enum Expr {
         right: Box<Expr>,
     },
     /// Unary operation
-    UnaryOp {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOp, expr: Box<Expr> },
     /// Function call
     Function {
         name: String,
@@ -75,10 +69,7 @@ pub enum Expr {
         distinct: bool,
     },
     /// IS NULL / IS NOT NULL
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
     /// IN (list)
     InList {
         expr: Box<Expr>,
@@ -177,10 +168,7 @@ pub enum Statement {
         if_not_exists: bool,
     },
     /// DROP TABLE
-    DropTable {
-        name: String,
-        if_exists: bool,
-    },
+    DropTable { name: String, if_exists: bool },
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -189,9 +177,7 @@ pub enum Statement {
         unique: bool,
     },
     /// DROP INDEX
-    DropIndex {
-        name: String,
-    },
+    DropIndex { name: String },
     /// INSERT
     Insert {
         table: String,
@@ -205,10 +191,7 @@ pub enum Statement {
         filter: Option<Expr>,
     },
     /// DELETE
-    Delete {
-        table: String,
-        filter: Option<Expr>,
-    },
+    Delete { table: String, filter: Option<Expr> },
     /// SELECT
     Select(SelectStatement),
 }
@@ -373,10 +356,7 @@ pub enum ResolvedStatement {
         if_not_exists: bool,
     },
     /// DROP TABLE
-    DropTable {
-        name: String,
-        if_exists: bool,
-    },
+    DropTable { name: String, if_exists: bool },
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -385,9 +365,7 @@ pub enum ResolvedStatement {
         unique: bool,
     },
     /// DROP INDEX
-    DropIndex {
-        name: String,
-    },
+    DropIndex { name: String },
     /// INSERT with resolved columns
     Insert {
         table: String,

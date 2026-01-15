@@ -95,9 +95,8 @@ impl<'a> Resolver<'a> {
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
         // Build column list (explicit or all columns)
-        let column_names = columns.unwrap_or_else(|| {
-            table_def.columns.iter().map(|c| c.name.clone()).collect()
-        });
+        let column_names =
+            columns.unwrap_or_else(|| table_def.columns.iter().map(|c| c.name.clone()).collect());
 
         // Resolve columns
         let mut resolved_columns = Vec::new();
@@ -237,7 +236,10 @@ impl<'a> Resolver<'a> {
                 .get_table(&table_ref.name)
                 .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
 
-            let alias = table_ref.alias.clone().unwrap_or_else(|| table_ref.name.clone());
+            let alias = table_ref
+                .alias
+                .clone()
+                .unwrap_or_else(|| table_ref.name.clone());
             scope.add_table(&alias, &table_ref.name, table_def);
         }
 
@@ -248,7 +250,11 @@ impl<'a> Resolver<'a> {
                 .get_table(&join.table.name)
                 .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
 
-            let alias = join.table.alias.clone().unwrap_or_else(|| join.table.name.clone());
+            let alias = join
+                .table
+                .alias
+                .clone()
+                .unwrap_or_else(|| join.table.name.clone());
             scope.add_table(&alias, &join.table.name, table_def);
         }
 
@@ -395,7 +401,11 @@ impl<'a> Resolver<'a> {
                     result_type,
                 })
             }
-            Expr::Function { name, args, distinct } => {
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => {
                 let mut resolved_args = Vec::new();
                 for arg in args {
                     resolved_args.push(self.resolve_expr(arg, scope)?);
@@ -412,7 +422,11 @@ impl<'a> Resolver<'a> {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
                 negated: *negated,
             }),
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let resolved_expr = self.resolve_expr(expr, scope)?;
                 let mut resolved_list = Vec::new();
                 for item in list {
@@ -424,7 +438,12 @@ impl<'a> Resolver<'a> {
                     negated: *negated,
                 })
             }
-            Expr::Between { expr, low, high, negated } => Ok(ResolvedExpr::Between {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(ResolvedExpr::Between {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
                 low: Box::new(self.resolve_expr(low, scope)?),
                 high: Box::new(self.resolve_expr(high, scope)?),
@@ -488,13 +507,15 @@ impl<'a> Resolver<'a> {
             }
 
             match found {
-                Some((table, index, data_type, nullable)) => Ok(ResolvedExpr::Column(ResolvedColumn {
-                    table,
-                    name: name.to_string(),
-                    index,
-                    data_type,
-                    nullable,
-                })),
+                Some((table, index, data_type, nullable)) => {
+                    Ok(ResolvedExpr::Column(ResolvedColumn {
+                        table,
+                        name: name.to_string(),
+                        index,
+                        data_type,
+                        nullable,
+                    }))
+                }
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
             }
         }
@@ -663,10 +684,8 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt = crate::sql::parser::Parser::parse_one(
-            "SELECT id, name FROM users WHERE id = 1",
-        )
-        .unwrap();
+        let stmt = crate::sql::parser::Parser::parse_one("SELECT id, name FROM users WHERE id = 1")
+            .unwrap();
 
         let resolved = resolver.resolve(stmt).unwrap();
         match resolved {
@@ -694,8 +713,7 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt =
-            crate::sql::parser::Parser::parse_one("SELECT nonexistent FROM users").unwrap();
+        let stmt = crate::sql::parser::Parser::parse_one("SELECT nonexistent FROM users").unwrap();
         let result = resolver.resolve(stmt);
 
         assert!(matches!(result, Err(SqlError::ColumnNotFound(_))));

@@ -34,10 +34,7 @@ impl TypeChecker {
     }
 
     /// Check INSERT statement
-    fn check_insert(
-        columns: &[ResolvedColumn],
-        values: &[Vec<ResolvedExpr>],
-    ) -> SqlResult<()> {
+    fn check_insert(columns: &[ResolvedColumn], values: &[Vec<ResolvedExpr>]) -> SqlResult<()> {
         for row in values {
             for (col, expr) in columns.iter().zip(row.iter()) {
                 Self::check_type_compatible(&col.data_type, &expr.data_type(), expr)?;
@@ -111,7 +108,8 @@ impl TypeChecker {
 
             if has_aggregate && has_non_aggregate {
                 return Err(SqlError::InvalidOperation(
-                    "SELECT with aggregates must use GROUP BY or only aggregate functions".to_string(),
+                    "SELECT with aggregates must use GROUP BY or only aggregate functions"
+                        .to_string(),
                 ));
             }
         }
@@ -232,9 +230,7 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         | (DataType::Varchar(_), DataType::Varchar(_)) => true,
 
         // String literals can be assigned to timestamps
-        (DataType::Timestamp, DataType::Text) | (DataType::Timestamp, DataType::Varchar(_)) => {
-            true
-        }
+        (DataType::Timestamp, DataType::Text) | (DataType::Timestamp, DataType::Varchar(_)) => true,
 
         // Integer literals can be booleans (0/1)
         (DataType::Boolean, DataType::TinyInt)
