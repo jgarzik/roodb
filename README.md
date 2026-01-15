@@ -1,11 +1,11 @@
 # RooDB
 
-A distributed SQL database written in Rust, featuring Raft consensus, TLS-secured client protocol, and high-performance I/O.
+A highly available, high performance, easy to use distributed SQL database.
 
 ## Goals
 
-* A general SQL database for Unix-like OS's
-* General purpose, Highly available
+* A general SQL database that is fast out-of-the-box for everyone
+* General purpose, Highly available, Self-tuning
 * Single node or multi-node (leader+replicas) configurations
 * Near-zero config
 
@@ -16,7 +16,6 @@ sharded-cluster workloads.
 
 - **Raft Consensus**: Distributed replication via OpenRaft for high availability
 - **LSM Storage Engine**
-- **RooDB Client Protocol**: Connect using standard `mysql` CLI or compatible client libraries (TLS required)
 - **SQL Support**: Parser (sqlparser-rs), query planner with optimizer, Volcano-style executor
 - **Cross-Platform I/O**: io_uring on Linux, async POSIX fallback on other platforms
 - **MySQL Wire Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
@@ -52,16 +51,16 @@ mysql -h 127.0.0.1 -P 3307 -u root --ssl-mode=REQUIRED --ssl-ca=ca.pem
 
 ```
 src/
-├── catalog/       # Schema catalog (tables, columns)
+├── catalog.rs     # Schema catalog (tables, columns)
 ├── executor/      # Volcano-style query executor
 ├── io/            # Cross-platform async I/O (io_uring / POSIX)
 ├── planner/       # Query planner and optimizer
-├── protocol/      # RooDB client protocol implementation
+├── protocol/      # MySQL wire protocol implementation
 ├── raft/          # Raft consensus layer (OpenRaft)
 ├── server/        # TCP listener, connection handling
 ├── sql/           # SQL parsing and AST
-├── storage/       # B+Tree storage engine
-├── tls/           # TLS configuration
+├── storage/       # LSM storage engine
+├── tls.rs         # TLS configuration
 ├── txn/           # Transaction management
 └── wal/           # Write-ahead log
 ```
