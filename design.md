@@ -2,14 +2,46 @@
 
 Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC transactions, Volcano executor, LSM storage.
 
-## Runtime & Threading
+## Process, Thread, and Task Model
 
-**Async Model**: Tokio multi-threaded runtime (`#[tokio::main]`)
+**Single process** - the `roodb` binary. No `fork()`, no child processes. Single failure domain.
 
-**Connection Handling**:
-- Single TCP accept loop in `RooDbServer::run()`
-- Each connection spawns independent tokio task via `tokio::spawn`
-- Non-blocking I/O throughout
+**Thread Pools**:
+```
+┌─────────────────────────────────────┐
+│  Tokio Runtime                      │
+│                                     │
+│  ┌─────────────────────────────┐    │
+│  │ Worker Pool (~1 per core)   │    │
+│  │ - all async tasks           │    │
+│  │ - network I/O               │    │
+│  │ - io_uring completions      │    │
+│  │ - CPU work (parse/plan/exec)│    │
+│  └─────────────────────────────┘    │
+│                                     │
+│  ┌─────────────────────────────┐    │
+│  │ Blocking Pool (elastic)     │    │
+│  │ - spawn_blocking() only     │    │
+│  │ - POSIX file I/O (non-Linux)│    │
+│  └─────────────────────────────┘    │
+└─────────────────────────────────────┘
+```
+
+**Tasks vs Threads**: Tasks are lightweight async coroutines (green threads), not OS threads. Thousands of connections share a handful of OS threads. Each connection spawns one task via `tokio::spawn`.
+
+**Yielding Behavior**:
+
+| Phase | Yields? | Notes |
+|-------|---------|-------|
+| Network read/write | Yes | Async I/O |
+| Storage read/write | Yes | Async I/O (io_uring or spawn_blocking) |
+| Parse SQL | No | Synchronous CPU |
+| Resolve/TypeCheck | No | Synchronous CPU |
+| Plan (logical/physical) | No | Synchronous CPU |
+| Filter/Project per row | No | CPU eval |
+| Sort/Aggregate | No | In-memory, CPU-bound |
+
+**Implication**: CPU-heavy queries (complex planning, large in-memory sorts) hold the OS thread without yielding. Under high concurrency with CPU-bound workloads, tasks queue up. I/O-bound workloads scale well.
 
 **Shared State** (via `Arc<>`):
 - `StorageEngine` - LSM storage backend
