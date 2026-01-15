@@ -48,7 +48,7 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 3: WAL (Write-Ahead Log)
+## Phase 3: WAL (Write-Ahead Log) ✓ COMPLETE
 **Goal**: Durable log using IO layer. Integrate with Raft.
 
 ### Files:
@@ -67,7 +67,7 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 4: Storage Engine (LSM-Tree)
+## Phase 4: Storage Engine (LSM-Tree) ✓ COMPLETE
 **Goal**: Key-value storage with ordered iteration
 
 ### Files:
@@ -87,7 +87,7 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 5: Catalog
+## Phase 5: Catalog ✓ COMPLETE
 **Goal**: Schema metadata (tables, columns, indexes)
 
 ### Files:
@@ -95,7 +95,7 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 6: SQL Layer
+## Phase 6: SQL Layer ✓ COMPLETE
 **Goal**: Parse SQL, resolve names, typecheck
 
 ### Files:

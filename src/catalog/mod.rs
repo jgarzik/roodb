@@ -61,7 +61,7 @@ impl DataType {
 }
 
 /// Column definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     /// Column name
     pub name: String,
@@ -107,7 +107,7 @@ impl ColumnDef {
 }
 
 /// Table constraint
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     /// Primary key constraint
     PrimaryKey(Vec<String>),
@@ -394,8 +394,7 @@ mod tests {
             .column(ColumnDef::new("bool_col", DataType::Boolean))
             .column(ColumnDef::new("int_col", DataType::Int).nullable(false))
             .column(
-                ColumnDef::new("str_col", DataType::Varchar(100))
-                    .default("'default'".to_string()),
+                ColumnDef::new("str_col", DataType::Varchar(100)).default("'default'".to_string()),
             )
             .column(ColumnDef::new("auto_col", DataType::BigInt).auto_increment());
 
@@ -429,8 +428,13 @@ mod tests {
                 ref_table: "users".to_string(),
                 ref_columns: vec!["id".to_string()],
             })
-            .constraint(Constraint::Unique(vec!["user_id".to_string(), "status".to_string()]))
-            .constraint(Constraint::Check("status IN ('pending', 'complete')".to_string()));
+            .constraint(Constraint::Unique(vec![
+                "user_id".to_string(),
+                "status".to_string(),
+            ]))
+            .constraint(Constraint::Check(
+                "status IN ('pending', 'complete')".to_string(),
+            ));
 
         assert_eq!(table.constraints.len(), 4);
         assert_eq!(table.primary_key(), Some(&["id".to_string()][..]));

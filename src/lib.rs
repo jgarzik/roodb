@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod io;
 pub mod raft;
 pub mod server;
+pub mod sql;
 pub mod storage;
 pub mod tls;
 pub mod wal;
