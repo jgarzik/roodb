@@ -12,4 +12,6 @@
 
 mod harness;
 
+pub mod ddl;
+
 pub use harness::TestServer;
