@@ -429,7 +429,7 @@ async fn test_server_integration_e2e() {
         .user(Some("root"))
         .ssl_opts(ssl_opts)
         .max_allowed_packet(Some(16_777_216)) // 16MB, skip @@max_allowed_packet query
-        .wait_timeout(Some(28800))            // Default, skip @@wait_timeout query
+        .wait_timeout(Some(28800)) // Default, skip @@wait_timeout query
         .into();
 
     // Connect

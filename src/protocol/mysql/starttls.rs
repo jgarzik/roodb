@@ -37,7 +37,10 @@ pub async fn starttls_handshake(
     write_packet_raw(&mut stream, 0, &greeting_packet).await?;
     stream.flush().await?;
 
-    debug!(connection_id, "Sent server greeting, waiting for SSL request");
+    debug!(
+        connection_id,
+        "Sent server greeting, waiting for SSL request"
+    );
 
     // Read client's SSL request (plaintext)
     let (packet, _seq) = read_packet_raw(&mut stream).await?;

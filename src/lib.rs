@@ -15,4 +15,5 @@ pub mod server;
 pub mod sql;
 pub mod storage;
 pub mod tls;
+pub mod txn;
 pub mod wal;

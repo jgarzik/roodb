@@ -12,6 +12,9 @@ pub mod resultset;
 pub mod starttls;
 pub mod types;
 
+// Re-export status flags for use by other modules
+pub use handshake::status_flags;
+
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -25,8 +28,10 @@ use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::planner::PhysicalPlanner;
 use crate::planner::physical::PhysicalPlan;
+use crate::server::session::Session;
 use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
+use crate::txn::{IsolationLevel, TransactionManager};
 
 use self::auth::{verify_mysql_native_password, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
@@ -72,6 +77,10 @@ where
     catalog: Arc<RwLock<Catalog>>,
     /// Whether client requested DEPRECATE_EOF
     deprecate_eof: bool,
+    /// Session state (transactions, autocommit, isolation level)
+    session: Session,
+    /// Transaction manager
+    txn_manager: Arc<TransactionManager>,
 }
 
 impl<S> MySqlConnection<S>
@@ -84,6 +93,7 @@ where
         connection_id: u32,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        txn_manager: Arc<TransactionManager>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -97,6 +107,8 @@ where
             storage,
             catalog,
             deprecate_eof: false,
+            session: Session::new(connection_id),
+            txn_manager,
         }
     }
 
@@ -110,6 +122,7 @@ where
         scramble: [u8; 20],
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        txn_manager: Arc<TransactionManager>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -123,6 +136,8 @@ where
             storage,
             catalog,
             deprecate_eof: false,
+            session: Session::new(connection_id),
+            txn_manager,
         }
     }
 
@@ -272,7 +287,10 @@ where
             self.reader.reset_sequence();
             self.writer.reset_sequence();
 
-            debug!(connection_id = self.connection_id, "Waiting for next command");
+            debug!(
+                connection_id = self.connection_id,
+                "Waiting for next command"
+            );
 
             // Read command packet
             let packet = match self.reader.read_packet().await {
@@ -339,7 +357,10 @@ where
             }
 
             ParsedCommand::StmtExecute { statement_id } => {
-                debug!(connection_id = self.connection_id, statement_id, "COM_STMT_EXECUTE");
+                debug!(
+                    connection_id = self.connection_id,
+                    statement_id, "COM_STMT_EXECUTE"
+                );
                 let err = unsupported_prepared_stmt_error();
                 self.writer.set_sequence(1);
                 self.writer.write_packet(&err).await?;
@@ -348,7 +369,10 @@ where
             }
 
             ParsedCommand::StmtClose(statement_id) => {
-                debug!(connection_id = self.connection_id, statement_id, "COM_STMT_CLOSE");
+                debug!(
+                    connection_id = self.connection_id,
+                    statement_id, "COM_STMT_CLOSE"
+                );
                 // No response needed for STMT_CLOSE
                 Ok(true)
             }
@@ -375,6 +399,11 @@ where
 
     /// Handle a SQL query
     async fn handle_query(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Check for transaction commands first
+        if let Some(()) = self.try_handle_transaction_command(sql).await? {
+            return Ok(());
+        }
+
         // Check for system variable queries (@@variable)
         if let Some(result) = self.try_handle_system_variable(sql).await? {
             return Ok(result);
@@ -511,6 +540,230 @@ where
         // Close executor
         executor.close().await?;
 
+        Ok(())
+    }
+
+    /// Try to handle transaction commands (BEGIN, COMMIT, ROLLBACK, SET)
+    ///
+    /// Returns Some(()) if handled, None if not a transaction command.
+    async fn try_handle_transaction_command(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let sql_trimmed = sql.trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+
+        // BEGIN / START TRANSACTION
+        if sql_upper == "BEGIN" || sql_upper.starts_with("START TRANSACTION") {
+            return self.handle_begin().await.map(Some);
+        }
+
+        // COMMIT
+        if sql_upper == "COMMIT" {
+            return self.handle_commit().await.map(Some);
+        }
+
+        // ROLLBACK
+        if sql_upper == "ROLLBACK" {
+            return self.handle_rollback().await.map(Some);
+        }
+
+        // SET autocommit = 0/1
+        if sql_upper.starts_with("SET AUTOCOMMIT") || sql_upper.starts_with("SET @@AUTOCOMMIT") {
+            let value = sql_upper.contains('1') || sql_upper.contains("ON");
+            return self.handle_set_autocommit(value).await.map(Some);
+        }
+
+        // SET TRANSACTION ISOLATION LEVEL
+        if sql_upper.starts_with("SET TRANSACTION ISOLATION LEVEL")
+            || sql_upper.starts_with("SET SESSION TRANSACTION ISOLATION LEVEL")
+        {
+            let level = if sql_upper.contains("READ UNCOMMITTED") {
+                IsolationLevel::ReadUncommitted
+            } else if sql_upper.contains("READ COMMITTED") {
+                IsolationLevel::ReadCommitted
+            } else if sql_upper.contains("REPEATABLE READ") {
+                IsolationLevel::RepeatableRead
+            } else if sql_upper.contains("SERIALIZABLE") {
+                IsolationLevel::Serializable
+            } else {
+                return self
+                    .send_error(
+                        codes::ER_SYNTAX_ERROR,
+                        states::SYNTAX_ERROR,
+                        "Unknown isolation level",
+                    )
+                    .await
+                    .map(|_| Some(()));
+            };
+            return self.handle_set_isolation_level(level).await.map(Some);
+        }
+
+        // Not a transaction command
+        Ok(None)
+    }
+
+    /// Handle BEGIN / START TRANSACTION
+    async fn handle_begin(&mut self) -> ProtocolResult<()> {
+        // Check if already in a transaction
+        if self.session.in_transaction() {
+            return self
+                .send_error(
+                    codes::ER_CANT_CHANGE_TX_CHARACTERISTICS,
+                    states::GENERAL_ERROR,
+                    "Transaction already in progress",
+                )
+                .await;
+        }
+
+        // Check if we can write (not on replica)
+        if self.session.is_read_only {
+            // Read-only transactions are allowed on replicas
+            match self
+                .txn_manager
+                .begin(self.session.isolation_level, true)
+            {
+                Ok(txn) => {
+                    self.session.begin_transaction(txn.txn_id);
+                    debug!(
+                        connection_id = self.connection_id,
+                        txn_id = txn.txn_id,
+                        "Started read-only transaction"
+                    );
+                }
+                Err(e) => {
+                    return self
+                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .await;
+                }
+            }
+        } else {
+            match self
+                .txn_manager
+                .begin(self.session.isolation_level, false)
+            {
+                Ok(txn) => {
+                    self.session.begin_transaction(txn.txn_id);
+                    debug!(
+                        connection_id = self.connection_id,
+                        txn_id = txn.txn_id,
+                        "Started transaction"
+                    );
+                }
+                Err(e) => {
+                    return self
+                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .await;
+                }
+            }
+        }
+
+        self.send_ok_with_status(0, 0).await
+    }
+
+    /// Handle COMMIT
+    async fn handle_commit(&mut self) -> ProtocolResult<()> {
+        if let Some(txn_id) = self.session.current_txn {
+            match self.txn_manager.commit(txn_id).await {
+                Ok(()) => {
+                    self.session.end_transaction();
+                    debug!(
+                        connection_id = self.connection_id,
+                        txn_id = txn_id,
+                        "Committed transaction"
+                    );
+                }
+                Err(e) => {
+                    self.session.end_transaction();
+                    return self
+                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .await;
+                }
+            }
+        }
+        // COMMIT without BEGIN is a no-op in MySQL
+        self.send_ok_with_status(0, 0).await
+    }
+
+    /// Handle ROLLBACK
+    async fn handle_rollback(&mut self) -> ProtocolResult<()> {
+        if let Some(txn_id) = self.session.current_txn {
+            match self.txn_manager.rollback(txn_id).await {
+                Ok(()) => {
+                    self.session.end_transaction();
+                    debug!(
+                        connection_id = self.connection_id,
+                        txn_id = txn_id,
+                        "Rolled back transaction"
+                    );
+                }
+                Err(e) => {
+                    self.session.end_transaction();
+                    return self
+                        .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
+                        .await;
+                }
+            }
+        }
+        // ROLLBACK without BEGIN is a no-op in MySQL
+        self.send_ok_with_status(0, 0).await
+    }
+
+    /// Handle SET autocommit = value
+    async fn handle_set_autocommit(&mut self, value: bool) -> ProtocolResult<()> {
+        // If turning off autocommit and not in transaction, start one
+        if !value && !self.session.in_transaction() && self.session.autocommit {
+            if let Ok(txn) = self
+                .txn_manager
+                .begin(self.session.isolation_level, self.session.is_read_only)
+            {
+                self.session.begin_transaction(txn.txn_id);
+            }
+        }
+
+        // If turning on autocommit while in transaction, commit it
+        if value && self.session.in_transaction() {
+            if let Some(txn_id) = self.session.current_txn {
+                let _ = self.txn_manager.commit(txn_id).await;
+                self.session.end_transaction();
+            }
+        }
+
+        self.session.set_autocommit(value);
+        debug!(
+            connection_id = self.connection_id,
+            autocommit = value,
+            "Set autocommit"
+        );
+        self.send_ok_with_status(0, 0).await
+    }
+
+    /// Handle SET TRANSACTION ISOLATION LEVEL
+    async fn handle_set_isolation_level(&mut self, level: IsolationLevel) -> ProtocolResult<()> {
+        // Can only change isolation level outside of a transaction
+        if self.session.in_transaction() {
+            return self
+                .send_error(
+                    codes::ER_CANT_CHANGE_TX_CHARACTERISTICS,
+                    states::GENERAL_ERROR,
+                    "Cannot change isolation level inside a transaction",
+                )
+                .await;
+        }
+
+        self.session.set_isolation_level(level);
+        debug!(
+            connection_id = self.connection_id,
+            isolation_level = ?level,
+            "Set isolation level"
+        );
+        self.send_ok_with_status(0, 0).await
+    }
+
+    /// Send OK packet with session-aware status flags
+    async fn send_ok_with_status(&mut self, affected_rows: u64, last_insert_id: u64) -> ProtocolResult<()> {
+        let status = self.session.status_flags();
+        self.writer.set_sequence(1);
+        let ok = encode_ok_packet(affected_rows, last_insert_id, status, 0);
+        self.writer.write_packet(&ok).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 

@@ -12,6 +12,7 @@ use crate::catalog::Catalog;
 use crate::protocol::mysql::starttls::starttls_handshake;
 use crate::protocol::mysql::MySqlConnection;
 use crate::storage::StorageEngine;
+use crate::txn::TransactionManager;
 
 /// Handle a MySQL client connection with STARTTLS
 ///
@@ -23,6 +24,7 @@ pub async fn handle_connection(
     acceptor: TlsAcceptor,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
+    txn_manager: Arc<TransactionManager>,
 ) {
     info!(%peer_addr, connection_id, "Client connected");
 
@@ -36,7 +38,14 @@ pub async fn handle_connection(
     };
 
     // Create MySQL connection on TLS stream
-    let mut conn = MySqlConnection::new_with_scramble(tls_stream, connection_id, scramble, storage, catalog);
+    let mut conn = MySqlConnection::new_with_scramble(
+        tls_stream,
+        connection_id,
+        scramble,
+        storage,
+        catalog,
+        txn_manager,
+    );
 
     // Complete authentication (handshake response comes over TLS)
     if let Err(e) = conn.complete_handshake().await {

@@ -327,7 +327,12 @@ pub async fn write_packet_raw<W: AsyncWrite + Unpin>(
 ) -> ProtocolResult<()> {
     // Write header
     let length_bytes = (payload.len() as u32).to_le_bytes();
-    let header = [length_bytes[0], length_bytes[1], length_bytes[2], sequence_id];
+    let header = [
+        length_bytes[0],
+        length_bytes[1],
+        length_bytes[2],
+        sequence_id,
+    ];
     writer.write_all(&header).await?;
 
     // Write payload

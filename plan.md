@@ -199,12 +199,38 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 11: Transaction Manager
-**Goal**: Basic transaction support
+## Phase 11: Transaction Manager ✓ IN PROGRESS
+**Goal**: ACID-compliant transaction support with MVCC
 
-### Files:
-- `src/txn/mod.rs` - module root
-- `src/txn/manager.rs` - `TransactionManager` (begin, commit, rollback)
+### Design Decisions:
+- **Default isolation**: REPEATABLE READ (MySQL default)
+- **Concurrency**: Full MVCC (InnoDB-style undo log)
+- **Row versioning**: Inline TXN_ID + ROLL_PTR, undo log for old versions
+- **Timeouts**: PostgreSQL-style (idle_in_transaction, statement, lock)
+- **Raft model**: Leader=read/write, Replica=read-only
+- **Commit durability**: fsync per commit
+- **Write conflicts**: First-writer-wins (MySQL behavior)
+
+### Files (Created):
+- `src/txn/mod.rs` - module root, error types, TimeoutConfig ✓
+- `src/txn/transaction.rs` - Transaction, TransactionState, IsolationLevel ✓
+- `src/txn/read_view.rs` - ReadView, MVCC visibility algorithm ✓
+- `src/txn/undo_log.rs` - UndoLog, UndoRecord, version chain ✓
+- `src/txn/manager.rs` - TransactionManager (begin/commit/rollback) ✓
+- `src/txn/purge.rs` - PurgeTask background cleanup ✓
+- `src/txn/mvcc_storage.rs` - MVCC wrapper around StorageEngine ✓
+
+### Files (Modified):
+- `src/server/session.rs` - transaction state per connection ✓
+- `src/server/handler.rs` - pass TransactionManager to connections ✓
+- `src/server/listener.rs` - create TransactionManager ✓
+- `src/protocol/mysql/mod.rs` - BEGIN/COMMIT/ROLLBACK/SET parsing ✓
+- `src/protocol/mysql/error.rs` - transaction error codes ✓
+
+### Remaining:
+- Wire MVCC into executors (scan/insert/update/delete)
+- WAL integration for commit durability
+- Integration tests for transactions
 
 ---
 

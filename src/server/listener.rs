@@ -14,6 +14,7 @@ use crate::catalog::Catalog;
 use crate::server::handler::handle_connection;
 use crate::storage::StorageEngine;
 use crate::tls::TlsConfig;
+use crate::txn::TransactionManager;
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -29,6 +30,7 @@ pub struct MySqlServer {
     tls_acceptor: TlsAcceptor,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
+    txn_manager: Arc<TransactionManager>,
     next_conn_id: AtomicU32,
 }
 
@@ -40,11 +42,31 @@ impl MySqlServer {
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
     ) -> Self {
+        let txn_manager = Arc::new(TransactionManager::with_storage(storage.clone()));
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
             storage,
             catalog,
+            txn_manager,
+            next_conn_id: AtomicU32::new(1),
+        }
+    }
+
+    /// Create a new MySQL server with custom transaction manager
+    pub fn with_txn_manager(
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+        storage: Arc<dyn StorageEngine>,
+        catalog: Arc<RwLock<Catalog>>,
+        txn_manager: Arc<TransactionManager>,
+    ) -> Self {
+        Self {
+            addr,
+            tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
+            storage,
+            catalog,
+            txn_manager,
             next_conn_id: AtomicU32::new(1),
         }
     }
@@ -54,11 +76,17 @@ impl MySqlServer {
         self.addr
     }
 
+    /// Get the transaction manager
+    pub fn txn_manager(&self) -> &Arc<TransactionManager> {
+        &self.txn_manager
+    }
+
     /// Run the server (blocking)
     pub async fn run(self) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
         let storage = self.storage;
         let catalog = self.catalog;
+        let txn_manager = self.txn_manager;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
@@ -69,12 +97,21 @@ impl MySqlServer {
             let acceptor = acceptor.clone();
             let storage = storage.clone();
             let catalog = catalog.clone();
+            let txn_manager = txn_manager.clone();
             let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
             // Handle connection with STARTTLS (TLS upgrade happens in handler)
             tokio::spawn(async move {
-                handle_connection(stream, peer_addr, connection_id, acceptor, storage, catalog)
-                    .await;
+                handle_connection(
+                    stream,
+                    peer_addr,
+                    connection_id,
+                    acceptor,
+                    storage,
+                    catalog,
+                    txn_manager,
+                )
+                .await;
             });
         }
     }
@@ -87,6 +124,7 @@ impl MySqlServer {
         let listener = TcpListener::bind(self.addr).await?;
         let storage = self.storage;
         let catalog = self.catalog;
+        let txn_manager = self.txn_manager;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
@@ -99,10 +137,19 @@ impl MySqlServer {
                     let acceptor = acceptor.clone();
                     let storage = storage.clone();
                     let catalog = catalog.clone();
+                    let txn_manager = txn_manager.clone();
                     let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
                     tokio::spawn(async move {
-                        handle_connection(stream, peer_addr, connection_id, acceptor, storage, catalog).await;
+                        handle_connection(
+                            stream,
+                            peer_addr,
+                            connection_id,
+                            acceptor,
+                            storage,
+                            catalog,
+                            txn_manager,
+                        ).await;
                     });
                 }
                 _ = &mut shutdown_rx => {
