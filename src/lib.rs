@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod executor;
 pub mod io;
 pub mod planner;
+pub mod protocol;
 pub mod raft;
 pub mod server;
 pub mod sql;

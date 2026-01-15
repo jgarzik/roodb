@@ -158,20 +158,23 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 9: MySQL Protocol
+## Phase 9: MySQL Protocol ✓ COMPLETE
 **Goal**: MySQL wire protocol (TLS only)
 
 ### Files:
 - `src/protocol/mod.rs` - module root
-- `src/protocol/mysql/mod.rs` - MySQL module
+- `src/protocol/mysql/mod.rs` - MySQL module, MySqlConnection state machine
 - `src/protocol/mysql/error.rs` - protocol errors
 - `src/protocol/mysql/packet.rs` - packet read/write (4-byte header)
 - `src/protocol/mysql/handshake.rs` - initial handshake sequence
 - `src/protocol/mysql/auth.rs` - mysql_native_password auth
-- `src/protocol/mysql/command.rs` - COM_QUERY, COM_QUIT, COM_INIT_DB, etc.
+- `src/protocol/mysql/command.rs` - COM_QUERY, COM_QUIT, COM_INIT_DB, COM_PING
 - `src/protocol/mysql/resultset.rs` - result set encoding
 - `src/protocol/mysql/types.rs` - MySQL type mapping
-- `src/protocol/mysql/prepared.rs` - prepared statements (COM_STMT_*)
+- `src/protocol/mysql/prepared.rs` - prepared statements stub
+
+### Tests:
+- `tests/protocol_tests.rs` - packet encoding, handshake, auth, commands, result sets
 
 ---
 
