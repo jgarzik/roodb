@@ -299,6 +299,21 @@ cargo clippy --all-targets
 
 ---
 
+## Phase 13: Collapse Directories ✓ COMPLETE
+**Goal**: Flatten directories with 1-2 files
+
+### 1-file directories → `name.rs`:
+- [x] `src/catalog/mod.rs` → `src/catalog.rs`
+- [x] `src/tls/mod.rs` → `src/tls.rs`
+- [x] `src/io/uring/mod.rs` → `src/io/uring.rs`
+- SKIP: `src/protocol/mod.rs` (has `roodb/` subdir)
+
+### 2-file directories → merge:
+- [x] `src/planner/optimizer/` → `src/planner/optimizer.rs`
+- [x] `src/planner/physical/` → `src/planner/physical.rs`
+
+---
+
 ## Decisions Made
 - **Storage**: LSM-Tree first, B+Tree later
 - **Raft**: Auto-bootstrap single-node as leader
