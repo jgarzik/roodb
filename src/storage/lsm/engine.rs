@@ -250,8 +250,16 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
         let manifest = self.manifest.lock().await;
         let mut source_idx = 100; // Start at higher index for SSTables
 
-        for level in manifest.levels() {
-            for info in &level.files {
+        for (level_num, level) in manifest.levels().iter().enumerate() {
+            // For L0, files can overlap and newer files have higher names
+            // Collect files in order: newest first for L0, normal order for other levels
+            let files: Vec<_> = if level_num == 0 {
+                level.files.iter().rev().collect()
+            } else {
+                level.files.iter().collect()
+            };
+
+            for info in files {
                 let path = manifest.sstable_path(&info.name);
                 let reader = SstableReader::open(&*self.factory, &path).await?;
 

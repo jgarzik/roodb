@@ -111,15 +111,15 @@ impl MvccStorage {
 
         // Check if this version is visible
         if read_view.is_visible(txn_id) {
-            // If visible and deleted, the row doesn't exist for this view
+            // If visible and deleted, the row doesn't exist for this transaction's view
             if deleted {
-                // But we need to check the version chain for an older visible version
-                return self.find_older_visible_version(roll_ptr, read_view).await;
+                return Ok(None);
             }
             return Ok(Some(data.to_vec()));
         }
 
         // This version is not visible, traverse the version chain
+        // to find an older version that IS visible
         self.find_older_visible_version(roll_ptr, read_view).await
     }
 

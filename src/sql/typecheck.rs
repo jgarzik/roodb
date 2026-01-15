@@ -137,8 +137,13 @@ impl TypeChecker {
     fn check_type_compatible(
         target: &DataType,
         source: &DataType,
-        _expr: &ResolvedExpr,
+        expr: &ResolvedExpr,
     ) -> SqlResult<()> {
+        // NULL is compatible with any nullable type
+        if Self::is_definitely_null(expr) {
+            return Ok(());
+        }
+
         if types_compatible(target, source) {
             Ok(())
         } else {
