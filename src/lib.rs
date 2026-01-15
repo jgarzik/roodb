@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod io;
+pub mod planner;
 pub mod raft;
 pub mod server;
 pub mod sql;
