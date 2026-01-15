@@ -26,6 +26,8 @@ pub enum ProtocolError {
     Executor(ExecutorError),
     /// Connection closed by client
     ConnectionClosed,
+    /// TLS handshake error
+    Tls(String),
     /// Internal error
     Internal(String),
 }
@@ -41,6 +43,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::Planner(e) => write!(f, "Planner error: {}", e),
             ProtocolError::Executor(e) => write!(f, "Executor error: {}", e),
             ProtocolError::ConnectionClosed => write!(f, "Connection closed"),
+            ProtocolError::Tls(msg) => write!(f, "TLS error: {}", msg),
             ProtocolError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }

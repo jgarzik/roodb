@@ -133,13 +133,21 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
 
             // Write header
             let length_bytes = (chunk_size as u32).to_le_bytes();
-            let header = [length_bytes[0], length_bytes[1], length_bytes[2], self.sequence_id];
+            let header = [
+                length_bytes[0],
+                length_bytes[1],
+                length_bytes[2],
+                self.sequence_id,
+            ];
+
             self.writer.write_all(&header).await?;
             self.sequence_id = self.sequence_id.wrapping_add(1);
 
             // Write payload chunk
             if chunk_size > 0 {
-                self.writer.write_all(&payload[offset..offset + chunk_size]).await?;
+                self.writer
+                    .write_all(&payload[offset..offset + chunk_size])
+                    .await?;
             }
 
             offset += chunk_size;
@@ -187,28 +195,36 @@ pub fn encode_length_encoded_int(value: u64) -> Vec<u8> {
 /// Decode a length-encoded integer, returns (value, bytes_consumed)
 pub fn decode_length_encoded_int(data: &[u8]) -> ProtocolResult<(u64, usize)> {
     if data.is_empty() {
-        return Err(ProtocolError::InvalidPacket("empty length-encoded int".to_string()));
+        return Err(ProtocolError::InvalidPacket(
+            "empty length-encoded int".to_string(),
+        ));
     }
 
     match data[0] {
         0..=250 => Ok((data[0] as u64, 1)),
         0xfc => {
             if data.len() < 3 {
-                return Err(ProtocolError::InvalidPacket("truncated 2-byte int".to_string()));
+                return Err(ProtocolError::InvalidPacket(
+                    "truncated 2-byte int".to_string(),
+                ));
             }
             let value = u16::from_le_bytes([data[1], data[2]]);
             Ok((value as u64, 3))
         }
         0xfd => {
             if data.len() < 4 {
-                return Err(ProtocolError::InvalidPacket("truncated 3-byte int".to_string()));
+                return Err(ProtocolError::InvalidPacket(
+                    "truncated 3-byte int".to_string(),
+                ));
             }
             let value = u32::from_le_bytes([data[1], data[2], data[3], 0]);
             Ok((value as u64, 4))
         }
         0xfe => {
             if data.len() < 9 {
-                return Err(ProtocolError::InvalidPacket("truncated 8-byte int".to_string()));
+                return Err(ProtocolError::InvalidPacket(
+                    "truncated 8-byte int".to_string(),
+                ));
             }
             let value = u64::from_le_bytes([
                 data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
@@ -219,7 +235,9 @@ pub fn decode_length_encoded_int(data: &[u8]) -> ProtocolResult<(u64, usize)> {
             // NULL indicator in row data
             Ok((0, 1))
         }
-        0xff => Err(ProtocolError::InvalidPacket("unexpected 0xff in length-encoded int".to_string())),
+        0xff => Err(ProtocolError::InvalidPacket(
+            "unexpected 0xff in length-encoded int".to_string(),
+        )),
     }
 }
 
@@ -271,6 +289,53 @@ pub fn encode_null_terminated_string(s: &str) -> Vec<u8> {
     let mut result = s.as_bytes().to_vec();
     result.push(0);
     result
+}
+
+/// Read a single packet directly from a stream (for STARTTLS)
+///
+/// Returns (payload, sequence_id)
+pub async fn read_packet_raw<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> ProtocolResult<(Vec<u8>, u8)> {
+    // Read 4-byte header
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(ProtocolError::ConnectionClosed);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+    let seq = header[3];
+
+    // Read payload
+    let mut payload = vec![0u8; length];
+    if length > 0 {
+        reader.read_exact(&mut payload).await?;
+    }
+
+    Ok((payload, seq))
+}
+
+/// Write a single packet directly to a stream (for STARTTLS)
+pub async fn write_packet_raw<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequence_id: u8,
+    payload: &[u8],
+) -> ProtocolResult<()> {
+    // Write header
+    let length_bytes = (payload.len() as u32).to_le_bytes();
+    let header = [length_bytes[0], length_bytes[1], length_bytes[2], sequence_id];
+    writer.write_all(&header).await?;
+
+    // Write payload
+    if !payload.is_empty() {
+        writer.write_all(payload).await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

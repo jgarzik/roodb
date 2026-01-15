@@ -13,4 +13,4 @@ pub mod manifest;
 pub mod memtable;
 pub mod sstable;
 
-pub use engine::LsmEngine;
+pub use engine::{LsmConfig, LsmEngine};

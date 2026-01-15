@@ -216,10 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_join() {
-        let left_rows = vec![
-            Row::new(vec![Datum::Int(1)]),
-            Row::new(vec![Datum::Int(2)]),
-        ];
+        let left_rows = vec![Row::new(vec![Datum::Int(1)]), Row::new(vec![Datum::Int(2)])];
         let right_rows = vec![
             Row::new(vec![Datum::String("a".to_string())]),
             Row::new(vec![Datum::String("b".to_string())]),

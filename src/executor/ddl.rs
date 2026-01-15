@@ -351,10 +351,8 @@ mod tests {
         // Create table first
         {
             let mut cat = catalog.write();
-            cat.create_table(
-                TableDef::new("users").column(ColumnDef::new("id", DataType::Int)),
-            )
-            .unwrap();
+            cat.create_table(TableDef::new("users").column(ColumnDef::new("id", DataType::Int)))
+                .unwrap();
         }
 
         // Drop it

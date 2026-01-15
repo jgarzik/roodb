@@ -7,7 +7,10 @@ use crate::planner::logical::OutputColumn;
 
 use super::handshake::status_flags;
 use super::packet::{encode_length_encoded_int, encode_length_encoded_string};
-use super::types::{charset, datatype_column_length, datatype_flags, datatype_to_mysql, datum_to_text_bytes, ColumnType};
+use super::types::{
+    charset, datatype_column_length, datatype_flags, datatype_to_mysql, datum_to_text_bytes,
+    ColumnType,
+};
 
 /// MySQL column definition packet (Protocol 4.1)
 #[derive(Debug)]
@@ -217,8 +220,8 @@ mod tests {
         let packet = encode_ok_packet(5, 10, status_flags::SERVER_STATUS_AUTOCOMMIT, 0);
 
         assert_eq!(packet[0], 0x00); // OK header
-        assert_eq!(packet[1], 5);    // affected_rows
-        assert_eq!(packet[2], 10);   // last_insert_id
+        assert_eq!(packet[1], 5); // affected_rows
+        assert_eq!(packet[2], 10); // last_insert_id
     }
 
     #[test]

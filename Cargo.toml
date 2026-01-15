@@ -59,6 +59,8 @@ ordered-float = "4.2"
 sha1 = "0.10"
 rand = "0.8"
 bitflags = "2.4"
+regex = "1"
+lazy_static = "1.4"
 
 # io_uring (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

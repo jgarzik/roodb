@@ -1,6 +1,6 @@
 //! MySQL protocol implementation
 //!
-//! Implements the MySQL wire protocol over TLS connections.
+//! Implements the MySQL wire protocol with STARTTLS support.
 
 pub mod auth;
 pub mod command;
@@ -9,6 +9,7 @@ pub mod handshake;
 pub mod packet;
 pub mod prepared;
 pub mod resultset;
+pub mod starttls;
 pub mod types;
 
 use std::sync::Arc;
@@ -41,6 +42,12 @@ use self::resultset::{
 /// Hardcoded credentials for MVP
 const ROOT_USER: &str = "root";
 const ROOT_PASSWORD: &str = "";
+
+/// Internal enum for planning errors (used to avoid holding guard across await)
+enum PlanError {
+    Sql(crate::sql::SqlError),
+    Planner(crate::planner::PlannerError),
+}
 
 /// MySQL connection handler
 pub struct MySqlConnection<S>
@@ -93,9 +100,101 @@ where
         }
     }
 
-    /// Perform the MySQL handshake
+    /// Create a new MySQL connection with pre-established scramble (for STARTTLS)
+    ///
+    /// Used after STARTTLS handshake where the scramble was already sent in the
+    /// plaintext greeting.
+    pub fn new_with_scramble(
+        stream: S,
+        connection_id: u32,
+        scramble: [u8; 20],
+        storage: Arc<dyn StorageEngine>,
+        catalog: Arc<RwLock<Catalog>>,
+    ) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
+
+        MySqlConnection {
+            reader: PacketReader::new(read_half),
+            writer: PacketWriter::new(write_half),
+            connection_id,
+            scramble,
+            client_capabilities: 0,
+            database: None,
+            storage,
+            catalog,
+            deprecate_eof: false,
+        }
+    }
+
+    /// Complete handshake after STARTTLS upgrade
+    ///
+    /// Reads the full HandshakeResponse41 that the client sends over TLS
+    /// after the SSL request was acknowledged.
+    pub async fn complete_handshake(&mut self) -> ProtocolResult<()> {
+        info!(
+            connection_id = self.connection_id,
+            "Completing handshake over TLS"
+        );
+
+        // Read client's handshake response (sent over TLS)
+        // After SSL upgrade, client re-sends with sequence 2
+        self.reader.set_sequence(2);
+        let response_packet = self.reader.read_packet().await?;
+
+        let response = HandshakeResponse41::parse(&response_packet)?;
+        self.client_capabilities = response.capability_flags;
+        self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
+
+        // Verify authentication
+        let auth_plugin = response
+            .auth_plugin_name
+            .as_deref()
+            .unwrap_or(AUTH_PLUGIN_NAME);
+
+        if auth_plugin != AUTH_PLUGIN_NAME {
+            warn!(plugin = auth_plugin, "Unsupported auth plugin");
+            return self
+                .send_auth_error("Unsupported authentication plugin")
+                .await;
+        }
+
+        // Check username and password
+        if response.username != ROOT_USER {
+            warn!(username = %response.username, "Unknown user");
+            return self.send_auth_error("Access denied").await;
+        }
+
+        if !verify_mysql_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
+            warn!("Password verification failed");
+            return self.send_auth_error("Access denied").await;
+        }
+
+        // Store database if provided
+        if let Some(db) = response.database {
+            self.database = Some(db);
+        }
+
+        // Send OK
+        self.writer.set_sequence(3);
+        let ok_packet = encode_ok_packet(0, 0, default_status(), 0);
+        self.writer.write_packet(&ok_packet).await?;
+        self.writer.flush().await?;
+
+        info!(
+            connection_id = self.connection_id,
+            username = ROOT_USER,
+            "Handshake completed over TLS"
+        );
+
+        Ok(())
+    }
+
+    /// Perform the MySQL handshake (non-STARTTLS, for testing)
     pub async fn handshake(&mut self) -> ProtocolResult<()> {
-        info!(connection_id = self.connection_id, "Starting MySQL handshake");
+        info!(
+            connection_id = self.connection_id,
+            "Starting MySQL handshake"
+        );
 
         // Send server greeting
         let greeting = HandshakeV10::new(self.connection_id);
@@ -121,7 +220,9 @@ where
 
         if auth_plugin != AUTH_PLUGIN_NAME {
             warn!(plugin = auth_plugin, "Unsupported auth plugin");
-            return self.send_auth_error("Unsupported authentication plugin").await;
+            return self
+                .send_auth_error("Unsupported authentication plugin")
+                .await;
         }
 
         // Check username and password
@@ -171,6 +272,8 @@ where
             self.reader.reset_sequence();
             self.writer.reset_sequence();
 
+            debug!(connection_id = self.connection_id, "Waiting for next command");
+
             // Read command packet
             let packet = match self.reader.read_packet().await {
                 Ok(p) => p,
@@ -185,7 +288,7 @@ where
             let cmd = parse_command(&packet)?;
 
             match self.handle_command(cmd).await {
-                Ok(true) => continue,   // Continue command loop
+                Ok(true) => continue,       // Continue command loop
                 Ok(false) => return Ok(()), // Client quit
                 Err(e) => {
                     // Try to send error to client
@@ -222,14 +325,31 @@ where
             ParsedCommand::Query(sql) => {
                 debug!(connection_id = self.connection_id, sql = %sql, "COM_QUERY");
                 self.handle_query(&sql).await?;
+                debug!(connection_id = self.connection_id, "Query completed");
                 Ok(true)
             }
 
-            ParsedCommand::StmtPrepare(_) | ParsedCommand::StmtExecute { .. } | ParsedCommand::StmtClose(_) => {
+            ParsedCommand::StmtPrepare(sql) => {
+                debug!(connection_id = self.connection_id, sql = %sql, "COM_STMT_PREPARE");
                 let err = unsupported_prepared_stmt_error();
                 self.writer.set_sequence(1);
                 self.writer.write_packet(&err).await?;
                 self.writer.flush().await?;
+                Ok(true)
+            }
+
+            ParsedCommand::StmtExecute { statement_id } => {
+                debug!(connection_id = self.connection_id, statement_id, "COM_STMT_EXECUTE");
+                let err = unsupported_prepared_stmt_error();
+                self.writer.set_sequence(1);
+                self.writer.write_packet(&err).await?;
+                self.writer.flush().await?;
+                Ok(true)
+            }
+
+            ParsedCommand::StmtClose(statement_id) => {
+                debug!(connection_id = self.connection_id, statement_id, "COM_STMT_CLOSE");
+                // No response needed for STMT_CLOSE
                 Ok(true)
             }
 
@@ -255,6 +375,11 @@ where
 
     /// Handle a SQL query
     async fn handle_query(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Check for system variable queries (@@variable)
+        if let Some(result) = self.try_handle_system_variable(sql).await? {
+            return Ok(result);
+        }
+
         // Parse
         let stmt = match Parser::parse_one(sql) {
             Ok(s) => s,
@@ -266,43 +391,32 @@ where
         };
 
         // Resolve, type check, and plan while holding catalog lock
-        let physical = {
+        // Use closure to return Result and ensure guard is dropped before await
+        let plan_result: Result<PhysicalPlan, PlanError> = (|| {
             let catalog_guard = self.catalog.read();
 
-            let resolved = match Resolver::new(&catalog_guard).resolve(stmt) {
-                Ok(r) => r,
-                Err(e) => {
-                    drop(catalog_guard);
-                    return self.send_sql_error(&e).await;
-                }
-            };
+            let resolved = Resolver::new(&catalog_guard)
+                .resolve(stmt)
+                .map_err(PlanError::Sql)?;
 
             // Type check
-            if let Err(e) = TypeChecker::check(&resolved) {
-                drop(catalog_guard);
-                return self.send_sql_error(&e).await;
-            }
+            TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
 
             // Build logical plan
-            let logical = match LogicalPlanBuilder::build(resolved) {
-                Ok(p) => p,
-                Err(e) => {
-                    drop(catalog_guard);
-                    return self.send_planner_error(&e).await;
-                }
-            };
+            let logical = LogicalPlanBuilder::build(resolved).map_err(PlanError::Planner)?;
 
             // Optimize
             let optimized = Optimizer::new().optimize(logical);
 
             // Build physical plan
-            match PhysicalPlanner::plan(optimized, &catalog_guard) {
-                Ok(p) => p,
-                Err(e) => {
-                    drop(catalog_guard);
-                    return self.send_planner_error(&e).await;
-                }
-            }
+            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)
+        })(); // catalog_guard dropped here
+
+        // Handle errors after guard is dropped
+        let physical = match plan_result {
+            Ok(p) => p,
+            Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
+            Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
 
         // Execute
@@ -400,6 +514,125 @@ where
         Ok(())
     }
 
+    /// Try to handle system variable queries (SELECT @@variable)
+    ///
+    /// Returns Some(()) if handled, None if not a system variable query.
+    async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        use regex::Regex;
+
+        // Simple pattern matching for SELECT @@variable queries
+        let sql_upper = sql.to_uppercase();
+        if !sql_upper.contains("@@") {
+            return Ok(None);
+        }
+
+        // Extract variable names from the query
+        lazy_static::lazy_static! {
+            static ref VAR_RE: Regex = Regex::new(r"@@(\w+)").unwrap();
+        }
+
+        let vars: Vec<&str> = VAR_RE
+            .captures_iter(sql)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+
+        if vars.is_empty() {
+            return Ok(None);
+        }
+
+        debug!(
+            connection_id = self.connection_id,
+            variables = ?vars,
+            "Handling system variable query"
+        );
+
+        // Build response with default values for common variables
+        let mut values: Vec<String> = Vec::new();
+        let mut col_names: Vec<String> = Vec::new();
+
+        for var in &vars {
+            let var_lower = var.to_lowercase();
+            let value = match var_lower.as_str() {
+                "max_allowed_packet" => "16777216",
+                "wait_timeout" => "28800",
+                "interactive_timeout" => "28800",
+                "net_write_timeout" => "60",
+                "net_read_timeout" => "30",
+                "socket" => "/tmp/mysql.sock",
+                "character_set_client" => "utf8mb4",
+                "character_set_connection" => "utf8mb4",
+                "character_set_results" => "utf8mb4",
+                "collation_connection" => "utf8mb4_general_ci",
+                "sql_mode" => "STRICT_TRANS_TABLES",
+                "time_zone" => "SYSTEM",
+                "system_time_zone" => "UTC",
+                "transaction_isolation" | "tx_isolation" => "REPEATABLE-READ",
+                "autocommit" => "1",
+                "version" => "8.0.0-RooDB",
+                "version_comment" => "RooDB",
+                _ => "", // Unknown variable, return empty string
+            };
+            col_names.push(format!("@@{}", var_lower));
+            values.push(value.to_string());
+        }
+
+        // Send result set with one row
+        self.writer.set_sequence(1);
+
+        // Column count
+        let count_packet = encode_column_count(values.len() as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        // Column definitions
+        for name in &col_names {
+            use crate::catalog::DataType;
+            use crate::planner::logical::OutputColumn;
+
+            let col = OutputColumn {
+                id: 0,
+                name: name.clone(),
+                data_type: DataType::Varchar(255),
+                nullable: true,
+            };
+            let def = ColumnDefinition41::from_output_column(&col, "", "");
+            self.writer.write_packet(&def.encode()).await?;
+        }
+
+        // EOF after columns (unless DEPRECATE_EOF)
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        // Send single row with values
+        let row = crate::executor::row::Row::new(
+            values
+                .iter()
+                .map(|v| crate::executor::datum::Datum::String(v.clone()))
+                .collect(),
+        );
+        let row_packet = encode_text_row(&row);
+        self.writer.write_packet(&row_packet).await?;
+
+        // Final EOF/OK
+        if self.deprecate_eof {
+            let ok = encode_ok_packet(0, 0, default_status(), 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+
+        debug!(
+            connection_id = self.connection_id,
+            "System variable response sent"
+        );
+
+        Ok(Some(()))
+    }
+
     /// Send an OK packet
     async fn send_ok(&mut self, affected_rows: u64, last_insert_id: u64) -> ProtocolResult<()> {
         self.writer.set_sequence(1);
@@ -437,8 +670,12 @@ where
 
     /// Send error from planner error
     async fn send_planner_error(&mut self, e: &crate::planner::PlannerError) -> ProtocolResult<()> {
-        self.send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e.to_string())
-            .await
+        self.send_error(
+            codes::ER_UNKNOWN_ERROR,
+            states::GENERAL_ERROR,
+            &e.to_string(),
+        )
+        .await
     }
 
     /// Send error from protocol error
@@ -450,10 +687,16 @@ where
             ProtocolError::Planner(plan_err) => {
                 return self.send_planner_error(plan_err).await;
             }
-            ProtocolError::Executor(exec_err) => {
-                (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, exec_err.to_string())
-            }
-            _ => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, e.to_string()),
+            ProtocolError::Executor(exec_err) => (
+                codes::ER_UNKNOWN_ERROR,
+                states::GENERAL_ERROR,
+                exec_err.to_string(),
+            ),
+            _ => (
+                codes::ER_UNKNOWN_ERROR,
+                states::GENERAL_ERROR,
+                e.to_string(),
+            ),
         };
 
         self.send_error(code, state, &msg).await

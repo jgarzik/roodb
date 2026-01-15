@@ -92,16 +92,17 @@ impl HandshakeV10 {
         rng.fill(&mut auth_plugin_data_part2);
 
         // Capabilities we support
+        // Note: We do NOT advertise CLIENT_DEPRECATE_EOF for maximum compatibility
         let capabilities = capabilities::CLIENT_LONG_PASSWORD
             | capabilities::CLIENT_FOUND_ROWS
             | capabilities::CLIENT_LONG_FLAG
             | capabilities::CLIENT_CONNECT_WITH_DB
             | capabilities::CLIENT_PROTOCOL_41
+            | capabilities::CLIENT_SSL // Required for STARTTLS
             | capabilities::CLIENT_TRANSACTIONS
             | capabilities::CLIENT_SECURE_CONNECTION
             | capabilities::CLIENT_PLUGIN_AUTH
-            | capabilities::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-            | capabilities::CLIENT_DEPRECATE_EOF;
+            | capabilities::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
 
         HandshakeV10 {
             protocol_version: 10,

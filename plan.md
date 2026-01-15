@@ -178,15 +178,24 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 
 ---
 
-## Phase 10: Server Integration
-**Goal**: Full server tying everything together
+## Phase 10: Server Integration ✓ COMPLETE
+**Goal**: Full server tying everything together with STARTTLS
 
 ### Files:
-- `src/server/handler.rs` - `ConnectionHandler` state machine (handshake → command loop)
-- `src/server/session.rs` - session state (current database, transaction)
+- `src/server/handler.rs` - handles STARTTLS handshake, spawns MySqlConnection
+- `src/server/session.rs` - session state (connection_id, database, user)
+- `src/protocol/mysql/starttls.rs` - STARTTLS handshake for MySQL compatibility
+
+### Key Changes:
+- **STARTTLS Protocol**: Plaintext greeting → SSLRequest → TLS upgrade → auth over TLS
+- **System Variables**: Mock @@socket, @@max_allowed_packet, etc. for client init
+- **No CLIENT_DEPRECATE_EOF**: Use traditional EOF-based protocol for compatibility
 
 ### Integration:
-- MySQL protocol → SQL parser → Planner → Executor → Storage → Raft
+- MySQL protocol → SQL parser → Planner → Executor → Storage (LsmEngine)
+
+### Tests:
+- `tests/protocol_tests.rs::test_server_integration_e2e` - full E2E with mysql_async
 
 ---
 

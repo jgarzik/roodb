@@ -7,5 +7,5 @@ pub mod lsm;
 pub mod traits;
 
 pub use error::{StorageError, StorageResult};
-pub use lsm::LsmEngine;
+pub use lsm::{LsmConfig, LsmEngine};
 pub use traits::StorageEngine;

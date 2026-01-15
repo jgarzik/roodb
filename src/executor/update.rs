@@ -215,7 +215,12 @@ mod tests {
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
 
-        let mut update = Update::new("users".to_string(), assignments, Some(filter), storage.clone());
+        let mut update = Update::new(
+            "users".to_string(),
+            assignments,
+            Some(filter),
+            storage.clone(),
+        );
         update.open().await.unwrap();
 
         let result = update.next().await.unwrap().unwrap();

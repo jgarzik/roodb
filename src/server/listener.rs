@@ -1,14 +1,18 @@
 //! TCP listener and MySQL server
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
-use crate::raft::RaftNode;
+use crate::catalog::Catalog;
+use crate::server::handler::handle_connection;
+use crate::storage::StorageEngine;
 use crate::tls::TlsConfig;
 
 #[derive(Error, Debug)]
@@ -19,20 +23,29 @@ pub enum ServerError {
     Tls(String),
 }
 
-/// MySQL-compatible server
+/// MySQL-compatible server with STARTTLS support
 pub struct MySqlServer {
     addr: SocketAddr,
-    tls_config: TlsConfig,
-    raft_node: RaftNode,
+    tls_acceptor: TlsAcceptor,
+    storage: Arc<dyn StorageEngine>,
+    catalog: Arc<RwLock<Catalog>>,
+    next_conn_id: AtomicU32,
 }
 
 impl MySqlServer {
     /// Create a new MySQL server
-    pub fn new(addr: SocketAddr, tls_config: TlsConfig, raft_node: RaftNode) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        tls_config: TlsConfig,
+        storage: Arc<dyn StorageEngine>,
+        catalog: Arc<RwLock<Catalog>>,
+    ) -> Self {
         Self {
             addr,
-            tls_config,
-            raft_node,
+            tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
+            storage,
+            catalog,
+            next_conn_id: AtomicU32::new(1),
         }
     }
 
@@ -44,27 +57,24 @@ impl MySqlServer {
     /// Run the server (blocking)
     pub async fn run(self) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
-        let acceptor = TlsAcceptor::from(self.tls_config.server_config());
-        let raft_node = Arc::new(self.raft_node);
+        let storage = self.storage;
+        let catalog = self.catalog;
+        let acceptor = self.tls_acceptor;
+        let next_conn_id = Arc::new(self.next_conn_id);
 
-        tracing::info!(addr = %self.addr, "MySQL server listening");
+        tracing::info!(addr = %self.addr, "MySQL server listening (STARTTLS enabled)");
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let acceptor = acceptor.clone();
-            let _raft_node = raft_node.clone();
+            let storage = storage.clone();
+            let catalog = catalog.clone();
+            let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
+            // Handle connection with STARTTLS (TLS upgrade happens in handler)
             tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(_tls_stream) => {
-                        tracing::debug!(%peer_addr, "Client connected");
-                        // TODO: MySQL protocol handshake and command loop
-                        // For Phase 1, we just accept TLS connections
-                    }
-                    Err(e) => {
-                        tracing::warn!(%peer_addr, error = %e, "TLS handshake failed");
-                    }
-                }
+                handle_connection(stream, peer_addr, connection_id, acceptor, storage, catalog)
+                    .await;
             });
         }
     }
@@ -75,28 +85,24 @@ impl MySqlServer {
         mut shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
-        let acceptor = TlsAcceptor::from(self.tls_config.server_config());
-        let raft_node = Arc::new(self.raft_node);
+        let storage = self.storage;
+        let catalog = self.catalog;
+        let acceptor = self.tls_acceptor;
+        let next_conn_id = Arc::new(self.next_conn_id);
 
-        tracing::info!(addr = %self.addr, "MySQL server listening");
+        tracing::info!(addr = %self.addr, "MySQL server listening (STARTTLS enabled)");
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, peer_addr) = result?;
                     let acceptor = acceptor.clone();
-                    let _raft_node = raft_node.clone();
+                    let storage = storage.clone();
+                    let catalog = catalog.clone();
+                    let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
                     tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(_tls_stream) => {
-                                tracing::debug!(%peer_addr, "Client connected");
-                                // TODO: MySQL protocol handling
-                            }
-                            Err(e) => {
-                                tracing::warn!(%peer_addr, error = %e, "TLS handshake failed");
-                            }
-                        }
+                        handle_connection(stream, peer_addr, connection_id, acceptor, storage, catalog).await;
                     });
                 }
                 _ = &mut shutdown_rx => {
@@ -127,11 +133,12 @@ impl ServerHandle {
 pub async fn start_test_server(
     addr: SocketAddr,
     tls_config: TlsConfig,
-    raft_node: RaftNode,
+    storage: Arc<dyn StorageEngine>,
+    catalog: Arc<RwLock<Catalog>>,
 ) -> Result<ServerHandle, ServerError> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = MySqlServer::new(addr, tls_config, raft_node);
+    let server = MySqlServer::new(addr, tls_config, storage, catalog);
     let actual_addr = server.addr();
 
     tokio::spawn(async move {

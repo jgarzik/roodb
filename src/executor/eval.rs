@@ -32,7 +32,10 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
         }
 
         ResolvedExpr::Function { name, args, .. } => {
-            let arg_vals: Vec<Datum> = args.iter().map(|a| eval(a, row)).collect::<Result<_, _>>()?;
+            let arg_vals: Vec<Datum> = args
+                .iter()
+                .map(|a| eval(a, row))
+                .collect::<Result<_, _>>()?;
             eval_function(name, &arg_vals)
         }
 
@@ -133,13 +136,15 @@ fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<
             .like(right)
             .ok_or_else(|| ExecutorError::InvalidOperation("LIKE requires strings".to_string())),
         BinaryOp::NotLike => {
-            let result = left
-                .like(right)
-                .ok_or_else(|| ExecutorError::InvalidOperation("NOT LIKE requires strings".to_string()))?;
+            let result = left.like(right).ok_or_else(|| {
+                ExecutorError::InvalidOperation("NOT LIKE requires strings".to_string())
+            })?;
             match result {
                 Datum::Bool(b) => Ok(Datum::Bool(!b)),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation("LIKE produced non-bool".to_string())),
+                _ => Err(ExecutorError::InvalidOperation(
+                    "LIKE produced non-bool".to_string(),
+                )),
             }
         }
     }
@@ -190,9 +195,15 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // Check for division by zero
     match right {
-        Datum::Int(0) => return Err(ExecutorError::InvalidOperation("division by zero".to_string())),
+        Datum::Int(0) => {
+            return Err(ExecutorError::InvalidOperation(
+                "division by zero".to_string(),
+            ))
+        }
         Datum::Float(f) if *f == 0.0 => {
-            return Err(ExecutorError::InvalidOperation("division by zero".to_string()))
+            return Err(ExecutorError::InvalidOperation(
+                "division by zero".to_string(),
+            ))
         }
         _ => {}
     }
@@ -211,7 +222,9 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 
 fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     if let Datum::Int(0) = right {
-        return Err(ExecutorError::InvalidOperation("modulo by zero".to_string()));
+        return Err(ExecutorError::InvalidOperation(
+            "modulo by zero".to_string(),
+        ));
     }
 
     match (left, right) {
@@ -260,35 +273,47 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
         // String functions
         "UPPER" | "UCASE" => {
             if args.len() != 1 {
-                return Err(ExecutorError::InvalidOperation("UPPER requires 1 argument".to_string()));
+                return Err(ExecutorError::InvalidOperation(
+                    "UPPER requires 1 argument".to_string(),
+                ));
             }
             match &args[0] {
                 Datum::String(s) => Ok(Datum::String(s.to_uppercase())),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation("UPPER requires string".to_string())),
+                _ => Err(ExecutorError::InvalidOperation(
+                    "UPPER requires string".to_string(),
+                )),
             }
         }
 
         "LOWER" | "LCASE" => {
             if args.len() != 1 {
-                return Err(ExecutorError::InvalidOperation("LOWER requires 1 argument".to_string()));
+                return Err(ExecutorError::InvalidOperation(
+                    "LOWER requires 1 argument".to_string(),
+                ));
             }
             match &args[0] {
                 Datum::String(s) => Ok(Datum::String(s.to_lowercase())),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation("LOWER requires string".to_string())),
+                _ => Err(ExecutorError::InvalidOperation(
+                    "LOWER requires string".to_string(),
+                )),
             }
         }
 
         "LENGTH" | "LEN" => {
             if args.len() != 1 {
-                return Err(ExecutorError::InvalidOperation("LENGTH requires 1 argument".to_string()));
+                return Err(ExecutorError::InvalidOperation(
+                    "LENGTH requires 1 argument".to_string(),
+                ));
             }
             match &args[0] {
                 Datum::String(s) => Ok(Datum::Int(s.len() as i64)),
                 Datum::Bytes(b) => Ok(Datum::Int(b.len() as i64)),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation("LENGTH requires string or bytes".to_string())),
+                _ => Err(ExecutorError::InvalidOperation(
+                    "LENGTH requires string or bytes".to_string(),
+                )),
             }
         }
 
@@ -322,7 +347,9 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 
         "NULLIF" => {
             if args.len() != 2 {
-                return Err(ExecutorError::InvalidOperation("NULLIF requires 2 arguments".to_string()));
+                return Err(ExecutorError::InvalidOperation(
+                    "NULLIF requires 2 arguments".to_string(),
+                ));
             }
             if args[0] == args[1] {
                 Ok(Datum::Null)
@@ -333,13 +360,17 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 
         "ABS" => {
             if args.len() != 1 {
-                return Err(ExecutorError::InvalidOperation("ABS requires 1 argument".to_string()));
+                return Err(ExecutorError::InvalidOperation(
+                    "ABS requires 1 argument".to_string(),
+                ));
             }
             match &args[0] {
                 Datum::Int(i) => Ok(Datum::Int(i.abs())),
                 Datum::Float(f) => Ok(Datum::Float(f.abs())),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation("ABS requires number".to_string())),
+                _ => Err(ExecutorError::InvalidOperation(
+                    "ABS requires number".to_string(),
+                )),
             }
         }
 

@@ -148,7 +148,9 @@ pub enum ParsedCommand {
 /// Parse a command packet
 pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
     if packet.is_empty() {
-        return Err(ProtocolError::InvalidPacket("empty command packet".to_string()));
+        return Err(ProtocolError::InvalidPacket(
+            "empty command packet".to_string(),
+        ));
     }
 
     let cmd = Command::try_from(packet[0])?;
@@ -158,8 +160,9 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
         Command::Quit => Ok(ParsedCommand::Quit),
 
         Command::InitDb => {
-            let db = String::from_utf8(payload.to_vec())
-                .map_err(|_| ProtocolError::InvalidPacket("invalid UTF-8 in database name".to_string()))?;
+            let db = String::from_utf8(payload.to_vec()).map_err(|_| {
+                ProtocolError::InvalidPacket("invalid UTF-8 in database name".to_string())
+            })?;
             Ok(ParsedCommand::InitDb(db))
         }
 
@@ -172,14 +175,17 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
         Command::Ping => Ok(ParsedCommand::Ping),
 
         Command::StmtPrepare => {
-            let sql = String::from_utf8(payload.to_vec())
-                .map_err(|_| ProtocolError::InvalidPacket("invalid UTF-8 in prepared statement".to_string()))?;
+            let sql = String::from_utf8(payload.to_vec()).map_err(|_| {
+                ProtocolError::InvalidPacket("invalid UTF-8 in prepared statement".to_string())
+            })?;
             Ok(ParsedCommand::StmtPrepare(sql))
         }
 
         Command::StmtExecute => {
             if payload.len() < 4 {
-                return Err(ProtocolError::InvalidPacket("STMT_EXECUTE too short".to_string()));
+                return Err(ProtocolError::InvalidPacket(
+                    "STMT_EXECUTE too short".to_string(),
+                ));
             }
             let statement_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             Ok(ParsedCommand::StmtExecute { statement_id })
@@ -187,7 +193,9 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
 
         Command::StmtClose => {
             if payload.len() < 4 {
-                return Err(ProtocolError::InvalidPacket("STMT_CLOSE too short".to_string()));
+                return Err(ProtocolError::InvalidPacket(
+                    "STMT_CLOSE too short".to_string(),
+                ));
             }
             let statement_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             Ok(ParsedCommand::StmtClose(statement_id))

@@ -326,10 +326,7 @@ mod tests {
 
     #[test]
     fn test_datum_from_literal() {
-        assert!(matches!(
-            Datum::from_literal(&Literal::Null),
-            Datum::Null
-        ));
+        assert!(matches!(Datum::from_literal(&Literal::Null), Datum::Null));
         assert!(matches!(
             Datum::from_literal(&Literal::Integer(42)),
             Datum::Int(42)

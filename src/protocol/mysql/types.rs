@@ -81,16 +81,16 @@ pub fn datatype_to_mysql(dt: &DataType) -> ColumnType {
 pub fn datatype_column_length(dt: &DataType) -> u32 {
     match dt {
         DataType::Boolean => 1,
-        DataType::TinyInt => 4,      // -128 to 127
-        DataType::SmallInt => 6,     // -32768 to 32767
-        DataType::Int => 11,         // -2147483648 to 2147483647
-        DataType::BigInt => 20,      // Full i64 range
+        DataType::TinyInt => 4,  // -128 to 127
+        DataType::SmallInt => 6, // -32768 to 32767
+        DataType::Int => 11,     // -2147483648 to 2147483647
+        DataType::BigInt => 20,  // Full i64 range
         DataType::Float => 12,
         DataType::Double => 22,
         DataType::Varchar(n) => *n,
         DataType::Text => 65535,
         DataType::Blob => 65535,
-        DataType::Timestamp => 19,   // "YYYY-MM-DD HH:MM:SS"
+        DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
     }
 }
 
@@ -131,22 +131,18 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
             // NULL is encoded as 0xfb
             vec![0xfb]
         }
-        Datum::Bool(b) => {
-            encode_length_encoded_string(if *b { "1" } else { "0" })
-        }
-        Datum::Int(i) => {
-            encode_length_encoded_string(&i.to_string())
-        }
+        Datum::Bool(b) => encode_length_encoded_string(if *b { "1" } else { "0" }),
+        Datum::Int(i) => encode_length_encoded_string(&i.to_string()),
         Datum::Float(f) => {
             // Use enough precision for round-trip
-            encode_length_encoded_string(format!("{:.15}", f).trim_end_matches('0').trim_end_matches('.'))
+            encode_length_encoded_string(
+                format!("{:.15}", f)
+                    .trim_end_matches('0')
+                    .trim_end_matches('.'),
+            )
         }
-        Datum::String(s) => {
-            encode_length_encoded_string(s)
-        }
-        Datum::Bytes(b) => {
-            super::packet::encode_length_encoded_bytes(b)
-        }
+        Datum::String(s) => encode_length_encoded_string(s),
+        Datum::Bytes(b) => super::packet::encode_length_encoded_bytes(b),
         Datum::Timestamp(ts) => {
             // Convert unix millis to MySQL datetime format
             let datetime = format_timestamp(*ts);
@@ -208,7 +204,10 @@ mod tests {
         assert_eq!(datatype_to_mysql(&DataType::Int), ColumnType::Long);
         assert_eq!(datatype_to_mysql(&DataType::BigInt), ColumnType::LongLong);
         assert_eq!(datatype_to_mysql(&DataType::Double), ColumnType::Double);
-        assert_eq!(datatype_to_mysql(&DataType::Varchar(255)), ColumnType::Varchar);
+        assert_eq!(
+            datatype_to_mysql(&DataType::Varchar(255)),
+            ColumnType::Varchar
+        );
         assert_eq!(datatype_to_mysql(&DataType::Blob), ColumnType::Blob);
     }
 

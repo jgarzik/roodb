@@ -2,13 +2,23 @@
 //!
 //! Tests for packet encoding/decoding, handshake, auth, and result sets.
 
-use roodb::catalog::DataType;
+mod test_utils;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use roodb::catalog::{Catalog, DataType};
 use roodb::executor::datum::Datum;
 use roodb::executor::row::Row;
+use roodb::io::PosixIOFactory;
 use roodb::planner::logical::OutputColumn;
 use roodb::protocol::mysql::auth::{verify_mysql_native_password, HandshakeResponse41};
 use roodb::protocol::mysql::command::{parse_command, Command, ParsedCommand};
-use roodb::protocol::mysql::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME, SERVER_VERSION};
+use roodb::protocol::mysql::handshake::{
+    capabilities, HandshakeV10, AUTH_PLUGIN_NAME, SERVER_VERSION,
+};
 use roodb::protocol::mysql::packet::{
     decode_length_encoded_int, decode_length_encoded_string, decode_null_terminated_string,
     encode_length_encoded_bytes, encode_length_encoded_int, encode_length_encoded_string,
@@ -19,6 +29,9 @@ use roodb::protocol::mysql::resultset::{
     ColumnDefinition41,
 };
 use roodb::protocol::mysql::types::{datatype_to_mysql, datum_to_text_bytes, ColumnType};
+use roodb::server::listener::start_test_server;
+use roodb::storage::lsm::{LsmConfig, LsmEngine};
+use roodb::storage::StorageEngine;
 
 // ============================================================================
 // Packet encoding/decoding tests
@@ -129,7 +142,11 @@ fn test_verify_empty_password() {
 fn test_verify_password_wrong_length() {
     let scramble = [0u8; 20];
     // Non-empty password should have 20-byte response
-    assert!(!verify_mysql_native_password(&scramble, "secret", &[1, 2, 3]));
+    assert!(!verify_mysql_native_password(
+        &scramble,
+        "secret",
+        &[1, 2, 3]
+    ));
 }
 
 #[test]
@@ -221,8 +238,8 @@ fn test_ok_packet_encoding() {
     let packet = encode_ok_packet(10, 5, 0x0002, 1);
 
     assert_eq!(packet[0], 0x00); // OK header
-    assert_eq!(packet[1], 10);   // affected_rows
-    assert_eq!(packet[2], 5);    // last_insert_id
+    assert_eq!(packet[1], 10); // affected_rows
+    assert_eq!(packet[2], 5); // last_insert_id
 }
 
 #[test]
@@ -293,10 +310,16 @@ fn test_datatype_to_mysql() {
     assert_eq!(datatype_to_mysql(&DataType::BigInt), ColumnType::LongLong);
     assert_eq!(datatype_to_mysql(&DataType::Float), ColumnType::Float);
     assert_eq!(datatype_to_mysql(&DataType::Double), ColumnType::Double);
-    assert_eq!(datatype_to_mysql(&DataType::Varchar(255)), ColumnType::Varchar);
+    assert_eq!(
+        datatype_to_mysql(&DataType::Varchar(255)),
+        ColumnType::Varchar
+    );
     assert_eq!(datatype_to_mysql(&DataType::Text), ColumnType::Blob);
     assert_eq!(datatype_to_mysql(&DataType::Blob), ColumnType::Blob);
-    assert_eq!(datatype_to_mysql(&DataType::Timestamp), ColumnType::Datetime);
+    assert_eq!(
+        datatype_to_mysql(&DataType::Timestamp),
+        ColumnType::Datetime
+    );
 }
 
 #[test]
@@ -336,4 +359,120 @@ fn test_datum_to_text_bytes_bytes() {
     // Length prefix (3) followed by data
     assert_eq!(bytes[0], 3);
     assert_eq!(&bytes[1..], &data[..]);
+}
+
+// ============================================================================
+// Server integration tests
+// ============================================================================
+
+fn test_dir(name: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "roodb_protocol_test_{}_{}",
+        name,
+        std::process::id()
+    ));
+    path
+}
+
+fn cleanup_dir(path: &PathBuf) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
+/// End-to-end integration test: start server, connect via mysql_async, run SQL
+#[tokio::test]
+async fn test_server_integration_e2e() {
+    use mysql_async::prelude::*;
+    use mysql_async::{Opts, OptsBuilder, SslOpts};
+
+    // Initialize tracing for debug output
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("roodb=debug")
+        .try_init();
+
+    // Setup test infrastructure
+    let tls_config = test_utils::certs::test_tls_config();
+    let data_dir = test_dir("e2e");
+    cleanup_dir(&data_dir);
+
+    // Create storage and catalog
+    let factory = Arc::new(PosixIOFactory);
+    let config = LsmConfig {
+        dir: data_dir.clone(),
+    };
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    // Find available port
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    // Start server
+    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+        .await
+        .expect("Failed to start test server");
+
+    // Give server time to bind
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Build MySQL client with TLS (accept invalid certs for self-signed)
+    // Set max_allowed_packet and wait_timeout to avoid init queries for @@variables
+    let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
+
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .ssl_opts(ssl_opts)
+        .max_allowed_packet(Some(16_777_216)) // 16MB, skip @@max_allowed_packet query
+        .wait_timeout(Some(28800))            // Default, skip @@wait_timeout query
+        .into();
+
+    // Connect
+    let pool = mysql_async::Pool::new(opts);
+    let mut conn = pool.get_conn().await.expect("Failed to connect");
+
+    // Test CREATE TABLE
+    conn.query_drop("CREATE TABLE test_table (id INT, name VARCHAR(100))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Test INSERT
+    conn.query_drop("INSERT INTO test_table (id, name) VALUES (1, 'Alice')")
+        .await
+        .expect("INSERT 1 failed");
+    conn.query_drop("INSERT INTO test_table (id, name) VALUES (2, 'Bob')")
+        .await
+        .expect("INSERT 2 failed");
+
+    // Test SELECT
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, name FROM test_table ORDER BY id")
+        .await
+        .expect("SELECT failed");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, "Alice".to_string()));
+    assert_eq!(rows[1], (2, "Bob".to_string()));
+
+    // Test DROP TABLE
+    conn.query_drop("DROP TABLE test_table")
+        .await
+        .expect("DROP TABLE failed");
+
+    // Cleanup
+    drop(conn);
+    pool.disconnect().await.unwrap();
+    handle.shutdown();
+
+    // Give server time to shutdown
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Cleanup storage
+    storage.close().await.unwrap();
+    cleanup_dir(&data_dir);
 }

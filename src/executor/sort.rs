@@ -52,7 +52,8 @@ impl Executor for Sort {
         let order_by = &self.order_by;
 
         // Precompute sort keys for each row
-        let mut keyed_rows: Vec<(Vec<super::datum::Datum>, Row)> = Vec::with_capacity(self.rows.len());
+        let mut keyed_rows: Vec<(Vec<super::datum::Datum>, Row)> =
+            Vec::with_capacity(self.rows.len());
         for row in self.rows.drain(..) {
             let mut keys = Vec::with_capacity(order_by.len());
             for (expr, _) in order_by {
@@ -153,9 +154,18 @@ mod tests {
         let mut sort = Sort::new(input, order_by);
         sort.open().await.unwrap();
 
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(1));
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(2));
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(3));
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(1)
+        );
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(2)
+        );
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(3)
+        );
         assert!(sort.next().await.unwrap().is_none());
 
         sort.close().await.unwrap();
@@ -184,9 +194,18 @@ mod tests {
         let mut sort = Sort::new(input, order_by);
         sort.open().await.unwrap();
 
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(3));
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(2));
-        assert_eq!(sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(), Some(1));
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(2)
+        );
+        assert_eq!(
+            sort.next().await.unwrap().unwrap().get(0).unwrap().as_int(),
+            Some(1)
+        );
 
         sort.close().await.unwrap();
     }

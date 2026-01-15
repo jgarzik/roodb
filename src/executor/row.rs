@@ -35,10 +35,12 @@ impl Row {
 
     /// Get a datum by index
     pub fn get(&self, index: usize) -> ExecutorResult<&Datum> {
-        self.values.get(index).ok_or(ExecutorError::ColumnIndexOutOfBounds {
-            index,
-            row_len: self.values.len(),
-        })
+        self.values
+            .get(index)
+            .ok_or(ExecutorError::ColumnIndexOutOfBounds {
+                index,
+                row_len: self.values.len(),
+            })
     }
 
     /// Get a datum by index, returns None if out of bounds
@@ -49,10 +51,12 @@ impl Row {
     /// Get a mutable reference to a datum by index
     pub fn get_mut(&mut self, index: usize) -> ExecutorResult<&mut Datum> {
         let len = self.values.len();
-        self.values.get_mut(index).ok_or(ExecutorError::ColumnIndexOutOfBounds {
-            index,
-            row_len: len,
-        })
+        self.values
+            .get_mut(index)
+            .ok_or(ExecutorError::ColumnIndexOutOfBounds {
+                index,
+                row_len: len,
+            })
     }
 
     /// Set a datum by index
@@ -178,11 +182,7 @@ mod tests {
 
     #[test]
     fn test_row_project() {
-        let row = Row::new(vec![
-            Datum::Int(1),
-            Datum::Int(2),
-            Datum::Int(3),
-        ]);
+        let row = Row::new(vec![Datum::Int(1), Datum::Int(2), Datum::Int(3)]);
         let projected = row.project(&[0, 2]).unwrap();
         assert_eq!(projected.len(), 2);
         assert!(matches!(projected.get(0), Ok(Datum::Int(1))));

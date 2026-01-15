@@ -155,7 +155,9 @@ pub fn decode_row(data: &[u8]) -> ExecutorResult<Row> {
 /// Decode a single datum, returns (datum, bytes_consumed)
 fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
     if data.is_empty() {
-        return Err(ExecutorError::Encoding("unexpected end of datum".to_string()));
+        return Err(ExecutorError::Encoding(
+            "unexpected end of datum".to_string(),
+        ));
     }
 
     let tag = data[0];
@@ -187,7 +189,9 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
 
         TAG_STRING => {
             if data.len() < 5 {
-                return Err(ExecutorError::Encoding("string header too short".to_string()));
+                return Err(ExecutorError::Encoding(
+                    "string header too short".to_string(),
+                ));
             }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             if data.len() < 5 + len {
@@ -200,7 +204,9 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
 
         TAG_BYTES => {
             if data.len() < 5 {
-                return Err(ExecutorError::Encoding("bytes header too short".to_string()));
+                return Err(ExecutorError::Encoding(
+                    "bytes header too short".to_string(),
+                ));
             }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             if data.len() < 5 + len {
@@ -211,13 +217,18 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
 
         TAG_TIMESTAMP => {
             if data.len() < 9 {
-                return Err(ExecutorError::Encoding("timestamp data too short".to_string()));
+                return Err(ExecutorError::Encoding(
+                    "timestamp data too short".to_string(),
+                ));
             }
             let t = i64::from_le_bytes(data[1..9].try_into().unwrap());
             Ok((Datum::Timestamp(t), 9))
         }
 
-        _ => Err(ExecutorError::Encoding(format!("unknown datum tag: {}", tag))),
+        _ => Err(ExecutorError::Encoding(format!(
+            "unknown datum tag: {}",
+            tag
+        ))),
     }
 }
 

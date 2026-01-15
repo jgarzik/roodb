@@ -75,10 +75,7 @@ impl ExecutorEngine {
                 let left_exec = self.build_node(*left)?;
                 let right_exec = self.build_node(*right)?;
                 Ok(Box::new(NestedLoopJoin::new(
-                    left_exec,
-                    right_exec,
-                    join_type,
-                    condition,
+                    left_exec, right_exec, join_type, condition,
                 )))
             }
 
@@ -88,7 +85,9 @@ impl ExecutorEngine {
                 aggregates,
             } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(HashAggregate::new(input_exec, group_by, aggregates)))
+                Ok(Box::new(HashAggregate::new(
+                    input_exec, group_by, aggregates,
+                )))
             }
 
             PhysicalPlan::Sort { input, order_by } => {
@@ -149,9 +148,11 @@ impl ExecutorEngine {
                 self.catalog.clone(),
             ))),
 
-            PhysicalPlan::DropTable { name, if_exists } => {
-                Ok(Box::new(DropTable::new(name, if_exists, self.catalog.clone())))
-            }
+            PhysicalPlan::DropTable { name, if_exists } => Ok(Box::new(DropTable::new(
+                name,
+                if_exists,
+                self.catalog.clone(),
+            ))),
 
             PhysicalPlan::CreateIndex {
                 name,
