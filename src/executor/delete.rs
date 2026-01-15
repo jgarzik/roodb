@@ -1,14 +1,15 @@
 //! Delete executor
 //!
-//! Deletes rows from a table that match a filter.
+//! Deletes rows from a table that match a filter with MVCC support.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::sql::ResolvedExpr;
-use crate::storage::StorageEngine;
+use crate::txn::MvccStorage;
 
+use super::context::TransactionContext;
 use super::encoding::{decode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::eval;
@@ -21,8 +22,10 @@ pub struct Delete {
     table: String,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
-    /// Storage engine
-    storage: Arc<dyn StorageEngine>,
+    /// MVCC-aware storage
+    mvcc: Arc<MvccStorage>,
+    /// Transaction context (for MVCC visibility and versioning)
+    txn_context: Option<TransactionContext>,
     /// Number of rows deleted
     rows_deleted: u64,
     /// Whether execution is complete
@@ -34,12 +37,14 @@ impl Delete {
     pub fn new(
         table: String,
         filter: Option<ResolvedExpr>,
-        storage: Arc<dyn StorageEngine>,
+        mvcc: Arc<MvccStorage>,
+        txn_context: Option<TransactionContext>,
     ) -> Self {
         Delete {
             table,
             filter,
-            storage,
+            mvcc,
+            txn_context,
             rows_deleted: 0,
             done: false,
         }
@@ -62,7 +67,13 @@ impl Executor for Delete {
         // Scan the table
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
-        let kv_pairs = self.storage.scan(Some(&prefix), Some(&end)).await?;
+
+        // Use MVCC scan with visibility filtering if we have a transaction context
+        let kv_pairs = if let Some(ref ctx) = self.txn_context {
+            self.mvcc.scan(Some(&prefix), Some(&end), &ctx.read_view).await?
+        } else {
+            self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
+        };
 
         // Collect keys to delete (can't delete while iterating)
         let mut keys_to_delete = Vec::new();
@@ -81,9 +92,13 @@ impl Executor for Delete {
             keys_to_delete.push(key);
         }
 
-        // Delete the rows
+        // Delete the rows using MVCC delete if we have a transaction context
         for key in keys_to_delete {
-            self.storage.delete(&key).await?;
+            if let Some(ref ctx) = self.txn_context {
+                self.mvcc.delete(&key, ctx.txn_id).await?;
+            } else {
+                self.mvcc.inner().delete(&key).await?;
+            }
             self.rows_deleted += 1;
         }
 
@@ -107,7 +122,8 @@ mod tests {
     use crate::executor::encoding::{encode_row, encode_row_key};
     use crate::sql::{BinaryOp, Literal, ResolvedColumn};
     use crate::storage::traits::KeyValue;
-    use crate::storage::StorageResult;
+    use crate::storage::{StorageEngine, StorageResult};
+    use crate::txn::TransactionManager;
     use std::sync::Mutex;
 
     struct MockStorage {
@@ -182,6 +198,11 @@ mod tests {
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
 
         // Delete where id > 1
         let filter = ResolvedExpr::BinaryOp {
@@ -197,7 +218,8 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut delete = Delete::new("users".to_string(), Some(filter), storage.clone());
+        // No txn_context = use raw storage (legacy mode)
+        let mut delete = Delete::new("users".to_string(), Some(filter), mvcc, None);
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -221,9 +243,14 @@ mod tests {
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
 
-        // Delete all (no filter)
-        let mut delete = Delete::new("users".to_string(), None, storage.clone());
+        // Delete all (no filter), no txn_context = use raw storage
+        let mut delete = Delete::new("users".to_string(), None, mvcc, None);
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();

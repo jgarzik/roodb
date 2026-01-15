@@ -8,9 +8,10 @@ use parking_lot::RwLock;
 
 use crate::catalog::Catalog;
 use crate::planner::PhysicalPlan;
-use crate::storage::StorageEngine;
+use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
+use super::context::TransactionContext;
 use super::ddl::{CreateIndex, CreateTable, DropIndex, DropTable};
 use super::delete::Delete;
 use super::distinct::HashDistinct;
@@ -27,16 +28,26 @@ use super::Executor;
 
 /// Executor engine - builds executors from physical plans
 pub struct ExecutorEngine {
-    /// Storage engine
-    storage: Arc<dyn StorageEngine>,
+    /// MVCC-aware storage
+    mvcc: Arc<MvccStorage>,
     /// Catalog
     catalog: Arc<RwLock<Catalog>>,
+    /// Transaction context (None for DDL-only or read-only without txn)
+    txn_context: Option<TransactionContext>,
 }
 
 impl ExecutorEngine {
     /// Create a new executor engine
-    pub fn new(storage: Arc<dyn StorageEngine>, catalog: Arc<RwLock<Catalog>>) -> Self {
-        ExecutorEngine { storage, catalog }
+    pub fn new(
+        mvcc: Arc<MvccStorage>,
+        catalog: Arc<RwLock<Catalog>>,
+        txn_context: Option<TransactionContext>,
+    ) -> Self {
+        ExecutorEngine {
+            mvcc,
+            catalog,
+            txn_context,
+        }
     }
 
     /// Build an executor tree from a physical plan
@@ -53,7 +64,8 @@ impl ExecutorEngine {
             } => Ok(Box::new(TableScan::new(
                 table,
                 filter,
-                self.storage.clone(),
+                self.mvcc.clone(),
+                self.txn_context.clone(),
             ))),
 
             PhysicalPlan::Filter { input, predicate } => {
@@ -117,7 +129,8 @@ impl ExecutorEngine {
                 table,
                 columns,
                 values,
-                self.storage.clone(),
+                self.mvcc.clone(),
+                self.txn_context.clone(),
             ))),
 
             PhysicalPlan::Update {
@@ -128,12 +141,16 @@ impl ExecutorEngine {
                 table,
                 assignments,
                 filter,
-                self.storage.clone(),
+                self.mvcc.clone(),
+                self.txn_context.clone(),
             ))),
 
-            PhysicalPlan::Delete { table, filter } => {
-                Ok(Box::new(Delete::new(table, filter, self.storage.clone())))
-            }
+            PhysicalPlan::Delete { table, filter } => Ok(Box::new(Delete::new(
+                table,
+                filter,
+                self.mvcc.clone(),
+                self.txn_context.clone(),
+            ))),
 
             PhysicalPlan::CreateTable {
                 name,
@@ -184,7 +201,8 @@ mod tests {
     use crate::planner::logical::expr::OutputColumn;
     use crate::sql::{Literal, ResolvedColumn, ResolvedExpr};
     use crate::storage::traits::KeyValue;
-    use crate::storage::StorageResult;
+    use crate::storage::{StorageEngine, StorageResult};
+    use crate::txn::TransactionManager;
     use std::sync::Mutex;
 
     struct MockStorage {
@@ -249,7 +267,7 @@ mod tests {
         }
     }
 
-    fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
+    fn setup_test_env() -> (ExecutorEngine, Arc<MvccStorage>) {
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
         let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
@@ -261,6 +279,11 @@ mod tests {
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
         let catalog = Arc::new(RwLock::new(Catalog::new()));
 
         // Add table to catalog
@@ -274,8 +297,9 @@ mod tests {
             .unwrap();
         }
 
-        let engine = ExecutorEngine::new(storage.clone() as Arc<dyn StorageEngine>, catalog);
-        (engine, storage)
+        // No transaction context for simple tests (legacy behavior)
+        let engine = ExecutorEngine::new(mvcc.clone(), catalog, None);
+        (engine, mvcc)
     }
 
     #[tokio::test]

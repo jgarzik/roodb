@@ -1,6 +1,6 @@
 //! Insert executor
 //!
-//! Inserts rows into a table.
+//! Inserts rows into a table with MVCC support.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -8,8 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::sql::{ResolvedColumn, ResolvedExpr};
-use crate::storage::StorageEngine;
+use crate::txn::MvccStorage;
 
+use super::context::TransactionContext;
 use super::encoding::{encode_row, encode_row_key};
 use super::error::ExecutorResult;
 use super::eval::eval;
@@ -27,8 +28,10 @@ pub struct Insert {
     _columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
     values: Vec<Vec<ResolvedExpr>>,
-    /// Storage engine
-    storage: Arc<dyn StorageEngine>,
+    /// MVCC-aware storage
+    mvcc: Arc<MvccStorage>,
+    /// Transaction context (for MVCC versioning)
+    txn_context: Option<TransactionContext>,
     /// Number of rows inserted
     rows_inserted: u64,
     /// Whether execution is complete
@@ -41,13 +44,15 @@ impl Insert {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
-        storage: Arc<dyn StorageEngine>,
+        mvcc: Arc<MvccStorage>,
+        txn_context: Option<TransactionContext>,
     ) -> Self {
         Insert {
             table,
             _columns: columns,
             values,
-            storage,
+            mvcc,
+            txn_context,
             rows_inserted: 0,
             done: false,
         }
@@ -89,7 +94,12 @@ impl Executor for Insert {
             let key = encode_row_key(&self.table, row_id);
             let value = encode_row(&row);
 
-            self.storage.put(&key, &value).await?;
+            // Use MVCC put if we have a transaction context, otherwise raw put
+            if let Some(ref ctx) = self.txn_context {
+                self.mvcc.put(&key, &value, ctx.txn_id).await?;
+            } else {
+                self.mvcc.put_raw(&key, &value).await?;
+            }
             self.rows_inserted += 1;
         }
 
@@ -112,7 +122,8 @@ mod tests {
     use crate::catalog::DataType;
     use crate::sql::Literal;
     use crate::storage::traits::KeyValue;
-    use crate::storage::StorageResult;
+    use crate::storage::{StorageEngine, StorageResult};
+    use crate::txn::TransactionManager;
     use std::sync::Mutex;
 
     struct MockStorage {
@@ -164,6 +175,11 @@ mod tests {
     #[tokio::test]
     async fn test_insert() {
         let storage = Arc::new(MockStorage::new());
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
 
         let columns = vec![
             ResolvedColumn {
@@ -187,7 +203,8 @@ mod tests {
             ResolvedExpr::Literal(Literal::String("alice".to_string())),
         ]];
 
-        let mut insert = Insert::new("users".to_string(), columns, values, storage.clone());
+        // No txn_context = use raw put (legacy mode)
+        let mut insert = Insert::new("users".to_string(), columns, values, mvcc, None);
         insert.open().await.unwrap();
 
         let result = insert.next().await.unwrap().unwrap();

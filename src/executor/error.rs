@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::catalog::DataType;
 use crate::storage::StorageError;
+use crate::txn::TransactionError;
 
 /// Result type for executor operations
 pub type ExecutorResult<T> = Result<T, ExecutorError>;
@@ -13,6 +14,9 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 pub enum ExecutorError {
     /// Storage layer error
     Storage(StorageError),
+
+    /// Transaction error
+    Transaction(TransactionError),
 
     /// Type mismatch during evaluation
     TypeMismatch {
@@ -47,6 +51,7 @@ impl fmt::Display for ExecutorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExecutorError::Storage(e) => write!(f, "storage error: {}", e),
+            ExecutorError::Transaction(e) => write!(f, "transaction error: {}", e),
             ExecutorError::TypeMismatch {
                 expected,
                 got,
@@ -81,6 +86,7 @@ impl std::error::Error for ExecutorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ExecutorError::Storage(e) => Some(e),
+            ExecutorError::Transaction(e) => Some(e),
             _ => None,
         }
     }
@@ -89,5 +95,11 @@ impl std::error::Error for ExecutorError {
 impl From<StorageError> for ExecutorError {
     fn from(e: StorageError) -> Self {
         ExecutorError::Storage(e)
+    }
+}
+
+impl From<TransactionError> for ExecutorError {
+    fn from(e: TransactionError) -> Self {
+        ExecutorError::Transaction(e)
     }
 }

@@ -1,14 +1,15 @@
 //! TableScan executor
 //!
-//! Scans all rows from a table using the storage engine.
+//! Scans all rows from a table using MVCC-aware storage.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::sql::ResolvedExpr;
-use crate::storage::StorageEngine;
+use crate::txn::MvccStorage;
 
+use super::context::TransactionContext;
 use super::encoding::{decode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::eval;
@@ -21,8 +22,10 @@ pub struct TableScan {
     table: String,
     /// Optional filter predicate (pushed down)
     filter: Option<ResolvedExpr>,
-    /// Storage engine
-    storage: Arc<dyn StorageEngine>,
+    /// MVCC-aware storage
+    mvcc: Arc<MvccStorage>,
+    /// Transaction context (for MVCC visibility)
+    txn_context: Option<TransactionContext>,
     /// Buffered rows from storage scan
     rows: Vec<Row>,
     /// Current position in rows
@@ -36,12 +39,14 @@ impl TableScan {
     pub fn new(
         table: String,
         filter: Option<ResolvedExpr>,
-        storage: Arc<dyn StorageEngine>,
+        mvcc: Arc<MvccStorage>,
+        txn_context: Option<TransactionContext>,
     ) -> Self {
         TableScan {
             table,
             filter,
-            storage,
+            mvcc,
+            txn_context,
             rows: Vec::new(),
             position: 0,
             scanned: false,
@@ -56,7 +61,13 @@ impl Executor for TableScan {
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
 
-        let kv_pairs = self.storage.scan(Some(&prefix), Some(&end)).await?;
+        // Use MVCC scan with visibility filtering if we have a transaction context,
+        // otherwise fall back to raw storage scan (for DDL or legacy tests)
+        let kv_pairs = if let Some(ref ctx) = self.txn_context {
+            self.mvcc.scan(Some(&prefix), Some(&end), &ctx.read_view).await?
+        } else {
+            self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
+        };
 
         // Decode rows and apply filter if present
         self.rows.clear();
@@ -101,7 +112,8 @@ mod tests {
     use crate::executor::datum::Datum;
     use crate::executor::encoding::encode_row;
     use crate::storage::traits::KeyValue;
-    use crate::storage::StorageResult;
+    use crate::storage::{StorageEngine, StorageResult};
+    use crate::txn::TransactionManager;
 
     struct MockStorage {
         data: Vec<KeyValue>,
@@ -148,7 +160,7 @@ mod tests {
         }
     }
 
-    fn make_test_storage() -> Arc<dyn StorageEngine> {
+    fn make_test_mvcc() -> Arc<MvccStorage> {
         use crate::executor::encoding::encode_row_key;
 
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
@@ -159,13 +171,16 @@ mod tests {
             (encode_row_key("users", 2), encode_row(&row2)),
         ];
 
-        Arc::new(MockStorage { data })
+        let storage = Arc::new(MockStorage { data }) as Arc<dyn StorageEngine>;
+        let txn_manager = Arc::new(TransactionManager::new());
+        Arc::new(MvccStorage::new(storage, txn_manager))
     }
 
     #[tokio::test]
     async fn test_table_scan_basic() {
-        let storage = make_test_storage();
-        let mut scan = TableScan::new("users".to_string(), None, storage);
+        let mvcc = make_test_mvcc();
+        // No txn_context = use inner storage directly (legacy mode)
+        let mut scan = TableScan::new("users".to_string(), None, mvcc, None);
 
         scan.open().await.unwrap();
 

@@ -13,6 +13,7 @@ use roodb::planner::PhysicalPlan;
 use roodb::sql::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
 use roodb::storage::traits::KeyValue;
 use roodb::storage::{StorageEngine, StorageResult};
+use roodb::txn::{MvccStorage, TransactionManager};
 
 use std::sync::Mutex;
 
@@ -87,6 +88,11 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
+    let txn_manager = Arc::new(TransactionManager::new());
+    let mvcc = Arc::new(MvccStorage::new(
+        storage.clone() as Arc<dyn StorageEngine>,
+        txn_manager,
+    ));
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
     {
@@ -100,7 +106,8 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
         .unwrap();
     }
 
-    let engine = ExecutorEngine::new(storage.clone() as Arc<dyn StorageEngine>, catalog);
+    // No transaction context for simple tests (legacy mode)
+    let engine = ExecutorEngine::new(mvcc, catalog, None);
     (engine, storage)
 }
 
@@ -442,8 +449,13 @@ async fn test_delete_with_filter() {
 #[tokio::test]
 async fn test_create_and_drop_table() {
     let storage = Arc::new(MockStorage::new(vec![]));
+    let txn_manager = Arc::new(TransactionManager::new());
+    let mvcc = Arc::new(MvccStorage::new(
+        storage as Arc<dyn StorageEngine>,
+        txn_manager,
+    ));
     let catalog = Arc::new(RwLock::new(Catalog::new()));
-    let engine = ExecutorEngine::new(storage as Arc<dyn StorageEngine>, catalog.clone());
+    let engine = ExecutorEngine::new(mvcc, catalog.clone(), None);
 
     // CREATE TABLE test (id INT)
     let create_plan = PhysicalPlan::CreateTable {
@@ -497,6 +509,11 @@ async fn test_distinct() {
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
+    let txn_manager = Arc::new(TransactionManager::new());
+    let mvcc = Arc::new(MvccStorage::new(
+        storage as Arc<dyn StorageEngine>,
+        txn_manager,
+    ));
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
     {
@@ -505,7 +522,7 @@ async fn test_distinct() {
             .unwrap();
     }
 
-    let engine = ExecutorEngine::new(storage as Arc<dyn StorageEngine>, catalog);
+    let engine = ExecutorEngine::new(mvcc, catalog, None);
 
     let scan = PhysicalPlan::TableScan {
         table: "nums".to_string(),

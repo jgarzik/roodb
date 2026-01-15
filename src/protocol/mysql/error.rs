@@ -6,6 +6,7 @@ use std::io;
 use crate::executor::ExecutorError;
 use crate::planner::PlannerError;
 use crate::sql::SqlError;
+use crate::txn::TransactionError;
 
 /// MySQL protocol errors
 #[derive(Debug)]
@@ -24,6 +25,8 @@ pub enum ProtocolError {
     Planner(PlannerError),
     /// Query execution error
     Executor(ExecutorError),
+    /// Transaction error
+    Transaction(TransactionError),
     /// Connection closed by client
     ConnectionClosed,
     /// TLS handshake error
@@ -42,6 +45,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::Sql(e) => write!(f, "SQL error: {}", e),
             ProtocolError::Planner(e) => write!(f, "Planner error: {}", e),
             ProtocolError::Executor(e) => write!(f, "Executor error: {}", e),
+            ProtocolError::Transaction(e) => write!(f, "Transaction error: {}", e),
             ProtocolError::ConnectionClosed => write!(f, "Connection closed"),
             ProtocolError::Tls(msg) => write!(f, "TLS error: {}", msg),
             ProtocolError::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -56,6 +60,7 @@ impl std::error::Error for ProtocolError {
             ProtocolError::Sql(e) => Some(e),
             ProtocolError::Planner(e) => Some(e),
             ProtocolError::Executor(e) => Some(e),
+            ProtocolError::Transaction(e) => Some(e),
             _ => None,
         }
     }
@@ -82,6 +87,12 @@ impl From<PlannerError> for ProtocolError {
 impl From<ExecutorError> for ProtocolError {
     fn from(e: ExecutorError) -> Self {
         ProtocolError::Executor(e)
+    }
+}
+
+impl From<TransactionError> for ProtocolError {
+    fn from(e: TransactionError) -> Self {
+        ProtocolError::Transaction(e)
     }
 }
 

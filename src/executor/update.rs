@@ -1,14 +1,15 @@
 //! Update executor
 //!
-//! Updates rows in a table that match a filter.
+//! Updates rows in a table that match a filter with MVCC support.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::sql::{ResolvedColumn, ResolvedExpr};
-use crate::storage::StorageEngine;
+use crate::txn::MvccStorage;
 
+use super::context::TransactionContext;
 use super::encoding::{decode_row, encode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::eval;
@@ -23,8 +24,10 @@ pub struct Update {
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
-    /// Storage engine
-    storage: Arc<dyn StorageEngine>,
+    /// MVCC-aware storage
+    mvcc: Arc<MvccStorage>,
+    /// Transaction context (for MVCC visibility and versioning)
+    txn_context: Option<TransactionContext>,
     /// Number of rows updated
     rows_updated: u64,
     /// Whether execution is complete
@@ -37,13 +40,15 @@ impl Update {
         table: String,
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
-        storage: Arc<dyn StorageEngine>,
+        mvcc: Arc<MvccStorage>,
+        txn_context: Option<TransactionContext>,
     ) -> Self {
         Update {
             table,
             assignments,
             filter,
-            storage,
+            mvcc,
+            txn_context,
             rows_updated: 0,
             done: false,
         }
@@ -66,7 +71,13 @@ impl Executor for Update {
         // Scan the table
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
-        let kv_pairs = self.storage.scan(Some(&prefix), Some(&end)).await?;
+
+        // Use MVCC scan with visibility filtering if we have a transaction context
+        let kv_pairs = if let Some(ref ctx) = self.txn_context {
+            self.mvcc.scan(Some(&prefix), Some(&end), &ctx.read_view).await?
+        } else {
+            self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
+        };
 
         for (key, value) in kv_pairs {
             let mut row = decode_row(&value)?;
@@ -85,9 +96,13 @@ impl Executor for Update {
                 row.set(col.index, new_value)?;
             }
 
-            // Write back
+            // Write back using MVCC put if we have a transaction context
             let new_value = encode_row(&row);
-            self.storage.put(&key, &new_value).await?;
+            if let Some(ref ctx) = self.txn_context {
+                self.mvcc.put(&key, &new_value, ctx.txn_id).await?;
+            } else {
+                self.mvcc.put_raw(&key, &new_value).await?;
+            }
             self.rows_updated += 1;
         }
 
@@ -111,7 +126,8 @@ mod tests {
     use crate::executor::encoding::encode_row_key;
     use crate::sql::{BinaryOp, Literal};
     use crate::storage::traits::KeyValue;
-    use crate::storage::StorageResult;
+    use crate::storage::{StorageEngine, StorageResult};
+    use crate::txn::TransactionManager;
     use std::sync::Mutex;
 
     struct MockStorage {
@@ -189,6 +205,11 @@ mod tests {
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
 
         // Update where id = 1
         let filter = ResolvedExpr::BinaryOp {
@@ -215,11 +236,13 @@ mod tests {
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
 
+        // No txn_context = use raw storage (legacy mode)
         let mut update = Update::new(
             "users".to_string(),
             assignments,
             Some(filter),
-            storage.clone(),
+            mvcc,
+            None,
         );
         update.open().await.unwrap();
 

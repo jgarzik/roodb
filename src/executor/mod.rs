@@ -4,6 +4,7 @@
 //! iterator model: each operator implements open/next/close methods.
 
 pub mod aggregate;
+pub mod context;
 pub mod datum;
 pub mod ddl;
 pub mod delete;
@@ -22,6 +23,7 @@ pub mod scan;
 pub mod sort;
 pub mod update;
 
+pub use context::TransactionContext;
 pub use datum::Datum;
 pub use engine::ExecutorEngine;
 pub use error::{ExecutorError, ExecutorResult};

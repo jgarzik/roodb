@@ -227,8 +227,19 @@ SQL → Parser → Planner → Optimizer → Physical Plan → Executor → Stor
 - `src/protocol/mysql/mod.rs` - BEGIN/COMMIT/ROLLBACK/SET parsing ✓
 - `src/protocol/mysql/error.rs` - transaction error codes ✓
 
+### Executor MVCC Wiring ✓ COMPLETE:
+- `src/executor/context.rs` - TransactionContext (txn_id + read_view) ✓
+- `src/executor/mod.rs` - export TransactionContext ✓
+- `src/executor/engine.rs` - accept MvccStorage + TransactionContext ✓
+- `src/executor/scan.rs` - use MvccStorage.scan() with read_view ✓
+- `src/executor/insert.rs` - use MvccStorage.put() with txn_id ✓
+- `src/executor/update.rs` - use MvccStorage for read/write ✓
+- `src/executor/delete.rs` - use MvccStorage.delete() with txn_id ✓
+- `src/executor/error.rs` - From<TransactionError> ✓
+- `src/protocol/mysql/mod.rs` - create txn context in execute_plan() ✓
+- `src/protocol/mysql/error.rs` - From<TransactionError> ✓
+
 ### Remaining:
-- Wire MVCC into executors (scan/insert/update/delete)
 - WAL integration for commit durability
 - Integration tests for transactions
 

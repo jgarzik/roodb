@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::catalog::Catalog;
 use crate::executor::engine::ExecutorEngine;
-use crate::executor::Executor;
+use crate::executor::{Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::planner::PhysicalPlanner;
@@ -31,7 +31,7 @@ use crate::planner::physical::PhysicalPlan;
 use crate::server::session::Session;
 use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
-use crate::txn::{IsolationLevel, TransactionManager};
+use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
 
 use self::auth::{verify_mysql_native_password, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
@@ -467,18 +467,59 @@ where
                 | PhysicalPlan::NestedLoopJoin { .. }
         );
 
+        // Check if this is DDL (no MVCC needed)
+        let is_ddl = matches!(
+            plan,
+            PhysicalPlan::CreateTable { .. }
+                | PhysicalPlan::DropTable { .. }
+                | PhysicalPlan::CreateIndex { .. }
+                | PhysicalPlan::DropIndex { .. }
+        );
+
+        // Create MVCC storage wrapper
+        let mvcc = Arc::new(MvccStorage::new(
+            self.storage.clone(),
+            self.txn_manager.clone(),
+        ));
+
+        // Determine transaction context
+        let (txn_context, implicit_txn_id) = if is_ddl {
+            // DDL operations don't use MVCC
+            (None, None)
+        } else if let Some(txn_id) = self.session.current_txn {
+            // Explicit transaction - use existing txn_id
+            let read_view = self.txn_manager.create_read_view(txn_id);
+            (Some(TransactionContext::new(txn_id, read_view)), None)
+        } else if !returns_rows && self.session.autocommit {
+            // Autocommit DML - create implicit transaction
+            let txn = self.txn_manager.begin(
+                self.session.isolation_level,
+                self.session.is_read_only,
+            )?;
+            let read_view = self.txn_manager.create_read_view(txn.txn_id);
+            (
+                Some(TransactionContext::new(txn.txn_id, read_view)),
+                Some(txn.txn_id),
+            )
+        } else {
+            // Read-only query in autocommit mode - create snapshot read view
+            // txn_id=0 special case: sees all committed transactions
+            let read_view = self.txn_manager.create_read_view(0);
+            (Some(TransactionContext::new(0, read_view)), None)
+        };
+
         if returns_rows {
             // Get column definitions before building executor
             let columns = plan.output_columns();
 
             // Build and execute
-            let engine = ExecutorEngine::new(self.storage.clone(), self.catalog.clone());
+            let engine = ExecutorEngine::new(mvcc, self.catalog.clone(), txn_context);
             let mut executor = engine.build(plan)?;
 
             self.send_result_set(&columns, &mut *executor).await
         } else {
             // DML/DDL - execute and count affected rows
-            let engine = ExecutorEngine::new(self.storage.clone(), self.catalog.clone());
+            let engine = ExecutorEngine::new(mvcc, self.catalog.clone(), txn_context);
             let mut executor = engine.build(plan)?;
 
             executor.open().await?;
@@ -487,6 +528,11 @@ where
                 affected += 1;
             }
             executor.close().await?;
+
+            // Commit implicit transaction if we created one
+            if let Some(txn_id) = implicit_txn_id {
+                self.txn_manager.commit(txn_id).await?;
+            }
 
             self.send_ok(affected, 0).await
         }
