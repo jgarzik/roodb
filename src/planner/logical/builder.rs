@@ -4,8 +4,8 @@
 
 use crate::catalog::DataType;
 use crate::sql::{
-    JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedOrderByItem, ResolvedSelect,
-    ResolvedSelectItem, ResolvedStatement, ResolvedTableRef,
+    JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
+    ResolvedStatement, ResolvedTableRef,
 };
 
 use super::expr::{AggregateFunc, OutputColumn};
@@ -82,6 +82,17 @@ impl LogicalPlanBuilder {
         // 1. Build scan for each table in FROM
         let mut plan = Self::build_from(&select.from)?;
 
+        // 1b. Apply JOINs
+        for join in &select.joins {
+            let right = Self::table_scan(&join.table);
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(right),
+                join_type: join.join_type,
+                condition: join.condition.clone(),
+            };
+        }
+
         // 2. Apply WHERE filter
         if let Some(filter) = select.filter {
             plan = LogicalPlan::Filter {
@@ -107,11 +118,7 @@ impl LogicalPlanBuilder {
             }
 
             // After aggregation, build projection that maps to aggregate output columns
-            plan = Self::build_post_aggregate_project(
-                plan,
-                &select.columns,
-                &select.group_by,
-            )?;
+            plan = Self::build_post_aggregate_project(plan, &select.columns, &select.group_by)?;
         } else {
             // 4. Apply projection (SELECT list) for non-aggregate queries
             plan = Self::build_project(plan, &select.columns)?;
@@ -124,9 +131,22 @@ impl LogicalPlanBuilder {
             };
         }
 
-        // 6. Apply ORDER BY
+        // 6. Apply ORDER BY (with transformed column references)
         if !select.order_by.is_empty() {
-            plan = Self::build_sort(plan, &select.order_by)?;
+            // Transform ORDER BY expressions to reference projection output columns
+            let transformed_order_by: Vec<_> = select
+                .order_by
+                .iter()
+                .map(|item| {
+                    let transformed_expr =
+                        Self::transform_to_output_columns(&item.expr, &select.columns);
+                    (transformed_expr, item.ascending)
+                })
+                .collect();
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                order_by: transformed_order_by,
+            };
         }
 
         // 7. Apply LIMIT/OFFSET
@@ -358,7 +378,9 @@ impl LogicalPlanBuilder {
     /// Get the result type for an aggregate expression
     fn get_aggregate_result_type(expr: &ResolvedExpr) -> DataType {
         match expr {
-            ResolvedExpr::Function { name, result_type, .. } => {
+            ResolvedExpr::Function {
+                name, result_type, ..
+            } => {
                 let upper = name.to_uppercase();
                 match upper.as_str() {
                     "COUNT" => DataType::BigInt,
@@ -485,7 +507,10 @@ impl LogicalPlanBuilder {
     }
 
     /// Find the index of an aggregate function in the SELECT list
-    fn find_aggregate_index(target: &ResolvedExpr, columns: &[ResolvedSelectItem]) -> Option<usize> {
+    fn find_aggregate_index(
+        target: &ResolvedExpr,
+        columns: &[ResolvedSelectItem],
+    ) -> Option<usize> {
         let mut agg_idx = 0usize;
         for item in columns {
             if let ResolvedSelectItem::Expr { expr, .. } = item {
@@ -549,20 +574,102 @@ impl LogicalPlanBuilder {
         }
     }
 
-    /// Build sort node
-    fn build_sort(
-        input: LogicalPlan,
-        order_by: &[ResolvedOrderByItem],
-    ) -> PlannerResult<LogicalPlan> {
-        let order = order_by
-            .iter()
-            .map(|item| (item.expr.clone(), item.ascending))
-            .collect();
-
-        Ok(LogicalPlan::Sort {
-            input: Box::new(input),
-            order_by: order,
-        })
+    /// Transform an expression to use output column indices from the projection
+    ///
+    /// ORDER BY expressions use input (joined) column indices, but after projection
+    /// the row only has output columns. This function maps input column references
+    /// to their corresponding output column indices.
+    fn transform_to_output_columns(
+        expr: &ResolvedExpr,
+        columns: &[ResolvedSelectItem],
+    ) -> ResolvedExpr {
+        match expr {
+            ResolvedExpr::Column(col) => {
+                // Find this column in the SELECT list
+                let mut output_idx = 0usize;
+                for item in columns {
+                    match item {
+                        ResolvedSelectItem::Expr { expr: sel_expr, .. } => {
+                            if let ResolvedExpr::Column(sel_col) = sel_expr {
+                                // Match by table and name (or just name if table is empty)
+                                if (col.table.is_empty()
+                                    || sel_col.table.is_empty()
+                                    || col.table == sel_col.table)
+                                    && col.name == sel_col.name
+                                {
+                                    // Found match - use output index
+                                    return ResolvedExpr::Column(ResolvedColumn {
+                                        table: col.table.clone(),
+                                        name: col.name.clone(),
+                                        index: output_idx,
+                                        data_type: col.data_type.clone(),
+                                        nullable: col.nullable,
+                                    });
+                                }
+                            }
+                            output_idx += 1;
+                        }
+                        ResolvedSelectItem::Columns(cols) => {
+                            // Wildcard expansion - check each column
+                            for expanded_col in cols {
+                                if (col.table.is_empty()
+                                    || expanded_col.table.is_empty()
+                                    || col.table == expanded_col.table)
+                                    && col.name == expanded_col.name
+                                {
+                                    return ResolvedExpr::Column(ResolvedColumn {
+                                        table: col.table.clone(),
+                                        name: col.name.clone(),
+                                        index: output_idx,
+                                        data_type: col.data_type.clone(),
+                                        nullable: col.nullable,
+                                    });
+                                }
+                                output_idx += 1;
+                            }
+                        }
+                    }
+                }
+                // Column not found in SELECT - keep original (may cause error at runtime)
+                expr.clone()
+            }
+            ResolvedExpr::BinaryOp {
+                left,
+                op,
+                right,
+                result_type,
+            } => ResolvedExpr::BinaryOp {
+                left: Box::new(Self::transform_to_output_columns(left, columns)),
+                op: *op,
+                right: Box::new(Self::transform_to_output_columns(right, columns)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::UnaryOp {
+                op,
+                expr: inner,
+                result_type,
+            } => ResolvedExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::Function {
+                name,
+                args,
+                distinct,
+                result_type,
+            } => ResolvedExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::transform_to_output_columns(a, columns))
+                    .collect(),
+                distinct: *distinct,
+                result_type: result_type.clone(),
+            },
+            // Other expression types pass through unchanged
+            _ => expr.clone(),
+        }
     }
 }
 

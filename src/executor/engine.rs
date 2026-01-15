@@ -84,10 +84,19 @@ impl ExecutorEngine {
                 join_type,
                 condition,
             } => {
+                // Get output widths before building child executors
+                let left_width = left.output_columns().len();
+                let right_width = right.output_columns().len();
+
                 let left_exec = self.build_node(*left)?;
                 let right_exec = self.build_node(*right)?;
                 Ok(Box::new(NestedLoopJoin::new(
-                    left_exec, right_exec, join_type, condition,
+                    left_exec,
+                    right_exec,
+                    join_type,
+                    condition,
+                    left_width,
+                    right_width,
                 )))
             }
 

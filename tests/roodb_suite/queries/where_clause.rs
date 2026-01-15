@@ -460,9 +460,7 @@ async fn test_where_complex_condition() {
 
     // Complex condition: (a = 10 AND b = 20) OR c = 35
     let rows: Vec<(i32,)> = conn
-        .query(
-            "SELECT id FROM where_complex_tbl WHERE (a = 10 AND b = 20) OR c = 35 ORDER BY id",
-        )
+        .query("SELECT id FROM where_complex_tbl WHERE (a = 10 AND b = 20) OR c = 35 ORDER BY id")
         .await
         .expect("SELECT with complex WHERE failed");
     assert_eq!(rows.len(), 2);

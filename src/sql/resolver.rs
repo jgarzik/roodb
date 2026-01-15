@@ -356,10 +356,38 @@ impl<'a> Resolver<'a> {
             });
         }
 
+        // Resolve JOINs
+        let mut resolved_joins = Vec::new();
+        for join in &select.joins {
+            let table_def = self.catalog.get_table(&join.table.name).unwrap();
+            let resolved_table = ResolvedTableRef {
+                name: join.table.name.clone(),
+                alias: join.table.alias.clone(),
+                columns: table_def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                    .collect(),
+            };
+
+            let resolved_condition = join
+                .condition
+                .as_ref()
+                .map(|c| self.resolve_expr(c, &scope))
+                .transpose()?;
+
+            resolved_joins.push(ResolvedJoin {
+                table: resolved_table,
+                join_type: join.join_type,
+                condition: resolved_condition,
+            });
+        }
+
         Ok(ResolvedStatement::Select(ResolvedSelect {
             distinct: select.distinct,
             columns: resolved_columns,
             from: resolved_from,
+            joins: resolved_joins,
             filter: resolved_filter,
             group_by: resolved_group_by,
             having: resolved_having,
@@ -381,15 +409,19 @@ impl<'a> Resolver<'a> {
                 alias: alias.clone(),
             }),
             SelectItem::Wildcard => {
-                // Expand to all columns from all tables
+                // Expand to all columns from all tables in order
                 let mut columns = Vec::new();
-                for (table_alias, table_info) in &scope.tables {
-                    for (idx, (name, data_type, nullable)) in table_info.columns.iter().enumerate()
+                for (table_alias, _offset) in &scope.table_order {
+                    let table_info = scope.tables.get(table_alias).unwrap();
+                    for (local_idx, (name, data_type, nullable)) in
+                        table_info.columns.iter().enumerate()
                     {
+                        // Use global index (offset + local)
+                        let global_idx = table_info.column_offset + local_idx;
                         columns.push(ResolvedColumn {
                             table: table_alias.clone(),
                             name: name.clone(),
-                            index: idx,
+                            index: global_idx,
                             data_type: data_type.clone(),
                             nullable: *nullable,
                         });
@@ -407,12 +439,16 @@ impl<'a> Resolver<'a> {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(idx, (name, data_type, nullable))| ResolvedColumn {
-                        table: table.clone(),
-                        name: name.clone(),
-                        index: idx,
-                        data_type: data_type.clone(),
-                        nullable: *nullable,
+                    .map(|(local_idx, (name, data_type, nullable))| {
+                        // Use global index (offset + local)
+                        let global_idx = table_info.column_offset + local_idx;
+                        ResolvedColumn {
+                            table: table.clone(),
+                            name: name.clone(),
+                            index: global_idx,
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        }
                     })
                     .collect();
 
@@ -519,17 +555,20 @@ impl<'a> Resolver<'a> {
                 .get(table_name)
                 .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
 
-            let (idx, col_info) = table_info
+            let (local_idx, col_info) = table_info
                 .columns
                 .iter()
                 .enumerate()
                 .find(|(_, (n, _, _))| n == name)
                 .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
 
+            // Add the table's column offset for joined rows
+            let global_idx = table_info.column_offset + local_idx;
+
             Ok(ResolvedExpr::Column(ResolvedColumn {
                 table: table_name.to_string(),
                 name: name.to_string(),
-                index: idx,
+                index: global_idx,
                 data_type: col_info.1.clone(),
                 nullable: col_info.2,
             }))
@@ -538,7 +577,7 @@ impl<'a> Resolver<'a> {
             let mut found: Option<(String, usize, DataType, bool)> = None;
 
             for (table_alias, table_info) in &scope.tables {
-                if let Some((idx, col_info)) = table_info
+                if let Some((local_idx, col_info)) = table_info
                     .columns
                     .iter()
                     .enumerate()
@@ -547,7 +586,14 @@ impl<'a> Resolver<'a> {
                     if found.is_some() {
                         return Err(SqlError::AmbiguousColumn(name.to_string()));
                     }
-                    found = Some((table_alias.clone(), idx, col_info.1.clone(), col_info.2));
+                    // Add the table's column offset for joined rows
+                    let global_idx = table_info.column_offset + local_idx;
+                    found = Some((
+                        table_alias.clone(),
+                        global_idx,
+                        col_info.1.clone(),
+                        col_info.2,
+                    ));
                 }
             }
 
@@ -570,18 +616,26 @@ impl<'a> Resolver<'a> {
 /// Scope for name resolution
 struct Scope {
     tables: HashMap<String, TableInfo>,
+    /// Tracks the order in which tables were added and their column offsets
+    table_order: Vec<(String, usize)>, // (alias, column_offset)
+    /// Total number of columns so far
+    total_columns: usize,
 }
 
 struct TableInfo {
     #[allow(dead_code)]
     real_name: String,
     columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
+    /// Column offset in the combined row for JOINs
+    column_offset: usize,
 }
 
 impl Scope {
     fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            table_order: Vec::new(),
+            total_columns: 0,
         }
     }
 
@@ -592,6 +646,9 @@ impl Scope {
     }
 
     fn add_table(&mut self, alias: &str, real_name: &str, table_def: &crate::catalog::TableDef) {
+        let column_offset = self.total_columns;
+        let num_columns = table_def.columns.len();
+
         self.tables.insert(
             alias.to_string(),
             TableInfo {
@@ -601,8 +658,12 @@ impl Scope {
                     .iter()
                     .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
                     .collect(),
+                column_offset,
             },
         );
+
+        self.table_order.push((alias.to_string(), column_offset));
+        self.total_columns += num_columns;
     }
 }
 

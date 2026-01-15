@@ -324,6 +324,14 @@ pub struct ResolvedOrderByItem {
     pub ascending: bool,
 }
 
+/// Resolved JOIN clause
+#[derive(Debug, Clone)]
+pub struct ResolvedJoin {
+    pub table: ResolvedTableRef,
+    pub join_type: JoinType,
+    pub condition: Option<ResolvedExpr>,
+}
+
 /// Resolved assignment for UPDATE
 #[derive(Debug, Clone)]
 pub struct ResolvedAssignment {
@@ -337,6 +345,7 @@ pub struct ResolvedSelect {
     pub distinct: bool,
     pub columns: Vec<ResolvedSelectItem>,
     pub from: Vec<ResolvedTableRef>,
+    pub joins: Vec<ResolvedJoin>,
     pub filter: Option<ResolvedExpr>,
     pub group_by: Vec<ResolvedExpr>,
     pub having: Option<ResolvedExpr>,

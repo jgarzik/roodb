@@ -21,7 +21,9 @@ async fn test_group_by_single() {
     .expect("INSERT failed");
 
     let rows: Vec<(String, i64)> = conn
-        .query("SELECT category, COUNT(*) FROM group_single_tbl GROUP BY category ORDER BY category")
+        .query(
+            "SELECT category, COUNT(*) FROM group_single_tbl GROUP BY category ORDER BY category",
+        )
         .await
         .expect("GROUP BY single column failed");
     assert_eq!(rows.len(), 2);
@@ -86,7 +88,9 @@ async fn test_group_by_with_sum() {
     .expect("INSERT failed");
 
     let rows: Vec<(String, i64)> = conn
-        .query("SELECT category, SUM(amount) FROM group_sum_tbl GROUP BY category ORDER BY category")
+        .query(
+            "SELECT category, SUM(amount) FROM group_sum_tbl GROUP BY category ORDER BY category",
+        )
         .await
         .expect("GROUP BY with SUM failed");
     assert_eq!(rows.len(), 2);
@@ -206,9 +210,11 @@ async fn test_group_by_with_where() {
     let server = TestServer::start("group_where").await;
     let mut conn = server.connect().await;
 
-    conn.query_drop("CREATE TABLE group_where_tbl (category VARCHAR(50), status VARCHAR(20), value INT)")
-        .await
-        .expect("CREATE TABLE failed");
+    conn.query_drop(
+        "CREATE TABLE group_where_tbl (category VARCHAR(50), status VARCHAR(20), value INT)",
+    )
+    .await
+    .expect("CREATE TABLE failed");
 
     conn.query_drop(
         "INSERT INTO group_where_tbl (category, status, value) VALUES

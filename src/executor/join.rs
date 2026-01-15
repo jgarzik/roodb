@@ -44,11 +44,17 @@ pub struct NestedLoopJoin {
 
 impl NestedLoopJoin {
     /// Create a new nested loop join executor
+    ///
+    /// `left_width` and `right_width` are the expected output widths.
+    /// These are needed to create null-padded rows for outer joins
+    /// even when one side is empty.
     pub fn new(
         left: Box<dyn Executor>,
         right: Box<dyn Executor>,
         join_type: JoinType,
         condition: Option<ResolvedExpr>,
+        left_width: usize,
+        right_width: usize,
     ) -> Self {
         NestedLoopJoin {
             left,
@@ -58,8 +64,8 @@ impl NestedLoopJoin {
             right_rows: Vec::new(),
             current_left: None,
             right_position: 0,
-            left_width: 0,
-            right_width: 0,
+            left_width,
+            right_width,
             left_matched: false,
             right_matched: Vec::new(),
             unmatched_right_pos: 0,
@@ -93,20 +99,14 @@ impl Executor for NestedLoopJoin {
         // Materialize right side
         self.right_rows.clear();
         while let Some(row) = self.right.next().await? {
-            if self.right_width == 0 {
-                self.right_width = row.len();
-            }
             self.right_rows.push(row);
         }
 
         // Initialize right_matched for right/full joins
         self.right_matched = vec![false; self.right_rows.len()];
 
-        // Get first left row and determine left width
+        // Get first left row
         self.current_left = self.left.next().await?;
-        if let Some(ref left_row) = self.current_left {
-            self.left_width = left_row.len();
-        }
 
         self.right_position = 0;
         self.left_matched = false;
@@ -231,7 +231,7 @@ mod tests {
             position: 0,
         });
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Cross, None);
+        let mut join = NestedLoopJoin::new(left, right, JoinType::Cross, None, 1, 1);
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -290,7 +290,7 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Inner, Some(condition));
+        let mut join = NestedLoopJoin::new(left, right, JoinType::Inner, Some(condition), 2, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -346,7 +346,7 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Left, Some(condition));
+        let mut join = NestedLoopJoin::new(left, right, JoinType::Left, Some(condition), 1, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
