@@ -76,9 +76,11 @@ async fn test_create_table_all_int_types() {
     .await
     .expect("CREATE TABLE failed");
 
-    conn.query_drop("INSERT INTO int_types (t, s, i, b) VALUES (127, 32767, 2147483647, 9223372036854775807)")
-        .await
-        .expect("INSERT failed");
+    conn.query_drop(
+        "INSERT INTO int_types (t, s, i, b) VALUES (127, 32767, 2147483647, 9223372036854775807)",
+    )
+    .await
+    .expect("INSERT failed");
 
     let rows: Vec<(i8, i16, i32, i64)> = conn
         .query("SELECT t, s, i, b FROM int_types")
