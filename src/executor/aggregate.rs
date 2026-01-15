@@ -143,6 +143,20 @@ impl HashAggregate {
         }
         hasher.finish().to_le_bytes().to_vec()
     }
+
+    /// Check if this is a COUNT(*) aggregate
+    /// COUNT(*) is parsed with a single Literal::Null argument
+    fn is_count_star(agg: &AggregateFunc) -> bool {
+        if agg.name.to_uppercase() != "COUNT" {
+            return false;
+        }
+        // COUNT(*) has a single null literal argument from the resolver
+        agg.args.len() == 1
+            && matches!(
+                &agg.args[0],
+                ResolvedExpr::Literal(crate::sql::Literal::Null)
+            )
+    }
 }
 
 #[async_trait]
@@ -177,8 +191,8 @@ impl Executor for HashAggregate {
             // Accumulate values for each aggregate
             for (i, (agg, _)) in self.aggregates.iter().enumerate() {
                 // Evaluate aggregate argument
-                let value = if agg.args.is_empty() {
-                    // COUNT(*) case
+                let value = if agg.args.is_empty() || Self::is_count_star(agg) {
+                    // COUNT(*) case - count every row
                     Datum::Int(1)
                 } else {
                     eval(&agg.args[0], &row)?

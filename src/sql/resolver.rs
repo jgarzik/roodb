@@ -95,43 +95,88 @@ impl<'a> Resolver<'a> {
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
         // Build column list (explicit or all columns)
-        let column_names =
+        let specified_columns =
             columns.unwrap_or_else(|| table_def.columns.iter().map(|c| c.name.clone()).collect());
 
-        // Resolve columns
-        let mut resolved_columns = Vec::new();
-        for col_name in &column_names {
+        // Resolve specified columns and get their indices
+        let mut column_indices = Vec::new();
+        for col_name in &specified_columns {
             let col_def = table_def
                 .get_column(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
             let idx = table_def.get_column_index(col_name).unwrap();
+
+            // Check if column is NOT NULL and not provided a default
+            // (we'll fill in NULL for missing columns later, so this is a check)
+            column_indices.push((idx, col_def.nullable, col_name.clone()));
+        }
+
+        // Build scope for expression resolution
+        let scope = Scope::single_table(&table, table_def);
+
+        // Resolve all columns for the output (always includes all table columns)
+        let mut resolved_columns = Vec::new();
+        for (idx, col_def) in table_def.columns.iter().enumerate() {
             resolved_columns.push(ResolvedColumn {
                 table: table.clone(),
-                name: col_name.clone(),
+                name: col_def.name.clone(),
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable,
             });
         }
 
-        // Build scope for expression resolution
-        let scope = Scope::single_table(&table, table_def);
-
-        // Resolve values
+        // Resolve values - expand to full rows
         let mut resolved_values = Vec::new();
         for row in values {
-            if row.len() != resolved_columns.len() {
+            if row.len() != specified_columns.len() {
                 return Err(SqlError::InvalidOperation(format!(
                     "INSERT has {} columns but {} values",
-                    resolved_columns.len(),
+                    specified_columns.len(),
                     row.len()
                 )));
             }
-            let mut resolved_row = Vec::new();
-            for expr in row {
-                resolved_row.push(self.resolve_expr(&expr, &scope)?);
+
+            // Start with NULL for all columns
+            let mut full_row: Vec<ResolvedExpr> = table_def
+                .columns
+                .iter()
+                .map(|_| ResolvedExpr::Literal(Literal::Null))
+                .collect();
+
+            // Fill in the specified values at their correct positions
+            for (value_idx, expr) in row.iter().enumerate() {
+                let (col_idx, nullable, col_name) = &column_indices[value_idx];
+                let resolved_expr = self.resolve_expr(expr, &scope)?;
+
+                // Check NOT NULL constraint for non-NULL values
+                if !nullable && matches!(resolved_expr, ResolvedExpr::Literal(Literal::Null)) {
+                    return Err(SqlError::InvalidOperation(format!(
+                        "Column '{}' cannot be NULL",
+                        col_name
+                    )));
+                }
+
+                full_row[*col_idx] = resolved_expr;
             }
-            resolved_values.push(resolved_row);
+
+            // Check NOT NULL constraints for omitted columns
+            for (idx, col_def) in table_def.columns.iter().enumerate() {
+                if !col_def.nullable
+                    && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
+                {
+                    // Check if this column was specified
+                    let was_specified = column_indices.iter().any(|(i, _, _)| *i == idx);
+                    if !was_specified {
+                        return Err(SqlError::InvalidOperation(format!(
+                            "Column '{}' cannot be NULL and was not specified",
+                            col_def.name
+                        )));
+                    }
+                }
+            }
+
+            resolved_values.push(full_row);
         }
 
         Ok(ResolvedStatement::Insert {

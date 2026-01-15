@@ -62,9 +62,7 @@ async fn test_insert_multiple_rows() {
     server.shutdown().await;
 }
 
-// BUG: INSERT with partial columns causes index out of bounds error
 #[tokio::test]
-#[ignore]
 async fn test_insert_named_columns() {
     let server = TestServer::start("insert_named").await;
     let mut conn = server.connect().await;

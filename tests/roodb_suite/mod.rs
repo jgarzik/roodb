@@ -14,5 +14,6 @@ mod harness;
 
 pub mod ddl;
 pub mod dml;
+pub mod queries;
 
 pub use harness::TestServer;

@@ -2,9 +2,10 @@
 //!
 //! Converts resolved SQL statements into logical query plans.
 
+use crate::catalog::DataType;
 use crate::sql::{
-    JoinType, Literal, ResolvedExpr, ResolvedOrderByItem, ResolvedSelect, ResolvedSelectItem,
-    ResolvedStatement, ResolvedTableRef,
+    JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedOrderByItem, ResolvedSelect,
+    ResolvedSelectItem, ResolvedStatement, ResolvedTableRef,
 };
 
 use super::expr::{AggregateFunc, OutputColumn};
@@ -94,17 +95,27 @@ impl LogicalPlanBuilder {
         if !select.group_by.is_empty() || has_aggregates {
             plan = Self::build_aggregate(plan, &select.group_by, &select.columns)?;
 
-            // After aggregation, apply HAVING
+            // After aggregation, apply HAVING (with transformed aggregates)
             if let Some(having) = select.having {
+                // Transform aggregate expressions in HAVING to column references
+                let transformed_having =
+                    Self::transform_aggregates_in_expr(&having, &select.columns, &select.group_by);
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: having,
+                    predicate: transformed_having,
                 };
             }
-        }
 
-        // 4. Apply projection (SELECT list)
-        plan = Self::build_project(plan, &select.columns)?;
+            // After aggregation, build projection that maps to aggregate output columns
+            plan = Self::build_post_aggregate_project(
+                plan,
+                &select.columns,
+                &select.group_by,
+            )?;
+        } else {
+            // 4. Apply projection (SELECT list) for non-aggregate queries
+            plan = Self::build_project(plan, &select.columns)?;
+        }
 
         // 5. Apply DISTINCT
         if select.distinct {
@@ -276,6 +287,249 @@ impl LogicalPlanBuilder {
             input: Box::new(input),
             expressions,
         })
+    }
+
+    /// Build projection after aggregate node
+    ///
+    /// The aggregate output is: [group_by_cols..., aggregate_results...]
+    /// We need to transform the original expressions to reference these output columns.
+    fn build_post_aggregate_project(
+        input: LogicalPlan,
+        columns: &[ResolvedSelectItem],
+        group_by: &[ResolvedExpr],
+    ) -> PlannerResult<LogicalPlan> {
+        let mut expressions = Vec::new();
+        let mut agg_idx = 0usize; // Track which aggregate we're on
+
+        for (idx, item) in columns.iter().enumerate() {
+            match item {
+                ResolvedSelectItem::Expr { expr, alias } => {
+                    let name = alias.clone().unwrap_or_else(|| Self::expr_name(expr, idx));
+
+                    // Check if this expression is an aggregate function
+                    if Self::expr_has_aggregate(expr) {
+                        // Map to aggregate result column (after group_by columns)
+                        let col_idx = group_by.len() + agg_idx;
+                        let result_type = Self::get_aggregate_result_type(expr);
+                        let col_ref = ResolvedExpr::Column(ResolvedColumn {
+                            table: String::new(),
+                            name: name.clone(),
+                            index: col_idx,
+                            data_type: result_type,
+                            nullable: true,
+                        });
+                        expressions.push((col_ref, name));
+                        agg_idx += 1;
+                    } else {
+                        // Non-aggregate expression - check if it's a group-by column
+                        if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
+                            let result_type = Self::get_expr_type(expr);
+                            let col_ref = ResolvedExpr::Column(ResolvedColumn {
+                                table: String::new(),
+                                name: name.clone(),
+                                index: gb_idx,
+                                data_type: result_type,
+                                nullable: true,
+                            });
+                            expressions.push((col_ref, name));
+                        } else {
+                            // Expression not in GROUP BY - pass through
+                            // (should be an error in strict SQL, but let's allow it)
+                            expressions.push((expr.clone(), name));
+                        }
+                    }
+                }
+                ResolvedSelectItem::Columns(cols) => {
+                    // Wildcards shouldn't appear in aggregate queries typically
+                    for col in cols {
+                        let expr = ResolvedExpr::Column(col.clone());
+                        expressions.push((expr, col.name.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(LogicalPlan::Project {
+            input: Box::new(input),
+            expressions,
+        })
+    }
+
+    /// Get the result type for an aggregate expression
+    fn get_aggregate_result_type(expr: &ResolvedExpr) -> DataType {
+        match expr {
+            ResolvedExpr::Function { name, result_type, .. } => {
+                let upper = name.to_uppercase();
+                match upper.as_str() {
+                    "COUNT" => DataType::BigInt,
+                    "SUM" => DataType::Double,
+                    "AVG" => DataType::Double,
+                    _ => result_type.clone(),
+                }
+            }
+            _ => DataType::Int,
+        }
+    }
+
+    /// Get the type of an expression
+    fn get_expr_type(expr: &ResolvedExpr) -> DataType {
+        match expr {
+            ResolvedExpr::Column(col) => col.data_type.clone(),
+            ResolvedExpr::Literal(lit) => match lit {
+                Literal::Integer(_) => DataType::Int,
+                Literal::Float(_) => DataType::Double,
+                Literal::String(_) => DataType::Text,
+                Literal::Boolean(_) => DataType::Boolean,
+                Literal::Null => DataType::Int,
+                Literal::Blob(_) => DataType::Blob,
+            },
+            ResolvedExpr::Function { result_type, .. } => result_type.clone(),
+            ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
+            _ => DataType::Int,
+        }
+    }
+
+    /// Find if an expression matches one in the group-by list
+    fn find_in_group_by(expr: &ResolvedExpr, group_by: &[ResolvedExpr]) -> Option<usize> {
+        for (idx, gb_expr) in group_by.iter().enumerate() {
+            if Self::exprs_equal(expr, gb_expr) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Check if two expressions are structurally equal
+    fn exprs_equal(a: &ResolvedExpr, b: &ResolvedExpr) -> bool {
+        match (a, b) {
+            (ResolvedExpr::Column(ca), ResolvedExpr::Column(cb)) => {
+                ca.table == cb.table && ca.name == cb.name && ca.index == cb.index
+            }
+            (ResolvedExpr::Literal(la), ResolvedExpr::Literal(lb)) => la == lb,
+            _ => false, // Simplified - could be more thorough
+        }
+    }
+
+    /// Transform aggregate expressions in an expression tree to column references
+    /// Used for HAVING clauses where aggregates need to reference aggregate output
+    fn transform_aggregates_in_expr(
+        expr: &ResolvedExpr,
+        columns: &[ResolvedSelectItem],
+        group_by: &[ResolvedExpr],
+    ) -> ResolvedExpr {
+        match expr {
+            ResolvedExpr::Function { name, args, .. } => {
+                let upper = name.to_uppercase();
+                if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                    // This is an aggregate function - find its index in the aggregate output
+                    if let Some(agg_idx) = Self::find_aggregate_index(expr, columns) {
+                        let col_idx = group_by.len() + agg_idx;
+                        let result_type = Self::get_aggregate_result_type(expr);
+                        return ResolvedExpr::Column(ResolvedColumn {
+                            table: String::new(),
+                            name: upper,
+                            index: col_idx,
+                            data_type: result_type,
+                            nullable: true,
+                        });
+                    }
+                }
+                // Non-aggregate function - transform arguments
+                ResolvedExpr::Function {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::transform_aggregates_in_expr(a, columns, group_by))
+                        .collect(),
+                    distinct: false,
+                    result_type: Self::get_expr_type(expr),
+                }
+            }
+            ResolvedExpr::BinaryOp {
+                left,
+                op,
+                right,
+                result_type,
+            } => ResolvedExpr::BinaryOp {
+                left: Box::new(Self::transform_aggregates_in_expr(left, columns, group_by)),
+                op: *op,
+                right: Box::new(Self::transform_aggregates_in_expr(right, columns, group_by)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::UnaryOp {
+                op,
+                expr: inner,
+                result_type,
+            } => ResolvedExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(Self::transform_aggregates_in_expr(inner, columns, group_by)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::Column(col) => {
+                // Check if this column is in the group-by list
+                if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
+                    ResolvedExpr::Column(ResolvedColumn {
+                        table: String::new(),
+                        name: col.name.clone(),
+                        index: gb_idx,
+                        data_type: col.data_type.clone(),
+                        nullable: col.nullable,
+                    })
+                } else {
+                    expr.clone()
+                }
+            }
+            // Other expressions pass through unchanged
+            _ => expr.clone(),
+        }
+    }
+
+    /// Find the index of an aggregate function in the SELECT list
+    fn find_aggregate_index(target: &ResolvedExpr, columns: &[ResolvedSelectItem]) -> Option<usize> {
+        let mut agg_idx = 0usize;
+        for item in columns {
+            if let ResolvedSelectItem::Expr { expr, .. } = item {
+                if Self::expr_has_aggregate(expr) {
+                    if Self::aggregates_match(target, expr) {
+                        return Some(agg_idx);
+                    }
+                    agg_idx += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if two aggregate expressions match (same function and arguments)
+    fn aggregates_match(a: &ResolvedExpr, b: &ResolvedExpr) -> bool {
+        match (a, b) {
+            (
+                ResolvedExpr::Function {
+                    name: name_a,
+                    args: args_a,
+                    ..
+                },
+                ResolvedExpr::Function {
+                    name: name_b,
+                    args: args_b,
+                    ..
+                },
+            ) => {
+                if name_a.to_uppercase() != name_b.to_uppercase() {
+                    return false;
+                }
+                if args_a.len() != args_b.len() {
+                    return false;
+                }
+                args_a.iter().zip(args_b.iter()).all(|(aa, ab)| {
+                    // Simple structural match for arguments
+                    Self::exprs_equal(aa, ab)
+                        || (matches!(aa, ResolvedExpr::Literal(Literal::Null))
+                            && matches!(ab, ResolvedExpr::Literal(Literal::Null)))
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Generate a name for an expression
