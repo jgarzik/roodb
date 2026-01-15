@@ -44,9 +44,7 @@ async fn test_syntax_error_unclosed_string() {
     let mut conn = server.connect().await;
 
     // Unclosed string literal
-    let result: Result<(), _> = conn
-        .query_drop("SELECT 'unclosed string")
-        .await;
+    let result: Result<(), _> = conn.query_drop("SELECT 'unclosed string").await;
     assert!(result.is_err(), "Expected syntax error for unclosed string");
 
     drop(conn);
@@ -63,9 +61,7 @@ async fn test_syntax_error_missing_values() {
         .expect("CREATE TABLE failed");
 
     // INSERT without VALUES
-    let result: Result<(), _> = conn
-        .query_drop("INSERT INTO err_syntax_tbl (id)")
-        .await;
+    let result: Result<(), _> = conn.query_drop("INSERT INTO err_syntax_tbl (id)").await;
     assert!(result.is_err(), "Expected syntax error");
 
     conn.query_drop("DROP TABLE err_syntax_tbl")

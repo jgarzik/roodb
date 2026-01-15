@@ -49,10 +49,11 @@ async fn test_many_columns() {
 
     // Insert a row with all columns
     let vals: Vec<String> = (1..=20).map(|i| i.to_string()).collect();
-    let insert_sql = format!("INSERT INTO edge_many_cols_tbl VALUES ({})", vals.join(", "));
-    conn.query_drop(&insert_sql)
-        .await
-        .expect("INSERT failed");
+    let insert_sql = format!(
+        "INSERT INTO edge_many_cols_tbl VALUES ({})",
+        vals.join(", ")
+    );
+    conn.query_drop(&insert_sql).await.expect("INSERT failed");
 
     // Select specific columns to verify
     let rows: Vec<(i32, i32, i32)> = conn
@@ -91,9 +92,7 @@ async fn test_many_rows() {
             "INSERT INTO edge_many_rows_tbl (id, value) VALUES {}",
             vals.join(", ")
         );
-        conn.query_drop(&insert_sql)
-            .await
-            .expect("INSERT failed");
+        conn.query_drop(&insert_sql).await.expect("INSERT failed");
     }
 
     // Verify count

@@ -325,11 +325,9 @@ async fn test_timestamp_type() {
         .await
         .expect("CREATE TABLE failed");
 
-    conn.query_drop(
-        "INSERT INTO type_timestamp_tbl (val) VALUES ('2024-01-15 12:30:45')",
-    )
-    .await
-    .expect("INSERT failed");
+    conn.query_drop("INSERT INTO type_timestamp_tbl (val) VALUES ('2024-01-15 12:30:45')")
+        .await
+        .expect("INSERT failed");
 
     // Query as string to verify format
     let rows: Vec<(String,)> = conn

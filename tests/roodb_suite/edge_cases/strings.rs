@@ -160,7 +160,10 @@ async fn test_case_sensitivity() {
 
     // Verify different case fails (RooDB is case-sensitive)
     let result: Result<Vec<(i32,)>, _> = conn.query("SELECT mycol FROM edgecasetbl").await;
-    assert!(result.is_err(), "Different case should fail - RooDB is case-sensitive");
+    assert!(
+        result.is_err(),
+        "Different case should fail - RooDB is case-sensitive"
+    );
 
     conn.query_drop("DROP TABLE EdgeCaseTbl")
         .await

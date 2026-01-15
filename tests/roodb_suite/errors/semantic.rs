@@ -97,9 +97,7 @@ async fn test_drop_nonexistent_table() {
     let mut conn = server.connect().await;
 
     // Try to drop a table that doesn't exist
-    let result: Result<(), _> = conn
-        .query_drop("DROP TABLE nonexistent_drop_tbl")
-        .await;
+    let result: Result<(), _> = conn.query_drop("DROP TABLE nonexistent_drop_tbl").await;
     assert!(result.is_err(), "Expected table not found error on DROP");
 
     drop(conn);
@@ -119,9 +117,8 @@ async fn test_ambiguous_column() {
         .expect("CREATE TABLE b failed");
 
     // SELECT ambiguous column 'id' without table qualifier
-    let result: Result<Vec<(i32,)>, _> = conn
-        .query("SELECT id FROM err_ambig_a, err_ambig_b")
-        .await;
+    let result: Result<Vec<(i32,)>, _> =
+        conn.query("SELECT id FROM err_ambig_a, err_ambig_b").await;
     assert!(result.is_err(), "Expected ambiguous column error");
 
     let err = result.unwrap_err();
