@@ -12,6 +12,7 @@
 
 mod harness;
 
+pub mod auth;
 pub mod cluster;
 pub mod ddl;
 pub mod dml;

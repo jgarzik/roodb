@@ -402,6 +402,9 @@ async fn test_server_integration_e2e() {
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
+    // Initialize root user with empty password for tests
+    test_utils::auth::initialize_root_user(&storage, "").await;
+
     // Find available port
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = std::net::TcpListener::bind(addr).unwrap();
@@ -497,6 +500,9 @@ async fn test_transaction_begin_commit() {
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
+    // Initialize root user with empty password for tests
+    test_utils::auth::initialize_root_user(&storage, "").await;
+
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = std::net::TcpListener::bind(addr).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -587,6 +593,9 @@ async fn test_transaction_rollback() {
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    // Initialize root user with empty password for tests
+    test_utils::auth::initialize_root_user(&storage, "").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = std::net::TcpListener::bind(addr).unwrap();
@@ -680,6 +689,9 @@ async fn test_autocommit() {
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
+
+    // Initialize root user with empty password for tests
+    test_utils::auth::initialize_root_user(&storage, "").await;
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = std::net::TcpListener::bind(addr).unwrap();

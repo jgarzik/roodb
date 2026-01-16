@@ -33,6 +33,15 @@ impl TypeChecker {
             } => Self::check_update(assignments, filter),
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
+
+            // Auth statements don't need type checking
+            ResolvedStatement::CreateUser { .. }
+            | ResolvedStatement::AlterUser { .. }
+            | ResolvedStatement::DropUser { .. }
+            | ResolvedStatement::SetPassword { .. }
+            | ResolvedStatement::Grant { .. }
+            | ResolvedStatement::Revoke { .. }
+            | ResolvedStatement::ShowGrants { .. } => Ok(()),
         }
     }
 

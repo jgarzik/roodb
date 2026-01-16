@@ -240,8 +240,89 @@ pub fn verify_native_password(scramble: &[u8], password: &str, auth_response: &[
     expected == auth_response
 }
 
-/// Compute native password auth response (for testing)
-#[cfg(test)]
+/// Verify native password using stored double SHA1 hash
+///
+/// The stored hash is SHA1(SHA1(password)) in hex format.
+/// This allows server-side verification without knowing the plaintext password.
+///
+/// Auth response from client: SHA1(password) XOR SHA1(scramble || stored_hash)
+///
+/// To verify:
+/// 1. Compute SHA1(scramble || stored_hash) -> scrambled
+/// 2. XOR auth_response with scrambled -> candidate_stage1
+/// 3. Compute SHA1(candidate_stage1) -> candidate_stage2
+/// 4. Compare candidate_stage2 with stored_hash
+pub fn verify_native_password_with_hash(
+    scramble: &[u8],
+    stored_hash_hex: &str,
+    auth_response: &[u8],
+) -> bool {
+    // Empty stored hash means empty password
+    if stored_hash_hex.is_empty() {
+        return auth_response.is_empty();
+    }
+
+    // Empty auth response with non-empty stored hash = wrong password
+    if auth_response.is_empty() {
+        return false;
+    }
+
+    if auth_response.len() != 20 {
+        return false;
+    }
+
+    // Decode stored hash from hex (it's SHA1(SHA1(password)))
+    let stored_hash = match hex::decode(stored_hash_hex) {
+        Ok(h) if h.len() == 20 => h,
+        _ => return false,
+    };
+
+    // Step 1: Compute SHA1(scramble || stored_hash)
+    let mut hasher = Sha1::new();
+    hasher.update(scramble);
+    hasher.update(&stored_hash);
+    let scrambled = hasher.finalize();
+
+    // Step 2: XOR auth_response with scrambled to get candidate_stage1
+    let mut candidate_stage1 = [0u8; 20];
+    for i in 0..20 {
+        candidate_stage1[i] = auth_response[i] ^ scrambled[i];
+    }
+
+    // Step 3: Compute SHA1(candidate_stage1) to get candidate_stage2
+    let mut hasher = Sha1::new();
+    hasher.update(candidate_stage1);
+    let candidate_stage2 = hasher.finalize();
+
+    // Step 4: Compare candidate_stage2 with stored_hash
+    candidate_stage2.as_slice() == stored_hash.as_slice()
+}
+
+/// Compute double SHA1 hash for password storage (mysql_native_password format)
+///
+/// Returns hex-encoded SHA1(SHA1(password))
+pub fn compute_password_hash(password: &str) -> String {
+    if password.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: SHA1(password)
+    let mut hasher = Sha1::new();
+    hasher.update(password.as_bytes());
+    let stage1 = hasher.finalize();
+
+    // Step 2: SHA1(SHA1(password))
+    let mut hasher = Sha1::new();
+    hasher.update(stage1);
+    let stage2 = hasher.finalize();
+
+    hex::encode(stage2)
+}
+
+/// Compute native password auth response
+///
+/// This computes the client-side auth response for mysql_native_password.
+/// Used for testing and by MySQL clients.
 pub fn compute_auth_response(scramble: &[u8], password: &str) -> Vec<u8> {
     if password.is_empty() {
         return Vec::new();
@@ -301,6 +382,54 @@ mod tests {
         let mut bad_response = auth_response.clone();
         bad_response[0] ^= 0xff;
         assert!(!verify_native_password(scramble, password, &bad_response));
+    }
+
+    #[test]
+    fn test_verify_with_stored_hash() {
+        let scramble = b"12345678901234567890";
+        let password = "secret";
+
+        // Compute stored hash (SHA1(SHA1(password)) in hex)
+        let stored_hash = compute_password_hash(password);
+        assert_eq!(stored_hash.len(), 40); // 20 bytes in hex
+
+        // Compute auth response as client would
+        let auth_response = compute_auth_response(scramble, password);
+
+        // Verify using stored hash
+        assert!(verify_native_password_with_hash(
+            scramble,
+            &stored_hash,
+            &auth_response
+        ));
+
+        // Wrong password should fail
+        let wrong_response = compute_auth_response(scramble, "wrong");
+        assert!(!verify_native_password_with_hash(
+            scramble,
+            &stored_hash,
+            &wrong_response
+        ));
+    }
+
+    #[test]
+    fn test_verify_empty_password_with_hash() {
+        let scramble = b"12345678901234567890";
+
+        // Empty password should have empty hash
+        let stored_hash = compute_password_hash("");
+        assert!(stored_hash.is_empty());
+
+        // Empty auth response should verify for empty password
+        assert!(verify_native_password_with_hash(scramble, "", &[]));
+
+        // Non-empty auth response should fail
+        let auth_response = compute_auth_response(scramble, "nonempty");
+        assert!(!verify_native_password_with_hash(
+            scramble,
+            "",
+            &auth_response
+        ));
     }
 
     #[test]

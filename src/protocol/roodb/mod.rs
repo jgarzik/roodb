@@ -21,19 +21,22 @@ use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tracing::{debug, info, warn};
 
+use crate::catalog::system_tables::SYSTEM_USERS;
 use crate::catalog::Catalog;
+use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
 use crate::executor::engine::ExecutorEngine;
-use crate::executor::{Executor, TransactionContext};
+use crate::executor::{Datum, Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
 use crate::raft::{ChangeSet, RaftNode};
 use crate::server::session::Session;
+use crate::sql::privileges::HostPattern;
 use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
 use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
 
-use self::auth::{verify_native_password, HandshakeResponse41};
+use self::auth::{verify_native_password_with_hash, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
@@ -43,10 +46,6 @@ use self::resultset::{
     default_status, encode_column_count, encode_eof_packet, encode_err_packet, encode_ok_packet,
     encode_text_row, ColumnDefinition41,
 };
-
-/// Hardcoded credentials for MVP
-const ROOT_USER: &str = "root";
-const ROOT_PASSWORD: &str = "";
 
 /// Internal enum for planning errors (used to avoid holding guard across await)
 enum PlanError {
@@ -177,7 +176,7 @@ where
 
         info!(
             connection_id = self.connection_id,
-            username = ROOT_USER,
+            username = %self.session.user,
             "Handshake completed over TLS"
         );
 
@@ -218,7 +217,7 @@ where
 
         info!(
             connection_id = self.connection_id,
-            username = ROOT_USER,
+            username = %self.session.user,
             "Handshake completed"
         );
 
@@ -248,21 +247,126 @@ where
                 .await;
         }
 
-        if response.username != ROOT_USER {
+        // Look up user in system.users table
+        // For now, use "%" as the client host pattern (TODO: get actual client IP)
+        let client_host = "%";
+        let user_info = self
+            .lookup_user(&response.username, client_host)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "User lookup failed");
+                ProtocolError::AuthFailed("Internal error during authentication".to_string())
+            })?;
+
+        let Some((password_hash, account_locked, password_expired)) = user_info else {
             warn!(username = %response.username, "Unknown user");
+            return self.send_auth_error("Access denied").await;
+        };
+
+        // Check account status
+        if account_locked {
+            warn!(username = %response.username, "Account is locked");
+            return self.send_auth_error("Account is locked").await;
+        }
+
+        if password_expired {
+            warn!(username = %response.username, "Password has expired");
+            return self.send_auth_error("Password has expired").await;
+        }
+
+        // Verify password
+        if !verify_native_password_with_hash(
+            &self.scramble,
+            &password_hash,
+            &response.auth_response,
+        ) {
+            warn!(username = %response.username, "Password verification failed");
             return self.send_auth_error("Access denied").await;
         }
 
-        if !verify_native_password(&self.scramble, ROOT_PASSWORD, &response.auth_response) {
-            warn!("Password verification failed");
-            return self.send_auth_error("Access denied").await;
-        }
+        // Set authenticated user in session
+        self.session.set_user(response.username.clone());
 
         if let Some(ref db) = response.database {
             self.database = Some(db.clone());
         }
 
         Ok(())
+    }
+
+    /// Look up a user in system.users table
+    ///
+    /// Returns Some((password_hash, account_locked, password_expired)) if found, None otherwise.
+    /// Matches user by username and host pattern.
+    async fn lookup_user(
+        &self,
+        username: &str,
+        client_host: &str,
+    ) -> Result<Option<(String, bool, bool)>, ProtocolError> {
+        // Scan system.users table
+        let prefix = table_key_prefix(SYSTEM_USERS);
+        let end = table_key_end(SYSTEM_USERS);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+
+        // Find matching user row
+        // system.users schema: username, host, password_hash, auth_plugin,
+        //   ssl_subject, ssl_issuer, account_locked, password_expired, created_at, updated_at
+        for (_key, value) in rows {
+            let row = match decode_row(&value) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Get username from row (column 0)
+            let row_username = match row.get_opt(0) {
+                Some(Datum::String(s)) => s,
+                _ => continue,
+            };
+
+            if row_username != username {
+                continue;
+            }
+
+            // Get host pattern from row (column 1)
+            let row_host = match row.get_opt(1) {
+                Some(Datum::String(s)) => s,
+                _ => continue,
+            };
+
+            // Check if client host matches the host pattern
+            let host_pattern = HostPattern::new(row_host);
+            if !host_pattern.matches(client_host, None) {
+                continue;
+            }
+
+            // Get password_hash (column 2)
+            let password_hash = match row.get_opt(2) {
+                Some(Datum::String(s)) => s.clone(),
+                Some(Datum::Null) | None => String::new(),
+                _ => continue,
+            };
+
+            // Get account_locked (column 6)
+            let account_locked = match row.get_opt(6) {
+                Some(Datum::Bool(b)) => *b,
+                _ => false,
+            };
+
+            // Get password_expired (column 7)
+            let password_expired = match row.get_opt(7) {
+                Some(Datum::Bool(b)) => *b,
+                _ => false,
+            };
+
+            return Ok(Some((password_hash, account_locked, password_expired)));
+        }
+
+        Ok(None)
     }
 
     /// Run the command loop
@@ -994,11 +1098,52 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::auth::{compute_password_hash, verify_native_password_with_hash};
 
     #[test]
-    fn test_root_credentials() {
-        assert_eq!(ROOT_USER, "root");
-        assert_eq!(ROOT_PASSWORD, "");
+    fn test_password_hash_verification() {
+        let scramble = b"12345678901234567890";
+        let password = "secret123";
+
+        // Compute stored hash (what would be in system.users)
+        let stored_hash = compute_password_hash(password);
+
+        // Compute auth response as client would
+        let auth_response = super::auth::compute_auth_response(scramble, password);
+
+        // Verify using stored hash
+        assert!(verify_native_password_with_hash(
+            scramble,
+            &stored_hash,
+            &auth_response
+        ));
+
+        // Wrong password should fail
+        let wrong_response = super::auth::compute_auth_response(scramble, "wrongpassword");
+        assert!(!verify_native_password_with_hash(
+            scramble,
+            &stored_hash,
+            &wrong_response
+        ));
+    }
+
+    #[test]
+    fn test_empty_password_verification() {
+        let scramble = b"12345678901234567890";
+
+        // Empty password should have empty hash and empty auth response
+        let stored_hash = compute_password_hash("");
+        assert!(stored_hash.is_empty());
+
+        // Empty auth response should match empty password
+        assert!(verify_native_password_with_hash(scramble, "", &[]));
+
+        // Non-empty auth response should fail for empty password
+        let auth_response = super::auth::compute_auth_response(scramble, "nonempty");
+        assert!(!verify_native_password_with_hash(
+            scramble,
+            "",
+            &auth_response
+        ));
     }
 }

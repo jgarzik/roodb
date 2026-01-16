@@ -16,6 +16,7 @@ use crate::planner::logical::{
     UnaryOp,
 };
 use crate::sql::error::{SqlError, SqlResult};
+use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 /// Name resolver
 pub struct Resolver<'a> {
@@ -48,6 +49,28 @@ impl<'a> Resolver<'a> {
             } => self.resolve_update(&table, &assignments, &selection),
             sp::Statement::Delete(delete) => self.resolve_delete(&delete),
             sp::Statement::Query(query) => self.resolve_query(&query),
+
+            // Auth statements
+            sp::Statement::CreateRole {
+                names,
+                if_not_exists,
+                password,
+                ..
+            } => self.resolve_create_user(&names, if_not_exists, &password),
+            sp::Statement::Grant {
+                privileges,
+                objects,
+                grantees,
+                with_grant_option,
+                ..
+            } => self.resolve_grant(&privileges, &objects, &grantees, with_grant_option),
+            sp::Statement::Revoke {
+                privileges,
+                objects,
+                grantees,
+                ..
+            } => self.resolve_revoke(&privileges, &objects, &grantees),
+
             _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
         }
     }
@@ -793,6 +816,224 @@ impl<'a> Resolver<'a> {
                 }
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
             }
+        }
+    }
+
+    // ============ Auth statement resolution ============
+
+    /// Resolve CREATE USER (uses CREATE ROLE in sqlparser)
+    fn resolve_create_user(
+        &self,
+        names: &[sp::ObjectName],
+        if_not_exists: bool,
+        password: &Option<sp::Password>,
+    ) -> SqlResult<ResolvedStatement> {
+        if names.is_empty() {
+            return Err(SqlError::Parse("CREATE USER requires a name".to_string()));
+        }
+
+        // Parse 'user'@'host' format or just 'user'
+        let (username, host) = parse_user_host(&names[0])?;
+
+        // Extract password from Password enum
+        let pwd = password.as_ref().and_then(|p| match p {
+            sp::Password::Password(expr) => extract_string_literal(expr),
+            sp::Password::NullPassword => None,
+        });
+
+        Ok(ResolvedStatement::CreateUser {
+            username,
+            host,
+            password: pwd,
+            if_not_exists,
+        })
+    }
+
+    /// Resolve GRANT statement
+    fn resolve_grant(
+        &self,
+        privileges: &sp::Privileges,
+        objects: &sp::GrantObjects,
+        grantees: &[sp::Ident],
+        with_grant_option: bool,
+    ) -> SqlResult<ResolvedStatement> {
+        let resolved_privileges = convert_privileges(privileges)?;
+        let object = convert_grant_objects(objects)?;
+
+        if grantees.is_empty() {
+            return Err(SqlError::Parse(
+                "GRANT requires at least one grantee".to_string(),
+            ));
+        }
+
+        // Parse first grantee's 'user'@'host' format
+        let (grantee, grantee_host) = parse_grantee(&grantees[0])?;
+
+        Ok(ResolvedStatement::Grant {
+            privileges: resolved_privileges,
+            object,
+            grantee,
+            grantee_host,
+            with_grant_option,
+        })
+    }
+
+    /// Resolve REVOKE statement
+    fn resolve_revoke(
+        &self,
+        privileges: &sp::Privileges,
+        objects: &sp::GrantObjects,
+        grantees: &[sp::Ident],
+    ) -> SqlResult<ResolvedStatement> {
+        let resolved_privileges = convert_privileges(privileges)?;
+        let object = convert_grant_objects(objects)?;
+
+        if grantees.is_empty() {
+            return Err(SqlError::Parse(
+                "REVOKE requires at least one grantee".to_string(),
+            ));
+        }
+
+        // Parse first grantee's 'user'@'host' format
+        let (grantee, grantee_host) = parse_grantee(&grantees[0])?;
+
+        Ok(ResolvedStatement::Revoke {
+            privileges: resolved_privileges,
+            object,
+            grantee,
+            grantee_host,
+        })
+    }
+}
+
+// ============ Auth helpers ============
+
+/// Parse 'user'@'host' format from ObjectName
+fn parse_user_host(name: &sp::ObjectName) -> SqlResult<(String, HostPattern)> {
+    // ObjectName is a Vec<Ident> - typically just one element for users
+    // MySQL format: 'user'@'host' - sqlparser may not parse this directly
+    // so we handle common cases
+    let full_name = name.to_string();
+
+    // Check for @host pattern
+    if let Some(at_pos) = full_name.find('@') {
+        let username = full_name[..at_pos].trim_matches('\'').to_string();
+        let host = full_name[at_pos + 1..].trim_matches('\'').to_string();
+        Ok((username, HostPattern::new(host)))
+    } else {
+        // No host specified - default to '%' (any host)
+        let username = full_name.trim_matches('\'').to_string();
+        Ok((username, HostPattern::any()))
+    }
+}
+
+/// Parse grantee identifier (may include host)
+fn parse_grantee(ident: &sp::Ident) -> SqlResult<(String, HostPattern)> {
+    let full_name = ident.value.clone();
+
+    // Check for @host pattern
+    if let Some(at_pos) = full_name.find('@') {
+        let username = full_name[..at_pos].trim_matches('\'').to_string();
+        let host = full_name[at_pos + 1..].trim_matches('\'').to_string();
+        Ok((username, HostPattern::new(host)))
+    } else {
+        // No host specified - default to '%' (any host)
+        Ok((full_name, HostPattern::any()))
+    }
+}
+
+/// Extract string literal from expression
+fn extract_string_literal(expr: &sp::Expr) -> Option<String> {
+    match expr {
+        sp::Expr::Value(sp::Value::SingleQuotedString(s)) => Some(s.clone()),
+        sp::Expr::Value(sp::Value::DoubleQuotedString(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Convert sqlparser Privileges to our Privilege type
+fn convert_privileges(privs: &sp::Privileges) -> SqlResult<Vec<Privilege>> {
+    match privs {
+        sp::Privileges::All { .. } => Ok(vec![Privilege::All]),
+        sp::Privileges::Actions(actions) => {
+            let mut result = Vec::new();
+            for action in actions {
+                if let Some(p) = convert_single_privilege(action) {
+                    result.push(p);
+                }
+            }
+            if result.is_empty() {
+                Err(SqlError::Unsupported(
+                    "No recognized privileges".to_string(),
+                ))
+            } else {
+                Ok(result)
+            }
+        }
+    }
+}
+
+/// Convert a single privilege action
+fn convert_single_privilege(action: &sp::Action) -> Option<Privilege> {
+    match action {
+        sp::Action::Select { .. } => Some(Privilege::Select),
+        sp::Action::Insert { .. } => Some(Privilege::Insert),
+        sp::Action::Update { .. } => Some(Privilege::Update),
+        sp::Action::Delete => Some(Privilege::Delete),
+        sp::Action::Create => Some(Privilege::Create),
+        sp::Action::Truncate => Some(Privilege::Delete), // Map truncate to delete privilege
+        // Note: DROP, ALTER, INDEX, GRANT OPTION are not in sqlparser's Action enum
+        // They need to be handled separately if needed (e.g., via ALL PRIVILEGES)
+        _ => None, // Unsupported privilege
+    }
+}
+
+/// Convert grant objects to PrivilegeObject
+fn convert_grant_objects(objects: &sp::GrantObjects) -> SqlResult<PrivilegeObject> {
+    match objects {
+        sp::GrantObjects::AllTablesInSchema { schemas } => {
+            // Database-level: db.*
+            if schemas.is_empty() {
+                Ok(PrivilegeObject::Global)
+            } else {
+                let db_name = schemas[0].to_string();
+                Ok(PrivilegeObject::Database(db_name))
+            }
+        }
+        sp::GrantObjects::Tables(tables) => {
+            // Table-level: db.table
+            if tables.is_empty() {
+                Ok(PrivilegeObject::Global)
+            } else {
+                let table_name = tables[0].to_string();
+                // Parse db.table format
+                if let Some(dot_pos) = table_name.find('.') {
+                    let db = table_name[..dot_pos].to_string();
+                    let table = table_name[dot_pos + 1..].to_string();
+                    Ok(PrivilegeObject::Table {
+                        database: db,
+                        table,
+                    })
+                } else {
+                    // No database specified - treat as table in current database
+                    Ok(PrivilegeObject::Table {
+                        database: String::new(),
+                        table: table_name,
+                    })
+                }
+            }
+        }
+        sp::GrantObjects::AllSequencesInSchema { .. } => {
+            // Not supported - treat as global
+            Ok(PrivilegeObject::Global)
+        }
+        sp::GrantObjects::Sequences(_) => {
+            // Not supported - treat as global
+            Ok(PrivilegeObject::Global)
+        }
+        sp::GrantObjects::Schemas(_) => {
+            // Schema-level - treat as database-level
+            Ok(PrivilegeObject::Global)
         }
     }
 }

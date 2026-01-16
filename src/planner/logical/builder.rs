@@ -74,6 +74,17 @@ impl LogicalPlanBuilder {
                 unique,
             }),
             ResolvedStatement::DropIndex { name } => Ok(LogicalPlan::DropIndex { name }),
+
+            // Auth statements are handled directly by the executor without a logical plan
+            ResolvedStatement::CreateUser { .. }
+            | ResolvedStatement::AlterUser { .. }
+            | ResolvedStatement::DropUser { .. }
+            | ResolvedStatement::SetPassword { .. }
+            | ResolvedStatement::Grant { .. }
+            | ResolvedStatement::Revoke { .. }
+            | ResolvedStatement::ShowGrants { .. } => Err(PlannerError::InvalidPlan(
+                "Auth statements do not use logical plans".to_string(),
+            )),
         }
     }
 

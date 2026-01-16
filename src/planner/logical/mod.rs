@@ -10,6 +10,7 @@ pub use builder::LogicalPlanBuilder;
 pub use expr::{AggregateFunc, ColumnId, OutputColumn};
 
 use crate::catalog::{ColumnDef, Constraint, DataType};
+use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 // ============ Operator types (shared with resolver/executor) ============
 
@@ -265,6 +266,53 @@ pub enum ResolvedStatement {
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
+
+    // ============ Auth/User Management ============
+    /// CREATE USER 'name'@'host' IDENTIFIED BY 'password'
+    CreateUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+        if_not_exists: bool,
+    },
+    /// ALTER USER 'name'@'host' IDENTIFIED BY 'password'
+    AlterUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+    },
+    /// DROP USER 'name'@'host'
+    DropUser {
+        username: String,
+        host: HostPattern,
+        if_exists: bool,
+    },
+    /// SET PASSWORD FOR 'name'@'host' = 'password'
+    SetPassword {
+        username: String,
+        host: HostPattern,
+        password: String,
+    },
+    /// GRANT privilege ON object TO 'user'@'host' [WITH GRANT OPTION]
+    Grant {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+        with_grant_option: bool,
+    },
+    /// REVOKE privilege ON object FROM 'user'@'host'
+    Revoke {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+    },
+    /// SHOW GRANTS [FOR 'user'@'host']
+    ShowGrants {
+        /// If None, show grants for current user
+        for_user: Option<(String, HostPattern)>,
+    },
 }
 
 /// Logical plan node
