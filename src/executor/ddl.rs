@@ -6,7 +6,6 @@
 //! (system.tables, system.columns, system.indexes). When raft_node is provided, changes
 //! are proposed to Raft and the catalog is updated when apply() processes the changes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,19 +17,13 @@ use crate::catalog::system_tables::{
 };
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
+use crate::storage::next_row_id;
 
 use super::datum::Datum;
 use super::encoding::{encode_row, encode_row_key};
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
-
-/// Row ID counter for DDL operations
-static DDL_ROW_ID: AtomicU64 = AtomicU64::new(3_000_000);
-
-fn next_row_id() -> u64 {
-    DDL_ROW_ID.fetch_add(1, Ordering::SeqCst)
-}
 
 /// CREATE TABLE executor
 pub struct CreateTable {

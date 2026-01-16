@@ -2,7 +2,6 @@
 //!
 //! Implements CREATE USER, DROP USER, ALTER USER, GRANT, REVOKE, SHOW GRANTS.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,19 +12,13 @@ use crate::catalog::Catalog;
 use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::server::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
+use crate::storage::next_row_id;
 
 use super::datum::Datum;
 use super::encoding::{encode_row, encode_row_key, table_key_end, table_key_prefix};
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
-
-/// Row ID counter for auth operations
-static AUTH_ROW_ID: AtomicU64 = AtomicU64::new(2_000_000);
-
-fn next_row_id() -> u64 {
-    AUTH_ROW_ID.fetch_add(1, Ordering::SeqCst)
-}
 
 /// Helper to get a string from a datum option
 fn get_string(datum: Option<&Datum>) -> Option<String> {

@@ -2,13 +2,13 @@
 //!
 //! Inserts rows into a table with MVCC support.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
+use crate::storage::next_row_id;
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
@@ -17,9 +17,6 @@ use super::error::ExecutorResult;
 use super::eval::eval;
 use super::row::Row;
 use super::Executor;
-
-/// Global row ID counter (simple auto-increment)
-static ROW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Insert executor
 pub struct Insert {
@@ -58,11 +55,6 @@ impl Insert {
             done: false,
         }
     }
-
-    /// Generate a new row ID
-    fn next_row_id() -> u64 {
-        ROW_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
-    }
 }
 
 #[async_trait]
@@ -90,7 +82,7 @@ impl Executor for Insert {
             }
 
             let row = Row::new(datums);
-            let row_id = Self::next_row_id();
+            let row_id = next_row_id();
 
             let key = encode_row_key(&self.table, row_id);
             let value = encode_row(&row);

@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 /// Type of undo operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,13 +173,12 @@ impl UndoLog {
         let roll_ptr = record.roll_ptr;
         let txn_id = record.txn_id;
 
-        let mut records = self.records.write().unwrap();
+        let mut records = self.records.write();
         let txn_records = records.entry(txn_id).or_default();
         let index = txn_records.len();
         txn_records.push(record);
 
-        let mut index_map = self.roll_ptr_index.write().unwrap();
-        index_map.insert(roll_ptr, (txn_id, index));
+        self.roll_ptr_index.write().insert(roll_ptr, (txn_id, index));
 
         roll_ptr
     }
@@ -189,17 +189,16 @@ impl UndoLog {
             return None;
         }
 
-        let index_map = self.roll_ptr_index.read().unwrap();
+        let index_map = self.roll_ptr_index.read();
         let (txn_id, index) = index_map.get(&roll_ptr)?;
 
-        let records = self.records.read().unwrap();
+        let records = self.records.read();
         records.get(txn_id)?.get(*index).cloned()
     }
 
     /// Get all undo records for a transaction (in order of creation)
     pub fn get_records(&self, txn_id: u64) -> Vec<UndoRecord> {
-        let records = self.records.read().unwrap();
-        records.get(&txn_id).cloned().unwrap_or_default()
+        self.records.read().get(&txn_id).cloned().unwrap_or_default()
     }
 
     /// Get undo records in reverse order (for rollback)
@@ -213,13 +212,10 @@ impl UndoLog {
     ///
     /// Called after commit (for INSERT undo logs) or after rollback completes.
     pub fn remove_transaction(&self, txn_id: u64) {
-        let removed_records = {
-            let mut records = self.records.write().unwrap();
-            records.remove(&txn_id).unwrap_or_default()
-        };
+        let removed_records = self.records.write().remove(&txn_id).unwrap_or_default();
 
         // Remove from roll_ptr index
-        let mut index_map = self.roll_ptr_index.write().unwrap();
+        let mut index_map = self.roll_ptr_index.write();
         for record in removed_records {
             index_map.remove(&record.roll_ptr);
         }
@@ -235,8 +231,8 @@ impl UndoLog {
     /// * `min_active_txn_id` - The lowest active transaction ID. Undo records for
     ///   committed transactions older than this can be purged.
     pub fn purge(&self, min_active_txn_id: u64) {
-        let mut records = self.records.write().unwrap();
-        let mut index_map = self.roll_ptr_index.write().unwrap();
+        let mut records = self.records.write();
+        let mut index_map = self.roll_ptr_index.write();
 
         // Find transactions that can be purged
         let txns_to_purge: Vec<u64> = records
@@ -256,14 +252,12 @@ impl UndoLog {
 
     /// Get count of undo records (for metrics/debugging)
     pub fn record_count(&self) -> usize {
-        let records = self.records.read().unwrap();
-        records.values().map(|v| v.len()).sum()
+        self.records.read().values().map(|v| v.len()).sum()
     }
 
     /// Get count of transactions with undo records
     pub fn transaction_count(&self) -> usize {
-        let records = self.records.read().unwrap();
-        records.len()
+        self.records.read().len()
     }
 }
 
