@@ -1,19 +1,36 @@
 //! DDL executors
 //!
 //! Implements CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX.
+//!
+//! DDL operations are replicated via Raft by persisting schema changes to system tables
+//! (system.tables, system.columns, system.indexes). When raft_node is provided, changes
+//! are proposed to Raft and the catalog is updated when apply() processes the changes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::catalog::system_tables::is_system_table;
+use crate::catalog::system_tables::{
+    index_def_to_row, is_system_table, table_def_to_columns_rows, table_def_to_tables_row,
+    SYSTEM_COLUMNS, SYSTEM_INDEXES, SYSTEM_TABLES,
+};
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
+use crate::raft::{ChangeSet, RaftNode, RowChange};
 
 use super::datum::Datum;
+use super::encoding::{encode_row, encode_row_key};
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
+
+/// Row ID counter for DDL operations
+static DDL_ROW_ID: AtomicU64 = AtomicU64::new(3_000_000);
+
+fn next_row_id() -> u64 {
+    DDL_ROW_ID.fetch_add(1, Ordering::SeqCst)
+}
 
 /// CREATE TABLE executor
 pub struct CreateTable {
@@ -27,8 +44,12 @@ pub struct CreateTable {
     if_not_exists: bool,
     /// Catalog reference
     catalog: Arc<RwLock<Catalog>>,
+    /// Optional Raft node for replication
+    raft_node: Option<Arc<RaftNode>>,
     /// Whether execution is complete
     done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
 }
 
 impl CreateTable {
@@ -46,7 +67,30 @@ impl CreateTable {
             constraints,
             if_not_exists,
             catalog,
+            raft_node: None,
             done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    /// Create a new CREATE TABLE executor with Raft replication
+    pub fn with_raft(
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+    ) -> Self {
+        CreateTable {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            done: false,
+            changes: Vec::new(),
         }
     }
 }
@@ -55,6 +99,7 @@ impl CreateTable {
 impl Executor for CreateTable {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
+        self.changes.clear();
         Ok(())
     }
 
@@ -71,18 +116,19 @@ impl Executor for CreateTable {
             )));
         }
 
-        let mut catalog = self.catalog.write();
-
-        // Check if table exists
-        if catalog.get_table(&self.name).is_some() {
-            if self.if_not_exists {
-                self.done = true;
-                return Ok(Some(Row::new(vec![Datum::Int(0)])));
+        // Check if table exists (catalog read)
+        {
+            let catalog = self.catalog.read();
+            if catalog.get_table(&self.name).is_some() {
+                if self.if_not_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "table '{}' already exists",
+                    self.name
+                )));
             }
-            return Err(ExecutorError::Internal(format!(
-                "table '{}' already exists",
-                self.name
-            )));
         }
 
         // Build table definition
@@ -94,9 +140,44 @@ impl Executor for CreateTable {
             table_def = table_def.constraint(constraint.clone());
         }
 
-        catalog
-            .create_table(table_def)
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        if let Some(ref raft_node) = self.raft_node {
+            // Generate RowChanges for system tables and propose via Raft
+            let mut changeset = ChangeSet::new(0);
+
+            // Insert into system.tables
+            let table_row = table_def_to_tables_row(&table_def);
+            let key = encode_row_key(SYSTEM_TABLES, next_row_id());
+            let value = encode_row(&table_row);
+            changeset.push(RowChange::insert(SYSTEM_TABLES, key.clone(), value.clone()));
+            self.changes
+                .push(RowChange::insert(SYSTEM_TABLES, key, value));
+
+            // Insert into system.columns (one row per column)
+            for col_row in table_def_to_columns_rows(&table_def) {
+                let key = encode_row_key(SYSTEM_COLUMNS, next_row_id());
+                let value = encode_row(&col_row);
+                changeset.push(RowChange::insert(
+                    SYSTEM_COLUMNS,
+                    key.clone(),
+                    value.clone(),
+                ));
+                self.changes
+                    .push(RowChange::insert(SYSTEM_COLUMNS, key, value));
+            }
+
+            // Propose to Raft - catalog is updated synchronously in apply()
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            // No need to update catalog here - apply() already did it before propose returns
+        } else {
+            // No Raft - update catalog directly (for tests without Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .create_table(table_def)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(0)])))
@@ -104,6 +185,10 @@ impl Executor for CreateTable {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
     }
 }
 
@@ -115,8 +200,14 @@ pub struct DropTable {
     if_exists: bool,
     /// Catalog reference
     catalog: Arc<RwLock<Catalog>>,
+    /// Optional Raft node for replication
+    raft_node: Option<Arc<RaftNode>>,
+    /// MVCC storage for scanning system tables
+    mvcc: Option<Arc<crate::txn::MvccStorage>>,
     /// Whether execution is complete
     done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
 }
 
 impl DropTable {
@@ -126,7 +217,29 @@ impl DropTable {
             name,
             if_exists,
             catalog,
+            raft_node: None,
+            mvcc: None,
             done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    /// Create a new DROP TABLE executor with Raft replication
+    pub fn with_raft(
+        name: String,
+        if_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+        mvcc: Arc<crate::txn::MvccStorage>,
+    ) -> Self {
+        DropTable {
+            name,
+            if_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            mvcc: Some(mvcc),
+            done: false,
+            changes: Vec::new(),
         }
     }
 }
@@ -135,6 +248,7 @@ impl DropTable {
 impl Executor for DropTable {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
+        self.changes.clear();
         Ok(())
     }
 
@@ -151,20 +265,103 @@ impl Executor for DropTable {
             )));
         }
 
-        let mut catalog = self.catalog.write();
-
-        // Check if table exists
-        if catalog.get_table(&self.name).is_none() {
-            if self.if_exists {
-                self.done = true;
-                return Ok(Some(Row::new(vec![Datum::Int(0)])));
+        // Check if table exists (catalog read)
+        {
+            let catalog = self.catalog.read();
+            if catalog.get_table(&self.name).is_none() {
+                if self.if_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::TableNotFound(self.name.clone()));
             }
-            return Err(ExecutorError::TableNotFound(self.name.clone()));
         }
 
-        catalog
-            .drop_table(&self.name)
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
+            // Scan system tables to find rows to delete
+            let mut changeset = ChangeSet::new(0);
+
+            // Find and delete from system.tables
+            let prefix = format!("t:{SYSTEM_TABLES}:");
+            let end = format!("t:{SYSTEM_TABLES};\x00");
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            for (key, value) in rows {
+                // Skip MVCC header (17 bytes) if present
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(table_name)) = row.values().first() {
+                        if table_name == &self.name {
+                            // Emit delete with value for tracking
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_TABLES,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                            self.changes.push(RowChange::delete_with_value(
+                                SYSTEM_TABLES,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Find and delete from system.columns
+            let prefix = format!("t:{SYSTEM_COLUMNS}:");
+            let end = format!("t:{SYSTEM_COLUMNS};\x00");
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            for (key, value) in rows {
+                // Skip MVCC header (17 bytes) if present
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(table_name)) = row.values().first() {
+                        if table_name == &self.name {
+                            // Emit delete with value for tracking
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_COLUMNS,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                            self.changes.push(RowChange::delete_with_value(
+                                SYSTEM_COLUMNS,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Propose to Raft - catalog is updated synchronously in apply()
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            // No need to update catalog here - apply() already did it before propose returns
+        } else {
+            // No Raft - update catalog directly (for tests without Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .drop_table(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(0)])))
@@ -172,6 +369,10 @@ impl Executor for DropTable {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
     }
 }
 
@@ -187,8 +388,12 @@ pub struct CreateIndex {
     unique: bool,
     /// Catalog reference
     catalog: Arc<RwLock<Catalog>>,
+    /// Optional Raft node for replication
+    raft_node: Option<Arc<RaftNode>>,
     /// Whether execution is complete
     done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
 }
 
 impl CreateIndex {
@@ -206,7 +411,30 @@ impl CreateIndex {
             columns,
             unique,
             catalog,
+            raft_node: None,
             done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    /// Create a new CREATE INDEX executor with Raft replication
+    pub fn with_raft(
+        name: String,
+        table: String,
+        columns: Vec<(String, usize)>,
+        unique: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+    ) -> Self {
+        CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            catalog,
+            raft_node: Some(raft_node),
+            done: false,
+            changes: Vec::new(),
         }
     }
 }
@@ -215,6 +443,7 @@ impl CreateIndex {
 impl Executor for CreateIndex {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
+        self.changes.clear();
         Ok(())
     }
 
@@ -223,11 +452,12 @@ impl Executor for CreateIndex {
             return Ok(None);
         }
 
-        let mut catalog = self.catalog.write();
-
-        // Verify table exists
-        if catalog.get_table(&self.table).is_none() {
-            return Err(ExecutorError::TableNotFound(self.table.clone()));
+        // Verify table exists (catalog read)
+        {
+            let catalog = self.catalog.read();
+            if catalog.get_table(&self.table).is_none() {
+                return Err(ExecutorError::TableNotFound(self.table.clone()));
+            }
         }
 
         let column_names: Vec<String> = self.columns.iter().map(|(n, _)| n.clone()).collect();
@@ -237,9 +467,35 @@ impl Executor for CreateIndex {
             index_def = index_def.unique();
         }
 
-        catalog
-            .create_index(index_def)
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        if let Some(ref raft_node) = self.raft_node {
+            // Generate RowChange for system.indexes and propose via Raft
+            let mut changeset = ChangeSet::new(0);
+
+            // Insert into system.indexes
+            let index_row = index_def_to_row(&index_def);
+            let key = encode_row_key(SYSTEM_INDEXES, next_row_id());
+            let value = encode_row(&index_row);
+            changeset.push(RowChange::insert(
+                SYSTEM_INDEXES,
+                key.clone(),
+                value.clone(),
+            ));
+            self.changes
+                .push(RowChange::insert(SYSTEM_INDEXES, key, value));
+
+            // Propose to Raft - catalog is updated synchronously in apply()
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            // No need to update catalog here - apply() already did it before propose returns
+        } else {
+            // No Raft - update catalog directly (for tests without Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .create_index(index_def)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(0)])))
@@ -247,6 +503,10 @@ impl Executor for CreateIndex {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
     }
 }
 
@@ -256,8 +516,14 @@ pub struct DropIndex {
     name: String,
     /// Catalog reference
     catalog: Arc<RwLock<Catalog>>,
+    /// Optional Raft node for replication
+    raft_node: Option<Arc<RaftNode>>,
+    /// MVCC storage for scanning system tables
+    mvcc: Option<Arc<crate::txn::MvccStorage>>,
     /// Whether execution is complete
     done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
 }
 
 impl DropIndex {
@@ -266,7 +532,27 @@ impl DropIndex {
         DropIndex {
             name,
             catalog,
+            raft_node: None,
+            mvcc: None,
             done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    /// Create a new DROP INDEX executor with Raft replication
+    pub fn with_raft(
+        name: String,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+        mvcc: Arc<crate::txn::MvccStorage>,
+    ) -> Self {
+        DropIndex {
+            name,
+            catalog,
+            raft_node: Some(raft_node),
+            mvcc: Some(mvcc),
+            done: false,
+            changes: Vec::new(),
         }
     }
 }
@@ -275,6 +561,7 @@ impl DropIndex {
 impl Executor for DropIndex {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
+        self.changes.clear();
         Ok(())
     }
 
@@ -283,11 +570,56 @@ impl Executor for DropIndex {
             return Ok(None);
         }
 
-        let mut catalog = self.catalog.write();
+        if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
+            // Scan system.indexes to find rows to delete
+            let mut changeset = ChangeSet::new(0);
 
-        catalog
-            .drop_index(&self.name)
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            let prefix = format!("t:{SYSTEM_INDEXES}:");
+            let end = format!("t:{SYSTEM_INDEXES};\x00");
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            for (key, value) in rows {
+                // Skip MVCC header (17 bytes) if present
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(index_name)) = row.values().first() {
+                        if index_name == &self.name {
+                            // Emit delete with value for tracking
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_INDEXES,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                            self.changes.push(RowChange::delete_with_value(
+                                SYSTEM_INDEXES,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Propose to Raft - catalog is updated synchronously in apply()
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            // No need to update catalog here - apply() already did it before propose returns
+        } else {
+            // No Raft - update catalog directly (for tests without Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .drop_index(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(0)])))
@@ -295,6 +627,10 @@ impl Executor for DropIndex {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
     }
 }
 

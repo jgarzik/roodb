@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 
 use crate::catalog::Catalog;
 use crate::planner::PhysicalPlan;
+use crate::raft::RaftNode;
 use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
@@ -34,6 +35,8 @@ pub struct ExecutorEngine {
     catalog: Arc<RwLock<Catalog>>,
     /// Transaction context (None for DDL-only or read-only without txn)
     txn_context: Option<TransactionContext>,
+    /// Optional Raft node for replication (DDL goes through Raft)
+    raft_node: Option<Arc<RaftNode>>,
 }
 
 impl ExecutorEngine {
@@ -47,6 +50,22 @@ impl ExecutorEngine {
             mvcc,
             catalog,
             txn_context,
+            raft_node: None,
+        }
+    }
+
+    /// Create a new executor engine with Raft support for DDL replication
+    pub fn with_raft(
+        mvcc: Arc<MvccStorage>,
+        catalog: Arc<RwLock<Catalog>>,
+        txn_context: Option<TransactionContext>,
+        raft_node: Arc<RaftNode>,
+    ) -> Self {
+        ExecutorEngine {
+            mvcc,
+            catalog,
+            txn_context,
+            raft_node: Some(raft_node),
         }
     }
 
@@ -166,35 +185,82 @@ impl ExecutorEngine {
                 columns,
                 constraints,
                 if_not_exists,
-            } => Ok(Box::new(CreateTable::new(
-                name,
-                columns,
-                constraints,
-                if_not_exists,
-                self.catalog.clone(),
-            ))),
+            } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(CreateTable::with_raft(
+                        name,
+                        columns,
+                        constraints,
+                        if_not_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(CreateTable::new(
+                        name,
+                        columns,
+                        constraints,
+                        if_not_exists,
+                        self.catalog.clone(),
+                    )))
+                }
+            }
 
-            PhysicalPlan::DropTable { name, if_exists } => Ok(Box::new(DropTable::new(
-                name,
-                if_exists,
-                self.catalog.clone(),
-            ))),
+            PhysicalPlan::DropTable { name, if_exists } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(DropTable::with_raft(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                        self.mvcc.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(DropTable::new(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                    )))
+                }
+            }
 
             PhysicalPlan::CreateIndex {
                 name,
                 table,
                 columns,
                 unique,
-            } => Ok(Box::new(CreateIndex::new(
-                name,
-                table,
-                columns,
-                unique,
-                self.catalog.clone(),
-            ))),
+            } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(CreateIndex::with_raft(
+                        name,
+                        table,
+                        columns,
+                        unique,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(CreateIndex::new(
+                        name,
+                        table,
+                        columns,
+                        unique,
+                        self.catalog.clone(),
+                    )))
+                }
+            }
 
             PhysicalPlan::DropIndex { name } => {
-                Ok(Box::new(DropIndex::new(name, self.catalog.clone())))
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(DropIndex::with_raft(
+                        name,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                        self.mvcc.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(DropIndex::new(name, self.catalog.clone())))
+                }
             }
         }
     }

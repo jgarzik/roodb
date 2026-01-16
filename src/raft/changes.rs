@@ -60,6 +60,19 @@ impl RowChange {
         }
     }
 
+    /// Create a DELETE change with value included for tracking
+    ///
+    /// Used for system table deletes where the row data is needed to identify
+    /// what table/index is being dropped (for catalog rebuild in apply()).
+    pub fn delete_with_value(table: impl Into<String>, key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            table: table.into(),
+            key,
+            value: Some(value),
+            op: ChangeOp::Delete,
+        }
+    }
+
     /// Check if this is a system table change
     pub fn is_system_change(&self) -> bool {
         self.table.starts_with("system.")

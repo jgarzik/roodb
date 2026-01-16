@@ -203,9 +203,15 @@ pub async fn start_test_server(
         .parse()
         .expect("valid raft address");
 
-    let mut raft_node = RaftNode::new(1, raft_addr, tls_config.clone(), storage.clone())
-        .await
-        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+    let mut raft_node = RaftNode::new(
+        1,
+        raft_addr,
+        tls_config.clone(),
+        storage.clone(),
+        catalog.clone(),
+    )
+    .await
+    .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
     raft_node
         .start_rpc_server()

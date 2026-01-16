@@ -57,7 +57,7 @@
 
 ---
 
-## Phase 2: DDL Through Raft
+## Phase 2: DDL Through Raft ✅ DONE
 
 **Problem**: CREATE/DROP TABLE only updates in-memory Catalog
 
@@ -66,8 +66,10 @@
 - `ddl.rs`: Call `propose_changes()` — follow `auth.rs` pattern
 - `apply()`: On system table changes, rebuild Catalog entry
 - `engine.rs`: Pass RaftNode to DDL executors
+- `changes.rs`: Add `delete_with_value()` for tracking deletes in apply()
+- `mvcc_storage.rs`: Add `scan_raw()` for DDL system table scanning
 
-**Files**: `src/executor/ddl.rs`, `src/executor/engine.rs`, `src/raft/lsm_storage.rs`
+**Files**: `src/executor/ddl.rs`, `src/executor/engine.rs`, `src/raft/lsm_storage.rs`, `src/raft/changes.rs`, `src/txn/mvcc_storage.rs`
 
 **Test**: CREATE TABLE → restart → table persists; leader CREATE → follower sees table
 

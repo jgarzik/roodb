@@ -9,12 +9,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use openraft::Config;
+use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
+use crate::catalog::Catalog;
 use crate::raft::lsm_storage::LsmRaftStorage;
 use crate::raft::network::{RaftNetworkFactoryImpl, RaftRpcHandler};
 use crate::raft::types::{Command, CommandResponse, Node, NodeId, Raft};
@@ -60,6 +62,7 @@ impl RaftNode {
         addr: SocketAddr,
         tls_config: TlsConfig,
         storage: Arc<dyn StorageEngine>,
+        catalog: Arc<RwLock<Catalog>>,
     ) -> Result<Self, RaftNodeError> {
         let config = Config {
             cluster_name: "roodb".to_string(),
@@ -71,7 +74,7 @@ impl RaftNode {
         let config = Arc::new(config);
 
         // Create LSM-backed storage that persists all Raft state
-        let lsm_storage = LsmRaftStorage::new(storage)
+        let lsm_storage = LsmRaftStorage::new(storage, catalog)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 

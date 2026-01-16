@@ -606,14 +606,24 @@ where
             // Get column definitions before building executor
             let columns = plan.output_columns();
 
-            // Build and execute
-            let engine = ExecutorEngine::new(mvcc, self.catalog.clone(), txn_context);
+            // Build and execute (with Raft for DDL replication)
+            let engine = ExecutorEngine::with_raft(
+                mvcc,
+                self.catalog.clone(),
+                txn_context,
+                self.raft_node.clone(),
+            );
             let mut executor = engine.build(plan)?;
 
             self.send_result_set(&columns, &mut *executor).await
         } else {
             // DML/DDL - execute and count affected rows
-            let engine = ExecutorEngine::new(mvcc, self.catalog.clone(), txn_context);
+            let engine = ExecutorEngine::with_raft(
+                mvcc,
+                self.catalog.clone(),
+                txn_context,
+                self.raft_node.clone(),
+            );
             let mut executor = engine.build(plan)?;
 
             executor.open().await?;

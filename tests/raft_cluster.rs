@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::RwLock;
+use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
@@ -34,6 +36,11 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
     Arc::new(LsmEngine::open(factory, config).await.unwrap())
 }
 
+/// Create a test catalog for Raft tests
+fn test_catalog() -> Arc<RwLock<Catalog>> {
+    Arc::new(RwLock::new(Catalog::with_system_tables()))
+}
+
 /// Helper to create a ChangeSet with a single insert
 fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
     let mut cs = ChangeSet::new(1);
@@ -46,8 +53,11 @@ async fn test_single_node_bootstrap() {
     let tls_config = test_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15000)).parse().unwrap();
     let storage = test_storage("single_bootstrap").await;
+    let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage).await.unwrap();
+    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog)
+        .await
+        .unwrap();
 
     // Start RPC server
     node.start_rpc_server().await.unwrap();
@@ -74,8 +84,11 @@ async fn test_single_node_multiple_writes() {
     let tls_config = test_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15100)).parse().unwrap();
     let storage = test_storage("single_writes").await;
+    let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage).await.unwrap();
+    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog)
+        .await
+        .unwrap();
     node.start_rpc_server().await.unwrap();
     node.bootstrap_single_node().await.unwrap();
 
@@ -109,15 +122,18 @@ async fn test_three_node_cluster_bootstrap() {
     let storage1 = test_storage("cluster_boot1").await;
     let storage2 = test_storage("cluster_boot2").await;
     let storage3 = test_storage("cluster_boot3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
     // Create nodes
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 
@@ -171,14 +187,17 @@ async fn test_log_replication() {
     let storage1 = test_storage("replication1").await;
     let storage2 = test_storage("replication2").await;
     let storage3 = test_storage("replication3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 

@@ -270,6 +270,13 @@ impl MvccStorage {
         self.inner.get(key).await
     }
 
+    /// Scan rows without MVCC filtering (for DDL system table operations)
+    ///
+    /// Returns raw key-value pairs including MVCC headers.
+    pub async fn scan_raw(&self, start: &[u8], end: &[u8]) -> StorageResult<Vec<KeyValue>> {
+        self.inner.scan(Some(start), Some(end)).await
+    }
+
     /// Flush to storage
     pub async fn flush(&self) -> StorageResult<()> {
         self.inner.flush().await

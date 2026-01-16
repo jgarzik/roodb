@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::RwLock;
+use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
@@ -36,6 +38,11 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
     Arc::new(LsmEngine::open(factory, config).await.unwrap())
 }
 
+/// Create a test catalog for Raft tests
+fn test_catalog() -> Arc<RwLock<Catalog>> {
+    Arc::new(RwLock::new(Catalog::with_system_tables()))
+}
+
 /// Helper to create a ChangeSet with a single insert
 fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
     let mut cs = ChangeSet::new(1);
@@ -55,14 +62,17 @@ async fn test_leader_election_timing() {
     let storage1 = test_storage("election1").await;
     let storage2 = test_storage("election2").await;
     let storage3 = test_storage("election3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 
@@ -124,14 +134,17 @@ async fn test_replication_consistency() {
     let storage1 = test_storage("consistency1").await;
     let storage2 = test_storage("consistency2").await;
     let storage3 = test_storage("consistency3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 
@@ -194,14 +207,17 @@ async fn test_follower_read() {
     let storage1 = test_storage("follower1").await;
     let storage2 = test_storage("follower2").await;
     let storage3 = test_storage("follower3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 
@@ -263,14 +279,17 @@ async fn test_write_delete_sequence() {
     let storage1 = test_storage("delete1").await;
     let storage2 = test_storage("delete2").await;
     let storage3 = test_storage("delete3").await;
+    let catalog1 = test_catalog();
+    let catalog2 = test_catalog();
+    let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
         .await
         .unwrap();
 
