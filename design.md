@@ -47,6 +47,7 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 - `StorageEngine` - LSM storage backend
 - `Catalog` - schema metadata (wrapped in `RwLock`)
 - `TransactionManager` - MVCC coordination
+- `RaftNode` - consensus and replication
 
 **Per-Connection State**:
 - `Session` - user, database, transaction state, isolation level
@@ -287,11 +288,10 @@ pub struct RowChange {
 - `start_rpc_server()`: Handle AppendEntries, RequestVote, InstallSnapshot
 - `is_leader()`: Check if this node can accept writes
 
-**Storage** (`storage.rs`):
-- `MemStorage`: In-memory log + state machine with optional LSM integration
-- `LogData`: Vote, log entries (BTreeMap by index)
-- `StateMachineData`: Applied log ID, membership, storage engine reference
-- When entries are applied, changes are written to the LSM storage
+**Storage**:
+- `LsmRaftStorage` (`lsm_storage.rs`): Production storage - persists log/state to LSM, rebuilds catalog on apply
+- `MemStorage` (`storage.rs`): Test-only in-memory storage
+- Log entries stored in LSM, state machine applies changes to storage and rebuilds catalog
 
 **Read Path**: Direct to local LSM (no Raft)
 **Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM
