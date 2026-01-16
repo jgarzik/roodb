@@ -51,7 +51,7 @@ mysql -h 127.0.0.1 -P 3307 -u root --ssl-mode=REQUIRED --ssl-ca=ca.pem
 
 ```
 src/
-├── catalog.rs     # Schema catalog (tables, columns)
+├── catalog.rs     # Schema catalog (tables, columns, system tables)
 ├── executor/      # Volcano-style query executor
 ├── io/            # Cross-platform async I/O (io_uring / POSIX)
 ├── planner/       # Query planner and optimizer
@@ -61,9 +61,14 @@ src/
 ├── sql/           # SQL parsing and AST
 ├── storage/       # LSM storage engine
 ├── tls.rs         # TLS configuration
-├── txn/           # Transaction management
-└── wal/           # Write-ahead log
+└── txn/           # Transaction management (MVCC)
 ```
+
+**Replication Model**:
+- Leader accepts all writes, replicates via Raft
+- Replicas serve read-only queries from local storage
+- Schema stored in system tables, replicated like data
+- Raft log serves as the write-ahead log
 
 ## Test Suite
 

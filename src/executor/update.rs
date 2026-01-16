@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::raft::RowChange;
 use crate::sql::{ResolvedColumn, ResolvedExpr};
 use crate::txn::MvccStorage;
 
@@ -100,8 +101,10 @@ impl Executor for Update {
 
             // Write back using MVCC put if we have a transaction context
             let new_value = encode_row(&row);
-            if let Some(ref ctx) = self.txn_context {
+            if let Some(ref mut ctx) = self.txn_context {
                 self.mvcc.put(&key, &new_value, ctx.txn_id).await?;
+                // Collect the change for Raft replication
+                ctx.add_change(RowChange::update(&self.table, key, new_value));
             } else {
                 self.mvcc.put_raw(&key, &new_value).await?;
             }
@@ -117,6 +120,13 @@ impl Executor for Update {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        self.txn_context
+            .as_mut()
+            .map(|ctx| ctx.take_changes())
+            .unwrap_or_default()
     }
 }
 

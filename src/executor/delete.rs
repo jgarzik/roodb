@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::raft::RowChange;
 use crate::sql::ResolvedExpr;
 use crate::txn::MvccStorage;
 
@@ -96,8 +97,10 @@ impl Executor for Delete {
 
         // Delete the rows using MVCC delete if we have a transaction context
         for key in keys_to_delete {
-            if let Some(ref ctx) = self.txn_context {
+            if let Some(ref mut ctx) = self.txn_context {
                 self.mvcc.delete(&key, ctx.txn_id).await?;
+                // Collect the change for Raft replication
+                ctx.add_change(RowChange::delete(&self.table, key));
             } else {
                 self.mvcc.inner().delete(&key).await?;
             }
@@ -113,6 +116,13 @@ impl Executor for Delete {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        self.txn_context
+            .as_mut()
+            .map(|ctx| ctx.take_changes())
+            .unwrap_or_default()
     }
 }
 

@@ -623,8 +623,6 @@ struct Scope {
 }
 
 struct TableInfo {
-    #[allow(dead_code)]
-    real_name: String,
     columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
     /// Column offset in the combined row for JOINs
     column_offset: usize,
@@ -645,14 +643,13 @@ impl Scope {
         scope
     }
 
-    fn add_table(&mut self, alias: &str, real_name: &str, table_def: &crate::catalog::TableDef) {
+    fn add_table(&mut self, alias: &str, _real_name: &str, table_def: &crate::catalog::TableDef) {
         let column_offset = self.total_columns;
         let num_columns = table_def.columns.len();
 
         self.tables.insert(
             alias.to_string(),
             TableInfo {
-                real_name: real_name.to_string(),
                 columns: table_def
                     .columns
                     .iter()

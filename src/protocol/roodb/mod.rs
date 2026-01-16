@@ -27,6 +27,7 @@ use crate::executor::{Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
+use crate::raft::{ChangeSet, RaftNode};
 use crate::server::session::Session;
 use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
@@ -80,6 +81,8 @@ where
     session: Session,
     /// Transaction manager
     txn_manager: Arc<TransactionManager>,
+    /// Raft node for consensus
+    raft_node: Arc<RaftNode>,
 }
 
 impl<S> RooDbConnection<S>
@@ -93,6 +96,7 @@ where
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         txn_manager: Arc<TransactionManager>,
+        raft_node: Arc<RaftNode>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -108,6 +112,7 @@ where
             deprecate_eof: false,
             session: Session::new(connection_id),
             txn_manager,
+            raft_node,
         }
     }
 
@@ -122,6 +127,7 @@ where
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         txn_manager: Arc<TransactionManager>,
+        raft_node: Arc<RaftNode>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -137,6 +143,7 @@ where
             deprecate_eof: false,
             session: Session::new(connection_id),
             txn_manager,
+            raft_node,
         }
     }
 
@@ -506,6 +513,19 @@ where
             }
             executor.close().await?;
 
+            // Collect and propose changes to Raft for replication
+            let changes = executor.take_changes();
+            if !changes.is_empty() {
+                let changeset = ChangeSet::new_with_changes(
+                    implicit_txn_id.unwrap_or(0),
+                    changes,
+                );
+                self.raft_node
+                    .propose_changes(changeset)
+                    .await
+                    .map_err(|e| ProtocolError::Raft(e.to_string()))?;
+            }
+
             // Commit implicit transaction if we created one
             if let Some(txn_id) = implicit_txn_id {
                 self.txn_manager.commit(txn_id).await?;
@@ -638,7 +658,10 @@ where
 
         // Read-only mode (replica) requires read-only transactions
         let read_only = self.session.is_read_only;
-        match self.txn_manager.begin(self.session.isolation_level, read_only) {
+        match self
+            .txn_manager
+            .begin(self.session.isolation_level, read_only)
+        {
             Ok(txn) => {
                 self.session.begin_transaction(txn.txn_id);
                 debug!(

@@ -31,12 +31,15 @@ pub use row::Row;
 
 use async_trait::async_trait;
 
+use crate::raft::RowChange;
+
 /// Volcano-style iterator executor
 ///
 /// Each operator implements:
 /// - `open()`: Initialize the operator
 /// - `next()`: Return the next row, or None if exhausted
 /// - `close()`: Clean up resources
+/// - `take_changes()`: Extract collected row changes (DML executors only)
 #[async_trait]
 pub trait Executor: Send {
     /// Initialize the executor
@@ -47,6 +50,17 @@ pub trait Executor: Send {
 
     /// Close the executor and release resources
     async fn close(&mut self) -> ExecutorResult<()>;
+
+    /// Take collected row changes for Raft replication
+    ///
+    /// DML executors (Insert, Update, Delete) collect row changes during
+    /// execution. After the executor completes, call this to extract the
+    /// changes for proposing to Raft consensus.
+    ///
+    /// Default implementation returns empty vec (read-only operators).
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        Vec::new()
+    }
 }
 
 /// Execution result for DML/DDL operations

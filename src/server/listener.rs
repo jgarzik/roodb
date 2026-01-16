@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
+use crate::raft::RaftNode;
 use crate::server::handler::handle_connection;
 use crate::storage::StorageEngine;
 use crate::tls::TlsConfig;
@@ -31,6 +32,7 @@ pub struct RooDbServer {
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
     txn_manager: Arc<TransactionManager>,
+    raft_node: Arc<RaftNode>,
     next_conn_id: AtomicU32,
 }
 
@@ -41,6 +43,7 @@ impl RooDbServer {
         tls_config: TlsConfig,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
     ) -> Self {
         let txn_manager = Arc::new(TransactionManager::with_storage(storage.clone()));
         Self {
@@ -49,6 +52,7 @@ impl RooDbServer {
             storage,
             catalog,
             txn_manager,
+            raft_node,
             next_conn_id: AtomicU32::new(1),
         }
     }
@@ -60,6 +64,7 @@ impl RooDbServer {
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         txn_manager: Arc<TransactionManager>,
+        raft_node: Arc<RaftNode>,
     ) -> Self {
         Self {
             addr,
@@ -67,6 +72,7 @@ impl RooDbServer {
             storage,
             catalog,
             txn_manager,
+            raft_node,
             next_conn_id: AtomicU32::new(1),
         }
     }
@@ -87,6 +93,7 @@ impl RooDbServer {
         let storage = self.storage;
         let catalog = self.catalog;
         let txn_manager = self.txn_manager;
+        let raft_node = self.raft_node;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
@@ -98,6 +105,7 @@ impl RooDbServer {
             let storage = storage.clone();
             let catalog = catalog.clone();
             let txn_manager = txn_manager.clone();
+            let raft_node = raft_node.clone();
             let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
             // Handle connection with STARTTLS (TLS upgrade happens in handler)
@@ -110,6 +118,7 @@ impl RooDbServer {
                     storage,
                     catalog,
                     txn_manager,
+                    raft_node,
                 )
                 .await;
             });
@@ -125,6 +134,7 @@ impl RooDbServer {
         let storage = self.storage;
         let catalog = self.catalog;
         let txn_manager = self.txn_manager;
+        let raft_node = self.raft_node;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
 
@@ -138,6 +148,7 @@ impl RooDbServer {
                     let storage = storage.clone();
                     let catalog = catalog.clone();
                     let txn_manager = txn_manager.clone();
+                    let raft_node = raft_node.clone();
                     let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
                     tokio::spawn(async move {
@@ -149,6 +160,7 @@ impl RooDbServer {
                             storage,
                             catalog,
                             txn_manager,
+                            raft_node,
                         ).await;
                     });
                 }
@@ -185,7 +197,33 @@ pub async fn start_test_server(
 ) -> Result<ServerHandle, ServerError> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = RooDbServer::new(addr, tls_config, storage, catalog);
+    // Create Raft node for single-node mode (use a different port for Raft RPC)
+    let raft_port = addr.port() + 1000;
+    let raft_addr: SocketAddr = format!("127.0.0.1:{}", raft_port)
+        .parse()
+        .expect("valid raft address");
+
+    let mut raft_node =
+        RaftNode::new(1, raft_addr, tls_config.clone(), Some(storage.clone()))
+            .await
+            .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    raft_node
+        .start_rpc_server()
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    raft_node
+        .bootstrap_single_node()
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    // Wait for leader election to complete (single-node should be immediate)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let raft_node = Arc::new(raft_node);
+
+    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
     let actual_addr = server.addr();
 
     tokio::spawn(async move {
@@ -195,7 +233,7 @@ pub async fn start_test_server(
     });
 
     // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     Ok(ServerHandle {
         addr: actual_addr,

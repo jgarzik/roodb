@@ -1,4 +1,8 @@
-//! In-memory Raft storage implementation for OpenRaft 0.9 (storage-v2)
+//! Raft storage implementation for OpenRaft 0.9 (storage-v2)
+//!
+//! Implements the OpenRaft storage traits:
+//! - `RaftLogStorage` for log persistence (in-memory for now)
+//! - `RaftStateMachine` for applying committed entries to LSM storage
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -10,10 +14,28 @@ use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
 use parking_lot::RwLock;
 
+use crate::raft::changes::ChangeOp;
 use crate::raft::types::{
     Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
     StoredMembership, TypeConfig, Vote,
 };
+use crate::storage::StorageEngine;
+
+/// MVCC row header size: txn_id(8) + roll_ptr(8) + deleted(1) = 17 bytes
+const MVCC_HEADER_SIZE: usize = 17;
+
+/// Encode a row with MVCC header format (matches MvccStorage::encode_row)
+///
+/// This ensures Raft-applied data has the same format as direct MVCC writes,
+/// making the two write paths idempotent and compatible with MVCC reads.
+fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
+    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR (0 = no undo chain needed)
+    result.push(if deleted { 1 } else { 0 }); // deleted flag
+    result.extend_from_slice(data);
+    result
+}
 
 /// In-memory log storage
 #[derive(Debug, Default)]
@@ -26,15 +48,30 @@ struct LogData {
     vote: Option<Vote>,
 }
 
-/// In-memory state machine
-#[derive(Debug, Default)]
+/// State machine data
+///
+/// Tracks applied state and provides access to the underlying storage engine.
+#[derive(Default)]
 struct StateMachineData {
     /// Last applied log ID
     last_applied_log: Option<LogId>,
     /// Current membership
     last_membership: StoredMembership,
-    /// Key-value store (the actual data)
-    kv: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Underlying storage engine for persisting data
+    ///
+    /// When changes are applied, they are written to this storage.
+    /// If None, changes are only stored in-memory (for testing).
+    storage: Option<Arc<dyn StorageEngine>>,
+}
+
+impl std::fmt::Debug for StateMachineData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateMachineData")
+            .field("last_applied_log", &self.last_applied_log)
+            .field("last_membership", &self.last_membership)
+            .field("storage", &self.storage.as_ref().map(|_| "<storage>"))
+            .finish()
+    }
 }
 
 /// In-memory Raft storage
@@ -49,19 +86,23 @@ impl MemStorage {
         Self::default()
     }
 
-    /// Get a value from the state machine
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.sm.read().kv.get(key).cloned()
+    /// Create a new MemStorage with a storage engine for applying changes
+    pub fn with_storage(storage: Arc<dyn StorageEngine>) -> Self {
+        Self {
+            log: Arc::new(RwLock::new(LogData::default())),
+            sm: Arc::new(RwLock::new(StateMachineData {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                storage: Some(storage),
+            })),
+        }
     }
 
-    /// Scan a range of keys
-    pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.sm
-            .read()
-            .kv
-            .range(range)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+    /// Set the storage engine for applying changes
+    ///
+    /// This should be called before the Raft node starts processing entries.
+    pub fn set_storage(&self, storage: Arc<dyn StorageEngine>) {
+        self.sm.write().storage = Some(storage);
     }
 }
 
@@ -157,36 +198,67 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut sm = self.sm.write();
+        // Get storage reference (if any) while holding lock briefly
+        let storage = self.sm.read().storage.clone();
+
         let mut results = Vec::new();
+        let entries_vec: Vec<Entry> = entries.into_iter().collect();
 
-        for entry in entries {
-            sm.last_applied_log = Some(*entry.get_log_id());
+        for entry in &entries_vec {
+            let log_id = *entry.get_log_id();
 
-            match entry.payload {
+            match &entry.payload {
                 EntryPayload::Blank => {
                     results.push(CommandResponse::Ok(None));
                 }
                 EntryPayload::Normal(cmd) => {
                     let resp = match cmd {
-                        Command::Put { key, value } => {
-                            sm.kv.insert(key, value);
+                        Command::DataChange(changeset) => {
+                            // Apply changes to storage with MVCC format
+                            // This matches the format used by MvccStorage::put/delete,
+                            // making Raft apply idempotent with direct MVCC writes.
+                            if let Some(ref storage) = storage {
+                                for change in &changeset.changes {
+                                    let result = match change.op {
+                                        ChangeOp::Insert | ChangeOp::Update => {
+                                            let data = change.value.as_deref().unwrap_or(&[]);
+                                            let encoded =
+                                                encode_mvcc_row(changeset.txn_id, false, data);
+                                            storage.put(&change.key, &encoded).await
+                                        }
+                                        ChangeOp::Delete => {
+                                            // MVCC deletes write a tombstone, not actual delete
+                                            let encoded =
+                                                encode_mvcc_row(changeset.txn_id, true, &[]);
+                                            storage.put(&change.key, &encoded).await
+                                        }
+                                    };
+
+                                    if let Err(e) = result {
+                                        tracing::error!("Failed to apply change to storage: {}", e);
+                                        // Continue applying other changes
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "No storage engine configured, changes not persisted"
+                                );
+                            }
                             CommandResponse::Ok(None)
-                        }
-                        Command::Delete { key } => {
-                            let old = sm.kv.remove(&key);
-                            CommandResponse::Ok(old)
                         }
                         Command::Noop => CommandResponse::Ok(None),
                     };
                     results.push(resp);
                 }
                 EntryPayload::Membership(ref m) => {
-                    sm.last_membership =
-                        StoredMembership::new(Some(*entry.get_log_id()), m.clone());
+                    self.sm.write().last_membership =
+                        StoredMembership::new(Some(log_id), m.clone());
                     results.push(CommandResponse::Ok(None));
                 }
             }
+
+            // Update last applied log
+            self.sm.write().last_applied_log = Some(log_id);
         }
 
         Ok(results)
@@ -203,19 +275,15 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        _snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError> {
         let mut sm = self.sm.write();
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
 
-        // Deserialize snapshot data
-        let data = snapshot.into_inner();
-        if !data.is_empty() {
-            if let Ok(kv) = bincode::deserialize::<BTreeMap<Vec<u8>, Vec<u8>>>(&data) {
-                sm.kv = kv;
-            }
-        }
+        // Note: Snapshot data would need to be applied to LSM storage.
+        // This is a placeholder - full snapshot support requires LSM integration.
+        // For now, we rely on log replay for state recovery.
 
         Ok(())
     }
@@ -223,13 +291,13 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
         let sm = self.sm.read();
 
-        let data = bincode::serialize(&sm.kv).unwrap_or_default();
-
+        // Note: Full snapshot support would serialize LSM state.
+        // For now, return empty snapshot - rely on log replay.
         let meta = SnapshotMeta {
             last_log_id: sm.last_applied_log,
             last_membership: sm.last_membership.clone(),
             snapshot_id: format!(
-                "{}-mem",
+                "{}-log",
                 sm.last_applied_log
                     .map(|l| l.to_string())
                     .unwrap_or_default()
@@ -238,7 +306,7 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
 
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(Vec::new())),
         }))
     }
 }
@@ -247,13 +315,13 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
         let sm = self.sm.read();
 
-        let data = bincode::serialize(&sm.kv).unwrap_or_default();
-
+        // Note: Full snapshot support would serialize LSM state.
+        // For now, return empty snapshot - rely on log replay.
         let meta = SnapshotMeta {
             last_log_id: sm.last_applied_log,
             last_membership: sm.last_membership.clone(),
             snapshot_id: format!(
-                "{}-mem",
+                "{}-log",
                 sm.last_applied_log
                     .map(|l| l.to_string())
                     .unwrap_or_default()
@@ -262,7 +330,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStorage {
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(Vec::new())),
         })
     }
 }

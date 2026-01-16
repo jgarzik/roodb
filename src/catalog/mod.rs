@@ -2,6 +2,11 @@
 //!
 //! The catalog stores metadata about database schema including
 //! table definitions, column types, constraints, and indexes.
+//!
+//! Schema is persisted in system tables (system.tables, system.columns, system.indexes)
+//! and the Catalog is a cache rebuilt from those tables on startup.
+
+pub mod system_tables;
 
 use std::collections::HashMap;
 
@@ -264,6 +269,41 @@ impl Catalog {
             tables: HashMap::new(),
             indexes: HashMap::new(),
         }
+    }
+
+    /// Create a catalog with system tables pre-populated
+    ///
+    /// This should be used on server startup to bootstrap the catalog
+    /// with the system table definitions that store schema metadata.
+    pub fn with_system_tables() -> Self {
+        let mut catalog = Self::new();
+        for table_def in system_tables::bootstrap_system_tables() {
+            catalog.tables.insert(table_def.name.clone(), table_def);
+        }
+        catalog
+    }
+
+    /// Register a table directly without validation (for rebuilding from storage)
+    ///
+    /// This bypasses the normal create_table checks and is used when
+    /// rebuilding the catalog cache from system tables on startup.
+    pub fn register_table(&mut self, def: TableDef) {
+        self.tables.insert(def.name.clone(), def);
+    }
+
+    /// Register an index directly without validation (for rebuilding from storage)
+    ///
+    /// This bypasses the normal create_index checks and is used when
+    /// rebuilding the catalog cache from system tables on startup.
+    pub fn register_index(&mut self, def: IndexDef) {
+        self.indexes.insert(def.name.clone(), def);
+    }
+
+    /// Clear all non-system tables (for testing or re-initialization)
+    pub fn clear_user_tables(&mut self) {
+        self.tables
+            .retain(|name, _| system_tables::is_system_table(name));
+        self.indexes.clear();
     }
 
     /// Create a table

@@ -54,10 +54,6 @@ pub enum TransactionError {
     #[error("Storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
 
-    /// WAL error during commit
-    #[error("WAL error: {0}")]
-    Wal(#[from] crate::wal::WalError),
-
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),

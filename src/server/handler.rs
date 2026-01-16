@@ -11,6 +11,7 @@ use tracing::{error, info};
 use crate::catalog::Catalog;
 use crate::protocol::roodb::starttls::starttls_handshake;
 use crate::protocol::roodb::RooDbConnection;
+use crate::raft::RaftNode;
 use crate::storage::StorageEngine;
 use crate::txn::TransactionManager;
 
@@ -25,6 +26,7 @@ pub async fn handle_connection(
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
     txn_manager: Arc<TransactionManager>,
+    raft_node: Arc<RaftNode>,
 ) {
     info!(%peer_addr, connection_id, "Client connected");
 
@@ -45,6 +47,7 @@ pub async fn handle_connection(
         storage,
         catalog,
         txn_manager,
+        raft_node,
     );
 
     // Complete authentication (handshake response comes over TLS)

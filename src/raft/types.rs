@@ -5,6 +5,8 @@ use std::io::Cursor;
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
+use super::ChangeSet;
+
 /// Node identifier
 pub type NodeId = u64;
 
@@ -12,12 +14,16 @@ pub type NodeId = u64;
 pub type Node = BasicNode;
 
 /// Raft log entry data - commands to be replicated
+///
+/// SQL operations produce row-level changes that are replicated through Raft.
+/// When a log entry is committed, the changes are applied to the local LSM storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Command {
-    /// Write a key-value pair
-    Put { key: Vec<u8>, value: Vec<u8> },
-    /// Delete a key
-    Delete { key: Vec<u8> },
+    /// Data changes from SQL DML/DDL operations
+    ///
+    /// Contains row-level changes collected during transaction execution.
+    /// These are applied to the LSM storage when the log entry is committed.
+    DataChange(ChangeSet),
     /// No-op for leader election
     Noop,
 }

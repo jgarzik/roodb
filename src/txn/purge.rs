@@ -104,35 +104,9 @@ impl PurgeTask {
     }
 }
 
-/// Create a purge task with default settings
-///
-/// Returns the task and a shutdown sender.
-#[allow(dead_code)]
-pub fn create_purge_task(txn_manager: Arc<TransactionManager>) -> (PurgeTask, watch::Sender<bool>) {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task = PurgeTask::new(
-        txn_manager,
-        Duration::from_secs(10), // Default: every 10 seconds
-        shutdown_rx,
-    );
-    (task, shutdown_tx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_purge_task_creation() {
-        let mgr = Arc::new(TransactionManager::new());
-        let (task, shutdown_tx) = create_purge_task(mgr.clone());
-
-        // Verify it's created with correct interval
-        assert_eq!(task.interval, Duration::from_secs(10));
-
-        // Clean shutdown
-        drop(shutdown_tx);
-    }
 
     #[tokio::test]
     async fn test_purge_cycle() {

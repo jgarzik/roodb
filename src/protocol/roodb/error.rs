@@ -31,6 +31,8 @@ pub enum ProtocolError {
     ConnectionClosed,
     /// TLS handshake error
     Tls(String),
+    /// Raft consensus error
+    Raft(String),
     /// Internal error
     Internal(String),
 }
@@ -48,6 +50,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::Transaction(e) => write!(f, "Transaction error: {}", e),
             ProtocolError::ConnectionClosed => write!(f, "Connection closed"),
             ProtocolError::Tls(msg) => write!(f, "TLS error: {}", msg),
+            ProtocolError::Raft(msg) => write!(f, "Raft error: {}", msg),
             ProtocolError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }

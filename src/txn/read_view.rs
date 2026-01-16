@@ -13,7 +13,7 @@ use std::collections::HashSet;
 /// - Rows created by transactions that were committed before the read view was created are visible
 /// - Rows created by transactions that were active when the read view was created are NOT visible
 /// - Rows created by transactions that started after the read view was created are NOT visible
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReadView {
     /// The transaction ID that created this read view
     pub creator_txn_id: u64,

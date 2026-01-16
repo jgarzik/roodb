@@ -98,7 +98,12 @@ SQL string
 
 ### `catalog.rs`
 
-Schema metadata store.
+Schema metadata cache. The catalog is an in-memory cache of schema metadata, rebuilt from system tables on startup.
+
+**System Tables** (stored in LSM, replicated via Raft):
+- `system.tables` - table definitions
+- `system.columns` - column definitions
+- `system.indexes` - index definitions
 
 **Types**:
 - `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, Float, Double, Varchar(n), Text, Blob, Timestamp
@@ -106,7 +111,10 @@ Schema metadata store.
 - `TableDef`: name, columns, constraints
 - `Constraint`: PrimaryKey, Unique, ForeignKey, Check
 
-**Operations**: `get_table()`, `create_table()`, `drop_table()`, `get_column_index()`
+**Operations**:
+- `get_table()`, `create_table()`, `drop_table()`, `get_column_index()`
+- `with_system_tables()`: Bootstrap with system table definitions
+- `rebuild_from_storage()`: Reload from system tables (startup)
 
 ### `executor/`
 
@@ -240,32 +248,51 @@ MySQL wire protocol implementation.
 
 ### `raft/`
 
-Distributed consensus via OpenRaft.
+Distributed consensus and replication via OpenRaft.
+
+**Architecture**:
+- SQL writes → RowChanges → Raft propose → Consensus → Apply to LSM
+- Raft log IS the WAL (no separate WAL module)
+- DDL = DML on system tables (replicated same path)
 
 **Types** (`types.rs`):
 ```rust
 pub type NodeId = u64;
 
 pub enum Command {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
-    Noop,
+    DataChange(ChangeSet),  // Row-level changes from SQL DML/DDL
+    Noop,                    // Leader election
+}
+
+pub struct ChangeSet {
+    pub txn_id: u64,
+    pub changes: Vec<RowChange>,
+}
+
+pub struct RowChange {
+    pub table: String,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,  // None = DELETE
+    pub op: ChangeOp,            // Insert, Update, Delete
 }
 ```
 
 **RaftNode** (`node.rs`):
+- `new()`: Create with optional storage engine integration
+- `propose_changes()`: Submit SQL changes for replication
 - `bootstrap_single_node()`: Auto-elect as leader
 - `bootstrap_cluster()`: Initialize with member list
 - `start_rpc_server()`: Handle AppendEntries, RequestVote, InstallSnapshot
+- `is_leader()`: Check if this node can accept writes
 
 **Storage** (`storage.rs`):
-- `MemStorage`: In-memory log + state machine
+- `MemStorage`: In-memory log + state machine with optional LSM integration
 - `LogData`: Vote, log entries (BTreeMap by index)
-- `StateMachineData`: Applied log ID, membership, KV store
+- `StateMachineData`: Applied log ID, membership, storage engine reference
+- When entries are applied, changes are written to the LSM storage
 
-**Integration**:
-- `TransactionManager::is_leader`: Rejects writes on followers
-- Write path: Txn → MVCC encode → Raft replicate → Apply to KV
+**Read Path**: Direct to local LSM (no Raft)
+**Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM
 
 ### `server/`
 
@@ -440,31 +467,6 @@ impl ReadView {
 
 **UndoLog**: Version chain storage for MVCC rollback
 
-### `wal/`
-
-Write-ahead log for durability.
-
-**Segment** (`segment.rs`):
-- Default size: 16MB
-- Header: 4KB (magic `WALS`, version)
-- File naming: `wal_<lsn_hex>.log`
-
-**Record Format** (`record.rs`):
-```
-| CRC32 (4B) | Type (1B) | Len (2B) | LSN (8B) | Data... |
-```
-
-**Record Types**: Data, Checkpoint, SegmentEnd, Commit
-
-**WalManager** (`manager.rs`):
-- Segment rotation when full
-- LSN tracking (monotonic)
-- Recovery: Scan all segments, find max LSN
-
-**Config**:
-- `segment_size`: 16MB default
-- `sync_on_write`: true (fsync after each append)
-
 ---
 
 ## Key Constants
@@ -473,9 +475,10 @@ Write-ahead log for durability.
 |----------|-------|----------|
 | Memtable flush threshold | 4 MB | `storage/lsm/memtable.rs` |
 | SSTable block size | 4 KB | `storage/lsm/block.rs` |
-| WAL segment size | 16 MB | `wal/segment.rs` |
 | L0 compaction trigger | 4 files | `storage/lsm/compaction.rs` |
 | Level size ratio | 10x | `storage/lsm/compaction.rs` |
 | io_uring queue depth | 64 | `io/uring.rs` |
 | Max packet size | 16 MB - 1 | `protocol/roodb/packet.rs` |
 | Page alignment | 4 KB | `io/traits.rs` |
+| Raft election timeout | 150-300 ms | `raft/node.rs` |
+| Raft heartbeat interval | 50 ms | `raft/node.rs` |

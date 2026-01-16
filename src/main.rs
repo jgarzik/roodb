@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 
 use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
+use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::TlsConfig;
@@ -52,12 +53,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io_factory, storage_config).await?);
 
-    // Initialize catalog
-    let catalog = Arc::new(RwLock::new(Catalog::new()));
+    // Initialize catalog with system tables
+    let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
+
+    // Initialize Raft node (single-node mode)
+    // Raft RPC uses port + 1000 by convention
+    let raft_port = port + 1000;
+    let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
+
+    let mut raft_node = RaftNode::new(1, raft_addr, tls_config.clone(), Some(storage.clone())).await?;
+    raft_node.start_rpc_server().await?;
+    raft_node.bootstrap_single_node().await?;
+    let raft_node = Arc::new(raft_node);
+
+    tracing::info!(raft_port, "Raft node bootstrapped (single-node mode)");
 
     // Start RooDB server
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let server = RooDbServer::new(addr, tls_config, storage, catalog);
+    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
     server.run().await?;
 
     Ok(())

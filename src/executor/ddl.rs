@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
+use crate::catalog::system_tables::is_system_table;
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 
 use super::datum::Datum;
@@ -60,6 +61,14 @@ impl Executor for CreateTable {
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
         if self.done {
             return Ok(None);
+        }
+
+        // Prevent creating tables with system. prefix
+        if is_system_table(&self.name) {
+            return Err(ExecutorError::Internal(format!(
+                "cannot create system table '{}'",
+                self.name
+            )));
         }
 
         let mut catalog = self.catalog.write();
@@ -132,6 +141,14 @@ impl Executor for DropTable {
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
         if self.done {
             return Ok(None);
+        }
+
+        // Prevent dropping system tables
+        if is_system_table(&self.name) {
+            return Err(ExecutorError::Internal(format!(
+                "cannot drop system table '{}'",
+                self.name
+            )));
         }
 
         let mut catalog = self.catalog.write();

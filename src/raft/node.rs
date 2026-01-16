@@ -1,4 +1,8 @@
 //! Raft node management
+//!
+//! Provides the RaftNode type which wraps OpenRaft and integrates with
+//! the SQL execution layer. SQL DML operations collect row changes which
+//! are proposed to Raft for replication.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -14,6 +18,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::raft::network::{RaftNetworkFactoryImpl, RaftRpcHandler};
 use crate::raft::storage::MemStorage;
 use crate::raft::types::{Command, CommandResponse, Node, NodeId, Raft};
+use crate::raft::ChangeSet;
+use crate::storage::StorageEngine;
 use crate::tls::TlsConfig;
 
 #[derive(Error, Debug)]
@@ -27,22 +33,34 @@ pub enum RaftNodeError {
 }
 
 /// A Raft node in the cluster
+///
+/// Wraps OpenRaft and provides methods for:
+/// - Proposing SQL changes for replication
+/// - Managing cluster membership
+/// - Handling Raft RPC communication
 pub struct RaftNode {
     id: NodeId,
     addr: SocketAddr,
     raft: Raft,
-    storage: MemStorage,
+    #[allow(dead_code)]
+    log_storage: MemStorage,
+    #[allow(dead_code)]
+    sm_storage: MemStorage,
     network: RaftNetworkFactoryImpl,
     tls_config: TlsConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl RaftNode {
-    /// Create a new Raft node
+    /// Create a new Raft node with storage engine integration
+    ///
+    /// The storage engine is used to apply committed changes. When a log entry
+    /// is committed, the row changes are written to the storage engine.
     pub async fn new(
         id: NodeId,
         addr: SocketAddr,
         tls_config: TlsConfig,
+        storage: Option<Arc<dyn StorageEngine>>,
     ) -> Result<Self, RaftNodeError> {
         let config = Config {
             cluster_name: "roodb".to_string(),
@@ -54,7 +72,11 @@ impl RaftNode {
         let config = Arc::new(config);
 
         let log_storage = MemStorage::new();
-        let sm_storage = MemStorage::new();
+        let sm_storage = if let Some(storage) = storage {
+            MemStorage::with_storage(storage)
+        } else {
+            MemStorage::new()
+        };
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
         let raft = Raft::new(
@@ -71,7 +93,8 @@ impl RaftNode {
             id,
             addr,
             raft,
-            storage: sm_storage,
+            log_storage,
+            sm_storage,
             network,
             tls_config,
             shutdown_tx: None,
@@ -86,11 +109,6 @@ impl RaftNode {
     /// Get the Raft instance
     pub fn raft(&self) -> &Raft {
         &self.raft
-    }
-
-    /// Get the storage
-    pub fn storage(&self) -> &MemStorage {
-        &self.storage
     }
 
     /// Add a peer node
@@ -173,7 +191,27 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Write a command to the Raft log
+    /// Propose a set of row changes through Raft consensus
+    ///
+    /// This is the main entry point for SQL write operations. After a DML
+    /// statement executes and collects row changes, those changes are proposed
+    /// to Raft for replication to followers.
+    ///
+    /// Returns Ok(()) when the changes have been committed (majority ack).
+    pub async fn propose_changes(&self, changeset: ChangeSet) -> Result<(), RaftNodeError> {
+        if changeset.is_empty() {
+            return Ok(());
+        }
+
+        let cmd = Command::DataChange(changeset);
+        self.raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Write a raw command to the Raft log
     pub async fn write(&self, cmd: Command) -> Result<CommandResponse, RaftNodeError> {
         let resp = self
             .raft
@@ -183,20 +221,24 @@ impl RaftNode {
         Ok(resp.data)
     }
 
-    /// Read a value (linearizable read through Raft)
-    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, RaftNodeError> {
-        // Ensure we're the leader (linearizable read)
+    /// Check if this node is the leader
+    ///
+    /// Returns true if this node can accept writes (is the Raft leader).
+    /// Non-leaders can still serve reads from local storage.
+    pub async fn is_leader(&self) -> bool {
+        self.raft.ensure_linearizable().await.is_ok()
+    }
+
+    /// Ensure linearizable read
+    ///
+    /// This confirms we are the leader and have the latest committed state.
+    /// Call this before returning query results if strong consistency is required.
+    pub async fn ensure_linearizable(&self) -> Result<(), RaftNodeError> {
         self.raft
             .ensure_linearizable()
             .await
-            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
-
-        Ok(self.storage.get(key))
-    }
-
-    /// Check if this node is the leader
-    pub async fn is_leader(&self) -> bool {
-        self.raft.ensure_linearizable().await.is_ok()
+            .map(|_| ())
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))
     }
 
     /// Shutdown the node
