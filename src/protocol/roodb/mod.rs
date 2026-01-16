@@ -577,14 +577,14 @@ where
             (None, None)
         } else if let Some(txn_id) = self.session.current_txn {
             // Explicit transaction - use existing txn_id
-            let read_view = self.txn_manager.create_read_view(txn_id);
+            let read_view = self.txn_manager.create_read_view(txn_id)?;
             (Some(TransactionContext::new(txn_id, read_view)), None)
         } else if !returns_rows && self.session.autocommit {
             // Autocommit DML - create implicit transaction
             let txn = self
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)?;
-            let read_view = self.txn_manager.create_read_view(txn.txn_id);
+            let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
             (
                 Some(TransactionContext::new(txn.txn_id, read_view)),
                 Some(txn.txn_id),
@@ -592,7 +592,7 @@ where
         } else {
             // Read-only query in autocommit mode - create snapshot read view
             // txn_id=0 special case: sees all committed transactions
-            let read_view = self.txn_manager.create_read_view(0);
+            let read_view = self.txn_manager.create_read_view(0)?;
             (Some(TransactionContext::new(0, read_view)), None)
         };
 

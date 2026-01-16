@@ -7,13 +7,39 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     IsolationLevel, ReadView, TimeoutConfig, Transaction, TransactionError, TransactionResult,
     TransactionState, UndoLog,
 };
 use crate::storage::StorageEngine;
+
+/// Convert a RwLock PoisonError to TransactionError
+fn lock_poisoned<T>(_: PoisonError<T>) -> TransactionError {
+    TransactionError::Internal("Lock poisoned: a thread panicked while holding the lock".into())
+}
+
+/// Helper trait to convert RwLock results to TransactionResult
+trait LockResultExt<T> {
+    fn or_poisoned(self) -> TransactionResult<T>;
+}
+
+impl<'a, T> LockResultExt<RwLockReadGuard<'a, T>>
+    for Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>
+{
+    fn or_poisoned(self) -> TransactionResult<RwLockReadGuard<'a, T>> {
+        self.map_err(lock_poisoned)
+    }
+}
+
+impl<'a, T> LockResultExt<RwLockWriteGuard<'a, T>>
+    for Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>
+{
+    fn or_poisoned(self) -> TransactionResult<RwLockWriteGuard<'a, T>> {
+        self.map_err(lock_poisoned)
+    }
+}
 
 /// Transaction manager - coordinates all transaction operations
 pub struct TransactionManager {
@@ -85,12 +111,24 @@ impl TransactionManager {
 
     /// Update timeout configuration
     pub fn set_timeout_config(&self, config: TimeoutConfig) {
-        *self.timeout_config.write().unwrap() = config;
+        match self.timeout_config.write() {
+            Ok(mut guard) => *guard = config,
+            Err(poisoned) => {
+                tracing::warn!("Timeout config lock poisoned, recovering");
+                *poisoned.into_inner() = config;
+            }
+        }
     }
 
     /// Get timeout configuration
     pub fn timeout_config(&self) -> TimeoutConfig {
-        self.timeout_config.read().unwrap().clone()
+        match self.timeout_config.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                tracing::warn!("Timeout config lock poisoned, recovering");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// Get a reference to the undo log
@@ -121,7 +159,7 @@ impl TransactionManager {
 
         // Register as active
         {
-            let mut active = self.active_transactions.write().unwrap();
+            let mut active = self.active_transactions.write().or_poisoned()?;
             active.insert(txn_id, txn.clone());
         }
 
@@ -136,7 +174,7 @@ impl TransactionManager {
     pub async fn commit(&self, txn_id: u64) -> TransactionResult<()> {
         // Get and validate transaction
         {
-            let mut active = self.active_transactions.write().unwrap();
+            let mut active = self.active_transactions.write().or_poisoned()?;
             let txn = active
                 .remove(&txn_id)
                 .ok_or(TransactionError::NotFound(txn_id))?;
@@ -148,7 +186,7 @@ impl TransactionManager {
 
         // Add to committed set
         {
-            let mut committed = self.committed_txns.write().unwrap();
+            let mut committed = self.committed_txns.write().or_poisoned()?;
             committed.insert(txn_id);
         }
 
@@ -174,7 +212,7 @@ impl TransactionManager {
     pub async fn rollback(&self, txn_id: u64) -> TransactionResult<()> {
         // Get and validate transaction
         {
-            let mut active = self.active_transactions.write().unwrap();
+            let mut active = self.active_transactions.write().or_poisoned()?;
             let txn = active
                 .remove(&txn_id)
                 .ok_or(TransactionError::NotFound(txn_id))?;
@@ -223,35 +261,47 @@ impl TransactionManager {
     ///
     /// The read view captures the current state of active transactions
     /// to determine which row versions are visible.
-    pub fn create_read_view(&self, txn_id: u64) -> ReadView {
-        let active = self.active_transactions.read().unwrap();
+    pub fn create_read_view(&self, txn_id: u64) -> TransactionResult<ReadView> {
+        let active = self.active_transactions.read().or_poisoned()?;
         let active_ids: HashSet<u64> = active.keys().copied().collect();
         let max_txn_id = self.next_txn_id.load(Ordering::SeqCst) - 1;
 
-        ReadView::new(txn_id, active_ids, max_txn_id)
+        Ok(ReadView::new(txn_id, active_ids, max_txn_id))
     }
 
     /// Check if a transaction is committed
     pub fn is_committed(&self, txn_id: u64) -> bool {
-        let committed = self.committed_txns.read().unwrap();
+        let committed = self.committed_txns.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Committed txns lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         committed.contains(&txn_id)
     }
 
     /// Check if a transaction is active
     pub fn is_active(&self, txn_id: u64) -> bool {
-        let active = self.active_transactions.read().unwrap();
+        let active = self.active_transactions.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Active transactions lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         active.contains_key(&txn_id)
     }
 
     /// Get a transaction by ID (if active)
     pub fn get_transaction(&self, txn_id: u64) -> Option<Transaction> {
-        let active = self.active_transactions.read().unwrap();
+        let active = self.active_transactions.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Active transactions lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         active.get(&txn_id).cloned()
     }
 
     /// Update last activity time for a transaction
     pub fn touch(&self, txn_id: u64) {
-        let mut active = self.active_transactions.write().unwrap();
+        let mut active = self.active_transactions.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("Active transactions lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         if let Some(txn) = active.get_mut(&txn_id) {
             txn.touch();
         }
@@ -261,7 +311,7 @@ impl TransactionManager {
     ///
     /// Returns the IDs of transactions that were rolled back.
     pub async fn check_timeouts(&self) -> Vec<u64> {
-        let timeout_config = self.timeout_config.read().unwrap().clone();
+        let timeout_config = self.timeout_config();
 
         if !timeout_config.has_idle_timeout() {
             return vec![];
@@ -271,7 +321,10 @@ impl TransactionManager {
 
         // Find timed out transactions
         let timed_out: Vec<u64> = {
-            let active = self.active_transactions.read().unwrap();
+            let active = self.active_transactions.read().unwrap_or_else(|poisoned| {
+                tracing::warn!("Active transactions lock poisoned, recovering");
+                poisoned.into_inner()
+            });
             active
                 .iter()
                 .filter(|(_, txn)| txn.idle_duration() > idle_timeout)
@@ -301,7 +354,10 @@ impl TransactionManager {
     ///
     /// Used for purging old undo records that are no longer needed.
     pub fn min_active_txn_id(&self) -> u64 {
-        let active = self.active_transactions.read().unwrap();
+        let active = self.active_transactions.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Active transactions lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         active.keys().min().copied().unwrap_or(u64::MAX)
     }
 
@@ -312,13 +368,19 @@ impl TransactionManager {
 
     /// Get count of active transactions
     pub fn active_count(&self) -> usize {
-        let active = self.active_transactions.read().unwrap();
+        let active = self.active_transactions.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Active transactions lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         active.len()
     }
 
     /// Get count of committed transactions (in memory)
     pub fn committed_count(&self) -> usize {
-        let committed = self.committed_txns.read().unwrap();
+        let committed = self.committed_txns.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("Committed txns lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         committed.len()
     }
 
@@ -326,7 +388,10 @@ impl TransactionManager {
     ///
     /// Call this periodically to free memory from old committed transaction IDs.
     pub fn purge_committed(&self, min_txn_id: u64) {
-        let mut committed = self.committed_txns.write().unwrap();
+        let mut committed = self.committed_txns.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("Committed txns lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         committed.retain(|&id| id >= min_txn_id);
     }
 }
@@ -433,7 +498,7 @@ mod tests {
         let txn3 = mgr.begin(IsolationLevel::RepeatableRead, false).unwrap();
 
         // Create read view for txn2
-        let view = mgr.create_read_view(txn2.txn_id);
+        let view = mgr.create_read_view(txn2.txn_id).unwrap();
 
         assert_eq!(view.creator_txn_id, txn2.txn_id);
         assert!(view.active_txn_ids.contains(&txn1.txn_id));
