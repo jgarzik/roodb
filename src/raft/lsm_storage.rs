@@ -839,7 +839,11 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             if snapshot_data.len() < 8 {
                 return Err(read_err("Invalid snapshot: too short"));
             }
-            let count = u64::from_le_bytes(snapshot_data[..8].try_into().unwrap()) as usize;
+            let count = u64::from_le_bytes(
+                snapshot_data[..8]
+                    .try_into()
+                    .map_err(|_| read_err("Invalid snapshot: count parse error"))?,
+            ) as usize;
             let mut offset = 8;
 
             // Install each entry
@@ -849,9 +853,11 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 if offset + 4 > snapshot_data.len() {
                     return Err(read_err("Invalid snapshot: truncated key length"));
                 }
-                let key_len =
-                    u32::from_le_bytes(snapshot_data[offset..offset + 4].try_into().unwrap())
-                        as usize;
+                let key_len = u32::from_le_bytes(
+                    snapshot_data[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| read_err("Invalid snapshot: key length parse error"))?,
+                ) as usize;
                 offset += 4;
 
                 if offset + key_len > snapshot_data.len() {
@@ -863,9 +869,11 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 if offset + 4 > snapshot_data.len() {
                     return Err(read_err("Invalid snapshot: truncated value length"));
                 }
-                let value_len =
-                    u32::from_le_bytes(snapshot_data[offset..offset + 4].try_into().unwrap())
-                        as usize;
+                let value_len = u32::from_le_bytes(
+                    snapshot_data[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| read_err("Invalid snapshot: value length parse error"))?,
+                ) as usize;
                 offset += 4;
 
                 if offset + value_len > snapshot_data.len() {

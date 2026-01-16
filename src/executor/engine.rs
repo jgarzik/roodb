@@ -157,7 +157,6 @@ impl ExecutorEngine {
                 table,
                 columns,
                 values,
-                self.mvcc.clone(),
                 self.txn_context.clone(),
             ))),
 

@@ -82,12 +82,18 @@ pub async fn compact_l0<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     // Update manifest: remove old files, add new ones
     for f in &l0_files {
         manifest.remove_sstable(0, &f.name);
-        // Delete old file
-        let _ = std::fs::remove_file(manifest.sstable_path(&f.name));
+        // Delete old file (log warning on failure, don't fail compaction)
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
+        }
     }
     for f in &l1_files {
         manifest.remove_sstable(1, &f.name);
-        let _ = std::fs::remove_file(manifest.sstable_path(&f.name));
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
+        }
     }
     for f in new_files {
         manifest.add_sstable(1, f);
@@ -131,11 +137,17 @@ pub async fn compact_level<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
 
     // Update manifest
     manifest.remove_sstable(level, &source.name);
-    let _ = std::fs::remove_file(manifest.sstable_path(&source.name));
+    let path = manifest.sstable_path(&source.name);
+    if let Err(e) = std::fs::remove_file(&path) {
+        tracing::warn!(path = ?path, level = level, error = %e, "Failed to delete old SSTable during level compaction");
+    }
 
     for f in &target_files {
         manifest.remove_sstable(level + 1, &f.name);
-        let _ = std::fs::remove_file(manifest.sstable_path(&f.name));
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, level = level + 1, error = %e, "Failed to delete old SSTable during level compaction");
+        }
     }
 
     for f in new_files {

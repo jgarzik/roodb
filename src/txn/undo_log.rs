@@ -178,7 +178,9 @@ impl UndoLog {
         let index = txn_records.len();
         txn_records.push(record);
 
-        self.roll_ptr_index.write().insert(roll_ptr, (txn_id, index));
+        self.roll_ptr_index
+            .write()
+            .insert(roll_ptr, (txn_id, index));
 
         roll_ptr
     }
@@ -198,7 +200,11 @@ impl UndoLog {
 
     /// Get all undo records for a transaction (in order of creation)
     pub fn get_records(&self, txn_id: u64) -> Vec<UndoRecord> {
-        self.records.read().get(&txn_id).cloned().unwrap_or_default()
+        self.records
+            .read()
+            .get(&txn_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get undo records in reverse order (for rollback)

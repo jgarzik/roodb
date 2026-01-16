@@ -154,7 +154,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         self.offset += BLOCK_SIZE as u64;
 
         // Write footer
-        let footer = self.build_footer(index_offset);
+        let footer = self.build_footer(index_offset)?;
         let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
         buf.copy_from_slice(&footer)?;
         self.io.write_at(&buf, self.offset).await?;
@@ -198,11 +198,19 @@ impl<IO: AsyncIO> SstableWriter<IO> {
     }
 
     /// Build the footer block
-    fn build_footer(&self, index_offset: u64) -> Vec<u8> {
+    fn build_footer(&self, index_offset: u64) -> StorageResult<Vec<u8>> {
         let mut buf = vec![0u8; FOOTER_SIZE];
 
-        let min_key = self.min_key.as_ref().unwrap();
-        let max_key = self.max_key.as_ref().unwrap();
+        let min_key = self.min_key.as_ref().ok_or_else(|| {
+            StorageError::InvalidSstable(
+                "Cannot build footer: no entries added (min_key missing)".to_string(),
+            )
+        })?;
+        let max_key = self.max_key.as_ref().ok_or_else(|| {
+            StorageError::InvalidSstable(
+                "Cannot build footer: no entries added (max_key missing)".to_string(),
+            )
+        })?;
 
         let mut offset = 0;
 
@@ -238,7 +246,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         buf[FOOTER_SIZE - 8..FOOTER_SIZE - 4].copy_from_slice(&SSTABLE_MAGIC.to_be_bytes());
         buf[FOOTER_SIZE - 4..].copy_from_slice(&SSTABLE_VERSION.to_be_bytes());
 
-        buf
+        Ok(buf)
     }
 }
 

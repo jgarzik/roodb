@@ -1,15 +1,12 @@
 //! Insert executor
 //!
-//! Inserts rows into a table with MVCC support.
-
-use std::sync::Arc;
+//! Inserts rows into a table.
 
 use async_trait::async_trait;
 
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::storage::next_row_id;
-use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
 use super::encoding::{encode_row, encode_row_key};
@@ -26,8 +23,6 @@ pub struct Insert {
     _columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
     values: Vec<Vec<ResolvedExpr>>,
-    /// MVCC-aware storage
-    mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC versioning)
     txn_context: Option<TransactionContext>,
     /// Number of rows inserted
@@ -42,14 +37,12 @@ impl Insert {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
-        mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
     ) -> Self {
         Insert {
             table,
             _columns: columns,
             values,
-            mvcc,
             txn_context,
             rows_inserted: 0,
             done: false,
@@ -126,68 +119,11 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::Literal;
-    use crate::storage::traits::KeyValue;
-    use crate::storage::{StorageEngine, StorageResult};
-    use crate::txn::TransactionManager;
-    use std::sync::Mutex;
-
-    struct MockStorage {
-        data: Mutex<Vec<KeyValue>>,
-    }
-
-    impl MockStorage {
-        fn new() -> Self {
-            MockStorage {
-                data: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl StorageEngine for MockStorage {
-        async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-            let data = self.data.lock().unwrap();
-            Ok(data.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
-        }
-
-        async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
-            let mut data = self.data.lock().unwrap();
-            data.push((key.to_vec(), value.to_vec()));
-            Ok(())
-        }
-
-        async fn delete(&self, _key: &[u8]) -> StorageResult<()> {
-            Ok(())
-        }
-
-        async fn scan(
-            &self,
-            _start: Option<&[u8]>,
-            _end: Option<&[u8]>,
-        ) -> StorageResult<Vec<KeyValue>> {
-            Ok(Vec::new())
-        }
-
-        async fn flush(&self) -> StorageResult<()> {
-            Ok(())
-        }
-
-        async fn close(&self) -> StorageResult<()> {
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn test_insert() {
         use crate::executor::context::TransactionContext;
         use crate::txn::ReadView;
-
-        let storage = Arc::new(MockStorage::new());
-        let txn_manager = Arc::new(TransactionManager::new());
-        let mvcc = Arc::new(MvccStorage::new(
-            storage.clone() as Arc<dyn StorageEngine>,
-            txn_manager,
-        ));
 
         let columns = vec![
             ResolvedColumn {
@@ -213,13 +149,7 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut insert = Insert::new(
-            "users".to_string(),
-            columns,
-            values,
-            mvcc,
-            Some(txn_context),
-        );
+        let mut insert = Insert::new("users".to_string(), columns, values, Some(txn_context));
         insert.open().await.unwrap();
 
         let result = insert.next().await.unwrap().unwrap();

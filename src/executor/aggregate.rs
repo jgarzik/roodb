@@ -2,7 +2,7 @@
 //!
 //! Implements GROUP BY with aggregate functions (COUNT, SUM, AVG, MIN, MAX).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 
@@ -101,6 +101,47 @@ impl Accumulator {
     }
 }
 
+/// Wrapper that handles DISTINCT tracking for aggregates
+#[derive(Debug, Clone)]
+struct DistinctAccumulator {
+    inner: Accumulator,
+    /// Set of seen values (only used when distinct=true)
+    seen: Option<HashSet<Datum>>,
+}
+
+impl DistinctAccumulator {
+    fn new(func_name: &str, distinct: bool) -> Self {
+        DistinctAccumulator {
+            inner: Accumulator::new(func_name),
+            // MIN/MAX don't need distinct tracking - they're naturally idempotent
+            seen: if distinct && !matches!(func_name.to_uppercase().as_str(), "MIN" | "MAX") {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+        }
+    }
+
+    fn accumulate(&mut self, value: &Datum) {
+        // If tracking distinct, check if we've seen this value
+        if let Some(seen) = &mut self.seen {
+            // Skip nulls for distinct tracking (NULL != NULL in SQL)
+            if value.is_null() {
+                return;
+            }
+            if !seen.insert(value.clone()) {
+                // Already seen this value, skip
+                return;
+            }
+        }
+        self.inner.accumulate(value);
+    }
+
+    fn finalize(&self) -> Datum {
+        self.inner.finalize()
+    }
+}
+
 /// Hash aggregate executor
 pub struct HashAggregate {
     /// Input executor
@@ -110,7 +151,7 @@ pub struct HashAggregate {
     /// Aggregate functions with output aliases
     aggregates: Vec<(AggregateFunc, String)>,
     /// Grouped results: group_key -> (group_values, accumulators)
-    groups: HashMap<Vec<u8>, (Vec<Datum>, Vec<Accumulator>)>,
+    groups: HashMap<Vec<u8>, (Vec<Datum>, Vec<DistinctAccumulator>)>,
     /// Iterator over groups for output
     output: Vec<Row>,
     /// Current position in output
@@ -179,7 +220,7 @@ impl Executor for HashAggregate {
                 let accs: Vec<_> = self
                     .aggregates
                     .iter()
-                    .map(|(agg, _)| Accumulator::new(&agg.name))
+                    .map(|(agg, _)| DistinctAccumulator::new(&agg.name, agg.distinct))
                     .collect();
                 (group_values.clone(), accs)
             });
@@ -210,7 +251,7 @@ impl Executor for HashAggregate {
         if self.output.is_empty() && self.group_by.is_empty() && !self.aggregates.is_empty() {
             let mut row_values = Vec::new();
             for (agg, _) in &self.aggregates {
-                let acc = Accumulator::new(&agg.name);
+                let acc = DistinctAccumulator::new(&agg.name, agg.distinct);
                 row_values.push(acc.finalize());
             }
             self.output.push(Row::new(row_values));
@@ -377,6 +418,82 @@ mod tests {
 
         assert_eq!(results.get("a"), Some(&40.0));
         assert_eq!(results.get("b"), Some(&20.0));
+
+        agg.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_count_distinct() {
+        // Values with duplicates: 1, 2, 2, 3, 3, 3
+        let rows = vec![
+            Row::new(vec![Datum::Int(1)]),
+            Row::new(vec![Datum::Int(2)]),
+            Row::new(vec![Datum::Int(2)]),
+            Row::new(vec![Datum::Int(3)]),
+            Row::new(vec![Datum::Int(3)]),
+            Row::new(vec![Datum::Int(3)]),
+        ];
+        let input = Box::new(MockExecutor { rows, position: 0 });
+
+        let aggregates = vec![(
+            AggregateFunc {
+                name: "COUNT".to_string(),
+                args: vec![ResolvedExpr::Column(ResolvedColumn {
+                    table: "t".to_string(),
+                    name: "c".to_string(),
+                    index: 0,
+                    data_type: DataType::Int,
+                    nullable: false,
+                })],
+                distinct: true, // COUNT(DISTINCT c)
+                result_type: DataType::BigInt,
+            },
+            "count_distinct".to_string(),
+        )];
+
+        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        agg.open().await.unwrap();
+
+        let result = agg.next().await.unwrap().unwrap();
+        // Should count only unique values: 1, 2, 3 = 3
+        assert_eq!(result.get(0).unwrap().as_int(), Some(3));
+
+        agg.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sum_distinct() {
+        // Values: 10, 20, 20, 30 - SUM(DISTINCT) should be 10+20+30=60
+        let rows = vec![
+            Row::new(vec![Datum::Int(10)]),
+            Row::new(vec![Datum::Int(20)]),
+            Row::new(vec![Datum::Int(20)]),
+            Row::new(vec![Datum::Int(30)]),
+        ];
+        let input = Box::new(MockExecutor { rows, position: 0 });
+
+        let aggregates = vec![(
+            AggregateFunc {
+                name: "SUM".to_string(),
+                args: vec![ResolvedExpr::Column(ResolvedColumn {
+                    table: "t".to_string(),
+                    name: "c".to_string(),
+                    index: 0,
+                    data_type: DataType::Int,
+                    nullable: false,
+                })],
+                distinct: true, // SUM(DISTINCT c)
+                result_type: DataType::Double,
+            },
+            "sum_distinct".to_string(),
+        )];
+
+        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        agg.open().await.unwrap();
+
+        let result = agg.next().await.unwrap().unwrap();
+        // Without DISTINCT: 10+20+20+30=80, with DISTINCT: 10+20+30=60
+        assert_eq!(result.get(0).unwrap().as_float(), Some(60.0));
 
         agg.close().await.unwrap();
     }

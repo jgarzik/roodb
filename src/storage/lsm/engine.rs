@@ -34,8 +34,8 @@ impl Default for LsmConfig {
 /// LSM-Tree storage engine
 pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     factory: Arc<F>,
-    /// Active memtable for writes
-    memtable: Arc<Memtable>,
+    /// Active memtable for writes (wrapped in RwLock for atomic rotation)
+    memtable: RwLock<Arc<Memtable>>,
     /// Immutable memtables being flushed
     imm_memtables: RwLock<Vec<Arc<Memtable>>>,
     /// Manifest for SSTable tracking
@@ -57,7 +57,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         Ok(Self {
             factory,
-            memtable: Arc::new(Memtable::new()),
+            memtable: RwLock::new(Arc::new(Memtable::new())),
             imm_memtables: RwLock::new(Vec::new()),
             manifest: Mutex::new(manifest),
             closed: AtomicBool::new(false),
@@ -132,7 +132,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
     /// Read from all levels (memtable, imm memtables, SSTables)
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
         // Check active memtable first
-        if let Some(result) = self.memtable.get(key) {
+        if let Some(result) = self.memtable.read().get(key) {
             return Ok(Some(result));
         }
 
@@ -192,20 +192,21 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             return Err(StorageError::Closed);
         }
 
-        self.memtable.put(key, value);
+        // Get current memtable and insert
+        let current_mem = Arc::clone(&*self.memtable.read());
+        current_mem.put(key, value);
 
         // Check if memtable needs flushing
-        if self.memtable.should_flush() {
-            // Rotate memtable
-            let old_mem = Arc::clone(&self.memtable);
-
-            // Create new memtable by replacing the current one
-            // This is a simplified approach - in production you'd use atomics
-            self.imm_memtables.write().push(old_mem.clone());
-            old_mem.clear(); // Clear for reuse in this simplified impl
-
-            // Flush in background (simplified: do it synchronously for now)
-            // In production, this would be a background task
+        if current_mem.should_flush() {
+            // Rotate memtable: create new one and move old to immutables
+            let new_mem = Arc::new(Memtable::new());
+            {
+                let mut mem_guard = self.memtable.write();
+                let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
+                // Push old memtable to immutables (data preserved, NOT cleared)
+                self.imm_memtables.write().push(old_mem);
+            }
+            // Note: Flush happens in background or on explicit flush() call
         }
 
         Ok(())
@@ -216,7 +217,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             return Err(StorageError::Closed);
         }
 
-        self.memtable.delete(key);
+        self.memtable.read().delete(key);
         Ok(())
     }
 
@@ -229,7 +230,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
         let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
 
         // Add from active memtable (source 0 = newest)
-        for (key, value) in self.memtable.scan(start, end) {
+        for (key, value) in self.memtable.read().scan(start, end) {
             all_entries.push((key, value, 0));
         }
 
@@ -294,14 +295,16 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             return Err(StorageError::Closed);
         }
 
-        // Flush current memtable
-        if !self.memtable.is_empty() {
-            let mem = Arc::clone(&self.memtable);
-            self.flush_memtable(mem).await?;
-            self.memtable.clear();
+        // Rotate current memtable to immutable and create fresh one
+        {
+            let mut mem_guard = self.memtable.write();
+            if !mem_guard.is_empty() {
+                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
+                self.imm_memtables.write().push(old_mem);
+            }
         }
 
-        // Flush any immutable memtables
+        // Flush all immutable memtables
         let imm_mems: Vec<Arc<Memtable>> = {
             let mut imm = self.imm_memtables.write();
             std::mem::take(&mut *imm)
@@ -316,13 +319,16 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
     async fn close(&self) -> StorageResult<()> {
         // Flush first, then mark as closed
-        // Direct flush implementation to avoid closed check
-        if !self.memtable.is_empty() {
-            let mem = Arc::clone(&self.memtable);
-            self.flush_memtable(mem).await?;
-            self.memtable.clear();
+        // Rotate current memtable to immutable
+        {
+            let mut mem_guard = self.memtable.write();
+            if !mem_guard.is_empty() {
+                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
+                self.imm_memtables.write().push(old_mem);
+            }
         }
 
+        // Flush all immutable memtables
         let imm_mems: Vec<Arc<Memtable>> = {
             let mut imm = self.imm_memtables.write();
             std::mem::take(&mut *imm)

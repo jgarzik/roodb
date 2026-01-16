@@ -749,7 +749,15 @@ where
             } else if sql_upper.contains("REPEATABLE READ") {
                 IsolationLevel::RepeatableRead
             } else if sql_upper.contains("SERIALIZABLE") {
-                IsolationLevel::Serializable
+                // Serializable isolation is not implemented
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        "SERIALIZABLE isolation level is not implemented",
+                    )
+                    .await
+                    .map(|_| Some(()));
             } else {
                 return self
                     .send_error(

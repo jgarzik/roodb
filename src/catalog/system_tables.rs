@@ -10,6 +10,7 @@ use crate::executor::{Datum, Row};
 pub const SYSTEM_TABLES: &str = "system.tables";
 pub const SYSTEM_COLUMNS: &str = "system.columns";
 pub const SYSTEM_INDEXES: &str = "system.indexes";
+pub const SYSTEM_CONSTRAINTS: &str = "system.constraints";
 
 // Auth system tables
 pub const SYSTEM_USERS: &str = "system.users";
@@ -53,6 +54,22 @@ pub fn indexes_table_def() -> TableDef {
         .column(ColumnDef::new("columns", DataType::Text).nullable(false))
         .column(ColumnDef::new("is_unique", DataType::Boolean).nullable(false))
         .constraint(Constraint::PrimaryKey(vec!["index_name".to_string()]))
+}
+
+/// Create the TableDef for system.constraints
+pub fn constraints_table_def() -> TableDef {
+    TableDef::new(SYSTEM_CONSTRAINTS)
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("ordinal", DataType::Int).nullable(false))
+        .column(ColumnDef::new("constraint_type", DataType::Varchar(32)).nullable(false))
+        .column(ColumnDef::new("columns", DataType::Text).nullable(true)) // comma-separated, for PK/UNIQUE/FK
+        .column(ColumnDef::new("ref_table", DataType::Varchar(255)).nullable(true)) // for FK
+        .column(ColumnDef::new("ref_columns", DataType::Text).nullable(true)) // comma-separated, for FK
+        .column(ColumnDef::new("check_expr", DataType::Text).nullable(true)) // for CHECK
+        .constraint(Constraint::PrimaryKey(vec![
+            "table_name".to_string(),
+            "ordinal".to_string(),
+        ]))
 }
 
 /// Create the TableDef for system.users (auth)
@@ -126,6 +143,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         tables_table_def(),
         columns_table_def(),
         indexes_table_def(),
+        constraints_table_def(),
         users_table_def(),
         grants_table_def(),
         roles_table_def(),
@@ -208,6 +226,108 @@ pub fn index_def_to_row(def: &IndexDef) -> Row {
         Datum::String(def.columns.join(",")),
         Datum::Bool(def.unique),
     ])
+}
+
+/// Convert a TableDef's constraints to rows for system.constraints
+pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
+    def.constraints
+        .iter()
+        .enumerate()
+        .map(|(ordinal, constraint)| {
+            let (constraint_type, columns, ref_table, ref_columns, check_expr) = match constraint {
+                Constraint::PrimaryKey(cols) => {
+                    ("PRIMARY_KEY", Some(cols.join(",")), None, None, None)
+                }
+                Constraint::Unique(cols) => ("UNIQUE", Some(cols.join(",")), None, None, None),
+                Constraint::ForeignKey {
+                    columns,
+                    ref_table,
+                    ref_columns,
+                } => (
+                    "FOREIGN_KEY",
+                    Some(columns.join(",")),
+                    Some(ref_table.clone()),
+                    Some(ref_columns.join(",")),
+                    None,
+                ),
+                Constraint::Check(expr) => ("CHECK", None, None, None, Some(expr.clone())),
+            };
+
+            Row::new(vec![
+                Datum::String(def.name.clone()),
+                Datum::Int(ordinal as i64),
+                Datum::String(constraint_type.to_string()),
+                columns.map(Datum::String).unwrap_or(Datum::Null),
+                ref_table.map(Datum::String).unwrap_or(Datum::Null),
+                ref_columns.map(Datum::String).unwrap_or(Datum::Null),
+                check_expr.map(Datum::String).unwrap_or(Datum::Null),
+            ])
+        })
+        .collect()
+}
+
+/// Reconstruct constraints from system.constraints rows
+pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
+    // Sort by ordinal to preserve order
+    let mut sorted_rows: Vec<&Row> = constraint_rows.iter().collect();
+    sorted_rows.sort_by_key(|row| {
+        if let Datum::Int(ord) = &row.values()[1] {
+            *ord
+        } else {
+            0
+        }
+    });
+
+    sorted_rows
+        .iter()
+        .filter_map(|row| {
+            let constraint_type = match &row.values()[2] {
+                Datum::String(s) => s.as_str(),
+                _ => return None,
+            };
+
+            let columns = match &row.values()[3] {
+                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
+                Datum::Null => None,
+                _ => return None,
+            };
+
+            let ref_table = match &row.values()[4] {
+                Datum::String(s) => Some(s.clone()),
+                Datum::Null => None,
+                _ => return None,
+            };
+
+            let ref_columns = match &row.values()[5] {
+                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
+                Datum::Null => None,
+                _ => return None,
+            };
+
+            let check_expr = match &row.values()[6] {
+                Datum::String(s) => Some(s.clone()),
+                Datum::Null => None,
+                _ => return None,
+            };
+
+            match constraint_type {
+                "PRIMARY_KEY" => columns.map(Constraint::PrimaryKey),
+                "UNIQUE" => columns.map(Constraint::Unique),
+                "FOREIGN_KEY" => {
+                    let cols = columns?;
+                    let rt = ref_table?;
+                    let rc = ref_columns?;
+                    Some(Constraint::ForeignKey {
+                        columns: cols,
+                        ref_table: rt,
+                        ref_columns: rc,
+                    })
+                }
+                "CHECK" => check_expr.map(Constraint::Check),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Reconstruct a TableDef from system table rows
@@ -388,15 +508,48 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 7);
+        assert_eq!(tables.len(), 8);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
         assert!(names.contains(&SYSTEM_COLUMNS));
         assert!(names.contains(&SYSTEM_INDEXES));
+        assert!(names.contains(&SYSTEM_CONSTRAINTS));
         assert!(names.contains(&SYSTEM_USERS));
         assert!(names.contains(&SYSTEM_GRANTS));
         assert!(names.contains(&SYSTEM_ROLES));
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
+    }
+
+    #[test]
+    fn test_constraint_roundtrip() {
+        let original = TableDef::new("test_table")
+            .column(ColumnDef::new("id", DataType::Int))
+            .column(ColumnDef::new("user_id", DataType::Int))
+            .column(ColumnDef::new("status", DataType::Varchar(50)))
+            .constraint(Constraint::PrimaryKey(vec!["id".to_string()]))
+            .constraint(Constraint::Unique(vec![
+                "user_id".to_string(),
+                "status".to_string(),
+            ]))
+            .constraint(Constraint::ForeignKey {
+                columns: vec!["user_id".to_string()],
+                ref_table: "users".to_string(),
+                ref_columns: vec!["id".to_string()],
+            })
+            .constraint(Constraint::Check("status IN ('a', 'b')".to_string()));
+
+        // Convert to rows
+        let constraint_rows = table_def_to_constraints_rows(&original);
+        assert_eq!(constraint_rows.len(), 4);
+
+        // Convert back
+        let restored = rows_to_constraints(&constraint_rows);
+        assert_eq!(restored.len(), 4);
+
+        // Verify each constraint matches
+        for (orig, rest) in original.constraints.iter().zip(restored.iter()) {
+            assert_eq!(orig, rest);
+        }
     }
 }
