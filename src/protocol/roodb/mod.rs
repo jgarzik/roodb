@@ -15,6 +15,7 @@ pub mod types;
 // Re-export status flags for use by other modules
 pub use handshake::status_flags;
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -64,6 +65,8 @@ where
     writer: PacketWriter<WriteHalf<S>>,
     /// Connection ID
     connection_id: u32,
+    /// Client IP address for authentication
+    client_ip: IpAddr,
     /// Scramble from handshake
     scramble: [u8; 20],
     /// Client capabilities
@@ -92,6 +95,7 @@ where
     pub fn new(
         stream: S,
         connection_id: u32,
+        client_ip: IpAddr,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         txn_manager: Arc<TransactionManager>,
@@ -103,6 +107,7 @@ where
             reader: PacketReader::new(read_half),
             writer: PacketWriter::new(write_half),
             connection_id,
+            client_ip,
             scramble: [0u8; 20],
             client_capabilities: 0,
             database: None,
@@ -119,9 +124,11 @@ where
     ///
     /// Used after STARTTLS handshake where the scramble was already sent in the
     /// plaintext greeting.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_scramble(
         stream: S,
         connection_id: u32,
+        client_ip: IpAddr,
         scramble: [u8; 20],
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
@@ -134,6 +141,7 @@ where
             reader: PacketReader::new(read_half),
             writer: PacketWriter::new(write_half),
             connection_id,
+            client_ip,
             scramble,
             client_capabilities: 0,
             database: None,
@@ -247,11 +255,10 @@ where
                 .await;
         }
 
-        // Look up user in system.users table
-        // For now, use "%" as the client host pattern (TODO: get actual client IP)
-        let client_host = "%";
+        // Look up user in system.users table using the actual client IP
+        let client_host = self.client_ip.to_string();
         let user_info = self
-            .lookup_user(&response.username, client_host)
+            .lookup_user(&response.username, &client_host)
             .await
             .map_err(|e| {
                 warn!(error = %e, "User lookup failed");

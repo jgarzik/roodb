@@ -958,9 +958,7 @@ fn convert_privileges(privs: &sp::Privileges) -> SqlResult<Vec<Privilege>> {
         sp::Privileges::Actions(actions) => {
             let mut result = Vec::new();
             for action in actions {
-                if let Some(p) = convert_single_privilege(action) {
-                    result.push(p);
-                }
+                result.push(convert_single_privilege(action)?);
             }
             if result.is_empty() {
                 Err(SqlError::Unsupported(
@@ -974,17 +972,18 @@ fn convert_privileges(privs: &sp::Privileges) -> SqlResult<Vec<Privilege>> {
 }
 
 /// Convert a single privilege action
-fn convert_single_privilege(action: &sp::Action) -> Option<Privilege> {
+fn convert_single_privilege(action: &sp::Action) -> SqlResult<Privilege> {
     match action {
-        sp::Action::Select { .. } => Some(Privilege::Select),
-        sp::Action::Insert { .. } => Some(Privilege::Insert),
-        sp::Action::Update { .. } => Some(Privilege::Update),
-        sp::Action::Delete => Some(Privilege::Delete),
-        sp::Action::Create => Some(Privilege::Create),
-        sp::Action::Truncate => Some(Privilege::Delete), // Map truncate to delete privilege
-        // Note: DROP, ALTER, INDEX, GRANT OPTION are not in sqlparser's Action enum
-        // They need to be handled separately if needed (e.g., via ALL PRIVILEGES)
-        _ => None, // Unsupported privilege
+        sp::Action::Select { .. } => Ok(Privilege::Select),
+        sp::Action::Insert { .. } => Ok(Privilege::Insert),
+        sp::Action::Update { .. } => Ok(Privilege::Update),
+        sp::Action::Delete => Ok(Privilege::Delete),
+        sp::Action::Create => Ok(Privilege::Create),
+        sp::Action::Truncate => Ok(Privilege::Delete), // Map truncate to delete privilege
+        other => Err(SqlError::Unsupported(format!(
+            "Unsupported privilege: {:?}",
+            other
+        ))),
     }
 }
 

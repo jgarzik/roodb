@@ -128,9 +128,21 @@ impl RooDbServer {
     /// Run the server with shutdown signal
     pub async fn run_with_shutdown(
         self,
-        mut shutdown_rx: oneshot::Receiver<()>,
+        shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
+        self.run_with_listener(listener, shutdown_rx).await
+    }
+
+    /// Run the server with a pre-bound listener and shutdown signal
+    ///
+    /// This avoids TOCTOU race conditions when the port is allocated
+    /// separately from server startup (e.g., in test harnesses).
+    pub async fn run_with_listener(
+        self,
+        listener: TcpListener,
+        mut shutdown_rx: oneshot::Receiver<()>,
+    ) -> Result<(), ServerError> {
         let storage = self.storage;
         let catalog = self.catalog;
         let txn_manager = self.txn_manager;
@@ -189,12 +201,16 @@ impl ServerHandle {
 }
 
 /// Start a server in the background for testing
+///
+/// Accepts a pre-bound TcpListener to avoid TOCTOU race conditions
+/// where the port could be grabbed by another test between allocation and binding.
 pub async fn start_test_server(
-    addr: SocketAddr,
+    listener: TcpListener,
     tls_config: TlsConfig,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
 ) -> Result<ServerHandle, ServerError> {
+    let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     // Create Raft node for single-node mode (use a different port for Raft RPC)
@@ -232,7 +248,7 @@ pub async fn start_test_server(
     let actual_addr = server.addr();
 
     tokio::spawn(async move {
-        if let Err(e) = server.run_with_shutdown(shutdown_rx).await {
+        if let Err(e) = server.run_with_listener(listener, shutdown_rx).await {
             tracing::error!(error = %e, "Server error");
         }
     });

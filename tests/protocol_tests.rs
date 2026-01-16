@@ -405,20 +405,18 @@ async fn test_server_integration_e2e() {
     // Initialize root user with empty password for tests
     test_utils::auth::initialize_root_user(&storage, "").await;
 
-    // Find available port
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Bind to an available port and keep the listener to avoid TOCTOU race
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-
-    // Start server
-    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+    // Start server with the pre-bound listener
+    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
         .await
         .expect("Failed to start test server");
 
-    // Give server time to bind
+    // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Build client with TLS (accept invalid certs for self-signed)
@@ -503,16 +501,18 @@ async fn test_transaction_begin_commit() {
     // Initialize root user with empty password for tests
     test_utils::auth::initialize_root_user(&storage, "").await;
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Bind to an available port and keep the listener to avoid TOCTOU race
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+    // Start server with the pre-bound listener
+    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
         .await
         .expect("Failed to start test server");
 
+    // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
@@ -597,16 +597,18 @@ async fn test_transaction_rollback() {
     // Initialize root user with empty password for tests
     test_utils::auth::initialize_root_user(&storage, "").await;
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Bind to an available port and keep the listener to avoid TOCTOU race
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+    // Start server with the pre-bound listener
+    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
         .await
         .expect("Failed to start test server");
 
+    // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
@@ -693,16 +695,18 @@ async fn test_autocommit() {
     // Initialize root user with empty password for tests
     test_utils::auth::initialize_root_user(&storage, "").await;
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // Bind to an available port and keep the listener to avoid TOCTOU race
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let handle = start_test_server(server_addr, tls_config, storage.clone(), catalog.clone())
+    // Start server with the pre-bound listener
+    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
         .await
         .expect("Failed to start test server");
 
+    // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);

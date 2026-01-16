@@ -44,6 +44,7 @@ pub async fn handle_connection(
     let mut conn = RooDbConnection::new_with_scramble(
         tls_stream,
         connection_id,
+        peer_addr.ip(),
         scramble,
         storage,
         catalog,

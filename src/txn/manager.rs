@@ -110,6 +110,13 @@ impl TransactionManager {
         isolation_level: IsolationLevel,
         is_read_only: bool,
     ) -> TransactionResult<Transaction> {
+        // Serializable isolation is not yet implemented
+        if isolation_level == IsolationLevel::Serializable {
+            return Err(TransactionError::UnsupportedIsolationLevel(
+                "SERIALIZABLE".to_string(),
+            ));
+        }
+
         // Check if writes are allowed
         if !is_read_only && !self.is_leader() {
             return Err(TransactionError::ReadOnly);

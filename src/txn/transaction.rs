@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use super::ReadView;
+use super::{ReadView, TransactionError, TransactionResult};
 
 /// Transaction isolation levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -121,13 +121,25 @@ impl Transaction {
     }
 
     /// Mark as committed
-    pub fn commit(&mut self) {
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn commit(&mut self) -> TransactionResult<()> {
+        if self.state != TransactionState::Active {
+            return Err(TransactionError::NotActive(self.txn_id, self.state));
+        }
         self.state = TransactionState::Committed;
+        Ok(())
     }
 
     /// Mark as aborted
-    pub fn abort(&mut self) {
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn abort(&mut self) -> TransactionResult<()> {
+        if self.state != TransactionState::Active {
+            return Err(TransactionError::NotActive(self.txn_id, self.state));
+        }
         self.state = TransactionState::Aborted;
+        Ok(())
     }
 }
 
@@ -162,7 +174,7 @@ mod tests {
         assert!(txn.is_active());
         assert_eq!(txn.state, TransactionState::Active);
 
-        txn.commit();
+        txn.commit().unwrap();
         assert!(!txn.is_active());
         assert_eq!(txn.state, TransactionState::Committed);
     }
@@ -170,9 +182,25 @@ mod tests {
     #[test]
     fn test_transaction_abort() {
         let mut txn = Transaction::new(1, IsolationLevel::RepeatableRead, false);
-        txn.abort();
+        txn.abort().unwrap();
         assert!(!txn.is_active());
         assert_eq!(txn.state, TransactionState::Aborted);
+    }
+
+    #[test]
+    fn test_double_commit_fails() {
+        let mut txn = Transaction::new(1, IsolationLevel::RepeatableRead, false);
+        txn.commit().unwrap();
+        // Second commit should fail
+        assert!(txn.commit().is_err());
+    }
+
+    #[test]
+    fn test_commit_after_abort_fails() {
+        let mut txn = Transaction::new(1, IsolationLevel::RepeatableRead, false);
+        txn.abort().unwrap();
+        // Commit after abort should fail
+        assert!(txn.commit().is_err());
     }
 
     #[test]

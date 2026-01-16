@@ -65,17 +65,29 @@ impl MvccStorage {
 
     /// Decode MVCC header from a row
     ///
-    /// Returns (txn_id, roll_ptr, deleted, data)
+    /// Returns `None` for rows without MVCC headers (legacy rows with length < 17 bytes).
+    /// For rows with headers, returns (txn_id, roll_ptr, deleted, data).
+    ///
+    /// Note: Once a row has an MVCC header, the header bytes are guaranteed to be
+    /// valid since we encode them ourselves. The try_into() calls cannot fail because
+    /// we've already verified the minimum length.
     fn decode_row(encoded: &[u8]) -> Option<(u64, u64, bool, &[u8])> {
         if encoded.len() < ROW_HEADER_SIZE {
+            // Row doesn't have MVCC header - treat as legacy row
             return None;
         }
 
-        let txn_id = u64::from_le_bytes(encoded[TXN_ID_OFFSET..TXN_ID_OFFSET + 8].try_into().ok()?);
+        // These conversions cannot fail: we've verified length >= ROW_HEADER_SIZE
+        // and we're taking exactly 8 bytes each
+        let txn_id = u64::from_le_bytes(
+            encoded[TXN_ID_OFFSET..TXN_ID_OFFSET + 8]
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        );
         let roll_ptr = u64::from_le_bytes(
             encoded[ROLL_PTR_OFFSET..ROLL_PTR_OFFSET + 8]
                 .try_into()
-                .ok()?,
+                .expect("slice is exactly 8 bytes"),
         );
         let deleted = encoded[DELETED_OFFSET] != 0;
         let data = &encoded[ROW_HEADER_SIZE..];

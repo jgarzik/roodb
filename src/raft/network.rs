@@ -18,6 +18,25 @@ use crate::raft::types::{
 };
 use crate::tls::TlsConfig;
 
+/// Create an RPC error with context about the operation and peer
+fn rpc_error<E: std::error::Error>(
+    target: NodeId,
+    addr: Option<SocketAddr>,
+    operation: &str,
+    err: impl std::fmt::Display,
+) -> RPCError<NodeId, Node, RaftError<NodeId, E>> {
+    let addr_str = addr
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let msg = format!(
+        "Raft RPC {} to node {} ({}): {}",
+        operation, target, addr_str, err
+    );
+    RPCError::Unreachable(Unreachable::new(&NetworkError::new(
+        &std::io::Error::other(msg),
+    )))
+}
+
 /// Message types for Raft RPC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -100,32 +119,29 @@ impl RaftNetworkConnection {
         Resp: serde::de::DeserializeOwned,
         E: std::error::Error,
     {
+        let operation = format!("{:?}", msg_type);
+
         let addr = self.addr.ok_or_else(|| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Node {} address not found", self.target),
-            ))))
+            rpc_error::<E>(self.target, None, &operation, "address not configured")
         })?;
 
         // Connect with TLS
         let stream = TcpStream::connect(addr)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         let connector = TlsConnector::from(self.tls_config.client_config());
-        let server_name = "localhost".try_into().unwrap();
+        // Use the IP address for SNI since we use self-signed certs in the cluster
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
         let mut tls_stream = connector
             .connect(server_name, stream)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         // Serialize request
-        let body = bincode::serialize(request).map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            ))))
-        })?;
+        let body = bincode::serialize(request)
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         // Send: [msg_type: u8][len: u32][body]
         let mut buf = BytesMut::with_capacity(5 + body.len());
@@ -136,33 +152,29 @@ impl RaftNetworkConnection {
         tls_stream
             .write_all(&buf)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
         tls_stream
             .flush()
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         // Read response: [len: u32][body]
         let mut len_buf = [0u8; 4];
         tls_stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
         let mut resp_buf = vec![0u8; len];
         tls_stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e))))?;
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         // Deserialize response
-        let resp: Resp = bincode::deserialize(&resp_buf).map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            ))))
-        })?;
+        let resp: Resp = bincode::deserialize(&resp_buf)
+            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
 
         Ok(resp)
     }

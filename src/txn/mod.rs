@@ -50,6 +50,10 @@ pub enum TransactionError {
     #[error("Transaction {0} timed out after {1:?} idle")]
     IdleTimeout(u64, Duration),
 
+    /// Unsupported isolation level
+    #[error("Isolation level {0} is not supported")]
+    UnsupportedIsolationLevel(String),
+
     /// Storage error during transaction operation
     #[error("Storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
