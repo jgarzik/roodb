@@ -62,7 +62,7 @@ FROM table [[AS] alias], ...
 [WHERE condition]
 [GROUP BY expr, ...]
 [HAVING condition]
-[ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
+[ORDER BY expr [ASC|DESC], ...]
 [LIMIT count [OFFSET skip]]
 ```
 
@@ -105,6 +105,54 @@ DELETE FROM table [WHERE condition]
 | `SET [SESSION] TRANSACTION ISOLATION LEVEL level` | Set isolation |
 
 **Isolation levels:** `READ UNCOMMITTED`, `READ COMMITTED`, `REPEATABLE READ`, `SERIALIZABLE`
+
+## User Management
+
+### CREATE USER
+
+```
+CREATE USER [IF NOT EXISTS] 'name'@'host' [IDENTIFIED BY 'password']
+```
+
+### ALTER USER
+
+```
+ALTER USER 'name'@'host' IDENTIFIED BY 'password'
+```
+
+### DROP USER
+
+```
+DROP USER [IF EXISTS] 'name'@'host'
+```
+
+### SET PASSWORD
+
+```
+SET PASSWORD FOR 'name'@'host' = 'password'
+```
+
+### GRANT
+
+```
+GRANT privilege, ... ON object TO 'user'@'host' [WITH GRANT OPTION]
+```
+
+**Privileges:** `ALL`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `INDEX`, `GRANT OPTION`
+
+**Objects:** `*.*` | `database.*` | `database.table`
+
+### REVOKE
+
+```
+REVOKE privilege, ... ON object FROM 'user'@'host'
+```
+
+### SHOW GRANTS
+
+```
+SHOW GRANTS [FOR 'user'@'host']
+```
 
 ## Operators
 
