@@ -6,7 +6,10 @@
 //! - Aggregate function usage is valid
 
 use crate::catalog::DataType;
-use crate::sql::ast::*;
+use crate::planner::logical::{
+    Literal, ResolvedAssignment, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
+    ResolvedStatement,
+};
 use crate::sql::error::{SqlError, SqlResult};
 
 /// Type checker

@@ -7,7 +7,7 @@ use crate::catalog::{Catalog, ColumnDef, Constraint};
 use crate::planner::error::PlannerResult;
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
 use crate::planner::logical::LogicalPlan;
-use crate::sql::{JoinType, ResolvedColumn, ResolvedExpr};
+use crate::planner::logical::{JoinType, ResolvedColumn, ResolvedExpr};
 
 /// Physical plan node
 #[derive(Debug, Clone)]

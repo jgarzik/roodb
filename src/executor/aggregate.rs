@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::planner::logical::expr::AggregateFunc;
-use crate::sql::ResolvedExpr;
+use crate::planner::logical::{Literal, ResolvedExpr};
 
 use super::datum::Datum;
 use super::error::ExecutorResult;
@@ -151,11 +151,7 @@ impl HashAggregate {
             return false;
         }
         // COUNT(*) has a single null literal argument from the resolver
-        agg.args.len() == 1
-            && matches!(
-                &agg.args[0],
-                ResolvedExpr::Literal(crate::sql::Literal::Null)
-            )
+        agg.args.len() == 1 && matches!(&agg.args[0], ResolvedExpr::Literal(Literal::Null))
     }
 }
 
@@ -244,7 +240,7 @@ impl Executor for HashAggregate {
 mod tests {
     use super::*;
     use crate::catalog::DataType;
-    use crate::sql::ResolvedColumn;
+    use crate::planner::logical::ResolvedColumn;
 
     struct MockExecutor {
         rows: Vec<Row>,

@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use crate::sql::{JoinType, ResolvedExpr};
+use crate::planner::logical::{JoinType, ResolvedExpr};
 
 use super::datum::Datum;
 use super::error::ExecutorResult;
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn test_inner_join() {
         use crate::catalog::DataType;
-        use crate::sql::{BinaryOp, ResolvedColumn};
+        use crate::planner::logical::{BinaryOp, ResolvedColumn};
 
         // Left: (id, name)
         let left_rows = vec![
@@ -306,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_left_join() {
         use crate::catalog::DataType;
-        use crate::sql::{BinaryOp, ResolvedColumn};
+        use crate::planner::logical::{BinaryOp, ResolvedColumn};
 
         let left_rows = vec![
             Row::new(vec![Datum::Int(1)]),

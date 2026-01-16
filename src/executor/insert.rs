@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
-use crate::sql::{ResolvedColumn, ResolvedExpr};
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
@@ -130,7 +130,7 @@ impl Executor for Insert {
 mod tests {
     use super::*;
     use crate::catalog::DataType;
-    use crate::sql::Literal;
+    use crate::planner::logical::Literal;
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;

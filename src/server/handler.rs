@@ -18,6 +18,7 @@ use crate::txn::TransactionManager;
 /// Handle a RooDB client connection with STARTTLS
 ///
 /// Performs STARTTLS handshake, then runs authentication and command loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,

@@ -1,7 +1,7 @@
 //! Logical expression types for the query planner
 
+use super::ResolvedExpr;
 use crate::catalog::DataType;
-use crate::sql::ResolvedExpr;
 
 /// Unique ID for columns in the plan
 pub type ColumnId = usize;

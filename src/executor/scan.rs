@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::sql::ResolvedExpr;
+use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;

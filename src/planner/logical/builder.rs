@@ -2,11 +2,11 @@
 //!
 //! Converts resolved SQL statements into logical query plans.
 
-use crate::catalog::DataType;
-use crate::sql::{
+use super::{
     JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
     ResolvedStatement, ResolvedTableRef,
 };
+use crate::catalog::DataType;
 
 use super::expr::{AggregateFunc, OutputColumn};
 use super::LogicalPlan;

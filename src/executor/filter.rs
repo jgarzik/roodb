@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use crate::sql::ResolvedExpr;
+use crate::planner::logical::ResolvedExpr;
 
 use super::error::ExecutorResult;
 use super::eval::eval;
@@ -57,7 +57,7 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
-    use crate::sql::{BinaryOp, Literal, ResolvedColumn};
+    use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
 
     struct MockExecutor {
         rows: Vec<Row>,

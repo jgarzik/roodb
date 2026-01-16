@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::planner::logical::ResolvedExpr;
 use crate::raft::RowChange;
-use crate::sql::ResolvedExpr;
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
@@ -132,7 +132,7 @@ mod tests {
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
     use crate::executor::encoding::{encode_row, encode_row_key};
-    use crate::sql::{BinaryOp, Literal, ResolvedColumn};
+    use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;

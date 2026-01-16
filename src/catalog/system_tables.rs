@@ -11,6 +11,12 @@ pub const SYSTEM_TABLES: &str = "system.tables";
 pub const SYSTEM_COLUMNS: &str = "system.columns";
 pub const SYSTEM_INDEXES: &str = "system.indexes";
 
+// Auth system tables
+pub const SYSTEM_USERS: &str = "system.users";
+pub const SYSTEM_GRANTS: &str = "system.grants";
+pub const SYSTEM_ROLES: &str = "system.roles";
+pub const SYSTEM_ROLE_GRANTS: &str = "system.role_grants";
+
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
     name.starts_with("system.")
@@ -49,9 +55,82 @@ pub fn indexes_table_def() -> TableDef {
         .constraint(Constraint::PrimaryKey(vec!["index_name".to_string()]))
 }
 
+/// Create the TableDef for system.users (auth)
+pub fn users_table_def() -> TableDef {
+    TableDef::new(SYSTEM_USERS)
+        .column(ColumnDef::new("username", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("host", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("password_hash", DataType::Varchar(255)).nullable(true))
+        .column(ColumnDef::new("auth_plugin", DataType::Varchar(64)).nullable(false))
+        .column(ColumnDef::new("ssl_subject", DataType::Varchar(512)).nullable(true))
+        .column(ColumnDef::new("ssl_issuer", DataType::Varchar(512)).nullable(true))
+        .column(ColumnDef::new("account_locked", DataType::Boolean).nullable(false))
+        .column(ColumnDef::new("password_expired", DataType::Boolean).nullable(false))
+        .column(ColumnDef::new("created_at", DataType::Timestamp).nullable(true))
+        .column(ColumnDef::new("updated_at", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::PrimaryKey(vec![
+            "username".to_string(),
+            "host".to_string(),
+        ]))
+}
+
+/// Create the TableDef for system.grants (auth)
+pub fn grants_table_def() -> TableDef {
+    TableDef::new(SYSTEM_GRANTS)
+        .column(ColumnDef::new("grantee", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("grantee_host", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("grantee_type", DataType::Varchar(16)).nullable(false))
+        .column(ColumnDef::new("privilege", DataType::Varchar(64)).nullable(false))
+        .column(ColumnDef::new("object_type", DataType::Varchar(16)).nullable(false))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(true))
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(true))
+        .column(ColumnDef::new("with_grant_option", DataType::Boolean).nullable(false))
+        .column(ColumnDef::new("granted_by", DataType::Varchar(255)).nullable(true))
+        .column(ColumnDef::new("granted_at", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::Unique(vec![
+            "grantee".to_string(),
+            "grantee_host".to_string(),
+            "privilege".to_string(),
+            "object_type".to_string(),
+            "database_name".to_string(),
+            "table_name".to_string(),
+        ]))
+}
+
+/// Create the TableDef for system.roles (auth)
+pub fn roles_table_def() -> TableDef {
+    TableDef::new(SYSTEM_ROLES)
+        .column(ColumnDef::new("role_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("created_at", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::PrimaryKey(vec!["role_name".to_string()]))
+}
+
+/// Create the TableDef for system.role_grants (auth)
+pub fn role_grants_table_def() -> TableDef {
+    TableDef::new(SYSTEM_ROLE_GRANTS)
+        .column(ColumnDef::new("username", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("host", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("role_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("with_admin_option", DataType::Boolean).nullable(false))
+        .column(ColumnDef::new("granted_at", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::PrimaryKey(vec![
+            "username".to_string(),
+            "host".to_string(),
+            "role_name".to_string(),
+        ]))
+}
+
 /// Get all system table definitions for bootstrapping
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
-    vec![tables_table_def(), columns_table_def(), indexes_table_def()]
+    vec![
+        tables_table_def(),
+        columns_table_def(),
+        indexes_table_def(),
+        users_table_def(),
+        grants_table_def(),
+        roles_table_def(),
+        role_grants_table_def(),
+    ]
 }
 
 /// Convert a TableDef to a row for system.tables
@@ -309,11 +388,15 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 3);
+        assert_eq!(tables.len(), 7);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
         assert!(names.contains(&SYSTEM_COLUMNS));
         assert!(names.contains(&SYSTEM_INDEXES));
+        assert!(names.contains(&SYSTEM_USERS));
+        assert!(names.contains(&SYSTEM_GRANTS));
+        assert!(names.contains(&SYSTEM_ROLES));
+        assert!(names.contains(&SYSTEM_ROLE_GRANTS));
     }
 }

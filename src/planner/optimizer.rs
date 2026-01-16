@@ -4,7 +4,7 @@
 
 use crate::catalog::DataType;
 use crate::planner::logical::LogicalPlan;
-use crate::sql::{BinaryOp, ResolvedExpr};
+use crate::planner::logical::{BinaryOp, ResolvedExpr};
 
 /// Optimization rule trait
 pub trait OptimizationRule: Send + Sync {
@@ -260,8 +260,9 @@ mod tests {
     use super::*;
     use crate::planner::logical::expr::OutputColumn;
     use crate::planner::logical::LogicalPlanBuilder;
+    use crate::planner::logical::{Literal, ResolvedColumn};
     use crate::planner::test_utils::test_catalog;
-    use crate::sql::{Literal, Parser, ResolvedColumn, Resolver, TypeChecker};
+    use crate::sql::{Parser, Resolver, TypeChecker};
 
     fn make_scan() -> LogicalPlan {
         LogicalPlan::Scan {

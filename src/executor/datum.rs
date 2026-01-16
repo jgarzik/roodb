@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 use crate::catalog::DataType;
-use crate::sql::Literal;
+use crate::planner::logical::Literal;
 
 /// A single value in a row
 #[derive(Debug, Clone, Default)]

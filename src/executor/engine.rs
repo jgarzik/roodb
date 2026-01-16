@@ -208,7 +208,7 @@ mod tests {
     use crate::executor::encoding::{encode_row, encode_row_key};
     use crate::executor::row::Row;
     use crate::planner::logical::expr::OutputColumn;
-    use crate::sql::{Literal, ResolvedColumn, ResolvedExpr};
+    use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
@@ -375,7 +375,7 @@ mod tests {
                     data_type: DataType::Int,
                     nullable: false,
                 })),
-                op: crate::sql::BinaryOp::Gt,
+                op: BinaryOp::Gt,
                 right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
                 result_type: DataType::Boolean,
             }),

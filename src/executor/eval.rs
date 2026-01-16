@@ -2,7 +2,7 @@
 //!
 //! Evaluates ResolvedExpr against a Row to produce a Datum.
 
-use crate::sql::{BinaryOp, ResolvedExpr, UnaryOp};
+use crate::planner::logical::{BinaryOp, ResolvedExpr, UnaryOp};
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
@@ -387,7 +387,7 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 mod tests {
     use super::*;
     use crate::catalog::DataType;
-    use crate::sql::{Literal, ResolvedColumn};
+    use crate::planner::logical::{Literal, ResolvedColumn};
 
     fn make_row() -> Row {
         Row::new(vec![

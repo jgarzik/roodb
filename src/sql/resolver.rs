@@ -1,14 +1,20 @@
 //! Name resolution against the catalog
 //!
-//! The resolver takes parsed SQL statements and resolves:
+//! The resolver takes parsed SQL statements from sqlparser and resolves:
 //! - Table names to table definitions
 //! - Column names to column definitions with type information
 //! - Validates that referenced tables and columns exist
 
 use std::collections::HashMap;
 
-use crate::catalog::{Catalog, DataType};
-use crate::sql::ast::*;
+use sqlparser::ast as sp;
+
+use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
+use crate::planner::logical::{
+    BinaryOp, JoinType, Literal, ResolvedAssignment, ResolvedColumn, ResolvedExpr, ResolvedJoin,
+    ResolvedOrderByItem, ResolvedSelect, ResolvedSelectItem, ResolvedStatement, ResolvedTableRef,
+    UnaryOp,
+};
 use crate::sql::error::{SqlError, SqlResult};
 
 /// Name resolver
@@ -23,80 +29,123 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve a statement
-    pub fn resolve(&self, stmt: Statement) -> SqlResult<ResolvedStatement> {
+    pub fn resolve(&self, stmt: sp::Statement) -> SqlResult<ResolvedStatement> {
         match stmt {
-            Statement::CreateTable {
-                name,
-                columns,
-                constraints,
-                if_not_exists,
-            } => Ok(ResolvedStatement::CreateTable {
-                name,
-                columns,
-                constraints,
-                if_not_exists,
-            }),
-            Statement::DropTable { name, if_exists } => {
-                Ok(ResolvedStatement::DropTable { name, if_exists })
-            }
-            Statement::CreateIndex {
-                name,
-                table,
-                columns,
-                unique,
-            } => {
-                // Resolve column indices
-                let table_def = self
-                    .catalog
-                    .get_table(&table)
-                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
-
-                let mut resolved_cols = Vec::new();
-                for col_name in columns {
-                    let idx = table_def
-                        .get_column_index(&col_name)
-                        .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-                    resolved_cols.push((col_name, idx));
-                }
-
-                Ok(ResolvedStatement::CreateIndex {
-                    name,
-                    table,
-                    columns: resolved_cols,
-                    unique,
-                })
-            }
-            Statement::DropIndex { name } => Ok(ResolvedStatement::DropIndex { name }),
-            Statement::Insert {
-                table,
-                columns,
-                values,
-            } => self.resolve_insert(table, columns, values),
-            Statement::Update {
+            sp::Statement::CreateTable(create) => self.resolve_create_table(&create),
+            sp::Statement::Drop {
+                object_type,
+                names,
+                if_exists,
+                ..
+            } => self.resolve_drop(&object_type, &names, if_exists),
+            sp::Statement::CreateIndex(create_index) => self.resolve_create_index(&create_index),
+            sp::Statement::Insert(insert) => self.resolve_insert(&insert),
+            sp::Statement::Update {
                 table,
                 assignments,
-                filter,
-            } => self.resolve_update(table, assignments, filter),
-            Statement::Delete { table, filter } => self.resolve_delete(table, filter),
-            Statement::Select(select) => self.resolve_select(select),
+                selection,
+                ..
+            } => self.resolve_update(&table, &assignments, &selection),
+            sp::Statement::Delete(delete) => self.resolve_delete(&delete),
+            sp::Statement::Query(query) => self.resolve_query(&query),
+            _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
         }
     }
 
-    /// Resolve INSERT statement
-    fn resolve_insert(
+    /// Resolve CREATE TABLE
+    fn resolve_create_table(&self, create: &sp::CreateTable) -> SqlResult<ResolvedStatement> {
+        let name = create.name.to_string();
+        let if_not_exists = create.if_not_exists;
+
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+
+        for col in &create.columns {
+            columns.push(convert_column_def(col)?);
+        }
+
+        for constraint in &create.constraints {
+            if let Some(c) = convert_table_constraint(constraint)? {
+                constraints.push(c);
+            }
+        }
+
+        Ok(ResolvedStatement::CreateTable {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+        })
+    }
+
+    /// Resolve DROP statement
+    fn resolve_drop(
         &self,
-        table: String,
-        columns: Option<Vec<String>>,
-        values: Vec<Vec<Expr>>,
+        object_type: &sp::ObjectType,
+        names: &[sp::ObjectName],
+        if_exists: bool,
     ) -> SqlResult<ResolvedStatement> {
+        if names.is_empty() {
+            return Err(SqlError::Parse("DROP requires a name".to_string()));
+        }
+        let name = names[0].to_string();
+
+        match object_type {
+            sp::ObjectType::Table => Ok(ResolvedStatement::DropTable { name, if_exists }),
+            sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
+            _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
+        }
+    }
+
+    /// Resolve CREATE INDEX
+    fn resolve_create_index(&self, create: &sp::CreateIndex) -> SqlResult<ResolvedStatement> {
+        let name = create
+            .name
+            .as_ref()
+            .map(|n| n.to_string())
+            .ok_or_else(|| SqlError::Parse("CREATE INDEX requires a name".to_string()))?;
+
+        let table = create.table_name.to_string();
+        let unique = create.unique;
+
+        // Resolve column indices
+        let table_def = self
+            .catalog
+            .get_table(&table)
+            .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+
+        let mut resolved_cols = Vec::new();
+        for col_expr in &create.columns {
+            let col_name = col_expr.expr.to_string();
+            let idx = table_def
+                .get_column_index(&col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            resolved_cols.push((col_name, idx));
+        }
+
+        Ok(ResolvedStatement::CreateIndex {
+            name,
+            table,
+            columns: resolved_cols,
+            unique,
+        })
+    }
+
+    /// Resolve INSERT statement
+    fn resolve_insert(&self, insert: &sp::Insert) -> SqlResult<ResolvedStatement> {
+        let table = insert.table_name.to_string();
+
         let table_def = self
             .catalog
             .get_table(&table)
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
         // Build column list (explicit or all columns)
-        let specified_columns =
-            columns.unwrap_or_else(|| table_def.columns.iter().map(|c| c.name.clone()).collect());
+        let specified_columns: Vec<String> = if insert.columns.is_empty() {
+            table_def.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            insert.columns.iter().map(|c| c.value.clone()).collect()
+        };
 
         // Resolve specified columns and get their indices
         let mut column_indices = Vec::new();
@@ -105,9 +154,6 @@ impl<'a> Resolver<'a> {
                 .get_column(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
             let idx = table_def.get_column_index(col_name).unwrap();
-
-            // Check if column is NOT NULL and not provided a default
-            // (we'll fill in NULL for missing columns later, so this is a check)
             column_indices.push((idx, col_def.nullable, col_name.clone()));
         }
 
@@ -126,9 +172,15 @@ impl<'a> Resolver<'a> {
             });
         }
 
+        // Parse values
+        let values_rows = match insert.source.as_ref().map(|s| s.body.as_ref()) {
+            Some(sp::SetExpr::Values(sp::Values { rows, .. })) => rows,
+            _ => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
+        };
+
         // Resolve values - expand to full rows
         let mut resolved_values = Vec::new();
-        for row in values {
+        for row in values_rows {
             if row.len() != specified_columns.len() {
                 return Err(SqlError::InvalidOperation(format!(
                     "INSERT has {} columns but {} values",
@@ -165,7 +217,6 @@ impl<'a> Resolver<'a> {
                 if !col_def.nullable
                     && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
                 {
-                    // Check if this column was specified
                     let was_specified = column_indices.iter().any(|(i, _, _)| *i == idx);
                     if !was_specified {
                         return Err(SqlError::InvalidOperation(format!(
@@ -189,16 +240,21 @@ impl<'a> Resolver<'a> {
     /// Resolve UPDATE statement
     fn resolve_update(
         &self,
-        table: String,
-        assignments: Vec<Assignment>,
-        filter: Option<Expr>,
+        table: &sp::TableWithJoins,
+        assignments: &[sp::Assignment],
+        selection: &Option<sp::Expr>,
     ) -> SqlResult<ResolvedStatement> {
+        let table_name = match &table.relation {
+            sp::TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(SqlError::Unsupported("Complex UPDATE table".to_string())),
+        };
+
         let table_def = self
             .catalog
-            .get_table(&table)
-            .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+            .get_table(&table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
-        let scope = Scope::single_table(&table, table_def);
+        let scope = Scope::single_table(&table_name, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -210,14 +266,15 @@ impl<'a> Resolver<'a> {
         // Resolve assignments
         let mut resolved_assignments = Vec::new();
         for assign in assignments {
+            let col_name = extract_assignment_target(&assign.target)?;
             let col_def = table_def
-                .get_column(&assign.column)
-                .ok_or_else(|| SqlError::ColumnNotFound(assign.column.clone()))?;
-            let idx = table_def.get_column_index(&assign.column).unwrap();
+                .get_column(&col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            let idx = table_def.get_column_index(&col_name).unwrap();
 
             let column = ResolvedColumn {
-                table: table.clone(),
-                name: assign.column.clone(),
+                table: table_name.clone(),
+                name: col_name,
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable,
@@ -228,13 +285,13 @@ impl<'a> Resolver<'a> {
         }
 
         // Resolve filter
-        let resolved_filter = filter
+        let resolved_filter = selection
             .as_ref()
             .map(|f| self.resolve_expr(f, &scope))
             .transpose()?;
 
         Ok(ResolvedStatement::Update {
-            table,
+            table: table_name,
             table_columns,
             assignments: resolved_assignments,
             filter: resolved_filter,
@@ -242,13 +299,29 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve DELETE statement
-    fn resolve_delete(&self, table: String, filter: Option<Expr>) -> SqlResult<ResolvedStatement> {
+    fn resolve_delete(&self, delete: &sp::Delete) -> SqlResult<ResolvedStatement> {
+        let table_name = match &delete.from {
+            sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => {
+                match &tables[0].relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+                }
+            }
+            sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => {
+                match &tables[0].relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+                }
+            }
+            _ => return Err(SqlError::Parse("DELETE requires a table".to_string())),
+        };
+
         let table_def = self
             .catalog
-            .get_table(&table)
-            .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+            .get_table(&table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
-        let scope = Scope::single_table(&table, table_def);
+        let scope = Scope::single_table(&table_name, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -258,157 +331,219 @@ impl<'a> Resolver<'a> {
             .collect();
 
         // Resolve filter
-        let resolved_filter = filter
+        let resolved_filter = delete
+            .selection
             .as_ref()
             .map(|f| self.resolve_expr(f, &scope))
             .transpose()?;
 
         Ok(ResolvedStatement::Delete {
-            table,
+            table: table_name,
             table_columns,
             filter: resolved_filter,
         })
     }
 
-    /// Resolve SELECT statement
-    fn resolve_select(&self, select: SelectStatement) -> SqlResult<ResolvedStatement> {
-        // Build scope from FROM clause
-        let mut scope = Scope::new();
+    /// Resolve SELECT query
+    fn resolve_query(&self, query: &sp::Query) -> SqlResult<ResolvedStatement> {
+        let select = self.resolve_select_body(query.body.as_ref())?;
 
-        for table_ref in &select.from {
-            let table_def = self
-                .catalog
-                .get_table(&table_ref.name)
-                .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+        let mut result = select;
 
-            let alias = table_ref
-                .alias
-                .clone()
-                .unwrap_or_else(|| table_ref.name.clone());
-            scope.add_table(&alias, &table_ref.name, table_def);
+        // Handle ORDER BY
+        if let Some(order_by) = &query.order_by {
+            // Need to create scope from the resolved tables
+            let mut scope = Scope::new();
+            for table_ref in &result.from {
+                if let Some(table_def) = self.catalog.get_table(&table_ref.name) {
+                    let alias = table_ref
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| table_ref.name.clone());
+                    scope.add_table(&alias, &table_ref.name, table_def);
+                }
+            }
+            for join in &result.joins {
+                if let Some(table_def) = self.catalog.get_table(&join.table.name) {
+                    let alias = join
+                        .table
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| join.table.name.clone());
+                    scope.add_table(&alias, &join.table.name, table_def);
+                }
+            }
+
+            for item in &order_by.exprs {
+                result.order_by.push(ResolvedOrderByItem {
+                    expr: self.resolve_expr(&item.expr, &scope)?,
+                    ascending: item.asc.unwrap_or(true),
+                });
+            }
         }
 
-        // Add joined tables to scope
-        for join in &select.joins {
-            let table_def = self
-                .catalog
-                .get_table(&join.table.name)
-                .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
-
-            let alias = join
-                .table
-                .alias
-                .clone()
-                .unwrap_or_else(|| join.table.name.clone());
-            scope.add_table(&alias, &join.table.name, table_def);
+        // Handle LIMIT/OFFSET
+        if let Some(sp::Expr::Value(sp::Value::Number(n, _))) = &query.limit {
+            result.limit = Some(n.parse().unwrap_or(0));
+        }
+        if let Some(offset) = &query.offset {
+            if let sp::Expr::Value(sp::Value::Number(n, _)) = &offset.value {
+                result.offset = Some(n.parse().unwrap_or(0));
+            }
         }
 
-        // Resolve columns
-        let mut resolved_columns = Vec::new();
-        for item in &select.columns {
-            resolved_columns.push(self.resolve_select_item(item, &scope)?);
-        }
+        Ok(ResolvedStatement::Select(result))
+    }
 
-        // Build resolved from list
-        let resolved_from: Vec<_> = select
-            .from
-            .iter()
-            .map(|t| {
-                let table_def = self.catalog.get_table(&t.name).unwrap();
-                ResolvedTableRef {
-                    name: t.name.clone(),
-                    alias: t.alias.clone(),
+    /// Resolve SELECT body
+    fn resolve_select_body(&self, body: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
+        match body {
+            sp::SetExpr::Select(select) => {
+                // Build scope from FROM clause
+                let mut scope = Scope::new();
+
+                for table in &select.from {
+                    let table_ref = self.resolve_table_factor(&table.relation)?;
+                    let table_def = self
+                        .catalog
+                        .get_table(&table_ref.name)
+                        .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+
+                    let alias = table_ref
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| table_ref.name.clone());
+                    scope.add_table(&alias, &table_ref.name, table_def);
+                }
+
+                // Build resolved from list first
+                let resolved_from: Vec<ResolvedTableRef> = select
+                    .from
+                    .iter()
+                    .map(|t| self.resolve_table_factor(&t.relation))
+                    .collect::<SqlResult<Vec<_>>>()?;
+
+                // Add joined tables to scope
+                let mut resolved_joins = Vec::new();
+                for table_with_joins in &select.from {
+                    for join in &table_with_joins.joins {
+                        let table_ref = self.resolve_table_factor(&join.relation)?;
+                        let table_def = self
+                            .catalog
+                            .get_table(&table_ref.name)
+                            .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+
+                        let alias = table_ref
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| table_ref.name.clone());
+                        scope.add_table(&alias, &table_ref.name, table_def);
+
+                        let join_type = convert_join_type(&join.join_operator)?;
+                        let condition = extract_join_condition(&join.join_operator)
+                            .map(|c| self.resolve_expr(c, &scope))
+                            .transpose()?;
+
+                        resolved_joins.push(ResolvedJoin {
+                            table: table_ref,
+                            join_type,
+                            condition,
+                        });
+                    }
+                }
+
+                // Resolve columns
+                let mut resolved_columns = Vec::new();
+                for item in &select.projection {
+                    resolved_columns.push(self.resolve_select_item(item, &scope)?);
+                }
+
+                // Resolve filter
+                let resolved_filter = select
+                    .selection
+                    .as_ref()
+                    .map(|f| self.resolve_expr(f, &scope))
+                    .transpose()?;
+
+                // Resolve GROUP BY
+                let mut resolved_group_by = Vec::new();
+                match &select.group_by {
+                    sp::GroupByExpr::Expressions(exprs, _) => {
+                        for expr in exprs {
+                            resolved_group_by.push(self.resolve_expr(expr, &scope)?);
+                        }
+                    }
+                    sp::GroupByExpr::All(_) => {
+                        return Err(SqlError::Unsupported("GROUP BY ALL".to_string()));
+                    }
+                }
+
+                // Resolve HAVING
+                let resolved_having = select
+                    .having
+                    .as_ref()
+                    .map(|h| self.resolve_expr(h, &scope))
+                    .transpose()?;
+
+                Ok(ResolvedSelect {
+                    distinct: select.distinct.is_some(),
+                    columns: resolved_columns,
+                    from: resolved_from,
+                    joins: resolved_joins,
+                    filter: resolved_filter,
+                    group_by: resolved_group_by,
+                    having: resolved_having,
+                    order_by: Vec::new(), // Filled in by resolve_query
+                    limit: None,
+                    offset: None,
+                })
+            }
+            _ => Err(SqlError::Unsupported(
+                "Complex query (UNION, etc.)".to_string(),
+            )),
+        }
+    }
+
+    /// Resolve table factor to table reference
+    fn resolve_table_factor(&self, table: &sp::TableFactor) -> SqlResult<ResolvedTableRef> {
+        match table {
+            sp::TableFactor::Table { name, alias, .. } => {
+                let table_name = name.to_string();
+                let table_def = self
+                    .catalog
+                    .get_table(&table_name)
+                    .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
+
+                Ok(ResolvedTableRef {
+                    name: table_name,
+                    alias: alias.as_ref().map(|a| a.name.value.clone()),
                     columns: table_def
                         .columns
                         .iter()
                         .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
                         .collect(),
-                }
-            })
-            .collect();
-
-        // Resolve filter
-        let resolved_filter = select
-            .filter
-            .as_ref()
-            .map(|f| self.resolve_expr(f, &scope))
-            .transpose()?;
-
-        // Resolve GROUP BY
-        let mut resolved_group_by = Vec::new();
-        for expr in &select.group_by {
-            resolved_group_by.push(self.resolve_expr(expr, &scope)?);
+                })
+            }
+            _ => Err(SqlError::Unsupported("Complex table reference".to_string())),
         }
-
-        // Resolve HAVING
-        let resolved_having = select
-            .having
-            .as_ref()
-            .map(|h| self.resolve_expr(h, &scope))
-            .transpose()?;
-
-        // Resolve ORDER BY
-        let mut resolved_order_by = Vec::new();
-        for item in &select.order_by {
-            resolved_order_by.push(ResolvedOrderByItem {
-                expr: self.resolve_expr(&item.expr, &scope)?,
-                ascending: item.ascending,
-            });
-        }
-
-        // Resolve JOINs
-        let mut resolved_joins = Vec::new();
-        for join in &select.joins {
-            let table_def = self.catalog.get_table(&join.table.name).unwrap();
-            let resolved_table = ResolvedTableRef {
-                name: join.table.name.clone(),
-                alias: join.table.alias.clone(),
-                columns: table_def
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-                    .collect(),
-            };
-
-            let resolved_condition = join
-                .condition
-                .as_ref()
-                .map(|c| self.resolve_expr(c, &scope))
-                .transpose()?;
-
-            resolved_joins.push(ResolvedJoin {
-                table: resolved_table,
-                join_type: join.join_type,
-                condition: resolved_condition,
-            });
-        }
-
-        Ok(ResolvedStatement::Select(ResolvedSelect {
-            distinct: select.distinct,
-            columns: resolved_columns,
-            from: resolved_from,
-            joins: resolved_joins,
-            filter: resolved_filter,
-            group_by: resolved_group_by,
-            having: resolved_having,
-            order_by: resolved_order_by,
-            limit: select.limit,
-            offset: select.offset,
-        }))
     }
 
     /// Resolve SELECT item
     fn resolve_select_item(
         &self,
-        item: &SelectItem,
+        item: &sp::SelectItem,
         scope: &Scope,
     ) -> SqlResult<ResolvedSelectItem> {
         match item {
-            SelectItem::Expr { expr, alias } => Ok(ResolvedSelectItem::Expr {
+            sp::SelectItem::UnnamedExpr(expr) => Ok(ResolvedSelectItem::Expr {
                 expr: self.resolve_expr(expr, scope)?,
-                alias: alias.clone(),
+                alias: None,
             }),
-            SelectItem::Wildcard => {
+            sp::SelectItem::ExprWithAlias { expr, alias } => Ok(ResolvedSelectItem::Expr {
+                expr: self.resolve_expr(expr, scope)?,
+                alias: Some(alias.value.clone()),
+            }),
+            sp::SelectItem::Wildcard(_) => {
                 // Expand to all columns from all tables in order
                 let mut columns = Vec::new();
                 for (table_alias, _offset) in &scope.table_order {
@@ -416,7 +551,6 @@ impl<'a> Resolver<'a> {
                     for (local_idx, (name, data_type, nullable)) in
                         table_info.columns.iter().enumerate()
                     {
-                        // Use global index (offset + local)
                         let global_idx = table_info.column_offset + local_idx;
                         columns.push(ResolvedColumn {
                             table: table_alias.clone(),
@@ -429,10 +563,11 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(ResolvedSelectItem::Columns(columns))
             }
-            SelectItem::QualifiedWildcard(table) => {
+            sp::SelectItem::QualifiedWildcard(name, _) => {
+                let table = name.to_string();
                 let table_info = scope
                     .tables
-                    .get(table)
+                    .get(&table)
                     .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
                 let columns: Vec<_> = table_info
@@ -440,7 +575,6 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .enumerate()
                     .map(|(local_idx, (name, data_type, nullable))| {
-                        // Use global index (offset + local)
                         let global_idx = table_info.column_offset + local_idx;
                         ResolvedColumn {
                             table: table.clone(),
@@ -458,52 +592,90 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve expression
-    fn resolve_expr(&self, expr: &Expr, scope: &Scope) -> SqlResult<ResolvedExpr> {
+    fn resolve_expr(&self, expr: &sp::Expr, scope: &Scope) -> SqlResult<ResolvedExpr> {
         match expr {
-            Expr::Column { table, name } => self.resolve_column(table.as_deref(), name, scope),
-            Expr::Literal(lit) => Ok(ResolvedExpr::Literal(lit.clone())),
-            Expr::BinaryOp { left, op, right } => {
+            sp::Expr::Identifier(ident) => self.resolve_column(None, &ident.value, scope),
+            sp::Expr::CompoundIdentifier(idents) => {
+                if idents.len() == 2 {
+                    self.resolve_column(Some(&idents[0].value), &idents[1].value, scope)
+                } else {
+                    Err(SqlError::Unsupported("Compound identifier".to_string()))
+                }
+            }
+            sp::Expr::Value(val) => Ok(ResolvedExpr::Literal(convert_value(val)?)),
+            sp::Expr::BinaryOp { left, op, right } => {
                 let resolved_left = self.resolve_expr(left, scope)?;
                 let resolved_right = self.resolve_expr(right, scope)?;
-                let result_type = infer_binary_result_type(*op, &resolved_left, &resolved_right)?;
+                let binary_op = convert_binary_op(op)?;
+                let result_type =
+                    infer_binary_result_type(binary_op, &resolved_left, &resolved_right)?;
                 Ok(ResolvedExpr::BinaryOp {
                     left: Box::new(resolved_left),
-                    op: *op,
+                    op: binary_op,
                     right: Box::new(resolved_right),
                     result_type,
                 })
             }
-            Expr::UnaryOp { op, expr } => {
+            sp::Expr::UnaryOp { op, expr } => {
                 let resolved_expr = self.resolve_expr(expr, scope)?;
-                let result_type = infer_unary_result_type(*op, &resolved_expr)?;
+                let unary_op = convert_unary_op(op)?;
+                let result_type = infer_unary_result_type(unary_op, &resolved_expr)?;
                 Ok(ResolvedExpr::UnaryOp {
-                    op: *op,
+                    op: unary_op,
                     expr: Box::new(resolved_expr),
                     result_type,
                 })
             }
-            Expr::Function {
-                name,
-                args,
-                distinct,
-            } => {
-                let mut resolved_args = Vec::new();
-                for arg in args {
-                    resolved_args.push(self.resolve_expr(arg, scope)?);
-                }
-                let result_type = infer_function_result_type(name, &resolved_args)?;
+            sp::Expr::Function(func) => {
+                let name = func.name.to_string().to_uppercase();
+                let distinct = matches!(
+                    func.args,
+                    sp::FunctionArguments::List(sp::FunctionArgumentList {
+                        duplicate_treatment: Some(sp::DuplicateTreatment::Distinct),
+                        ..
+                    })
+                );
+                let args = match &func.args {
+                    sp::FunctionArguments::List(list) => {
+                        let mut result = Vec::new();
+                        for arg in &list.args {
+                            match arg {
+                                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                                    result.push(self.resolve_expr(e, scope)?);
+                                }
+                                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
+                                    // COUNT(*) - use a placeholder
+                                    result.push(ResolvedExpr::Literal(Literal::Null));
+                                }
+                                _ => {
+                                    return Err(SqlError::Unsupported(
+                                        "Function argument".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        result
+                    }
+                    sp::FunctionArguments::None => Vec::new(),
+                    _ => return Err(SqlError::Unsupported("Function arguments".to_string())),
+                };
+                let result_type = infer_function_result_type(&name, &args)?;
                 Ok(ResolvedExpr::Function {
-                    name: name.clone(),
-                    args: resolved_args,
-                    distinct: *distinct,
+                    name,
+                    args,
+                    distinct,
                     result_type,
                 })
             }
-            Expr::IsNull { expr, negated } => Ok(ResolvedExpr::IsNull {
+            sp::Expr::IsNull(expr) => Ok(ResolvedExpr::IsNull {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
-                negated: *negated,
+                negated: false,
             }),
-            Expr::InList {
+            sp::Expr::IsNotNull(expr) => Ok(ResolvedExpr::IsNull {
+                expr: Box::new(self.resolve_expr(expr, scope)?),
+                negated: true,
+            }),
+            sp::Expr::InList {
                 expr,
                 list,
                 negated,
@@ -519,25 +691,39 @@ impl<'a> Resolver<'a> {
                     negated: *negated,
                 })
             }
-            Expr::Between {
+            sp::Expr::Between {
                 expr,
+                negated,
                 low,
                 high,
-                negated,
             } => Ok(ResolvedExpr::Between {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
                 low: Box::new(self.resolve_expr(low, scope)?),
                 high: Box::new(self.resolve_expr(high, scope)?),
                 negated: *negated,
             }),
-            Expr::Wildcard => {
-                // Wildcard in expression context is only valid in COUNT(*)
-                // Return a placeholder that gets handled in function resolution
-                Ok(ResolvedExpr::Literal(Literal::Null))
+            sp::Expr::Nested(inner) => self.resolve_expr(inner, scope),
+            sp::Expr::Like {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
+                let resolved_left = self.resolve_expr(expr, scope)?;
+                let resolved_right = self.resolve_expr(pattern, scope)?;
+                let op = if *negated {
+                    BinaryOp::NotLike
+                } else {
+                    BinaryOp::Like
+                };
+                Ok(ResolvedExpr::BinaryOp {
+                    left: Box::new(resolved_left),
+                    op,
+                    right: Box::new(resolved_right),
+                    result_type: DataType::Boolean,
+                })
             }
-            Expr::QualifiedWildcard(_) | Expr::Subquery(_) => {
-                Err(SqlError::Unsupported("Expression type".to_string()))
-            }
+            _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }
 
@@ -562,7 +748,6 @@ impl<'a> Resolver<'a> {
                 .find(|(_, (n, _, _))| n == name)
                 .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
 
-            // Add the table's column offset for joined rows
             let global_idx = table_info.column_offset + local_idx;
 
             Ok(ResolvedExpr::Column(ResolvedColumn {
@@ -586,7 +771,6 @@ impl<'a> Resolver<'a> {
                     if found.is_some() {
                         return Err(SqlError::AmbiguousColumn(name.to_string()));
                     }
-                    // Add the table's column offset for joined rows
                     let global_idx = table_info.column_offset + local_idx;
                     found = Some((
                         table_alias.clone(),
@@ -613,18 +797,17 @@ impl<'a> Resolver<'a> {
     }
 }
 
+// ============ Scope ============
+
 /// Scope for name resolution
 struct Scope {
     tables: HashMap<String, TableInfo>,
-    /// Tracks the order in which tables were added and their column offsets
     table_order: Vec<(String, usize)>, // (alias, column_offset)
-    /// Total number of columns so far
     total_columns: usize,
 }
 
 struct TableInfo {
     columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
-    /// Column offset in the combined row for JOINs
     column_offset: usize,
 }
 
@@ -663,6 +846,204 @@ impl Scope {
         self.total_columns += num_columns;
     }
 }
+
+// ============ Conversion helpers ============
+
+/// Convert column definition
+fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
+    let name = col.name.value.clone();
+    let data_type = convert_data_type(&col.data_type)?;
+
+    let mut col_def = ColumnDef::new(name, data_type);
+
+    for option in &col.options {
+        match &option.option {
+            sp::ColumnOption::Null => {
+                col_def = col_def.nullable(true);
+            }
+            sp::ColumnOption::NotNull => {
+                col_def = col_def.nullable(false);
+            }
+            sp::ColumnOption::Default(expr) => {
+                col_def = col_def.default(expr.to_string());
+            }
+            sp::ColumnOption::Unique { is_primary, .. } => {
+                if *is_primary {
+                    col_def = col_def.nullable(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(col_def)
+}
+
+/// Convert data type
+pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
+    match dt {
+        sp::DataType::Boolean => Ok(DataType::Boolean),
+        sp::DataType::TinyInt(_) => Ok(DataType::TinyInt),
+        sp::DataType::SmallInt(_) => Ok(DataType::SmallInt),
+        sp::DataType::Int(_) | sp::DataType::Integer(_) => Ok(DataType::Int),
+        sp::DataType::BigInt(_) => Ok(DataType::BigInt),
+        sp::DataType::Float(_) | sp::DataType::Real => Ok(DataType::Float),
+        sp::DataType::Double | sp::DataType::DoublePrecision => Ok(DataType::Double),
+        sp::DataType::Varchar(len) => {
+            let n = extract_varchar_length(len).unwrap_or(255);
+            Ok(DataType::Varchar(n))
+        }
+        sp::DataType::Char(len) => {
+            let n = extract_varchar_length(len).unwrap_or(1);
+            Ok(DataType::Varchar(n))
+        }
+        sp::DataType::Text => Ok(DataType::Text),
+        sp::DataType::Blob(_) | sp::DataType::Binary(_) | sp::DataType::Varbinary(_) => {
+            Ok(DataType::Blob)
+        }
+        sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
+        _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
+    }
+}
+
+/// Extract length from VARCHAR/CHAR specification
+fn extract_varchar_length(len: &Option<sp::CharacterLength>) -> Option<u32> {
+    len.as_ref().map(|l| match l {
+        sp::CharacterLength::IntegerLength { length, .. } => *length as u32,
+        sp::CharacterLength::Max => 65535,
+    })
+}
+
+/// Convert table constraint
+fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Option<Constraint>> {
+    match constraint {
+        sp::TableConstraint::PrimaryKey { columns, .. } => {
+            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+            Ok(Some(Constraint::PrimaryKey(cols)))
+        }
+        sp::TableConstraint::Unique { columns, .. } => {
+            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+            Ok(Some(Constraint::Unique(cols)))
+        }
+        sp::TableConstraint::ForeignKey {
+            columns,
+            foreign_table,
+            referred_columns,
+            ..
+        } => {
+            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+            let ref_cols: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
+            Ok(Some(Constraint::ForeignKey {
+                columns: cols,
+                ref_table: foreign_table.to_string(),
+                ref_columns: ref_cols,
+            }))
+        }
+        sp::TableConstraint::Check { expr, .. } => Ok(Some(Constraint::Check(expr.to_string()))),
+        _ => Ok(None),
+    }
+}
+
+/// Extract column name from assignment target
+fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String> {
+    match target {
+        sp::AssignmentTarget::ColumnName(names) => Ok(names
+            .0
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".")),
+        sp::AssignmentTarget::Tuple(_) => {
+            Err(SqlError::Unsupported("Tuple assignment".to_string()))
+        }
+    }
+}
+
+/// Convert JOIN type
+fn convert_join_type(join_op: &sp::JoinOperator) -> SqlResult<JoinType> {
+    match join_op {
+        sp::JoinOperator::Inner(_) => Ok(JoinType::Inner),
+        sp::JoinOperator::LeftOuter(_) => Ok(JoinType::Left),
+        sp::JoinOperator::RightOuter(_) => Ok(JoinType::Right),
+        sp::JoinOperator::FullOuter(_) => Ok(JoinType::Full),
+        sp::JoinOperator::CrossJoin => Ok(JoinType::Cross),
+        _ => Err(SqlError::Unsupported("Join type".to_string())),
+    }
+}
+
+/// Extract JOIN condition
+fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
+    match join_op {
+        sp::JoinOperator::Inner(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::LeftOuter(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::RightOuter(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::FullOuter(sp::JoinConstraint::On(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+/// Convert literal value
+fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
+    match val {
+        sp::Value::Null => Ok(Literal::Null),
+        sp::Value::Boolean(b) => Ok(Literal::Boolean(*b)),
+        sp::Value::Number(n, _) => {
+            if n.contains('.') {
+                Ok(Literal::Float(n.parse().unwrap_or(0.0)))
+            } else {
+                Ok(Literal::Integer(n.parse().unwrap_or(0)))
+            }
+        }
+        sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
+            Ok(Literal::String(s.clone()))
+        }
+        sp::Value::HexStringLiteral(s) => {
+            let bytes = hex_decode(s).unwrap_or_default();
+            Ok(Literal::Blob(bytes))
+        }
+        _ => Err(SqlError::Unsupported(format!("Value: {:?}", val))),
+    }
+}
+
+/// Hex decoding helper
+fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
+    let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+/// Convert binary operator
+fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
+    match op {
+        sp::BinaryOperator::Plus => Ok(BinaryOp::Add),
+        sp::BinaryOperator::Minus => Ok(BinaryOp::Sub),
+        sp::BinaryOperator::Multiply => Ok(BinaryOp::Mul),
+        sp::BinaryOperator::Divide => Ok(BinaryOp::Div),
+        sp::BinaryOperator::Modulo => Ok(BinaryOp::Mod),
+        sp::BinaryOperator::Eq => Ok(BinaryOp::Eq),
+        sp::BinaryOperator::NotEq => Ok(BinaryOp::NotEq),
+        sp::BinaryOperator::Lt => Ok(BinaryOp::Lt),
+        sp::BinaryOperator::LtEq => Ok(BinaryOp::LtEq),
+        sp::BinaryOperator::Gt => Ok(BinaryOp::Gt),
+        sp::BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
+        sp::BinaryOperator::And => Ok(BinaryOp::And),
+        sp::BinaryOperator::Or => Ok(BinaryOp::Or),
+        _ => Err(SqlError::Unsupported(format!("Binary operator: {:?}", op))),
+    }
+}
+
+/// Convert unary operator
+fn convert_unary_op(op: &sp::UnaryOperator) -> SqlResult<UnaryOp> {
+    match op {
+        sp::UnaryOperator::Not => Ok(UnaryOp::Not),
+        sp::UnaryOperator::Minus => Ok(UnaryOp::Neg),
+        _ => Err(SqlError::Unsupported(format!("Unary operator: {:?}", op))),
+    }
+}
+
+// ============ Type inference ============
 
 /// Infer result type of binary operation
 fn infer_binary_result_type(
@@ -761,17 +1142,17 @@ fn wider_numeric_type(a: &DataType, b: &DataType) -> DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnDef, TableDef};
+    use crate::sql::parser::Parser;
 
     fn test_catalog() -> Catalog {
         let mut catalog = Catalog::new();
 
-        let users = TableDef::new("users")
+        let users = crate::catalog::TableDef::new("users")
             .column(ColumnDef::new("id", DataType::Int).nullable(false))
             .column(ColumnDef::new("name", DataType::Varchar(100)))
             .column(ColumnDef::new("email", DataType::Varchar(255)));
 
-        let orders = TableDef::new("orders")
+        let orders = crate::catalog::TableDef::new("orders")
             .column(ColumnDef::new("id", DataType::Int).nullable(false))
             .column(ColumnDef::new("user_id", DataType::Int))
             .column(ColumnDef::new("total", DataType::Double));
@@ -787,8 +1168,7 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt = crate::sql::parser::Parser::parse_one("SELECT id, name FROM users WHERE id = 1")
-            .unwrap();
+        let stmt = Parser::parse_one("SELECT id, name FROM users WHERE id = 1").unwrap();
 
         let resolved = resolver.resolve(stmt).unwrap();
         match resolved {
@@ -805,7 +1185,7 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt = crate::sql::parser::Parser::parse_one("SELECT * FROM nonexistent").unwrap();
+        let stmt = Parser::parse_one("SELECT * FROM nonexistent").unwrap();
         let result = resolver.resolve(stmt);
 
         assert!(matches!(result, Err(SqlError::TableNotFound(_))));
@@ -816,7 +1196,7 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt = crate::sql::parser::Parser::parse_one("SELECT nonexistent FROM users").unwrap();
+        let stmt = Parser::parse_one("SELECT nonexistent FROM users").unwrap();
         let result = resolver.resolve(stmt);
 
         assert!(matches!(result, Err(SqlError::ColumnNotFound(_))));
@@ -828,10 +1208,9 @@ mod tests {
         let resolver = Resolver::new(&catalog);
 
         // Both users and orders have 'id' column
-        let stmt = crate::sql::parser::Parser::parse_one(
-            "SELECT id FROM users JOIN orders ON users.id = orders.user_id",
-        )
-        .unwrap();
+        let stmt =
+            Parser::parse_one("SELECT id FROM users JOIN orders ON users.id = orders.user_id")
+                .unwrap();
         let result = resolver.resolve(stmt);
 
         assert!(matches!(result, Err(SqlError::AmbiguousColumn(_))));
@@ -842,7 +1221,7 @@ mod tests {
         let catalog = test_catalog();
         let resolver = Resolver::new(&catalog);
 
-        let stmt = crate::sql::parser::Parser::parse_one(
+        let stmt = Parser::parse_one(
             "SELECT users.id, orders.total FROM users JOIN orders ON users.id = orders.user_id",
         )
         .unwrap();
