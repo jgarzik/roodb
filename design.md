@@ -104,6 +104,8 @@ Schema metadata cache. The catalog is an in-memory cache of schema metadata, reb
 - `system.tables` - table definitions
 - `system.columns` - column definitions
 - `system.indexes` - index definitions
+- `system.users` - user accounts (auth)
+- `system.grants` - privileges
 
 **Types**:
 - `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, Float, Double, Varchar(n), Text, Blob, Timestamp
