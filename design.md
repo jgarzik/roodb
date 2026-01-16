@@ -96,7 +96,7 @@ SQL string
 
 ## Module Reference
 
-### `catalog.rs`
+### `catalog/`
 
 Schema metadata cache. The catalog is an in-memory cache of schema metadata, rebuilt from system tables on startup.
 
@@ -306,6 +306,7 @@ pub struct RooDbServer {
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
     txn_manager: Arc<TransactionManager>,
+    raft_node: Arc<RaftNode>,
     next_conn_id: AtomicU32,
 }
 ```

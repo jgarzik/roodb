@@ -51,7 +51,7 @@ mysql -h 127.0.0.1 -P 3307 -u root --ssl-mode=REQUIRED --ssl-ca=ca.pem
 
 ```
 src/
-├── catalog.rs     # Schema catalog (tables, columns, system tables)
+├── catalog/       # Schema catalog (tables, columns, system tables)
 ├── executor/      # Volcano-style query executor
 ├── io/            # Cross-platform async I/O (io_uring / POSIX)
 ├── planner/       # Query planner and optimizer
