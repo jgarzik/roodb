@@ -19,16 +19,16 @@
 
 **No external replication** — we build everything ourselves via Raft primitives.
 
-## Current Issues
+## Current Issues (ALL RESOLVED)
 
-| Issue | Location | Severity |
-|-------|----------|----------|
-| Followers skip DataChange apply | `lsm_storage.rs:374-392` | CRITICAL |
-| DDL bypasses Raft | `ddl.rs` - only in-memory Catalog | CRITICAL |
-| Snapshot is metadata-only | `lsm_storage.rs:456-457` | CRITICAL |
-| Write before Raft commit | DML writes memtable, then proposes | HIGH |
-| put_raw() bypasses Raft | `insert.rs:104`, `update.rs:109` | MEDIUM |
-| Rollback bypasses Raft | `manager.rs:229-250` | MEDIUM |
+| Issue | Status | Phase |
+|-------|--------|-------|
+| Followers skip DataChange apply | ✅ Fixed | Phase 1 |
+| DDL bypasses Raft | ✅ Fixed | Phase 2 |
+| Snapshot is metadata-only | ✅ Fixed | Phase 3 |
+| Write before Raft commit | ✅ Fixed | Phase 4 |
+| put_raw() bypasses Raft | ✅ Fixed | Phase 5 |
+| Rollback bypasses Raft | ✅ Fixed | Phase 6 |
 
 ---
 
@@ -75,17 +75,18 @@
 
 ---
 
-## Phase 3: LSM Snapshot Transfer
+## Phase 3: LSM Snapshot Transfer ✅ DONE
 
 **Problem**: `install_snapshot()` only updates metadata (line 456-457). New/stale followers can't receive data.
 
-**Changes**:
-- Define snapshot wire format: SSTable files + manifest + Raft metadata
-- `build_snapshot()`: Stream LSM files (SSTables) to snapshot payload
-- `install_snapshot()`: Receive and install SSTable files, rebuild memtable state
-- Add RPC for incremental snapshot chunks (large data)
+**Solution implemented**:
+- Snapshot format: `[count: u64][key_len: u32][key][value_len: u32][value]...`
+- `build_snapshot()`: Serialize all user data (exclude `_raft:` prefix keys)
+- `install_snapshot()`: Clear user data, deserialize and install entries, rebuild catalog
+- `get_current_snapshot()`: Return current state with data
+- `rebuild_catalog_from_system_tables()`: Full catalog rebuild after install
 
-**Files**: `src/raft/lsm_storage.rs`, `src/raft/network.rs`, `src/storage/lsm/engine.rs`
+**Files**: `src/raft/lsm_storage.rs`
 
 **Test**: Start blank follower → receives snapshot → can serve reads
 
@@ -112,32 +113,36 @@
 
 ---
 
-## Phase 5: Remove put_raw() Bypass
+## Phase 5: Remove put_raw() Bypass ✅ DONE
 
 **Problem**: `put_raw()` when txn_context=None bypasses MVCC+Raft
 
-**Changes**:
-- Remove put_raw paths in insert.rs:98-105, update.rs:104-110, delete.rs:100-107
-- Protocol layer: Always create implicit txn context for DML
-- Only bootstrap/init may use raw storage writes (pre-Raft)
+**Solution implemented**:
+- Removed put_raw() fallback paths from insert.rs, update.rs, delete.rs
+- DML executors now require transaction context (error if None)
+- Protocol layer already creates implicit txn context for autocommit DML
+- Updated unit and integration tests to provide TransactionContext with MVCC-encoded data
 
-**Files**: `src/executor/insert.rs`, `src/executor/update.rs`, `src/executor/delete.rs`, `src/protocol/roodb/mod.rs`
+**Files**: `src/executor/insert.rs`, `src/executor/update.rs`, `src/executor/delete.rs`, `tests/executor_tests.rs`
 
 **Test**: Single INSERT without BEGIN still replicates to followers
 
 ---
 
-## Phase 6: Rollback Through Raft
+## Phase 6: Rollback Through Raft ✅ DONE
 
 **Problem**: `manager.rs:229-250` writes directly to storage
 
-**Changes**:
-- Option A: Propose rollback changeset (undo operations) to Raft
-- Option B: Mark txn aborted in Raft; MVCC visibility hides uncommitted; GC later
+**Solution implemented**:
+With Raft-as-WAL, this problem is naturally solved:
+- Uncommitted changes are never written to storage
+- Changes are buffered in session until COMMIT, then proposed to Raft
+- On ROLLBACK, `session.clear_pending_changes()` discards buffered changes
+- `manager.rollback()` just removes transaction from active set
+- No storage writes or Raft involvement needed for rollback
+- Removed dead code from `manager.rs:rollback()` that iterated empty undo log
 
-**Recommendation**: Option B simpler — uncommitted writes invisible anyway
-
-**Files**: `src/txn/manager.rs`, `src/raft/types.rs` (add Command::AbortTxn if needed)
+**Files**: `src/txn/manager.rs`
 
 **Test**: BEGIN → INSERT → ROLLBACK on leader; follower never sees row
 

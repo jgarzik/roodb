@@ -97,15 +97,13 @@ impl Executor for Delete {
 
         // Collect the changes for Raft replication.
         // Data is written to storage in apply() after Raft commit.
+        let ctx = self.txn_context.as_mut().ok_or_else(|| {
+            super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
+        })?;
         for key in keys_to_delete {
-            if let Some(ref mut ctx) = self.txn_context {
-                ctx.add_change(RowChange::delete(&self.table, key.clone()));
-                // Buffer for read-your-writes within this transaction
-                ctx.buffer_delete(key);
-            } else {
-                // Legacy path: direct delete without Raft (only for bootstrap/init)
-                self.mvcc.inner().delete(&key).await?;
-            }
+            ctx.add_change(RowChange::delete(&self.table, key.clone()));
+            // Buffer for read-your-writes within this transaction
+            ctx.buffer_delete(key);
             self.rows_deleted += 1;
         }
 
@@ -198,17 +196,39 @@ mod tests {
         }
     }
 
+    /// Encode data with MVCC header for test fixtures
+    fn encode_with_mvcc_header(txn_id: u64, data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(17 + data.len());
+        result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+        result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR
+        result.push(0); // deleted flag
+        result.extend_from_slice(data);
+        result
+    }
+
     #[tokio::test]
     async fn test_delete_with_filter() {
-        // Setup initial data
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        // Setup initial data with MVCC headers (txn_id=0 = committed)
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
         let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
 
         let initial = vec![
-            (encode_row_key("users", 1), encode_row(&row1)),
-            (encode_row_key("users", 2), encode_row(&row2)),
-            (encode_row_key("users", 3), encode_row(&row3)),
+            (
+                encode_row_key("users", 1),
+                encode_with_mvcc_header(0, &encode_row(&row1)),
+            ),
+            (
+                encode_row_key("users", 2),
+                encode_with_mvcc_header(0, &encode_row(&row2)),
+            ),
+            (
+                encode_row_key("users", 3),
+                encode_with_mvcc_header(0, &encode_row(&row3)),
+            ),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
@@ -232,8 +252,9 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        // No txn_context = use raw storage (legacy mode)
-        let mut delete = Delete::new("users".to_string(), Some(filter), mvcc, None);
+        // Provide transaction context (required for Raft-as-WAL)
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new("users".to_string(), Some(filter), mvcc, Some(txn_context));
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -241,19 +262,29 @@ mod tests {
 
         delete.close().await.unwrap();
 
-        // Verify only row 1 remains
-        let data = storage.data.lock().unwrap();
-        assert_eq!(data.len(), 1);
+        // Verify changes were collected (data written via Raft apply, not directly)
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 2);
     }
 
     #[tokio::test]
     async fn test_delete_all() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        // Setup initial data with MVCC headers (txn_id=0 = committed)
         let row1 = Row::new(vec![Datum::Int(1)]);
         let row2 = Row::new(vec![Datum::Int(2)]);
 
         let initial = vec![
-            (encode_row_key("users", 1), encode_row(&row1)),
-            (encode_row_key("users", 2), encode_row(&row2)),
+            (
+                encode_row_key("users", 1),
+                encode_with_mvcc_header(0, &encode_row(&row1)),
+            ),
+            (
+                encode_row_key("users", 2),
+                encode_with_mvcc_header(0, &encode_row(&row2)),
+            ),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
@@ -263,8 +294,9 @@ mod tests {
             txn_manager,
         ));
 
-        // Delete all (no filter), no txn_context = use raw storage
-        let mut delete = Delete::new("users".to_string(), None, mvcc, None);
+        // Provide transaction context (required for Raft-as-WAL)
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new("users".to_string(), None, mvcc, Some(txn_context));
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -272,8 +304,8 @@ mod tests {
 
         delete.close().await.unwrap();
 
-        // Verify all deleted
-        let data = storage.data.lock().unwrap();
-        assert!(data.is_empty());
+        // Verify changes were collected (data written via Raft apply, not directly)
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 2);
     }
 }

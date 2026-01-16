@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
+use roodb::executor::context::TransactionContext;
 use roodb::executor::encoding::{encode_row, encode_row_key};
 use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
@@ -13,7 +14,7 @@ use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
 use roodb::planner::PhysicalPlan;
 use roodb::storage::traits::KeyValue;
 use roodb::storage::{StorageEngine, StorageResult};
-use roodb::txn::{MvccStorage, TransactionManager};
+use roodb::txn::{MvccStorage, ReadView, TransactionManager};
 
 use std::sync::Mutex;
 
@@ -76,15 +77,35 @@ impl StorageEngine for MockStorage {
     }
 }
 
+/// Encode data with MVCC header for test fixtures
+fn encode_with_mvcc_header(txn_id: u64, data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(17 + data.len());
+    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR
+    result.push(0); // deleted flag
+    result.extend_from_slice(data);
+    result
+}
+
 fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
     let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
     let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
     let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
 
+    // Encode with MVCC headers (txn_id=0 = committed)
     let initial = vec![
-        (encode_row_key("users", 1), encode_row(&row1)),
-        (encode_row_key("users", 2), encode_row(&row2)),
-        (encode_row_key("users", 3), encode_row(&row3)),
+        (
+            encode_row_key("users", 1),
+            encode_with_mvcc_header(0, &encode_row(&row1)),
+        ),
+        (
+            encode_row_key("users", 2),
+            encode_with_mvcc_header(0, &encode_row(&row2)),
+        ),
+        (
+            encode_row_key("users", 3),
+            encode_with_mvcc_header(0, &encode_row(&row3)),
+        ),
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
@@ -106,8 +127,9 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
         .unwrap();
     }
 
-    // No transaction context for simple tests (legacy mode)
-    let engine = ExecutorEngine::new(mvcc, catalog, None);
+    // Provide transaction context (required for Raft-as-WAL)
+    let txn_context = TransactionContext::new(1, ReadView::default());
+    let engine = ExecutorEngine::new(mvcc, catalog, Some(txn_context));
     (engine, storage)
 }
 
@@ -401,18 +423,20 @@ async fn test_insert() {
 
     exec.close().await.unwrap();
 
-    // Verify data was inserted (count increased or new key exists)
+    // Verify changes were collected (data written via Raft apply, not directly)
+    let changes = exec.take_changes();
+    assert_eq!(changes.len(), 1);
+
+    // Storage unchanged (changes only applied after Raft commit)
     let data = storage.data.lock().unwrap();
-    // Due to global row ID counter, we might have overwritten an existing row
-    // or added a new one - either way we should have at least 3 rows
-    assert!(data.len() >= 3);
+    assert_eq!(data.len(), 3);
 }
 
 // ============ Delete Tests ============
 
 #[tokio::test]
 async fn test_delete_with_filter() {
-    let (engine, storage) = setup_test_env();
+    let (engine, _storage) = setup_test_env();
 
     // DELETE FROM users WHERE id = 2
     let plan = PhysicalPlan::Delete {
@@ -439,9 +463,9 @@ async fn test_delete_with_filter() {
 
     exec.close().await.unwrap();
 
-    // Verify data was deleted
-    let data = storage.data.lock().unwrap();
-    assert_eq!(data.len(), 2); // 3 - 1 = 2
+    // Verify changes were collected (data written via Raft apply, not directly)
+    let changes = exec.take_changes();
+    assert_eq!(changes.len(), 1);
 }
 
 // ============ DDL Tests ============

@@ -350,6 +350,109 @@ impl LsmRaftStorage {
         Ok(())
     }
 
+    /// Rebuild entire catalog from system tables after snapshot install
+    async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
+        use crate::catalog::{IndexDef, TableDef};
+
+        let mut table_defs: Vec<TableDef> = Vec::new();
+        let mut index_defs: Vec<IndexDef> = Vec::new();
+
+        // Scan system.columns to rebuild all tables
+        let prefix = table_key_prefix(SYSTEM_COLUMNS);
+        let end = table_key_end(SYSTEM_COLUMNS);
+        let column_rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(read_err)?;
+
+        // Group columns by table name
+        let mut columns_by_table: std::collections::HashMap<
+            String,
+            Vec<crate::executor::row::Row>,
+        > = std::collections::HashMap::new();
+
+        for (_key, value) in column_rows {
+            if value.len() <= MVCC_HEADER_SIZE {
+                continue;
+            }
+            if value[16] == 1 {
+                continue; // Skip deleted
+            }
+            let row_data = &value[MVCC_HEADER_SIZE..];
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
+                    if !is_system_table(table_name) {
+                        columns_by_table
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(row);
+                    }
+                }
+            }
+        }
+
+        // Build TableDef for each table
+        for (table_name, column_rows) in columns_by_table {
+            if let Some(table_def) = rows_to_table_def(&table_name, &column_rows) {
+                table_defs.push(table_def);
+            }
+        }
+
+        // Scan system.indexes to rebuild all indexes
+        let prefix = table_key_prefix(SYSTEM_INDEXES);
+        let end = table_key_end(SYSTEM_INDEXES);
+        let index_rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(read_err)?;
+
+        for (_key, value) in index_rows {
+            if value.len() <= MVCC_HEADER_SIZE {
+                continue;
+            }
+            if value[16] == 1 {
+                continue; // Skip deleted
+            }
+            let row_data = &value[MVCC_HEADER_SIZE..];
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(index_def) = row_to_index_def(&row) {
+                    index_defs.push(index_def);
+                }
+            }
+        }
+
+        // Update catalog (clear and rebuild)
+        let mut catalog = self.catalog.write();
+
+        // Clear existing user tables/indexes (keep system tables)
+        let existing_tables: Vec<String> = catalog
+            .list_tables()
+            .iter()
+            .filter(|t| !is_system_table(t))
+            .map(|t| t.to_string())
+            .collect();
+        for table_name in existing_tables {
+            let _ = catalog.drop_table(&table_name);
+        }
+
+        // Add tables from snapshot
+        for table_def in table_defs {
+            tracing::debug!(table = %table_def.name, "Rebuilding table from snapshot");
+            let _ = catalog.create_table(table_def);
+        }
+
+        // Add indexes from snapshot
+        for index_def in index_defs {
+            tracing::debug!(index = %index_def.name, "Rebuilding index from snapshot");
+            let _ = catalog.create_index(index_def);
+        }
+
+        tracing::info!("Rebuilt catalog from system tables after snapshot install");
+        Ok(())
+    }
+
     /// Helper to track system table changes for catalog rebuild
     #[allow(clippy::too_many_arguments)]
     fn track_system_table_change(
@@ -716,8 +819,74 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta,
-        _snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError> {
+        let snapshot_data = snapshot.into_inner();
+
+        // Parse snapshot data if present
+        if !snapshot_data.is_empty() {
+            // Delete existing user data (preserve Raft metadata)
+            let existing_data = self.storage.scan(None, None).await.map_err(read_err)?;
+            let mut deleted_count = 0;
+            for (key, _) in existing_data {
+                if !key.starts_with(RAFT_PREFIX) {
+                    self.storage.delete(&key).await.map_err(write_err)?;
+                    deleted_count += 1;
+                }
+            }
+
+            // Parse snapshot: [count: u64][entries...]
+            if snapshot_data.len() < 8 {
+                return Err(read_err("Invalid snapshot: too short"));
+            }
+            let count = u64::from_le_bytes(snapshot_data[..8].try_into().unwrap()) as usize;
+            let mut offset = 8;
+
+            // Install each entry
+            let mut installed_count = 0;
+            for _ in 0..count {
+                // [key_len: u32][key][value_len: u32][value]
+                if offset + 4 > snapshot_data.len() {
+                    return Err(read_err("Invalid snapshot: truncated key length"));
+                }
+                let key_len =
+                    u32::from_le_bytes(snapshot_data[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                offset += 4;
+
+                if offset + key_len > snapshot_data.len() {
+                    return Err(read_err("Invalid snapshot: truncated key"));
+                }
+                let key = &snapshot_data[offset..offset + key_len];
+                offset += key_len;
+
+                if offset + 4 > snapshot_data.len() {
+                    return Err(read_err("Invalid snapshot: truncated value length"));
+                }
+                let value_len =
+                    u32::from_le_bytes(snapshot_data[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                offset += 4;
+
+                if offset + value_len > snapshot_data.len() {
+                    return Err(read_err("Invalid snapshot: truncated value"));
+                }
+                let value = &snapshot_data[offset..offset + value_len];
+                offset += value_len;
+
+                self.storage.put(key, value).await.map_err(write_err)?;
+                installed_count += 1;
+            }
+
+            tracing::info!(
+                ?meta,
+                deleted = deleted_count,
+                installed = installed_count,
+                bytes = snapshot_data.len(),
+                "Installed snapshot data"
+            );
+        }
+
         // Update last applied from snapshot metadata
         if let Some(log_id) = meta.last_log_id {
             let data = bincode::serialize(&log_id).map_err(write_err)?;
@@ -736,10 +905,13 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             .map_err(write_err)?;
         *self.cached_membership.write() = meta.last_membership.clone();
 
-        // Note: Full snapshot support for cluster join would require bulk LSM state transfer.
-        // For now, snapshots only update metadata - actual data must be transferred separately.
+        // Rebuild catalog from system tables after snapshot install
+        self.rebuild_catalog_from_system_tables().await?;
 
-        tracing::info!(?meta, "Installed snapshot metadata");
+        // Flush to ensure all snapshot data is persisted
+        self.storage.flush().await.map_err(write_err)?;
+
+        tracing::info!(?meta, "Installed snapshot");
         Ok(())
     }
 
@@ -747,43 +919,91 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
-        // LSM storage IS the state machine snapshot - return metadata only
+        // Scan all user data (exclude Raft metadata keys)
+        let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
+        let user_data: Vec<_> = all_data
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
+            .collect();
+
+        // Serialize snapshot data: [count: u64][entries...]
+        let mut snapshot_data = Vec::new();
+        snapshot_data.extend_from_slice(&(user_data.len() as u64).to_le_bytes());
+
+        for (key, value) in &user_data {
+            snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            snapshot_data.extend_from_slice(key);
+            snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            snapshot_data.extend_from_slice(value);
+        }
+
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
             snapshot_id: format!(
-                "{}-lsm",
-                last_applied.map(|l| l.to_string()).unwrap_or_default()
+                "{}-lsm-{}",
+                last_applied.map(|l| l.to_string()).unwrap_or_default(),
+                user_data.len()
             ),
         };
 
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(Vec::new())),
+            snapshot: Box::new(Cursor::new(snapshot_data)),
         }))
     }
 }
+
+/// Raft metadata key prefix - excluded from snapshots
+const RAFT_PREFIX: &[u8] = b"_raft:";
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
-        // LSM storage IS the state machine snapshot - return metadata only
+        // Flush storage to ensure all data is persisted
+        self.storage.flush().await.map_err(write_err)?;
+
+        // Scan all user data (exclude Raft metadata keys)
+        let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
+        let user_data: Vec<_> = all_data
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
+            .collect();
+
+        // Serialize snapshot data: [count: u64][entries...]
+        let mut snapshot_data = Vec::new();
+        snapshot_data.extend_from_slice(&(user_data.len() as u64).to_le_bytes());
+
+        for (key, value) in &user_data {
+            // [key_len: u32][key][value_len: u32][value]
+            snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            snapshot_data.extend_from_slice(key);
+            snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            snapshot_data.extend_from_slice(value);
+        }
+
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
             snapshot_id: format!(
-                "{}-lsm",
-                last_applied.map(|l| l.to_string()).unwrap_or_default()
+                "{}-lsm-{}",
+                last_applied.map(|l| l.to_string()).unwrap_or_default(),
+                user_data.len()
             ),
         };
 
-        tracing::debug!(?meta, "Built snapshot");
+        tracing::info!(
+            ?meta,
+            entries = user_data.len(),
+            bytes = snapshot_data.len(),
+            "Built snapshot"
+        );
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(Vec::new())),
+            snapshot: Box::new(Cursor::new(snapshot_data)),
         })
     }
 }

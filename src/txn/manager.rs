@@ -208,7 +208,10 @@ impl TransactionManager {
 
     /// Rollback a transaction
     ///
-    /// Applies undo records in reverse order to restore previous state.
+    /// With Raft-as-WAL, uncommitted changes are never written to storage.
+    /// Changes are buffered in the session until COMMIT, when they're proposed
+    /// to Raft. On ROLLBACK, the session simply discards the buffered changes.
+    /// This method just removes the transaction from the active set.
     pub async fn rollback(&self, txn_id: u64) -> TransactionResult<()> {
         // Get and validate transaction
         {
@@ -222,34 +225,11 @@ impl TransactionManager {
             }
         }
 
-        // Get undo records in reverse order
-        let undo_records = self.undo_log.get_records_reversed(txn_id);
+        // With Raft-as-WAL, uncommitted changes never reach storage.
+        // The session layer clears pending changes before calling this method.
+        // No storage writes needed for rollback.
 
-        // Apply undo operations
-        if let Some(storage) = &self.storage {
-            for record in undo_records {
-                match record.undo_type {
-                    super::UndoType::Insert => {
-                        // Row was inserted - delete it
-                        storage.delete(&record.row_key).await?;
-                    }
-                    super::UndoType::Update => {
-                        // Row was updated - restore old value
-                        if let Some(old_data) = &record.old_data {
-                            storage.put(&record.row_key, old_data).await?;
-                        }
-                    }
-                    super::UndoType::Delete => {
-                        // Row was deleted - restore it
-                        if let Some(old_data) = &record.old_data {
-                            storage.put(&record.row_key, old_data).await?;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove undo records
+        // Remove any undo records (should be empty with Raft-as-WAL)
         self.undo_log.remove_transaction(txn_id);
 
         // Don't add to committed set - transaction was rolled back

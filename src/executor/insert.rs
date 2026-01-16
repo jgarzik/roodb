@@ -98,14 +98,14 @@ impl Executor for Insert {
             // Collect the change for Raft replication.
             // Data is written to storage in apply() after Raft commit.
             // This ensures Raft-as-WAL: no writes until consensus.
-            if let Some(ref mut ctx) = self.txn_context {
-                ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
-                // Buffer for read-your-writes within this transaction
-                ctx.buffer_write(key, value);
-            } else {
-                // Legacy path: direct write without Raft (only for bootstrap/init)
-                self.mvcc.put_raw(&key, &value).await?;
-            }
+            let ctx = self.txn_context.as_mut().ok_or_else(|| {
+                super::error::ExecutorError::Internal(
+                    "INSERT requires transaction context".to_string(),
+                )
+            })?;
+            ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+            // Buffer for read-your-writes within this transaction
+            ctx.buffer_write(key, value);
             self.rows_inserted += 1;
         }
 
@@ -187,6 +187,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
         let storage = Arc::new(MockStorage::new());
         let txn_manager = Arc::new(TransactionManager::new());
         let mvcc = Arc::new(MvccStorage::new(
@@ -216,8 +219,15 @@ mod tests {
             ResolvedExpr::Literal(Literal::String("alice".to_string())),
         ]];
 
-        // No txn_context = use raw put (legacy mode)
-        let mut insert = Insert::new("users".to_string(), columns, values, mvcc, None);
+        // Provide transaction context (required for Raft-as-WAL)
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut insert = Insert::new(
+            "users".to_string(),
+            columns,
+            values,
+            mvcc,
+            Some(txn_context),
+        );
         insert.open().await.unwrap();
 
         let result = insert.next().await.unwrap().unwrap();
@@ -225,8 +235,8 @@ mod tests {
 
         insert.close().await.unwrap();
 
-        // Verify data was stored
-        let data = storage.data.lock().unwrap();
-        assert_eq!(data.len(), 1);
+        // Verify changes were collected (data written via Raft apply, not directly)
+        let changes = insert.take_changes();
+        assert_eq!(changes.len(), 1);
     }
 }

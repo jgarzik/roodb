@@ -25,20 +25,6 @@
 - **Details:** Existence check happens before Raft proposal. Two concurrent CREATEs can both pass check.
 - **Fix:** Move existence check into apply() where Raft serializes all proposals.
 
-## High
-
-### put_raw() bypass still exists
-- **Impact:** Data written outside Raft in some paths
-- **Location:** `insert.rs:107`, `update.rs`, `delete.rs`
-- **Details:** When `txn_context=None`, writes go directly to storage bypassing Raft.
-- **Fix:** Phase 5 of plan - remove put_raw() bypass, always require txn context.
-
-### Rollback doesn't go through Raft
-- **Impact:** Inconsistent state if leader crashes mid-rollback
-- **Location:** `manager.rs`
-- **Details:** Rollback writes directly to storage.
-- **Fix:** Phase 6 of plan - rollback through Raft.
-
 ## Medium
 
 ### Isolation level not clearly enforced
@@ -61,3 +47,15 @@
 ### Executor writes before Raft commit
 - **Status:** Fixed in Phase 1+4
 - **Details:** Executors now collect changes; apply() writes to storage.
+
+### Snapshot is metadata-only
+- **Status:** Fixed in Phase 3
+- **Details:** Snapshots now include full user data serialization.
+
+### put_raw() bypass
+- **Status:** Fixed in Phase 5
+- **Details:** DML executors now require transaction context; put_raw() fallback removed.
+
+### Rollback doesn't go through Raft
+- **Status:** Fixed in Phase 6
+- **Details:** With Raft-as-WAL, uncommitted changes never reach storage. Rollback just discards buffered changes.

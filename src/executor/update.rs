@@ -102,18 +102,18 @@ impl Executor for Update {
             // Collect the change for Raft replication.
             // Data is written to storage in apply() after Raft commit.
             let new_value = encode_row(&row);
-            if let Some(ref mut ctx) = self.txn_context {
-                ctx.add_change(RowChange::update(
-                    &self.table,
-                    key.clone(),
-                    new_value.clone(),
-                ));
-                // Buffer for read-your-writes within this transaction
-                ctx.buffer_write(key, new_value);
-            } else {
-                // Legacy path: direct write without Raft (only for bootstrap/init)
-                self.mvcc.put_raw(&key, &new_value).await?;
-            }
+            let ctx = self.txn_context.as_mut().ok_or_else(|| {
+                super::error::ExecutorError::Internal(
+                    "UPDATE requires transaction context".to_string(),
+                )
+            })?;
+            ctx.add_change(RowChange::update(
+                &self.table,
+                key.clone(),
+                new_value.clone(),
+            ));
+            // Buffer for read-your-writes within this transaction
+            ctx.buffer_write(key, new_value);
             self.rows_updated += 1;
         }
 
@@ -211,15 +211,34 @@ mod tests {
         }
     }
 
+    /// Encode data with MVCC header for test fixtures
+    fn encode_with_mvcc_header(txn_id: u64, data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(17 + data.len());
+        result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+        result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR
+        result.push(0); // deleted flag
+        result.extend_from_slice(data);
+        result
+    }
+
     #[tokio::test]
     async fn test_update() {
-        // Setup initial data
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        // Setup initial data with MVCC headers (txn_id=0 = committed)
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
 
         let initial = vec![
-            (encode_row_key("users", 1), encode_row(&row1)),
-            (encode_row_key("users", 2), encode_row(&row2)),
+            (
+                encode_row_key("users", 1),
+                encode_with_mvcc_header(0, &encode_row(&row1)),
+            ),
+            (
+                encode_row_key("users", 2),
+                encode_with_mvcc_header(0, &encode_row(&row2)),
+            ),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
@@ -254,19 +273,24 @@ mod tests {
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
 
-        // No txn_context = use raw storage (legacy mode)
-        let mut update = Update::new("users".to_string(), assignments, Some(filter), mvcc, None);
+        // Provide transaction context (required for Raft-as-WAL)
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut update = Update::new(
+            "users".to_string(),
+            assignments,
+            Some(filter),
+            mvcc,
+            Some(txn_context),
+        );
         update.open().await.unwrap();
 
         let result = update.next().await.unwrap().unwrap();
         assert_eq!(result.get(0).unwrap().as_int(), Some(1)); // 1 row updated
 
-        // Verify the update
-        let key = encode_row_key("users", 1);
-        let value = storage.get(&key).await.unwrap().unwrap();
-        let updated_row = decode_row(&value).unwrap();
-        assert_eq!(updated_row.get(1).unwrap().as_str(), Some("alice_updated"));
-
         update.close().await.unwrap();
+
+        // Verify changes were collected (data written via Raft apply, not directly)
+        let changes = update.take_changes();
+        assert_eq!(changes.len(), 1);
     }
 }
