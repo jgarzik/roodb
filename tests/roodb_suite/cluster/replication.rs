@@ -4,15 +4,36 @@
 //! SQL-level replication is tested via the full integration tests.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use roodb::io::default_io_factory;
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
+use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
 use crate::test_utils::certs::test_tls_config;
 
 /// Get a unique port for testing
 fn test_port(base: u16) -> u16 {
     base + (std::process::id() as u16 % 1000)
+}
+
+/// Create a temporary storage engine for testing
+async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "roodb_test_{}_{}_{:?}",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&path);
+    let factory = Arc::new(default_io_factory());
+    let config = LsmConfig { dir: path };
+    Arc::new(LsmEngine::open(factory, config).await.unwrap())
 }
 
 /// Helper to create a ChangeSet with a single insert
@@ -31,13 +52,17 @@ async fn test_leader_election_timing() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let storage1 = test_storage("election1").await;
+    let storage2 = test_storage("election2").await;
+    let storage3 = test_storage("election3").await;
+
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 
@@ -96,13 +121,17 @@ async fn test_replication_consistency() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let storage1 = test_storage("consistency1").await;
+    let storage2 = test_storage("consistency2").await;
+    let storage3 = test_storage("consistency3").await;
+
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 
@@ -162,13 +191,17 @@ async fn test_follower_read() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let storage1 = test_storage("follower1").await;
+    let storage2 = test_storage("follower2").await;
+    let storage3 = test_storage("follower3").await;
+
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 
@@ -227,13 +260,17 @@ async fn test_write_delete_sequence() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let storage1 = test_storage("delete1").await;
+    let storage2 = test_storage("delete2").await;
+    let storage3 = test_storage("delete3").await;
+
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 

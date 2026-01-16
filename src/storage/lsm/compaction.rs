@@ -71,7 +71,9 @@ pub async fn compact_l0<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         .collect();
 
     // Collect all files to merge
-    let mut all_files = l0_files.clone();
+    // L0 files are reversed so newest (highest numbered) come first
+    // This ensures newer versions win during merge deduplication
+    let mut all_files: Vec<_> = l0_files.iter().rev().cloned().collect();
     all_files.extend(l1_files.clone());
 
     // Merge into new L1 file(s)
@@ -155,6 +157,7 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     }
 
     // Load all entries from all files
+    // Files should be ordered newest-first so that idx=0 is newest
     let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
 
     for (idx, info) in files.iter().enumerate() {

@@ -3,14 +3,35 @@
 mod test_utils;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use roodb::io::default_io_factory;
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
+use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 use test_utils::certs::test_tls_config;
 
 /// Get a unique port for testing (based on process ID to avoid conflicts)
 fn test_port(base: u16) -> u16 {
     base + (std::process::id() as u16 % 1000)
+}
+
+/// Create a temporary storage engine for testing
+async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "roodb_test_{}_{}_{:?}",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&path);
+    let factory = Arc::new(default_io_factory());
+    let config = LsmConfig { dir: path };
+    Arc::new(LsmEngine::open(factory, config).await.unwrap())
 }
 
 /// Helper to create a ChangeSet with a single insert
@@ -24,8 +45,9 @@ fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
 async fn test_single_node_bootstrap() {
     let tls_config = test_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15000)).parse().unwrap();
+    let storage = test_storage("single_bootstrap").await;
 
-    let mut node = RaftNode::new(1, addr, tls_config, None).await.unwrap();
+    let mut node = RaftNode::new(1, addr, tls_config, storage).await.unwrap();
 
     // Start RPC server
     node.start_rpc_server().await.unwrap();
@@ -51,8 +73,9 @@ async fn test_single_node_bootstrap() {
 async fn test_single_node_multiple_writes() {
     let tls_config = test_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15100)).parse().unwrap();
+    let storage = test_storage("single_writes").await;
 
-    let mut node = RaftNode::new(1, addr, tls_config, None).await.unwrap();
+    let mut node = RaftNode::new(1, addr, tls_config, storage).await.unwrap();
     node.start_rpc_server().await.unwrap();
     node.bootstrap_single_node().await.unwrap();
 
@@ -83,14 +106,18 @@ async fn test_three_node_cluster_bootstrap() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
+    let storage1 = test_storage("cluster_boot1").await;
+    let storage2 = test_storage("cluster_boot2").await;
+    let storage3 = test_storage("cluster_boot3").await;
+
     // Create nodes
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 
@@ -141,13 +168,17 @@ async fn test_log_replication() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
     let addr3: SocketAddr = format!("127.0.0.1:{}", base_port + 2).parse().unwrap();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), None)
+    let storage1 = test_storage("replication1").await;
+    let storage2 = test_storage("replication2").await;
+    let storage3 = test_storage("replication3").await;
+
+    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), None)
+    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), None)
+    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3)
         .await
         .unwrap();
 

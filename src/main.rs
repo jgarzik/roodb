@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
 
     let mut raft_node =
-        RaftNode::new(1, raft_addr, tls_config.clone(), Some(storage.clone())).await?;
+        RaftNode::new(1, raft_addr, tls_config.clone(), storage.clone()).await?;
     raft_node.start_rpc_server().await?;
     raft_node.bootstrap_single_node().await?;
     let raft_node = Arc::new(raft_node);

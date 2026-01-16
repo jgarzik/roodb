@@ -15,8 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
+use crate::raft::lsm_storage::LsmRaftStorage;
 use crate::raft::network::{RaftNetworkFactoryImpl, RaftRpcHandler};
-use crate::raft::storage::MemStorage;
 use crate::raft::types::{Command, CommandResponse, Node, NodeId, Raft};
 use crate::raft::ChangeSet;
 use crate::storage::StorageEngine;
@@ -43,9 +43,7 @@ pub struct RaftNode {
     addr: SocketAddr,
     raft: Raft,
     #[allow(dead_code)]
-    log_storage: MemStorage,
-    #[allow(dead_code)]
-    sm_storage: MemStorage,
+    storage: LsmRaftStorage,
     network: RaftNetworkFactoryImpl,
     tls_config: TlsConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -54,13 +52,14 @@ pub struct RaftNode {
 impl RaftNode {
     /// Create a new Raft node with storage engine integration
     ///
-    /// The storage engine is used to apply committed changes. When a log entry
-    /// is committed, the row changes are written to the storage engine.
+    /// The storage engine is used for both Raft log persistence and applying
+    /// committed changes. All Raft state (log entries, vote, membership) is
+    /// persisted to LSM storage for crash recovery.
     pub async fn new(
         id: NodeId,
         addr: SocketAddr,
         tls_config: TlsConfig,
-        storage: Option<Arc<dyn StorageEngine>>,
+        storage: Arc<dyn StorageEngine>,
     ) -> Result<Self, RaftNodeError> {
         let config = Config {
             cluster_name: "roodb".to_string(),
@@ -71,20 +70,19 @@ impl RaftNode {
         };
         let config = Arc::new(config);
 
-        let log_storage = MemStorage::new();
-        let sm_storage = if let Some(storage) = storage {
-            MemStorage::with_storage(storage)
-        } else {
-            MemStorage::new()
-        };
+        // Create LSM-backed storage that persists all Raft state
+        let lsm_storage = LsmRaftStorage::new(storage)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
         let raft = Raft::new(
             id,
             config,
             network.clone(),
-            log_storage.clone(),
-            sm_storage.clone(),
+            lsm_storage.clone(),
+            lsm_storage.clone(),
         )
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
@@ -93,8 +91,7 @@ impl RaftNode {
             id,
             addr,
             raft,
-            log_storage,
-            sm_storage,
+            storage: lsm_storage,
             network,
             tls_config,
             shutdown_tx: None,
