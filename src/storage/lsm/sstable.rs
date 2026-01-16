@@ -117,7 +117,12 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         }
 
         // Record index entry before building
-        let first_key = self.block_builder.first_key().unwrap().to_vec();
+        // is_empty() check above guarantees first_key() returns Some
+        let first_key = self
+            .block_builder
+            .first_key()
+            .expect("block not empty: first_key must exist")
+            .to_vec();
         self.index_entries.push(IndexEntry {
             block_offset: self.offset,
             first_key,

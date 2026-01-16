@@ -175,7 +175,12 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             if data.len() < 9 {
                 return Err(ExecutorError::Encoding("int data too short".to_string()));
             }
-            let i = i64::from_le_bytes(data[1..9].try_into().unwrap());
+            // Length validated above; slice is exactly 8 bytes
+            let i = i64::from_le_bytes(
+                data[1..9]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
             Ok((Datum::Int(i), 9))
         }
 
@@ -183,7 +188,12 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             if data.len() < 9 {
                 return Err(ExecutorError::Encoding("float data too short".to_string()));
             }
-            let f = f64::from_le_bytes(data[1..9].try_into().unwrap());
+            // Length validated above; slice is exactly 8 bytes
+            let f = f64::from_le_bytes(
+                data[1..9]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
             Ok((Datum::Float(f), 9))
         }
 
@@ -193,7 +203,12 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     "string header too short".to_string(),
                 ));
             }
-            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            // Length validated above; slice is exactly 4 bytes
+            let len = u32::from_le_bytes(
+                data[1..5]
+                    .try_into()
+                    .expect("length checked: slice is 4 bytes"),
+            ) as usize;
             if data.len() < 5 + len {
                 return Err(ExecutorError::Encoding("string data too short".to_string()));
             }
@@ -208,7 +223,12 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     "bytes header too short".to_string(),
                 ));
             }
-            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            // Length validated above; slice is exactly 4 bytes
+            let len = u32::from_le_bytes(
+                data[1..5]
+                    .try_into()
+                    .expect("length checked: slice is 4 bytes"),
+            ) as usize;
             if data.len() < 5 + len {
                 return Err(ExecutorError::Encoding("bytes data too short".to_string()));
             }
@@ -221,7 +241,12 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     "timestamp data too short".to_string(),
                 ));
             }
-            let t = i64::from_le_bytes(data[1..9].try_into().unwrap());
+            // Length validated above; slice is exactly 8 bytes
+            let t = i64::from_le_bytes(
+                data[1..9]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
             Ok((Datum::Timestamp(t), 9))
         }
 

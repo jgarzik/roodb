@@ -23,6 +23,8 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error("TLS error: {0}")]
     Tls(String),
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 /// RooDB server with STARTTLS support
@@ -214,10 +216,17 @@ pub async fn start_test_server(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     // Create Raft node for single-node mode (use a different port for Raft RPC)
-    let raft_port = addr.port() + 1000;
+    let base_port = addr.port();
+    if base_port > 64535 {
+        return Err(ServerError::Config(format!(
+            "port {} too high for Raft offset (+1000 would exceed 65535)",
+            base_port
+        )));
+    }
+    let raft_port = base_port + 1000;
     let raft_addr: SocketAddr = format!("127.0.0.1:{}", raft_port)
         .parse()
-        .expect("valid raft address");
+        .expect("format produces valid address");
 
     let mut raft_node = RaftNode::new(
         1,

@@ -1,8 +1,8 @@
 //! Page-aligned buffers for direct IO
+//!
+//! Uses safe Rust by over-allocating a Vec and finding an aligned offset within it.
 
-use std::alloc::{self, Layout};
 use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
 
 use super::error::{IoError, IoResult};
 use super::traits::PAGE_SIZE;
@@ -10,16 +10,18 @@ use super::traits::PAGE_SIZE;
 /// A buffer aligned to PAGE_SIZE for direct IO operations
 ///
 /// Direct IO requires buffers to be aligned to the filesystem's block size,
-/// typically 4KB. This struct ensures proper alignment for all operations.
+/// typically 4KB. This struct ensures proper alignment by allocating a Vec
+/// with extra space and finding an aligned offset within it.
 pub struct AlignedBuffer {
-    ptr: NonNull<u8>,
+    /// Backing storage (over-allocated to guarantee alignment)
+    backing: Vec<u8>,
+    /// Offset to the first aligned byte within backing
+    offset: usize,
+    /// Current length of valid data
     len: usize,
+    /// Usable capacity (aligned region size)
     capacity: usize,
 }
-
-// Safety: AlignedBuffer owns its data and can be sent between threads
-unsafe impl Send for AlignedBuffer {}
-unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
     /// Create a new aligned buffer with the given capacity
@@ -34,23 +36,17 @@ impl AlignedBuffer {
             });
         }
 
-        let layout =
-            Layout::from_size_align(capacity, PAGE_SIZE).map_err(|_| IoError::Alignment {
-                expected: PAGE_SIZE,
-                actual: 0,
-            })?;
+        // Allocate extra space to guarantee we can find an aligned start
+        let backing = vec![0u8; capacity + PAGE_SIZE - 1];
 
-        // Safety: layout has non-zero size
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or_else(|| {
-            IoError::Io(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "Failed to allocate aligned buffer",
-            ))
-        })?;
+        // Find first aligned offset within the backing buffer
+        let base_addr = backing.as_ptr() as usize;
+        let aligned_addr = (base_addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let offset = aligned_addr - base_addr;
 
         Ok(Self {
-            ptr,
+            backing,
+            offset,
             len: 0,
             capacity,
         })
@@ -105,30 +101,28 @@ impl AlignedBuffer {
         self.len = len;
     }
 
-    /// Get a pointer to the buffer data
+    /// Get a pointer to the buffer data (aligned)
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
+        self.backing[self.offset..].as_ptr()
     }
 
-    /// Get a mutable pointer to the buffer data
+    /// Get a mutable pointer to the buffer data (aligned)
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+        self.backing[self.offset..].as_mut_ptr()
     }
 
     /// Get the buffer as a slice (up to len)
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // Safety: ptr is valid for len bytes
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        &self.backing[self.offset..self.offset + self.len]
     }
 
     /// Get the buffer as a mutable slice (up to capacity)
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // Safety: ptr is valid for capacity bytes
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity) }
+        &mut self.backing[self.offset..self.offset + self.capacity]
     }
 
     /// Clear the buffer (set len to 0)
@@ -138,10 +132,7 @@ impl AlignedBuffer {
 
     /// Fill the buffer with zeros
     pub fn zero(&mut self) {
-        // Safety: ptr is valid for capacity bytes
-        unsafe {
-            std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.capacity);
-        }
+        self.backing[self.offset..self.offset + self.capacity].fill(0);
         self.len = 0;
     }
 
@@ -154,23 +145,9 @@ impl AlignedBuffer {
             });
         }
 
-        // Safety: both pointers are valid and don't overlap
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr(), data.len());
-        }
+        self.backing[self.offset..self.offset + data.len()].copy_from_slice(data);
         self.len = data.len();
         Ok(())
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity, PAGE_SIZE)
-            .expect("layout was valid at allocation");
-        // Safety: ptr was allocated with this layout
-        unsafe {
-            alloc::dealloc(self.ptr.as_ptr(), layout);
-        }
     }
 }
 
@@ -185,7 +162,7 @@ impl Deref for AlignedBuffer {
 impl DerefMut for AlignedBuffer {
     fn deref_mut(&mut self) -> &mut [u8] {
         // Return slice up to len, not capacity
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        &mut self.backing[self.offset..self.offset + self.len]
     }
 }
 
