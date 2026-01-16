@@ -217,7 +217,7 @@ pub enum LogicalPlan {
 
 ### `protocol/`
 
-MySQL wire protocol implementation.
+MySQL-compatible wire protocol (branded as RooDB, version `8.0.0-RooDB`).
 
 **Connection Lifecycle**:
 1. TCP accept
@@ -246,8 +246,6 @@ MySQL wire protocol implementation.
 3. EOF packet (unless `CLIENT_DEPRECATE_EOF`)
 4. Text row packets
 5. Final EOF/OK packet
-
-**Server Version**: `8.0.0-RooDB`
 
 ### `raft/`
 
