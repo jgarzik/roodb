@@ -95,13 +95,15 @@ impl Executor for Delete {
             keys_to_delete.push(key);
         }
 
-        // Delete the rows using MVCC delete if we have a transaction context
+        // Collect the changes for Raft replication.
+        // Data is written to storage in apply() after Raft commit.
         for key in keys_to_delete {
             if let Some(ref mut ctx) = self.txn_context {
-                self.mvcc.delete(&key, ctx.txn_id).await?;
-                // Collect the change for Raft replication
-                ctx.add_change(RowChange::delete(&self.table, key));
+                ctx.add_change(RowChange::delete(&self.table, key.clone()));
+                // Buffer for read-your-writes within this transaction
+                ctx.buffer_delete(key);
             } else {
+                // Legacy path: direct delete without Raft (only for bootstrap/init)
                 self.mvcc.inner().delete(&key).await?;
             }
             self.rows_deleted += 1;

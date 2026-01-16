@@ -99,13 +99,19 @@ impl Executor for Update {
                 row.set(col.index, new_value)?;
             }
 
-            // Write back using MVCC put if we have a transaction context
+            // Collect the change for Raft replication.
+            // Data is written to storage in apply() after Raft commit.
             let new_value = encode_row(&row);
             if let Some(ref mut ctx) = self.txn_context {
-                self.mvcc.put(&key, &new_value, ctx.txn_id).await?;
-                // Collect the change for Raft replication
-                ctx.add_change(RowChange::update(&self.table, key, new_value));
+                ctx.add_change(RowChange::update(
+                    &self.table,
+                    key.clone(),
+                    new_value.clone(),
+                ));
+                // Buffer for read-your-writes within this transaction
+                ctx.buffer_write(key, new_value);
             } else {
+                // Legacy path: direct write without Raft (only for bootstrap/init)
                 self.mvcc.put_raw(&key, &new_value).await?;
             }
             self.rows_updated += 1;

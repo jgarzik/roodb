@@ -1,5 +1,6 @@
 //! Session state for RooDB connections
 
+use crate::raft::RowChange;
 use crate::txn::{IsolationLevel, TimeoutConfig};
 
 /// Per-connection session state
@@ -23,6 +24,8 @@ pub struct Session {
     pub is_read_only: bool,
     /// Per-session timeout configuration
     pub timeout_config: TimeoutConfig,
+    /// Accumulated changes for explicit transaction (proposed on COMMIT)
+    pending_changes: Vec<RowChange>,
 }
 
 impl Session {
@@ -38,6 +41,7 @@ impl Session {
             isolation_level: IsolationLevel::default(),
             is_read_only: false,
             timeout_config: TimeoutConfig::default(),
+            pending_changes: Vec::new(),
         }
     }
 
@@ -98,5 +102,30 @@ impl Session {
         }
 
         flags
+    }
+
+    /// Add changes to the pending transaction (for explicit transactions)
+    pub fn add_pending_changes(&mut self, changes: Vec<RowChange>) {
+        self.pending_changes.extend(changes);
+    }
+
+    /// Take all pending changes (called on COMMIT)
+    pub fn take_pending_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.pending_changes)
+    }
+
+    /// Check if there are pending changes
+    pub fn has_pending_changes(&self) -> bool {
+        !self.pending_changes.is_empty()
+    }
+
+    /// Get a reference to pending changes (for read-your-writes)
+    pub fn get_pending_changes(&self) -> &[RowChange] {
+        &self.pending_changes
+    }
+
+    /// Clear pending changes without returning them (called on ROLLBACK)
+    pub fn clear_pending_changes(&mut self) {
+        self.pending_changes.clear();
     }
 }

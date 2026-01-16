@@ -13,11 +13,27 @@ use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapsho
 use openraft::{ErrorSubject, ErrorVerb};
 use parking_lot::RwLock;
 
+use crate::raft::changes::ChangeOp;
 use crate::raft::types::{
     Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
     StoredMembership, TypeConfig, Vote,
 };
 use crate::storage::StorageEngine;
+
+/// MVCC row header size: DB_TRX_ID (8 bytes) + DB_ROLL_PTR (8 bytes) + deleted flag (1 byte)
+const MVCC_HEADER_SIZE: usize = 17;
+
+/// Encode row data with MVCC header for storage
+///
+/// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data]
+fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
+    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR = 0 (no version chain)
+    result.push(if deleted { 1 } else { 0 }); // deleted flag
+    result.extend_from_slice(data);
+    result
+}
 
 // Key prefixes for Raft state in LSM
 const VOTE_KEY: &[u8] = b"_raft:vote";
@@ -372,22 +388,38 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 EntryPayload::Normal(cmd) => {
                     let resp = match cmd {
                         Command::DataChange(changeset) => {
-                            // NOTE: User data is already written by MvccStorage.put() during
-                            // transaction execution. The Raft log stores the changes for
-                            // replication and recovery, but we don't apply them again here
-                            // because:
-                            // 1. MvccStorage already wrote with proper MVCC headers (roll_ptr)
-                            // 2. Writing again would race with flush() and cause data loss
-                            // 3. For crash recovery, we would replay from SSTable + uncommitted
-                            //    changes, not re-apply from Raft log
-                            //
-                            // In a multi-node cluster, followers would need to apply these
-                            // changes since they didn't execute the transaction locally.
-                            // TODO: Add cluster role check here when cluster mode is implemented.
+                            // Apply each row change to storage with MVCC headers.
+                            // This is the unified write path for both leader and follower:
+                            // - Leader: collected changes during execution, now persisting after Raft commit
+                            // - Follower: received changes via AppendEntries, now persisting locally
+                            for change in &changeset.changes {
+                                match change.op {
+                                    ChangeOp::Insert | ChangeOp::Update => {
+                                        // Encode with MVCC header and write
+                                        if let Some(ref value) = change.value {
+                                            let encoded =
+                                                encode_mvcc_row(changeset.txn_id, false, value);
+                                            self.storage
+                                                .put(&change.key, &encoded)
+                                                .await
+                                                .map_err(write_err)?;
+                                        }
+                                    }
+                                    ChangeOp::Delete => {
+                                        // Write tombstone (deleted=true, empty data)
+                                        let encoded = encode_mvcc_row(changeset.txn_id, true, &[]);
+                                        self.storage
+                                            .put(&change.key, &encoded)
+                                            .await
+                                            .map_err(write_err)?;
+                                    }
+                                }
+                            }
                             tracing::debug!(
                                 txn_id = changeset.txn_id,
                                 changes = changeset.changes.len(),
-                                "RAFT APPLY: changeset (skipping user data write - already written by MvccStorage)"
+                                "RAFT APPLY: wrote {} changes to storage",
+                                changeset.changes.len()
                             );
                             CommandResponse::Ok(None)
                         }

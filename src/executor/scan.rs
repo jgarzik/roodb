@@ -71,9 +71,26 @@ impl Executor for TableScan {
             self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
         };
 
-        // Decode rows and apply filter if present
+        // Collect keys that are buffered (for read-your-writes merge)
+        let buffered_entries = if let Some(ref ctx) = self.txn_context {
+            ctx.get_buffered_for_prefix(&prefix)
+        } else {
+            Vec::new()
+        };
+
+        // Build a set of buffered keys for quick lookup
+        use std::collections::HashSet;
+        let buffered_keys: HashSet<&[u8]> =
+            buffered_entries.iter().map(|(k, _)| k.as_slice()).collect();
+
+        // Decode rows from storage, excluding keys that are buffered (will be replaced)
         self.rows.clear();
-        for (_key, value) in kv_pairs {
+        for (key, value) in kv_pairs {
+            // Skip if this key is overwritten in the buffer
+            if buffered_keys.contains(key.as_slice()) {
+                continue;
+            }
+
             let row = decode_row(&value)?;
 
             // Apply pushed-down filter
@@ -85,6 +102,24 @@ impl Executor for TableScan {
             }
 
             self.rows.push(row);
+        }
+
+        // Add buffered writes (uncommitted inserts/updates, skip deletes)
+        for (_key, value_opt) in buffered_entries {
+            if let Some(value) = value_opt {
+                let row = decode_row(value)?;
+
+                // Apply pushed-down filter
+                if let Some(filter) = &self.filter {
+                    let result = eval(filter, &row)?;
+                    if !result.as_bool().unwrap_or(false) {
+                        continue;
+                    }
+                }
+
+                self.rows.push(row);
+            }
+            // If value_opt is None, it's a delete - don't add to results
         }
 
         self.position = 0;

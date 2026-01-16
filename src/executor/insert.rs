@@ -95,12 +95,15 @@ impl Executor for Insert {
             let key = encode_row_key(&self.table, row_id);
             let value = encode_row(&row);
 
-            // Use MVCC put if we have a transaction context, otherwise raw put
+            // Collect the change for Raft replication.
+            // Data is written to storage in apply() after Raft commit.
+            // This ensures Raft-as-WAL: no writes until consensus.
             if let Some(ref mut ctx) = self.txn_context {
-                self.mvcc.put(&key, &value, ctx.txn_id).await?;
-                // Collect the change for Raft replication
-                ctx.add_change(RowChange::insert(&self.table, key, value));
+                ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+                // Buffer for read-your-writes within this transaction
+                ctx.buffer_write(key, value);
             } else {
+                // Legacy path: direct write without Raft (only for bootstrap/init)
                 self.mvcc.put_raw(&key, &value).await?;
             }
             self.rows_inserted += 1;

@@ -576,9 +576,15 @@ where
             // DDL operations don't use MVCC
             (None, None)
         } else if let Some(txn_id) = self.session.current_txn {
-            // Explicit transaction - use existing txn_id
+            // Explicit transaction - use existing txn_id with pending changes for read-your-writes
             let read_view = self.txn_manager.create_read_view(txn_id)?;
-            (Some(TransactionContext::new(txn_id, read_view)), None)
+            let pending = self.session.get_pending_changes();
+            (
+                Some(TransactionContext::with_pending_changes(
+                    txn_id, read_view, pending,
+                )),
+                None,
+            )
         } else if !returns_rows && self.session.autocommit {
             // Autocommit DML - create implicit transaction
             let txn = self
@@ -617,14 +623,21 @@ where
             }
             executor.close().await?;
 
-            // Collect and propose changes to Raft for replication
+            // Collect changes for Raft replication
             let changes = executor.take_changes();
             if !changes.is_empty() {
-                let changeset = ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
-                self.raft_node
-                    .propose_changes(changeset)
-                    .await
-                    .map_err(|e| ProtocolError::Raft(e.to_string()))?;
+                if self.session.in_transaction() {
+                    // Explicit transaction: accumulate changes, propose on COMMIT
+                    self.session.add_pending_changes(changes);
+                } else {
+                    // Autocommit: propose immediately
+                    let changeset =
+                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    self.raft_node
+                        .propose_changes(changeset)
+                        .await
+                        .map_err(|e| ProtocolError::Raft(e.to_string()))?;
+                }
             }
 
             // Commit implicit transaction if we created one
@@ -789,6 +802,25 @@ where
     /// Handle COMMIT
     async fn handle_commit(&mut self) -> ProtocolResult<()> {
         if let Some(txn_id) = self.session.current_txn {
+            // First, propose any pending changes to Raft
+            let changes = self.session.take_pending_changes();
+            if !changes.is_empty() {
+                let changeset = ChangeSet::new_with_changes(txn_id, changes);
+                if let Err(e) = self.raft_node.propose_changes(changeset).await {
+                    // Raft proposal failed - rollback the transaction
+                    self.session.end_transaction();
+                    let _ = self.txn_manager.rollback(txn_id).await;
+                    return self
+                        .send_error(
+                            codes::ER_UNKNOWN_ERROR,
+                            states::GENERAL_ERROR,
+                            &format!("Raft commit failed: {}", e),
+                        )
+                        .await;
+                }
+            }
+
+            // Now commit the transaction in the transaction manager
             match self.txn_manager.commit(txn_id).await {
                 Ok(()) => {
                     self.session.end_transaction();
@@ -816,6 +848,9 @@ where
 
     /// Handle ROLLBACK
     async fn handle_rollback(&mut self) -> ProtocolResult<()> {
+        // Clear any pending changes (not proposed to Raft)
+        self.session.clear_pending_changes();
+
         if let Some(txn_id) = self.session.current_txn {
             match self.txn_manager.rollback(txn_id).await {
                 Ok(()) => {
