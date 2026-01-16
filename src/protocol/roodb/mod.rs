@@ -516,10 +516,7 @@ where
             // Collect and propose changes to Raft for replication
             let changes = executor.take_changes();
             if !changes.is_empty() {
-                let changeset = ChangeSet::new_with_changes(
-                    implicit_txn_id.unwrap_or(0),
-                    changes,
-                );
+                let changeset = ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
                 self.raft_node
                     .propose_changes(changeset)
                     .await
