@@ -41,6 +41,18 @@ fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Extract txn_id (version) from a stored row with MVCC header
+///
+/// Returns None if the row doesn't exist or is too short to have a header.
+fn extract_row_version(encoded: &[u8]) -> Option<u64> {
+    if encoded.len() < MVCC_HEADER_SIZE {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        encoded[0..8].try_into().expect("slice is exactly 8 bytes"),
+    ))
+}
+
 // Key prefixes for Raft state in LSM
 const VOTE_KEY: &[u8] = b"_raft:vote";
 const PURGED_KEY: &[u8] = b"_raft:log_state:purged";
@@ -711,11 +723,98 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             // This is the unified write path for both leader and follower:
                             // - Leader: collected changes during execution, now persisting after Raft commit
                             // - Follower: received changes via AppendEntries, now persisting locally
+                            let mut conflict_error: Option<String> = None;
+
                             for change in &changeset.changes {
+                                // OCC version check for UPDATE/DELETE operations
+                                // If expected_version is set, verify the row hasn't been modified
+                                if let Some(expected_version) = change.expected_version {
+                                    if let Ok(Some(current_data)) =
+                                        self.storage.get(&change.key).await
+                                    {
+                                        let current_version =
+                                            extract_row_version(&current_data).unwrap_or(0);
+                                        if current_version != expected_version {
+                                            // Conflict detected - row was modified by another transaction
+                                            tracing::warn!(
+                                                table = %change.table,
+                                                expected = expected_version,
+                                                actual = current_version,
+                                                "OCC conflict: row was modified by another transaction"
+                                            );
+                                            conflict_error = Some(format!(
+                                                "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
+                                                change.table, expected_version, current_version
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                    // If row doesn't exist anymore, that's also a conflict for UPDATE
+                                    else if change.op == ChangeOp::Update {
+                                        tracing::warn!(
+                                            table = %change.table,
+                                            "OCC conflict: row no longer exists"
+                                        );
+                                        conflict_error = Some(format!(
+                                            "Write conflict: row in '{}' no longer exists",
+                                            change.table
+                                        ));
+                                        break;
+                                    }
+                                    // For DELETE, if row doesn't exist, that's ok (idempotent)
+                                }
+
                                 match change.op {
                                     ChangeOp::Insert | ChangeOp::Update => {
                                         // Encode with MVCC header and write
                                         if let Some(ref value) = change.value {
+                                            // Check for duplicate table creation (race condition fix)
+                                            // This makes apply() idempotent for CREATE TABLE
+                                            if change.table == SYSTEM_TABLES
+                                                && change.op == ChangeOp::Insert
+                                            {
+                                                if let Ok(row) = decode_row(value) {
+                                                    if let Some(crate::executor::Datum::String(
+                                                        table_name,
+                                                    )) = row.values().first()
+                                                    {
+                                                        let catalog = self.catalog.read();
+                                                        if catalog.get_table(table_name).is_some() {
+                                                            // Table already exists - skip this insert
+                                                            // This handles the race condition where two
+                                                            // CREATE TABLE proposals both passed local
+                                                            // checks but Raft serializes them here
+                                                            tracing::debug!(
+                                                                table = %table_name,
+                                                                "Skipping duplicate CREATE TABLE in apply()"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // Check for duplicate index creation
+                                            if change.table == SYSTEM_INDEXES
+                                                && change.op == ChangeOp::Insert
+                                            {
+                                                if let Ok(row) = decode_row(value) {
+                                                    if let Some(crate::executor::Datum::String(
+                                                        index_name,
+                                                    )) = row.values().first()
+                                                    {
+                                                        let catalog = self.catalog.read();
+                                                        if catalog.get_index(index_name).is_some() {
+                                                            tracing::debug!(
+                                                                index = %index_name,
+                                                                "Skipping duplicate CREATE INDEX in apply()"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             let encoded =
                                                 encode_mvcc_row(changeset.txn_id, false, value);
                                             self.storage
@@ -759,13 +858,23 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                     }
                                 }
                             }
-                            tracing::debug!(
-                                txn_id = changeset.txn_id,
-                                changes = changeset.changes.len(),
-                                "RAFT APPLY: wrote {} changes to storage",
-                                changeset.changes.len()
-                            );
-                            CommandResponse::Ok(None)
+
+                            // Return conflict error or success
+                            if let Some(err_msg) = conflict_error {
+                                tracing::debug!(
+                                    txn_id = changeset.txn_id,
+                                    "RAFT APPLY: OCC conflict detected"
+                                );
+                                CommandResponse::Error(err_msg)
+                            } else {
+                                tracing::debug!(
+                                    txn_id = changeset.txn_id,
+                                    changes = changeset.changes.len(),
+                                    "RAFT APPLY: wrote {} changes to storage",
+                                    changeset.changes.len()
+                                );
+                                CommandResponse::Ok(None)
+                            }
                         }
                         Command::Noop => CommandResponse::Ok(None),
                     };

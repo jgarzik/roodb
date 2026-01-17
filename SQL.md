@@ -106,6 +106,31 @@ DELETE FROM table [WHERE condition]
 
 **Isolation levels:** `READ UNCOMMITTED`, `READ COMMITTED`, `REPEATABLE READ`, `SERIALIZABLE`
 
+### Isolation Level Details
+
+RooDB uses **InnoDB-style snapshot isolation** via MVCC. Default: `REPEATABLE READ`.
+
+| Level | Support | Behavior |
+|-------|---------|----------|
+| `READ UNCOMMITTED` | Partial | Falls back to READ COMMITTED |
+| `READ COMMITTED` | Yes | Each statement sees latest committed data |
+| `REPEATABLE READ` | Yes | Snapshot at first read, consistent for transaction |
+| `SERIALIZABLE` | Partial | Falls back to REPEATABLE READ (no gap locks) |
+
+**Anomaly prevention at REPEATABLE READ:**
+
+| Anomaly | Prevented? | Mechanism |
+|---------|------------|-----------|
+| Dirty reads | Yes | MVCC visibility |
+| Non-repeatable reads | Yes | Snapshot isolation |
+| Lost updates | Yes | OCC version check |
+| Phantom reads | Mostly | OCC (not gap locks) |
+
+**Write conflicts:** Concurrent UPDATE/DELETE on same row detected at commit (Raft apply). Client receives error:
+```
+Write conflict: row in 'table' was modified by another transaction
+```
+
 ## User Management
 
 ### CREATE USER

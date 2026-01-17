@@ -69,19 +69,27 @@ impl Executor for Delete {
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
 
-        // Use MVCC scan with visibility filtering if we have a transaction context
+        // Use MVCC scan with version tracking for OCC conflict detection
+        // Returns (key, value, txn_id) tuples where txn_id is the row's version
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
             self.mvcc
-                .scan(Some(&prefix), Some(&end), &ctx.read_view)
+                .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
                 .await?
         } else {
-            self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
+            // Without transaction context, use regular scan (no OCC)
+            self.mvcc
+                .inner()
+                .scan(Some(&prefix), Some(&end))
+                .await?
+                .into_iter()
+                .map(|(k, v)| (k, v, 0u64))
+                .collect()
         };
 
-        // Collect keys to delete (can't delete while iterating)
+        // Collect keys to delete with their versions (can't delete while iterating)
         let mut keys_to_delete = Vec::new();
 
-        for (key, value) in kv_pairs {
+        for (key, value, row_version) in kv_pairs {
             let row = decode_row(&value)?;
 
             // Apply filter
@@ -92,16 +100,20 @@ impl Executor for Delete {
                 }
             }
 
-            keys_to_delete.push(key);
+            keys_to_delete.push((key, row_version));
         }
 
-        // Collect the changes for Raft replication.
-        // Data is written to storage in apply() after Raft commit.
+        // Collect the changes for Raft replication with OCC version check.
+        // apply() will verify the row hasn't been modified since we read it.
         let ctx = self.txn_context.as_mut().ok_or_else(|| {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
         })?;
-        for key in keys_to_delete {
-            ctx.add_change(RowChange::delete(&self.table, key.clone()));
+        for (key, row_version) in keys_to_delete {
+            ctx.add_change(RowChange::delete_with_version(
+                &self.table,
+                key.clone(),
+                row_version,
+            ));
             // Buffer for read-your-writes within this transaction
             ctx.buffer_delete(key);
             self.rows_deleted += 1;

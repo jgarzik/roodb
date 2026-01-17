@@ -11,7 +11,7 @@ use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
-use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
+use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::TlsConfig;
 use tracing_subscriber::EnvFilter;
 
@@ -61,14 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_port = port + 1000;
     let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
 
+    let node_id = 1;
     let mut raft_node = RaftNode::new(
-        1,
+        node_id,
         raft_addr,
         tls_config.clone(),
         storage.clone(),
         catalog.clone(),
     )
     .await?;
+
+    // Set node ID for globally unique row ID generation
+    set_node_id(node_id);
+
     raft_node.start_rpc_server().await?;
     raft_node.bootstrap_single_node().await?;
     let raft_node = Arc::new(raft_node);

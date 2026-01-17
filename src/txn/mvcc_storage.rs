@@ -272,6 +272,91 @@ impl MvccStorage {
         Ok(visible_rows)
     }
 
+    /// Scan a range with version tracking for OCC conflict detection
+    ///
+    /// Returns (key, value, txn_id) tuples where txn_id is the version of the row
+    /// that was read. This is used for optimistic concurrency control - the executor
+    /// records this version and apply() verifies it hasn't changed.
+    pub async fn scan_with_versions(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        read_view: &ReadView,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>, u64)>> {
+        let all_rows = self.inner.scan(start, end).await?;
+
+        let mut visible_rows = Vec::new();
+        for (key, value) in all_rows {
+            if let Some((data, txn_id)) = self
+                .find_visible_version_with_txn_id(&value, read_view)
+                .await?
+            {
+                visible_rows.push((key, data, txn_id));
+            }
+        }
+
+        Ok(visible_rows)
+    }
+
+    /// Find visible version and return both data and txn_id for OCC
+    async fn find_visible_version_with_txn_id(
+        &self,
+        encoded: &[u8],
+        read_view: &ReadView,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let (txn_id, roll_ptr, deleted, data) = match Self::decode_row(encoded) {
+            Some(decoded) => decoded,
+            None => {
+                // Legacy row without MVCC header - treat as always visible with txn_id 0
+                return Ok(Some((encoded.to_vec(), 0)));
+            }
+        };
+
+        // Check if this version is visible
+        if read_view.is_visible(txn_id) {
+            // If visible and deleted, the row doesn't exist for this transaction's view
+            if deleted {
+                return Ok(None);
+            }
+            return Ok(Some((data.to_vec(), txn_id)));
+        }
+
+        // This version is not visible, traverse the version chain
+        self.find_older_visible_version_with_txn_id(roll_ptr, read_view)
+            .await
+    }
+
+    /// Traverse undo log to find visible version, returning both data and txn_id
+    async fn find_older_visible_version_with_txn_id(
+        &self,
+        roll_ptr: u64,
+        read_view: &ReadView,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        if roll_ptr == 0 {
+            return Ok(None);
+        }
+
+        let undo_record = match self.txn_manager.undo_log().get_by_roll_ptr(roll_ptr) {
+            Some(record) => record,
+            None => return Ok(None),
+        };
+
+        if read_view.is_visible(undo_record.old_trx_id) {
+            match undo_record.undo_type {
+                UndoType::Insert => Ok(None),
+                UndoType::Update | UndoType::Delete => Ok(undo_record
+                    .old_data
+                    .clone()
+                    .map(|d| (d, undo_record.old_trx_id))),
+            }
+        } else {
+            Box::pin(
+                self.find_older_visible_version_with_txn_id(undo_record.old_roll_ptr, read_view),
+            )
+            .await
+        }
+    }
+
     /// Put a row without MVCC tracking (for bootstrap/system tables)
     pub async fn put_raw(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.inner.put(key, value).await

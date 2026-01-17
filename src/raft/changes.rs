@@ -27,6 +27,13 @@ pub struct RowChange {
     pub value: Option<Vec<u8>>,
     /// Type of change
     pub op: ChangeOp,
+    /// Expected version (txn_id) for OCC conflict detection
+    ///
+    /// For UPDATE/DELETE: The txn_id of the row version we read.
+    /// In apply(), if the current row has a different txn_id, the write is rejected
+    /// as a concurrent modification conflict.
+    #[serde(default)]
+    pub expected_version: Option<u64>,
 }
 
 impl RowChange {
@@ -37,6 +44,7 @@ impl RowChange {
             key,
             value: Some(value),
             op: ChangeOp::Insert,
+            expected_version: None,
         }
     }
 
@@ -47,6 +55,26 @@ impl RowChange {
             key,
             value: Some(value),
             op: ChangeOp::Update,
+            expected_version: None,
+        }
+    }
+
+    /// Create an UPDATE change with OCC version check
+    ///
+    /// The expected_version is the txn_id of the row version we read.
+    /// apply() will reject the update if the row has been modified since.
+    pub fn update_with_version(
+        table: impl Into<String>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expected_version: u64,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            key,
+            value: Some(value),
+            op: ChangeOp::Update,
+            expected_version: Some(expected_version),
         }
     }
 
@@ -57,6 +85,22 @@ impl RowChange {
             key,
             value: None,
             op: ChangeOp::Delete,
+            expected_version: None,
+        }
+    }
+
+    /// Create a DELETE change with OCC version check
+    pub fn delete_with_version(
+        table: impl Into<String>,
+        key: Vec<u8>,
+        expected_version: u64,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            key,
+            value: None,
+            op: ChangeOp::Delete,
+            expected_version: Some(expected_version),
         }
     }
 
@@ -70,6 +114,7 @@ impl RowChange {
             key,
             value: Some(value),
             op: ChangeOp::Delete,
+            expected_version: None,
         }
     }
 

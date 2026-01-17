@@ -1,4 +1,48 @@
 //! Transaction struct and related types
+//!
+//! # Isolation Levels
+//!
+//! RooDB implements **InnoDB-style snapshot isolation** using MVCC (Multi-Version
+//! Concurrency Control). The default isolation level is `REPEATABLE READ`.
+//!
+//! ## Current Implementation
+//!
+//! | Level | Implemented | Behavior |
+//! |-------|-------------|----------|
+//! | `READ UNCOMMITTED` | Partial | Falls back to READ COMMITTED behavior |
+//! | `READ COMMITTED` | Yes | Each statement sees committed data as of statement start |
+//! | `REPEATABLE READ` | Yes | Transaction sees consistent snapshot from first read |
+//! | `SERIALIZABLE` | No | Falls back to REPEATABLE READ (no range locks yet) |
+//!
+//! ## Anomaly Prevention
+//!
+//! | Anomaly | Prevented at REPEATABLE READ? |
+//! |---------|-------------------------------|
+//! | Dirty reads | Yes |
+//! | Non-repeatable reads | Yes |
+//! | Phantom reads | Mostly (via OCC, not gap locks) |
+//! | Lost updates | Yes (via OCC version checking) |
+//!
+//! ## How It Works
+//!
+//! 1. **MVCC**: Each row stores a transaction ID (`txn_id`) indicating which transaction
+//!    last modified it. Old versions are preserved via undo log for visibility.
+//!
+//! 2. **Read View**: At transaction start (for REPEATABLE READ), a read view captures
+//!    the set of active transactions. Rows modified by active or future transactions
+//!    are invisible; only committed data from before the snapshot is visible.
+//!
+//! 3. **OCC (Optimistic Concurrency Control)**: UPDATE/DELETE operations record the
+//!    row version they read. At commit time (Raft apply), if the row version changed,
+//!    the operation fails with a write conflict error.
+//!
+//! ## Limitations
+//!
+//! - **No true SERIALIZABLE**: Gap locks and predicate locks are not implemented.
+//!   SERIALIZABLE falls back to REPEATABLE READ.
+//! - **No READ UNCOMMITTED**: Dirty reads aren't supported; falls back to READ COMMITTED.
+//! - **Conflict errors are late**: Write conflicts are detected at Raft apply time,
+//!   not at execution time. The client receives an error after commit attempt.
 
 use std::time::Instant;
 

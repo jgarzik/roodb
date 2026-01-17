@@ -13,7 +13,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::catalog::Catalog;
 use crate::raft::RaftNode;
 use crate::server::handler::handle_connection;
-use crate::storage::StorageEngine;
+use crate::storage::{set_node_id, StorageEngine};
 use crate::tls::TlsConfig;
 use crate::txn::TransactionManager;
 
@@ -228,8 +228,9 @@ pub async fn start_test_server(
         .parse()
         .expect("format produces valid address");
 
+    let node_id = 1;
     let mut raft_node = RaftNode::new(
-        1,
+        node_id,
         raft_addr,
         tls_config.clone(),
         storage.clone(),
@@ -237,6 +238,9 @@ pub async fn start_test_server(
     )
     .await
     .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    // Set node ID for globally unique row ID generation
+    set_node_id(node_id);
 
     raft_node
         .start_rpc_server()
