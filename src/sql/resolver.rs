@@ -1268,6 +1268,10 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
 /// Hex decoding helper
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
     let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    // Validate hex string has even length
+    if !s.len().is_multiple_of(2) {
+        return Err(()); // Odd-length hex string is invalid
+    }
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))

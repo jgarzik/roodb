@@ -215,18 +215,9 @@ pub async fn start_test_server(
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    // Create Raft node for single-node mode (use a different port for Raft RPC)
-    let base_port = addr.port();
-    if base_port > 64535 {
-        return Err(ServerError::Config(format!(
-            "port {} too high for Raft offset (+1000 would exceed 65535)",
-            base_port
-        )));
-    }
-    let raft_port = base_port + 1000;
-    let raft_addr: SocketAddr = format!("127.0.0.1:{}", raft_port)
-        .parse()
-        .expect("format produces valid address");
+    // Create Raft node for single-node mode (use port 0 to let OS pick available port)
+    // This avoids port conflicts when running tests in parallel
+    let raft_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
 
     let node_id = 1;
     let mut raft_node = RaftNode::new(

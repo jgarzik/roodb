@@ -14,6 +14,10 @@ use super::error::{ProtocolError, ProtocolResult};
 /// Maximum payload size for a single packet (2^24 - 1)
 pub const MAX_PACKET_SIZE: usize = 16_777_215;
 
+/// Maximum total payload size for multi-packet messages (256 MB)
+/// This prevents memory exhaustion attacks via very large multi-packet payloads.
+pub const MAX_TOTAL_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
+
 /// Reads protocol packets from an async stream
 pub struct PacketReader<R> {
     reader: R,
@@ -73,6 +77,13 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
 
             // Read payload
             if length > 0 {
+                let new_size = payload.len().saturating_add(length);
+                if new_size > MAX_TOTAL_PAYLOAD_SIZE {
+                    return Err(ProtocolError::InvalidPacket(format!(
+                        "Payload exceeds maximum size of {} bytes",
+                        MAX_TOTAL_PAYLOAD_SIZE
+                    )));
+                }
                 let start = payload.len();
                 payload.resize(start + length, 0);
                 self.reader.read_exact(&mut payload[start..]).await?;

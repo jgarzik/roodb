@@ -32,7 +32,9 @@ use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
 use crate::raft::{ChangeSet, RaftNode};
 use crate::server::session::Session;
-use crate::sql::privileges::HostPattern;
+use crate::sql::privileges::{
+    check_privilege, GrantEntry, HostPattern, Privilege, PrivilegeObject, RequiredPrivilege,
+};
 use crate::sql::{Parser, Resolver, TypeChecker};
 use crate::storage::StorageEngine;
 use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
@@ -517,12 +519,16 @@ where
 
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
-        let plan_result: Result<PhysicalPlan, PlanError> = (|| {
+        // Returns both the physical plan and required privileges for authorization
+        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>), PlanError> = (|| {
             let catalog_guard = self.catalog.read();
 
             let resolved = Resolver::new(&catalog_guard)
                 .resolve(stmt)
                 .map_err(PlanError::Sql)?;
+
+            // Extract required privileges from resolved statement before consuming it
+            let required_privileges = self.extract_required_privileges(&resolved);
 
             // Type check
             TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
@@ -534,18 +540,216 @@ where
             let optimized = Optimizer::new().optimize(logical);
 
             // Build physical plan
-            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)
+            let physical =
+                PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
+
+            Ok((physical, required_privileges))
         })(); // catalog_guard dropped here
 
         // Handle errors after guard is dropped
-        let physical = match plan_result {
-            Ok(p) => p,
+        let (physical, required_privileges) = match plan_result {
+            Ok((p, privs)) => (p, privs),
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
 
+        // Check authorization (async - needs to scan system.grants)
+        if !required_privileges.is_empty() {
+            if let Err(e) = self.check_authorization(&required_privileges).await {
+                return self
+                    .send_error(codes::ER_ACCESS_DENIED, states::GENERAL_ERROR, &e)
+                    .await;
+            }
+        }
+
         // Execute
         self.execute_plan(physical).await
+    }
+
+    /// Extract required privileges from a resolved statement
+    fn extract_required_privileges(
+        &self,
+        stmt: &crate::planner::logical::ResolvedStatement,
+    ) -> Vec<RequiredPrivilege> {
+        use crate::planner::logical::ResolvedStatement;
+
+        // Use "default" database for privilege checks - tables don't have explicit db prefix
+        let db = self.database.as_deref().unwrap_or("default");
+
+        match stmt {
+            ResolvedStatement::Select(select) => {
+                // SELECT requires SELECT privilege on all tables in FROM clause
+                select
+                    .from
+                    .iter()
+                    .map(|table_ref| RequiredPrivilege::select(db, &table_ref.name))
+                    .collect()
+            }
+            ResolvedStatement::Insert { table, .. } => {
+                vec![RequiredPrivilege::insert(db, table)]
+            }
+            ResolvedStatement::Update { table, .. } => {
+                vec![RequiredPrivilege::update(db, table)]
+            }
+            ResolvedStatement::Delete { table, .. } => {
+                vec![RequiredPrivilege::delete(db, table)]
+            }
+            ResolvedStatement::CreateTable { .. } => {
+                vec![RequiredPrivilege::create_table(db)]
+            }
+            ResolvedStatement::DropTable { name, .. } => {
+                vec![RequiredPrivilege::drop_table(db, name)]
+            }
+            ResolvedStatement::CreateIndex { table, .. } => {
+                vec![RequiredPrivilege::create_index(db, table)]
+            }
+            ResolvedStatement::DropIndex { .. } => {
+                // DROP INDEX requires INDEX privilege at database level
+                vec![RequiredPrivilege::new(
+                    Privilege::Index,
+                    PrivilegeObject::Database(db.to_string()),
+                )]
+            }
+            // Auth commands require global privileges (checked separately)
+            ResolvedStatement::CreateUser { .. }
+            | ResolvedStatement::AlterUser { .. }
+            | ResolvedStatement::DropUser { .. }
+            | ResolvedStatement::SetPassword { .. }
+            | ResolvedStatement::Grant { .. }
+            | ResolvedStatement::Revoke { .. } => {
+                // These require CREATE USER or GRANT privileges - checked elsewhere
+                vec![]
+            }
+            ResolvedStatement::ShowGrants { .. } => {
+                // Users can always see their own grants
+                vec![]
+            }
+        }
+    }
+
+    /// Check if the current user has the required privileges
+    async fn check_authorization(&self, required: &[RequiredPrivilege]) -> Result<(), String> {
+        use crate::catalog::system_tables::SYSTEM_GRANTS;
+
+        let username = &self.session.user;
+        if username.is_empty() {
+            return Err("Not authenticated".to_string());
+        }
+
+        // Root user bypasses authorization checks
+        if username == "root" {
+            return Ok(());
+        }
+
+        // Scan system.grants to get user's grants
+        let prefix = table_key_prefix(SYSTEM_GRANTS);
+        let end = table_key_end(SYSTEM_GRANTS);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(|e| format!("Failed to query grants: {}", e))?;
+
+        // Parse grants for this user
+        let mut user_grants = Vec::new();
+        let client_host = self.client_ip.to_string();
+
+        for (_key, value) in rows {
+            // Skip MVCC header (17 bytes) if present
+            if value.len() <= 17 {
+                continue;
+            }
+            // Check deleted flag
+            if value[16] == 1 {
+                continue;
+            }
+            let row_data = &value[17..];
+            if let Ok(row) = decode_row(row_data) {
+                // system.grants columns: grantee, grantee_host, grantee_type, privilege,
+                // object_type, database_name, table_name, with_grant_option, granted_by, granted_at
+                let values = row.values();
+                if values.len() < 8 {
+                    continue;
+                }
+
+                let grantee = match &values[0] {
+                    Datum::String(s) => s.clone(),
+                    _ => continue,
+                };
+                let grantee_host = match &values[1] {
+                    Datum::String(s) => HostPattern::new(s.clone()),
+                    _ => continue,
+                };
+
+                // Check if grant applies to current user
+                if grantee != *username
+                    || !grantee_host.matches(&client_host, Some(&self.client_ip))
+                {
+                    continue;
+                }
+
+                let privilege_str = match &values[3] {
+                    Datum::String(s) => s.as_str(),
+                    _ => continue,
+                };
+                let privilege = match Privilege::parse(privilege_str) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let object_type = match &values[4] {
+                    Datum::String(s) => s.as_str(),
+                    _ => continue,
+                };
+                let database_name = match &values[5] {
+                    Datum::String(s) => Some(s.as_str()),
+                    Datum::Null => None,
+                    _ => continue,
+                };
+                let table_name = match &values[6] {
+                    Datum::String(s) => Some(s.as_str()),
+                    Datum::Null => None,
+                    _ => continue,
+                };
+
+                let object = match object_type {
+                    "GLOBAL" => PrivilegeObject::Global,
+                    "DATABASE" => {
+                        PrivilegeObject::Database(database_name.unwrap_or("").to_string())
+                    }
+                    "TABLE" => PrivilegeObject::Table {
+                        database: database_name.unwrap_or("").to_string(),
+                        table: table_name.unwrap_or("").to_string(),
+                    },
+                    _ => continue,
+                };
+
+                let with_grant_option = matches!(&values[7], Datum::Bool(true));
+
+                user_grants.push(GrantEntry {
+                    grantee,
+                    grantee_host,
+                    privilege,
+                    object,
+                    with_grant_option,
+                });
+            }
+        }
+
+        // Check each required privilege
+        for req in required {
+            if !check_privilege(&user_grants, req) {
+                return Err(format!(
+                    "Access denied for user '{}'@'{}': {} privilege required",
+                    username,
+                    client_host,
+                    req.privilege.to_str()
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Execute a physical plan and send results
@@ -845,7 +1049,10 @@ where
                 }
             }
 
-            // Now commit the transaction in the transaction manager
+            // Now commit the transaction in the transaction manager.
+            // CRITICAL: After successful Raft proposal, the data IS committed and durable.
+            // The txn_manager.commit() is just bookkeeping - if it fails, we log the error
+            // but still report success to the client since data is already committed via Raft.
             match self.txn_manager.commit(txn_id).await {
                 Ok(()) => {
                     self.session.end_transaction();
@@ -856,14 +1063,15 @@ where
                     );
                 }
                 Err(e) => {
+                    // Log the error but don't fail - data is already committed via Raft
+                    tracing::error!(
+                        connection_id = self.connection_id,
+                        txn_id = txn_id,
+                        error = %e,
+                        "TxnManager commit failed after Raft success - data IS committed, txn bookkeeping inconsistent"
+                    );
                     self.session.end_transaction();
-                    return self
-                        .send_error(
-                            codes::ER_UNKNOWN_ERROR,
-                            states::GENERAL_ERROR,
-                            &e.to_string(),
-                        )
-                        .await;
+                    // Still report success - data is durable
                 }
             }
         }

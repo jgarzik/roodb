@@ -228,11 +228,8 @@ impl TypeChecker {
 
 /// Check if types are compatible for assignment/comparison
 fn types_compatible(target: &DataType, source: &DataType) -> bool {
-    // NULL is compatible with anything
-    if matches!(source, DataType::Int) && matches!(target, _) {
-        // Placeholder for NULL which we default to Int
-        // In practice, we'd need to track nullability differently
-    }
+    // Note: NULL literals default to Int type in the parser.
+    // The match below handles numeric type compatibility, which covers this case.
 
     match (target, source) {
         // Same types are always compatible

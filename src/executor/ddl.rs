@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::catalog::system_tables::{
-    index_def_to_row, is_system_table, table_def_to_columns_rows, table_def_to_tables_row,
-    SYSTEM_COLUMNS, SYSTEM_INDEXES, SYSTEM_TABLES,
+    index_def_to_row, is_system_table, table_def_to_columns_rows, table_def_to_constraints_rows,
+    table_def_to_tables_row, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_INDEXES, SYSTEM_TABLES,
 };
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
@@ -137,9 +137,10 @@ impl Executor for CreateTable {
             // Generate RowChanges for system tables and propose via Raft
             let mut changeset = ChangeSet::new(0);
 
-            // Pre-allocate row IDs: 1 for system.tables + N for system.columns
+            // Pre-allocate row IDs: 1 for system.tables + N for system.columns + M for system.constraints
             let column_rows = table_def_to_columns_rows(&table_def);
-            let total_ids = 1 + column_rows.len() as u64;
+            let constraint_rows = table_def_to_constraints_rows(&table_def);
+            let total_ids = 1 + column_rows.len() as u64 + constraint_rows.len() as u64;
             let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
 
             // Insert into system.tables
@@ -165,6 +166,21 @@ impl Executor for CreateTable {
                 ));
                 self.changes
                     .push(RowChange::insert(SYSTEM_COLUMNS, key, value));
+            }
+
+            // Insert into system.constraints (one row per constraint)
+            for constraint_row in constraint_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
+                let value = encode_row(&constraint_row);
+                changeset.push(RowChange::insert(
+                    SYSTEM_CONSTRAINTS,
+                    key.clone(),
+                    value.clone(),
+                ));
+                self.changes
+                    .push(RowChange::insert(SYSTEM_CONSTRAINTS, key, value));
             }
 
             // Propose to Raft - catalog is updated synchronously in apply()
@@ -343,6 +359,40 @@ impl Executor for DropTable {
                             ));
                             self.changes.push(RowChange::delete_with_value(
                                 SYSTEM_COLUMNS,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Find and delete from system.constraints
+            let prefix = format!("t:{SYSTEM_CONSTRAINTS}:");
+            let end = format!("t:{SYSTEM_CONSTRAINTS};\x00");
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            for (key, value) in rows {
+                // Skip MVCC header (17 bytes) if present
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(table_name)) = row.values().first() {
+                        if table_name == &self.name {
+                            // Emit delete with value for tracking
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_CONSTRAINTS,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                            self.changes.push(RowChange::delete_with_value(
+                                SYSTEM_CONSTRAINTS,
                                 key,
                                 row_data.to_vec(),
                             ));

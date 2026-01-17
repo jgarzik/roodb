@@ -227,9 +227,15 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             let new_mem = Arc::new(Memtable::new());
             {
                 let mut mem_guard = self.memtable.write();
-                let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
-                // Push old memtable to immutables (data preserved, NOT cleared)
-                self.imm_memtables.write().push(old_mem);
+                // Only rotate if we're still looking at the same memtable.
+                // Another thread may have already rotated between our should_flush check
+                // and acquiring this write lock.
+                if Arc::ptr_eq(&current_mem, &*mem_guard) {
+                    let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
+                    // Push old memtable to immutables (data preserved, NOT cleared)
+                    self.imm_memtables.write().push(old_mem);
+                }
+                // If not the same, another thread already rotated - nothing to do
             }
             // Note: Flush happens in background or on explicit flush() call
         }

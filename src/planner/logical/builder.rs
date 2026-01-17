@@ -463,11 +463,11 @@ impl LogicalPlanBuilder {
         match expr {
             ResolvedExpr::Column(col) => col.data_type.clone(),
             ResolvedExpr::Literal(lit) => match lit {
-                Literal::Integer(_) => DataType::Int,
+                Literal::Integer(_) => DataType::BigInt, // Use BigInt for integer literals (safer for large values)
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Boolean(_) => DataType::Boolean,
-                Literal::Null => DataType::Int,
+                Literal::Null => DataType::Int, // NULL is polymorphic, default to Int
                 Literal::Blob(_) => DataType::Blob,
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),

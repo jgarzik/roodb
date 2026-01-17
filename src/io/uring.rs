@@ -81,7 +81,11 @@ impl AsyncIO for UringIO {
 
         let mut ring = self.ring.lock();
 
-        // Safety: the buffer lives until completion
+        // SAFETY: This unsafe block is sound because:
+        // 1. The buffer `buf` is owned by this function and lives until submit_and_wait() returns
+        // 2. submit_and_wait(1) blocks until the I/O operation completes
+        // 3. The kernel only accesses the buffer during the I/O operation
+        // 4. No aliasing occurs because we hold exclusive access to `buf`
         unsafe {
             ring.submission().push(&read_e).map_err(|_| {
                 IoError::Io(std::io::Error::other("io_uring submission queue full"))
@@ -125,7 +129,11 @@ impl AsyncIO for UringIO {
 
         let mut ring = self.ring.lock();
 
-        // Safety: the buffer lives until completion
+        // SAFETY: This unsafe block is sound because:
+        // 1. The buffer `buf` is borrowed for the duration of this function call
+        // 2. submit_and_wait(1) blocks until the I/O operation completes
+        // 3. The kernel only reads from the buffer during the write operation
+        // 4. No aliasing occurs because `buf` is immutably borrowed
         unsafe {
             ring.submission().push(&write_e).map_err(|_| {
                 IoError::Io(std::io::Error::other("io_uring submission queue full"))
@@ -238,7 +246,11 @@ impl AsyncIO for UringIO {
                     .build()
                     .user_data(i as u64);
 
-                // Safety: buffers live until completion
+                // SAFETY: This unsafe block is sound because:
+                // 1. Each buffer in the batch is stored in `bufs` which outlives this function
+                // 2. submit_and_wait() is called below, blocking until all I/O completes
+                // 3. The kernel only accesses buffers during the I/O operations
+                // 4. Each buffer has exclusive access (stored in Option for ownership tracking)
                 unsafe {
                     if ring.submission().push(&read_e).is_err() {
                         // Queue full - shouldn't happen with proper batching
@@ -338,7 +350,11 @@ impl AsyncIO for UringIO {
                 .build()
                 .user_data(i as u64);
 
-            // Safety: buffers live until completion
+            // SAFETY: This unsafe block is sound because:
+            // 1. The buffer references in the batch are borrowed from the caller
+            // 2. submit_and_wait() is called below, blocking until all I/O completes
+            // 3. The kernel only reads from buffers during write operations
+            // 4. Buffers are immutably borrowed, preventing concurrent modification
             unsafe {
                 if ring.submission().push(&write_e).is_err() {
                     results[i] = Err(IoError::Io(std::io::Error::other("queue full")));

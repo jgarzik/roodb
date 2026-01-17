@@ -153,6 +153,9 @@ impl RaftNode {
     /// Start the Raft RPC server
     pub async fn start_rpc_server(&mut self) -> Result<(), RaftNodeError> {
         let listener = TcpListener::bind(self.addr).await?;
+        // Update addr with the actual bound address (important when port was 0)
+        self.addr = listener.local_addr()?;
+
         let acceptor = TlsAcceptor::from(self.tls_config.server_config());
         let handler = Arc::new(RaftRpcHandler::new(self.raft.clone()));
 

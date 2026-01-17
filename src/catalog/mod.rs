@@ -232,6 +232,10 @@ pub enum CatalogError {
     IndexNotFound(String),
     /// Column not found
     ColumnNotFound(String, String),
+    /// Invalid name (empty or otherwise invalid)
+    InvalidName(String),
+    /// Invalid constraint definition
+    InvalidConstraint(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -244,6 +248,8 @@ impl std::fmt::Display for CatalogError {
             CatalogError::ColumnNotFound(table, col) => {
                 write!(f, "Column '{}' not found in table '{}'", col, table)
             }
+            CatalogError::InvalidName(msg) => write!(f, "Invalid name: {}", msg),
+            CatalogError::InvalidConstraint(msg) => write!(f, "Invalid constraint: {}", msg),
         }
     }
 }
@@ -308,6 +314,32 @@ impl Catalog {
 
     /// Create a table
     pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {
+        // Validate table name
+        if def.name.is_empty() {
+            return Err(CatalogError::InvalidName(
+                "Table name cannot be empty".into(),
+            ));
+        }
+
+        // Validate constraint columns reference existing columns
+        for constraint in &def.constraints {
+            let cols = match constraint {
+                Constraint::PrimaryKey(cols) | Constraint::Unique(cols) => cols,
+                Constraint::ForeignKey { columns, .. } => columns,
+                Constraint::Check(_) => continue,
+            };
+            if cols.is_empty() {
+                return Err(CatalogError::InvalidConstraint(
+                    "Constraint columns cannot be empty".into(),
+                ));
+            }
+            for col in cols {
+                if def.get_column(col).is_none() {
+                    return Err(CatalogError::ColumnNotFound(def.name.clone(), col.clone()));
+                }
+            }
+        }
+
         if self.tables.contains_key(&def.name) {
             return Err(CatalogError::TableExists(def.name.clone()));
         }

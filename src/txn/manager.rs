@@ -206,10 +206,17 @@ impl TransactionManager {
     ///
     /// The read view captures the current state of active transactions
     /// to determine which row versions are visible.
+    ///
+    /// IMPORTANT: We read max_txn_id WHILE holding the active_transactions lock.
+    /// This ensures consistency: any transaction that started after we captured
+    /// active_ids will have id > max_txn_id, so it will be correctly treated
+    /// as invisible to this read view.
     pub fn create_read_view(&self, txn_id: u64) -> TransactionResult<ReadView> {
         let active = self.active_transactions.read();
-        let active_ids: HashSet<u64> = active.keys().copied().collect();
+        // Read max_txn_id while still holding active_transactions lock
         let max_txn_id = self.next_txn_id.load(Ordering::SeqCst) - 1;
+        let active_ids: HashSet<u64> = active.keys().copied().collect();
+        // active lock released here, but we've already captured consistent state
 
         Ok(ReadView::new(txn_id, active_ids, max_txn_id))
     }

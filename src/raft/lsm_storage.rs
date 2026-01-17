@@ -14,8 +14,8 @@ use openraft::{ErrorSubject, ErrorVerb};
 use parking_lot::RwLock;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_INDEXES,
-    SYSTEM_TABLES,
+    is_system_table, row_to_index_def, rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS,
+    SYSTEM_CONSTRAINTS, SYSTEM_INDEXES, SYSTEM_TABLES,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -281,8 +281,42 @@ impl LsmRaftStorage {
 
             if !column_rows.is_empty() {
                 // Rebuild TableDef from column rows
-                if let Some(table_def) = rows_to_table_def(table_name, &column_rows) {
-                    tracing::debug!(table = %table_name, columns = column_rows.len(), "Rebuilding table in catalog (Raft apply)");
+                if let Some(mut table_def) = rows_to_table_def(table_name, &column_rows) {
+                    // Scan for constraints for this table
+                    let prefix = table_key_prefix(SYSTEM_CONSTRAINTS);
+                    let end = table_key_end(SYSTEM_CONSTRAINTS);
+                    let constraint_data = self
+                        .storage
+                        .scan(Some(&prefix), Some(&end))
+                        .await
+                        .map_err(read_err)?;
+
+                    let mut constraint_rows = Vec::new();
+                    for (_key, value) in constraint_data {
+                        if value.len() <= MVCC_HEADER_SIZE {
+                            continue;
+                        }
+                        if value[16] == 1 {
+                            continue;
+                        }
+                        let row_data = &value[MVCC_HEADER_SIZE..];
+                        if let Ok(row) = decode_row(row_data) {
+                            if let Some(crate::executor::Datum::String(tbl)) = row.values().first()
+                            {
+                                if tbl == table_name {
+                                    constraint_rows.push(row);
+                                }
+                            }
+                        }
+                    }
+
+                    // Attach constraints to table def
+                    let constraints = rows_to_constraints(&constraint_rows);
+                    for constraint in constraints {
+                        table_def = table_def.constraint(constraint);
+                    }
+
+                    tracing::debug!(table = %table_name, columns = column_rows.len(), constraints = constraint_rows.len(), "Rebuilding table in catalog (Raft apply)");
                     table_defs.push((table_name.clone(), table_def));
                 }
             }
@@ -418,9 +452,51 @@ impl LsmRaftStorage {
             }
         }
 
-        // Build TableDef for each table
+        // Scan system.constraints to rebuild constraints
+        let prefix = table_key_prefix(SYSTEM_CONSTRAINTS);
+        let end = table_key_end(SYSTEM_CONSTRAINTS);
+        let constraint_rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(read_err)?;
+
+        // Group constraints by table name
+        let mut constraints_by_table: std::collections::HashMap<
+            String,
+            Vec<crate::executor::row::Row>,
+        > = std::collections::HashMap::new();
+
+        for (_key, value) in constraint_rows {
+            if value.len() <= MVCC_HEADER_SIZE {
+                continue;
+            }
+            if value[16] == 1 {
+                continue; // Skip deleted
+            }
+            let row_data = &value[MVCC_HEADER_SIZE..];
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
+                    if !is_system_table(table_name) {
+                        constraints_by_table
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(row);
+                    }
+                }
+            }
+        }
+
+        // Build TableDef for each table (with constraints)
         for (table_name, column_rows) in columns_by_table {
-            if let Some(table_def) = rows_to_table_def(&table_name, &column_rows) {
+            if let Some(mut table_def) = rows_to_table_def(&table_name, &column_rows) {
+                // Attach constraints if any
+                if let Some(constraint_rows) = constraints_by_table.get(&table_name) {
+                    let constraints = rows_to_constraints(constraint_rows);
+                    for constraint in constraints {
+                        table_def = table_def.constraint(constraint);
+                    }
+                }
                 table_defs.push(table_def);
             }
         }
@@ -791,6 +867,31 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                     ChangeOp::Insert | ChangeOp::Update => {
                                         // Encode with MVCC header and write
                                         if let Some(ref value) = change.value {
+                                            // Check for duplicate key on INSERT for user tables
+                                            // This prevents INSERT from silently overwriting existing rows
+                                            if change.op == ChangeOp::Insert
+                                                && !is_system_table(&change.table)
+                                            {
+                                                if let Ok(Some(existing_data)) =
+                                                    self.storage.get(&change.key).await
+                                                {
+                                                    // Check if the existing row is not deleted
+                                                    if existing_data.len() > 16
+                                                        && existing_data[16] != 1
+                                                    {
+                                                        tracing::warn!(
+                                                            table = %change.table,
+                                                            "INSERT conflict: row already exists with this key"
+                                                        );
+                                                        conflict_error = Some(format!(
+                                                            "Duplicate key: row in '{}' already exists",
+                                                            change.table
+                                                        ));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
                                             // Check for duplicate table creation (race condition fix)
                                             // This makes apply() idempotent for CREATE TABLE
                                             // Uses precomputed existing_tables set to avoid lock contention
