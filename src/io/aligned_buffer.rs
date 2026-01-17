@@ -62,6 +62,19 @@ impl AlignedBuffer {
         Self::new(count * PAGE_SIZE)
     }
 
+    /// Create a 2MB buffer for large I/O operations
+    ///
+    /// Suitable for bulk reads/writes like memtable flush and compaction.
+    /// Aligns with Linux huge page size for potential memory optimization.
+    pub fn large() -> IoResult<Self> {
+        Self::new(2 * 1024 * 1024)
+    }
+
+    /// Create a buffer for the specified chunk size
+    pub fn for_chunk(chunk: super::scheduler::ChunkSize) -> IoResult<Self> {
+        Self::new(chunk.bytes())
+    }
+
     /// Round up a size to the nearest PAGE_SIZE multiple
     #[inline]
     pub fn round_up(size: usize) -> usize {

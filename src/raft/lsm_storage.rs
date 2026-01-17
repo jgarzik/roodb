@@ -576,7 +576,8 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         self.storage.put(VOTE_KEY, &data).await.map_err(write_err)?;
 
         // CRITICAL: flush to disk before returning - vote durability prevents double-voting
-        self.storage.flush().await.map_err(write_err)?;
+        // Uses Critical priority to bypass backpressure and ensure durability
+        self.storage.flush_critical().await.map_err(write_err)?;
 
         *self.cached_vote.write() = Some(*vote);
 

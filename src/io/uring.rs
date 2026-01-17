@@ -183,6 +183,200 @@ impl AsyncIO for UringIO {
         self.file.set_len(size)?;
         Ok(())
     }
+
+    /// Check if batch operations are optimized
+    ///
+    /// io_uring supports true batch submission.
+    fn supports_batch(&self) -> bool {
+        true
+    }
+
+    /// Read multiple regions in a single io_uring submission
+    ///
+    /// Submits all reads to the submission queue and waits for all completions.
+    async fn read_batch(&self, requests: &[(u64, usize)]) -> Vec<IoResult<AlignedBuffer>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        // Allocate buffers upfront
+        let mut buffers: Vec<Option<AlignedBuffer>> = Vec::with_capacity(requests.len());
+        for &(_, size) in requests {
+            match AlignedBuffer::new(size) {
+                Ok(buf) => buffers.push(Some(buf)),
+                Err(e) => {
+                    // If allocation fails, return early with error for that slot
+                    let mut results: Vec<IoResult<AlignedBuffer>> =
+                        Vec::with_capacity(requests.len());
+                    for _ in 0..buffers.len() {
+                        results.push(Err(IoError::NotSupported("allocation failed".into())));
+                    }
+                    results.push(Err(e));
+                    for _ in (buffers.len() + 1)..requests.len() {
+                        results.push(Err(IoError::NotSupported("allocation failed".into())));
+                    }
+                    return results;
+                }
+            }
+        }
+
+        let fd = types::Fd(self.file.as_raw_fd());
+        let mut ring = self.ring.lock();
+
+        // Build and submit all read operations
+        for (i, (&(offset, _), buf_opt)) in requests.iter().zip(buffers.iter_mut()).enumerate() {
+            if let Some(buf) = buf_opt {
+                // Validate alignment
+                if !offset.is_multiple_of(PAGE_SIZE as u64) {
+                    // Mark this one as failed
+                    *buf_opt = None;
+                    continue;
+                }
+
+                let read_e = opcode::Read::new(fd, buf.as_mut_ptr(), buf.capacity() as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(i as u64);
+
+                // Safety: buffers live until completion
+                unsafe {
+                    if ring.submission().push(&read_e).is_err() {
+                        // Queue full - shouldn't happen with proper batching
+                        *buf_opt = None;
+                    }
+                }
+            }
+        }
+
+        // Submit all and wait for completions
+        let submitted = match ring.submit_and_wait(requests.len()) {
+            Ok(n) => n,
+            Err(e) => {
+                let mut results: Vec<IoResult<AlignedBuffer>> = Vec::with_capacity(requests.len());
+                for _ in 0..requests.len() {
+                    results.push(Err(IoError::Io(std::io::Error::from(e.kind()))));
+                }
+                return results;
+            }
+        };
+
+        // Collect results - initialize with placeholder errors
+        let mut results: Vec<IoResult<AlignedBuffer>> = Vec::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            results.push(Err(IoError::NotSupported("incomplete".into())));
+        }
+
+        for cqe in ring.completion() {
+            let idx = cqe.user_data() as usize;
+            if idx >= requests.len() {
+                continue;
+            }
+
+            let result = cqe.result();
+            if result < 0 {
+                results[idx] = Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
+            } else if let Some(mut buf) = buffers[idx].take() {
+                buf.set_len(result as usize);
+                results[idx] = Ok(buf);
+            }
+        }
+
+        // Handle any that weren't submitted
+        for (i, buf_opt) in buffers.iter().enumerate() {
+            if buf_opt.is_some() && matches!(results[i], Err(IoError::NotSupported(_))) {
+                results[i] = Err(IoError::OffsetAlignment {
+                    offset: requests[i].0,
+                    alignment: PAGE_SIZE,
+                });
+            }
+        }
+
+        let _ = submitted; // silence unused warning
+        results
+    }
+
+    /// Write multiple regions in a single io_uring submission
+    ///
+    /// Submits all writes to the submission queue and waits for all completions.
+    async fn write_batch(&self, requests: &[(u64, AlignedBuffer)]) -> Vec<IoResult<usize>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        let fd = types::Fd(self.file.as_raw_fd());
+        let mut ring = self.ring.lock();
+
+        let mut valid_indices = Vec::with_capacity(requests.len());
+        let mut results: Vec<IoResult<usize>> = Vec::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            results.push(Err(IoError::NotSupported("not submitted".into())));
+        }
+
+        // Build and submit all write operations
+        for (i, (offset, buf)) in requests.iter().enumerate() {
+            // Validate alignment
+            if !offset.is_multiple_of(PAGE_SIZE as u64) {
+                results[i] = Err(IoError::OffsetAlignment {
+                    offset: *offset,
+                    alignment: PAGE_SIZE,
+                });
+                continue;
+            }
+
+            // For direct IO, round up to page size
+            let write_len = AlignedBuffer::round_up(buf.len());
+            if write_len > buf.capacity() {
+                results[i] = Err(IoError::BufferSize {
+                    size: buf.len(),
+                    alignment: PAGE_SIZE,
+                });
+                continue;
+            }
+
+            let write_e = opcode::Write::new(fd, buf.as_ptr(), write_len as u32)
+                .offset(*offset)
+                .build()
+                .user_data(i as u64);
+
+            // Safety: buffers live until completion
+            unsafe {
+                if ring.submission().push(&write_e).is_err() {
+                    results[i] = Err(IoError::Io(std::io::Error::other("queue full")));
+                    continue;
+                }
+            }
+            valid_indices.push(i);
+        }
+
+        if valid_indices.is_empty() {
+            return results;
+        }
+
+        // Submit all and wait for completions
+        if let Err(e) = ring.submit_and_wait(valid_indices.len()) {
+            for &idx in &valid_indices {
+                results[idx] = Err(IoError::Io(e.kind().into()));
+            }
+            return results;
+        }
+
+        // Collect results
+        for cqe in ring.completion() {
+            let idx = cqe.user_data() as usize;
+            if idx >= requests.len() {
+                continue;
+            }
+
+            let result = cqe.result();
+            if result < 0 {
+                results[idx] = Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
+            } else {
+                results[idx] = Ok(result as usize);
+            }
+        }
+
+        results
+    }
 }
 
 /// Factory for creating UringIO instances

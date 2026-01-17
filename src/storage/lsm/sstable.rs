@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::io::scheduler::{IoContext, IoPriority, OpKind};
 use crate::io::{AlignedBuffer, AsyncIO, AsyncIOFactory, PAGE_SIZE};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block::{BlockBuilder, BlockReader, Entry, BLOCK_SIZE};
@@ -67,6 +68,8 @@ pub struct SstableWriter<IO: AsyncIO> {
     index_entries: Vec<IndexEntry>,
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
+    /// I/O priority for write operations
+    priority: IoPriority,
 }
 
 impl<IO: AsyncIO> SstableWriter<IO> {
@@ -74,6 +77,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
     pub async fn create<F: AsyncIOFactory<IO = IO>>(
         factory: &F,
         path: &Path,
+        priority: IoPriority,
     ) -> StorageResult<Self> {
         let io = factory.open(path, true).await?;
         Ok(Self {
@@ -84,6 +88,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             index_entries: Vec::new(),
             min_key: None,
             max_key: None,
+            priority,
         })
     }
 
@@ -133,7 +138,9 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
         buf.copy_from_slice(&block)?;
 
-        self.io.write_at(&buf, self.offset).await?;
+        self.io
+            .write_at_priority(&buf, self.offset, self.priority)
+            .await?;
         self.offset += BLOCK_SIZE as u64;
 
         self.block_builder = BlockBuilder::new();
@@ -155,17 +162,22 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         let index_block = self.build_index_block();
         let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
         buf.copy_from_slice(&index_block)?;
-        self.io.write_at(&buf, self.offset).await?;
+        self.io
+            .write_at_priority(&buf, self.offset, self.priority)
+            .await?;
         self.offset += BLOCK_SIZE as u64;
 
         // Write footer
         let footer = self.build_footer(index_offset)?;
         let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
         buf.copy_from_slice(&footer)?;
-        self.io.write_at(&buf, self.offset).await?;
+        self.io
+            .write_at_priority(&buf, self.offset, self.priority)
+            .await?;
 
-        // Sync to disk
-        self.io.sync().await?;
+        // Sync to disk with context derived from write priority
+        let sync_ctx = IoContext::new(self.priority.to_context().urgency, OpKind::Sync);
+        self.io.sync_with_context(sync_ctx).await?;
 
         Ok(self.path)
     }
@@ -260,11 +272,17 @@ pub struct SstableReader<IO: AsyncIO> {
     io: IO,
     metadata: SstableMetadata,
     index: Vec<IndexEntry>,
+    /// I/O priority for read operations
+    priority: IoPriority,
 }
 
 impl<IO: AsyncIO> SstableReader<IO> {
     /// Open an existing SSTable
-    pub async fn open<F: AsyncIOFactory<IO = IO>>(factory: &F, path: &Path) -> StorageResult<Self> {
+    pub async fn open<F: AsyncIOFactory<IO = IO>>(
+        factory: &F,
+        path: &Path,
+        priority: IoPriority,
+    ) -> StorageResult<Self> {
         let io = factory.open(path, false).await?;
 
         // Read file size
@@ -276,14 +294,16 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Read footer
         let footer_offset = file_size - FOOTER_SIZE as u64;
         let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
-        io.read_at(&mut footer_buf, footer_offset).await?;
+        io.read_at_priority(&mut footer_buf, footer_offset, priority)
+            .await?;
 
         // Parse footer
         let metadata = Self::parse_footer(&footer_buf)?;
 
         // Read index block
         let mut index_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        io.read_at(&mut index_buf, metadata.index_offset).await?;
+        io.read_at_priority(&mut index_buf, metadata.index_offset, priority)
+            .await?;
 
         // Parse index
         let index = Self::parse_index(&index_buf)?;
@@ -292,6 +312,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
             io,
             metadata,
             index,
+            priority,
         })
     }
 
@@ -447,7 +468,9 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Read and search the block
         let block_offset = self.index[block_idx].block_offset;
         let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        self.io.read_at(&mut buf, block_offset).await?;
+        self.io
+            .read_at_priority(&mut buf, block_offset, self.priority)
+            .await?;
 
         let reader = BlockReader::parse(buf.as_slice(), block_offset)?;
         if let Some(entry) = reader.get(key) {
@@ -486,7 +509,9 @@ impl<IO: AsyncIO> SstableReader<IO> {
 
         for entry in &self.index {
             let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            self.io.read_at(&mut buf, entry.block_offset).await?;
+            self.io
+                .read_at_priority(&mut buf, entry.block_offset, self.priority)
+                .await?;
 
             let reader = BlockReader::parse(buf.as_slice(), entry.block_offset)?;
             for e in reader.entries() {
@@ -522,7 +547,9 @@ impl<IO: AsyncIO> SstableReader<IO> {
             }
 
             let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            self.io.read_at(&mut buf, entry.block_offset).await?;
+            self.io
+                .read_at_priority(&mut buf, entry.block_offset, self.priority)
+                .await?;
 
             let reader = BlockReader::parse(buf.as_slice(), entry.block_offset)?;
             for e in reader.entries() {

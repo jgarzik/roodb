@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
+use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::compaction::{compact_l0, needs_l0_compaction};
@@ -67,6 +68,16 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
     /// Flush memtable to L0 SSTable
     async fn flush_memtable(&self, mem: Arc<Memtable>) -> StorageResult<()> {
+        self.flush_memtable_with_priority(mem, IoPriority::Flush)
+            .await
+    }
+
+    /// Flush memtable to L0 SSTable with specified priority
+    async fn flush_memtable_with_priority(
+        &self,
+        mem: Arc<Memtable>,
+        priority: IoPriority,
+    ) -> StorageResult<()> {
         if mem.is_empty() {
             return Ok(());
         }
@@ -77,7 +88,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         let name = manifest.next_sstable_name();
         let path = manifest.sstable_path(&name);
 
-        let mut writer = SstableWriter::create(&*self.factory, &path).await?;
+        let mut writer = SstableWriter::create(&*self.factory, &path, priority).await?;
 
         // Write all entries from memtable
         let entries = mem.iter();
@@ -159,7 +170,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 }
 
                 let path = manifest.sstable_path(&info.name);
-                let reader = SstableReader::open(&*self.factory, &path).await?;
+                let reader =
+                    SstableReader::open(&*self.factory, &path, IoPriority::QueryRead).await?;
 
                 if let Some(result) = reader.get(key).await? {
                     return Ok(Some(result));
@@ -259,7 +271,8 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
             for info in files {
                 let path = manifest.sstable_path(&info.name);
-                let reader = SstableReader::open(&*self.factory, &path).await?;
+                let reader =
+                    SstableReader::open(&*self.factory, &path, IoPriority::QueryRead).await?;
 
                 for (key, value) in reader.scan_range(start, end).await? {
                     all_entries.push((key, value, source_idx));
@@ -312,6 +325,34 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
         for mem in imm_mems {
             self.flush_memtable(mem).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_critical(&self) -> StorageResult<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(StorageError::Closed);
+        }
+
+        // Rotate current memtable to immutable and create fresh one
+        {
+            let mut mem_guard = self.memtable.write();
+            if !mem_guard.is_empty() {
+                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
+                self.imm_memtables.write().push(old_mem);
+            }
+        }
+
+        // Flush all immutable memtables with Critical priority (WAL)
+        let imm_mems: Vec<Arc<Memtable>> = {
+            let mut imm = self.imm_memtables.write();
+            std::mem::take(&mut *imm)
+        };
+
+        for mem in imm_mems {
+            self.flush_memtable_with_priority(mem, IoPriority::Wal)
+                .await?;
         }
 
         Ok(())

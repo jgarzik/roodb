@@ -147,6 +147,111 @@ impl AsyncIO for PosixIO {
         .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
         .map_err(IoError::from)
     }
+
+    /// Check if batch operations are optimized
+    ///
+    /// POSIX backend uses thread pool parallelism for batching.
+    fn supports_batch(&self) -> bool {
+        true
+    }
+
+    /// Read multiple regions in parallel using thread pool
+    ///
+    /// Spawns concurrent blocking tasks for parallel I/O.
+    async fn read_batch(&self, requests: &[(u64, usize)]) -> Vec<IoResult<AlignedBuffer>> {
+        // Spawn all tasks first
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|&(offset, size)| {
+                let file = self.file.clone();
+                tokio::spawn(async move {
+                    // Validate alignment
+                    if !offset.is_multiple_of(PAGE_SIZE as u64) {
+                        return Err(IoError::OffsetAlignment {
+                            offset,
+                            alignment: PAGE_SIZE,
+                        });
+                    }
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut file = file.lock();
+                        file.seek(SeekFrom::Start(offset))?;
+
+                        let mut temp = vec![0u8; size];
+                        let bytes_read = file.read(&mut temp)?;
+                        temp.truncate(bytes_read);
+
+                        Ok::<(Vec<u8>, usize), std::io::Error>((temp, bytes_read))
+                    })
+                    .await
+                    .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
+
+                    let (temp, bytes_read) = result;
+                    let mut buf = AlignedBuffer::new(size)?;
+                    buf.as_mut_slice()[..bytes_read].copy_from_slice(&temp[..bytes_read]);
+                    buf.set_len(bytes_read);
+                    Ok(buf)
+                })
+            })
+            .collect();
+
+        // Await all in order
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(e) => results.push(Err(IoError::Io(std::io::Error::other(e.to_string())))),
+            }
+        }
+        results
+    }
+
+    /// Write multiple regions in parallel using thread pool
+    ///
+    /// Spawns concurrent blocking tasks for parallel I/O.
+    async fn write_batch(&self, requests: &[(u64, AlignedBuffer)]) -> Vec<IoResult<usize>> {
+        // Spawn all tasks first
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|(offset, buf)| {
+                let file = self.file.clone();
+                let offset = *offset;
+                // Copy data to avoid lifetime issues
+                let data = buf.as_slice().to_vec();
+                let write_len = data.len();
+
+                tokio::spawn(async move {
+                    // Validate alignment
+                    if !offset.is_multiple_of(PAGE_SIZE as u64) {
+                        return Err(IoError::OffsetAlignment {
+                            offset,
+                            alignment: PAGE_SIZE,
+                        });
+                    }
+
+                    tokio::task::spawn_blocking(move || {
+                        let mut file = file.lock();
+                        file.seek(SeekFrom::Start(offset))?;
+                        file.write_all(&data)?;
+                        Ok::<usize, std::io::Error>(write_len)
+                    })
+                    .await
+                    .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
+                    .map_err(IoError::from)
+                })
+            })
+            .collect();
+
+        // Await all in order
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(e) => results.push(Err(IoError::Io(std::io::Error::other(e.to_string())))),
+            }
+        }
+        results
+    }
 }
 
 /// Factory for creating PosixIO instances

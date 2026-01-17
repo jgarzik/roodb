@@ -151,27 +151,63 @@ pub trait Executor: Send {
 
 ### `io/`
 
-Cross-platform async I/O abstraction.
+Cross-platform async I/O with priority scheduling.
+
+**Architecture**:
+```
+                    ┌─────────────────┐
+                    │  LSM / Raft     │
+                    └────────┬────────┘
+                             │ IoContext (urgency + kind)
+                    ┌────────▼────────┐
+                    │  I/O Scheduler  │  Backpressure, metrics
+                    └────────┬────────┘
+              ┌──────────────┴──────────────┐
+              │                             │
+     ┌────────▼────────┐           ┌────────▼────────┐
+     │    UringIO      │           │    PosixIO      │
+     │   (Linux)       │           │   (non-Linux)   │
+     └─────────────────┘           └─────────────────┘
+```
 
 **Files**:
 - `traits.rs` - `AsyncIO`, `AsyncIOFactory` traits
 - `aligned_buffer.rs` - Page-aligned memory allocation
+- `scheduler/` - Priority scheduling, backpressure, metrics
 - `uring.rs` - Linux io_uring backend
 - `posix_aio.rs` - POSIX fallback
 
-**UringIO** (Linux):
-- Opens file with `O_DIRECT`
-- Submits read/write via io_uring opcodes
-- `submit_and_wait(1)` for completion
-- Validates alignment before each operation
+**Scheduler** (`scheduler/`):
 
-**PosixIO** (non-Linux):
-- Wraps `std::fs::File` in `Arc<Mutex<>>`
-- Uses `tokio::task::spawn_blocking()` for sync I/O
-- Copies data to avoid lifetime issues with blocking task
+Two-dimensional I/O context:
+```rust
+pub enum Urgency {
+    Critical,    // Blocks COMMIT (Raft vote, txn durability)
+    Foreground,  // User query latency (SLO-bound)
+    Background,  // Flush, compaction - deferrable
+}
+
+pub enum OpKind { Read, Write, Sync }
+
+pub struct IoContext { urgency: Urgency, kind: OpKind }
+```
+
+Backpressure behavior:
+- Critical: Always processed immediately
+- Foreground: Delayed if backpressure saturated
+- Background: Delayed if any backpressure
+
+`ScheduledIOFactory` wraps any `AsyncIOFactory` to add scheduling.
+
+**Backends**:
+
+| Platform | Backend | Features |
+|----------|---------|----------|
+| Linux | `UringIO` | io_uring, O_DIRECT, 64-entry queue |
+| Other | `PosixIO` | `spawn_blocking()`, no O_DIRECT |
 
 **AlignedBuffer**:
-- `Layout::from_size_align()` for allocation
+- `Layout::from_size_align()` for 4KB alignment
 - Manual `NonNull<u8>` management
 - Implements `Send + Sync`
 
@@ -290,6 +326,7 @@ pub struct RowChange {
 - `LsmRaftStorage` (`lsm_storage.rs`): Production storage - persists log/state to LSM, rebuilds catalog on apply
 - `MemStorage` (`storage.rs`): Test-only in-memory storage
 - Log entries stored in LSM, state machine applies changes to storage and rebuilds catalog
+- Vote persistence uses `flush_critical()` (Critical I/O priority) to prevent split-brain
 
 **Read Path**: Direct to local LSM (no Raft)
 **Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM
@@ -405,7 +442,7 @@ Entry: | Key Len (2B) | Val Len (2B) | Key | Value |
 - L1 base: 10MB
 - Process: Find overlap → Merge → Write new SSTable → Update manifest
 
-**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level
+**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level. Uses atomic write pattern (temp file → fsync → rename) to prevent corruption.
 
 ### `tls.rs`
 

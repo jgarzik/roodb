@@ -38,6 +38,15 @@ pub trait StorageEngine: Send + Sync {
     /// Flush all pending writes to disk
     async fn flush(&self) -> StorageResult<()>;
 
+    /// Flush with Critical urgency for durability-critical operations
+    ///
+    /// Used for Raft vote persistence and other operations where the
+    /// sync must complete before returning to ensure durability.
+    /// Default implementation calls `flush()`.
+    async fn flush_critical(&self) -> StorageResult<()> {
+        self.flush().await
+    }
+
     /// Close the storage engine
     async fn close(&self) -> StorageResult<()>;
 }

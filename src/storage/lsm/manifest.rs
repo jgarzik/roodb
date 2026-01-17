@@ -3,6 +3,8 @@
 //! The manifest tracks which SSTables exist at each level and their key ranges.
 //! It is stored as JSON for simplicity and human readability.
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -94,12 +96,40 @@ impl Manifest {
         })
     }
 
-    /// Save manifest to disk
+    /// Save manifest to disk using atomic rename
+    ///
+    /// This ensures the manifest is never partially written:
+    /// 1. Write to a temporary file
+    /// 2. fsync the temporary file
+    /// 3. Rename to final path (atomic on POSIX)
     pub fn save(&self) -> StorageResult<()> {
         let manifest_path = self.dir.join(MANIFEST_FILE);
+        let temp_path = self.dir.join(format!("{}.tmp", MANIFEST_FILE));
+
+        // Serialize content
         let content = serde_json::to_string_pretty(&self.data)
             .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
-        std::fs::write(&manifest_path, content)?;
+
+        // Write to temporary file
+        {
+            let mut file = File::create(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            // fsync to ensure data is on disk before rename
+            file.sync_all()?;
+        }
+
+        // Atomic rename
+        std::fs::rename(&temp_path, &manifest_path)?;
+
+        // Optionally sync the directory to ensure rename is durable
+        // (Some filesystems require this for full durability)
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = File::open(&self.dir) {
+                let _ = dir.sync_all();
+            }
+        }
+
         Ok(())
     }
 

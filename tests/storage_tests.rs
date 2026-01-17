@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use roodb::io::scheduler::IoPriority;
 use roodb::io::PosixIOFactory;
 use roodb::storage::lsm::engine::LsmConfig;
 use roodb::storage::lsm::LsmEngine;
@@ -131,7 +132,9 @@ async fn test_sstable_write_read() {
 
     // Write SSTable
     {
-        let mut writer = SstableWriter::create(&factory, &path).await.unwrap();
+        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+            .await
+            .unwrap();
 
         writer
             .add(b"apple".to_vec(), Some(b"red".to_vec()))
@@ -152,7 +155,9 @@ async fn test_sstable_write_read() {
 
     // Read SSTable
     {
-        let reader = SstableReader::open(&factory, &path).await.unwrap();
+        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+            .await
+            .unwrap();
 
         // Point lookups
         let apple = reader.get(b"apple").await.unwrap();
@@ -186,7 +191,9 @@ async fn test_sstable_large() {
 
     // Write many entries (enough to span multiple blocks)
     {
-        let mut writer = SstableWriter::create(&factory, &path).await.unwrap();
+        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+            .await
+            .unwrap();
 
         for i in 0..1000u32 {
             let key = format!("key{:06}", i);
@@ -202,7 +209,9 @@ async fn test_sstable_large() {
 
     // Read back and verify
     {
-        let reader = SstableReader::open(&factory, &path).await.unwrap();
+        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+            .await
+            .unwrap();
 
         // Spot check some entries
         let key500 = reader.get(b"key000500").await.unwrap();
@@ -405,7 +414,9 @@ async fn test_uring_sstable_write_read() {
 
     // Write SSTable
     {
-        let mut writer = SstableWriter::create(&factory, &path).await.unwrap();
+        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+            .await
+            .unwrap();
 
         for i in 0..100u32 {
             let key = format!("key{:04}", i);
@@ -421,7 +432,9 @@ async fn test_uring_sstable_write_read() {
 
     // Read SSTable
     {
-        let reader = SstableReader::open(&factory, &path).await.unwrap();
+        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+            .await
+            .unwrap();
 
         let v50 = reader.get(b"key0050").await.unwrap();
         assert_eq!(v50, Some(Some(b"val0050".to_vec())));

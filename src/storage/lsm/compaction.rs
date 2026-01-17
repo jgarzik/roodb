@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 
+use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::StorageResult;
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
@@ -174,7 +175,7 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
 
     for (idx, info) in files.iter().enumerate() {
         let path = manifest.sstable_path(&info.name);
-        let reader = SstableReader::open(factory, &path).await?;
+        let reader = SstableReader::open(factory, &path, IoPriority::Compaction).await?;
         let entries = reader.scan().await?;
         for (key, value) in entries {
             all_entries.push((key, value, idx));
@@ -204,7 +205,7 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     // Write to new SSTable
     let new_name = manifest.next_sstable_name();
     let new_path = manifest.sstable_path(&new_name);
-    let mut writer = SstableWriter::create(factory, &new_path).await?;
+    let mut writer = SstableWriter::create(factory, &new_path, IoPriority::Compaction).await?;
 
     for (key, value) in &deduped {
         writer.add(key.clone(), value.clone()).await?;
