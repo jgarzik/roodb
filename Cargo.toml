@@ -13,9 +13,6 @@ thiserror = "1.0"
 # Platform detection
 cfg-if = "1.0"
 
-# Low-level OS interface
-libc = "0.2"
-
 # Raft consensus
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 
@@ -68,9 +65,10 @@ argon2 = "0.5"
 # Hex encoding
 hex = "0.4"
 
-# io_uring (Linux only)
+# Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

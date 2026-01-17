@@ -26,7 +26,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -56,8 +56,12 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: brew install mysql-client && echo "$(brew --prefix mysql-client)/bin" >> $GITHUB_PATH
 
+      - name: Install mysql client (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install mysql-cli
+
       # Run the full RooDB test suite
       # On Linux: runs single_uring, single_posix, cluster_uring, cluster_posix
-      # On macOS: runs single_posix, cluster_posix (io_uring not available)
+      # On macOS/Windows: runs single_posix, cluster_posix (io_uring not available)
       - name: Run RooDB test suite
         run: cargo test --release
