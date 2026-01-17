@@ -151,7 +151,14 @@ impl CostEstimator {
             PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
-            | PhysicalPlan::DropIndex { .. } => Cost::zero(),
+            | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateUser { .. }
+            | PhysicalPlan::DropUser { .. }
+            | PhysicalPlan::AlterUser { .. }
+            | PhysicalPlan::SetPassword { .. }
+            | PhysicalPlan::Grant { .. }
+            | PhysicalPlan::Revoke { .. }
+            | PhysicalPlan::ShowGrants { .. } => Cost::zero(),
         }
     }
 }

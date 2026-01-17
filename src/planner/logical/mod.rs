@@ -416,6 +416,58 @@ pub enum LogicalPlan {
 
     /// DROP INDEX
     DropIndex { name: String },
+
+    // ============ Auth Operations ============
+    /// CREATE USER
+    CreateUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+        if_not_exists: bool,
+    },
+
+    /// DROP USER
+    DropUser {
+        username: String,
+        host: HostPattern,
+        if_exists: bool,
+    },
+
+    /// ALTER USER
+    AlterUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+    },
+
+    /// SET PASSWORD
+    SetPassword {
+        username: String,
+        host: HostPattern,
+        password: String,
+    },
+
+    /// GRANT privileges
+    Grant {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+        with_grant_option: bool,
+    },
+
+    /// REVOKE privileges
+    Revoke {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+    },
+
+    /// SHOW GRANTS
+    ShowGrants {
+        for_user: Option<(String, HostPattern)>,
+    },
 }
 
 impl LogicalPlan {
@@ -488,6 +540,15 @@ impl LogicalPlan {
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. } => vec![],
+
+            // Auth operations don't produce output columns (except ShowGrants which returns rows)
+            LogicalPlan::CreateUser { .. }
+            | LogicalPlan::DropUser { .. }
+            | LogicalPlan::AlterUser { .. }
+            | LogicalPlan::SetPassword { .. }
+            | LogicalPlan::Grant { .. }
+            | LogicalPlan::Revoke { .. }
+            | LogicalPlan::ShowGrants { .. } => vec![],
         }
     }
 

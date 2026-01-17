@@ -146,6 +146,60 @@ impl ExplainOutput {
             PhysicalPlan::DropIndex { name } => {
                 writeln!(out, "{}DropIndex: {}", prefix, name).unwrap();
             }
+
+            PhysicalPlan::CreateUser { username, host, .. } => {
+                writeln!(out, "{}CreateUser: {}@{}", prefix, username, host.as_str()).unwrap();
+            }
+
+            PhysicalPlan::DropUser { username, host, .. } => {
+                writeln!(out, "{}DropUser: {}@{}", prefix, username, host.as_str()).unwrap();
+            }
+
+            PhysicalPlan::AlterUser { username, host, .. } => {
+                writeln!(out, "{}AlterUser: {}@{}", prefix, username, host.as_str()).unwrap();
+            }
+
+            PhysicalPlan::SetPassword { username, host, .. } => {
+                writeln!(out, "{}SetPassword: {}@{}", prefix, username, host.as_str()).unwrap();
+            }
+
+            PhysicalPlan::Grant {
+                grantee,
+                grantee_host,
+                ..
+            } => {
+                writeln!(
+                    out,
+                    "{}Grant: to {}@{}",
+                    prefix,
+                    grantee,
+                    grantee_host.as_str()
+                )
+                .unwrap();
+            }
+
+            PhysicalPlan::Revoke {
+                grantee,
+                grantee_host,
+                ..
+            } => {
+                writeln!(
+                    out,
+                    "{}Revoke: from {}@{}",
+                    prefix,
+                    grantee,
+                    grantee_host.as_str()
+                )
+                .unwrap();
+            }
+
+            PhysicalPlan::ShowGrants { for_user } => {
+                if let Some((user, host)) = for_user {
+                    writeln!(out, "{}ShowGrants: for {}@{}", prefix, user, host.as_str()).unwrap();
+                } else {
+                    writeln!(out, "{}ShowGrants: for current user", prefix).unwrap();
+                }
+            }
         }
     }
 }

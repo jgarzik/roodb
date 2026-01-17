@@ -39,7 +39,7 @@ use super::config::SchedulerConfig;
 use super::limiter::AdaptiveLimiter;
 use super::metrics::IoMetrics;
 use super::throughput::ThroughputTracker;
-use super::{IoContext, OpKind, Urgency};
+use super::{IoContext, Urgency};
 use crate::io::aligned_buffer::AlignedBuffer;
 use crate::io::error::{IoError, IoResult};
 use crate::io::traits::{AsyncIO, AsyncIOFactory};
@@ -61,18 +61,6 @@ const LRU_CLOCK_INTERVAL_MS: u64 = 100;
 struct InFlightOp {
     /// Completion channel
     tx: oneshot::Sender<IoResult<OpResult>>,
-    /// When operation started (for latency tracking)
-    #[allow(dead_code)]
-    started_at: Instant,
-    /// Operation size in bytes (for throughput tracking)
-    #[allow(dead_code)]
-    size: usize,
-    /// Urgency level (for priority decisions)
-    #[allow(dead_code)]
-    urgency: Urgency,
-    /// Operation kind (for metrics)
-    #[allow(dead_code)]
-    kind: OpKind,
 }
 
 /// Result of an I/O operation
@@ -180,20 +168,14 @@ impl<IO: AsyncIO> FileRing<IO> {
         &mut self,
         offset: u64,
         size: usize,
-        ctx: IoContext,
+        _ctx: IoContext,
     ) -> IoResult<oneshot::Receiver<IoResult<OpResult>>> {
         self.touch();
 
         let (tx, rx) = oneshot::channel();
         let op_id = self.next_op_id();
 
-        let in_flight = InFlightOp {
-            tx,
-            started_at: Instant::now(),
-            size,
-            urgency: ctx.urgency,
-            kind: ctx.kind,
-        };
+        let in_flight = InFlightOp { tx };
 
         self.in_flight.insert(op_id, in_flight);
         self.in_flight_count += 1;
@@ -220,21 +202,14 @@ impl<IO: AsyncIO> FileRing<IO> {
         &mut self,
         offset: u64,
         data: AlignedBuffer,
-        ctx: IoContext,
+        _ctx: IoContext,
     ) -> IoResult<oneshot::Receiver<IoResult<OpResult>>> {
         self.touch();
 
         let (tx, rx) = oneshot::channel();
         let op_id = self.next_op_id();
-        let size = data.len();
 
-        let in_flight = InFlightOp {
-            tx,
-            started_at: Instant::now(),
-            size,
-            urgency: ctx.urgency,
-            kind: ctx.kind,
-        };
+        let in_flight = InFlightOp { tx };
 
         self.in_flight.insert(op_id, in_flight);
         self.in_flight_count += 1;
@@ -255,20 +230,14 @@ impl<IO: AsyncIO> FileRing<IO> {
     /// Submit a sync operation
     pub async fn submit_sync(
         &mut self,
-        ctx: IoContext,
+        _ctx: IoContext,
     ) -> IoResult<oneshot::Receiver<IoResult<OpResult>>> {
         self.touch();
 
         let (tx, rx) = oneshot::channel();
         let op_id = self.next_op_id();
 
-        let in_flight = InFlightOp {
-            tx,
-            started_at: Instant::now(),
-            size: 0,
-            urgency: ctx.urgency,
-            kind: ctx.kind,
-        };
+        let in_flight = InFlightOp { tx };
 
         self.in_flight.insert(op_id, in_flight);
         self.in_flight_count += 1;

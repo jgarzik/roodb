@@ -357,13 +357,11 @@ impl Catalog {
 
     /// Create an index
     pub fn create_index(&mut self, def: IndexDef) -> CatalogResult<()> {
-        // Verify table exists
-        if !self.tables.contains_key(&def.table) {
-            return Err(CatalogError::TableNotFound(def.table.clone()));
-        }
-
-        // Verify columns exist
-        let table = self.tables.get(&def.table).unwrap();
+        // Verify table exists and get reference
+        let table = self
+            .tables
+            .get(&def.table)
+            .ok_or_else(|| CatalogError::TableNotFound(def.table.clone()))?;
         for col in &def.columns {
             if table.get_column(col).is_none() {
                 return Err(CatalogError::ColumnNotFound(def.table.clone(), col.clone()));

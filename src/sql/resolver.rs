@@ -5,7 +5,7 @@
 //! - Column names to column definitions with type information
 //! - Validates that referenced tables and columns exist
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast as sp;
 
@@ -176,7 +176,9 @@ impl<'a> Resolver<'a> {
             let col_def = table_def
                 .get_column(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let idx = table_def.get_column_index(col_name).unwrap();
+            let idx = table_def
+                .get_column_index(col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
             column_indices.push((idx, col_def.nullable, col_name.clone()));
         }
 
@@ -236,11 +238,14 @@ impl<'a> Resolver<'a> {
             }
 
             // Check NOT NULL constraints for omitted columns
+            // Build set of specified indices for O(1) lookup
+            let specified_indices: HashSet<usize> =
+                column_indices.iter().map(|(i, _, _)| *i).collect();
             for (idx, col_def) in table_def.columns.iter().enumerate() {
                 if !col_def.nullable
                     && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
                 {
-                    let was_specified = column_indices.iter().any(|(i, _, _)| *i == idx);
+                    let was_specified = specified_indices.contains(&idx);
                     if !was_specified {
                         return Err(SqlError::InvalidOperation(format!(
                             "Column '{}' cannot be NULL and was not specified",
@@ -293,7 +298,9 @@ impl<'a> Resolver<'a> {
             let col_def = table_def
                 .get_column(&col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let idx = table_def.get_column_index(&col_name).unwrap();
+            let idx = table_def
+                .get_column_index(&col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
 
             let column = ResolvedColumn {
                 table: table_name.clone(),
@@ -407,11 +414,15 @@ impl<'a> Resolver<'a> {
 
         // Handle LIMIT/OFFSET
         if let Some(sp::Expr::Value(sp::Value::Number(n, _))) = &query.limit {
-            result.limit = Some(n.parse().unwrap_or(0));
+            result.limit = Some(n.parse().map_err(|_| {
+                SqlError::InvalidOperation(format!("Invalid LIMIT value: '{}'", n))
+            })?);
         }
         if let Some(offset) = &query.offset {
             if let sp::Expr::Value(sp::Value::Number(n, _)) = &offset.value {
-                result.offset = Some(n.parse().unwrap_or(0));
+                result.offset = Some(n.parse().map_err(|_| {
+                    SqlError::InvalidOperation(format!("Invalid OFFSET value: '{}'", n))
+                })?);
             }
         }
 
@@ -570,7 +581,10 @@ impl<'a> Resolver<'a> {
                 // Expand to all columns from all tables in order
                 let mut columns = Vec::new();
                 for (table_alias, _offset) in &scope.table_order {
-                    let table_info = scope.tables.get(table_alias).unwrap();
+                    let table_info = scope
+                        .tables
+                        .get(table_alias)
+                        .ok_or_else(|| SqlError::TableNotFound(table_alias.clone()))?;
                     for (local_idx, (name, data_type, nullable)) in
                         table_info.columns.iter().enumerate()
                     {
@@ -1229,9 +1243,15 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::Boolean(b) => Ok(Literal::Boolean(*b)),
         sp::Value::Number(n, _) => {
             if n.contains('.') {
-                Ok(Literal::Float(n.parse().unwrap_or(0.0)))
+                let val = n.parse().map_err(|_| {
+                    SqlError::InvalidOperation(format!("Invalid float literal: '{}'", n))
+                })?;
+                Ok(Literal::Float(val))
             } else {
-                Ok(Literal::Integer(n.parse().unwrap_or(0)))
+                let val = n.parse().map_err(|_| {
+                    SqlError::InvalidOperation(format!("Invalid integer literal: '{}'", n))
+                })?;
+                Ok(Literal::Integer(val))
             }
         }
         sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {

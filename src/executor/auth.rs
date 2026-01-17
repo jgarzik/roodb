@@ -5,10 +5,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
 
 use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
-use crate::catalog::Catalog;
 use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::server::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
@@ -44,12 +42,12 @@ pub struct CreateUser {
     host: HostPattern,
     /// Password (plaintext, will be hashed)
     password: Option<String>,
-    /// IF NOT EXISTS flag (TODO: check for existing user)
-    _if_not_exists: bool,
+    /// IF NOT EXISTS flag
+    if_not_exists: bool,
     /// Raft node for replication
     raft_node: Arc<RaftNode>,
-    /// Catalog reference (for checking existence)
-    _catalog: Arc<RwLock<Catalog>>,
+    /// Storage for scanning existing users
+    storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
     /// Collected row changes
@@ -64,15 +62,15 @@ impl CreateUser {
         password: Option<String>,
         if_not_exists: bool,
         raft_node: Arc<RaftNode>,
-        catalog: Arc<RwLock<Catalog>>,
+        storage: Arc<dyn crate::storage::StorageEngine>,
     ) -> Self {
         CreateUser {
             username,
             host,
             password,
-            _if_not_exists: if_not_exists,
+            if_not_exists,
             raft_node,
-            _catalog: catalog,
+            storage,
             done: false,
             changes: Vec::new(),
         }
@@ -90,6 +88,38 @@ impl Executor for CreateUser {
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
         if self.done {
             return Ok(None);
+        }
+
+        // Check if user already exists
+        let prefix = table_key_prefix(SYSTEM_USERS);
+        let end = table_key_end(SYSTEM_USERS);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+
+        for (_key, value) in rows {
+            let row = super::encoding::decode_row(&value)?;
+            let uname = get_string(row.get_opt(0));
+            let host = get_string(row.get_opt(1));
+
+            if uname.as_ref() == Some(&self.username) && host.as_deref() == Some(self.host.as_str())
+            {
+                // User already exists
+                if self.if_not_exists {
+                    // Silently succeed (no-op)
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                } else {
+                    return Err(ExecutorError::Internal(format!(
+                        "User '{}@{}' already exists",
+                        self.username,
+                        self.host.as_str()
+                    )));
+                }
+            }
         }
 
         // Hash the password
@@ -265,6 +295,263 @@ impl Executor for DropUser {
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(if found { 1 } else { 0 })])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+/// ALTER USER executor - updates user password
+pub struct AlterUser {
+    /// Username
+    username: String,
+    /// Host pattern
+    host: HostPattern,
+    /// New password (plaintext, will be hashed)
+    password: Option<String>,
+    /// Raft node for replication
+    raft_node: Arc<RaftNode>,
+    /// Storage for scanning
+    storage: Arc<dyn crate::storage::StorageEngine>,
+    /// Whether execution is complete
+    done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
+}
+
+impl AlterUser {
+    /// Create a new ALTER USER executor
+    pub fn new(
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+        raft_node: Arc<RaftNode>,
+        storage: Arc<dyn crate::storage::StorageEngine>,
+    ) -> Self {
+        AlterUser {
+            username,
+            host,
+            password,
+            raft_node,
+            storage,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for AlterUser {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Find the user row
+        let prefix = table_key_prefix(SYSTEM_USERS);
+        let end = table_key_end(SYSTEM_USERS);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+
+        let mut found_key = None;
+        let mut found_row = None;
+
+        for (key, value) in rows {
+            let row = super::encoding::decode_row(&value)?;
+            let uname = get_string(row.get_opt(0));
+            let host = get_string(row.get_opt(1));
+
+            if uname.as_ref() == Some(&self.username) && host.as_deref() == Some(self.host.as_str())
+            {
+                found_key = Some(key);
+                found_row = Some(row);
+                break;
+            }
+        }
+
+        let (key, old_row) = match (found_key, found_row) {
+            (Some(k), Some(r)) => (k, r),
+            _ => {
+                return Err(ExecutorError::Internal(format!(
+                    "User '{}@{}' does not exist",
+                    self.username,
+                    self.host.as_str()
+                )));
+            }
+        };
+
+        // Build updated row with new password hash
+        let password_hash = match &self.password {
+            Some(pwd) => Datum::String(hash_password(pwd)),
+            None => Datum::String(String::new()),
+        };
+
+        // Reconstruct the row with updated password_hash (column 2)
+        let mut new_values = old_row.into_values();
+        if new_values.len() > 2 {
+            new_values[2] = password_hash;
+        }
+        let new_row = Row::new(new_values);
+        let encoded = encode_row(&new_row);
+
+        let mut changeset = ChangeSet::new(0);
+        changeset.push(RowChange::update(
+            SYSTEM_USERS,
+            key.clone(),
+            encoded.clone(),
+        ));
+        self.changes
+            .push(RowChange::update(SYSTEM_USERS, key, encoded));
+
+        self.raft_node
+            .propose_changes(changeset)
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(1)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+/// SET PASSWORD executor - simplified password update
+pub struct SetPassword {
+    /// Username
+    username: String,
+    /// Host pattern
+    host: HostPattern,
+    /// New password (plaintext, will be hashed)
+    password: String,
+    /// Raft node for replication
+    raft_node: Arc<RaftNode>,
+    /// Storage for scanning
+    storage: Arc<dyn crate::storage::StorageEngine>,
+    /// Whether execution is complete
+    done: bool,
+    /// Collected row changes
+    changes: Vec<RowChange>,
+}
+
+impl SetPassword {
+    /// Create a new SET PASSWORD executor
+    pub fn new(
+        username: String,
+        host: HostPattern,
+        password: String,
+        raft_node: Arc<RaftNode>,
+        storage: Arc<dyn crate::storage::StorageEngine>,
+    ) -> Self {
+        SetPassword {
+            username,
+            host,
+            password,
+            raft_node,
+            storage,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for SetPassword {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Find the user row
+        let prefix = table_key_prefix(SYSTEM_USERS);
+        let end = table_key_end(SYSTEM_USERS);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+
+        let mut found_key = None;
+        let mut found_row = None;
+
+        for (key, value) in rows {
+            let row = super::encoding::decode_row(&value)?;
+            let uname = get_string(row.get_opt(0));
+            let host = get_string(row.get_opt(1));
+
+            if uname.as_ref() == Some(&self.username) && host.as_deref() == Some(self.host.as_str())
+            {
+                found_key = Some(key);
+                found_row = Some(row);
+                break;
+            }
+        }
+
+        let (key, old_row) = match (found_key, found_row) {
+            (Some(k), Some(r)) => (k, r),
+            _ => {
+                return Err(ExecutorError::Internal(format!(
+                    "User '{}@{}' does not exist",
+                    self.username,
+                    self.host.as_str()
+                )));
+            }
+        };
+
+        // Build updated row with new password hash
+        let password_hash = Datum::String(hash_password(&self.password));
+
+        // Reconstruct the row with updated password_hash (column 2)
+        let mut new_values = old_row.into_values();
+        if new_values.len() > 2 {
+            new_values[2] = password_hash;
+        }
+        let new_row = Row::new(new_values);
+        let encoded = encode_row(&new_row);
+
+        let mut changeset = ChangeSet::new(0);
+        changeset.push(RowChange::update(
+            SYSTEM_USERS,
+            key.clone(),
+            encoded.clone(),
+        ));
+        self.changes
+            .push(RowChange::update(SYSTEM_USERS, key, encoded));
+
+        self.raft_node
+            .propose_changes(changeset)
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(1)])))
     }
 
     async fn close(&mut self) -> ExecutorResult<()> {

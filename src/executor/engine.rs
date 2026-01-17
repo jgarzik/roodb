@@ -12,11 +12,12 @@ use crate::raft::RaftNode;
 use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
+use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
 use super::ddl::{CreateIndex, CreateTable, DropIndex, DropTable};
 use super::delete::Delete;
 use super::distinct::HashDistinct;
-use super::error::ExecutorResult;
+use super::error::{ExecutorError, ExecutorResult};
 use super::filter::Filter;
 use super::insert::Insert;
 use super::join::NestedLoopJoin;
@@ -260,6 +261,121 @@ impl ExecutorEngine {
                 } else {
                     Ok(Box::new(DropIndex::new(name, self.catalog.clone())))
                 }
+            }
+
+            // ============ Auth Operations ============
+            PhysicalPlan::CreateUser {
+                username,
+                host,
+                password,
+                if_not_exists,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(CreateUser::new(
+                    username,
+                    host,
+                    password,
+                    if_not_exists,
+                    raft_node,
+                    self.mvcc.inner().clone(),
+                )))
+            }
+
+            PhysicalPlan::DropUser {
+                username,
+                host,
+                if_exists,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(DropUser::new(
+                    username,
+                    host,
+                    if_exists,
+                    raft_node,
+                    self.mvcc.inner().clone(),
+                )))
+            }
+
+            PhysicalPlan::Grant {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+                with_grant_option,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(Grant::new(
+                    privileges,
+                    object,
+                    grantee,
+                    grantee_host,
+                    with_grant_option,
+                    raft_node,
+                )))
+            }
+
+            PhysicalPlan::Revoke {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(Revoke::new(
+                    privileges,
+                    object,
+                    grantee,
+                    grantee_host,
+                    raft_node,
+                    self.mvcc.inner().clone(),
+                )))
+            }
+
+            PhysicalPlan::ShowGrants { for_user } => Ok(Box::new(ShowGrants::new(
+                for_user,
+                self.mvcc.inner().clone(),
+            ))),
+
+            PhysicalPlan::AlterUser {
+                username,
+                host,
+                password,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(AlterUser::new(
+                    username,
+                    host,
+                    password,
+                    raft_node,
+                    self.mvcc.inner().clone(),
+                )))
+            }
+
+            PhysicalPlan::SetPassword {
+                username,
+                host,
+                password,
+            } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("Auth operations require Raft".to_string())
+                })?;
+                Ok(Box::new(SetPassword::new(
+                    username,
+                    host,
+                    password,
+                    raft_node,
+                    self.mvcc.inner().clone(),
+                )))
             }
         }
     }

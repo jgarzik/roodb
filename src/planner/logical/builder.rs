@@ -75,16 +75,70 @@ impl LogicalPlanBuilder {
             }),
             ResolvedStatement::DropIndex { name } => Ok(LogicalPlan::DropIndex { name }),
 
-            // Auth statements are handled directly by the executor without a logical plan
-            ResolvedStatement::CreateUser { .. }
-            | ResolvedStatement::AlterUser { .. }
-            | ResolvedStatement::DropUser { .. }
-            | ResolvedStatement::SetPassword { .. }
-            | ResolvedStatement::Grant { .. }
-            | ResolvedStatement::Revoke { .. }
-            | ResolvedStatement::ShowGrants { .. } => Err(PlannerError::InvalidPlan(
-                "Auth statements do not use logical plans".to_string(),
-            )),
+            // Auth statements - passthrough to logical plan
+            ResolvedStatement::CreateUser {
+                username,
+                host,
+                password,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateUser {
+                username,
+                host,
+                password,
+                if_not_exists,
+            }),
+            ResolvedStatement::DropUser {
+                username,
+                host,
+                if_exists,
+            } => Ok(LogicalPlan::DropUser {
+                username,
+                host,
+                if_exists,
+            }),
+            ResolvedStatement::AlterUser {
+                username,
+                host,
+                password,
+            } => Ok(LogicalPlan::AlterUser {
+                username,
+                host,
+                password,
+            }),
+            ResolvedStatement::SetPassword {
+                username,
+                host,
+                password,
+            } => Ok(LogicalPlan::SetPassword {
+                username,
+                host,
+                password,
+            }),
+            ResolvedStatement::Grant {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+                with_grant_option,
+            } => Ok(LogicalPlan::Grant {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+                with_grant_option,
+            }),
+            ResolvedStatement::Revoke {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+            } => Ok(LogicalPlan::Revoke {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+            }),
+            ResolvedStatement::ShowGrants { for_user } => Ok(LogicalPlan::ShowGrants { for_user }),
         }
     }
 

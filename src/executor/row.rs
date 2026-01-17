@@ -93,6 +93,14 @@ impl Row {
         Row { values }
     }
 
+    /// Concatenate two rows by reference (avoids cloning when building join output)
+    pub fn concat_ref(left: &Row, right: &Row) -> Row {
+        let mut values = Vec::with_capacity(left.len() + right.len());
+        values.extend(left.values.iter().cloned());
+        values.extend(right.values.iter().cloned());
+        Row { values }
+    }
+
     /// Project specific columns by indices
     pub fn project(&self, indices: &[usize]) -> ExecutorResult<Row> {
         let mut values = Vec::with_capacity(indices.len());

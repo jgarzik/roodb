@@ -192,12 +192,18 @@ CREATE USER 'internal'@'192.168.%' IDENTIFIED BY 'internal_pass';
 
 ```sql
 ALTER USER 'username'@'host' IDENTIFIED BY 'new_password';
+
+-- Or use SET PASSWORD
+SET PASSWORD FOR 'username'@'host' = 'new_password';
 ```
 
 ### Removing Users
 
 ```sql
 DROP USER 'username'@'host';
+
+-- Use IF EXISTS to avoid error when user doesn't exist
+DROP USER IF EXISTS 'username'@'host';
 ```
 
 ## Privilege System

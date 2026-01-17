@@ -83,7 +83,8 @@ const TAG_TIMESTAMP: u8 = 6;
 /// Format: [num_cols:u16][datum...]
 /// Each datum: [tag:u8][data...]
 pub fn encode_row(row: &Row) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Estimate capacity: 2 bytes header + ~10 bytes per datum average
+    let mut buf = Vec::with_capacity(2 + row.len() * 10);
 
     // Number of columns
     let num_cols = row.len() as u16;

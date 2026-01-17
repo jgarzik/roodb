@@ -124,7 +124,7 @@ impl Executor for NestedLoopJoin {
                     let right_row = &self.right_rows[self.right_position];
                     self.right_position += 1;
 
-                    let combined = left_row.clone().concat(right_row.clone());
+                    let combined = Row::concat_ref(left_row, right_row);
 
                     if self.matches(&combined)? {
                         self.left_matched = true;
@@ -139,7 +139,7 @@ impl Executor for NestedLoopJoin {
                 // For left/full outer join, emit unmatched left row
                 if !self.left_matched && matches!(self.join_type, JoinType::Left | JoinType::Full) {
                     let null_right = Self::null_row(self.right_width);
-                    let combined = left_row.clone().concat(null_right);
+                    let combined = Row::concat_ref(left_row, &null_right);
 
                     // Move to next left row before returning
                     self.current_left = self.left.next().await?;

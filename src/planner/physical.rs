@@ -8,6 +8,7 @@ use crate::planner::error::PlannerResult;
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
 use crate::planner::logical::LogicalPlan;
 use crate::planner::logical::{JoinType, ResolvedColumn, ResolvedExpr};
+use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 /// Physical plan node
 #[derive(Debug, Clone)]
@@ -110,6 +111,58 @@ pub enum PhysicalPlan {
 
     /// DROP INDEX
     DropIndex { name: String },
+
+    // ============ Auth Operations ============
+    /// CREATE USER
+    CreateUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+        if_not_exists: bool,
+    },
+
+    /// DROP USER
+    DropUser {
+        username: String,
+        host: HostPattern,
+        if_exists: bool,
+    },
+
+    /// ALTER USER
+    AlterUser {
+        username: String,
+        host: HostPattern,
+        password: Option<String>,
+    },
+
+    /// SET PASSWORD
+    SetPassword {
+        username: String,
+        host: HostPattern,
+        password: String,
+    },
+
+    /// GRANT privileges
+    Grant {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+        with_grant_option: bool,
+    },
+
+    /// REVOKE privileges
+    Revoke {
+        privileges: Vec<Privilege>,
+        object: PrivilegeObject,
+        grantee: String,
+        grantee_host: HostPattern,
+    },
+
+    /// SHOW GRANTS
+    ShowGrants {
+        for_user: Option<(String, HostPattern)>,
+    },
 }
 
 impl PhysicalPlan {
@@ -180,6 +233,15 @@ impl PhysicalPlan {
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. } => vec![],
+
+            // Auth operations don't produce query output columns
+            PhysicalPlan::CreateUser { .. }
+            | PhysicalPlan::DropUser { .. }
+            | PhysicalPlan::AlterUser { .. }
+            | PhysicalPlan::SetPassword { .. }
+            | PhysicalPlan::Grant { .. }
+            | PhysicalPlan::Revoke { .. }
+            | PhysicalPlan::ShowGrants { .. } => vec![],
         }
     }
 
@@ -333,6 +395,71 @@ impl PhysicalPlanner {
             }),
 
             LogicalPlan::DropIndex { name } => Ok(PhysicalPlan::DropIndex { name }),
+
+            // Auth operations - passthrough
+            LogicalPlan::CreateUser {
+                username,
+                host,
+                password,
+                if_not_exists,
+            } => Ok(PhysicalPlan::CreateUser {
+                username,
+                host,
+                password,
+                if_not_exists,
+            }),
+            LogicalPlan::DropUser {
+                username,
+                host,
+                if_exists,
+            } => Ok(PhysicalPlan::DropUser {
+                username,
+                host,
+                if_exists,
+            }),
+            LogicalPlan::AlterUser {
+                username,
+                host,
+                password,
+            } => Ok(PhysicalPlan::AlterUser {
+                username,
+                host,
+                password,
+            }),
+            LogicalPlan::SetPassword {
+                username,
+                host,
+                password,
+            } => Ok(PhysicalPlan::SetPassword {
+                username,
+                host,
+                password,
+            }),
+            LogicalPlan::Grant {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+                with_grant_option,
+            } => Ok(PhysicalPlan::Grant {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+                with_grant_option,
+            }),
+            LogicalPlan::Revoke {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+            } => Ok(PhysicalPlan::Revoke {
+                privileges,
+                object,
+                grantee,
+                grantee_host,
+            }),
+            LogicalPlan::ShowGrants { for_user } => Ok(PhysicalPlan::ShowGrants { for_user }),
         }
     }
 }
