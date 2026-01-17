@@ -16,16 +16,26 @@
 
 pub mod backpressure;
 pub mod batch;
+pub mod batcher;
 pub mod config;
+pub mod engine;
+pub mod limiter;
 pub mod metrics;
 #[allow(clippy::module_inception)]
 pub mod scheduler;
+pub mod throughput;
 
 pub use backpressure::{BackpressureController, BackpressureLevel};
 pub use batch::PriorityQueues;
+pub use batcher::{BackgroundBatcher, BatchOp, BatchResult, PendingOp};
 pub use config::{SchedulerConfig, LARGE_CHUNK_SIZE};
+pub use engine::{
+    FileRing, IoEngine, IoEngineFactory, IoEngineHandle, OpResult, RingManager, RingManagerStats,
+};
+pub use limiter::AdaptiveLimiter;
 pub use metrics::{IoMetrics, IoMetricsSnapshot, LatencyHistogram};
 pub use scheduler::{FileHandle, IoScheduler, ScheduledHandle, ScheduledIOFactory};
+pub use throughput::ThroughputTracker;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
