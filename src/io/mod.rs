@@ -38,6 +38,9 @@ pub mod traits;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
+#[cfg(target_os = "windows")]
+pub mod iocp;
+
 pub use aligned_buffer::AlignedBuffer;
 pub use error::{IoError, IoResult};
 pub use posix_aio::{PosixIO, PosixIOFactory};
@@ -52,6 +55,9 @@ pub use scheduler::{
 #[cfg(target_os = "linux")]
 pub use uring::{UringIO, UringIOFactory};
 
+#[cfg(target_os = "windows")]
+pub use iocp::{IocpIO, IocpIOFactory};
+
 /// Default IO factory for the current platform (without scheduling)
 ///
 /// Returns io_uring on Linux, POSIX fallback elsewhere.
@@ -65,11 +71,22 @@ pub fn default_io_factory() -> UringIOFactory {
 
 /// Default IO factory for the current platform (without scheduling)
 ///
-/// Returns POSIX fallback on non-Linux platforms.
+/// Returns IOCP on Windows for high-performance direct IO.
 ///
 /// **Note**: For production use, prefer `scheduled_io_factory()` which adds
 /// backpressure, metrics, and priority-based scheduling.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn default_io_factory() -> IocpIOFactory {
+    IocpIOFactory
+}
+
+/// Default IO factory for the current platform (without scheduling)
+///
+/// Returns POSIX fallback on platforms other than Linux and Windows.
+///
+/// **Note**: For production use, prefer `scheduled_io_factory()` which adds
+/// backpressure, metrics, and priority-based scheduling.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn default_io_factory() -> PosixIOFactory {
     PosixIOFactory
 }
@@ -79,7 +96,11 @@ pub fn default_io_factory() -> PosixIOFactory {
 pub type DefaultIO = UringIO;
 
 /// Type alias for the default IO type on this platform
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub type DefaultIO = IocpIO;
+
+/// Type alias for the default IO type on this platform
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub type DefaultIO = PosixIO;
 
 /// Type alias for the default IO factory on this platform
@@ -87,7 +108,11 @@ pub type DefaultIO = PosixIO;
 pub type DefaultIOFactory = UringIOFactory;
 
 /// Type alias for the default IO factory on this platform
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub type DefaultIOFactory = IocpIOFactory;
+
+/// Type alias for the default IO factory on this platform
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub type DefaultIOFactory = PosixIOFactory;
 
 /// Type alias for a scheduled IO handle
