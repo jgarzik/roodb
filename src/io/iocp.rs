@@ -163,24 +163,22 @@ impl AsyncIO for IocpIO {
         let iocp = self.iocp;
         let capacity = buf.capacity();
 
-        // Allocate a temporary buffer for the blocking task
-        let mut temp_buf = vec![0u8; capacity];
-        let temp_ptr = temp_buf.as_mut_ptr();
-
         // Use spawn_blocking to avoid blocking the async runtime
         let bytes_read = tokio::task::spawn_blocking(move || {
             let file_handle = handle.as_handle();
             let iocp_handle = iocp.as_handle();
 
+            // Allocate buffer inside the blocking task to avoid Send issues
+            let mut temp_buf = vec![0u8; capacity];
+
             let mut overlapped = Self::create_overlapped(offset);
             let mut bytes_read: u32 = 0;
 
             // Initiate read operation
-            // SAFETY: temp_ptr points to valid memory that outlives this call
             let result = unsafe {
                 ReadFile(
                     file_handle,
-                    Some(std::slice::from_raw_parts_mut(temp_ptr, capacity)),
+                    Some(&mut temp_buf),
                     Some(&mut bytes_read),
                     Some(&mut overlapped),
                 )
@@ -391,7 +389,6 @@ impl AsyncIO for IocpIO {
                     let iocp_handle = iocp.as_handle();
 
                     let mut temp_buf = vec![0u8; size];
-                    let temp_ptr = temp_buf.as_mut_ptr();
 
                     let mut overlapped = Self::create_overlapped(offset);
                     let mut bytes_read: u32 = 0;
@@ -399,7 +396,7 @@ impl AsyncIO for IocpIO {
                     let result = unsafe {
                         ReadFile(
                             file_handle,
-                            Some(std::slice::from_raw_parts_mut(temp_ptr, size)),
+                            Some(&mut temp_buf),
                             Some(&mut bytes_read),
                             Some(&mut overlapped),
                         )
