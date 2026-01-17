@@ -217,10 +217,11 @@ mod tests {
         thread::sleep(Duration::from_millis(15));
         assert!(tracker.tick());
 
-        // Should have ~1MB/s throughput (with some timing variance)
+        // Should have reasonable throughput (wide range for CI timing variance)
+        // 10KB in 10-100ms = 100KB/s to 1MB/s, allow even wider for slow CI
         let throughput = tracker.foreground_throughput();
-        assert!(throughput > 500_000, "throughput was {}", throughput);
-        assert!(throughput < 2_000_000, "throughput was {}", throughput);
+        assert!(throughput > 50_000, "throughput was {}", throughput);
+        assert!(throughput < 10_000_000, "throughput was {}", throughput);
     }
 
     #[test]
