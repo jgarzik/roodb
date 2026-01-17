@@ -18,7 +18,7 @@ sharded-cluster workloads.
 - **LSM Storage Engine**
 - **SQL Support**: Parser (sqlparser-rs), query planner with optimizer, Volcano-style executor
 - **Cross-Platform I/O**: io_uring on Linux, async POSIX fallback on other platforms
-- **MySQL Wire Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
+- **MySQL-Compatible Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
 
 ## Quick Start
 

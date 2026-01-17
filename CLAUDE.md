@@ -36,7 +36,7 @@ RooDB is a distributed SQL database in Rust with these key design decisions:
 ### Key Types
 
 - `RooDbServer` (`src/server/listener.rs`) - Main server entry point
-- `ConnectionHandler` (`src/server/handler.rs`) - Per-connection state machine
+- `handle_connection()` (`src/server/handler.rs`) - Per-connection handling
 - `ExecutorEngine` (`src/executor/engine.rs`) - Query execution
 - `LsmEngine` (`src/storage/lsm/engine.rs`) - LSM storage backend
 - `Catalog` (`src/catalog/mod.rs`) - Schema metadata
@@ -47,8 +47,8 @@ RooDB is a distributed SQL database in Rust with these key design decisions:
 SQL string
   → Parser::parse_one() (src/sql/parser.rs)
   → LogicalPlanBuilder::build() (src/planner/logical/builder.rs)
-  → Optimizer::optimize() (src/planner/optimizer/mod.rs)
-  → PhysicalPlanner::plan() (src/planner/physical/planner.rs)
+  → Optimizer::optimize() (src/planner/optimizer.rs)
+  → PhysicalPlanner::plan() (src/planner/physical.rs)
   → ExecutorEngine::build() (src/executor/engine.rs)
   → executor.open() / .next() / .close()
 ```
@@ -79,5 +79,5 @@ Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`,
 ## Development Notes
 
 - Use `--release` mode for Raft cluster tests (timing sensitive)
-- Direct I/O requires 4KB-aligned buffers (`AlignedBuffer::page_aligned()`)
+- Direct I/O requires 4KB-aligned buffers (`AlignedBuffer::page()` or `AlignedBuffer::pages()`)
 - Debug protocol: update wrapper scripts in `/tmp/*.sh`, re-run to minimize prompts

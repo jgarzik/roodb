@@ -140,9 +140,9 @@ See `tests/raft_cluster.rs` for complete working example.
 
 On first startup with an empty data directory, RooDB:
 
-1. Creates system tables (`system.tables`, `system.columns`, `system.indexes`, `system.users`, `system.grants`)
-2. Creates the root user with password from environment variable
-3. Grants root full privileges (`ALL PRIVILEGES ON *.*`)
+1. Creates system tables (`system.tables`, `system.columns`, `system.indexes`, `system.constraints`, `system.users`, `system.grants`, `system.roles`, `system.role_grants`)
+
+**Note:** Root user initialization from environment variables (`ROODB_ROOT_PASSWORD`, `ROODB_ROOT_PASSWORD_FILE`) is not yet integrated into the main startup path. The initialization logic exists in `src/server/init.rs` but must be called explicitly.
 
 **Container deployment:**
 ```bash
@@ -321,8 +321,11 @@ Query system tables for metadata (read-only, managed by SQL commands):
 | `system.tables` | Table definitions |
 | `system.columns` | Column definitions |
 | `system.indexes` | Index definitions |
+| `system.constraints` | Table constraints |
 | `system.users` | User accounts |
 | `system.grants` | Privileges |
+| `system.roles` | Role definitions |
+| `system.role_grants` | Role-to-user assignments |
 
 **Note:** SHOW STATUS and SHOW PROCESSLIST are not yet implemented.
 

@@ -115,7 +115,7 @@ RooDB uses **InnoDB-style snapshot isolation** via MVCC. Default: `REPEATABLE RE
 | `READ UNCOMMITTED` | Partial | Falls back to READ COMMITTED |
 | `READ COMMITTED` | Yes | Each statement sees latest committed data |
 | `REPEATABLE READ` | Yes | Snapshot at first read, consistent for transaction |
-| `SERIALIZABLE` | Partial | Falls back to REPEATABLE READ (no gap locks) |
+| `SERIALIZABLE` | No | Returns error (not implemented) |
 
 **Anomaly prevention at REPEATABLE READ:**
 
