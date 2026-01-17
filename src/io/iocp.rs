@@ -4,14 +4,11 @@
 //! for high-performance direct IO operations.
 
 use std::ffi::OsStr;
-use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
@@ -26,17 +23,34 @@ use crate::io::aligned_buffer::AlignedBuffer;
 use crate::io::error::{IoError, IoResult};
 use crate::io::traits::{AsyncIO, AsyncIOFactory, PAGE_SIZE};
 
-/// IOCP-based async IO implementation for Windows
-pub struct IocpIO {
-    handle: HANDLE,
-    iocp: HANDLE,
-    inner: Arc<Mutex<IocpInner>>,
+/// A Send-safe wrapper for Windows HANDLE
+///
+/// Windows HANDLEs are safe to send between threads - the underlying
+/// kernel object is process-wide. The windows crate marks HANDLE as
+/// !Send because it contains a raw pointer, but for file and IOCP
+/// handles this is overly conservative.
+#[derive(Clone, Copy)]
+struct SendableHandle(isize);
+
+impl SendableHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle.0 as isize)
+    }
+
+    fn as_handle(self) -> HANDLE {
+        HANDLE(self.0 as *mut std::ffi::c_void)
+    }
 }
 
-/// Inner state protected by mutex for concurrent access
-struct IocpInner {
-    // State for coordinating I/O operations
-    // IOCP handles thread-safety, but we need mutex for our overlapped tracking
+// SAFETY: Windows file handles and IOCP handles are kernel objects
+// that can safely be used from any thread in the process.
+unsafe impl Send for SendableHandle {}
+unsafe impl Sync for SendableHandle {}
+
+/// IOCP-based async IO implementation for Windows
+pub struct IocpIO {
+    handle: SendableHandle,
+    iocp: SendableHandle,
 }
 
 impl IocpIO {
@@ -63,8 +77,9 @@ impl IocpIO {
                 disposition,
                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH,
                 None, // No template file
-            )?
-        };
+            )
+        }
+        .map_err(|e| IoError::Io(std::io::Error::from_raw_os_error(e.code().0 as i32)))?;
 
         if handle == INVALID_HANDLE_VALUE {
             return Err(IoError::Io(std::io::Error::last_os_error()));
@@ -73,12 +88,15 @@ impl IocpIO {
         // Create I/O completion port and associate with file handle
         let iocp = unsafe {
             CreateIoCompletionPort(
-                handle,
-                HANDLE::default(), // Create new IOCP
-                0,                 // Completion key
-                0,                 // Number of concurrent threads (0 = system default)
-            )?
-        };
+                handle, None, // Create new IOCP
+                0,    // Completion key
+                0,    // Number of concurrent threads (0 = system default)
+            )
+        }
+        .map_err(|e| {
+            unsafe { CloseHandle(handle) }.ok();
+            IoError::Io(std::io::Error::from_raw_os_error(e.code().0 as i32))
+        })?;
 
         if iocp.is_invalid() {
             unsafe { CloseHandle(handle) }.ok();
@@ -86,9 +104,8 @@ impl IocpIO {
         }
 
         Ok(Self {
-            handle,
-            iocp,
-            inner: Arc::new(Mutex::new(IocpInner {})),
+            handle: SendableHandle::new(handle),
+            iocp: SendableHandle::new(iocp),
         })
     }
 
@@ -119,45 +136,21 @@ impl IocpIO {
         overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
         overlapped
     }
-
-    /// Wait for I/O completion on the IOCP
-    fn wait_for_completion(&self) -> IoResult<u32> {
-        let mut bytes_transferred: u32 = 0;
-        let mut completion_key: usize = 0;
-        let mut overlapped_ptr: *mut OVERLAPPED = ptr::null_mut();
-
-        let result = unsafe {
-            GetQueuedCompletionStatus(
-                self.iocp,
-                &mut bytes_transferred,
-                &mut completion_key,
-                &mut overlapped_ptr,
-                u32::MAX, // INFINITE timeout
-            )
-        };
-
-        if result.is_err() {
-            return Err(IoError::Io(std::io::Error::last_os_error()));
-        }
-
-        Ok(bytes_transferred)
-    }
 }
 
 impl Drop for IocpIO {
     fn drop(&mut self) {
         // Close handles in reverse order of creation
         unsafe {
-            let _ = CloseHandle(self.iocp);
-            let _ = CloseHandle(self.handle);
+            let _ = CloseHandle(self.iocp.as_handle());
+            let _ = CloseHandle(self.handle.as_handle());
         }
     }
 }
 
 // SAFETY: IocpIO can be sent between threads because:
-// 1. HANDLE is just a pointer-sized value
-// 2. All mutable state is protected by Mutex
-// 3. Windows IOCP is designed for multi-threaded access
+// 1. SendableHandle wraps raw handle values (isize)
+// 2. Windows handles are kernel objects safe for cross-thread use
 unsafe impl Send for IocpIO {}
 unsafe impl Sync for IocpIO {}
 
@@ -168,29 +161,32 @@ impl AsyncIO for IocpIO {
 
         let handle = self.handle;
         let iocp = self.iocp;
-        let buf_ptr = buf.as_mut_ptr();
-        let buf_capacity = buf.capacity() as u32;
+        let capacity = buf.capacity();
+
+        // Allocate a temporary buffer for the blocking task
+        let mut temp_buf = vec![0u8; capacity];
+        let temp_ptr = temp_buf.as_mut_ptr();
 
         // Use spawn_blocking to avoid blocking the async runtime
         let bytes_read = tokio::task::spawn_blocking(move || {
+            let file_handle = handle.as_handle();
+            let iocp_handle = iocp.as_handle();
+
             let mut overlapped = Self::create_overlapped(offset);
             let mut bytes_read: u32 = 0;
 
             // Initiate read operation
+            // SAFETY: temp_ptr points to valid memory that outlives this call
             let result = unsafe {
                 ReadFile(
-                    handle,
-                    Some(std::slice::from_raw_parts_mut(
-                        buf_ptr,
-                        buf_capacity as usize,
-                    )),
+                    file_handle,
+                    Some(std::slice::from_raw_parts_mut(temp_ptr, capacity)),
                     Some(&mut bytes_read),
                     Some(&mut overlapped),
                 )
             };
 
-            // For overlapped I/O, ReadFile returns false with ERROR_IO_PENDING
-            // if the operation is pending
+            // For overlapped I/O, ReadFile may return error with ERROR_IO_PENDING
             if result.is_err() {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(997) {
@@ -206,7 +202,7 @@ impl AsyncIO for IocpIO {
 
             let wait_result = unsafe {
                 GetQueuedCompletionStatus(
-                    iocp,
+                    iocp_handle,
                     &mut bytes_transferred,
                     &mut completion_key,
                     &mut overlapped_ptr,
@@ -218,13 +214,16 @@ impl AsyncIO for IocpIO {
                 return Err(IoError::Io(std::io::Error::last_os_error()));
             }
 
-            Ok(bytes_transferred)
+            Ok((temp_buf, bytes_transferred))
         })
         .await
         .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
 
-        buf.set_len(bytes_read as usize);
-        Ok(bytes_read as usize)
+        let (temp_buf, bytes_transferred) = bytes_read;
+        buf.as_mut_slice()[..bytes_transferred as usize]
+            .copy_from_slice(&temp_buf[..bytes_transferred as usize]);
+        buf.set_len(bytes_transferred as usize);
+        Ok(bytes_transferred as usize)
     }
 
     async fn write_at(&self, buf: &AlignedBuffer, offset: u64) -> IoResult<usize> {
@@ -245,20 +244,23 @@ impl AsyncIO for IocpIO {
         let data = buf.as_slice()[..write_len].to_vec();
 
         let bytes_written = tokio::task::spawn_blocking(move || {
+            let file_handle = handle.as_handle();
+            let iocp_handle = iocp.as_handle();
+
             let mut overlapped = Self::create_overlapped(offset);
             let mut bytes_written: u32 = 0;
 
             // Initiate write operation
             let result = unsafe {
                 WriteFile(
-                    handle,
+                    file_handle,
                     Some(&data),
                     Some(&mut bytes_written),
                     Some(&mut overlapped),
                 )
             };
 
-            // For overlapped I/O, WriteFile returns false with ERROR_IO_PENDING
+            // For overlapped I/O, WriteFile may return error with ERROR_IO_PENDING
             if result.is_err() {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(997) {
@@ -274,7 +276,7 @@ impl AsyncIO for IocpIO {
 
             let wait_result = unsafe {
                 GetQueuedCompletionStatus(
-                    iocp,
+                    iocp_handle,
                     &mut bytes_transferred,
                     &mut completion_key,
                     &mut overlapped_ptr,
@@ -298,7 +300,8 @@ impl AsyncIO for IocpIO {
         let handle = self.handle;
 
         tokio::task::spawn_blocking(move || {
-            let result = unsafe { FlushFileBuffers(handle) };
+            let file_handle = handle.as_handle();
+            let result = unsafe { FlushFileBuffers(file_handle) };
             if result.is_err() {
                 return Err(IoError::Io(std::io::Error::last_os_error()));
             }
@@ -312,8 +315,9 @@ impl AsyncIO for IocpIO {
         let handle = self.handle;
 
         tokio::task::spawn_blocking(move || {
+            let file_handle = handle.as_handle();
             let mut size: i64 = 0;
-            let result = unsafe { GetFileSizeEx(handle, &mut size) };
+            let result = unsafe { GetFileSizeEx(file_handle, &mut size) };
             if result.is_err() {
                 return Err(IoError::Io(std::io::Error::last_os_error()));
             }
@@ -327,11 +331,13 @@ impl AsyncIO for IocpIO {
         let handle = self.handle;
 
         tokio::task::spawn_blocking(move || {
+            let file_handle = handle.as_handle();
+
             // Move file pointer to desired size
             let mut new_pos: i64 = 0;
             let result = unsafe {
                 SetFilePointerEx(
-                    handle,
+                    file_handle,
                     size as i64,
                     Some(&mut new_pos),
                     SET_FILE_POINTER_MOVE_METHOD(0), // FILE_BEGIN
@@ -342,7 +348,7 @@ impl AsyncIO for IocpIO {
             }
 
             // Set end of file at current position
-            let result = unsafe { SetEndOfFile(handle) };
+            let result = unsafe { SetEndOfFile(file_handle) };
             if result.is_err() {
                 return Err(IoError::Io(std::io::Error::last_os_error()));
             }
@@ -362,14 +368,17 @@ impl AsyncIO for IocpIO {
 
     /// Read multiple regions using parallel IOCP operations
     async fn read_batch(&self, requests: &[(u64, usize)]) -> Vec<IoResult<AlignedBuffer>> {
+        let handle = self.handle;
+        let iocp = self.iocp;
+
         // Spawn all tasks first for parallelism
         let handles: Vec<_> = requests
             .iter()
             .map(|&(offset, size)| {
-                let handle = self.handle;
-                let iocp = self.iocp;
+                let handle = handle;
+                let iocp = iocp;
 
-                tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
                     // Validate alignment
                     if !offset.is_multiple_of(PAGE_SIZE as u64) {
                         return Err(IoError::OffsetAlignment {
@@ -378,57 +387,53 @@ impl AsyncIO for IocpIO {
                         });
                     }
 
+                    let file_handle = handle.as_handle();
+                    let iocp_handle = iocp.as_handle();
+
+                    let mut temp_buf = vec![0u8; size];
+                    let temp_ptr = temp_buf.as_mut_ptr();
+
+                    let mut overlapped = Self::create_overlapped(offset);
+                    let mut bytes_read: u32 = 0;
+
+                    let result = unsafe {
+                        ReadFile(
+                            file_handle,
+                            Some(std::slice::from_raw_parts_mut(temp_ptr, size)),
+                            Some(&mut bytes_read),
+                            Some(&mut overlapped),
+                        )
+                    };
+
+                    if result.is_err() {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(997) {
+                            return Err(IoError::Io(err));
+                        }
+                    }
+
+                    let mut bytes_transferred: u32 = 0;
+                    let mut completion_key: usize = 0;
+                    let mut overlapped_ptr: *mut OVERLAPPED = ptr::null_mut();
+
+                    let wait_result = unsafe {
+                        GetQueuedCompletionStatus(
+                            iocp_handle,
+                            &mut bytes_transferred,
+                            &mut completion_key,
+                            &mut overlapped_ptr,
+                            u32::MAX,
+                        )
+                    };
+
+                    if wait_result.is_err() {
+                        return Err(IoError::Io(std::io::Error::last_os_error()));
+                    }
+
                     let mut buf = AlignedBuffer::new(size)?;
-                    let buf_ptr = buf.as_mut_ptr();
-                    let buf_capacity = buf.capacity() as u32;
-
-                    let bytes_read = tokio::task::spawn_blocking(move || {
-                        let mut overlapped = Self::create_overlapped(offset);
-                        let mut bytes_read: u32 = 0;
-
-                        let result = unsafe {
-                            ReadFile(
-                                handle,
-                                Some(std::slice::from_raw_parts_mut(
-                                    buf_ptr,
-                                    buf_capacity as usize,
-                                )),
-                                Some(&mut bytes_read),
-                                Some(&mut overlapped),
-                            )
-                        };
-
-                        if result.is_err() {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() != Some(997) {
-                                return Err(IoError::Io(err));
-                            }
-                        }
-
-                        let mut bytes_transferred: u32 = 0;
-                        let mut completion_key: usize = 0;
-                        let mut overlapped_ptr: *mut OVERLAPPED = ptr::null_mut();
-
-                        let wait_result = unsafe {
-                            GetQueuedCompletionStatus(
-                                iocp,
-                                &mut bytes_transferred,
-                                &mut completion_key,
-                                &mut overlapped_ptr,
-                                u32::MAX,
-                            )
-                        };
-
-                        if wait_result.is_err() {
-                            return Err(IoError::Io(std::io::Error::last_os_error()));
-                        }
-
-                        Ok(bytes_transferred)
-                    })
-                    .await
-                    .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
-
-                    buf.set_len(bytes_read as usize);
+                    buf.as_mut_slice()[..bytes_transferred as usize]
+                        .copy_from_slice(&temp_buf[..bytes_transferred as usize]);
+                    buf.set_len(bytes_transferred as usize);
                     Ok(buf)
                 })
             })
@@ -447,19 +452,22 @@ impl AsyncIO for IocpIO {
 
     /// Write multiple regions using parallel IOCP operations
     async fn write_batch(&self, requests: &[(u64, AlignedBuffer)]) -> Vec<IoResult<usize>> {
+        let handle = self.handle;
+        let iocp = self.iocp;
+
         // Spawn all tasks first for parallelism
         let handles: Vec<_> = requests
             .iter()
             .map(|(offset, buf)| {
-                let handle = self.handle;
-                let iocp = self.iocp;
+                let handle = handle;
+                let iocp = iocp;
                 let offset = *offset;
                 // Copy data to avoid lifetime issues
                 let write_len = AlignedBuffer::round_up(buf.len());
                 let data = buf.as_slice()[..write_len.min(buf.capacity())].to_vec();
                 let buf_capacity = buf.capacity();
 
-                tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
                     // Validate alignment
                     if !offset.is_multiple_of(PAGE_SIZE as u64) {
                         return Err(IoError::OffsetAlignment {
@@ -475,50 +483,47 @@ impl AsyncIO for IocpIO {
                         });
                     }
 
-                    let bytes_written = tokio::task::spawn_blocking(move || {
-                        let mut overlapped = Self::create_overlapped(offset);
-                        let mut bytes_written: u32 = 0;
+                    let file_handle = handle.as_handle();
+                    let iocp_handle = iocp.as_handle();
 
-                        let result = unsafe {
-                            WriteFile(
-                                handle,
-                                Some(&data),
-                                Some(&mut bytes_written),
-                                Some(&mut overlapped),
-                            )
-                        };
+                    let mut overlapped = Self::create_overlapped(offset);
+                    let mut bytes_written: u32 = 0;
 
-                        if result.is_err() {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() != Some(997) {
-                                return Err(IoError::Io(err));
-                            }
+                    let result = unsafe {
+                        WriteFile(
+                            file_handle,
+                            Some(&data),
+                            Some(&mut bytes_written),
+                            Some(&mut overlapped),
+                        )
+                    };
+
+                    if result.is_err() {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(997) {
+                            return Err(IoError::Io(err));
                         }
+                    }
 
-                        let mut bytes_transferred: u32 = 0;
-                        let mut completion_key: usize = 0;
-                        let mut overlapped_ptr: *mut OVERLAPPED = ptr::null_mut();
+                    let mut bytes_transferred: u32 = 0;
+                    let mut completion_key: usize = 0;
+                    let mut overlapped_ptr: *mut OVERLAPPED = ptr::null_mut();
 
-                        let wait_result = unsafe {
-                            GetQueuedCompletionStatus(
-                                iocp,
-                                &mut bytes_transferred,
-                                &mut completion_key,
-                                &mut overlapped_ptr,
-                                u32::MAX,
-                            )
-                        };
+                    let wait_result = unsafe {
+                        GetQueuedCompletionStatus(
+                            iocp_handle,
+                            &mut bytes_transferred,
+                            &mut completion_key,
+                            &mut overlapped_ptr,
+                            u32::MAX,
+                        )
+                    };
 
-                        if wait_result.is_err() {
-                            return Err(IoError::Io(std::io::Error::last_os_error()));
-                        }
+                    if wait_result.is_err() {
+                        return Err(IoError::Io(std::io::Error::last_os_error()));
+                    }
 
-                        Ok(bytes_transferred)
-                    })
-                    .await
-                    .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
-
-                    Ok(bytes_written as usize)
+                    Ok(bytes_transferred as usize)
                 })
             })
             .collect();
