@@ -345,6 +345,16 @@ impl Catalog {
         self.tables.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Get all table names as a HashSet (for efficient duplicate checking)
+    pub fn table_names(&self) -> std::collections::HashSet<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    /// Get all index names as a HashSet (for efficient duplicate checking)
+    pub fn index_names(&self) -> std::collections::HashSet<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
     /// Create an index
     pub fn create_index(&mut self, def: IndexDef) -> CatalogResult<()> {
         // Verify table exists

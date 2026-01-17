@@ -126,8 +126,10 @@ impl<IO: AsyncIO> FileRing<IO> {
     }
 
     /// Generate next operation ID
+    ///
+    /// Uses SeqCst ordering to ensure globally unique IDs across threads.
     fn next_op_id(&self) -> u64 {
-        self.next_op_id.fetch_add(1, Ordering::Relaxed)
+        self.next_op_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Check if ring has capacity for more operations
@@ -537,7 +539,8 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
     /// Open a file and register with the engine
     pub async fn open(&self, path: &Path, create: bool, ctx: IoContext) -> IoResult<u64> {
         let io = self.factory.open(path, create).await?;
-        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
+        // SeqCst ordering ensures globally unique file IDs across threads
+        let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 
         let ring = FileRing::new(Arc::new(io), path.to_path_buf());
 

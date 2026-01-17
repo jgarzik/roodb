@@ -73,6 +73,15 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
     }
 
     /// Flush memtable to L0 SSTable with specified priority
+    ///
+    /// # Locking
+    /// This function minimizes manifest lock contention by using a split-phase approach:
+    /// 1. Brief lock to reserve SSTable name (increment sequence)
+    /// 2. Release lock during expensive SSTable I/O operations
+    /// 3. Re-acquire lock to add metadata and save
+    ///
+    /// This allows concurrent operations to proceed while SSTable writes happen.
+    /// The sequence number reservation ensures unique file names across concurrent flushes.
     async fn flush_memtable_with_priority(
         &self,
         mem: Arc<Memtable>,
@@ -82,15 +91,18 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             return Ok(());
         }
 
-        let mut manifest = self.manifest.lock().await;
+        // Phase 1: Brief lock to reserve SSTable name
+        let (name, path) = {
+            let mut manifest = self.manifest.lock().await;
+            let name = manifest.next_sstable_name();
+            let path = manifest.sstable_path(&name);
+            // Manifest lock released here - sequence number is reserved
+            (name, path)
+        };
 
-        // Create new SSTable
-        let name = manifest.next_sstable_name();
-        let path = manifest.sstable_path(&name);
-
+        // Phase 2: Write SSTable without holding manifest lock
         let mut writer = SstableWriter::create(&*self.factory, &path, priority).await?;
 
-        // Write all entries from memtable
         let entries = mem.iter();
         for (key, value) in entries {
             writer.add(key, value).await?;
@@ -98,7 +110,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         writer.finish().await?;
 
-        // Get file metadata
+        // Get file metadata (still no lock needed)
         let size = std::fs::metadata(&path)?.len();
         let all_entries = mem.iter();
         let min_key = all_entries
@@ -110,7 +122,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
 
-        // Add to manifest
+        // Phase 3: Re-acquire lock to update manifest
+        let mut manifest = self.manifest.lock().await;
         manifest.add_sstable(
             0,
             SstableInfo {
@@ -238,26 +251,31 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             return Err(StorageError::Closed);
         }
 
+        // SNAPSHOT ISOLATION: Capture consistent point-in-time view of all data sources.
+        // We acquire manifest lock first (async), then atomically snapshot memtables.
+        // This ensures no writes can interleave between capturing the different sources.
+        let manifest = self.manifest.lock().await;
+
+        // Clone Arc pointers while holding manifest lock for atomic snapshot
+        let memtable_snapshot = Arc::clone(&*self.memtable.read());
+        let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
+
         // Collect entries from all sources
         let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
 
-        // Add from active memtable (source 0 = newest)
-        for (key, value) in self.memtable.read().scan(start, end) {
+        // Add from active memtable snapshot (source 0 = newest)
+        for (key, value) in memtable_snapshot.scan(start, end) {
             all_entries.push((key, value, 0));
         }
 
-        // Add from immutable memtables
-        {
-            let imm = self.imm_memtables.read();
-            for (idx, mem) in imm.iter().rev().enumerate() {
-                for (key, value) in mem.scan(start, end) {
-                    all_entries.push((key, value, idx + 1));
-                }
+        // Add from immutable memtables snapshot
+        for (idx, mem) in imm_snapshot.iter().rev().enumerate() {
+            for (key, value) in mem.scan(start, end) {
+                all_entries.push((key, value, idx + 1));
             }
         }
 
-        // Add from SSTables
-        let manifest = self.manifest.lock().await;
+        // Add from SSTables (manifest still locked)
         let mut source_idx = 100; // Start at higher index for SSTables
 
         for (level_num, level) in manifest.levels().iter().enumerate() {

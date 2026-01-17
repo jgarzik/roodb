@@ -112,10 +112,24 @@ fn log_key_end() -> Vec<u8> {
 /// - Last purged: `_raft:log_state:purged`
 /// - Last applied: `_raft:sm:last_applied`
 /// - Membership: `_raft:sm:membership`
+///
+/// # Locking Architecture
+///
+/// This struct uses multiple independent RwLocks. The locks are designed to be
+/// independent subsystems with no nesting requirements:
+///
+/// - `catalog` - Schema metadata. Acquired briefly during apply() for DDL changes.
+///   Never held during storage I/O operations.
+/// - `cached_*` - In-memory caches for Raft state. Each is updated independently
+///   after successful storage writes. None are held across await points.
+///
+/// **Key invariant**: Catalog lock is acquired alone, never nested with storage
+/// operations or other locks. Storage writes complete first, then catalog is updated.
 #[derive(Clone)]
 pub struct LsmRaftStorage {
     storage: Arc<dyn StorageEngine>,
-    /// Catalog reference for updating schema on DDL changes
+    /// Catalog reference for updating schema on DDL changes.
+    /// See struct-level locking documentation.
     catalog: Arc<RwLock<Catalog>>,
     // In-memory caches for hot paths
     cached_vote: Arc<RwLock<Option<Vote>>>,
@@ -710,6 +724,14 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let mut affected_indexes: HashSet<String> = HashSet::new();
         let mut dropped_indexes: HashSet<String> = HashSet::new();
 
+        // PERFORMANCE: Snapshot existing table/index names once before the loop.
+        // This avoids repeated catalog lock acquisitions for duplicate DDL detection.
+        // We'll add newly created names to these sets as we process them.
+        let (mut existing_tables, mut existing_indexes) = {
+            let catalog = self.catalog.read();
+            (catalog.table_names(), catalog.index_names())
+        };
+
         for entry in entries {
             let log_id = *entry.get_log_id();
 
@@ -771,6 +793,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                         if let Some(ref value) = change.value {
                                             // Check for duplicate table creation (race condition fix)
                                             // This makes apply() idempotent for CREATE TABLE
+                                            // Uses precomputed existing_tables set to avoid lock contention
                                             if change.table == SYSTEM_TABLES
                                                 && change.op == ChangeOp::Insert
                                             {
@@ -779,8 +802,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                         table_name,
                                                     )) = row.values().first()
                                                     {
-                                                        let catalog = self.catalog.read();
-                                                        if catalog.get_table(table_name).is_some() {
+                                                        if existing_tables.contains(table_name) {
                                                             // Table already exists - skip this insert
                                                             // This handles the race condition where two
                                                             // CREATE TABLE proposals both passed local
@@ -791,11 +813,14 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                             );
                                                             continue;
                                                         }
+                                                        // Track this table as now existing for subsequent entries
+                                                        existing_tables.insert(table_name.clone());
                                                     }
                                                 }
                                             }
 
                                             // Check for duplicate index creation
+                                            // Uses precomputed existing_indexes set to avoid lock contention
                                             if change.table == SYSTEM_INDEXES
                                                 && change.op == ChangeOp::Insert
                                             {
@@ -804,14 +829,15 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                         index_name,
                                                     )) = row.values().first()
                                                     {
-                                                        let catalog = self.catalog.read();
-                                                        if catalog.get_index(index_name).is_some() {
+                                                        if existing_indexes.contains(index_name) {
                                                             tracing::debug!(
                                                                 index = %index_name,
                                                                 "Skipping duplicate CREATE INDEX in apply()"
                                                             );
                                                             continue;
                                                         }
+                                                        // Track this index as now existing for subsequent entries
+                                                        existing_indexes.insert(index_name.clone());
                                                     }
                                                 }
                                             }

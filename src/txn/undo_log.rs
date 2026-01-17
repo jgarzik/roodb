@@ -186,6 +186,16 @@ impl UndoLog {
     }
 
     /// Get an undo record by roll_ptr
+    ///
+    /// # Locking
+    /// This function acquires two read locks in sequence:
+    /// 1. `roll_ptr_index` (read) - to map roll_ptr to (txn_id, index)
+    /// 2. `records` (read) - to retrieve the actual record
+    ///
+    /// This is safe because:
+    /// - Both are read locks (concurrent reads allowed)
+    /// - Lock ordering is consistent: always roll_ptr_index before records
+    /// - No deadlock possible since all code paths follow this order
     pub fn get_by_roll_ptr(&self, roll_ptr: u64) -> Option<UndoRecord> {
         if roll_ptr == 0 {
             return None;
@@ -236,22 +246,44 @@ impl UndoLog {
     /// # Arguments
     /// * `min_active_txn_id` - The lowest active transaction ID. Undo records for
     ///   committed transactions older than this can be purged.
+    ///
+    /// # Locking
+    /// This function acquires locks sequentially to minimize contention:
+    /// 1. `records` (write) - collect roll_ptrs and remove transaction records
+    /// 2. Release `records`
+    /// 3. `roll_ptr_index` (write) - remove index entries
+    ///
+    /// There's a brief window where the index may point to removed records, but
+    /// this is safe because purged transactions are guaranteed to be older than
+    /// any active transaction's read view (no valid lookups are possible).
     pub fn purge(&self, min_active_txn_id: u64) {
-        let mut records = self.records.write();
-        let mut index_map = self.roll_ptr_index.write();
+        // Phase 1: Collect roll_ptrs to remove and remove records
+        let roll_ptrs_to_remove: Vec<u64> = {
+            let mut records = self.records.write();
 
-        // Find transactions that can be purged
-        let txns_to_purge: Vec<u64> = records
-            .keys()
-            .filter(|&&txn_id| txn_id < min_active_txn_id)
-            .copied()
-            .collect();
+            let txns_to_purge: Vec<u64> = records
+                .keys()
+                .filter(|&&txn_id| txn_id < min_active_txn_id)
+                .copied()
+                .collect();
 
-        for txn_id in txns_to_purge {
-            if let Some(removed) = records.remove(&txn_id) {
-                for record in removed {
-                    index_map.remove(&record.roll_ptr);
+            let mut roll_ptrs = Vec::new();
+            for txn_id in txns_to_purge {
+                if let Some(removed) = records.remove(&txn_id) {
+                    for record in removed {
+                        roll_ptrs.push(record.roll_ptr);
+                    }
                 }
+            }
+            roll_ptrs
+            // records lock released here
+        };
+
+        // Phase 2: Remove from index (separate lock scope)
+        if !roll_ptrs_to_remove.is_empty() {
+            let mut index_map = self.roll_ptr_index.write();
+            for roll_ptr in roll_ptrs_to_remove {
+                index_map.remove(&roll_ptr);
             }
         }
     }
