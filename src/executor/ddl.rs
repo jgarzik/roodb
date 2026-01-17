@@ -17,7 +17,7 @@ use crate::catalog::system_tables::{
 };
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
-use crate::storage::next_row_id;
+use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use super::datum::Datum;
 use super::encoding::{encode_row, encode_row_key};
@@ -137,17 +137,26 @@ impl Executor for CreateTable {
             // Generate RowChanges for system tables and propose via Raft
             let mut changeset = ChangeSet::new(0);
 
+            // Pre-allocate row IDs: 1 for system.tables + N for system.columns
+            let column_rows = table_def_to_columns_rows(&table_def);
+            let total_ids = 1 + column_rows.len() as u64;
+            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+
             // Insert into system.tables
             let table_row = table_def_to_tables_row(&table_def);
-            let key = encode_row_key(SYSTEM_TABLES, next_row_id());
+            let row_id = encode_row_id(next_local, node_id);
+            next_local += 1;
+            let key = encode_row_key(SYSTEM_TABLES, row_id);
             let value = encode_row(&table_row);
             changeset.push(RowChange::insert(SYSTEM_TABLES, key.clone(), value.clone()));
             self.changes
                 .push(RowChange::insert(SYSTEM_TABLES, key, value));
 
             // Insert into system.columns (one row per column)
-            for col_row in table_def_to_columns_rows(&table_def) {
-                let key = encode_row_key(SYSTEM_COLUMNS, next_row_id());
+            for col_row in column_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_COLUMNS, row_id);
                 let value = encode_row(&col_row);
                 changeset.push(RowChange::insert(
                     SYSTEM_COLUMNS,
@@ -464,9 +473,13 @@ impl Executor for CreateIndex {
             // Generate RowChange for system.indexes and propose via Raft
             let mut changeset = ChangeSet::new(0);
 
+            // Allocate single row ID for system.indexes
+            let (local_id, node_id) = allocate_row_id_batch(1);
+            let row_id = encode_row_id(local_id, node_id);
+
             // Insert into system.indexes
             let index_row = index_def_to_row(&index_def);
-            let key = encode_row_key(SYSTEM_INDEXES, next_row_id());
+            let key = encode_row_key(SYSTEM_INDEXES, row_id);
             let value = encode_row(&index_row);
             changeset.push(RowChange::insert(
                 SYSTEM_INDEXES,

@@ -62,6 +62,17 @@ impl RowIdGenerator {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Allocate a batch of row IDs
+    ///
+    /// Returns the start of the allocated range. The caller owns IDs from
+    /// `start` to `start + count - 1` (inclusive).
+    ///
+    /// This reduces atomic contention by allocating many IDs at once.
+    #[inline]
+    pub fn allocate_batch(&self, count: u64) -> u64 {
+        self.next_id.fetch_add(count, Ordering::SeqCst)
+    }
+
     /// Get the current counter value (for debugging/metrics)
     pub fn current(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
@@ -89,6 +100,28 @@ pub fn next_row_id() -> u64 {
     let local = GLOBAL_ROW_ID_GEN.next();
     let node_id = NODE_ID.load(Ordering::SeqCst);
     // Encode: [16-bit node_id][48-bit local counter]
+    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
+}
+
+/// Allocate a batch of globally unique row IDs
+///
+/// Returns (start_local, node_id) where the caller owns local IDs from
+/// `start_local` to `start_local + count - 1`. Use `encode_row_id()` to
+/// convert each local ID to a full row ID.
+///
+/// This reduces atomic contention by allocating many IDs at once.
+#[inline]
+pub fn allocate_row_id_batch(count: u64) -> (u64, u64) {
+    let start_local = GLOBAL_ROW_ID_GEN.allocate_batch(count);
+    let node_id = NODE_ID.load(Ordering::SeqCst);
+    (start_local, node_id)
+}
+
+/// Encode a local counter value into a full row ID
+///
+/// Combines the node_id (high 16 bits) with the local counter (low 48 bits).
+#[inline]
+pub fn encode_row_id(local: u64, node_id: u64) -> u64 {
     (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
 }
 

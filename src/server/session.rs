@@ -1,7 +1,62 @@
 //! Session state for RooDB connections
 
 use crate::raft::RowChange;
+use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 use crate::txn::{IsolationLevel, TimeoutConfig};
+
+/// Default batch size for row ID allocation
+const ROW_ID_BATCH_SIZE: u64 = 1000;
+
+/// Pre-allocated batch of IDs for session-local allocation
+///
+/// This reduces atomic contention by allocating IDs in batches.
+/// When the batch is exhausted, a new batch is allocated from the global counter.
+#[derive(Debug, Clone)]
+pub struct IdBatch {
+    /// Next local ID to allocate
+    next_local: u64,
+    /// End of the allocated range (exclusive)
+    end_local: u64,
+    /// Node ID for encoding full row IDs
+    node_id: u64,
+}
+
+impl IdBatch {
+    /// Create an empty batch (will allocate on first use)
+    pub fn empty() -> Self {
+        Self {
+            next_local: 0,
+            end_local: 0,
+            node_id: 0,
+        }
+    }
+
+    /// Check if the batch is exhausted
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.next_local >= self.end_local
+    }
+
+    /// Get the next ID from this batch, or None if exhausted
+    #[inline]
+    pub fn next_id(&mut self) -> Option<u64> {
+        if self.next_local < self.end_local {
+            let local = self.next_local;
+            self.next_local += 1;
+            Some(encode_row_id(local, self.node_id))
+        } else {
+            None
+        }
+    }
+
+    /// Refill this batch from the global allocator
+    fn refill(&mut self, count: u64) {
+        let (start, node_id) = allocate_row_id_batch(count);
+        self.next_local = start;
+        self.end_local = start + count;
+        self.node_id = node_id;
+    }
+}
 
 /// Per-connection session state
 #[derive(Debug, Clone)]
@@ -26,6 +81,10 @@ pub struct Session {
     pub timeout_config: TimeoutConfig,
     /// Accumulated changes for explicit transaction (proposed on COMMIT)
     pending_changes: Vec<RowChange>,
+
+    // ID batching for reduced atomic contention
+    /// Pre-allocated batch of row IDs for this session
+    row_id_batch: IdBatch,
 }
 
 impl Session {
@@ -42,6 +101,8 @@ impl Session {
             is_read_only: false,
             timeout_config: TimeoutConfig::default(),
             pending_changes: Vec::new(),
+            // ID batching
+            row_id_batch: IdBatch::empty(),
         }
     }
 
@@ -127,5 +188,23 @@ impl Session {
     /// Clear pending changes without returning them (called on ROLLBACK)
     pub fn clear_pending_changes(&mut self) {
         self.pending_changes.clear();
+    }
+
+    /// Get the next row ID from this session's batch
+    ///
+    /// This reduces atomic contention by allocating IDs in batches of 1000.
+    /// When the batch is exhausted, a new batch is allocated from the global counter.
+    #[inline]
+    pub fn next_row_id(&mut self) -> u64 {
+        // Try to get from existing batch
+        if let Some(id) = self.row_id_batch.next_id() {
+            return id;
+        }
+
+        // Batch exhausted, refill and return first ID
+        self.row_id_batch.refill(ROW_ID_BATCH_SIZE);
+        self.row_id_batch
+            .next_id()
+            .expect("freshly refilled batch should have IDs")
     }
 }

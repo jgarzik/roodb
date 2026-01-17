@@ -8,7 +8,6 @@
 
 use std::env;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -22,10 +21,8 @@ use crate::executor::{Datum, Row};
 use crate::protocol::roodb::auth::compute_password_hash;
 use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::sql::Privilege;
+use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 use crate::storage::StorageEngine;
-
-/// Global row ID counter for init operations
-static INIT_ROW_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
 /// Root username
 pub const ROOT_USER: &str = "root";
@@ -137,11 +134,6 @@ pub async fn is_initialized(storage: &Arc<dyn StorageEngine>) -> Result<bool, In
     Ok(!rows.is_empty())
 }
 
-/// Generate the next row ID for init operations
-fn next_row_id() -> u64 {
-    INIT_ROW_ID.fetch_add(1, Ordering::SeqCst)
-}
-
 /// Initialize the root user and default grants
 pub async fn initialize_root_user(
     password: &str,
@@ -179,11 +171,15 @@ pub async fn initialize_root_user(
         Datum::Null,                                        // granted_at
     ]);
 
+    // Pre-allocate row IDs: 1 for user + 1 for grant
+    let (mut next_local, node_id) = allocate_row_id_batch(2);
+
     // Encode rows for storage
-    let user_key = encode_row_key(SYSTEM_USERS, next_row_id());
+    let user_key = encode_row_key(SYSTEM_USERS, encode_row_id(next_local, node_id));
+    next_local += 1;
     let user_value = encode_row(&user_row);
 
-    let grant_key = encode_row_key(SYSTEM_GRANTS, next_row_id());
+    let grant_key = encode_row_key(SYSTEM_GRANTS, encode_row_id(next_local, node_id));
     let grant_value = encode_row(&grant_row);
 
     // Create ChangeSet for Raft replication

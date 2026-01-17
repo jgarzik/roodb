@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
-use crate::storage::next_row_id;
+use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use super::context::TransactionContext;
 use super::encoding::{encode_row, encode_row_key};
@@ -16,6 +16,10 @@ use super::row::Row;
 use super::Executor;
 
 /// Insert executor
+///
+/// Uses batch allocation for row IDs to reduce atomic contention.
+/// Instead of calling next_row_id() N times (N atomics), we allocate
+/// all IDs at once in open() (1 atomic per INSERT statement).
 pub struct Insert {
     /// Table name
     table: String,
@@ -29,6 +33,10 @@ pub struct Insert {
     rows_inserted: u64,
     /// Whether execution is complete
     done: bool,
+    /// Pre-allocated row ID batch (start_local, node_id)
+    row_id_batch: Option<(u64, u64)>,
+    /// Next local ID to use from batch
+    next_local_id: u64,
 }
 
 impl Insert {
@@ -46,6 +54,8 @@ impl Insert {
             txn_context,
             rows_inserted: 0,
             done: false,
+            row_id_batch: None,
+            next_local_id: 0,
         }
     }
 }
@@ -55,6 +65,15 @@ impl Executor for Insert {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.rows_inserted = 0;
         self.done = false;
+
+        // Pre-allocate row IDs for all rows (1 atomic instead of N)
+        let row_count = self.values.len() as u64;
+        if row_count > 0 {
+            let (start_local, node_id) = allocate_row_id_batch(row_count);
+            self.row_id_batch = Some((start_local, node_id));
+            self.next_local_id = start_local;
+        }
+
         Ok(())
     }
 
@@ -62,6 +81,11 @@ impl Executor for Insert {
         if self.done {
             return Ok(None);
         }
+
+        // Get batch info (set in open())
+        let (_, node_id) = self.row_id_batch.ok_or_else(|| {
+            super::error::ExecutorError::Internal("Row ID batch not initialized".to_string())
+        })?;
 
         // Insert all rows
         let empty_row = Row::empty();
@@ -75,7 +99,10 @@ impl Executor for Insert {
             }
 
             let row = Row::new(datums);
-            let row_id = next_row_id();
+
+            // Get next row ID from pre-allocated batch
+            let row_id = encode_row_id(self.next_local_id, node_id);
+            self.next_local_id += 1;
 
             let key = encode_row_key(&self.table, row_id);
             let value = encode_row(&row);
