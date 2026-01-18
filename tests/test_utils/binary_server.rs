@@ -29,7 +29,7 @@ pub struct BinaryServer {
 impl BinaryServer {
     /// Get or initialize the global binary server instance (synchronous init)
     pub fn global() -> &'static Self {
-        BINARY_SERVER.get_or_init(|| Self::spawn_blocking())
+        BINARY_SERVER.get_or_init(Self::spawn_blocking)
     }
 
     /// Get a new connection (creates fresh pool per-call to avoid cross-runtime issues)
