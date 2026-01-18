@@ -84,3 +84,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "roodb"
 path = "src/main.rs"
+
+[[bin]]
+name = "roodb_init"
+path = "src/bin/roodb_init.rs"

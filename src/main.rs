@@ -11,6 +11,7 @@ use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
+use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::TlsConfig;
 use tracing_subscriber::EnvFilter;
@@ -52,6 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = LsmConfig { dir: data_dir };
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io_factory, storage_config).await?);
+
+    // Check if database is initialized
+    if !is_initialized(&storage).await? {
+        eprintln!("ERROR: Database not initialized. Run 'roodb_init' first.");
+        std::process::exit(1);
+    }
 
     // Initialize catalog with system tables
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));

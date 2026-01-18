@@ -8,10 +8,13 @@ mkdir -p certs
 openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt \
     -days 365 -nodes -subj "/CN=localhost"
 
-# 2. Set root password and start server
-ROODB_ROOT_PASSWORD=changeme ./roodb
+# 2. Initialize database (first time only)
+ROODB_ROOT_PASSWORD=changeme ./roodb_init ./data
 
-# 3. Connect via MySQL client
+# 3. Start server
+./roodb
+
+# 4. Connect via MySQL client
 mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ```
 
@@ -138,29 +141,67 @@ See `tests/raft_cluster.rs` for complete working example.
 
 ## First-Time Initialization
 
-On first startup with an empty data directory, RooDB:
+Database initialization is handled by the separate `roodb_init` binary. The server (`roodb`) requires an initialized database and will exit with an error if the database has not been initialized.
 
-1. Creates system tables (`system.tables`, `system.columns`, `system.indexes`, `system.constraints`, `system.users`, `system.grants`, `system.roles`, `system.role_grants`)
+### roodb_init Usage
 
-**Note:** Root user initialization from environment variables (`ROODB_ROOT_PASSWORD`, `ROODB_ROOT_PASSWORD_FILE`) is not yet integrated into the main startup path. The initialization logic exists in `src/server/init.rs` but must be called explicitly.
-
-**Container deployment:**
-```bash
-# Direct password
-docker run -e ROODB_ROOT_PASSWORD=mysecretpassword roodb
-
-# Docker secrets
-docker run -e ROODB_ROOT_PASSWORD_FILE=/run/secrets/db_password \
-    -v /path/to/secrets:/run/secrets:ro roodb
 ```
+roodb_init [data_dir]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| data_dir | ./data | Data directory path |
+
+**Exit codes:**
+- `0` - Success (initialized or already initialized - idempotent)
+- `2` - No password configured
+- `3` - Storage error
+
+### Password Configuration
+
+Set the root password via environment variable:
+
+| Variable | Description |
+|----------|-------------|
+| `ROODB_ROOT_PASSWORD` | Set root password directly |
+| `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
+
+Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
+
+### Examples
 
 **Bare metal:**
 ```bash
-export ROODB_ROOT_PASSWORD=mysecretpassword
-./roodb
+ROODB_ROOT_PASSWORD=mysecretpassword ./roodb_init ./data
+./roodb 3307 ./data ./certs/server.crt ./certs/server.key
 ```
 
-If no password environment variable is set and the database is uninitialized, the server exits with an error indicating which variable to set.
+**Container deployment:**
+```bash
+# Initialize (run once or as idempotent entrypoint)
+docker run -e ROODB_ROOT_PASSWORD=mysecretpassword -v ./data:/data roodb roodb_init /data
+
+# Start server
+docker run -v ./data:/data roodb roodb 3307 /data /certs/server.crt /certs/server.key
+```
+
+**Docker secrets:**
+```bash
+docker run -e ROODB_ROOT_PASSWORD_FILE=/run/secrets/db_password \
+    -v /path/to/secrets:/run/secrets:ro \
+    -v ./data:/data roodb roodb_init /data
+```
+
+### What Gets Initialized
+
+When `roodb_init` runs on an empty data directory:
+
+1. Creates root user (`root@%`) with the configured password
+2. Grants `ALL PRIVILEGES ON *.*` with `GRANT OPTION` to root
+3. Writes schema version marker
+
+System tables (`system.tables`, `system.columns`, etc.) are created by the catalog at server startup, not by initialization.
 
 ## User Management
 

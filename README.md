@@ -28,6 +28,27 @@ sharded-cluster workloads.
 cargo build --release
 ```
 
+### Initialize and Run
+
+```bash
+# Generate TLS certificate
+mkdir -p certs
+openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt \
+    -days 365 -nodes -subj "/CN=localhost"
+
+# Initialize database (first time only, idempotent)
+ROODB_ROOT_PASSWORD=secret ./target/release/roodb_init ./data
+
+# Start server
+./target/release/roodb 3307 ./data ./certs/server.crt ./certs/server.key
+```
+
+### Connect with Client
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
+```
+
 ### Run Tests
 
 ```bash
@@ -39,12 +60,6 @@ cargo test --release test_name
 
 # Lint
 cargo clippy --all-targets
-```
-
-### Connect with Client
-
-```bash
-mysql -h 127.0.0.1 -P 3307 -u root --ssl-mode=REQUIRED --ssl-ca=ca.pem
 ```
 
 ## Architecture

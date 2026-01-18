@@ -5,6 +5,7 @@
 pub mod error;
 pub mod lsm;
 pub mod row_id;
+pub mod schema_version;
 pub mod traits;
 
 pub use error::{StorageError, StorageResult};
