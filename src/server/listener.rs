@@ -14,7 +14,7 @@ use crate::catalog::Catalog;
 use crate::raft::RaftNode;
 use crate::server::handler::handle_connection;
 use crate::storage::{set_node_id, StorageEngine};
-use crate::tls::TlsConfig;
+use crate::tls::{RaftTlsConfig, TlsConfig};
 use crate::txn::TransactionManager;
 
 #[derive(Error, Debug)]
@@ -209,6 +209,7 @@ impl ServerHandle {
 pub async fn start_test_server(
     listener: TcpListener,
     tls_config: TlsConfig,
+    raft_tls_config: RaftTlsConfig,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
 ) -> Result<ServerHandle, ServerError> {
@@ -223,7 +224,7 @@ pub async fn start_test_server(
     let mut raft_node = RaftNode::new(
         node_id,
         raft_addr,
-        tls_config.clone(),
+        raft_tls_config,
         storage.clone(),
         catalog.clone(),
     )

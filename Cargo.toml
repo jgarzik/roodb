@@ -72,7 +72,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # MySQL client for integration tests (uses rustls with ring)
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "ring"] }

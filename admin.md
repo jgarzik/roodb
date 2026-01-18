@@ -23,7 +23,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ### Command Line Arguments
 
 ```
-./roodb [port] [data_dir] [cert_path] [key_path]
+./roodb [port] [data_dir] [cert_path] [key_path] [ca_cert_path]
 ```
 
 | Argument | Default | Description |
@@ -32,6 +32,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 | data_dir | ./data | Data directory path |
 | cert_path | ./certs/server.crt | TLS certificate |
 | key_path | ./certs/server.key | TLS private key |
+| ca_cert_path | ./certs/ca.crt | CA certificate for Raft mTLS |
 
 ### TLS Requirements
 
@@ -46,6 +47,45 @@ openssl req -x509 -newkey rsa:4096 \
 ```
 
 For production, use certificates from a trusted CA or your organization's PKI.
+
+### Raft mTLS (Inter-Node Authentication)
+
+RooDB enforces mutual TLS (mTLS) for Raft inter-node communication. Each cluster node must present a certificate signed by a trusted CA. This prevents unauthorized nodes from joining the cluster.
+
+**Certificate model:**
+- Single CA signs all node certificates
+- Each node trusts the CA and verifies peer certificates
+- Client port (3307): standard TLS (no client cert required)
+- Raft port (4307): mTLS (client cert required, verified against CA)
+
+**Generate CA and node certificates for production:**
+
+```bash
+# 1. Generate CA key and certificate
+openssl genrsa -out ca.key 4096
+openssl req -new -x509 -key ca.key -out ca.crt -days 365 -subj "/CN=RooDB CA"
+
+# 2. Generate node key and CSR
+openssl genrsa -out node1.key 4096
+openssl req -new -key node1.key -out node1.csr -subj "/CN=roodb-node1"
+
+# 3. Sign node certificate with CA
+openssl x509 -req -in node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out node1.crt -days 365 -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1")
+
+# Repeat steps 2-3 for node2, node3, etc.
+```
+
+**Starting nodes with mTLS:**
+```bash
+# Each node uses its own cert/key, same CA
+./roodb 3307 ./data1 ./node1.crt ./node1.key ./ca.crt
+./roodb 3308 ./data2 ./node2.crt ./node2.key ./ca.crt
+./roodb 3309 ./data3 ./node3.crt ./node3.key ./ca.crt
+```
+
+**Testing mTLS rejection:**
+A node with a certificate signed by a different CA will be rejected by the cluster. This protects against rogue nodes attempting to join.
 
 ### Port Configuration
 
@@ -99,7 +139,8 @@ Multi-node clusters provide high availability through Raft consensus. Currently,
 **Cluster requirements:**
 - 3 nodes minimum (tolerates 1 failure)
 - 5 nodes for higher availability (tolerates 2 failures)
-- All nodes need TLS certificates (can share or use individual)
+- All nodes need TLS certificates signed by the same CA (mTLS)
+- Shared CA certificate on all nodes for peer verification
 - Network connectivity between all nodes on Raft RPC port
 
 **Bootstrap procedure (programmatic):**
@@ -311,7 +352,8 @@ SHOW GRANTS FOR 'username'@'host';     -- Specific user
 1. Use CA-signed certificates in production
 2. Rotate certificates before expiration
 3. Store private keys with restricted permissions (600)
-4. For clusters, each node can use the same certificate or individual certificates
+4. For clusters, each node must use a certificate signed by the shared CA
+5. Protect the CA private key carefully; it can authorize new cluster members
 
 ### Network Security
 

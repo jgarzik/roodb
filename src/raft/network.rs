@@ -16,7 +16,7 @@ use crate::raft::types::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     Node, NodeId, TypeConfig, VoteRequest, VoteResponse,
 };
-use crate::tls::TlsConfig;
+use crate::tls::RaftTlsConfig;
 
 /// Create an RPC error with context about the operation and peer
 fn rpc_error<E: std::error::Error>(
@@ -67,12 +67,12 @@ impl TryFrom<u8> for MessageType {
 /// Network factory for creating Raft connections
 #[derive(Clone)]
 pub struct RaftNetworkFactoryImpl {
-    tls_config: TlsConfig,
+    tls_config: RaftTlsConfig,
     nodes: Arc<RwLock<HashMap<NodeId, SocketAddr>>>,
 }
 
 impl RaftNetworkFactoryImpl {
-    pub fn new(tls_config: TlsConfig) -> Self {
+    pub fn new(tls_config: RaftTlsConfig) -> Self {
         Self {
             tls_config,
             nodes: Arc::new(RwLock::new(HashMap::new())),
@@ -105,7 +105,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
 pub struct RaftNetworkConnection {
     target: NodeId,
     addr: Option<SocketAddr>,
-    tls_config: TlsConfig,
+    tls_config: RaftTlsConfig,
 }
 
 impl RaftNetworkConnection {

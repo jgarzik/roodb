@@ -11,7 +11,8 @@ use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
-use test_utils::certs::test_tls_config;
+use roodb::tls::RaftTlsConfig;
+use test_utils::certs::{test_raft_tls_config, write_raft_cluster_certs};
 
 /// Get a unique port for testing (based on process ID to avoid conflicts)
 fn test_port(base: u16) -> u16 {
@@ -48,9 +49,33 @@ fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
     cs
 }
 
+/// Generate mTLS configs for a 3-node cluster (CA + 3 unique node certs)
+fn generate_cluster_tls_configs() -> (
+    RaftTlsConfig,
+    RaftTlsConfig,
+    RaftTlsConfig,
+    test_utils::certs::RaftCertFiles,
+) {
+    let files = write_raft_cluster_certs();
+
+    let ca_pem = std::fs::read(&files.ca_cert_path).unwrap();
+    let node1_cert = std::fs::read(&files.node1_cert_path).unwrap();
+    let node1_key = std::fs::read(&files.node1_key_path).unwrap();
+    let node2_cert = std::fs::read(&files.node2_cert_path).unwrap();
+    let node2_key = std::fs::read(&files.node2_key_path).unwrap();
+    let node3_cert = std::fs::read(&files.node3_cert_path).unwrap();
+    let node3_key = std::fs::read(&files.node3_key_path).unwrap();
+
+    let tls1 = RaftTlsConfig::from_pem_with_ca(&node1_cert, &node1_key, &ca_pem).unwrap();
+    let tls2 = RaftTlsConfig::from_pem_with_ca(&node2_cert, &node2_key, &ca_pem).unwrap();
+    let tls3 = RaftTlsConfig::from_pem_with_ca(&node3_cert, &node3_key, &ca_pem).unwrap();
+
+    (tls1, tls2, tls3, files)
+}
+
 #[tokio::test]
 async fn test_single_node_bootstrap() {
-    let tls_config = test_tls_config();
+    let tls_config = test_raft_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15000)).parse().unwrap();
     let storage = test_storage("single_bootstrap").await;
     let catalog = test_catalog();
@@ -81,7 +106,7 @@ async fn test_single_node_bootstrap() {
 
 #[tokio::test]
 async fn test_single_node_multiple_writes() {
-    let tls_config = test_tls_config();
+    let tls_config = test_raft_tls_config();
     let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15100)).parse().unwrap();
     let storage = test_storage("single_writes").await;
     let catalog = test_catalog();
@@ -112,7 +137,7 @@ async fn test_single_node_multiple_writes() {
 
 #[tokio::test]
 async fn test_three_node_cluster_bootstrap() {
-    let tls_config = test_tls_config();
+    let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(15200);
 
     let addr1: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
@@ -126,14 +151,14 @@ async fn test_three_node_cluster_bootstrap() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    // Create nodes
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
+    // Create nodes with unique per-node mTLS certs
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
         .await
         .unwrap();
 
@@ -177,7 +202,7 @@ async fn test_three_node_cluster_bootstrap() {
 
 #[tokio::test]
 async fn test_log_replication() {
-    let tls_config = test_tls_config();
+    let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(15300);
 
     let addr1: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
@@ -191,13 +216,13 @@ async fn test_log_replication() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
         .await
         .unwrap();
 

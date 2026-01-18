@@ -13,7 +13,7 @@ use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
-use roodb::tls::TlsConfig;
+use roodb::tls::{RaftTlsConfig, TlsConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -48,10 +48,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./certs/server.key"));
 
+    let raft_ca_cert_path = args
+        .get(5)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./certs/ca.crt"));
+
     tracing::info!(port, ?data_dir, "Starting RooDB");
 
-    // Load TLS config
+    // Load TLS config for client connections (no client cert auth)
     let tls_config = TlsConfig::from_files(&cert_path, &key_path).await?;
+
+    // Load Raft TLS config with mTLS (mutual cert auth)
+    let raft_tls_config =
+        RaftTlsConfig::from_files_with_ca(&cert_path, &key_path, &raft_ca_cert_path).await?;
 
     // Initialize storage engine
     let io_factory = Arc::new(default_io_factory());
@@ -77,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raft_node = RaftNode::new(
         node_id,
         raft_addr,
-        tls_config.clone(),
+        raft_tls_config,
         storage.clone(),
         catalog.clone(),
     )

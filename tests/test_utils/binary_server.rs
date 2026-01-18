@@ -9,7 +9,7 @@ use std::time::Duration;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts};
 use tempfile::TempDir;
 
-use super::certs::write_test_cert_files;
+use super::certs::{write_raft_cluster_certs, RaftCertFiles};
 
 const TEST_PORT: u16 = 13307;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,7 +22,7 @@ pub struct BinaryServer {
     port: u16,
     opts: Opts,
     _data_dir: TempDir,
-    _cert_dir: TempDir,
+    _raft_cert_files: RaftCertFiles,
     _server_process: Child,
 }
 
@@ -71,7 +71,7 @@ impl BinaryServer {
 
         // Create temp directories
         let data_dir = TempDir::new().expect("Failed to create data temp dir");
-        let cert_files = write_test_cert_files();
+        let raft_cert_files = write_raft_cluster_certs();
 
         // Run roodb_init
         let init_status = Command::new(env!("CARGO_BIN_EXE_roodb_init"))
@@ -86,12 +86,13 @@ impl BinaryServer {
             panic!("roodb_init failed with status: {}", init_status);
         }
 
-        // Spawn roodb server
+        // Spawn roodb server with mTLS certs (use node1 cert for single-node mode)
         let server_process = Command::new(env!("CARGO_BIN_EXE_roodb"))
             .arg(TEST_PORT.to_string())
             .arg(data_dir.path())
-            .arg(&cert_files.cert_path)
-            .arg(&cert_files.key_path)
+            .arg(&raft_cert_files.node1_cert_path)
+            .arg(&raft_cert_files.node1_key_path)
+            .arg(&raft_cert_files.ca_cert_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -126,7 +127,7 @@ impl BinaryServer {
             port: TEST_PORT,
             opts,
             _data_dir: data_dir,
-            _cert_dir: cert_files._cert_dir,
+            _raft_cert_files: raft_cert_files,
             _server_process: server_process,
         }
     }
