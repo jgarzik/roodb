@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, GetFileSizeEx, ReadFile, SetEndOfFile, SetFilePointerEx,
-    WriteFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-    OPEN_EXISTING, SET_FILE_POINTER_MOVE_METHOD,
+    WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING, SET_FILE_POINTER_MOVE_METHOD,
 };
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
@@ -68,6 +68,9 @@ impl IocpIO {
         // - FILE_FLAG_OVERLAPPED: Enable async I/O via IOCP
         // - FILE_FLAG_NO_BUFFERING: Bypass filesystem cache (direct I/O)
         // - FILE_FLAG_WRITE_THROUGH: Write directly to disk for durability
+        let flags = FILE_FLAGS_AND_ATTRIBUTES(
+            FILE_FLAG_OVERLAPPED.0 | FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_WRITE_THROUGH.0,
+        );
         let handle = unsafe {
             CreateFileW(
                 windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
@@ -75,7 +78,7 @@ impl IocpIO {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None, // No security attributes
                 disposition,
-                FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+                flags,
                 None, // No template file
             )
         }
