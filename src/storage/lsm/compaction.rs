@@ -109,11 +109,11 @@ pub fn prepare_l0_compaction(manifest: &mut Manifest) -> Option<L0CompactionJob>
 
 /// Phase 2: Execute compaction I/O (without manifest lock)
 ///
-/// Returns the new SSTable info on success.
+/// Returns the new SSTable info on success, or None if all entries were tombstones.
 pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     factory: &F,
     job: &L0CompactionJob,
-) -> StorageResult<SstableInfo> {
+) -> StorageResult<Option<SstableInfo>> {
     // Load all entries from all files
     let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
 
@@ -145,6 +145,11 @@ pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         }
     }
 
+    // If all entries were tombstones, don't create an empty SSTable
+    if deduped.is_empty() {
+        return Ok(None);
+    }
+
     // Write to new SSTable
     let mut writer =
         SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
@@ -155,26 +160,27 @@ pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
 
     writer.finish().await?;
 
-    // Get file metadata
+    // Get file metadata - safe to unwrap since deduped is non-empty
     let size = std::fs::metadata(&job.output_path)?.len();
-    let min_key = deduped.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let max_key = deduped.last().map(|(k, _)| k.clone()).unwrap_or_default();
+    let min_key = deduped.first().unwrap().0.clone();
+    let max_key = deduped.last().unwrap().0.clone();
 
-    Ok(SstableInfo {
+    Ok(Some(SstableInfo {
         name: job.output_name.clone(),
         min_key,
         max_key,
         size,
-    })
+    }))
 }
 
 /// Phase 3: Finalize compaction (with manifest lock)
 ///
-/// Updates manifest and deletes old files.
+/// Updates manifest and deletes old files. If new_file is None (all entries
+/// were tombstones), only cleans up old files without adding a new one.
 pub fn finalize_l0_compaction(
     manifest: &mut Manifest,
     job: &L0CompactionJob,
-    new_file: SstableInfo,
+    new_file: Option<SstableInfo>,
 ) -> StorageResult<()> {
     // Remove old files from manifest and delete them
     for f in &job.l0_files {
@@ -192,7 +198,10 @@ pub fn finalize_l0_compaction(
         }
     }
 
-    manifest.add_sstable(1, new_file);
+    // Only add new file if there were non-tombstone entries
+    if let Some(file) = new_file {
+        manifest.add_sstable(1, file);
+    }
     manifest.save()?;
     Ok(())
 }
