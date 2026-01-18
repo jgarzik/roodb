@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, GetFileSizeEx, ReadFile, SetEndOfFile, SetFilePointerEx,
-    WriteFile, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
-    SET_FILE_POINTER_MOVE_METHOD,
+    WriteFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    OPEN_EXISTING, SET_FILE_POINTER_MOVE_METHOD,
 };
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
@@ -64,12 +64,10 @@ impl IocpIO {
 
         let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
 
-        // Open with async I/O flags:
+        // Open with direct I/O flags:
         // - FILE_FLAG_OVERLAPPED: Enable async I/O via IOCP
+        // - FILE_FLAG_NO_BUFFERING: Bypass filesystem cache (direct I/O)
         // - FILE_FLAG_WRITE_THROUGH: Write directly to disk for durability
-        // Note: FILE_FLAG_NO_BUFFERING omitted because it requires sector-aligned
-        // buffers, and we use Vec<u8> in spawn_blocking which isn't aligned.
-        // Windows buffered I/O with write-through still provides good performance.
         let handle = unsafe {
             CreateFileW(
                 windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
@@ -77,7 +75,7 @@ impl IocpIO {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None, // No security attributes
                 disposition,
-                FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH,
+                FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
                 None, // No template file
             )
         }
@@ -166,21 +164,22 @@ impl AsyncIO for IocpIO {
         let capacity = buf.capacity();
 
         // Use spawn_blocking to avoid blocking the async runtime
-        let bytes_read = tokio::task::spawn_blocking(move || {
+        // AlignedBuffer is created inside the closure for proper page alignment
+        let (aligned_buf, bytes_transferred) = tokio::task::spawn_blocking(move || {
             let file_handle = handle.as_handle();
             let iocp_handle = iocp.as_handle();
 
-            // Allocate buffer inside the blocking task to avoid Send issues
-            let mut temp_buf = vec![0u8; capacity];
+            // Create page-aligned buffer inside blocking task
+            let mut aligned_buf = AlignedBuffer::new(capacity)?;
 
             let mut overlapped = Self::create_overlapped(offset);
             let mut bytes_read: u32 = 0;
 
-            // Initiate read operation
+            // Initiate read operation directly into aligned buffer
             let result = unsafe {
                 ReadFile(
                     file_handle,
-                    Some(&mut temp_buf),
+                    Some(aligned_buf.as_mut_slice()),
                     Some(&mut bytes_read),
                     Some(&mut overlapped),
                 )
@@ -214,14 +213,15 @@ impl AsyncIO for IocpIO {
                 return Err(IoError::Io(std::io::Error::last_os_error()));
             }
 
-            Ok((temp_buf, bytes_transferred))
+            aligned_buf.set_len(bytes_transferred as usize);
+            Ok((aligned_buf, bytes_transferred))
         })
         .await
         .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
 
-        let (temp_buf, bytes_transferred) = bytes_read;
+        // Copy from aligned buffer to caller's buffer
         buf.as_mut_slice()[..bytes_transferred as usize]
-            .copy_from_slice(&temp_buf[..bytes_transferred as usize]);
+            .copy_from_slice(&aligned_buf.as_slice()[..bytes_transferred as usize]);
         buf.set_len(bytes_transferred as usize);
         Ok(bytes_transferred as usize)
     }
@@ -240,21 +240,26 @@ impl AsyncIO for IocpIO {
 
         let handle = self.handle;
         let iocp = self.iocp;
-        // Copy data to avoid lifetime issues with spawn_blocking
-        let data = buf.as_slice()[..write_len].to_vec();
+        // Copy actual data before spawn_blocking (as_slice returns only len bytes)
+        let data = buf.as_slice().to_vec();
 
         let bytes_written = tokio::task::spawn_blocking(move || {
             let file_handle = handle.as_handle();
             let iocp_handle = iocp.as_handle();
 
+            // Create page-aligned buffer inside blocking task
+            // Copy data into it; rest is zeros (padding for direct I/O alignment)
+            let mut aligned_buf = AlignedBuffer::new(write_len)?;
+            aligned_buf.as_mut_slice()[..data.len()].copy_from_slice(&data);
+
             let mut overlapped = Self::create_overlapped(offset);
             let mut bytes_written: u32 = 0;
 
-            // Initiate write operation
+            // Initiate write operation from aligned buffer
             let result = unsafe {
                 WriteFile(
                     file_handle,
-                    Some(&data),
+                    Some(&aligned_buf.as_mut_slice()[..write_len]),
                     Some(&mut bytes_written),
                     Some(&mut overlapped),
                 )
@@ -390,15 +395,17 @@ impl AsyncIO for IocpIO {
                     let file_handle = handle.as_handle();
                     let iocp_handle = iocp.as_handle();
 
-                    let mut temp_buf = vec![0u8; size];
+                    // Create page-aligned buffer inside blocking task
+                    let mut aligned_buf = AlignedBuffer::new(size)?;
 
                     let mut overlapped = Self::create_overlapped(offset);
                     let mut bytes_read: u32 = 0;
 
+                    // Read directly into aligned buffer
                     let result = unsafe {
                         ReadFile(
                             file_handle,
-                            Some(&mut temp_buf),
+                            Some(aligned_buf.as_mut_slice()),
                             Some(&mut bytes_read),
                             Some(&mut overlapped),
                         )
@@ -429,11 +436,8 @@ impl AsyncIO for IocpIO {
                         return Err(IoError::Io(std::io::Error::last_os_error()));
                     }
 
-                    let mut buf = AlignedBuffer::new(size)?;
-                    buf.as_mut_slice()[..bytes_transferred as usize]
-                        .copy_from_slice(&temp_buf[..bytes_transferred as usize]);
-                    buf.set_len(bytes_transferred as usize);
-                    Ok(buf)
+                    aligned_buf.set_len(bytes_transferred as usize);
+                    Ok(aligned_buf)
                 })
             })
             .collect();
@@ -461,9 +465,9 @@ impl AsyncIO for IocpIO {
                 let handle = handle;
                 let iocp = iocp;
                 let offset = *offset;
-                // Copy data to avoid lifetime issues
+                // Copy actual data before spawn_blocking (as_slice returns only len bytes)
                 let write_len = AlignedBuffer::round_up(buf.len());
-                let data = buf.as_slice()[..write_len.min(buf.capacity())].to_vec();
+                let data = buf.as_slice().to_vec();
                 let buf_capacity = buf.capacity();
 
                 tokio::task::spawn_blocking(move || {
@@ -485,13 +489,19 @@ impl AsyncIO for IocpIO {
                     let file_handle = handle.as_handle();
                     let iocp_handle = iocp.as_handle();
 
+                    // Create page-aligned buffer inside blocking task
+                    // Copy data into it; rest is zeros (padding for direct I/O alignment)
+                    let mut aligned_buf = AlignedBuffer::new(write_len)?;
+                    aligned_buf.as_mut_slice()[..data.len()].copy_from_slice(&data);
+
                     let mut overlapped = Self::create_overlapped(offset);
                     let mut bytes_written: u32 = 0;
 
+                    // Write from aligned buffer
                     let result = unsafe {
                         WriteFile(
                             file_handle,
-                            Some(&data),
+                            Some(&aligned_buf.as_mut_slice()[..write_len]),
                             Some(&mut bytes_written),
                             Some(&mut overlapped),
                         )
