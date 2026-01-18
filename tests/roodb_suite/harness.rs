@@ -1,135 +1,54 @@
 //! Test harness for roodb_suite integration tests.
 //!
-//! Provides TestServer for starting/stopping RooDB instances and connecting via mysql_async.
+//! Uses shared binary server for true E2E testing against actual roodb binaries.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use mysql_async::Conn;
 
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts};
-use parking_lot::RwLock;
-
-use roodb::catalog::Catalog;
-use roodb::init::initialize_database;
-use roodb::io::PosixIOFactory;
-use roodb::server::listener::{start_test_server, ServerHandle};
-use roodb::storage::lsm::{LsmConfig, LsmEngine};
-use roodb::storage::StorageEngine;
+use crate::test_utils::binary_server::BinaryServer;
 
 /// Test server instance for integration tests.
+///
+/// Wraps the shared binary server. Each test gets unique table names
+/// for isolation while sharing the same server instance.
 pub struct TestServer {
-    handle: ServerHandle,
-    port: u16,
-    storage: Arc<dyn StorageEngine>,
     #[allow(dead_code)]
-    catalog: Arc<RwLock<Catalog>>,
-    data_dir: PathBuf,
-    pool: Pool,
+    test_name: String,
 }
 
 impl TestServer {
-    /// Start a new test server with the given name (used for data directory).
+    /// Start a test session (connects to shared binary server).
     pub async fn start(name: &str) -> Self {
-        Self::start_with_password(name, "").await
-    }
-
-    /// Start a new test server with a specific root password.
-    pub async fn start_with_password(name: &str, password: &str) -> Self {
-        // Initialize tracing (only first call succeeds, subsequent are no-ops)
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("roodb=warn")
-            .try_init();
-
-        // Setup data directory
-        let data_dir = Self::test_dir(name);
-        Self::cleanup_dir(&data_dir);
-
-        // Create TLS config
-        let tls_config = crate::test_utils::certs::test_tls_config();
-
-        // Create storage and catalog
-        let factory = Arc::new(PosixIOFactory);
-        let config = LsmConfig {
-            dir: data_dir.clone(),
-        };
-        let storage: Arc<dyn StorageEngine> =
-            Arc::new(LsmEngine::open(factory, config).await.unwrap());
-        let catalog = Arc::new(RwLock::new(Catalog::new()));
-
-        // Initialize database with root user for tests
-        initialize_database(&storage, password)
-            .await
-            .expect("Failed to initialize database");
-
-        // Bind to an available port and keep the listener to avoid TOCTOU race
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        std_listener.set_nonblocking(true).unwrap();
-        let port = std_listener.local_addr().unwrap().port();
-        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-
-        // Start server with the pre-bound listener
-        let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
-            .await
-            .expect("Failed to start test server");
-
-        // Give server time to start accepting connections
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Create connection pool
-        let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
-        let opts: Opts = OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .ssl_opts(ssl_opts)
-            .max_allowed_packet(Some(16_777_216))
-            .wait_timeout(Some(28800))
-            .into();
-        let pool = Pool::new(opts);
-
-        TestServer {
-            handle,
-            port,
-            storage,
-            catalog,
-            data_dir,
-            pool,
+        // Ensure binary server is running (lazy init on first call)
+        let _ = BinaryServer::global();
+        Self {
+            test_name: name.to_string(),
         }
     }
 
-    /// Get a new connection from the pool.
+    /// Start with password - incompatible with shared server.
+    ///
+    /// # Panics
+    /// Always panics. Use `#[ignore]` on tests that require custom passwords.
+    pub async fn start_with_password(_name: &str, _password: &str) -> Self {
+        panic!(
+            "start_with_password is incompatible with shared binary server. \
+             Mark this test with #[ignore] or use a dedicated test server."
+        );
+    }
+
+    /// Get a connection from the shared pool.
     pub async fn connect(&self) -> Conn {
-        self.pool.get_conn().await.expect("Failed to connect")
+        BinaryServer::connect().await
     }
 
     /// Get the server port.
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
-        self.port
+        BinaryServer::port()
     }
 
-    /// Shutdown the server and cleanup.
+    /// Shutdown (no-op: shared server stays alive for other tests).
     pub async fn shutdown(self) {
-        // Disconnect pool
-        self.pool.disconnect().await.unwrap();
-
-        // Shutdown server
-        self.handle.shutdown();
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Close storage
-        self.storage.close().await.unwrap();
-
-        // Cleanup data directory
-        Self::cleanup_dir(&self.data_dir);
-    }
-
-    fn test_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("roodb_suite_{}_{}", name, std::process::id()));
-        path
-    }
-
-    fn cleanup_dir(path: &PathBuf) {
-        let _ = std::fs::remove_dir_all(path);
+        // No-op: the shared binary server persists for all tests
     }
 }

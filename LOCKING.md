@@ -87,14 +87,60 @@ Multiple RwLocks but NEVER nested - each acquired/released independently.
 | `memtable.size` | AtomicUsize | Approximate size tracking |
 | `imm_memtables` | parking_lot::RwLock | Pending flush memtables |
 | `manifest` | tokio::sync::Mutex | SSTable metadata |
+| `compaction_mutex` | tokio::sync::Mutex | Serializes compactions |
 | `closed` | AtomicBool | Engine shutdown flag |
 
-**Critical pattern:** Manifest lock is released before compaction:
+**Critical pattern:** Atomic memtable snapshots prevent rotation races:
+
+Both `read_all()` and `scan()` must read the active memtable and immutable memtables atomically
+to prevent entries from becoming temporarily invisible during memtable rotation:
 ```rust
-if needs_l0_compaction(&manifest) {
-    drop(manifest);  // Release before async work
-    self.maybe_compact().await?;
+// CRITICAL: Both must be read while holding memtable lock
+let (memtable_snapshot, imm_snapshot) = {
+    let mem_guard = self.memtable.read();
+    let memtable_snapshot = Arc::clone(&*mem_guard);
+    let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
+    (memtable_snapshot, imm_snapshot)
+};
+// Use snapshots outside lock for actual reads
+```
+
+Without this, a concurrent `put()` could rotate the memtable between reading the two
+structures, causing an entry to be missed (moved from memtable to imm_memtables
+between our reads).
+
+**Critical pattern:** Flush removes from imm_memtables only AFTER disk write:
+
+When flushing memtables to disk, entries must remain visible in `imm_memtables`
+until the disk write completes. Otherwise there's a visibility gap:
+```rust
+// WRONG: Entries invisible during flush
+let imm_mems = std::mem::take(&mut *imm_memtables);  // Entries gone!
+for mem in imm_mems {
+    flush_to_disk(mem).await;  // Not on disk yet - entries invisible
 }
+
+// CORRECT: Entries visible until disk write completes
+loop {
+    let mem = imm_memtables.first().cloned();  // Peek, don't remove
+    flush_to_disk(mem).await;  // Now on disk
+    imm_memtables.remove(0);  // Safe to remove
+}
+```
+
+**Critical pattern:** Compaction uses split-phase locking:
+```rust
+// Phase 1: Brief lock to prepare job
+let job = {
+    let mut manifest = self.manifest.lock().await;
+    prepare_l0_compaction(&mut manifest)
+    // Lock released here
+};
+// Phase 2: I/O without lock
+let new_file = execute_l0_compaction(&factory, &job).await?;
+// Phase 3: Re-acquire lock to finalize
+let mut manifest = self.manifest.lock().await;
+finalize_l0_compaction(&mut manifest, &job, new_file)?;
 ```
 
 ### I/O (`src/io/`)
@@ -110,6 +156,7 @@ Single lock per I/O instance; never nested.
 
 | Component | Type | Purpose |
 |-----------|------|---------|
+| `log_mutex` | tokio::sync::Mutex | Serializes log operations |
 | `cached_vote` | parking_lot::RwLock | Vote state cache |
 | `cached_last_applied` | parking_lot::RwLock | Last applied log ID |
 | `cached_membership` | parking_lot::RwLock | Cluster membership |
@@ -117,6 +164,30 @@ Single lock per I/O instance; never nested.
 | `cached_last_purged` | parking_lot::RwLock | Last purged log ID |
 | `catalog` | parking_lot::RwLock | Schema updates in apply() |
 | `nodes` | parking_lot::RwLock | Peer addresses |
+
+**Critical pattern:** Log mutex serializes log operations to establish memory barrier ordering:
+
+`LsmRaftStorage` is `Clone` with shared `Arc` fields. OpenRaft's `&mut self` methods imply
+serialized access, but clones can call methods concurrently. The `log_mutex` ensures that
+when `get_log_state()` reports log entry N exists, `try_get_log_entries()` will find it.
+
+Without the mutex, the separate locks for storage (memtable) and cache (cached_last_log_id)
+don't establish happens-before ordering across operations:
+```rust
+// Thread A: append()
+storage.put(entry_49).await;    // Acquires memtable lock
+cached_last_log_id = 49;        // Acquires cache lock
+
+// Thread B: get_log_state() then try_get_log_entries()
+// Without log_mutex, Thread B could see cache=49 but miss the memtable entry
+```
+
+**Critical pattern:** Snapshot methods protected by log_mutex for consistency:
+
+The `applied_state()`, `get_current_snapshot()`, and `build_snapshot()` methods all acquire
+`log_mutex` to ensure they see a consistent view of cached state alongside log operations.
+Without this, concurrent log appends could modify cached_last_log_id while these methods
+read cached_last_applied, leading to inconsistent state views under high concurrency.
 
 **Critical pattern:** Async work (storage scans) done before catalog lock:
 ```rust
