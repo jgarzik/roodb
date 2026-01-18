@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, GetFileSizeEx, ReadFile, SetEndOfFile, SetFilePointerEx,
-    WriteFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-    OPEN_EXISTING, SET_FILE_POINTER_MOVE_METHOD,
+    WriteFile, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+    SET_FILE_POINTER_MOVE_METHOD,
 };
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
@@ -64,10 +64,12 @@ impl IocpIO {
 
         let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
 
-        // Open with direct I/O flags:
-        // - FILE_FLAG_NO_BUFFERING: Bypass OS cache (direct I/O)
-        // - FILE_FLAG_OVERLAPPED: Enable async I/O
-        // - FILE_FLAG_WRITE_THROUGH: Write directly to disk
+        // Open with async I/O flags:
+        // - FILE_FLAG_OVERLAPPED: Enable async I/O via IOCP
+        // - FILE_FLAG_WRITE_THROUGH: Write directly to disk for durability
+        // Note: FILE_FLAG_NO_BUFFERING omitted because it requires sector-aligned
+        // buffers, and we use Vec<u8> in spawn_blocking which isn't aligned.
+        // Windows buffered I/O with write-through still provides good performance.
         let handle = unsafe {
             CreateFileW(
                 windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
@@ -75,7 +77,7 @@ impl IocpIO {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None, // No security attributes
                 disposition,
-                FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH,
+                FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH,
                 None, // No template file
             )
         }
