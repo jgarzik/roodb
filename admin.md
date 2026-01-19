@@ -122,7 +122,7 @@ data/
 Single-node deployment is production-ready and fully supported via CLI:
 
 ```bash
-ROODB_ROOT_PASSWORD=secret ./roodb --port 3307 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
+./roodb --port 3307 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
 ```
 
 The server automatically bootstraps as a single-node Raft cluster, electing itself as leader. All reads and writes are processed locally.

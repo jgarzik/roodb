@@ -2,11 +2,11 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-
-use clap::Parser;
 use std::sync::Arc;
 
+use clap::Parser;
 use parking_lot::RwLock;
+use tracing_subscriber::EnvFilter;
 
 use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
@@ -15,7 +15,6 @@ use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::{RaftTlsConfig, TlsConfig};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version = env!("CARGO_PKG_VERSION"))]
