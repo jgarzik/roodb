@@ -19,5 +19,8 @@ pub(crate) fn register_cleanup_handler() {
 
 /// Called by atexit on process exit.
 extern "C" fn cleanup_handler() {
-    super::server_manager::ServerManager::global().cleanup();
+    // Only cleanup if server was actually initialized (avoid starting server during shutdown)
+    if let Some(manager) = super::server_manager::ServerManager::try_get() {
+        manager.cleanup();
+    }
 }

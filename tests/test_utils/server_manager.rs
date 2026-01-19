@@ -38,6 +38,11 @@ struct ServerState {
 }
 
 impl ServerManager {
+    /// Get the global ServerManager if already initialized (no lazy init).
+    pub fn try_get() -> Option<&'static Self> {
+        SERVER_MANAGER.get()
+    }
+
     /// Get the global ServerManager instance (lazy init).
     pub fn global() -> &'static Self {
         SERVER_MANAGER.get_or_init(|| {
