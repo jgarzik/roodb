@@ -372,6 +372,9 @@ pub enum LogicalPlan {
     /// Remove duplicate rows
     Distinct { input: Box<LogicalPlan> },
 
+    /// Single empty row (TABLE_DEE - for expression-only queries)
+    SingleRow,
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -529,6 +532,7 @@ impl LogicalPlan {
             LogicalPlan::Sort { input, .. } => input.output_columns(),
             LogicalPlan::Limit { input, .. } => input.output_columns(),
             LogicalPlan::Distinct { input } => input.output_columns(),
+            LogicalPlan::SingleRow => vec![],
 
             // DML operations don't produce output columns for query purposes
             LogicalPlan::Insert { .. }

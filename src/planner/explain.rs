@@ -113,6 +113,10 @@ impl ExplainOutput {
                 Self::format_node(input, indent + 1, out);
             }
 
+            PhysicalPlan::SingleRow => {
+                writeln!(out, "{}SingleRow (TABLE_DEE)", prefix).unwrap();
+            }
+
             PhysicalPlan::Insert { table, values, .. } => {
                 writeln!(out, "{}Insert: {} ({} rows)", prefix, table, values.len()).unwrap();
             }

@@ -67,6 +67,9 @@ pub enum PhysicalPlan {
     /// Hash-based distinct
     HashDistinct { input: Box<PhysicalPlan> },
 
+    /// Single empty row (TABLE_DEE)
+    SingleRow,
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -224,6 +227,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { input, .. } => input.output_columns(),
             PhysicalPlan::Limit { input, .. } => input.output_columns(),
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
+            PhysicalPlan::SingleRow => vec![],
 
             // DML/DDL operations don't produce query output
             PhysicalPlan::Insert { .. }
@@ -341,6 +345,8 @@ impl PhysicalPlanner {
             LogicalPlan::Distinct { input } => Ok(PhysicalPlan::HashDistinct {
                 input: Box::new(Self::plan_node(*input)?),
             }),
+
+            LogicalPlan::SingleRow => Ok(PhysicalPlan::SingleRow),
 
             // DML passthrough
             LogicalPlan::Insert {

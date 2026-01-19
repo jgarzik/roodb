@@ -24,6 +24,7 @@ use super::join::NestedLoopJoin;
 use super::limit::Limit;
 use super::project::Project;
 use super::scan::TableScan;
+use super::single_row::SingleRow;
 use super::sort::Sort;
 use super::update::Update;
 use super::Executor;
@@ -77,6 +78,8 @@ impl ExecutorEngine {
 
     fn build_node(&self, plan: PhysicalPlan) -> ExecutorResult<Box<dyn Executor>> {
         match plan {
+            PhysicalPlan::SingleRow => Ok(Box::new(SingleRow::new())),
+
             PhysicalPlan::TableScan {
                 table,
                 columns: _,

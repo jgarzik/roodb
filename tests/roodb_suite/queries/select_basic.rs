@@ -128,7 +128,7 @@ async fn test_select_literal() {
     let server = TestServer::start("select_literal").await;
     let mut conn = server.connect().await;
 
-    // We need a table for SELECT (RooDB doesn't support SELECT without FROM)
+    // Test SELECT with literals mixed with table data
     conn.query_drop("CREATE TABLE select_lit_tbl (x INT)")
         .await
         .expect("CREATE TABLE failed");
@@ -232,6 +232,67 @@ async fn test_select_table_alias() {
     conn.query_drop("DROP TABLE select_alias2_tbl")
         .await
         .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_select_without_from() {
+    let server = TestServer::start("select_no_from").await;
+    let mut conn = server.connect().await;
+
+    // Simple literal
+    let rows: Vec<(i64,)> = conn.query("SELECT 1").await.expect("SELECT 1 failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+
+    // Expression
+    let rows: Vec<(i64,)> = conn
+        .query("SELECT 1 + 2 * 3")
+        .await
+        .expect("SELECT expression failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 7);
+
+    // String literal
+    let rows: Vec<(String,)> = conn
+        .query("SELECT 'hello'")
+        .await
+        .expect("SELECT string failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "hello");
+
+    // Multiple expressions
+    let rows: Vec<(i64, String, i64)> = conn
+        .query("SELECT 42, 'world', 10 - 3")
+        .await
+        .expect("SELECT multiple failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (42, "world".to_string(), 7));
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_select_without_from_functions() {
+    let server = TestServer::start("select_no_from_fn").await;
+    let mut conn = server.connect().await;
+
+    // String functions
+    let rows: Vec<(String,)> = conn
+        .query("SELECT UPPER('hello')")
+        .await
+        .expect("SELECT UPPER failed");
+    assert_eq!(rows[0].0, "HELLO");
+
+    // COALESCE
+    let rows: Vec<(i64,)> = conn
+        .query("SELECT COALESCE(NULL, 42)")
+        .await
+        .expect("SELECT COALESCE failed");
+    assert_eq!(rows[0].0, 42);
 
     drop(conn);
     server.shutdown().await;

@@ -148,6 +148,12 @@ impl CostEstimator {
                 io: Self::DEFAULT_TABLE_ROWS / 100.0,
             },
 
+            PhysicalPlan::SingleRow => Cost {
+                rows: 1.0,
+                cpu: 1.0,
+                io: 0.0,
+            },
+
             PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
