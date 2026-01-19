@@ -9,9 +9,9 @@ on:
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same branch
+# Cancel in-progress runs for the same branch or PR head
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:

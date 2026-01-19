@@ -3,7 +3,7 @@ name: container
 on:
   # Build validation on PRs (no push)
   pull_request:
-  # Build and push only after CI passes on main/tags
+  # Build and push only after CI passes on main
   workflow_run:
     workflows: [CI]
     types: [completed]
@@ -16,9 +16,9 @@ permissions:
   contents: read
   packages: write
 
-# Cancel in-progress runs for the same branch
+# Cancel in-progress runs for the same branch (handles workflow_run source branch)
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -67,6 +67,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tags are set in merge job; build job only needs labels for digest push
 
       - name: Build and push by digest
         id: build
@@ -75,7 +76,13 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          # For PRs: build only (no push). For workflow_run/tags: push by digest.
+          outputs: >-
+            type=image,
+            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
+            push-by-digest=true,
+            name-canonical=true,
+            push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
@@ -133,9 +140,18 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          set -euo pipefail
+          shopt -s nullglob
+          digests=( * )
+          if [ "${#digests[@]}" -lt 2 ]; then
+            echo "Error: expected 2 digest files (amd64 + arm64), found ${#digests[@]}" >&2
+            echo "Files present: ${digests[*]:-none}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' "${digests[@]}")
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
