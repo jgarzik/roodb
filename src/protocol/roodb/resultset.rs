@@ -126,6 +126,31 @@ pub fn encode_ok_packet(
     buf
 }
 
+/// Encode an OK packet as EOF replacement (for DEPRECATE_EOF)
+///
+/// When CLIENT_DEPRECATE_EOF is set, the final OK packet in a result set
+/// uses 0xFE header instead of 0x00 to distinguish it from regular OK.
+pub fn encode_eof_ok_packet(status: u16, warnings: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+
+    // Header (0xFE = EOF/OK replacement)
+    buf.push(0xfe);
+
+    // affected_rows = 0 (length-encoded int)
+    buf.push(0x00);
+
+    // last_insert_id = 0 (length-encoded int)
+    buf.push(0x00);
+
+    // status_flags (2 bytes)
+    buf.extend_from_slice(&status.to_le_bytes());
+
+    // warnings (2 bytes)
+    buf.extend_from_slice(&warnings.to_le_bytes());
+
+    buf
+}
+
 /// Encode an ERR packet
 pub fn encode_err_packet(error_code: u16, sql_state: &str, message: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + message.len());

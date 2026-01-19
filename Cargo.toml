@@ -32,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # TLS (required - no plaintext networking)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rustls-pemfile = "2"
@@ -72,9 +72,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-# MySQL client for integration tests (uses rustls with ring)
-mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "ring"] }
+# MySQL client for integration tests (uses rustls with aws-lc-rs)
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
 
 [lib]
 name = "roodb"

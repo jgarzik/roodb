@@ -282,6 +282,21 @@ pub fn decode_length_encoded_string(data: &[u8]) -> ProtocolResult<(String, usiz
     Ok((s, header_size + len))
 }
 
+/// Decode length-encoded binary data, returns (bytes, bytes_consumed)
+pub fn decode_length_encoded_bytes(data: &[u8]) -> ProtocolResult<(Vec<u8>, usize)> {
+    let (len, header_size) = decode_length_encoded_int(data)?;
+    let len = len as usize;
+
+    if data.len() < header_size + len {
+        return Err(ProtocolError::InvalidPacket("truncated bytes".to_string()));
+    }
+
+    Ok((
+        data[header_size..header_size + len].to_vec(),
+        header_size + len,
+    ))
+}
+
 /// Decode a null-terminated string
 pub fn decode_null_terminated_string(data: &[u8]) -> ProtocolResult<(String, usize)> {
     let null_pos = data
