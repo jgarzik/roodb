@@ -23,11 +23,11 @@ fi
 # Initialize database if not already initialized
 # roodb_init is idempotent - exits 0 if already initialized
 echo "Checking database initialization..."
-if ! roodb_init "$DATA_DIR"; then
+if ! roodb_init --data-dir "$DATA_DIR"; then
     echo "ERROR: Database initialization failed"
     exit 1
 fi
 
 # Start the server
 echo "Starting RooDB server on port $PORT..."
-exec roodb "$PORT" "$DATA_DIR" "$CERT_PATH" "$KEY_PATH" "$CA_CERT_PATH"
+exec roodb --port "$PORT" --data-dir "$DATA_DIR" --cert-path "$CERT_PATH" --key-path "$KEY_PATH" --raft-ca-cert-path "$CA_CERT_PATH"

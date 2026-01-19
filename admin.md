@@ -9,7 +9,7 @@ openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.cr
     -days 365 -nodes -subj "/CN=localhost"
 
 # 2. Initialize database (first time only)
-ROODB_ROOT_PASSWORD=changeme ./roodb_init ./data
+ROODB_ROOT_PASSWORD=changeme ./roodb_init --data-dir ./data
 
 # 3. Start server
 ./roodb
@@ -23,7 +23,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ### Command Line Arguments
 
 ```
-./roodb [port] [data_dir] [cert_path] [key_path] [ca_cert_path]
+./roodb --port PORT --data-dir PATH --cert-path PATH --key-path PATH --raft-ca-cert-path PATH
 ```
 
 | Argument | Default | Description |
@@ -79,9 +79,9 @@ openssl x509 -req -in node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 **Starting nodes with mTLS:**
 ```bash
 # Each node uses its own cert/key, same CA
-./roodb 3307 ./data1 ./node1.crt ./node1.key ./ca.crt
-./roodb 3308 ./data2 ./node2.crt ./node2.key ./ca.crt
-./roodb 3309 ./data3 ./node3.crt ./node3.key ./ca.crt
+./roodb --port 3307 --data-dir ./data1 --cert-path ./node1.crt --key-path ./node1.key --raft-ca-cert-path ./ca.crt
+./roodb --port 3308 --data-dir ./data2 --cert-path ./node2.crt --key-path ./node2.key --raft-ca-cert-path ./ca.crt
+./roodb --port 3309 --data-dir ./data3 --cert-path ./node3.crt --key-path ./node3.key --raft-ca-cert-path ./ca.crt
 ```
 
 **Testing mTLS rejection:**
@@ -122,7 +122,7 @@ data/
 Single-node deployment is production-ready and fully supported via CLI:
 
 ```bash
-ROODB_ROOT_PASSWORD=secret ./roodb 3307 ./data ./certs/server.crt ./certs/server.key
+ROODB_ROOT_PASSWORD=secret ./roodb --port 3307 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
 ```
 
 The server automatically bootstraps as a single-node Raft cluster, electing itself as leader. All reads and writes are processed locally.
@@ -187,7 +187,7 @@ Database initialization is handled by the separate `roodb_init` binary. The serv
 ### roodb_init Usage
 
 ```
-roodb_init [data_dir]
+roodb_init --data-dir PATH
 ```
 
 | Argument | Default | Description |
@@ -214,24 +214,24 @@ Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`
 
 **Bare metal:**
 ```bash
-ROODB_ROOT_PASSWORD=mysecretpassword ./roodb_init ./data
-./roodb 3307 ./data ./certs/server.crt ./certs/server.key
+ROODB_ROOT_PASSWORD=mysecretpassword ./roodb_init --data-dir ./data
+./roodb --port 3307 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
 ```
 
 **Container deployment:**
 ```bash
 # Initialize (run once or as idempotent entrypoint)
-docker run -e ROODB_ROOT_PASSWORD=mysecretpassword -v ./data:/data roodb roodb_init /data
+docker run -e ROODB_ROOT_PASSWORD=mysecretpassword -v ./data:/data roodb roodb_init --data-dir /data
 
 # Start server
-docker run -v ./data:/data roodb roodb 3307 /data /certs/server.crt /certs/server.key
+docker run -v ./data:/data roodb roodb --port 3307 --data-dir /data --cert-path /certs/server.crt --key-path /certs/server.key
 ```
 
 **Docker secrets:**
 ```bash
 docker run -e ROODB_ROOT_PASSWORD_FILE=/run/secrets/db_password \
     -v /path/to/secrets:/run/secrets:ro \
-    -v ./data:/data roodb roodb_init /data
+    -v ./data:/data roodb roodb_init --data-dir /data
 ```
 
 ### What Gets Initialized
@@ -486,7 +486,7 @@ Raft handles node failures automatically:
 cp -r ./backup/data-20240115 ./data
 
 # Start single node
-ROODB_ROOT_PASSWORD=secret ./roodb
+./roodb
 
 # Verify data
 mysql -h 127.0.0.1 -P 3307 -u root -p -e "SELECT COUNT(*) FROM mydb.mytable"

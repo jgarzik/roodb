@@ -1,8 +1,9 @@
 //! RooDB server binary
 
-use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use clap::Parser;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -16,6 +17,22 @@ use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::{RaftTlsConfig, TlsConfig};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Parser)]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "RooDB distributed SQL database server")]
+struct Cli {
+    #[arg(long, default_value = "3307", env = "ROODB_PORT")]
+    port: u16,
+    #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
+    data_dir: PathBuf,
+    #[arg(long, default_value = "./certs/server.crt", env = "ROODB_CERT_PATH")]
+    cert_path: PathBuf,
+    #[arg(long, default_value = "./certs/server.key", env = "ROODB_KEY_PATH")]
+    key_path: PathBuf,
+    #[arg(long, default_value = "./certs/ca.crt", env = "ROODB_CA_CERT_PATH")]
+    raft_ca_cert_path: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize rustls crypto provider
@@ -28,30 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Parse CLI args (minimal for now)
-    let args: Vec<String> = env::args().collect();
-
-    let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3307);
-
-    let data_dir = args
-        .get(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./data"));
-
-    let cert_path = args
-        .get(3)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./certs/server.crt"));
-
-    let key_path = args
-        .get(4)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./certs/server.key"));
-
-    let raft_ca_cert_path = args
-        .get(5)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./certs/ca.crt"));
+    // Parse CLI args
+    let Cli {
+        port,
+        data_dir,
+        cert_path,
+        key_path,
+        raft_ca_cert_path,
+    } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
 

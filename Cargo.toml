@@ -1,6 +1,6 @@
 [package]
 name = "roodb"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 
 # Error handling
 thiserror = "1.0"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
 
 # Platform detection
 cfg-if = "1.0"
