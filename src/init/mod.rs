@@ -1,6 +1,8 @@
-//! First-time initialization for RooDB
+//! Database initialization for RooDB
 //!
-//! Handles environment variable-based initialization for container deployments.
+//! This module handles first-time database initialization, creating the root user
+//! and setting up required system state. Initialization uses direct storage writes
+//! (no Raft) and should be run before starting the server.
 //!
 //! Environment Variables:
 //! - `ROODB_ROOT_PASSWORD` - Set root password directly
@@ -10,18 +12,14 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{error, info};
 
 use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
-use crate::catalog::Catalog;
-use crate::executor::encoding::{encode_row, encode_row_key, table_key_end, table_key_prefix};
+use crate::executor::encoding::{encode_row, encode_row_key};
 use crate::executor::{Datum, Row};
 use crate::protocol::roodb::auth::compute_password_hash;
-use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::sql::Privilege;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::schema_version::{write_schema_version, CURRENT_SCHEMA_VERSION};
 use crate::storage::StorageEngine;
 
 /// Root username
@@ -42,23 +40,8 @@ pub enum InitError {
     Io(#[from] std::io::Error),
     #[error("Password hashing error: {0}")]
     PasswordHash(String),
-    #[error("Raft error: {0}")]
-    Raft(String),
     #[error("Storage error: {0}")]
     Storage(String),
-    #[error("Transaction error: {0}")]
-    Transaction(String),
-}
-
-/// Result of initialization
-#[derive(Debug)]
-pub enum InitResult {
-    /// Database already initialized, skipped
-    AlreadyInitialized,
-    /// Successfully initialized
-    Initialized,
-    /// Initialization failed
-    Failed(String),
 }
 
 /// Configuration from environment variables
@@ -120,30 +103,17 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
     computed_hash == stored_hash
 }
 
-/// Check if the database has been initialized (has users)
-pub async fn is_initialized(storage: &Arc<dyn StorageEngine>) -> Result<bool, InitError> {
-    // Check if system.users has any rows using raw storage scan
-    let prefix = table_key_prefix(SYSTEM_USERS);
-    let end = table_key_end(SYSTEM_USERS);
-
-    let rows = storage
-        .scan(Some(&prefix), Some(&end))
-        .await
-        .map_err(|e| InitError::Storage(e.to_string()))?;
-
-    Ok(!rows.is_empty())
-}
-
-/// Initialize the root user and default grants
-pub async fn initialize_root_user(
+/// Initialize the database with root user and schema version marker
+///
+/// This writes directly to storage (no Raft) and should only be called
+/// once before the server is started.
+pub async fn initialize_database(
+    storage: &Arc<dyn StorageEngine>,
     password: &str,
-    _storage: Arc<dyn StorageEngine>,
-    _catalog: Arc<RwLock<Catalog>>,
-    raft_node: Arc<RaftNode>,
 ) -> Result<(), InitError> {
     let password_hash = hash_password(password);
 
-    // Create user row
+    // Create user row for root@%
     let user_row = Row::new(vec![
         Datum::String(ROOT_USER.to_string()),          // username
         Datum::String(DEFAULT_HOST.to_string()),       // host
@@ -171,77 +141,36 @@ pub async fn initialize_root_user(
         Datum::Null,                                        // granted_at
     ]);
 
-    // Pre-allocate row IDs: 1 for user + 1 for grant
-    let (mut next_local, node_id) = allocate_row_id_batch(2);
+    // Use fixed row IDs for init (1 for user, 2 for grant)
+    // These are safe since this is first-time init on empty storage
+    let user_row_id: u64 = 1;
+    let grant_row_id: u64 = 2;
 
     // Encode rows for storage
-    let user_key = encode_row_key(SYSTEM_USERS, encode_row_id(next_local, node_id));
-    next_local += 1;
+    let user_key = encode_row_key(SYSTEM_USERS, user_row_id);
     let user_value = encode_row(&user_row);
 
-    let grant_key = encode_row_key(SYSTEM_GRANTS, encode_row_id(next_local, node_id));
+    let grant_key = encode_row_key(SYSTEM_GRANTS, grant_row_id);
     let grant_value = encode_row(&grant_row);
 
-    // Create ChangeSet for Raft replication
-    let mut changeset = ChangeSet::new(0); // txn_id 0 for init
-    changeset.push(RowChange::insert(SYSTEM_USERS, user_key, user_value));
-    changeset.push(RowChange::insert(SYSTEM_GRANTS, grant_key, grant_value));
-
-    // Apply through Raft
-    raft_node
-        .propose_changes(changeset)
+    // Write user row
+    storage
+        .put(&user_key, &user_value)
         .await
-        .map_err(|e| InitError::Raft(e.to_string()))?;
+        .map_err(|e| InitError::Storage(e.to_string()))?;
 
-    info!(
-        "Root user '{}' created with ALL PRIVILEGES on *.*",
-        ROOT_USER
-    );
+    // Write grant row
+    storage
+        .put(&grant_key, &grant_value)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
+    // Write schema version marker
+    write_schema_version(storage, CURRENT_SCHEMA_VERSION)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
 
     Ok(())
-}
-
-/// Perform first-time initialization if needed
-pub async fn maybe_initialize(
-    storage: Arc<dyn StorageEngine>,
-    catalog: Arc<RwLock<Catalog>>,
-    raft_node: Arc<RaftNode>,
-) -> InitResult {
-    // Check if already initialized
-    match is_initialized(&storage).await {
-        Ok(true) => {
-            info!("Database already initialized, skipping initialization");
-            return InitResult::AlreadyInitialized;
-        }
-        Ok(false) => {
-            info!("First-time initialization starting...");
-        }
-        Err(e) => {
-            error!("Failed to check initialization status: {}", e);
-            return InitResult::Failed(e.to_string());
-        }
-    }
-
-    // Read configuration from environment
-    let config = InitConfig::from_env();
-
-    // Determine password
-    let password = match config.determine_password() {
-        Ok(p) => p,
-        Err(e) => {
-            error!("{}", e);
-            return InitResult::Failed(e.to_string());
-        }
-    };
-
-    // Initialize root user
-    match initialize_root_user(&password, storage, catalog, raft_node).await {
-        Ok(()) => InitResult::Initialized,
-        Err(e) => {
-            error!("Failed to initialize root user: {}", e);
-            InitResult::Failed(e.to_string())
-        }
-    }
 }
 
 #[cfg(test)]

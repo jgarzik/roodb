@@ -1,0 +1,23 @@
+services:
+  roodb:
+    build: .
+    security_opt:
+      - seccomp:unconfined  # Required for io_uring syscalls
+    ports:
+      - "3307:3307"   # Client connections (MySQL protocol over TLS)
+      - "4307:4307"   # Raft consensus
+    volumes:
+      - roodb_data:/data
+      - ./certs:/certs:ro
+    environment:
+      - ROODB_ROOT_PASSWORD
+    healthcheck:
+      test: ["CMD", "timeout", "1", "bash", "-c", "< /dev/tcp/localhost/3307"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  roodb_data:

@@ -7,8 +7,6 @@
 //!
 //! Level sizing: L0 has 4 files max, L1+ have 10x size ratio
 
-use std::cmp::Ordering;
-
 use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::StorageResult;
@@ -50,16 +48,31 @@ pub fn pick_compaction_level(manifest: &Manifest) -> Option<u32> {
     (1..4).find(|&level| needs_level_compaction(manifest, level))
 }
 
-/// Compact L0 into L1
+/// Information gathered for a compaction job (gathered with lock held)
+pub struct L0CompactionJob {
+    /// L0 files to compact
+    pub l0_files: Vec<SstableInfo>,
+    /// L1 files that overlap with L0
+    pub l1_files: Vec<SstableInfo>,
+    /// Reserved name for output SSTable
+    pub output_name: String,
+    /// Path for output SSTable
+    pub output_path: std::path::PathBuf,
+    /// Paths to input files (L0 reversed + L1)
+    pub input_paths: Vec<std::path::PathBuf>,
+}
+
+/// Phase 1: Gather compaction job info with manifest lock held
 ///
-/// This merges all L0 files with overlapping L1 files into new L1 files.
-pub async fn compact_l0<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
-    factory: &F,
-    manifest: &mut Manifest,
-) -> StorageResult<()> {
+/// Returns None if no compaction is needed.
+pub fn prepare_l0_compaction(manifest: &mut Manifest) -> Option<L0CompactionJob> {
+    if !needs_l0_compaction(manifest) {
+        return None;
+    }
+
     let l0_files = manifest.get_level(0).to_vec();
     if l0_files.is_empty() {
-        return Ok(());
+        return None;
     }
 
     // Find L1 files that overlap with L0 key range
@@ -71,111 +84,39 @@ pub async fn compact_l0<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         .cloned()
         .collect();
 
-    // Collect all files to merge
-    // L0 files are reversed so newest (highest numbered) come first
-    // This ensures newer versions win during merge deduplication
-    let mut all_files: Vec<_> = l0_files.iter().rev().cloned().collect();
-    all_files.extend(l1_files.clone());
+    // Reserve output SSTable name
+    let output_name = manifest.next_sstable_name();
+    let output_path = manifest.sstable_path(&output_name);
 
-    // Merge into new L1 file(s)
-    let new_files = merge_sstables(factory, manifest, &all_files).await?;
-
-    // Update manifest: remove old files, add new ones
-    for f in &l0_files {
-        manifest.remove_sstable(0, &f.name);
-        // Delete old file (log warning on failure, don't fail compaction)
-        let path = manifest.sstable_path(&f.name);
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
-        }
-    }
-    for f in &l1_files {
-        manifest.remove_sstable(1, &f.name);
-        let path = manifest.sstable_path(&f.name);
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
-        }
-    }
-    for f in new_files {
-        manifest.add_sstable(1, f);
-    }
-
-    manifest.save()?;
-    Ok(())
-}
-
-/// Compact a level into the next level
-pub async fn compact_level<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
-    factory: &F,
-    manifest: &mut Manifest,
-    level: u32,
-) -> StorageResult<()> {
-    if level == 0 {
-        return compact_l0(factory, manifest).await;
-    }
-
-    let source_files = manifest.get_level(level).to_vec();
-    if source_files.is_empty() {
-        return Ok(());
-    }
-
-    // Pick a file to compact (e.g., first one for simplicity)
-    let source = &source_files[0];
-
-    // Find overlapping files in next level
-    let target_files: Vec<_> = manifest
-        .get_level(level + 1)
+    // Collect paths for reading (L0 files reversed so newest come first)
+    let input_paths: Vec<_> = l0_files
         .iter()
-        .filter(|f| ranges_overlap(&f.min_key, &f.max_key, &source.min_key, &source.max_key))
-        .cloned()
+        .rev()
+        .chain(l1_files.iter())
+        .map(|info| manifest.sstable_path(&info.name))
         .collect();
 
-    // Merge files
-    let mut files_to_merge = vec![source.clone()];
-    files_to_merge.extend(target_files.clone());
-
-    let new_files = merge_sstables(factory, manifest, &files_to_merge).await?;
-
-    // Update manifest
-    manifest.remove_sstable(level, &source.name);
-    let path = manifest.sstable_path(&source.name);
-    if let Err(e) = std::fs::remove_file(&path) {
-        tracing::warn!(path = ?path, level = level, error = %e, "Failed to delete old SSTable during level compaction");
-    }
-
-    for f in &target_files {
-        manifest.remove_sstable(level + 1, &f.name);
-        let path = manifest.sstable_path(&f.name);
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!(path = ?path, level = level + 1, error = %e, "Failed to delete old SSTable during level compaction");
-        }
-    }
-
-    for f in new_files {
-        manifest.add_sstable(level + 1, f);
-    }
-
-    manifest.save()?;
-    Ok(())
+    Some(L0CompactionJob {
+        l0_files,
+        l1_files,
+        output_name,
+        output_path,
+        input_paths,
+    })
 }
 
-/// Merge multiple SSTables into new file(s)
-async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
+/// Phase 2: Execute compaction I/O (without manifest lock)
+///
+/// Returns the new SSTable info on success, or None if all entries were tombstones.
+pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     factory: &F,
-    manifest: &mut Manifest,
-    files: &[SstableInfo],
-) -> StorageResult<Vec<SstableInfo>> {
-    if files.is_empty() {
-        return Ok(vec![]);
-    }
-
+    job: &L0CompactionJob,
+) -> StorageResult<Option<SstableInfo>> {
     // Load all entries from all files
-    // Files should be ordered newest-first so that idx=0 is newest
     let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
 
-    for (idx, info) in files.iter().enumerate() {
-        let path = manifest.sstable_path(&info.name);
-        let reader = SstableReader::open(factory, &path, IoPriority::Compaction).await?;
+    for (idx, path) in job.input_paths.iter().enumerate() {
+        let reader = SstableReader::open(factory, path, IoPriority::Compaction).await?;
         let entries = reader.scan().await?;
         for (key, value) in entries {
             all_entries.push((key, value, idx));
@@ -184,7 +125,7 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
 
     // Sort by key, then by source index (lower = newer)
     all_entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-        Ordering::Equal => a.2.cmp(&b.2),
+        std::cmp::Ordering::Equal => a.2.cmp(&b.2),
         other => other,
     });
 
@@ -202,10 +143,14 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         }
     }
 
+    // If all entries were tombstones, don't create an empty SSTable
+    if deduped.is_empty() {
+        return Ok(None);
+    }
+
     // Write to new SSTable
-    let new_name = manifest.next_sstable_name();
-    let new_path = manifest.sstable_path(&new_name);
-    let mut writer = SstableWriter::create(factory, &new_path, IoPriority::Compaction).await?;
+    let mut writer =
+        SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
 
     for (key, value) in &deduped {
         writer.add(key.clone(), value.clone()).await?;
@@ -213,18 +158,50 @@ async fn merge_sstables<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
 
     writer.finish().await?;
 
-    // Get file size
-    let size = std::fs::metadata(&new_path)?.len();
+    // Get file metadata - safe to unwrap since deduped is non-empty
+    let size = std::fs::metadata(&job.output_path)?.len();
+    let min_key = deduped.first().unwrap().0.clone();
+    let max_key = deduped.last().unwrap().0.clone();
 
-    let min_key = deduped.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let max_key = deduped.last().map(|(k, _)| k.clone()).unwrap_or_default();
-
-    Ok(vec![SstableInfo {
-        name: new_name,
+    Ok(Some(SstableInfo {
+        name: job.output_name.clone(),
         min_key,
         max_key,
         size,
-    }])
+    }))
+}
+
+/// Phase 3: Finalize compaction (with manifest lock)
+///
+/// Updates manifest and deletes old files. If new_file is None (all entries
+/// were tombstones), only cleans up old files without adding a new one.
+pub fn finalize_l0_compaction(
+    manifest: &mut Manifest,
+    job: &L0CompactionJob,
+    new_file: Option<SstableInfo>,
+) -> StorageResult<()> {
+    // Remove old files from manifest and delete them
+    for f in &job.l0_files {
+        manifest.remove_sstable(0, &f.name);
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
+        }
+    }
+    for f in &job.l1_files {
+        manifest.remove_sstable(1, &f.name);
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during L0 compaction");
+        }
+    }
+
+    // Only add new file if there were non-tombstone entries
+    if let Some(file) = new_file {
+        manifest.add_sstable(1, file);
+    }
+    manifest.save()?;
+    Ok(())
 }
 
 /// Find overall key range from a set of files

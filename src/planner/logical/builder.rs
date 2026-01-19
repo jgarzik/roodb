@@ -10,7 +10,7 @@ use crate::catalog::DataType;
 
 use super::expr::{AggregateFunc, OutputColumn};
 use super::LogicalPlan;
-use crate::planner::error::{PlannerError, PlannerResult};
+use crate::planner::error::PlannerResult;
 
 /// Builder for logical query plans
 pub struct LogicalPlanBuilder;
@@ -229,9 +229,7 @@ impl LogicalPlanBuilder {
     /// Build scan nodes for FROM clause
     fn build_from(tables: &[ResolvedTableRef]) -> PlannerResult<LogicalPlan> {
         if tables.is_empty() {
-            return Err(PlannerError::InvalidPlan(
-                "SELECT requires at least one table".to_string(),
-            ));
+            return Ok(LogicalPlan::SingleRow);
         }
 
         // Create scan for first table

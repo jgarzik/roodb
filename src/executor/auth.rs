@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
+use crate::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
-use crate::server::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 

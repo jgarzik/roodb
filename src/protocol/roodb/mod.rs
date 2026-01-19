@@ -46,8 +46,8 @@ use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
 use self::packet::{PacketReader, PacketWriter};
 use self::prepared::unsupported_prepared_stmt_error;
 use self::resultset::{
-    default_status, encode_column_count, encode_eof_packet, encode_err_packet, encode_ok_packet,
-    encode_text_row, ColumnDefinition41,
+    default_status, encode_column_count, encode_eof_ok_packet, encode_eof_packet,
+    encode_err_packet, encode_ok_packet, encode_text_row, ColumnDefinition41,
 };
 
 /// Internal enum for planning errors (used to avoid holding guard across await)
@@ -174,6 +174,13 @@ where
         let response = HandshakeResponse41::parse(&response_packet)?;
         self.client_capabilities = response.capability_flags;
         self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
+
+        debug!(
+            connection_id = self.connection_id,
+            client_capabilities = format!("{:#010x}", self.client_capabilities),
+            deprecate_eof = self.deprecate_eof,
+            "Client capabilities parsed"
+        );
 
         // Verify authentication
         self.verify_auth(&response).await?;
@@ -906,7 +913,7 @@ where
 
         // Send final EOF/OK
         if self.deprecate_eof {
-            let ok = encode_ok_packet(0, 0, default_status(), 0);
+            let ok = encode_eof_ok_packet(default_status(), 0);
             self.writer.write_packet(&ok).await?;
         } else {
             let eof = encode_eof_packet(0, default_status());
@@ -1277,7 +1284,7 @@ where
 
         // Final EOF/OK
         if self.deprecate_eof {
-            let ok = encode_ok_packet(0, 0, default_status(), 0);
+            let ok = encode_eof_ok_packet(default_status(), 0);
             self.writer.write_packet(&ok).await?;
         } else {
             let eof = encode_eof_packet(0, default_status());

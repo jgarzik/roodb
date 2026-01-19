@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::lsm::compaction::{compact_l0, needs_l0_compaction};
+use crate::storage::lsm::compaction::{
+    execute_l0_compaction, finalize_l0_compaction, needs_l0_compaction, prepare_l0_compaction,
+};
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
@@ -41,6 +43,9 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     imm_memtables: RwLock<Vec<Arc<Memtable>>>,
     /// Manifest for SSTable tracking
     manifest: Mutex<Manifest>,
+    /// Compaction serialization - prevents concurrent compactions from racing
+    /// on file deletion. Separate from manifest lock to allow reads during compaction.
+    compaction_mutex: Mutex<()>,
     /// Closed flag
     closed: AtomicBool,
     /// Phantom for IO type
@@ -61,6 +66,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             memtable: RwLock::new(Arc::new(Memtable::new())),
             imm_memtables: RwLock::new(Vec::new()),
             manifest: Mutex::new(manifest),
+            compaction_mutex: Mutex::new(()),
             closed: AtomicBool::new(false),
             _io: std::marker::PhantomData,
         })
@@ -145,28 +151,66 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
     }
 
     /// Trigger compaction if needed
+    ///
+    /// # Locking
+    /// Uses split-phase locking to minimize manifest lock contention:
+    /// 1. Acquire compaction_mutex to serialize compactions (prevents file deletion races)
+    /// 2. Brief manifest lock to check if compaction needed and gather job info
+    /// 3. Release manifest lock during expensive I/O operations
+    /// 4. Re-acquire manifest lock to finalize manifest updates
+    ///
+    /// The compaction_mutex ensures only one compaction runs at a time, preventing
+    /// races where one compaction deletes files another is about to read.
+    /// The manifest lock is released during I/O to allow concurrent reads.
     async fn maybe_compact(&self) -> StorageResult<()> {
+        // Serialize compactions to prevent file deletion races
+        let _compaction_guard = self.compaction_mutex.lock().await;
+
+        // Phase 1: Brief manifest lock to check and prepare compaction job
+        let job = {
+            let mut manifest = self.manifest.lock().await;
+            prepare_l0_compaction(&mut manifest)
+            // Manifest lock released here
+        };
+
+        // If no compaction needed, we're done
+        let job = match job {
+            Some(j) => j,
+            None => return Ok(()),
+        };
+
+        // Phase 2: Execute I/O without holding manifest lock (but with compaction_mutex)
+        let new_file = execute_l0_compaction(&*self.factory, &job).await?;
+
+        // Phase 3: Re-acquire manifest lock to finalize
         let mut manifest = self.manifest.lock().await;
-        if needs_l0_compaction(&manifest) {
-            compact_l0(&*self.factory, &mut manifest).await?;
-        }
+        finalize_l0_compaction(&mut manifest, &job, new_file)?;
+
         Ok(())
     }
 
     /// Read from all levels (memtable, imm memtables, SSTables)
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
-        // Check active memtable first
-        if let Some(result) = self.memtable.read().get(key) {
+        // SNAPSHOT ISOLATION: Capture consistent point-in-time view of memtables.
+        // CRITICAL: Both memtable and imm_memtables must be read while holding the
+        // memtable lock to prevent a race where put() rotates the memtable between
+        // our two reads, making an entry temporarily invisible.
+        let (memtable_snapshot, imm_snapshot) = {
+            let mem_guard = self.memtable.read();
+            let memtable_snapshot = Arc::clone(&*mem_guard);
+            let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
+            (memtable_snapshot, imm_snapshot)
+        };
+
+        // Check active memtable snapshot first
+        if let Some(result) = memtable_snapshot.get(key) {
             return Ok(Some(result));
         }
 
-        // Check immutable memtables (newest first)
-        {
-            let imm = self.imm_memtables.read();
-            for mem in imm.iter().rev() {
-                if let Some(result) = mem.get(key) {
-                    return Ok(Some(result));
-                }
+        // Check immutable memtable snapshots (newest first)
+        for mem in imm_snapshot.iter().rev() {
+            if let Some(result) = mem.get(key) {
+                return Ok(Some(result));
             }
         }
 
@@ -259,12 +303,18 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
         // SNAPSHOT ISOLATION: Capture consistent point-in-time view of all data sources.
         // We acquire manifest lock first (async), then atomically snapshot memtables.
-        // This ensures no writes can interleave between capturing the different sources.
+        // CRITICAL: Both memtable and imm_memtables must be read while holding the
+        // memtable lock to prevent a race where put() rotates the memtable between
+        // our two reads, making an entry temporarily invisible.
         let manifest = self.manifest.lock().await;
 
-        // Clone Arc pointers while holding manifest lock for atomic snapshot
-        let memtable_snapshot = Arc::clone(&*self.memtable.read());
-        let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
+        // Clone Arc pointers atomically - hold memtable read lock while reading both
+        let (memtable_snapshot, imm_snapshot) = {
+            let mem_guard = self.memtable.read();
+            let memtable_snapshot = Arc::clone(&*mem_guard);
+            let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
+            (memtable_snapshot, imm_snapshot)
+        };
 
         // Collect entries from all sources
         let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
@@ -341,14 +391,31 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             }
         }
 
-        // Flush all immutable memtables
-        let imm_mems: Vec<Arc<Memtable>> = {
-            let mut imm = self.imm_memtables.write();
-            std::mem::take(&mut *imm)
-        };
+        // Flush immutable memtables one at a time
+        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
+        // to prevent visibility gaps where entries are not in memtable, imm_memtables, or disk
+        loop {
+            // Peek at the oldest memtable (first in vec) but don't remove yet
+            let mem = {
+                let imm = self.imm_memtables.read();
+                imm.first().cloned()
+            };
 
-        for mem in imm_mems {
-            self.flush_memtable(mem).await?;
+            let mem = match mem {
+                Some(m) => m,
+                None => break, // No more memtables to flush
+            };
+
+            // Flush to disk (memtable still visible in imm_memtables during this)
+            self.flush_memtable(Arc::clone(&mem)).await?;
+
+            // Now safe to remove - data is on disk
+            {
+                let mut imm = self.imm_memtables.write();
+                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                    imm.remove(0);
+                }
+            }
         }
 
         Ok(())
@@ -368,15 +435,32 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             }
         }
 
-        // Flush all immutable memtables with Critical priority (WAL)
-        let imm_mems: Vec<Arc<Memtable>> = {
-            let mut imm = self.imm_memtables.write();
-            std::mem::take(&mut *imm)
-        };
+        // Flush immutable memtables one at a time with Critical priority (WAL)
+        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
+        // to prevent visibility gaps where entries are not in memtable, imm_memtables, or disk
+        loop {
+            // Peek at the oldest memtable (first in vec) but don't remove yet
+            let mem = {
+                let imm = self.imm_memtables.read();
+                imm.first().cloned()
+            };
 
-        for mem in imm_mems {
-            self.flush_memtable_with_priority(mem, IoPriority::Wal)
+            let mem = match mem {
+                Some(m) => m,
+                None => break, // No more memtables to flush
+            };
+
+            // Flush to disk (memtable still visible in imm_memtables during this)
+            self.flush_memtable_with_priority(Arc::clone(&mem), IoPriority::Wal)
                 .await?;
+
+            // Now safe to remove - data is on disk
+            {
+                let mut imm = self.imm_memtables.write();
+                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                    imm.remove(0);
+                }
+            }
         }
 
         Ok(())
@@ -393,14 +477,27 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             }
         }
 
-        // Flush all immutable memtables
-        let imm_mems: Vec<Arc<Memtable>> = {
-            let mut imm = self.imm_memtables.write();
-            std::mem::take(&mut *imm)
-        };
+        // Flush immutable memtables one at a time
+        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
+        loop {
+            let mem = {
+                let imm = self.imm_memtables.read();
+                imm.first().cloned()
+            };
 
-        for mem in imm_mems {
-            self.flush_memtable(mem).await?;
+            let mem = match mem {
+                Some(m) => m,
+                None => break,
+            };
+
+            self.flush_memtable(Arc::clone(&mem)).await?;
+
+            {
+                let mut imm = self.imm_memtables.write();
+                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                    imm.remove(0);
+                }
+            }
         }
 
         self.closed.store(true, Ordering::SeqCst);

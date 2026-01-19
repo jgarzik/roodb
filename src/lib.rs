@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod executor;
+pub mod init;
 pub mod io;
 pub mod planner;
 pub mod protocol;

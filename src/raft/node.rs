@@ -22,7 +22,7 @@ use crate::raft::network::{RaftNetworkFactoryImpl, RaftRpcHandler};
 use crate::raft::types::{Command, CommandResponse, Node, NodeId, Raft};
 use crate::raft::ChangeSet;
 use crate::storage::StorageEngine;
-use crate::tls::TlsConfig;
+use crate::tls::RaftTlsConfig;
 
 #[derive(Error, Debug)]
 pub enum RaftNodeError {
@@ -47,7 +47,7 @@ pub struct RaftNode {
     #[allow(dead_code)]
     storage: LsmRaftStorage,
     network: RaftNetworkFactoryImpl,
-    tls_config: TlsConfig,
+    tls_config: RaftTlsConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -60,7 +60,7 @@ impl RaftNode {
     pub async fn new(
         id: NodeId,
         addr: SocketAddr,
-        tls_config: TlsConfig,
+        tls_config: RaftTlsConfig,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
     ) -> Result<Self, RaftNodeError> {

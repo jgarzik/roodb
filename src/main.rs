@@ -11,12 +11,18 @@ use roodb::catalog::Catalog;
 use roodb::io::default_io_factory;
 use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
+use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
-use roodb::tls::TlsConfig;
+use roodb::tls::{RaftTlsConfig, TlsConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize rustls crypto provider
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -42,16 +48,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./certs/server.key"));
 
+    let raft_ca_cert_path = args
+        .get(5)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./certs/ca.crt"));
+
     tracing::info!(port, ?data_dir, "Starting RooDB");
 
-    // Load TLS config
+    // Load TLS config for client connections (no client cert auth)
     let tls_config = TlsConfig::from_files(&cert_path, &key_path).await?;
+
+    // Load Raft TLS config with mTLS (mutual cert auth)
+    let raft_tls_config =
+        RaftTlsConfig::from_files_with_ca(&cert_path, &key_path, &raft_ca_cert_path).await?;
 
     // Initialize storage engine
     let io_factory = Arc::new(default_io_factory());
     let storage_config = LsmConfig { dir: data_dir };
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io_factory, storage_config).await?);
+
+    // Check if database is initialized
+    if !is_initialized(&storage).await? {
+        eprintln!("ERROR: Database not initialized. Run 'roodb_init' first.");
+        std::process::exit(1);
+    }
 
     // Initialize catalog with system tables
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
@@ -65,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raft_node = RaftNode::new(
         node_id,
         raft_addr,
-        tls_config.clone(),
+        raft_tls_config,
         storage.clone(),
         catalog.clone(),
     )

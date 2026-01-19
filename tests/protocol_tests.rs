@@ -391,6 +391,7 @@ async fn test_server_integration_e2e() {
 
     // Setup test infrastructure
     let tls_config = test_utils::certs::test_tls_config();
+    let raft_tls_config = test_utils::certs::test_raft_tls_config();
     let data_dir = test_dir("e2e");
     cleanup_dir(&data_dir);
 
@@ -412,9 +413,15 @@ async fn test_server_integration_e2e() {
     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
     // Start server with the pre-bound listener
-    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
-        .await
-        .expect("Failed to start test server");
+    let handle = start_test_server(
+        listener,
+        tls_config,
+        raft_tls_config,
+        storage.clone(),
+        catalog.clone(),
+    )
+    .await
+    .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -488,6 +495,7 @@ async fn test_transaction_begin_commit() {
         .try_init();
 
     let tls_config = test_utils::certs::test_tls_config();
+    let raft_tls_config = test_utils::certs::test_raft_tls_config();
     let data_dir = test_dir("txn_commit");
     cleanup_dir(&data_dir);
 
@@ -508,9 +516,15 @@ async fn test_transaction_begin_commit() {
     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
     // Start server with the pre-bound listener
-    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
-        .await
-        .expect("Failed to start test server");
+    let handle = start_test_server(
+        listener,
+        tls_config,
+        raft_tls_config,
+        storage.clone(),
+        catalog.clone(),
+    )
+    .await
+    .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -584,6 +598,7 @@ async fn test_transaction_rollback() {
         .try_init();
 
     let tls_config = test_utils::certs::test_tls_config();
+    let raft_tls_config = test_utils::certs::test_raft_tls_config();
     let data_dir = test_dir("txn_rollback");
     cleanup_dir(&data_dir);
 
@@ -604,9 +619,15 @@ async fn test_transaction_rollback() {
     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
     // Start server with the pre-bound listener
-    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
-        .await
-        .expect("Failed to start test server");
+    let handle = start_test_server(
+        listener,
+        tls_config,
+        raft_tls_config,
+        storage.clone(),
+        catalog.clone(),
+    )
+    .await
+    .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -682,6 +703,7 @@ async fn test_autocommit() {
         .try_init();
 
     let tls_config = test_utils::certs::test_tls_config();
+    let raft_tls_config = test_utils::certs::test_raft_tls_config();
     let data_dir = test_dir("autocommit");
     cleanup_dir(&data_dir);
 
@@ -702,9 +724,15 @@ async fn test_autocommit() {
     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
     // Start server with the pre-bound listener
-    let handle = start_test_server(listener, tls_config, storage.clone(), catalog.clone())
-        .await
-        .expect("Failed to start test server");
+    let handle = start_test_server(
+        listener,
+        tls_config,
+        raft_tls_config,
+        storage.clone(),
+        catalog.clone(),
+    )
+    .await
+    .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

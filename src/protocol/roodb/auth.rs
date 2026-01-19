@@ -6,7 +6,7 @@ use sha1::{Digest, Sha1};
 
 use super::error::{ProtocolError, ProtocolResult};
 use super::handshake::capabilities;
-use super::packet::{decode_length_encoded_string, decode_null_terminated_string};
+use super::packet::{decode_length_encoded_bytes, decode_null_terminated_string};
 
 /// SSL Request packet from client (sent before TLS upgrade)
 ///
@@ -122,10 +122,10 @@ impl HandshakeResponse41 {
         // Auth response
         let auth_response =
             if capability_flags & capabilities::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
-                // Length-encoded auth response
-                let (s, consumed) = decode_length_encoded_string(&data[offset..])?;
+                // Length-encoded auth response (binary data, not UTF-8 string)
+                let (bytes, consumed) = decode_length_encoded_bytes(&data[offset..])?;
                 offset += consumed;
-                s.into_bytes()
+                bytes
             } else if capability_flags & capabilities::CLIENT_SECURE_CONNECTION != 0 {
                 // Length-prefixed auth response (1-byte length)
                 if offset >= data.len() {

@@ -1,0 +1,34 @@
+# Build artifacts
+target/
+
+# Version control
+.git/
+.gitignore
+
+# Documentation
+*.md
+!CLAUDE.md
+
+# Tests and scripts
+tests/
+scripts/
+
+# CI/CD
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local development
+data/
+certs/
+*.pem
+*.crt
+*.key
+
+# Misc
+notes.txt
+.DS_Store

@@ -12,6 +12,7 @@ use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
 use openraft::{ErrorSubject, ErrorVerb};
 use parking_lot::RwLock;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
     is_system_table, row_to_index_def, rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS,
@@ -118,6 +119,10 @@ fn log_key_end() -> Vec<u8> {
 /// This struct uses multiple independent RwLocks. The locks are designed to be
 /// independent subsystems with no nesting requirements:
 ///
+/// - `log_mutex` - Serializes log operations (append, get_log_state, try_get_log_entries).
+///   This ensures that when get_log_state() reports log entry N exists, any subsequent
+///   try_get_log_entries() will find it. Required because LsmRaftStorage is Clone with
+///   shared state, but OpenRaft's `&mut self` methods imply serialized access.
 /// - `catalog` - Schema metadata. Acquired briefly during apply() for DDL changes.
 ///   Never held during storage I/O operations.
 /// - `cached_*` - In-memory caches for Raft state. Each is updated independently
@@ -131,6 +136,9 @@ pub struct LsmRaftStorage {
     /// Catalog reference for updating schema on DDL changes.
     /// See struct-level locking documentation.
     catalog: Arc<RwLock<Catalog>>,
+    /// Serializes log operations to prevent races between append and read operations.
+    /// See struct-level documentation for details.
+    log_mutex: Arc<TokioMutex<()>>,
     // In-memory caches for hot paths
     cached_vote: Arc<RwLock<Option<Vote>>>,
     cached_last_applied: Arc<RwLock<Option<LogId>>>,
@@ -160,6 +168,7 @@ impl LsmRaftStorage {
         let this = Self {
             storage,
             catalog,
+            log_mutex: Arc::new(TokioMutex::new(())),
             cached_vote: Arc::new(RwLock::new(None)),
             cached_last_applied: Arc::new(RwLock::new(None)),
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
@@ -612,6 +621,9 @@ impl RaftLogReader<TypeConfig> for LsmRaftStorage {
     ) -> Result<Vec<Entry>, StorageError> {
         use std::ops::Bound;
 
+        // Serialize with other log operations to ensure visibility of appended entries
+        let _lock = self.log_mutex.lock().await;
+
         let start_index = match range.start_bound() {
             Bound::Included(&i) => i,
             Bound::Excluded(&i) => i + 1,
@@ -647,6 +659,9 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState, StorageError> {
+        // Serialize with other log operations to ensure consistency
+        let _lock = self.log_mutex.lock().await;
+
         let last_purged = *self.cached_last_purged.read();
         let last_log_id = *self.cached_last_log_id.read();
 
@@ -693,6 +708,9 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        // Serialize with other log operations to ensure visibility before cache update
+        let _lock = self.log_mutex.lock().await;
+
         let mut last_log_id = None;
 
         for entry in entries {
@@ -716,6 +734,9 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        // Serialize with other log operations
+        let _lock = self.log_mutex.lock().await;
+
         // Delete all entries with index >= log_id.index
         let start_key = log_key(log_id.index);
         let end_key = log_key_end();
@@ -749,6 +770,9 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        // Serialize with other log operations
+        let _lock = self.log_mutex.lock().await;
+
         // Delete all entries with index <= log_id.index
         let end_key = log_key(log_id.index + 1);
 
@@ -780,6 +804,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), StorageError> {
+        // Serialize with log operations to ensure consistency between applied state and log state.
+        // Without this, a concurrent append could update cached_last_log_id while we read
+        // cached_last_applied, leading to inconsistent views.
+        let _lock = self.log_mutex.lock().await;
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
         Ok((last_applied, membership))
@@ -1161,6 +1189,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
+        // Serialize with log operations to ensure snapshot reflects a consistent state.
+        // Without this, concurrent log operations could modify state while we're reading,
+        // leading to snapshots that don't match any valid point in time.
+        let _lock = self.log_mutex.lock().await;
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
@@ -1204,6 +1236,10 @@ const RAFT_PREFIX: &[u8] = b"_raft:";
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
+        // Serialize with log operations to ensure snapshot reflects a consistent state.
+        // Without this, concurrent log operations could modify state while we're reading,
+        // leading to snapshots that don't match any valid point in time.
+        let _lock = self.log_mutex.lock().await;
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 

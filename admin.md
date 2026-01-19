@@ -8,10 +8,13 @@ mkdir -p certs
 openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt \
     -days 365 -nodes -subj "/CN=localhost"
 
-# 2. Set root password and start server
-ROODB_ROOT_PASSWORD=changeme ./roodb
+# 2. Initialize database (first time only)
+ROODB_ROOT_PASSWORD=changeme ./roodb_init ./data
 
-# 3. Connect via MySQL client
+# 3. Start server
+./roodb
+
+# 4. Connect via MySQL client
 mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ```
 
@@ -20,7 +23,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ### Command Line Arguments
 
 ```
-./roodb [port] [data_dir] [cert_path] [key_path]
+./roodb [port] [data_dir] [cert_path] [key_path] [ca_cert_path]
 ```
 
 | Argument | Default | Description |
@@ -29,6 +32,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 | data_dir | ./data | Data directory path |
 | cert_path | ./certs/server.crt | TLS certificate |
 | key_path | ./certs/server.key | TLS private key |
+| ca_cert_path | ./certs/ca.crt | CA certificate for Raft mTLS |
 
 ### TLS Requirements
 
@@ -43,6 +47,45 @@ openssl req -x509 -newkey rsa:4096 \
 ```
 
 For production, use certificates from a trusted CA or your organization's PKI.
+
+### Raft mTLS (Inter-Node Authentication)
+
+RooDB enforces mutual TLS (mTLS) for Raft inter-node communication. Each cluster node must present a certificate signed by a trusted CA. This prevents unauthorized nodes from joining the cluster.
+
+**Certificate model:**
+- Single CA signs all node certificates
+- Each node trusts the CA and verifies peer certificates
+- Client port (3307): standard TLS (no client cert required)
+- Raft port (4307): mTLS (client cert required, verified against CA)
+
+**Generate CA and node certificates for production:**
+
+```bash
+# 1. Generate CA key and certificate
+openssl genrsa -out ca.key 4096
+openssl req -new -x509 -key ca.key -out ca.crt -days 365 -subj "/CN=RooDB CA"
+
+# 2. Generate node key and CSR
+openssl genrsa -out node1.key 4096
+openssl req -new -key node1.key -out node1.csr -subj "/CN=roodb-node1"
+
+# 3. Sign node certificate with CA
+openssl x509 -req -in node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out node1.crt -days 365 -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1")
+
+# Repeat steps 2-3 for node2, node3, etc.
+```
+
+**Starting nodes with mTLS:**
+```bash
+# Each node uses its own cert/key, same CA
+./roodb 3307 ./data1 ./node1.crt ./node1.key ./ca.crt
+./roodb 3308 ./data2 ./node2.crt ./node2.key ./ca.crt
+./roodb 3309 ./data3 ./node3.crt ./node3.key ./ca.crt
+```
+
+**Testing mTLS rejection:**
+A node with a certificate signed by a different CA will be rejected by the cluster. This protects against rogue nodes attempting to join.
 
 ### Port Configuration
 
@@ -96,7 +139,8 @@ Multi-node clusters provide high availability through Raft consensus. Currently,
 **Cluster requirements:**
 - 3 nodes minimum (tolerates 1 failure)
 - 5 nodes for higher availability (tolerates 2 failures)
-- All nodes need TLS certificates (can share or use individual)
+- All nodes need TLS certificates signed by the same CA (mTLS)
+- Shared CA certificate on all nodes for peer verification
 - Network connectivity between all nodes on Raft RPC port
 
 **Bootstrap procedure (programmatic):**
@@ -138,29 +182,67 @@ See `tests/raft_cluster.rs` for complete working example.
 
 ## First-Time Initialization
 
-On first startup with an empty data directory, RooDB:
+Database initialization is handled by the separate `roodb_init` binary. The server (`roodb`) requires an initialized database and will exit with an error if the database has not been initialized.
 
-1. Creates system tables (`system.tables`, `system.columns`, `system.indexes`, `system.constraints`, `system.users`, `system.grants`, `system.roles`, `system.role_grants`)
+### roodb_init Usage
 
-**Note:** Root user initialization from environment variables (`ROODB_ROOT_PASSWORD`, `ROODB_ROOT_PASSWORD_FILE`) is not yet integrated into the main startup path. The initialization logic exists in `src/server/init.rs` but must be called explicitly.
-
-**Container deployment:**
-```bash
-# Direct password
-docker run -e ROODB_ROOT_PASSWORD=mysecretpassword roodb
-
-# Docker secrets
-docker run -e ROODB_ROOT_PASSWORD_FILE=/run/secrets/db_password \
-    -v /path/to/secrets:/run/secrets:ro roodb
 ```
+roodb_init [data_dir]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| data_dir | ./data | Data directory path |
+
+**Exit codes:**
+- `0` - Success (initialized or already initialized - idempotent)
+- `2` - No password configured
+- `3` - Storage error
+
+### Password Configuration
+
+Set the root password via environment variable:
+
+| Variable | Description |
+|----------|-------------|
+| `ROODB_ROOT_PASSWORD` | Set root password directly |
+| `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
+
+Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
+
+### Examples
 
 **Bare metal:**
 ```bash
-export ROODB_ROOT_PASSWORD=mysecretpassword
-./roodb
+ROODB_ROOT_PASSWORD=mysecretpassword ./roodb_init ./data
+./roodb 3307 ./data ./certs/server.crt ./certs/server.key
 ```
 
-If no password environment variable is set and the database is uninitialized, the server exits with an error indicating which variable to set.
+**Container deployment:**
+```bash
+# Initialize (run once or as idempotent entrypoint)
+docker run -e ROODB_ROOT_PASSWORD=mysecretpassword -v ./data:/data roodb roodb_init /data
+
+# Start server
+docker run -v ./data:/data roodb roodb 3307 /data /certs/server.crt /certs/server.key
+```
+
+**Docker secrets:**
+```bash
+docker run -e ROODB_ROOT_PASSWORD_FILE=/run/secrets/db_password \
+    -v /path/to/secrets:/run/secrets:ro \
+    -v ./data:/data roodb roodb_init /data
+```
+
+### What Gets Initialized
+
+When `roodb_init` runs on an empty data directory:
+
+1. Creates root user (`root@%`) with the configured password
+2. Grants `ALL PRIVILEGES ON *.*` with `GRANT OPTION` to root
+3. Writes schema version marker
+
+System tables (`system.tables`, `system.columns`, etc.) are created by the catalog at server startup, not by initialization.
 
 ## User Management
 
@@ -270,7 +352,8 @@ SHOW GRANTS FOR 'username'@'host';     -- Specific user
 1. Use CA-signed certificates in production
 2. Rotate certificates before expiration
 3. Store private keys with restricted permissions (600)
-4. For clusters, each node can use the same certificate or individual certificates
+4. For clusters, each node must use a certificate signed by the shared CA
+5. Protect the CA private key carefully; it can authorize new cluster members
 
 ### Network Security
 

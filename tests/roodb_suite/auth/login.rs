@@ -16,6 +16,7 @@ async fn test_login_success() {
 
 /// Test login with password
 #[tokio::test]
+#[ignore = "requires isolated server with custom password"]
 async fn test_login_with_password() {
     use mysql_async::{Opts, OptsBuilder, Pool, SslOpts};
 
@@ -46,6 +47,7 @@ async fn test_login_with_password() {
 
 /// Test login with wrong password fails
 #[tokio::test]
+#[ignore = "requires isolated server with custom password"]
 async fn test_login_wrong_password() {
     use mysql_async::{Opts, OptsBuilder, Pool, SslOpts};
 
