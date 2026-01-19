@@ -176,6 +176,7 @@ pub async fn initialize_database(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_hash_and_verify_password() {
@@ -194,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_init_config_from_env() {
         // Clear any existing vars
         env::remove_var("ROODB_ROOT_PASSWORD");
@@ -213,6 +215,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_determine_password_priority() {
         env::remove_var("ROODB_ROOT_PASSWORD");
         env::remove_var("ROODB_ROOT_PASSWORD_FILE");

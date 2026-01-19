@@ -6,5 +6,6 @@
 #![allow(dead_code)]
 
 pub mod auth;
-pub mod binary_server;
 pub mod certs;
+pub mod cleanup;
+pub mod server_manager;
