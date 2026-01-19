@@ -49,6 +49,20 @@ fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
     cs
 }
 
+/// Wait for leader election with polling (handles system load better than fixed sleep)
+async fn wait_for_leader<'a>(nodes: &[&'a RaftNode], timeout_ms: u64) -> Option<&'a RaftNode> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < timeout_ms as u128 {
+        for node in nodes {
+            if node.is_leader().await {
+                return Some(*node);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
 /// Generate mTLS configs for a 3-node cluster (CA + 3 unique node certs)
 fn generate_cluster_tls_configs() -> (
     RaftTlsConfig,
@@ -179,20 +193,11 @@ async fn test_three_node_cluster_bootstrap() {
     let members = vec![(1, addr1), (2, addr2), (3, addr3)];
     node1.bootstrap_cluster(members).await.unwrap();
 
-    // Wait for leader election
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find the leader
-    let mut leader = None;
-    for (i, node) in [&node1, &node2, &node3].iter().enumerate() {
-        if node.is_leader().await {
-            leader = Some(i + 1);
-            break;
-        }
-    }
+    // Wait for leader election with polling (30s timeout for system load)
+    let nodes = [&node1, &node2, &node3];
+    let leader = wait_for_leader(&nodes, 30_000).await;
 
     assert!(leader.is_some(), "No leader elected");
-    tracing::info!(leader_id = leader.unwrap(), "Leader elected");
 
     // Shutdown nodes
     node1.shutdown().await.unwrap();
@@ -240,19 +245,11 @@ async fn test_log_replication() {
     let members = vec![(1, addr1), (2, addr2), (3, addr3)];
     node1.bootstrap_cluster(members).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find leader and write through it
+    // Wait for leader election with polling (30s timeout for system load)
     let nodes = [&node1, &node2, &node3];
-    let mut leader_node = None;
-    for node in &nodes {
-        if node.is_leader().await {
-            leader_node = Some(*node);
-            break;
-        }
-    }
-
-    let leader = leader_node.expect("No leader found");
+    let leader = wait_for_leader(&nodes, 30_000)
+        .await
+        .expect("No leader found");
 
     // Propose changes through leader
     let changeset = insert_change("test", b"replicated_key", b"replicated_value");

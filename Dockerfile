@@ -32,6 +32,10 @@ RUN cargo build --release --bin roodb --bin roodb_init
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/jgarzik/roodb"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.description="RooDB distributed SQL database"
+
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

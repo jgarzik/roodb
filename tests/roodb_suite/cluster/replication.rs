@@ -15,6 +15,16 @@ use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
 use crate::test_utils::certs::write_raft_cluster_certs;
 use roodb::tls::RaftTlsConfig;
+use serial_test::serial;
+
+/// Timeout for leader election in milliseconds (generous to handle system load)
+const LEADER_ELECTION_TIMEOUT_MS: u64 = 30_000;
+/// Poll interval when waiting for leader election
+const LEADER_POLL_INTERVAL_MS: u64 = 100;
+/// Wait time for replication to complete
+const REPLICATION_WAIT_MS: u64 = 500;
+/// Wait time between sequential operations
+const OPERATION_WAIT_MS: u64 = 300;
 
 /// Get a unique port for testing
 fn test_port(base: u16) -> u16 {
@@ -42,6 +52,20 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
 /// Create a test catalog for Raft tests
 fn test_catalog() -> Arc<RwLock<Catalog>> {
     Arc::new(RwLock::new(Catalog::with_system_tables()))
+}
+
+/// Wait for leader election with retries
+async fn wait_for_leader<'a>(nodes: &[&'a RaftNode], timeout_ms: u64) -> Option<&'a RaftNode> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < timeout_ms as u128 {
+        for node in nodes {
+            if node.is_leader().await {
+                return Some(*node);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(LEADER_POLL_INTERVAL_MS)).await;
+    }
+    None
 }
 
 /// Helper to create a ChangeSet with a single insert
@@ -76,6 +100,7 @@ fn generate_cluster_tls_configs() -> (
 }
 
 #[tokio::test]
+#[serial]
 async fn test_leader_election_timing() {
     let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(16000);
@@ -119,7 +144,7 @@ async fn test_leader_election_timing() {
     // Wait up to 2 seconds to be safe
     let mut leader_found = false;
     for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(LEADER_POLL_INTERVAL_MS)).await;
         for node in [&node1, &node2, &node3] {
             if node.is_leader().await {
                 leader_found = true;
@@ -148,6 +173,7 @@ async fn test_leader_election_timing() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_replication_consistency() {
     let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(16100);
@@ -187,18 +213,11 @@ async fn test_replication_consistency() {
     let members = vec![(1, addr1), (2, addr2), (3, addr3)];
     node1.bootstrap_cluster(members).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find leader
+    // Wait for leader election with retries
     let nodes = [&node1, &node2, &node3];
-    let mut leader = None;
-    for node in &nodes {
-        if node.is_leader().await {
-            leader = Some(*node);
-            break;
-        }
-    }
-    let leader = leader.expect("No leader found");
+    let leader = wait_for_leader(&nodes, LEADER_ELECTION_TIMEOUT_MS)
+        .await
+        .expect("No leader found");
 
     // Propose multiple changes through leader
     for i in 0..5 {
@@ -209,7 +228,7 @@ async fn test_replication_consistency() {
     }
 
     // Wait for replication - if Raft consensus works, changes are replicated
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(REPLICATION_WAIT_MS)).await;
 
     // The test verifies that propose_changes succeeds, which means
     // the Raft log was replicated to a majority. Without a shared
@@ -221,6 +240,7 @@ async fn test_replication_consistency() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_follower_read() {
     let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(16200);
@@ -260,21 +280,20 @@ async fn test_follower_read() {
     let members = vec![(1, addr1), (2, addr2), (3, addr3)];
     node1.bootstrap_cluster(members).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find leader and a follower
+    // Wait for leader election with retries
     let nodes = [&node1, &node2, &node3];
-    let mut leader = None;
+    let leader = wait_for_leader(&nodes, LEADER_ELECTION_TIMEOUT_MS)
+        .await
+        .expect("No leader found");
+
+    // Find a follower
     let mut follower = None;
     for node in &nodes {
-        if node.is_leader().await {
-            leader = Some(*node);
-        } else if follower.is_none() {
+        if !node.is_leader().await {
             follower = Some(*node);
+            break;
         }
     }
-
-    let leader = leader.expect("No leader found");
     let _follower = follower.expect("No follower found");
 
     // Propose changes through leader
@@ -282,7 +301,7 @@ async fn test_follower_read() {
     leader.propose_changes(changeset).await.unwrap();
 
     // Wait for replication
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(REPLICATION_WAIT_MS)).await;
 
     // Note: To verify follower reads, we would need integrated storage.
     // This test verifies that the cluster can elect a leader and accept writes.
@@ -293,6 +312,7 @@ async fn test_follower_read() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_write_delete_sequence() {
     let (tls1, tls2, tls3, _cert_files) = generate_cluster_tls_configs();
     let base_port = test_port(16300);
@@ -332,31 +352,24 @@ async fn test_write_delete_sequence() {
     let members = vec![(1, addr1), (2, addr2), (3, addr3)];
     node1.bootstrap_cluster(members).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Find leader
+    // Wait for leader election with retries
     let nodes = [&node1, &node2, &node3];
-    let mut leader = None;
-    for node in &nodes {
-        if node.is_leader().await {
-            leader = Some(*node);
-            break;
-        }
-    }
-    let leader = leader.expect("No leader found");
+    let leader = wait_for_leader(&nodes, LEADER_ELECTION_TIMEOUT_MS)
+        .await
+        .expect("No leader found");
 
     // Propose an insert
     let insert_cs = insert_change("test", b"delete_test_key", b"delete_test_value");
     leader.propose_changes(insert_cs).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;
 
     // Propose a delete
     let mut delete_cs = ChangeSet::new(2);
     delete_cs.push(RowChange::delete("test", b"delete_test_key".to_vec()));
     leader.propose_changes(delete_cs).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;
 
     // Test verifies that insert and delete changes can be proposed successfully
 

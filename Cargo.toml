@@ -2,6 +2,7 @@
 name = "roodb"
 version = "0.5.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # Async runtime
@@ -75,6 +76,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
+libc = "0.2"
 # MySQL client for integration tests (uses rustls with aws-lc-rs)
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
 
