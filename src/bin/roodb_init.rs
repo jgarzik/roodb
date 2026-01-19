@@ -7,24 +7,28 @@
 //!   2 - No password configured
 //!   3 - Storage error
 
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use clap::Parser;
 
 use roodb::init::{initialize_database, InitConfig, InitError};
 use roodb::io::default_io_factory;
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
+#[derive(Parser)]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "Initialize RooDB database")]
+struct Cli {
+    #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
+    data_dir: PathBuf,
+}
+
 #[tokio::main]
 async fn main() {
     // Parse CLI args
-    let args: Vec<String> = env::args().collect();
-
-    let data_dir = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./data"));
+    let Cli { data_dir } = Cli::parse();
 
     eprintln!("RooDB initialization");
     eprintln!("Data directory: {}", data_dir.display());

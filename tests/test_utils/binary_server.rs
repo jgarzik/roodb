@@ -75,6 +75,7 @@ impl BinaryServer {
 
         // Run roodb_init
         let init_status = Command::new(env!("CARGO_BIN_EXE_roodb_init"))
+            .arg("--data-dir")
             .arg(data_dir.path())
             .env("ROODB_ROOT_PASSWORD", "")
             .stdout(Stdio::null())
@@ -88,10 +89,15 @@ impl BinaryServer {
 
         // Spawn roodb server with mTLS certs (use node1 cert for single-node mode)
         let server_process = Command::new(env!("CARGO_BIN_EXE_roodb"))
+            .arg("--port")
             .arg(TEST_PORT.to_string())
+            .arg("--data-dir")
             .arg(data_dir.path())
+            .arg("--cert-path")
             .arg(&raft_cert_files.node1_cert_path)
+            .arg("--key-path")
             .arg(&raft_cert_files.node1_key_path)
+            .arg("--raft-ca-cert-path")
             .arg(&raft_cert_files.ca_cert_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

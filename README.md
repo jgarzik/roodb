@@ -37,10 +37,10 @@ openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.cr
     -days 365 -nodes -subj "/CN=localhost"
 
 # Initialize database (first time only, idempotent)
-ROODB_ROOT_PASSWORD=secret ./target/release/roodb_init ./data
+ROODB_ROOT_PASSWORD=secret ./target/release/roodb_init --data-dir ./data
 
 # Start server
-./target/release/roodb 3307 ./data ./certs/server.crt ./certs/server.key
+./target/release/roodb --port 3307 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
 ```
 
 ### Connect with Client
