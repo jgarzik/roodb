@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,6 +21,7 @@ jobs:
   # Fast checks first
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,13 +37,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
-  # RooDB Integration Test Suite - runs all 4 configurations
+  # RooDB Integration Test Suite
   roodb-tests:
     needs: build
     strategy:
@@ -42,26 +52,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      # Install mysql client (used to connect to RooDB)
-      - name: Install mysql client (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y mysql-client
-
-      - name: Install mysql client (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install mysql-client && echo "$(brew --prefix mysql-client)/bin" >> $GITHUB_PATH
-
-      - name: Install mysql client (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install mysql-cli
-
-      # Run the full RooDB test suite
-      # On Linux: runs single_uring, single_posix, cluster_uring, cluster_posix
-      # On macOS/Windows: runs single_posix, cluster_posix (io_uring not available)
       - name: Run RooDB test suite
         run: cargo test --release
