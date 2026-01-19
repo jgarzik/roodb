@@ -68,9 +68,7 @@ impl ServerManager {
             state.opts.clone().expect("Server not initialized")
         };
         let pool = Pool::new(opts);
-        pool.get_conn()
-            .await
-            .expect("Failed to connect to binary server")
+        pool.get_conn().await.expect("Failed to connect to server")
     }
 
     /// Get the server port.
@@ -166,13 +164,15 @@ impl ServerManager {
 
     /// Cleanup server resources (called by atexit handler).
     pub fn cleanup(&self) {
-        let mut state = self.inner.lock().unwrap();
-        if let Some(ref mut child) = state.server_process {
-            let _ = child.kill();
-            let _ = child.wait();
+        // Use lock().ok() to avoid panicking in extern "C" context if mutex is poisoned
+        if let Ok(mut state) = self.inner.lock() {
+            if let Some(ref mut child) = state.server_process {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            state.server_process = None;
+            // TempDirs are cleaned up automatically when dropped
         }
-        state.server_process = None;
-        // TempDirs are cleaned up automatically when dropped
     }
 
     /// Kill any existing server on the specified port (cross-platform).

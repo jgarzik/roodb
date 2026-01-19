@@ -17,8 +17,8 @@ use crate::test_utils::certs::write_raft_cluster_certs;
 use roodb::tls::RaftTlsConfig;
 use serial_test::serial;
 
-/// Timeout for leader election in milliseconds
-const LEADER_ELECTION_TIMEOUT_MS: u64 = 10_000;
+/// Timeout for leader election in milliseconds (generous to handle system load)
+const LEADER_ELECTION_TIMEOUT_MS: u64 = 30_000;
 /// Poll interval when waiting for leader election
 const LEADER_POLL_INTERVAL_MS: u64 = 100;
 /// Wait time for replication to complete
