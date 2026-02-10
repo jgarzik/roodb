@@ -37,6 +37,10 @@ pub struct Insert {
     row_id_batch: Option<(u64, u64)>,
     /// Next local ID to use from batch
     next_local_id: u64,
+    /// Column indices that are auto_increment
+    auto_increment_indices: Vec<usize>,
+    /// Last auto-generated ID (for LAST_INSERT_ID)
+    last_insert_id: u64,
 }
 
 impl Insert {
@@ -46,6 +50,7 @@ impl Insert {
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         txn_context: Option<TransactionContext>,
+        auto_increment_indices: Vec<usize>,
     ) -> Self {
         Insert {
             table,
@@ -56,7 +61,14 @@ impl Insert {
             done: false,
             row_id_batch: None,
             next_local_id: 0,
+            auto_increment_indices,
+            last_insert_id: 0,
         }
+    }
+
+    /// Get the last auto-generated ID
+    pub fn last_insert_id(&self) -> u64 {
+        self.last_insert_id
     }
 }
 
@@ -98,11 +110,21 @@ impl Executor for Insert {
                 datums.push(datum);
             }
 
-            let row = Row::new(datums);
-
             // Get next row ID from pre-allocated batch
             let row_id = encode_row_id(self.next_local_id, node_id);
             self.next_local_id += 1;
+
+            // Replace NULL values in auto_increment columns with generated ID
+            // Use the low 48 bits (local counter) as the auto_increment value
+            let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
+            for &idx in &self.auto_increment_indices {
+                if idx < datums.len() && datums[idx].is_null() {
+                    datums[idx] = super::datum::Datum::Int(auto_id as i64);
+                    self.last_insert_id = auto_id;
+                }
+            }
+
+            let row = Row::new(datums);
 
             let key = encode_row_key(&self.table, row_id);
             let value = encode_row(&row);
@@ -123,10 +145,11 @@ impl Executor for Insert {
 
         self.done = true;
 
-        // Return a row indicating number of rows inserted
-        Ok(Some(Row::new(vec![super::datum::Datum::Int(
-            self.rows_inserted as i64,
-        )])))
+        // Return a row indicating number of rows inserted and last auto-generated ID
+        Ok(Some(Row::new(vec![
+            super::datum::Datum::Int(self.rows_inserted as i64),
+            super::datum::Datum::Int(self.last_insert_id as i64),
+        ])))
     }
 
     async fn close(&mut self) -> ExecutorResult<()> {
@@ -176,7 +199,13 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut insert = Insert::new("users".to_string(), columns, values, Some(txn_context));
+        let mut insert = Insert::new(
+            "users".to_string(),
+            columns,
+            values,
+            Some(txn_context),
+            vec![],
+        );
         insert.open().await.unwrap();
 
         let result = insert.next().await.unwrap().unwrap();

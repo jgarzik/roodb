@@ -186,6 +186,8 @@ impl<'a> Resolver<'a> {
         let scope = Scope::single_table(&table, table_def);
 
         // Resolve all columns for the output (always includes all table columns)
+        // Auto-increment columns are treated as nullable for INSERT purposes
+        // since NULL values will be replaced with auto-generated values.
         let mut resolved_columns = Vec::new();
         for (idx, col_def) in table_def.columns.iter().enumerate() {
             resolved_columns.push(ResolvedColumn {
@@ -193,7 +195,7 @@ impl<'a> Resolver<'a> {
                 name: col_def.name.clone(),
                 index: idx,
                 data_type: col_def.data_type.clone(),
-                nullable: col_def.nullable,
+                nullable: col_def.nullable || col_def.auto_increment,
             });
         }
 
@@ -243,6 +245,7 @@ impl<'a> Resolver<'a> {
                 column_indices.iter().map(|(i, _, _)| *i).collect();
             for (idx, col_def) in table_def.columns.iter().enumerate() {
                 if !col_def.nullable
+                    && !col_def.auto_increment
                     && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
                 {
                     let was_specified = specified_indices.contains(&idx);
@@ -1123,6 +1126,17 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
             }
             sp::ColumnOption::Unique { is_primary, .. } => {
                 if *is_primary {
+                    col_def = col_def.nullable(false);
+                }
+            }
+            sp::ColumnOption::DialectSpecific(tokens) => {
+                let token_str: String = tokens
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<String>()
+                    .to_uppercase();
+                if token_str.contains("AUTO_INCREMENT") || token_str.contains("AUTOINCREMENT") {
+                    col_def = col_def.auto_increment();
                     col_def = col_def.nullable(false);
                 }
             }

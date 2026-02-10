@@ -132,13 +132,16 @@ pub enum ParsedCommand {
     Ping,
     /// COM_STMT_PREPARE with SQL
     StmtPrepare(String),
-    /// COM_STMT_EXECUTE with statement ID and parameters
+    /// COM_STMT_EXECUTE with statement ID and raw payload for parameter decoding
     StmtExecute {
         statement_id: u32,
-        // Parameters would go here for full implementation
+        /// Raw payload bytes after the statement ID (flags, iteration-count, params)
+        raw_payload: Vec<u8>,
     },
     /// COM_STMT_CLOSE with statement ID
     StmtClose(u32),
+    /// COM_STMT_RESET with statement ID
+    StmtReset(u32),
     /// COM_RESET_CONNECTION
     ResetConnection,
     /// Unsupported command
@@ -188,7 +191,11 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
                 ));
             }
             let statement_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            Ok(ParsedCommand::StmtExecute { statement_id })
+            let raw_payload = payload[4..].to_vec();
+            Ok(ParsedCommand::StmtExecute {
+                statement_id,
+                raw_payload,
+            })
         }
 
         Command::StmtClose => {
@@ -199,6 +206,16 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
             }
             let statement_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             Ok(ParsedCommand::StmtClose(statement_id))
+        }
+
+        Command::StmtReset => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::InvalidPacket(
+                    "STMT_RESET too short".to_string(),
+                ));
+            }
+            let statement_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Ok(ParsedCommand::StmtReset(statement_id))
         }
 
         Command::ResetConnection => Ok(ParsedCommand::ResetConnection),

@@ -157,11 +157,13 @@ impl ExecutorEngine {
                 table,
                 columns,
                 values,
+                auto_increment_indices,
             } => Ok(Box::new(Insert::new(
                 table,
                 columns,
                 values,
                 self.txn_context.clone(),
+                auto_increment_indices,
             ))),
 
             PhysicalPlan::Update {

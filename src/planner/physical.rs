@@ -76,6 +76,8 @@ pub enum PhysicalPlan {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
+        /// Column indices that are auto_increment (value generated if NULL)
+        auto_increment_indices: Vec<usize>,
     },
 
     /// UPDATE rows in a table
@@ -274,12 +276,12 @@ pub struct PhysicalPlanner;
 
 impl PhysicalPlanner {
     /// Convert a logical plan to a physical plan
-    pub fn plan(logical: LogicalPlan, _catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
-        Self::plan_node(logical)
+    pub fn plan(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
+        Self::plan_node(logical, catalog)
     }
 
     /// Plan a single logical node
-    fn plan_node(logical: LogicalPlan) -> PlannerResult<PhysicalPlan> {
+    fn plan_node(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
         match logical {
             LogicalPlan::Scan {
                 table,
@@ -292,12 +294,12 @@ impl PhysicalPlanner {
             }),
 
             LogicalPlan::Filter { input, predicate } => Ok(PhysicalPlan::Filter {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
                 predicate,
             }),
 
             LogicalPlan::Project { input, expressions } => Ok(PhysicalPlan::Project {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
                 expressions,
             }),
 
@@ -310,8 +312,8 @@ impl PhysicalPlanner {
                 // For now, always use nested loop join
                 // Future: could choose hash join based on cost/statistics
                 Ok(PhysicalPlan::NestedLoopJoin {
-                    left: Box::new(Self::plan_node(*left)?),
-                    right: Box::new(Self::plan_node(*right)?),
+                    left: Box::new(Self::plan_node(*left, catalog)?),
+                    right: Box::new(Self::plan_node(*right, catalog)?),
                     join_type,
                     condition,
                 })
@@ -322,13 +324,13 @@ impl PhysicalPlanner {
                 group_by,
                 aggregates,
             } => Ok(PhysicalPlan::HashAggregate {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
                 group_by,
                 aggregates,
             }),
 
             LogicalPlan::Sort { input, order_by } => Ok(PhysicalPlan::Sort {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
                 order_by,
             }),
 
@@ -337,13 +339,13 @@ impl PhysicalPlanner {
                 limit,
                 offset,
             } => Ok(PhysicalPlan::Limit {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
                 limit,
                 offset,
             }),
 
             LogicalPlan::Distinct { input } => Ok(PhysicalPlan::HashDistinct {
-                input: Box::new(Self::plan_node(*input)?),
+                input: Box::new(Self::plan_node(*input, catalog)?),
             }),
 
             LogicalPlan::SingleRow => Ok(PhysicalPlan::SingleRow),
@@ -353,11 +355,29 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 values,
-            } => Ok(PhysicalPlan::Insert {
-                table,
-                columns,
-                values,
-            }),
+            } => {
+                // Look up auto_increment columns from catalog
+                let auto_increment_indices = if let Some(table_def) = catalog.get_table(&table) {
+                    columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, col)| {
+                            table_def
+                                .get_column(&col.name)
+                                .is_some_and(|cd| cd.auto_increment)
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                } else {
+                    vec![]
+                };
+                Ok(PhysicalPlan::Insert {
+                    table,
+                    columns,
+                    values,
+                    auto_increment_indices,
+                })
+            }
 
             LogicalPlan::Update {
                 table,

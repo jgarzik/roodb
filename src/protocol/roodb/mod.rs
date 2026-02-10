@@ -3,6 +3,7 @@
 //! Implements the RooDB client wire protocol with STARTTLS support.
 
 pub mod auth;
+pub mod binary;
 pub mod command;
 pub mod error;
 pub mod handshake;
@@ -44,7 +45,9 @@ use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
 use self::packet::{PacketReader, PacketWriter};
-use self::prepared::unsupported_prepared_stmt_error;
+use self::prepared::{
+    decode_execute_params, encode_prepare_ok, substitute_params, PreparedStatementManager,
+};
 use self::resultset::{
     default_status, encode_column_count, encode_eof_ok_packet, encode_eof_packet,
     encode_err_packet, encode_ok_packet, encode_text_row, ColumnDefinition41,
@@ -87,6 +90,8 @@ where
     txn_manager: Arc<TransactionManager>,
     /// Raft node for consensus
     raft_node: Arc<RaftNode>,
+    /// Prepared statement manager (per-connection)
+    prepared_stmts: PreparedStatementManager,
 }
 
 impl<S> RooDbConnection<S>
@@ -119,6 +124,7 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            prepared_stmts: PreparedStatementManager::new(),
         }
     }
 
@@ -153,6 +159,7 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            prepared_stmts: PreparedStatementManager::new(),
         }
     }
 
@@ -454,22 +461,19 @@ where
 
             ParsedCommand::StmtPrepare(sql) => {
                 debug!(connection_id = self.connection_id, sql = %sql, "COM_STMT_PREPARE");
-                let err = unsupported_prepared_stmt_error();
-                self.writer.set_sequence(1);
-                self.writer.write_packet(&err).await?;
-                self.writer.flush().await?;
+                self.handle_stmt_prepare(&sql).await?;
                 Ok(true)
             }
 
-            ParsedCommand::StmtExecute { statement_id } => {
+            ParsedCommand::StmtExecute {
+                statement_id,
+                raw_payload,
+            } => {
                 debug!(
                     connection_id = self.connection_id,
                     statement_id, "COM_STMT_EXECUTE"
                 );
-                let err = unsupported_prepared_stmt_error();
-                self.writer.set_sequence(1);
-                self.writer.write_packet(&err).await?;
-                self.writer.flush().await?;
+                self.handle_stmt_execute(statement_id, &raw_payload).await?;
                 Ok(true)
             }
 
@@ -478,13 +482,25 @@ where
                     connection_id = self.connection_id,
                     statement_id, "COM_STMT_CLOSE"
                 );
-                // No response needed for STMT_CLOSE
+                self.prepared_stmts.close(statement_id);
+                // No response needed for STMT_CLOSE per MySQL protocol
+                Ok(true)
+            }
+
+            ParsedCommand::StmtReset(statement_id) => {
+                debug!(
+                    connection_id = self.connection_id,
+                    statement_id, "COM_STMT_RESET"
+                );
+                // No cursor state to reset; just return OK
+                self.send_ok(0, 0).await?;
                 Ok(true)
             }
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
                 self.database = None;
+                self.prepared_stmts.clear();
                 self.send_ok(0, 0).await?;
                 Ok(true)
             }
@@ -500,6 +516,299 @@ where
                 Ok(true)
             }
         }
+    }
+
+    /// Handle COM_STMT_PREPARE: parse SQL, store AST, send COM_STMT_PREPARE_OK.
+    async fn handle_stmt_prepare(&mut self, sql: &str) -> ProtocolResult<()> {
+        let ps = match self.prepared_stmts.prepare(sql) {
+            Ok(ps) => ps,
+            Err(e) => {
+                return self.send_error_from_protocol_error(&e).await;
+            }
+        };
+
+        let stmt_id = ps.id;
+        let num_params = ps.param_count;
+
+        // Send COM_STMT_PREPARE_OK (num_columns=0; client derives columns from execute)
+        self.writer.set_sequence(1);
+        let ok_packet = encode_prepare_ok(stmt_id, 0, num_params);
+        self.writer.write_packet(&ok_packet).await?;
+
+        // Send parameter column definitions (type=VARCHAR as placeholder)
+        if num_params > 0 {
+            let schema = self.database.as_deref().unwrap_or("default");
+            for i in 0..num_params {
+                let col = crate::planner::logical::OutputColumn {
+                    id: i as usize,
+                    name: "?".to_string(),
+                    data_type: crate::catalog::DataType::Varchar(255),
+                    nullable: true,
+                };
+                let def = ColumnDefinition41::from_output_column(&col, "", schema);
+                self.writer.write_packet(&def.encode()).await?;
+            }
+
+            // EOF after parameter definitions
+            if !self.deprecate_eof {
+                let eof = encode_eof_packet(0, default_status());
+                self.writer.write_packet(&eof).await?;
+            }
+        }
+
+        // No column definitions to send (num_columns=0)
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Handle COM_STMT_EXECUTE: decode params, substitute into AST, run pipeline.
+    async fn handle_stmt_execute(
+        &mut self,
+        statement_id: u32,
+        raw_payload: &[u8],
+    ) -> ProtocolResult<()> {
+        // Look up statement
+        let ps = match self.prepared_stmts.get(statement_id) {
+            Some(ps) => ps.clone(),
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Unknown prepared statement id: {}", statement_id),
+                    )
+                    .await;
+            }
+        };
+
+        // Decode binary parameters from payload
+        let params = match decode_execute_params(raw_payload, ps.param_count) {
+            Ok(p) => p,
+            Err(e) => {
+                return self.send_error_from_protocol_error(&e).await;
+            }
+        };
+
+        // Substitute parameters into cloned AST
+        let stmt = match substitute_params(&ps.parsed_stmt, &params) {
+            Ok(s) => s,
+            Err(e) => {
+                return self.send_error_from_protocol_error(&e).await;
+            }
+        };
+
+        // Run through the normal pipeline using the substituted statement,
+        // but send binary result sets instead of text
+        self.handle_prepared_query(stmt).await
+    }
+
+    /// Execute a prepared statement (substituted AST) and send results in binary format.
+    async fn handle_prepared_query(
+        &mut self,
+        stmt: sqlparser::ast::Statement,
+    ) -> ProtocolResult<()> {
+        // Check for transaction commands based on the statement type
+        // (Prepared statements that are transaction commands are unlikely but handle gracefully)
+
+        // Resolve, type check, and plan while holding catalog lock
+        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>), PlanError> = (|| {
+            let catalog_guard = self.catalog.read();
+
+            let resolved = Resolver::new(&catalog_guard)
+                .resolve(stmt)
+                .map_err(PlanError::Sql)?;
+
+            let required_privileges = self.extract_required_privileges(&resolved);
+
+            TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
+
+            let logical = LogicalPlanBuilder::build(resolved).map_err(PlanError::Planner)?;
+
+            let optimized = Optimizer::new().optimize(logical);
+
+            let physical =
+                PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
+
+            Ok((physical, required_privileges))
+        })();
+
+        let (physical, required_privileges) = match plan_result {
+            Ok((p, privs)) => (p, privs),
+            Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
+            Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
+        };
+
+        // Check authorization
+        if !required_privileges.is_empty() {
+            if let Err(e) = self.check_authorization(&required_privileges).await {
+                return self
+                    .send_error(codes::ER_ACCESS_DENIED, states::GENERAL_ERROR, &e)
+                    .await;
+            }
+        }
+
+        // Execute with binary result sets
+        self.execute_plan_binary(physical).await
+    }
+
+    /// Execute a physical plan and send results in binary format (for prepared statements).
+    async fn execute_plan_binary(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+        let returns_rows = matches!(
+            plan,
+            PhysicalPlan::TableScan { .. }
+                | PhysicalPlan::Filter { .. }
+                | PhysicalPlan::Project { .. }
+                | PhysicalPlan::Sort { .. }
+                | PhysicalPlan::Limit { .. }
+                | PhysicalPlan::HashDistinct { .. }
+                | PhysicalPlan::HashAggregate { .. }
+                | PhysicalPlan::NestedLoopJoin { .. }
+        );
+
+        let is_ddl = matches!(
+            plan,
+            PhysicalPlan::CreateTable { .. }
+                | PhysicalPlan::DropTable { .. }
+                | PhysicalPlan::CreateIndex { .. }
+                | PhysicalPlan::DropIndex { .. }
+        );
+
+        let mvcc = Arc::new(MvccStorage::new(
+            self.storage.clone(),
+            self.txn_manager.clone(),
+        ));
+
+        let (txn_context, implicit_txn_id) = if is_ddl {
+            (None, None)
+        } else if let Some(txn_id) = self.session.current_txn {
+            let read_view = self.txn_manager.create_read_view(txn_id)?;
+            let pending = self.session.get_pending_changes();
+            (
+                Some(TransactionContext::with_pending_changes(
+                    txn_id, read_view, pending,
+                )),
+                None,
+            )
+        } else if !returns_rows && self.session.autocommit {
+            let txn = self
+                .txn_manager
+                .begin(self.session.isolation_level, self.session.is_read_only)?;
+            let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
+            (
+                Some(TransactionContext::new(txn.txn_id, read_view)),
+                Some(txn.txn_id),
+            )
+        } else {
+            let read_view = self.txn_manager.create_read_view(0)?;
+            (Some(TransactionContext::new(0, read_view)), None)
+        };
+
+        if returns_rows {
+            let columns = plan.output_columns();
+
+            let engine = ExecutorEngine::with_raft(
+                mvcc,
+                self.catalog.clone(),
+                txn_context,
+                self.raft_node.clone(),
+            );
+            let mut executor = engine.build(plan)?;
+
+            self.send_binary_result_set(&columns, &mut *executor).await
+        } else {
+            let engine = ExecutorEngine::with_raft(
+                mvcc,
+                self.catalog.clone(),
+                txn_context,
+                self.raft_node.clone(),
+            );
+            let mut executor = engine.build(plan)?;
+
+            executor.open().await?;
+            let mut affected = 0u64;
+            let mut last_insert_id = 0u64;
+            while let Some(row) = executor.next().await? {
+                if let Some(Datum::Int(n)) = row.get_opt(0) {
+                    affected += *n as u64;
+                } else {
+                    affected += 1;
+                }
+                if let Some(Datum::Int(id)) = row.get_opt(1) {
+                    last_insert_id = *id as u64;
+                }
+            }
+            executor.close().await?;
+
+            let changes = executor.take_changes();
+            if !changes.is_empty() {
+                if self.session.in_transaction() {
+                    self.session.add_pending_changes(changes);
+                } else {
+                    let changeset =
+                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    self.raft_node
+                        .propose_changes(changeset)
+                        .await
+                        .map_err(|e| ProtocolError::Raft(e.to_string()))?;
+                }
+            }
+
+            if let Some(txn_id) = implicit_txn_id {
+                self.txn_manager.commit(txn_id).await?;
+            }
+
+            self.send_ok(affected, last_insert_id).await
+        }
+    }
+
+    /// Send a result set in binary format (for prepared statement execution).
+    async fn send_binary_result_set(
+        &mut self,
+        columns: &[crate::planner::logical::OutputColumn],
+        executor: &mut dyn Executor,
+    ) -> ProtocolResult<()> {
+        executor.open().await?;
+
+        // Send column count
+        self.writer.set_sequence(1);
+        let count_packet = encode_column_count(columns.len() as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        // Send column definitions
+        let schema = self.database.as_deref().unwrap_or("default");
+        for col in columns {
+            let def = ColumnDefinition41::from_output_column(col, "", schema);
+            let def_packet = def.encode();
+            self.writer.write_packet(&def_packet).await?;
+        }
+
+        // Send EOF after columns (unless DEPRECATE_EOF)
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        // Send rows in binary format
+        while let Some(row) = executor.next().await? {
+            let row_packet = binary::encode_binary_row(&row, columns);
+            self.writer.write_packet(&row_packet).await?;
+        }
+
+        // Send final EOF/OK
+        if self.deprecate_eof {
+            let ok = encode_eof_ok_packet(default_status(), 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+
+        executor.close().await?;
+
+        Ok(())
     }
 
     /// Handle a SQL query
@@ -846,8 +1155,18 @@ where
 
             executor.open().await?;
             let mut affected = 0u64;
-            while executor.next().await?.is_some() {
-                affected += 1;
+            let mut last_insert_id = 0u64;
+            while let Some(row) = executor.next().await? {
+                // For INSERT, the result row contains [rows_inserted] as first datum
+                if let Some(Datum::Int(n)) = row.get_opt(0) {
+                    affected += *n as u64;
+                } else {
+                    affected += 1;
+                }
+                // Check for last_insert_id in second datum (from auto_increment)
+                if let Some(Datum::Int(id)) = row.get_opt(1) {
+                    last_insert_id = *id as u64;
+                }
             }
             executor.close().await?;
 
@@ -873,7 +1192,7 @@ where
                 self.txn_manager.commit(txn_id).await?;
             }
 
-            self.send_ok(affected, 0).await
+            self.send_ok(affected, last_insert_id).await
         }
     }
 

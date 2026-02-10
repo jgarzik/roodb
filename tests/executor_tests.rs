@@ -413,6 +413,7 @@ async fn test_insert() {
             ResolvedExpr::Literal(Literal::Integer(10)),
             ResolvedExpr::Literal(Literal::String("dave".to_string())),
         ]],
+        auto_increment_indices: vec![],
     };
 
     let mut exec = engine.build(plan).unwrap();
