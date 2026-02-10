@@ -27,11 +27,13 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::io::scheduler::{IoContext, IoPriority, OpKind};
 use crate::io::{AlignedBuffer, AsyncIO, AsyncIOFactory, PAGE_SIZE};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block::{BlockBuilder, BlockReader, Entry, BLOCK_SIZE};
+use crate::storage::lsm::block_cache::BlockCache;
 
 /// SSTable magic number
 const SSTABLE_MAGIC: u32 = 0x4C534D54; // "LSMT"
@@ -291,6 +293,10 @@ pub struct SstableReader<IO: AsyncIO> {
     index: Vec<IndexEntry>,
     /// I/O priority for read operations
     priority: IoPriority,
+    /// Optional block cache for avoiding repeated disk reads
+    block_cache: Option<Arc<BlockCache>>,
+    /// SSTable name for cache key (shared to avoid per-lookup allocation)
+    cache_name: Arc<str>,
 }
 
 impl<IO: AsyncIO> SstableReader<IO> {
@@ -300,7 +306,24 @@ impl<IO: AsyncIO> SstableReader<IO> {
         path: &Path,
         priority: IoPriority,
     ) -> StorageResult<Self> {
+        Self::open_with_cache(factory, path, priority, None).await
+    }
+
+    /// Open an existing SSTable with an optional block cache
+    pub async fn open_with_cache<F: AsyncIOFactory<IO = IO>>(
+        factory: &F,
+        path: &Path,
+        priority: IoPriority,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> StorageResult<Self> {
         let io = factory.open(path, false).await?;
+
+        // Derive cache name from file path
+        let cache_name: Arc<str> = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .into();
 
         // Read file size
         let file_size = io.file_size().await?;
@@ -308,28 +331,64 @@ impl<IO: AsyncIO> SstableReader<IO> {
             return Err(StorageError::InvalidSstable("file too small".to_string()));
         }
 
-        // Read footer
+        // Read footer (check cache first)
         let footer_offset = file_size - FOOTER_SIZE as u64;
-        let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
-        io.read_at_priority(&mut footer_buf, footer_offset, priority)
-            .await?;
+        let footer_data = if let Some(ref cache) = block_cache {
+            if let Some(cached) = cache.get(&cache_name, footer_offset) {
+                cached
+            } else {
+                let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
+                io.read_at_priority(&mut footer_buf, footer_offset, priority)
+                    .await?;
+                let data = footer_buf.as_slice().to_vec();
+                cache.insert(&cache_name, footer_offset, data.clone());
+                Arc::new(data)
+            }
+        } else {
+            let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
+            io.read_at_priority(&mut footer_buf, footer_offset, priority)
+                .await?;
+            Arc::new(footer_buf.as_slice().to_vec())
+        };
 
         // Parse footer
-        let metadata = Self::parse_footer(&footer_buf)?;
+        let metadata = Self::parse_footer(&footer_data)?;
 
-        // Read index block (may span multiple pages)
+        // Read index block (may span multiple pages, check cache)
         let index_size = metadata.index_size as usize;
-        let mut index_data = vec![0u8; index_size];
-        for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
-            let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            io.read_at_priority(
-                &mut page_buf,
-                metadata.index_offset + chunk_start as u64,
-                priority,
-            )
-            .await?;
-            index_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
-        }
+        let index_data = if let Some(ref cache) = block_cache {
+            // Cache index as a single block keyed by index_offset
+            if let Some(cached) = cache.get(&cache_name, metadata.index_offset) {
+                (*cached).clone()
+            } else {
+                let mut data = vec![0u8; index_size];
+                for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
+                    let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+                    io.read_at_priority(
+                        &mut page_buf,
+                        metadata.index_offset + chunk_start as u64,
+                        priority,
+                    )
+                    .await?;
+                    data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+                }
+                cache.insert(&cache_name, metadata.index_offset, data.clone());
+                data
+            }
+        } else {
+            let mut data = vec![0u8; index_size];
+            for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
+                let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+                io.read_at_priority(
+                    &mut page_buf,
+                    metadata.index_offset + chunk_start as u64,
+                    priority,
+                )
+                .await?;
+                data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+            }
+            data
+        };
 
         // Parse index
         let index = Self::parse_index(&index_data)?;
@@ -339,6 +398,8 @@ impl<IO: AsyncIO> SstableReader<IO> {
             metadata,
             index,
             priority,
+            block_cache,
+            cache_name,
         })
     }
 
@@ -482,6 +543,27 @@ impl<IO: AsyncIO> SstableReader<IO> {
         Ok(entries)
     }
 
+    /// Read a data block, using cache if available
+    async fn read_data_block(&self, block_offset: u64) -> StorageResult<Arc<Vec<u8>>> {
+        if let Some(ref cache) = self.block_cache {
+            if let Some(cached) = cache.get(&self.cache_name, block_offset) {
+                return Ok(cached);
+            }
+        }
+
+        let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
+        self.io
+            .read_at_priority(&mut buf, block_offset, self.priority)
+            .await?;
+        let data = buf.as_slice().to_vec();
+
+        if let Some(ref cache) = self.block_cache {
+            cache.insert(&self.cache_name, block_offset, data.clone());
+        }
+
+        Ok(Arc::new(data))
+    }
+
     /// Get a value by key
     pub async fn get(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
         // Check key range
@@ -492,14 +574,11 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Binary search index to find the right block
         let block_idx = self.find_block(key);
 
-        // Read and search the block
+        // Read and search the block (with cache)
         let block_offset = self.index[block_idx].block_offset;
-        let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        self.io
-            .read_at_priority(&mut buf, block_offset, self.priority)
-            .await?;
+        let block_data = self.read_data_block(block_offset).await?;
 
-        let reader = BlockReader::parse(buf.as_slice(), block_offset)?;
+        let reader = BlockReader::parse(&block_data, block_offset)?;
         if let Some(entry) = reader.get(key) {
             Ok(Some(entry.value.clone()))
         } else {
@@ -535,12 +614,8 @@ impl<IO: AsyncIO> SstableReader<IO> {
         let mut results = Vec::new();
 
         for entry in &self.index {
-            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            self.io
-                .read_at_priority(&mut buf, entry.block_offset, self.priority)
-                .await?;
-
-            let reader = BlockReader::parse(buf.as_slice(), entry.block_offset)?;
+            let block_data = self.read_data_block(entry.block_offset).await?;
+            let reader = BlockReader::parse(&block_data, entry.block_offset)?;
             for e in reader.entries() {
                 results.push((e.key.clone(), e.value.clone()));
             }
@@ -573,12 +648,8 @@ impl<IO: AsyncIO> SstableReader<IO> {
                 }
             }
 
-            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            self.io
-                .read_at_priority(&mut buf, entry.block_offset, self.priority)
-                .await?;
-
-            let reader = BlockReader::parse(buf.as_slice(), entry.block_offset)?;
+            let block_data = self.read_data_block(entry.block_offset).await?;
+            let reader = BlockReader::parse(&block_data, entry.block_offset)?;
             for e in reader.entries() {
                 // Check range
                 if let Some(s) = start {

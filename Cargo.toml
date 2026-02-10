@@ -56,6 +56,9 @@ sqlparser = { version = "0.50", features = ["visitor"] }
 # Ordered floats for sorting
 ordered-float = "4.2"
 
+# LRU cache for block cache
+lru = "0.12"
+
 # MySQL protocol support
 sha1 = "0.10"
 rand = "0.8"

@@ -81,3 +81,7 @@ Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`,
 - Use `--release` mode for Raft cluster tests (timing sensitive)
 - Direct I/O requires 4KB-aligned buffers (`AlignedBuffer::page()` or `AlignedBuffer::pages()`)
 - Debug protocol: update wrapper scripts in `/tmp/*.sh`, re-run to minimize prompts
+
+## Code Policies
+
+- `#[allow(dead_code)]` markers are banned — do not use them

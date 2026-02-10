@@ -40,6 +40,23 @@ impl ExplainOutput {
                 }
             }
 
+            PhysicalPlan::PointGet {
+                table,
+                columns,
+                key_value,
+            } => {
+                let col_names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
+                writeln!(
+                    out,
+                    "{}PointGet: {} [{}] key={:?}",
+                    prefix,
+                    table,
+                    col_names.join(", "),
+                    key_value,
+                )
+                .unwrap();
+            }
+
             PhysicalPlan::Filter { input, predicate } => {
                 writeln!(out, "{}Filter: {:?}", prefix, predicate).unwrap();
                 Self::format_node(input, indent + 1, out);

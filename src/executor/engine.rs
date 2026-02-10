@@ -22,6 +22,7 @@ use super::filter::Filter;
 use super::insert::Insert;
 use super::join::NestedLoopJoin;
 use super::limit::Limit;
+use super::point_get::PointGet;
 use super::project::Project;
 use super::scan::TableScan;
 use super::single_row::SingleRow;
@@ -87,6 +88,17 @@ impl ExecutorEngine {
             } => Ok(Box::new(TableScan::new(
                 table,
                 filter,
+                self.mvcc.clone(),
+                self.txn_context.clone(),
+            ))),
+
+            PhysicalPlan::PointGet {
+                table,
+                columns: _,
+                key_value,
+            } => Ok(Box::new(PointGet::new(
+                table,
+                key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
             ))),

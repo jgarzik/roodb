@@ -18,6 +18,7 @@ pub mod filter;
 pub mod insert;
 pub mod join;
 pub mod limit;
+pub mod point_get;
 pub mod project;
 pub mod row;
 pub mod scan;

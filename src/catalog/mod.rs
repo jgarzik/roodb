@@ -266,6 +266,8 @@ pub struct Catalog {
     tables: HashMap<String, TableDef>,
     /// Indexes by name
     indexes: HashMap<String, IndexDef>,
+    /// Schema version counter (incremented on DDL operations)
+    schema_version: u64,
 }
 
 impl Catalog {
@@ -274,7 +276,13 @@ impl Catalog {
         Self {
             tables: HashMap::new(),
             indexes: HashMap::new(),
+            schema_version: 0,
         }
+    }
+
+    /// Get the current schema version (incremented on DDL changes)
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
     }
 
     /// Create a catalog with system tables pre-populated
@@ -344,6 +352,7 @@ impl Catalog {
             return Err(CatalogError::TableExists(def.name.clone()));
         }
         self.tables.insert(def.name.clone(), def);
+        self.schema_version += 1;
         Ok(())
     }
 
@@ -354,6 +363,7 @@ impl Catalog {
         }
         // Also drop all indexes for this table
         self.indexes.retain(|_, idx| idx.table != name);
+        self.schema_version += 1;
         Ok(())
     }
 
@@ -404,6 +414,7 @@ impl Catalog {
             return Err(CatalogError::IndexExists(def.name.clone()));
         }
         self.indexes.insert(def.name.clone(), def);
+        self.schema_version += 1;
         Ok(())
     }
 
@@ -412,6 +423,7 @@ impl Catalog {
         if self.indexes.remove(name).is_none() {
             return Err(CatalogError::IndexNotFound(name.to_string()));
         }
+        self.schema_version += 1;
         Ok(())
     }
 

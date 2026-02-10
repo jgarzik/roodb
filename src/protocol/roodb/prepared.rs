@@ -14,10 +14,25 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser as SqlParser;
 
 use crate::executor::datum::Datum;
+use crate::planner::physical::PhysicalPlan;
+use crate::sql::privileges::RequiredPrivilege;
 
 use super::error::{ProtocolError, ProtocolResult};
 use super::packet::decode_length_encoded_bytes;
 use super::types::ColumnType;
+
+// ── CachedPlan ──────────────────────────────────────────────────────
+
+/// A cached physical plan from a previous execution of this prepared statement.
+#[derive(Debug, Clone)]
+pub struct CachedPlan {
+    /// The physical plan (with Placeholder literals for parameters)
+    pub physical: PhysicalPlan,
+    /// Required privileges for authorization
+    pub required_privileges: Vec<RequiredPrivilege>,
+    /// Schema version when this plan was cached (invalidate on DDL)
+    pub schema_version: u64,
+}
 
 // ── PreparedStatement ───────────────────────────────────────────────
 
@@ -36,6 +51,8 @@ pub struct PreparedStatement {
     pub column_count: u16,
     /// Last-bound parameter types (remembered for new_params_bound_flag=0)
     pub last_param_types: Option<Vec<ColumnType>>,
+    /// Cached physical plan from first execution (reused on subsequent)
+    pub cached_plan: Option<CachedPlan>,
 }
 
 // ── PreparedStatementManager ────────────────────────────────────────
@@ -78,6 +95,7 @@ impl PreparedStatementManager {
             param_count,
             column_count: 0,
             last_param_types: None,
+            cached_plan: None,
         };
         self.statements.insert(id, ps);
         Ok(self.statements.get(&id).unwrap())

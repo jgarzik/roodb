@@ -467,6 +467,7 @@ impl LogicalPlanBuilder {
                 Literal::Boolean(_) => DataType::Boolean,
                 Literal::Null => DataType::Int, // NULL is polymorphic, default to Int
                 Literal::Blob(_) => DataType::Blob,
+                Literal::Placeholder(_) => DataType::BigInt, // Resolved at substitution time
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
@@ -632,6 +633,7 @@ impl LogicalPlanBuilder {
                 Literal::Boolean(b) => b.to_string(),
                 Literal::Null => "NULL".to_string(),
                 Literal::Blob(_) => "blob".to_string(),
+                Literal::Placeholder(n) => format!("?{}", n),
             },
             _ => format!("expr_{}", idx),
         }

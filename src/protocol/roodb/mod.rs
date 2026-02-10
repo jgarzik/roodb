@@ -46,7 +46,7 @@ use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
 use self::packet::{PacketReader, PacketWriter};
 use self::prepared::{
-    decode_execute_params, encode_prepare_ok, select_column_names, substitute_params,
+    decode_execute_params, encode_prepare_ok, select_column_names, CachedPlan,
     PreparedStatementManager,
 };
 use self::resultset::{
@@ -629,32 +629,47 @@ where
             ps_mut.last_param_types = Some(used_types);
         }
 
-        // Substitute parameters into cloned AST
-        let stmt = match substitute_params(&ps.parsed_stmt, &params) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    connection_id = self.connection_id,
-                    statement_id,
-                    error = %e,
-                    "COM_STMT_EXECUTE parameter substitution failed"
-                );
-                return self.send_error_from_protocol_error(&e).await;
+        // Try the plan cache: if we have a cached plan and schema hasn't changed, reuse it
+        let cached = ps.cached_plan.as_ref().and_then(|cp| {
+            let current_version = self.catalog.read().schema_version();
+            if cp.schema_version == current_version {
+                Some(cp.clone())
+            } else {
+                None // Schema changed, invalidate cache
             }
-        };
+        });
 
-        // Run through the normal pipeline using the substituted statement,
-        // but send binary result sets instead of text
-        self.handle_prepared_query(stmt).await
+        if let Some(cached) = cached {
+            // Cache hit: clone plan and substitute params directly
+            let mut physical = cached.physical.clone();
+            physical.substitute_params(&params);
+
+            // Check authorization
+            if !cached.required_privileges.is_empty() {
+                if let Err(e) = self.check_authorization(&cached.required_privileges).await {
+                    return self
+                        .send_error(codes::ER_ACCESS_DENIED, states::GENERAL_ERROR, &e)
+                        .await;
+                }
+            }
+
+            return self.execute_plan_binary(physical).await;
+        }
+
+        // Cache miss: build plan from the unsubstituted AST with placeholder mode
+        self.handle_prepared_query(statement_id, &ps.parsed_stmt, &params)
+            .await
     }
 
-    /// Execute a prepared statement (substituted AST) and send results in binary format.
+    /// Build and cache a plan for a prepared statement, then execute it.
     async fn handle_prepared_query(
         &mut self,
-        stmt: sqlparser::ast::Statement,
+        statement_id: u32,
+        parsed_stmt: &sqlparser::ast::Statement,
+        params: &[Datum],
     ) -> ProtocolResult<()> {
         // Handle transaction/SET commands that bypass the resolve/plan pipeline
-        match &stmt {
+        match parsed_stmt {
             sqlparser::ast::Statement::StartTransaction { .. } => {
                 return self.handle_begin().await;
             }
@@ -668,18 +683,20 @@ where
             | sqlparser::ast::Statement::SetNames { .. }
             | sqlparser::ast::Statement::SetNamesDefault { .. } => {
                 // Handle SET statements via the text path
-                let sql = stmt.to_string();
+                let sql = parsed_stmt.to_string();
                 return self.try_handle_transaction_command(&sql).await.map(|_| ());
             }
             _ => {}
         }
 
-        // Resolve, type check, and plan while holding catalog lock
-        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>), PlanError> = (|| {
+        // Resolve with placeholder mode (? becomes Literal::Placeholder(n))
+        // Then build the plan template, cache it, substitute params, and execute.
+        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>, u64), PlanError> = (|| {
             let catalog_guard = self.catalog.read();
+            let schema_version = catalog_guard.schema_version();
 
-            let resolved = Resolver::new(&catalog_guard)
-                .resolve(stmt)
+            let resolved = Resolver::new_with_placeholders(&catalog_guard)
+                .resolve(parsed_stmt.clone())
                 .map_err(PlanError::Sql)?;
 
             let required_privileges = self.extract_required_privileges(&resolved);
@@ -693,14 +710,27 @@ where
             let physical =
                 PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
 
-            Ok((physical, required_privileges))
+            Ok((physical, required_privileges, schema_version))
         })();
 
-        let (physical, required_privileges) = match plan_result {
-            Ok((p, privs)) => (p, privs),
+        let (plan_template, required_privileges, schema_version) = match plan_result {
+            Ok((p, privs, sv)) => (p, privs, sv),
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
+
+        // Cache the plan template (with Placeholder literals) for future executions
+        if let Some(ps_mut) = self.prepared_stmts.get_mut(statement_id) {
+            ps_mut.cached_plan = Some(CachedPlan {
+                physical: plan_template.clone(),
+                required_privileges: required_privileges.clone(),
+                schema_version,
+            });
+        }
+
+        // Substitute params into a copy of the plan for this execution
+        let mut physical = plan_template;
+        physical.substitute_params(params);
 
         // Check authorization
         if !required_privileges.is_empty() {
@@ -720,6 +750,7 @@ where
         let returns_rows = matches!(
             plan,
             PhysicalPlan::TableScan { .. }
+                | PhysicalPlan::PointGet { .. }
                 | PhysicalPlan::Filter { .. }
                 | PhysicalPlan::Project { .. }
                 | PhysicalPlan::Sort { .. }
@@ -1137,6 +1168,7 @@ where
         let returns_rows = matches!(
             plan,
             PhysicalPlan::TableScan { .. }
+                | PhysicalPlan::PointGet { .. }
                 | PhysicalPlan::Filter { .. }
                 | PhysicalPlan::Project { .. }
                 | PhysicalPlan::Sort { .. }

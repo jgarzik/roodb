@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
+use crate::storage::lsm::block_cache::{BlockCache, DEFAULT_CACHE_CAPACITY};
 use crate::storage::lsm::compaction::{
     execute_l0_compaction, finalize_l0_compaction, needs_l0_compaction, prepare_l0_compaction,
 };
@@ -46,6 +47,8 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     /// Compaction serialization - prevents concurrent compactions from racing
     /// on file deletion. Separate from manifest lock to allow reads during compaction.
     compaction_mutex: Mutex<()>,
+    /// LRU block cache shared across all SSTable reads
+    block_cache: Arc<BlockCache>,
     /// Closed flag
     closed: AtomicBool,
     /// Phantom for IO type
@@ -67,6 +70,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             imm_memtables: RwLock::new(Vec::new()),
             manifest: Mutex::new(manifest),
             compaction_mutex: Mutex::new(()),
+            block_cache: Arc::new(BlockCache::new(DEFAULT_CACHE_CAPACITY)),
             closed: AtomicBool::new(false),
             _io: std::marker::PhantomData,
         })
@@ -184,6 +188,15 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         // Phase 3: Re-acquire manifest lock to finalize
         let mut manifest = self.manifest.lock().await;
+
+        // Invalidate cache for SSTables being removed by compaction
+        for f in &job.l0_files {
+            self.block_cache.invalidate_sstable(&f.name);
+        }
+        for f in &job.l1_files {
+            self.block_cache.invalidate_sstable(&f.name);
+        }
+
         finalize_l0_compaction(&mut manifest, &job, new_file)?;
 
         Ok(())
@@ -227,8 +240,13 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 }
 
                 let path = manifest.sstable_path(&info.name);
-                let reader =
-                    SstableReader::open(&*self.factory, &path, IoPriority::QueryRead).await?;
+                let reader = SstableReader::open_with_cache(
+                    &*self.factory,
+                    &path,
+                    IoPriority::QueryRead,
+                    Some(self.block_cache.clone()),
+                )
+                .await?;
 
                 if let Some(result) = reader.get(key).await? {
                     return Ok(Some(result));
@@ -345,8 +363,13 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
             for info in files {
                 let path = manifest.sstable_path(&info.name);
-                let reader =
-                    SstableReader::open(&*self.factory, &path, IoPriority::QueryRead).await?;
+                let reader = SstableReader::open_with_cache(
+                    &*self.factory,
+                    &path,
+                    IoPriority::QueryRead,
+                    Some(self.block_cache.clone()),
+                )
+                .await?;
 
                 for (key, value) in reader.scan_range(start, end).await? {
                     all_entries.push((key, value, source_idx));

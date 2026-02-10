@@ -5,6 +5,7 @@
 //! - Column names to column definitions with type information
 //! - Validates that referenced tables and columns exist
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast as sp;
@@ -21,12 +22,30 @@ use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 /// Name resolver
 pub struct Resolver<'a> {
     catalog: &'a Catalog,
+    /// When true, `?` placeholders resolve to `Literal::Placeholder(n)` instead of erroring.
+    /// Used for prepared statement plan caching.
+    placeholder_mode: bool,
+    /// Counter for assigning placeholder indices (used in placeholder_mode)
+    placeholder_counter: Cell<usize>,
 }
 
 impl<'a> Resolver<'a> {
     /// Create a new resolver
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            placeholder_mode: false,
+            placeholder_counter: Cell::new(0),
+        }
+    }
+
+    /// Create a resolver that handles `?` placeholders for plan caching.
+    pub fn new_with_placeholders(catalog: &'a Catalog) -> Self {
+        Self {
+            catalog,
+            placeholder_mode: true,
+            placeholder_counter: Cell::new(0),
+        }
     }
 
     /// Resolve a statement
@@ -642,7 +661,19 @@ impl<'a> Resolver<'a> {
                     Err(SqlError::Unsupported("Compound identifier".to_string()))
                 }
             }
-            sp::Expr::Value(val) => Ok(ResolvedExpr::Literal(convert_value(val)?)),
+            sp::Expr::Value(val) => {
+                // Handle `?` placeholders in placeholder mode (prepared statement plan caching)
+                if self.placeholder_mode {
+                    if let sp::Value::Placeholder(s) = val {
+                        if s == "?" {
+                            let idx = self.placeholder_counter.get();
+                            self.placeholder_counter.set(idx + 1);
+                            return Ok(ResolvedExpr::Literal(Literal::Placeholder(idx)));
+                        }
+                    }
+                }
+                Ok(ResolvedExpr::Literal(convert_value(val)?))
+            }
             sp::Expr::BinaryOp { left, op, right } => {
                 let resolved_left = self.resolve_expr(left, scope)?;
                 let resolved_right = self.resolve_expr(right, scope)?;

@@ -4,10 +4,11 @@
 //! including specific algorithm choices (e.g., nested loop vs hash join).
 
 use crate::catalog::{Catalog, ColumnDef, Constraint};
+use crate::executor::datum::Datum;
 use crate::planner::error::PlannerResult;
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
-use crate::planner::logical::LogicalPlan;
-use crate::planner::logical::{JoinType, ResolvedColumn, ResolvedExpr};
+use crate::planner::logical::{Literal, LogicalPlan};
+use crate::planner::logical::{BinaryOp, JoinType, ResolvedColumn, ResolvedExpr};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 /// Physical plan node
@@ -19,6 +20,14 @@ pub enum PhysicalPlan {
         columns: Vec<OutputColumn>,
         /// Optional filter to apply during scan
         filter: Option<ResolvedExpr>,
+    },
+
+    /// Point lookup by primary key (O(log n) instead of O(n) scan)
+    PointGet {
+        table: String,
+        columns: Vec<OutputColumn>,
+        /// Primary key value to look up
+        key_value: ResolvedExpr,
     },
 
     /// Filter rows based on a predicate
@@ -176,6 +185,8 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::TableScan { columns, .. } => columns.clone(),
 
+            PhysicalPlan::PointGet { columns, .. } => columns.clone(),
+
             PhysicalPlan::Filter { input, .. } => input.output_columns(),
 
             PhysicalPlan::Project { expressions, .. } => expressions
@@ -269,6 +280,162 @@ impl PhysicalPlan {
             PhysicalPlan::Insert { .. } | PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. }
         )
     }
+
+    /// Substitute `Literal::Placeholder(n)` with concrete values from `params`.
+    /// Used for prepared statement plan caching — clone the cached plan, then substitute.
+    pub fn substitute_params(&mut self, params: &[Datum]) {
+        match self {
+            PhysicalPlan::TableScan { filter, .. } => {
+                if let Some(f) = filter {
+                    substitute_expr(f, params);
+                }
+            }
+            PhysicalPlan::PointGet { key_value, .. } => {
+                substitute_expr(key_value, params);
+            }
+            PhysicalPlan::Filter { input, predicate } => {
+                input.substitute_params(params);
+                substitute_expr(predicate, params);
+            }
+            PhysicalPlan::Project {
+                input, expressions, ..
+            } => {
+                input.substitute_params(params);
+                for (expr, _) in expressions {
+                    substitute_expr(expr, params);
+                }
+            }
+            PhysicalPlan::NestedLoopJoin {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                left.substitute_params(params);
+                right.substitute_params(params);
+                if let Some(c) = condition {
+                    substitute_expr(c, params);
+                }
+            }
+            PhysicalPlan::HashAggregate {
+                input, group_by, ..
+            } => {
+                input.substitute_params(params);
+                for expr in group_by {
+                    substitute_expr(expr, params);
+                }
+            }
+            PhysicalPlan::Sort {
+                input, order_by, ..
+            } => {
+                input.substitute_params(params);
+                for (expr, _) in order_by {
+                    substitute_expr(expr, params);
+                }
+            }
+            PhysicalPlan::Limit { input, .. } => {
+                input.substitute_params(params);
+            }
+            PhysicalPlan::HashDistinct { input } => {
+                input.substitute_params(params);
+            }
+            PhysicalPlan::Insert { values, .. } => {
+                for row in values {
+                    for expr in row {
+                        substitute_expr(expr, params);
+                    }
+                }
+            }
+            PhysicalPlan::Update {
+                assignments,
+                filter,
+                ..
+            } => {
+                for (_, expr) in assignments {
+                    substitute_expr(expr, params);
+                }
+                if let Some(f) = filter {
+                    substitute_expr(f, params);
+                }
+            }
+            PhysicalPlan::Delete { filter, .. } => {
+                if let Some(f) = filter {
+                    substitute_expr(f, params);
+                }
+            }
+            // DDL/Auth operations have no expression parameters
+            PhysicalPlan::SingleRow
+            | PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::CreateIndex { .. }
+            | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateUser { .. }
+            | PhysicalPlan::DropUser { .. }
+            | PhysicalPlan::AlterUser { .. }
+            | PhysicalPlan::SetPassword { .. }
+            | PhysicalPlan::Grant { .. }
+            | PhysicalPlan::Revoke { .. }
+            | PhysicalPlan::ShowGrants { .. } => {}
+        }
+    }
+}
+
+/// Replace `Literal::Placeholder(n)` in a `ResolvedExpr` with concrete values.
+fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) {
+    match expr {
+        ResolvedExpr::Literal(lit) => {
+            if let Literal::Placeholder(idx) = lit {
+                let datum = if *idx < params.len() {
+                    &params[*idx]
+                } else {
+                    &Datum::Null
+                };
+                *lit = datum_to_literal(datum);
+            }
+        }
+        ResolvedExpr::BinaryOp { left, right, .. } => {
+            substitute_expr(left, params);
+            substitute_expr(right, params);
+        }
+        ResolvedExpr::UnaryOp { expr: inner, .. } => {
+            substitute_expr(inner, params);
+        }
+        ResolvedExpr::Function { args, .. } => {
+            for arg in args {
+                substitute_expr(arg, params);
+            }
+        }
+        ResolvedExpr::IsNull { expr: inner, .. } => {
+            substitute_expr(inner, params);
+        }
+        ResolvedExpr::InList { expr, list, .. } => {
+            substitute_expr(expr, params);
+            for item in list {
+                substitute_expr(item, params);
+            }
+        }
+        ResolvedExpr::Between {
+            expr, low, high, ..
+        } => {
+            substitute_expr(expr, params);
+            substitute_expr(low, params);
+            substitute_expr(high, params);
+        }
+        ResolvedExpr::Column(_) => {}
+    }
+}
+
+/// Convert a Datum to a Literal for plan substitution.
+fn datum_to_literal(datum: &Datum) -> Literal {
+    match datum {
+        Datum::Null => Literal::Null,
+        Datum::Bool(b) => Literal::Boolean(*b),
+        Datum::Int(i) => Literal::Integer(*i),
+        Datum::Float(f) => Literal::Float(*f),
+        Datum::String(s) => Literal::String(s.clone()),
+        Datum::Bytes(b) => Literal::Blob(b.clone()),
+        Datum::Timestamp(t) => Literal::Integer(*t),
+    }
 }
 
 /// Physical planner - converts logical plans to physical plans
@@ -280,6 +447,51 @@ impl PhysicalPlanner {
         Self::plan_node(logical, catalog)
     }
 
+    /// Check if a filter expression is a point lookup on the primary key.
+    /// Returns the key value expression if it is.
+    pub fn extract_point_get(
+        table_name: &str,
+        filter: &ResolvedExpr,
+        catalog: &Catalog,
+    ) -> Option<ResolvedExpr> {
+        // Get PK columns from catalog
+        let table_def = catalog.get_table(table_name)?;
+        let pk_cols = table_def.primary_key()?;
+        if pk_cols.len() != 1 {
+            return None; // Only single-column PK supported
+        }
+        let pk_col_name = &pk_cols[0];
+        let pk_col_index = table_def.get_column_index(pk_col_name)?;
+
+        // Match filter: Column(pk) = Literal or Literal = Column(pk)
+        if let ResolvedExpr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = filter
+        {
+            // Check Column = Literal
+            if let ResolvedExpr::Column(col) = left.as_ref() {
+                if col.index == pk_col_index
+                    && matches!(right.as_ref(), ResolvedExpr::Literal(_))
+                {
+                    return Some(right.as_ref().clone());
+                }
+            }
+            // Check Literal = Column
+            if let ResolvedExpr::Column(col) = right.as_ref() {
+                if col.index == pk_col_index
+                    && matches!(left.as_ref(), ResolvedExpr::Literal(_))
+                {
+                    return Some(left.as_ref().clone());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Plan a single logical node
     fn plan_node(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
         match logical {
@@ -287,11 +499,16 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 filter,
-            } => Ok(PhysicalPlan::TableScan {
-                table,
-                columns,
-                filter,
-            }),
+            } => {
+                // Note: PointGet optimization is not currently used because
+                // storage keys are auto-generated row IDs, not PK values.
+                // PointGet would require a PK→row_key index to work.
+                Ok(PhysicalPlan::TableScan {
+                    table,
+                    columns,
+                    filter,
+                })
+            }
 
             LogicalPlan::Filter { input, predicate } => Ok(PhysicalPlan::Filter {
                 input: Box::new(Self::plan_node(*input, catalog)?),
