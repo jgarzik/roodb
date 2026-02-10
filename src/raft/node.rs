@@ -207,11 +207,18 @@ impl RaftNode {
         }
 
         let cmd = Command::DataChange(changeset);
-        self.raft
+        let resp = self
+            .raft
             .client_write(cmd)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
-        Ok(())
+
+        // Check the state machine apply result for application-level errors
+        // (e.g., OCC conflicts, duplicate keys)
+        match resp.data {
+            CommandResponse::Ok(_) => Ok(()),
+            CommandResponse::Error(msg) => Err(RaftNodeError::Raft(msg)),
+        }
     }
 
     /// Write a raw command to the Raft log

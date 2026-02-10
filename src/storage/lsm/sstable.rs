@@ -34,12 +34,13 @@ use crate::io::{AlignedBuffer, AsyncIO, AsyncIOFactory, PAGE_SIZE};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block::{BlockBuilder, BlockReader, Entry, BLOCK_SIZE};
 use crate::storage::lsm::block_cache::BlockCache;
+use crate::storage::lsm::bloom::BloomFilter;
 
 /// SSTable magic number
 const SSTABLE_MAGIC: u32 = 0x4C534D54; // "LSMT"
 
-/// SSTable version
-const SSTABLE_VERSION: u32 = 1;
+/// SSTable version (v2 adds bloom filter)
+const SSTABLE_VERSION: u32 = 2;
 
 /// Footer size (one page)
 const FOOTER_SIZE: usize = PAGE_SIZE;
@@ -59,6 +60,10 @@ pub struct SstableMetadata {
     pub num_blocks: u32,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
+    /// Bloom filter offset (0 if no bloom filter)
+    pub bloom_offset: u64,
+    /// Bloom filter size (0 if no bloom filter)
+    pub bloom_size: u64,
 }
 
 /// SSTable writer
@@ -72,6 +77,10 @@ pub struct SstableWriter<IO: AsyncIO> {
     max_key: Option<Vec<u8>>,
     /// I/O priority for write operations
     priority: IoPriority,
+    /// Bloom filter built during add()
+    bloom: BloomFilter,
+    /// Number of keys added (for bloom sizing)
+    num_keys: usize,
 }
 
 impl<IO: AsyncIO> SstableWriter<IO> {
@@ -91,6 +100,8 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             min_key: None,
             max_key: None,
             priority,
+            bloom: BloomFilter::new(1024), // Initial size, will be rebuilt in finish()
+            num_keys: 0,
         })
     }
 
@@ -101,10 +112,12 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             None => Entry::tombstone(key.clone()),
         };
 
-        // Update min/max keys
+        // Update min/max keys and bloom filter
         if self.min_key.is_none() {
             self.min_key = Some(key.clone());
         }
+        self.bloom.add(&key);
+        self.num_keys += 1;
         self.max_key = Some(key);
 
         // Try to add to current block
@@ -163,7 +176,6 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         let index_offset = self.offset;
         let index_block = self.build_index_block();
         let index_size = index_block.len();
-        // Write each page of the index block
         for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
             let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
             buf.copy_from_slice(&index_block[chunk_start..chunk_start + BLOCK_SIZE])?;
@@ -173,8 +185,25 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             self.offset += BLOCK_SIZE as u64;
         }
 
+        // Write bloom filter (rebuild with correct size, padded to BLOCK_SIZE)
+        let bloom_offset = self.offset;
+        let mut bloom = BloomFilter::new(self.num_keys);
+        std::mem::swap(&mut bloom, &mut self.bloom);
+        let bloom_bytes = bloom.to_bytes();
+        let bloom_size = bloom_bytes.len().next_multiple_of(BLOCK_SIZE);
+        let mut bloom_padded = vec![0u8; bloom_size];
+        bloom_padded[..bloom_bytes.len()].copy_from_slice(&bloom_bytes);
+        for chunk_start in (0..bloom_size).step_by(BLOCK_SIZE) {
+            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
+            buf.copy_from_slice(&bloom_padded[chunk_start..chunk_start + BLOCK_SIZE])?;
+            self.io
+                .write_at_priority(&buf, self.offset, self.priority)
+                .await?;
+            self.offset += BLOCK_SIZE as u64;
+        }
+
         // Write footer
-        let footer = self.build_footer(index_offset, index_size)?;
+        let footer = self.build_footer(index_offset, index_size, bloom_offset, bloom_bytes.len())?;
         let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
         buf.copy_from_slice(&footer)?;
         self.io
@@ -234,7 +263,13 @@ impl<IO: AsyncIO> SstableWriter<IO> {
     }
 
     /// Build the footer block
-    fn build_footer(&self, index_offset: u64, index_size: usize) -> StorageResult<Vec<u8>> {
+    fn build_footer(
+        &self,
+        index_offset: u64,
+        index_size: usize,
+        bloom_offset: u64,
+        bloom_size: usize,
+    ) -> StorageResult<Vec<u8>> {
         let mut buf = vec![0u8; FOOTER_SIZE];
 
         let min_key = self.min_key.as_ref().ok_or_else(|| {
@@ -277,6 +312,15 @@ impl<IO: AsyncIO> SstableWriter<IO> {
 
         // Max key
         buf[offset..offset + max_key.len()].copy_from_slice(max_key);
+        offset += max_key.len();
+
+        // Bloom filter offset (8 bytes)
+        buf[offset..offset + 8].copy_from_slice(&bloom_offset.to_be_bytes());
+        offset += 8;
+
+        // Bloom filter size (8 bytes)
+        buf[offset..offset + 8].copy_from_slice(&(bloom_size as u64).to_be_bytes());
+        let _ = offset;
 
         // Magic and version at the very end
         buf[FOOTER_SIZE - 8..FOOTER_SIZE - 4].copy_from_slice(&SSTABLE_MAGIC.to_be_bytes());
@@ -297,6 +341,8 @@ pub struct SstableReader<IO: AsyncIO> {
     block_cache: Option<Arc<BlockCache>>,
     /// SSTable name for cache key (shared to avoid per-lookup allocation)
     cache_name: Arc<str>,
+    /// Bloom filter (if present in SSTable v2+)
+    bloom: Option<BloomFilter>,
 }
 
 impl<IO: AsyncIO> SstableReader<IO> {
@@ -393,6 +439,25 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Parse index
         let index = Self::parse_index(&index_data)?;
 
+        // Read bloom filter (v2+)
+        let bloom = if metadata.bloom_size > 0 {
+            let bloom_disk_size = (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
+            let mut bloom_data = vec![0u8; bloom_disk_size];
+            for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
+                let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+                io.read_at_priority(
+                    &mut page_buf,
+                    metadata.bloom_offset + chunk_start as u64,
+                    priority,
+                )
+                .await?;
+                bloom_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+            }
+            BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
+        } else {
+            None
+        };
+
         Ok(Self {
             io,
             metadata,
@@ -400,6 +465,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
             priority,
             block_cache,
             cache_name,
+            bloom,
         })
     }
 
@@ -419,14 +485,14 @@ impl<IO: AsyncIO> SstableReader<IO> {
             )));
         }
 
-        // Verify version
+        // Verify version (accept v1 and v2)
         let version = u32::from_be_bytes([
             buf[FOOTER_SIZE - 4],
             buf[FOOTER_SIZE - 3],
             buf[FOOTER_SIZE - 2],
             buf[FOOTER_SIZE - 1],
         ]);
-        if version != SSTABLE_VERSION {
+        if version != 1 && version != SSTABLE_VERSION {
             return Err(StorageError::InvalidSstable(format!(
                 "unsupported version: {}",
                 version
@@ -480,6 +546,18 @@ impl<IO: AsyncIO> SstableReader<IO> {
         let max_key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
         offset += 2;
         let max_key = buf[offset..offset + max_key_len].to_vec();
+        offset += max_key_len;
+
+        // Bloom filter fields (v2 only)
+        let (bloom_offset, bloom_size) = if version >= 2 {
+            let bo = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let bs = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+            let _ = offset;
+            (bo, bs)
+        } else {
+            (0, 0)
+        };
 
         Ok(SstableMetadata {
             index_offset,
@@ -487,6 +565,8 @@ impl<IO: AsyncIO> SstableReader<IO> {
             num_blocks,
             min_key,
             max_key,
+            bloom_offset,
+            bloom_size,
         })
     }
 
@@ -569,6 +649,13 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Check key range
         if key < self.metadata.min_key.as_slice() || key > self.metadata.max_key.as_slice() {
             return Ok(None);
+        }
+
+        // Check bloom filter — skip block reads on definite miss
+        if let Some(ref bloom) = self.bloom {
+            if !bloom.may_contain(key) {
+                return Ok(None);
+            }
         }
 
         // Binary search index to find the right block

@@ -230,10 +230,16 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         // Check SSTables level by level
         let manifest = self.manifest.lock().await;
 
-        for level in manifest.levels() {
-            // For L0, check all files (they can overlap)
-            // For L1+, files don't overlap so we can stop at first match
-            for info in &level.files {
+        for (level_num, level) in manifest.levels().iter().enumerate() {
+            // For L0, check newest files first (they can overlap, newer shadows older)
+            // For L1+, files don't overlap so order doesn't matter for point lookups
+            let files: Vec<_> = if level_num == 0 {
+                level.files.iter().rev().collect()
+            } else {
+                level.files.iter().collect()
+            };
+
+            for info in files {
                 // Quick key range check
                 if key < info.min_key.as_slice() || key > info.max_key.as_slice() {
                     continue;

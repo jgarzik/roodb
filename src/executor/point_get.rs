@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::executor::datum::Datum;
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
-use super::encoding::{decode_row, encode_row_key};
+use super::encoding::{decode_row, encode_pk_key};
 use super::error::ExecutorResult;
 use super::eval::eval;
 use super::row::Row;
@@ -59,14 +58,8 @@ impl Executor for PointGet {
         let empty_row = Row::empty();
         let key_datum = eval(&self.key_expr, &empty_row)?;
 
-        // Convert Datum to u64 row key
-        let row_id = match &key_datum {
-            Datum::Int(i) => *i as u64,
-            _ => return Ok(()), // Non-integer PK, no result
-        };
-
-        // Encode the storage key
-        let storage_key = encode_row_key(&self.table, row_id);
+        // Encode the storage key using PK-based encoding
+        let storage_key = encode_pk_key(&self.table, &[key_datum]);
 
         // Do the O(log n) lookup
         let value = if let Some(ref ctx) = self.txn_context {

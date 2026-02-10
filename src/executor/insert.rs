@@ -9,7 +9,7 @@ use crate::raft::RowChange;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use super::context::TransactionContext;
-use super::encoding::{encode_row, encode_row_key};
+use super::encoding::{encode_pk_key, encode_row, encode_row_key};
 use super::error::ExecutorResult;
 use super::eval::eval;
 use super::row::Row;
@@ -41,6 +41,8 @@ pub struct Insert {
     auto_increment_indices: Vec<usize>,
     /// Last auto-generated ID (for LAST_INSERT_ID)
     last_insert_id: u64,
+    /// Primary key column indices (for PK-based storage keys)
+    pk_column_indices: Vec<usize>,
 }
 
 impl Insert {
@@ -51,6 +53,7 @@ impl Insert {
         values: Vec<Vec<ResolvedExpr>>,
         txn_context: Option<TransactionContext>,
         auto_increment_indices: Vec<usize>,
+        pk_column_indices: Vec<usize>,
     ) -> Self {
         Insert {
             table,
@@ -63,6 +66,7 @@ impl Insert {
             next_local_id: 0,
             auto_increment_indices,
             last_insert_id: 0,
+            pk_column_indices,
         }
     }
 
@@ -126,7 +130,17 @@ impl Executor for Insert {
 
             let row = Row::new(datums);
 
-            let key = encode_row_key(&self.table, row_id);
+            // Use PK-based storage key if PK columns are known, else fall back to row_id
+            let key = if !self.pk_column_indices.is_empty() {
+                let pk_values: Vec<_> = self
+                    .pk_column_indices
+                    .iter()
+                    .map(|&idx| row.get(idx).unwrap().clone())
+                    .collect();
+                encode_pk_key(&self.table, &pk_values)
+            } else {
+                encode_row_key(&self.table, row_id)
+            };
             let value = encode_row(&row);
 
             // Collect the change for Raft replication.
@@ -205,6 +219,7 @@ mod tests {
             values,
             Some(txn_context),
             vec![],
+            vec![0], // id is PK at index 0
         );
         insert.open().await.unwrap();
 

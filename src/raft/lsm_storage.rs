@@ -850,11 +850,16 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             // This is the unified write path for both leader and follower:
                             // - Leader: collected changes during execution, now persisting after Raft commit
                             // - Follower: received changes via AppendEntries, now persisting locally
+                            //
+                            // Two-pass approach: OCC checks first, then applies.
+                            // This prevents false conflicts when multiple changes in
+                            // the same changeset target the same key (e.g., UPDATE + DELETE
+                            // on the same row). All OCC checks see the pre-changeset
+                            // storage state, matching what executors saw during scan.
                             let mut conflict_error: Option<String> = None;
 
+                            // Pass 1: OCC version checks (before any writes)
                             for change in &changeset.changes {
-                                // OCC version check for UPDATE/DELETE operations
-                                // If expected_version is set, verify the row hasn't been modified
                                 if let Some(expected_version) = change.expected_version {
                                     if let Ok(Some(current_data)) =
                                         self.storage.get(&change.key).await
@@ -862,7 +867,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                         let current_version =
                                             extract_row_version(&current_data).unwrap_or(0);
                                         if current_version != expected_version {
-                                            // Conflict detected - row was modified by another transaction
                                             tracing::warn!(
                                                 table = %change.table,
                                                 expected = expected_version,
@@ -875,9 +879,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                             ));
                                             break;
                                         }
-                                    }
-                                    // If row doesn't exist anymore, that's also a conflict for UPDATE
-                                    else if change.op == ChangeOp::Update {
+                                    } else if change.op == ChangeOp::Update {
                                         tracing::warn!(
                                             table = %change.table,
                                             "OCC conflict: row no longer exists"
@@ -890,20 +892,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                     }
                                     // For DELETE, if row doesn't exist, that's ok (idempotent)
                                 }
+                            }
 
+                            // Pass 2: Apply changes (only if no OCC conflict)
+                            if conflict_error.is_none() {
+                            for change in &changeset.changes {
                                 match change.op {
                                     ChangeOp::Insert | ChangeOp::Update => {
-                                        // Encode with MVCC header and write
                                         if let Some(ref value) = change.value {
                                             // Check for duplicate key on INSERT for user tables
-                                            // This prevents INSERT from silently overwriting existing rows
                                             if change.op == ChangeOp::Insert
                                                 && !is_system_table(&change.table)
                                             {
                                                 if let Ok(Some(existing_data)) =
                                                     self.storage.get(&change.key).await
                                                 {
-                                                    // Check if the existing row is not deleted
                                                     if existing_data.len() > 16
                                                         && existing_data[16] != 1
                                                     {
@@ -921,8 +924,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                             }
 
                                             // Check for duplicate table creation (race condition fix)
-                                            // This makes apply() idempotent for CREATE TABLE
-                                            // Uses precomputed existing_tables set to avoid lock contention
                                             if change.table == SYSTEM_TABLES
                                                 && change.op == ChangeOp::Insert
                                             {
@@ -932,24 +933,18 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                     )) = row.values().first()
                                                     {
                                                         if existing_tables.contains(table_name) {
-                                                            // Table already exists - skip this insert
-                                                            // This handles the race condition where two
-                                                            // CREATE TABLE proposals both passed local
-                                                            // checks but Raft serializes them here
                                                             tracing::debug!(
                                                                 table = %table_name,
                                                                 "Skipping duplicate CREATE TABLE in apply()"
                                                             );
                                                             continue;
                                                         }
-                                                        // Track this table as now existing for subsequent entries
                                                         existing_tables.insert(table_name.clone());
                                                     }
                                                 }
                                             }
 
                                             // Check for duplicate index creation
-                                            // Uses precomputed existing_indexes set to avoid lock contention
                                             if change.table == SYSTEM_INDEXES
                                                 && change.op == ChangeOp::Insert
                                             {
@@ -965,7 +960,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                             );
                                                             continue;
                                                         }
-                                                        // Track this index as now existing for subsequent entries
                                                         existing_indexes.insert(index_name.clone());
                                                     }
                                                 }
@@ -973,16 +967,16 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
 
                                             let encoded =
                                                 encode_mvcc_row(changeset.txn_id, false, value);
+
                                             self.storage
                                                 .put(&change.key, &encoded)
                                                 .await
                                                 .map_err(write_err)?;
 
-                                            // Track system table changes for catalog rebuild
                                             self.track_system_table_change(
                                                 &change.table,
                                                 value,
-                                                false, // not a delete
+                                                false,
                                                 &mut affected_tables,
                                                 &mut dropped_tables,
                                                 &mut affected_indexes,
@@ -991,20 +985,17 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                         }
                                     }
                                     ChangeOp::Delete => {
-                                        // Write tombstone (deleted=true, empty data)
                                         let encoded = encode_mvcc_row(changeset.txn_id, true, &[]);
                                         self.storage
                                             .put(&change.key, &encoded)
                                             .await
                                             .map_err(write_err)?;
 
-                                        // Track system table deletions
-                                        // For deletes, we need to read the existing value to find table name
                                         if let Some(ref value) = change.value {
                                             self.track_system_table_change(
                                                 &change.table,
                                                 value,
-                                                true, // is a delete
+                                                true,
                                                 &mut affected_tables,
                                                 &mut dropped_tables,
                                                 &mut affected_indexes,
@@ -1014,6 +1005,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                     }
                                 }
                             }
+                            } // end pass 2
 
                             // Return conflict error or success
                             if let Some(err_msg) = conflict_error {

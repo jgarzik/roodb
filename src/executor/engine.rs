@@ -170,12 +170,14 @@ impl ExecutorEngine {
                 columns,
                 values,
                 auto_increment_indices,
+                pk_column_indices,
             } => Ok(Box::new(Insert::new(
                 table,
                 columns,
                 values,
                 self.txn_context.clone(),
                 auto_increment_indices,
+                pk_column_indices,
             ))),
 
             PhysicalPlan::Update {
@@ -403,7 +405,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnDef, DataType, TableDef};
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::{encode_row, encode_row_key};
+    use crate::executor::encoding::{encode_pk_key, encode_row};
     use crate::executor::row::Row;
     use crate::planner::logical::expr::OutputColumn;
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
@@ -480,9 +482,18 @@ mod tests {
         let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
 
         let initial = vec![
-            (encode_row_key("users", 1), encode_row(&row1)),
-            (encode_row_key("users", 2), encode_row(&row2)),
-            (encode_row_key("users", 3), encode_row(&row3)),
+            (
+                encode_pk_key("users", &[Datum::Int(1)]),
+                encode_row(&row1),
+            ),
+            (
+                encode_pk_key("users", &[Datum::Int(2)]),
+                encode_row(&row2),
+            ),
+            (
+                encode_pk_key("users", &[Datum::Int(3)]),
+                encode_row(&row3),
+            ),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));

@@ -87,6 +87,8 @@ pub enum PhysicalPlan {
         values: Vec<Vec<ResolvedExpr>>,
         /// Column indices that are auto_increment (value generated if NULL)
         auto_increment_indices: Vec<usize>,
+        /// Primary key column indices for PK-based storage keys
+        pk_column_indices: Vec<usize>,
     },
 
     /// UPDATE rows in a table
@@ -500,9 +502,16 @@ impl PhysicalPlanner {
                 columns,
                 filter,
             } => {
-                // Note: PointGet optimization is not currently used because
-                // storage keys are auto-generated row IDs, not PK values.
-                // PointGet would require a PK→row_key index to work.
+                // Try to convert to PointGet if filter is PK equality lookup
+                if let Some(ref f) = filter {
+                    if let Some(key_value) = Self::extract_point_get(&table, f, catalog) {
+                        return Ok(PhysicalPlan::PointGet {
+                            table,
+                            columns,
+                            key_value,
+                        });
+                    }
+                }
                 Ok(PhysicalPlan::TableScan {
                     table,
                     columns,
@@ -573,26 +582,40 @@ impl PhysicalPlanner {
                 columns,
                 values,
             } => {
-                // Look up auto_increment columns from catalog
-                let auto_increment_indices = if let Some(table_def) = catalog.get_table(&table) {
-                    columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, col)| {
-                            table_def
-                                .get_column(&col.name)
-                                .is_some_and(|cd| cd.auto_increment)
-                        })
-                        .map(|(i, _)| i)
-                        .collect()
-                } else {
-                    vec![]
-                };
+                // Look up auto_increment and PK columns from catalog
+                let (auto_increment_indices, pk_column_indices) =
+                    if let Some(table_def) = catalog.get_table(&table) {
+                        let auto_inc: Vec<usize> = columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, col)| {
+                                table_def
+                                    .get_column(&col.name)
+                                    .is_some_and(|cd| cd.auto_increment)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        let pk_indices: Vec<usize> =
+                            if let Some(pk_cols) = table_def.primary_key() {
+                                pk_cols
+                                    .iter()
+                                    .filter_map(|pk_name| {
+                                        columns.iter().position(|c| c.name == *pk_name)
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            };
+                        (auto_inc, pk_indices)
+                    } else {
+                        (vec![], vec![])
+                    };
                 Ok(PhysicalPlan::Insert {
                     table,
                     columns,
                     values,
                     auto_increment_indices,
+                    pk_column_indices,
                 })
             }
 

@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tracing::{debug, info, warn};
 
 use crate::catalog::system_tables::SYSTEM_USERS;
@@ -65,10 +65,10 @@ pub struct RooDbConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    /// Packet reader
-    reader: PacketReader<ReadHalf<S>>,
-    /// Packet writer
-    writer: PacketWriter<WriteHalf<S>>,
+    /// Packet reader (buffered to reduce syscalls)
+    reader: PacketReader<BufReader<ReadHalf<S>>>,
+    /// Packet writer (buffered to reduce syscalls)
+    writer: PacketWriter<BufWriter<WriteHalf<S>>>,
     /// Connection ID
     connection_id: u32,
     /// Client IP address for authentication
@@ -112,8 +112,8 @@ where
         let (read_half, write_half) = tokio::io::split(stream);
 
         RooDbConnection {
-            reader: PacketReader::new(read_half),
-            writer: PacketWriter::new(write_half),
+            reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
+            writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
             connection_id,
             client_ip,
             scramble: [0u8; 20],
@@ -147,8 +147,8 @@ where
         let (read_half, write_half) = tokio::io::split(stream);
 
         RooDbConnection {
-            reader: PacketReader::new(read_half),
-            writer: PacketWriter::new(write_half),
+            reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
+            writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
             connection_id,
             client_ip,
             scramble,

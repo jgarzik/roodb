@@ -7,15 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-
 use parking_lot::RwLock;
 
 use super::{
     IsolationLevel, ReadView, TimeoutConfig, Transaction, TransactionError, TransactionResult,
     TransactionState, UndoLog,
 };
-use crate::storage::StorageEngine;
 
 /// Transaction manager - coordinates all transaction operations
 pub struct TransactionManager {
@@ -37,9 +34,6 @@ pub struct TransactionManager {
 
     /// Timeout configuration
     timeout_config: RwLock<TimeoutConfig>,
-
-    /// Storage engine reference (for rollback operations)
-    storage: Option<Arc<dyn StorageEngine>>,
 }
 
 impl TransactionManager {
@@ -53,26 +47,7 @@ impl TransactionManager {
             undo_log: UndoLog::new(),
             is_leader: AtomicBool::new(true), // Default to leader for single-node
             timeout_config: RwLock::new(TimeoutConfig::default()),
-            storage: None,
         }
-    }
-
-    /// Create a transaction manager with storage reference
-    pub fn with_storage(storage: Arc<dyn StorageEngine>) -> Self {
-        Self {
-            next_txn_id: AtomicU64::new(1),
-            active_transactions: RwLock::new(HashMap::new()),
-            committed_txns: RwLock::new(HashSet::new()),
-            undo_log: UndoLog::new(),
-            is_leader: AtomicBool::new(true),
-            timeout_config: RwLock::new(TimeoutConfig::default()),
-            storage: Some(storage),
-        }
-    }
-
-    /// Set the storage engine (for rollback operations)
-    pub fn set_storage(&mut self, storage: Arc<dyn StorageEngine>) {
-        self.storage = Some(storage);
     }
 
     /// Set whether this node is the Raft leader
@@ -155,18 +130,10 @@ impl TransactionManager {
         // Add to committed set
         self.committed_txns.write().insert(txn_id);
 
-        // For now, we keep UPDATE/DELETE undo logs for MVCC visibility
-        // INSERT undo logs can be removed since the row now exists
-        //
-        // Note: WAL-based commit logging (Record::commit) is available but not
-        // yet integrated. Currently, commit durability is achieved via storage.flush()
-        // which syncs the storage engine to disk. For a full WAL-based recovery
-        // system, we would write a COMMIT record to WAL before marking committed.
-
-        // Flush storage to ensure durability
-        if let Some(storage) = &self.storage {
-            storage.flush().await?;
-        }
+        // Durability note: With Raft-as-WAL, commit durability is provided by
+        // the Raft log. The memtable flushes to SSTable when it reaches the size
+        // threshold (64MB), not on every commit. On recovery, the Raft log is
+        // replayed to reconstruct the storage state.
 
         Ok(())
     }

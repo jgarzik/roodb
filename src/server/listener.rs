@@ -47,7 +47,7 @@ impl RooDbServer {
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
     ) -> Self {
-        let txn_manager = Arc::new(TransactionManager::with_storage(storage.clone()));
+        let txn_manager = Arc::new(TransactionManager::new());
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),

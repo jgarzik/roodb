@@ -110,6 +110,7 @@ impl Executor for Update {
             // Collect the change for Raft replication with OCC version check.
             // apply() will verify the row hasn't been modified since we read it.
             let new_value = encode_row(&row);
+
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
                 super::error::ExecutorError::Internal(
                     "UPDATE requires transaction context".to_string(),
@@ -150,7 +151,7 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::encode_row_key;
+    use crate::executor::encoding::encode_pk_key;
     use crate::planner::logical::{BinaryOp, Literal};
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
@@ -241,11 +242,11 @@ mod tests {
 
         let initial = vec![
             (
-                encode_row_key("users", 1),
+                encode_pk_key("users", &[Datum::Int(1)]),
                 encode_with_mvcc_header(0, &encode_row(&row1)),
             ),
             (
-                encode_row_key("users", 2),
+                encode_pk_key("users", &[Datum::Int(2)]),
                 encode_with_mvcc_header(0, &encode_row(&row2)),
             ),
         ];

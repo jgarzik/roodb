@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::{encode_row, encode_row_key};
+    use crate::executor::encoding::{encode_pk_key, encode_row};
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
@@ -230,15 +230,15 @@ mod tests {
 
         let initial = vec![
             (
-                encode_row_key("users", 1),
+                encode_pk_key("users", &[Datum::Int(1)]),
                 encode_with_mvcc_header(0, &encode_row(&row1)),
             ),
             (
-                encode_row_key("users", 2),
+                encode_pk_key("users", &[Datum::Int(2)]),
                 encode_with_mvcc_header(0, &encode_row(&row2)),
             ),
             (
-                encode_row_key("users", 3),
+                encode_pk_key("users", &[Datum::Int(3)]),
                 encode_with_mvcc_header(0, &encode_row(&row3)),
             ),
         ];
@@ -290,11 +290,11 @@ mod tests {
 
         let initial = vec![
             (
-                encode_row_key("users", 1),
+                encode_pk_key("users", &[Datum::Int(1)]),
                 encode_with_mvcc_header(0, &encode_row(&row1)),
             ),
             (
-                encode_row_key("users", 2),
+                encode_pk_key("users", &[Datum::Int(2)]),
                 encode_with_mvcc_header(0, &encode_row(&row2)),
             ),
         ];

@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 
 use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
 use roodb::executor::context::TransactionContext;
-use roodb::executor::encoding::{encode_row, encode_row_key};
+use roodb::executor::encoding::{encode_pk_key, encode_row};
 use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
 use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
@@ -95,15 +95,15 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
     // Encode with MVCC headers (txn_id=0 = committed)
     let initial = vec![
         (
-            encode_row_key("users", 1),
+            encode_pk_key("users", &[Datum::Int(1)]),
             encode_with_mvcc_header(0, &encode_row(&row1)),
         ),
         (
-            encode_row_key("users", 2),
+            encode_pk_key("users", &[Datum::Int(2)]),
             encode_with_mvcc_header(0, &encode_row(&row2)),
         ),
         (
-            encode_row_key("users", 3),
+            encode_pk_key("users", &[Datum::Int(3)]),
             encode_with_mvcc_header(0, &encode_row(&row3)),
         ),
     ];
@@ -414,6 +414,7 @@ async fn test_insert() {
             ResolvedExpr::Literal(Literal::String("dave".to_string())),
         ]],
         auto_increment_indices: vec![],
+        pk_column_indices: vec![0], // id is PK
     };
 
     let mut exec = engine.build(plan).unwrap();
@@ -528,9 +529,18 @@ async fn test_distinct() {
     let row3 = Row::new(vec![Datum::Int(2)]);
 
     let initial = vec![
-        (encode_row_key("nums", 1), encode_row(&row1)),
-        (encode_row_key("nums", 2), encode_row(&row2)),
-        (encode_row_key("nums", 3), encode_row(&row3)),
+        (
+            encode_pk_key("nums", &[Datum::Int(1)]),
+            encode_row(&row1),
+        ),
+        (
+            encode_pk_key("nums", &[Datum::Int(2)]),
+            encode_row(&row2),
+        ),
+        (
+            encode_pk_key("nums", &[Datum::Int(3)]),
+            encode_row(&row3),
+        ),
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
