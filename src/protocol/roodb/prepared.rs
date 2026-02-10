@@ -34,6 +34,8 @@ pub struct PreparedStatement {
     pub param_count: u16,
     /// Column count (0 at prepare time; derived from execute response)
     pub column_count: u16,
+    /// Last-bound parameter types (remembered for new_params_bound_flag=0)
+    pub last_param_types: Option<Vec<ColumnType>>,
 }
 
 // ── PreparedStatementManager ────────────────────────────────────────
@@ -75,6 +77,7 @@ impl PreparedStatementManager {
             parsed_stmt: stmt,
             param_count,
             column_count: 0,
+            last_param_types: None,
         };
         self.statements.insert(id, ps);
         Ok(self.statements.get(&id).unwrap())
@@ -83,6 +86,11 @@ impl PreparedStatementManager {
     /// Look up by ID.
     pub fn get(&self, id: u32) -> Option<&PreparedStatement> {
         self.statements.get(&id)
+    }
+
+    /// Look up by ID (mutable).
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut PreparedStatement> {
+        self.statements.get_mut(&id)
     }
 
     /// Close (deallocate) a statement.
@@ -124,6 +132,38 @@ pub fn count_placeholders(stmt: &Statement) -> u16 {
     let mut c = Counter(0);
     let _ = stmt.visit(&mut c);
     c.0
+}
+
+/// Extract the projected column names from a parsed SELECT statement.
+///
+/// Returns `Some(names)` for SELECT with explicit items (not `*`),
+/// or `None` if the column count cannot be determined statically
+/// (e.g. `SELECT *` requires catalog lookup).
+pub fn select_column_names(stmt: &Statement) -> Option<Vec<String>> {
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+
+    let select = match query.body.as_ref() {
+        sp::SetExpr::Select(s) => s,
+        _ => return None,
+    };
+
+    let mut names = Vec::new();
+    for item in &select.projection {
+        match item {
+            sp::SelectItem::UnnamedExpr(expr) => {
+                names.push(expr.to_string());
+            }
+            sp::SelectItem::ExprWithAlias { alias, .. } => {
+                names.push(alias.value.clone());
+            }
+            // Wildcard / QualifiedWildcard need catalog → give up
+            _ => return None,
+        }
+    }
+    Some(names)
 }
 
 // ── Parameter substitution ──────────────────────────────────────────
@@ -239,9 +279,17 @@ pub fn encode_prepare_ok(stmt_id: u32, num_cols: u16, num_params: u16) -> Vec<u8
 ///     if new_params_bound_flag == 1:
 ///       [num_params * 2]  type info (type_code:u8, unsigned_flag:u8)
 ///     [...]  parameter values
-pub fn decode_execute_params(payload: &[u8], num_params: u16) -> ProtocolResult<Vec<Datum>> {
+///
+/// `prev_types` should be the types from the last execution of this statement.
+/// When `new_params_bound_flag == 0`, the client reuses the previous types.
+/// Returns (params, type_codes) so the caller can store the types for next time.
+pub fn decode_execute_params(
+    payload: &[u8],
+    num_params: u16,
+    prev_types: Option<&[ColumnType]>,
+) -> ProtocolResult<(Vec<Datum>, Vec<ColumnType>)> {
     if num_params == 0 {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
 
     // payload starts right after statement_id (4 bytes already consumed by caller)
@@ -275,10 +323,10 @@ pub fn decode_execute_params(payload: &[u8], num_params: u16) -> ProtocolResult<
     let new_params_bound = payload[offset];
     offset += 1;
 
-    // Type info (if new params bound)
-    let mut type_codes = vec![ColumnType::VarString; num_params as usize];
-    if new_params_bound == 1 {
-        for tc in type_codes.iter_mut().take(num_params as usize) {
+    // Type info (if new params bound, or reuse from previous execution)
+    let type_codes = if new_params_bound == 1 {
+        let mut codes = vec![ColumnType::VarString; num_params as usize];
+        for tc in codes.iter_mut().take(num_params as usize) {
             if offset + 2 > payload.len() {
                 return Err(ProtocolError::InvalidPacket(
                     "STMT_EXECUTE type info truncated".to_string(),
@@ -288,7 +336,13 @@ pub fn decode_execute_params(payload: &[u8], num_params: u16) -> ProtocolResult<
             // payload[offset+1] is unsigned flag, we ignore for now
             offset += 2;
         }
-    }
+        codes
+    } else if let Some(prev) = prev_types {
+        prev.to_vec()
+    } else {
+        // No previous types and client didn't send new ones — use VarString as fallback
+        vec![ColumnType::VarString; num_params as usize]
+    };
 
     // Decode parameter values
     let mut params = Vec::with_capacity(num_params as usize);
@@ -306,7 +360,7 @@ pub fn decode_execute_params(payload: &[u8], num_params: u16) -> ProtocolResult<
         offset += consumed;
     }
 
-    Ok(params)
+    Ok((params, type_codes))
 }
 
 /// Decode a single binary-encoded parameter value.
@@ -577,8 +631,9 @@ mod tests {
 
     #[test]
     fn test_decode_execute_params_no_params() {
-        let params = decode_execute_params(&[], 0).unwrap();
+        let (params, types) = decode_execute_params(&[], 0, None).unwrap();
         assert!(params.is_empty());
+        assert!(types.is_empty());
     }
 
     #[test]

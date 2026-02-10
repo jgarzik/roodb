@@ -46,7 +46,8 @@ use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
 use self::packet::{PacketReader, PacketWriter};
 use self::prepared::{
-    decode_execute_params, encode_prepare_ok, substitute_params, PreparedStatementManager,
+    decode_execute_params, encode_prepare_ok, select_column_names, substitute_params,
+    PreparedStatementManager,
 };
 use self::resultset::{
     default_status, encode_column_count, encode_eof_ok_packet, encode_eof_packet,
@@ -530,9 +531,15 @@ where
         let stmt_id = ps.id;
         let num_params = ps.param_count;
 
-        // Send COM_STMT_PREPARE_OK (num_columns=0; client derives columns from execute)
+        // Derive column names from AST for SELECT statements.
+        // The C MySQL client (libmysqlclient) requires column definitions
+        // in the prepare response; without them it hangs waiting for data.
+        let col_names = select_column_names(&ps.parsed_stmt).unwrap_or_default();
+        let num_columns = col_names.len() as u16;
+
+        // Send COM_STMT_PREPARE_OK
         self.writer.set_sequence(1);
-        let ok_packet = encode_prepare_ok(stmt_id, 0, num_params);
+        let ok_packet = encode_prepare_ok(stmt_id, num_columns, num_params);
         self.writer.write_packet(&ok_packet).await?;
 
         // Send parameter column definitions (type=VARCHAR as placeholder)
@@ -556,7 +563,26 @@ where
             }
         }
 
-        // No column definitions to send (num_columns=0)
+        // Send result column definitions (placeholder types for SELECT)
+        if num_columns > 0 {
+            let schema = self.database.as_deref().unwrap_or("default");
+            for (i, name) in col_names.iter().enumerate() {
+                let col = crate::planner::logical::OutputColumn {
+                    id: i,
+                    name: name.clone(),
+                    data_type: crate::catalog::DataType::Varchar(255),
+                    nullable: true,
+                };
+                let def = ColumnDefinition41::from_output_column(&col, "", schema);
+                self.writer.write_packet(&def.encode()).await?;
+            }
+
+            // EOF after column definitions
+            if !self.deprecate_eof {
+                let eof = encode_eof_packet(0, default_status());
+                self.writer.write_packet(&eof).await?;
+            }
+        }
 
         self.writer.flush().await?;
         Ok(())
@@ -583,17 +609,36 @@ where
         };
 
         // Decode binary parameters from payload
-        let params = match decode_execute_params(raw_payload, ps.param_count) {
-            Ok(p) => p,
-            Err(e) => {
-                return self.send_error_from_protocol_error(&e).await;
-            }
-        };
+        let prev_types = ps.last_param_types.as_deref();
+        let (params, used_types) =
+            match decode_execute_params(raw_payload, ps.param_count, prev_types) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        connection_id = self.connection_id,
+                        statement_id,
+                        error = %e,
+                        "COM_STMT_EXECUTE parameter decode failed"
+                    );
+                    return self.send_error_from_protocol_error(&e).await;
+                }
+            };
+
+        // Store the used types for subsequent executions with new_params_bound=0
+        if let Some(ps_mut) = self.prepared_stmts.get_mut(statement_id) {
+            ps_mut.last_param_types = Some(used_types);
+        }
 
         // Substitute parameters into cloned AST
         let stmt = match substitute_params(&ps.parsed_stmt, &params) {
             Ok(s) => s,
             Err(e) => {
+                warn!(
+                    connection_id = self.connection_id,
+                    statement_id,
+                    error = %e,
+                    "COM_STMT_EXECUTE parameter substitution failed"
+                );
                 return self.send_error_from_protocol_error(&e).await;
             }
         };
@@ -608,8 +653,26 @@ where
         &mut self,
         stmt: sqlparser::ast::Statement,
     ) -> ProtocolResult<()> {
-        // Check for transaction commands based on the statement type
-        // (Prepared statements that are transaction commands are unlikely but handle gracefully)
+        // Handle transaction/SET commands that bypass the resolve/plan pipeline
+        match &stmt {
+            sqlparser::ast::Statement::StartTransaction { .. } => {
+                return self.handle_begin().await;
+            }
+            sqlparser::ast::Statement::Commit { .. } => {
+                return self.handle_commit().await;
+            }
+            sqlparser::ast::Statement::Rollback { .. } => {
+                return self.handle_rollback().await;
+            }
+            sqlparser::ast::Statement::SetVariable { .. }
+            | sqlparser::ast::Statement::SetNames { .. }
+            | sqlparser::ast::Statement::SetNamesDefault { .. } => {
+                // Handle SET statements via the text path
+                let sql = stmt.to_string();
+                return self.try_handle_transaction_command(&sql).await.map(|_| ());
+            }
+            _ => {}
+        }
 
         // Resolve, type check, and plan while holding catalog lock
         let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>), PlanError> = (|| {
@@ -1306,6 +1369,12 @@ where
                     .map(|_| Some(()));
             };
             return self.handle_set_isolation_level(level).await.map(Some);
+        }
+
+        // Catch-all: silently accept any other SET statement (SET NAMES, SET charset, etc.)
+        if sql_upper.starts_with("SET ") {
+            debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET statement");
+            return self.send_ok(0, 0).await.map(Some);
         }
 
         // Not a transaction command

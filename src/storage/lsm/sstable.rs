@@ -157,18 +157,22 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             return Ok(self.path);
         }
 
-        // Write index block
+        // Write index block (may span multiple pages)
         let index_offset = self.offset;
         let index_block = self.build_index_block();
-        let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        buf.copy_from_slice(&index_block)?;
-        self.io
-            .write_at_priority(&buf, self.offset, self.priority)
-            .await?;
-        self.offset += BLOCK_SIZE as u64;
+        let index_size = index_block.len();
+        // Write each page of the index block
+        for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
+            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
+            buf.copy_from_slice(&index_block[chunk_start..chunk_start + BLOCK_SIZE])?;
+            self.io
+                .write_at_priority(&buf, self.offset, self.priority)
+                .await?;
+            self.offset += BLOCK_SIZE as u64;
+        }
 
         // Write footer
-        let footer = self.build_footer(index_offset)?;
+        let footer = self.build_footer(index_offset, index_size)?;
         let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
         buf.copy_from_slice(&footer)?;
         self.io
@@ -182,9 +186,22 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         Ok(self.path)
     }
 
-    /// Build the index block
+    /// Build the index block (may span multiple pages).
+    ///
+    /// Returns a buffer whose length is a multiple of BLOCK_SIZE.
+    /// Layout: [num_entries: 4B] [entries...] [padding] [CRC32: 4B]
+    /// CRC covers all bytes from 0..total_size-4.
     fn build_index_block(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        // Calculate required size: 4 (count) + entries + 4 (CRC)
+        let entries_size: usize = self
+            .index_entries
+            .iter()
+            .map(|e| 8 + 2 + e.first_key.len())
+            .sum();
+        let needed = 4 + entries_size + 4; // count + entries + CRC
+        let total_size = needed.next_multiple_of(BLOCK_SIZE);
+
+        let mut buf = vec![0u8; total_size];
 
         // Write num entries
         let num_entries = self.index_entries.len() as u32;
@@ -207,15 +224,15 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             offset += entry.first_key.len();
         }
 
-        // CRC32 at the end
-        let crc = crc32fast::hash(&buf[..BLOCK_SIZE - 4]);
-        buf[BLOCK_SIZE - 4..].copy_from_slice(&crc.to_be_bytes());
+        // CRC32 at the very end of the buffer
+        let crc = crc32fast::hash(&buf[..total_size - 4]);
+        buf[total_size - 4..].copy_from_slice(&crc.to_be_bytes());
 
         buf
     }
 
     /// Build the footer block
-    fn build_footer(&self, index_offset: u64) -> StorageResult<Vec<u8>> {
+    fn build_footer(&self, index_offset: u64, index_size: usize) -> StorageResult<Vec<u8>> {
         let mut buf = vec![0u8; FOOTER_SIZE];
 
         let min_key = self.min_key.as_ref().ok_or_else(|| {
@@ -236,7 +253,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         offset += 8;
 
         // Index block size (8 bytes)
-        buf[offset..offset + 8].copy_from_slice(&(BLOCK_SIZE as u64).to_be_bytes());
+        buf[offset..offset + 8].copy_from_slice(&(index_size as u64).to_be_bytes());
         offset += 8;
 
         // Num data blocks (4 bytes)
@@ -300,13 +317,22 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Parse footer
         let metadata = Self::parse_footer(&footer_buf)?;
 
-        // Read index block
-        let mut index_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        io.read_at_priority(&mut index_buf, metadata.index_offset, priority)
+        // Read index block (may span multiple pages)
+        let index_size = metadata.index_size as usize;
+        let mut index_data = vec![0u8; index_size];
+        for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
+            let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+            io.read_at_priority(
+                &mut page_buf,
+                metadata.index_offset + chunk_start as u64,
+                priority,
+            )
             .await?;
+            index_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+        }
 
         // Parse index
-        let index = Self::parse_index(&index_buf)?;
+        let index = Self::parse_index(&index_data)?;
 
         Ok(Self {
             io,
@@ -403,16 +429,17 @@ impl<IO: AsyncIO> SstableReader<IO> {
         })
     }
 
-    /// Parse index block from buffer
+    /// Parse index block from buffer (may be multiple pages)
     fn parse_index(buf: &[u8]) -> StorageResult<Vec<IndexEntry>> {
-        // Verify CRC
+        let total_size = buf.len();
+        // Verify CRC (last 4 bytes of the buffer)
         let stored_crc = u32::from_be_bytes([
-            buf[BLOCK_SIZE - 4],
-            buf[BLOCK_SIZE - 3],
-            buf[BLOCK_SIZE - 2],
-            buf[BLOCK_SIZE - 1],
+            buf[total_size - 4],
+            buf[total_size - 3],
+            buf[total_size - 2],
+            buf[total_size - 1],
         ]);
-        let computed_crc = crc32fast::hash(&buf[..BLOCK_SIZE - 4]);
+        let computed_crc = crc32fast::hash(&buf[..total_size - 4]);
         if stored_crc != computed_crc {
             return Err(StorageError::InvalidSstable(
                 "index CRC mismatch".to_string(),

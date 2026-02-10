@@ -288,6 +288,27 @@ async fn test_prepare_types() {
 }
 
 #[tokio::test]
+async fn test_set_names() {
+    let server = TestServer::start("prep_setnames").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("SET NAMES utf8mb4")
+        .await
+        .expect("SET NAMES utf8mb4 failed");
+
+    conn.query_drop("SET character_set_results = NULL")
+        .await
+        .expect("SET character_set_results failed");
+
+    conn.query_drop("SET sql_mode = 'STRICT_TRANS_TABLES'")
+        .await
+        .expect("SET sql_mode failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_sysbench_patterns() {
     let server = TestServer::start("prep_sysbench").await;
     let mut conn = server.connect().await;
