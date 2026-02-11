@@ -403,10 +403,10 @@ impl<IO: AsyncIO> SstableReader<IO> {
 
         // Read index block (may span multiple pages, check cache)
         let index_size = metadata.index_size as usize;
-        let index_data = if let Some(ref cache) = block_cache {
+        let index_data: Arc<Vec<u8>> = if let Some(ref cache) = block_cache {
             // Cache index as a single block keyed by index_offset
             if let Some(cached) = cache.get(&cache_name, metadata.index_offset) {
-                (*cached).clone()
+                cached
             } else {
                 let mut data = vec![0u8; index_size];
                 for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
@@ -420,7 +420,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
                     data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
                 }
                 cache.insert(&cache_name, metadata.index_offset, data.clone());
-                data
+                Arc::new(data)
             }
         } else {
             let mut data = vec![0u8; index_size];
@@ -434,7 +434,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
                 .await?;
                 data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
             }
-            data
+            Arc::new(data)
         };
 
         // Parse index

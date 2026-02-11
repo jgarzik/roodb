@@ -304,9 +304,11 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         }
 
         // Snapshot SSTable readers from cache under brief read lock, then release
-        let readers: Vec<Arc<SstableReader<IO>>> = {
+        // Collect cache misses (path + cache_name) for fallback opening
+        let (readers, cache_misses) = {
             let manifest = self.manifest.read();
             let mut readers = Vec::new();
+            let mut misses = Vec::new();
             for (level_num, level) in manifest.levels().iter().enumerate() {
                 let files: Vec<_> = if level_num == 0 {
                     level.files.iter().rev().collect()
@@ -320,16 +322,43 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                     let cache_name: Arc<str> = info.name.as_str().into();
                     if let Some(r) = self.reader_cache.read().get(&cache_name).cloned() {
                         readers.push(r);
+                    } else {
+                        misses.push((manifest.sstable_path(&info.name), cache_name));
                     }
                 }
             }
-            readers
+            (readers, misses)
         };
 
         // Point lookups on pre-resolved readers, lock-free
-        for reader in readers {
+        for reader in &readers {
             if let Some(result) = reader.get(key).await? {
                 return Ok(Some(result));
+            }
+        }
+
+        // Fallback: open any cache-missed SSTables and retry lookup
+        for (path, cache_name) in cache_misses {
+            match SstableReader::open_with_cache(
+                &*self.factory,
+                &path,
+                IoPriority::QueryRead,
+                Some(self.block_cache.clone()),
+            )
+            .await
+            {
+                Ok(reader) => {
+                    let reader = Arc::new(reader);
+                    self.reader_cache
+                        .write()
+                        .insert(cache_name, Arc::clone(&reader));
+                    if let Some(result) = reader.get(key).await? {
+                        return Ok(Some(result));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = ?path, error = %e, "Failed to open SSTable on cache miss");
+                }
             }
         }
 
@@ -402,7 +431,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
         // SNAPSHOT ISOLATION: Capture consistent point-in-time view of all data sources.
         // Brief lock: snapshot memtables + pre-resolve SSTable readers, then release.
-        let (memtable_snapshot, imm_snapshot, readers) = {
+        let (memtable_snapshot, imm_snapshot, mut readers, cache_misses) = {
             let manifest = self.manifest.read();
 
             // Clone Arc pointers atomically
@@ -412,6 +441,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
             // Pre-resolve all SSTable readers from cache while holding manifest lock
             let mut readers: Vec<(Arc<SstableReader<IO>>, usize)> = Vec::new();
+            let mut misses: Vec<(PathBuf, Arc<str>, usize)> = Vec::new();
             let mut source_idx = 100usize;
             for (level_num, level) in manifest.levels().iter().enumerate() {
                 let files: Vec<_> = if level_num == 0 {
@@ -427,15 +457,39 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     };
                     if let Some(r) = reader {
                         readers.push((r, source_idx));
+                    } else {
+                        misses.push((manifest.sstable_path(&info.name), cache_name, source_idx));
                     }
-                    // Cache miss: skip this SSTable (warmup should have loaded it)
                     source_idx += 1;
                 }
             }
 
-            (memtable_snapshot, imm_snapshot, readers)
+            (memtable_snapshot, imm_snapshot, readers, misses)
             // manifest lock released here
         };
+
+        // Fallback: open any cache-missed SSTables
+        for (path, cache_name, source_idx) in cache_misses {
+            match SstableReader::open_with_cache(
+                &*self.factory,
+                &path,
+                IoPriority::QueryRead,
+                Some(self.block_cache.clone()),
+            )
+            .await
+            {
+                Ok(reader) => {
+                    let reader = Arc::new(reader);
+                    self.reader_cache
+                        .write()
+                        .insert(cache_name, Arc::clone(&reader));
+                    readers.push((reader, source_idx));
+                }
+                Err(e) => {
+                    tracing::warn!(path = ?path, error = %e, "Failed to open SSTable on cache miss");
+                }
+            }
+        }
 
         let lock_ns = t_start.elapsed().as_nanos() as u64;
 

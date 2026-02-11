@@ -918,8 +918,6 @@ where
         columns: &[crate::planner::logical::OutputColumn],
         executor: &mut dyn Executor,
     ) -> ProtocolResult<()> {
-        executor.open().await?;
-
         // Send column count
         self.writer.set_sequence(1);
         let count_packet = encode_column_count(columns.len() as u64);
