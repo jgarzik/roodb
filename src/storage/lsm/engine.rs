@@ -1,5 +1,6 @@
 //! LSM-Tree storage engine implementation
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,6 +50,8 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     compaction_mutex: Mutex<()>,
     /// LRU block cache shared across all SSTable reads
     block_cache: Arc<BlockCache>,
+    /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
+    reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader<IO>>>>,
     /// Closed flag
     closed: AtomicBool,
     /// Phantom for IO type
@@ -63,6 +66,36 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         // Open manifest
         let manifest = Manifest::open(&config.dir)?;
+        let block_cache = Arc::new(BlockCache::new(DEFAULT_CACHE_CAPACITY));
+
+        // Warmup: open readers for all existing SSTables and eager-load blocks
+        let mut reader_map: HashMap<Arc<str>, Arc<SstableReader<IO>>> = HashMap::new();
+        for level in manifest.levels() {
+            for info in &level.files {
+                let path = manifest.sstable_path(&info.name);
+                let cache_name: Arc<str> = info.name.as_str().into();
+                match SstableReader::open_with_cache(
+                    &*factory,
+                    &path,
+                    IoPriority::QueryRead,
+                    Some(block_cache.clone()),
+                )
+                .await
+                {
+                    Ok(reader) => {
+                        let reader = Arc::new(reader);
+                        // Eager-load blocks for small SSTables (< 16MB)
+                        if info.size < (DEFAULT_CACHE_CAPACITY / 4) as u64 {
+                            let _ = reader.eager_load_blocks().await;
+                        }
+                        reader_map.insert(cache_name, reader);
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = ?path, error = %e, "Failed to warmup SSTable reader");
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             factory,
@@ -70,7 +103,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             imm_memtables: RwLock::new(Vec::new()),
             manifest: Mutex::new(manifest),
             compaction_mutex: Mutex::new(()),
-            block_cache: Arc::new(BlockCache::new(DEFAULT_CACHE_CAPACITY)),
+            block_cache,
+            reader_cache: RwLock::new(reader_map),
             closed: AtomicBool::new(false),
             _io: std::marker::PhantomData,
         })
@@ -133,6 +167,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             .unwrap_or_default();
 
         // Phase 3: Re-acquire lock to update manifest
+        let cache_name: Arc<str> = name.as_str().into();
         let mut manifest = self.manifest.lock().await;
         manifest.add_sstable(
             0,
@@ -144,6 +179,19 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             },
         );
         manifest.save()?;
+
+        // Write-through: open reader and cache it
+        let reader = SstableReader::open_with_cache(
+            &*self.factory,
+            &path,
+            IoPriority::QueryRead,
+            Some(self.block_cache.clone()),
+        )
+        .await?;
+        let reader = Arc::new(reader);
+        // Eager-load all data blocks into block cache
+        let _ = reader.eager_load_blocks().await;
+        self.reader_cache.write().insert(cache_name, reader);
 
         // Check if compaction is needed
         if needs_l0_compaction(&manifest) {
@@ -189,17 +237,78 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         // Phase 3: Re-acquire manifest lock to finalize
         let mut manifest = self.manifest.lock().await;
 
-        // Invalidate cache for SSTables being removed by compaction
-        for f in &job.l0_files {
-            self.block_cache.invalidate_sstable(&f.name);
+        // Invalidate block cache and reader cache for SSTables being removed
+        {
+            let mut rc = self.reader_cache.write();
+            for f in &job.l0_files {
+                self.block_cache.invalidate_sstable(&f.name);
+                rc.remove(f.name.as_str());
+            }
+            for f in &job.l1_files {
+                self.block_cache.invalidate_sstable(&f.name);
+                rc.remove(f.name.as_str());
+            }
         }
-        for f in &job.l1_files {
-            self.block_cache.invalidate_sstable(&f.name);
+
+        // Write-through: open reader for new compaction output and eager-load
+        if let Some(ref _nf) = new_file {
+            let output_path = &job.output_path;
+            let cache_name: Arc<str> = job.output_name.as_str().into();
+            match SstableReader::open_with_cache(
+                &*self.factory,
+                output_path,
+                IoPriority::QueryRead,
+                Some(self.block_cache.clone()),
+            )
+            .await
+            {
+                Ok(reader) => {
+                    let reader = Arc::new(reader);
+                    let _ = reader.eager_load_blocks().await;
+                    self.reader_cache.write().insert(cache_name, reader);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to cache compaction output reader");
+                }
+            }
         }
 
         finalize_l0_compaction(&mut manifest, &job, new_file)?;
 
         Ok(())
+    }
+
+    /// Get a cached SSTable reader, or open and cache one on miss.
+    async fn get_reader(
+        &self,
+        info: &SstableInfo,
+        manifest: &Manifest,
+    ) -> StorageResult<Arc<SstableReader<IO>>> {
+        let cache_name: Arc<str> = info.name.as_str().into();
+
+        // Fast path: check reader cache
+        {
+            let guard = self.reader_cache.read();
+            if let Some(reader) = guard.get(&cache_name) {
+                return Ok(reader.clone());
+            }
+        }
+
+        // Slow path: open reader and cache it (read-allocate)
+        let path = manifest.sstable_path(&info.name);
+        let reader = Arc::new(
+            SstableReader::open_with_cache(
+                &*self.factory,
+                &path,
+                IoPriority::QueryRead,
+                Some(self.block_cache.clone()),
+            )
+            .await?,
+        );
+        self.reader_cache
+            .write()
+            .insert(cache_name, reader.clone());
+        Ok(reader)
     }
 
     /// Read from all levels (memtable, imm memtables, SSTables)
@@ -245,14 +354,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                     continue;
                 }
 
-                let path = manifest.sstable_path(&info.name);
-                let reader = SstableReader::open_with_cache(
-                    &*self.factory,
-                    &path,
-                    IoPriority::QueryRead,
-                    Some(self.block_cache.clone()),
-                )
-                .await?;
+                let reader = self.get_reader(info, &manifest).await?;
 
                 if let Some(result) = reader.get(key).await? {
                     return Ok(Some(result));
@@ -368,16 +470,9 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             };
 
             for info in files {
-                let path = manifest.sstable_path(&info.name);
-                let reader = SstableReader::open_with_cache(
-                    &*self.factory,
-                    &path,
-                    IoPriority::QueryRead,
-                    Some(self.block_cache.clone()),
-                )
-                .await?;
+                let reader = self.get_reader(info, &manifest).await?;
 
-                for (key, value) in reader.scan_range(start, end).await? {
+                for (key, value) in reader.scan_range_batched(start, end).await? {
                     all_entries.push((key, value, source_idx));
                 }
                 source_idx += 1;

@@ -751,6 +751,7 @@ where
             plan,
             PhysicalPlan::TableScan { .. }
                 | PhysicalPlan::PointGet { .. }
+                | PhysicalPlan::RangeScan { .. }
                 | PhysicalPlan::Filter { .. }
                 | PhysicalPlan::Project { .. }
                 | PhysicalPlan::Sort { .. }
@@ -1169,6 +1170,7 @@ where
             plan,
             PhysicalPlan::TableScan { .. }
                 | PhysicalPlan::PointGet { .. }
+                | PhysicalPlan::RangeScan { .. }
                 | PhysicalPlan::Filter { .. }
                 | PhysicalPlan::Project { .. }
                 | PhysicalPlan::Sort { .. }

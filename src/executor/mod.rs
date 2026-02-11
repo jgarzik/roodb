@@ -20,6 +20,7 @@ pub mod join;
 pub mod limit;
 pub mod point_get;
 pub mod project;
+pub mod range_scan;
 pub mod row;
 pub mod scan;
 pub mod single_row;

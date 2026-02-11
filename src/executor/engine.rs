@@ -24,6 +24,7 @@ use super::join::NestedLoopJoin;
 use super::limit::Limit;
 use super::point_get::PointGet;
 use super::project::Project;
+use super::range_scan::RangeScan;
 use super::scan::TableScan;
 use super::single_row::SingleRow;
 use super::sort::Sort;
@@ -99,6 +100,27 @@ impl ExecutorEngine {
             } => Ok(Box::new(PointGet::new(
                 table,
                 key_value,
+                self.mvcc.clone(),
+                self.txn_context.clone(),
+            ))),
+
+            PhysicalPlan::RangeScan {
+                table,
+                columns: _,
+                start_key,
+                end_key,
+                inclusive_start,
+                inclusive_end,
+                remaining_filter,
+            } => Ok(Box::new(RangeScan::new(
+                table,
+                super::range_scan::RangeScanBounds {
+                    start_expr: start_key,
+                    end_expr: end_key,
+                    inclusive_start,
+                    inclusive_end,
+                    remaining_filter,
+                },
                 self.mvcc.clone(),
                 self.txn_context.clone(),
             ))),

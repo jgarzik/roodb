@@ -3,7 +3,7 @@
 //! Physical plans represent how a query will actually be executed,
 //! including specific algorithm choices (e.g., nested loop vs hash join).
 
-use crate::catalog::{Catalog, ColumnDef, Constraint};
+use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::executor::datum::Datum;
 use crate::planner::error::PlannerResult;
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
@@ -28,6 +28,22 @@ pub enum PhysicalPlan {
         columns: Vec<OutputColumn>,
         /// Primary key value to look up
         key_value: ResolvedExpr,
+    },
+
+    /// Range scan by primary key bounds (scans only matching PK range instead of full table)
+    RangeScan {
+        table: String,
+        columns: Vec<OutputColumn>,
+        /// Start PK bound (None = unbounded start)
+        start_key: Option<ResolvedExpr>,
+        /// End PK bound (None = unbounded end)
+        end_key: Option<ResolvedExpr>,
+        /// Whether start bound is inclusive
+        inclusive_start: bool,
+        /// Whether end bound is inclusive
+        inclusive_end: bool,
+        /// Any remaining filter predicates that couldn't be pushed to storage bounds
+        remaining_filter: Option<ResolvedExpr>,
     },
 
     /// Filter rows based on a predicate
@@ -189,6 +205,8 @@ impl PhysicalPlan {
 
             PhysicalPlan::PointGet { columns, .. } => columns.clone(),
 
+            PhysicalPlan::RangeScan { columns, .. } => columns.clone(),
+
             PhysicalPlan::Filter { input, .. } => input.output_columns(),
 
             PhysicalPlan::Project { expressions, .. } => expressions
@@ -294,6 +312,22 @@ impl PhysicalPlan {
             }
             PhysicalPlan::PointGet { key_value, .. } => {
                 substitute_expr(key_value, params);
+            }
+            PhysicalPlan::RangeScan {
+                start_key,
+                end_key,
+                remaining_filter,
+                ..
+            } => {
+                if let Some(sk) = start_key {
+                    substitute_expr(sk, params);
+                }
+                if let Some(ek) = end_key {
+                    substitute_expr(ek, params);
+                }
+                if let Some(rf) = remaining_filter {
+                    substitute_expr(rf, params);
+                }
             }
             PhysicalPlan::Filter { input, predicate } => {
                 input.substitute_params(params);
@@ -440,6 +474,23 @@ fn datum_to_literal(datum: &Datum) -> Literal {
     }
 }
 
+/// Result of extracting PK range bounds from a filter expression
+pub struct RangeBounds {
+    pub start_key: Option<ResolvedExpr>,
+    pub end_key: Option<ResolvedExpr>,
+    pub inclusive_start: bool,
+    pub inclusive_end: bool,
+    pub remaining_filter: Option<ResolvedExpr>,
+}
+
+/// Helper enum for PK range bound extraction
+enum BoundType {
+    GtEq(ResolvedExpr),
+    Gt(ResolvedExpr),
+    LtEq(ResolvedExpr),
+    Lt(ResolvedExpr),
+}
+
 /// Physical planner - converts logical plans to physical plans
 pub struct PhysicalPlanner;
 
@@ -494,6 +545,198 @@ impl PhysicalPlanner {
         None
     }
 
+    /// Check if a filter expression is a range scan on the primary key.
+    pub fn extract_range_scan(
+        table_name: &str,
+        filter: &ResolvedExpr,
+        catalog: &Catalog,
+    ) -> Option<RangeBounds> {
+        // Get PK columns from catalog
+        let table_def = catalog.get_table(table_name)?;
+        let pk_cols = table_def.primary_key()?;
+        if pk_cols.len() != 1 {
+            return None; // Only single-column PK supported
+        }
+        let pk_col_name = &pk_cols[0];
+        let pk_col_index = table_def.get_column_index(pk_col_name)?;
+
+        // Match BETWEEN: Column(pk) BETWEEN low AND high
+        if let ResolvedExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } = filter
+        {
+            if *negated {
+                return None;
+            }
+            if let ResolvedExpr::Column(col) = expr.as_ref() {
+                if col.index == pk_col_index {
+                    return Some(RangeBounds {
+                        start_key: Some(low.as_ref().clone()),
+                        end_key: Some(high.as_ref().clone()),
+                        inclusive_start: true,
+                        inclusive_end: true,
+                        remaining_filter: None,
+                    });
+                }
+            }
+        }
+
+        // Match AND of two comparisons on PK
+        if let ResolvedExpr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } = filter
+        {
+            let mut start_key = None;
+            let mut end_key = None;
+            let mut inclusive_start = false;
+            let mut inclusive_end = false;
+            let mut remaining_parts = Vec::new();
+
+            for part in [left.as_ref(), right.as_ref()] {
+                if let Some(bound_type) = Self::extract_pk_bound(part, pk_col_index) {
+                    match bound_type {
+                        BoundType::GtEq(v) => {
+                            start_key = Some(v);
+                            inclusive_start = true;
+                        }
+                        BoundType::Gt(v) => {
+                            start_key = Some(v);
+                            inclusive_start = false;
+                        }
+                        BoundType::LtEq(v) => {
+                            end_key = Some(v);
+                            inclusive_end = true;
+                        }
+                        BoundType::Lt(v) => {
+                            end_key = Some(v);
+                            inclusive_end = false;
+                        }
+                    }
+                } else {
+                    remaining_parts.push(part.clone());
+                }
+            }
+
+            if start_key.is_some() || end_key.is_some() {
+                let remaining_filter = if remaining_parts.is_empty() {
+                    None
+                } else if remaining_parts.len() == 1 {
+                    Some(remaining_parts.remove(0))
+                } else {
+                    Some(ResolvedExpr::BinaryOp {
+                        left: Box::new(remaining_parts.remove(0)),
+                        op: BinaryOp::And,
+                        right: Box::new(remaining_parts.remove(0)),
+                        result_type: DataType::Boolean,
+                    })
+                };
+                return Some(RangeBounds {
+                    start_key,
+                    end_key,
+                    inclusive_start,
+                    inclusive_end,
+                    remaining_filter,
+                });
+            }
+        }
+
+        // Match single comparison on PK (half-bounded range)
+        if let Some(bound_type) = Self::extract_pk_bound(filter, pk_col_index) {
+            let rb = match bound_type {
+                BoundType::GtEq(v) => RangeBounds {
+                    start_key: Some(v),
+                    end_key: None,
+                    inclusive_start: true,
+                    inclusive_end: false,
+                    remaining_filter: None,
+                },
+                BoundType::Gt(v) => RangeBounds {
+                    start_key: Some(v),
+                    end_key: None,
+                    inclusive_start: false,
+                    inclusive_end: false,
+                    remaining_filter: None,
+                },
+                BoundType::LtEq(v) => RangeBounds {
+                    start_key: None,
+                    end_key: Some(v),
+                    inclusive_start: false,
+                    inclusive_end: true,
+                    remaining_filter: None,
+                },
+                BoundType::Lt(v) => RangeBounds {
+                    start_key: None,
+                    end_key: Some(v),
+                    inclusive_start: false,
+                    inclusive_end: false,
+                    remaining_filter: None,
+                },
+            };
+            return Some(rb);
+        }
+
+        None
+    }
+
+    /// Extract a PK bound from a comparison expression
+    fn extract_pk_bound(
+        expr: &ResolvedExpr,
+        pk_col_index: usize,
+    ) -> Option<BoundType> {
+        if let ResolvedExpr::BinaryOp {
+            left, op, right, ..
+        } = expr
+        {
+            // Column op Literal
+            if let ResolvedExpr::Column(col) = left.as_ref() {
+                if col.index == pk_col_index {
+                    match op {
+                        BinaryOp::GtEq => {
+                            return Some(BoundType::GtEq(right.as_ref().clone()));
+                        }
+                        BinaryOp::Gt => {
+                            return Some(BoundType::Gt(right.as_ref().clone()));
+                        }
+                        BinaryOp::LtEq => {
+                            return Some(BoundType::LtEq(right.as_ref().clone()));
+                        }
+                        BinaryOp::Lt => {
+                            return Some(BoundType::Lt(right.as_ref().clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Literal op Column (reversed)
+            if let ResolvedExpr::Column(col) = right.as_ref() {
+                if col.index == pk_col_index {
+                    match op {
+                        BinaryOp::GtEq => {
+                            return Some(BoundType::LtEq(left.as_ref().clone()));
+                        }
+                        BinaryOp::Gt => {
+                            return Some(BoundType::Lt(left.as_ref().clone()));
+                        }
+                        BinaryOp::LtEq => {
+                            return Some(BoundType::GtEq(left.as_ref().clone()));
+                        }
+                        BinaryOp::Lt => {
+                            return Some(BoundType::Gt(left.as_ref().clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Plan a single logical node
     fn plan_node(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
         match logical {
@@ -509,6 +752,18 @@ impl PhysicalPlanner {
                             table,
                             columns,
                             key_value,
+                        });
+                    }
+                    // Try to convert to RangeScan if filter is PK range
+                    if let Some(rb) = Self::extract_range_scan(&table, f, catalog) {
+                        return Ok(PhysicalPlan::RangeScan {
+                            table,
+                            columns,
+                            start_key: rb.start_key,
+                            end_key: rb.end_key,
+                            inclusive_start: rb.inclusive_start,
+                            inclusive_end: rb.inclusive_end,
+                            remaining_filter: rb.remaining_filter,
                         });
                     }
                 }
@@ -734,29 +989,103 @@ impl PhysicalPlanner {
 mod tests {
     use super::*;
     use crate::planner::logical::LogicalPlanBuilder;
+    use crate::planner::optimizer::Optimizer;
     use crate::planner::test_utils::test_catalog;
     use crate::sql::{Parser, Resolver, TypeChecker};
+
+    /// Helper: parse SQL through the full pipeline (optimizer included)
+    fn plan_sql(catalog: &Catalog, sql: &str) -> PhysicalPlan {
+        let stmt = Parser::parse_one(sql).unwrap();
+        let resolver = Resolver::new(catalog);
+        let resolved = resolver.resolve(stmt).unwrap();
+        TypeChecker::check(&resolved).unwrap();
+        let logical = LogicalPlanBuilder::build(resolved).unwrap();
+        let optimized = Optimizer::new().optimize(logical);
+        PhysicalPlanner::plan(optimized, catalog).unwrap()
+    }
 
     #[test]
     fn test_physical_plan_select() {
         let catalog = test_catalog();
-        let sql = "SELECT id, name FROM users WHERE age > 18";
-        let stmt = Parser::parse_one(sql).unwrap();
-        let resolver = Resolver::new(&catalog);
-        let resolved = resolver.resolve(stmt).unwrap();
-        TypeChecker::check(&resolved).unwrap();
+        let physical = plan_sql(&catalog, "SELECT id, name FROM users WHERE age > 18");
 
-        let logical = LogicalPlanBuilder::build(resolved).unwrap();
-        let physical = PhysicalPlanner::plan(logical, &catalog).unwrap();
-
-        // Should produce: Project -> Filter -> TableScan
+        // Should produce: Project -> TableScan(filter: ...)
         match physical {
-            PhysicalPlan::Project { input, .. } => match *input {
-                PhysicalPlan::Filter { input, .. } => {
-                    assert!(matches!(*input, PhysicalPlan::TableScan { .. }));
+            PhysicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, PhysicalPlan::TableScan { filter: Some(_), .. }),
+                    "Expected TableScan with pushed-down filter"
+                );
+            }
+            _ => panic!("Expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_physical_plan_range_scan_between() {
+        let catalog = test_catalog();
+        let physical = plan_sql(&catalog, "SELECT id, name FROM users WHERE id BETWEEN 10 AND 20");
+
+        // Should produce: Project -> RangeScan (BETWEEN on PK)
+        match physical {
+            PhysicalPlan::Project { input, .. } => {
+                match *input {
+                    PhysicalPlan::RangeScan {
+                        ref table,
+                        inclusive_start,
+                        inclusive_end,
+                        ref remaining_filter,
+                        ..
+                    } => {
+                        assert_eq!(table, "users");
+                        assert!(inclusive_start);
+                        assert!(inclusive_end);
+                        assert!(remaining_filter.is_none());
+                    }
+                    _ => panic!("Expected RangeScan, got {:?}", *input),
                 }
-                _ => panic!("Expected Filter"),
-            },
+            }
+            _ => panic!("Expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_physical_plan_range_scan_comparison() {
+        let catalog = test_catalog();
+        let physical = plan_sql(&catalog, "SELECT id FROM users WHERE id >= 5 AND id < 15");
+
+        // Should produce: Project -> RangeScan (comparisons on PK)
+        match physical {
+            PhysicalPlan::Project { input, .. } => {
+                match *input {
+                    PhysicalPlan::RangeScan {
+                        inclusive_start,
+                        inclusive_end,
+                        ..
+                    } => {
+                        assert!(inclusive_start);   // >= is inclusive
+                        assert!(!inclusive_end);     // < is exclusive
+                    }
+                    _ => panic!("Expected RangeScan, got {:?}", *input),
+                }
+            }
+            _ => panic!("Expected Project"),
+        }
+    }
+
+    #[test]
+    fn test_physical_plan_no_range_scan_non_pk() {
+        let catalog = test_catalog();
+        let physical = plan_sql(&catalog, "SELECT id FROM users WHERE age BETWEEN 18 AND 65");
+
+        // age is NOT the PK, so should NOT use RangeScan
+        match physical {
+            PhysicalPlan::Project { input, .. } => {
+                assert!(
+                    !matches!(*input, PhysicalPlan::RangeScan { .. }),
+                    "Should NOT use RangeScan for non-PK column"
+                );
+            }
             _ => panic!("Expected Project"),
         }
     }

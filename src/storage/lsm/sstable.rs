@@ -439,21 +439,44 @@ impl<IO: AsyncIO> SstableReader<IO> {
         // Parse index
         let index = Self::parse_index(&index_data)?;
 
-        // Read bloom filter (v2+)
+        // Read bloom filter (v2+), using block cache if available
         let bloom = if metadata.bloom_size > 0 {
-            let bloom_disk_size = (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
-            let mut bloom_data = vec![0u8; bloom_disk_size];
-            for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
-                let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-                io.read_at_priority(
-                    &mut page_buf,
-                    metadata.bloom_offset + chunk_start as u64,
-                    priority,
-                )
-                .await?;
-                bloom_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+            if let Some(ref cache) = block_cache {
+                if let Some(cached) = cache.get(&cache_name, metadata.bloom_offset) {
+                    BloomFilter::from_bytes(&cached[..metadata.bloom_size as usize])
+                } else {
+                    let bloom_disk_size =
+                        (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
+                    let mut bloom_data = vec![0u8; bloom_disk_size];
+                    for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
+                        let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+                        io.read_at_priority(
+                            &mut page_buf,
+                            metadata.bloom_offset + chunk_start as u64,
+                            priority,
+                        )
+                        .await?;
+                        bloom_data[chunk_start..chunk_start + BLOCK_SIZE]
+                            .copy_from_slice(&page_buf);
+                    }
+                    cache.insert(&cache_name, metadata.bloom_offset, bloom_data.clone());
+                    BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
+                }
+            } else {
+                let bloom_disk_size = (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
+                let mut bloom_data = vec![0u8; bloom_disk_size];
+                for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
+                    let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
+                    io.read_at_priority(
+                        &mut page_buf,
+                        metadata.bloom_offset + chunk_start as u64,
+                        priority,
+                    )
+                    .await?;
+                    bloom_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
+                }
+                BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
             }
-            BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
         } else {
             None
         };
@@ -624,7 +647,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
     }
 
     /// Read a data block, using cache if available
-    async fn read_data_block(&self, block_offset: u64) -> StorageResult<Arc<Vec<u8>>> {
+    pub async fn read_data_block(&self, block_offset: u64) -> StorageResult<Arc<Vec<u8>>> {
         if let Some(ref cache) = self.block_cache {
             if let Some(cached) = cache.get(&self.cache_name, block_offset) {
                 return Ok(cached);
@@ -756,6 +779,108 @@ impl<IO: AsyncIO> SstableReader<IO> {
         Ok(results)
     }
 
+    /// Scan entries in a key range using batched block reads.
+    ///
+    /// Instead of reading blocks one at a time, this determines which blocks
+    /// are needed, submits all cache-miss reads in a single batch via read_batch(),
+    /// then processes entries from the fetched blocks.
+    pub async fn scan_range_batched(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        // Find starting and ending block indices
+        let start_idx = match start {
+            Some(k) => self.find_block(k),
+            None => 0,
+        };
+
+        // Determine which blocks we need (and which are cache misses)
+        let mut needed_blocks: Vec<(usize, u64)> = Vec::new(); // (block_index, offset)
+        for i in start_idx..self.index.len() {
+            let entry = &self.index[i];
+            if let Some(e) = end {
+                if entry.first_key.as_slice() >= e {
+                    break;
+                }
+            }
+            needed_blocks.push((i, entry.block_offset));
+        }
+
+        if needed_blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Separate cache hits from misses
+        let mut miss_indices: Vec<usize> = Vec::new(); // indices into needed_blocks
+        let mut cached_blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(needed_blocks.len());
+
+        for (idx, &(_, offset)) in needed_blocks.iter().enumerate() {
+            if let Some(ref cache) = self.block_cache {
+                if let Some(cached) = cache.get(&self.cache_name, offset) {
+                    cached_blocks.push(Some(cached));
+                    continue;
+                }
+            }
+            cached_blocks.push(None);
+            miss_indices.push(idx);
+        }
+
+        // Batch-read all cache misses
+        if !miss_indices.is_empty() {
+            let requests: Vec<(u64, usize)> = miss_indices
+                .iter()
+                .map(|&idx| (needed_blocks[idx].1, BLOCK_SIZE))
+                .collect();
+
+            let batch_results = self.io.read_batch(&requests).await;
+
+            for (i, result) in batch_results.into_iter().enumerate() {
+                let idx = miss_indices[i];
+                let offset = needed_blocks[idx].1;
+                match result {
+                    Ok(buf) => {
+                        let data = buf.as_slice().to_vec();
+                        if let Some(ref cache) = self.block_cache {
+                            cache.insert(&self.cache_name, offset, data.clone());
+                        }
+                        cached_blocks[idx] = Some(Arc::new(data));
+                    }
+                    Err(e) => {
+                        return Err(StorageError::Io(crate::io::IoError::Io(
+                            std::io::Error::other(format!("batch read failed: {}", e)),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Process all blocks and collect results
+        let mut results = Vec::new();
+        for (i, &(_, offset)) in needed_blocks.iter().enumerate() {
+            let block_data = cached_blocks[i]
+                .as_ref()
+                .expect("all blocks should be loaded after batch read");
+
+            let reader = BlockReader::parse(block_data, offset)?;
+            for e in reader.entries() {
+                if let Some(s) = start {
+                    if e.key.as_slice() < s {
+                        continue;
+                    }
+                }
+                if let Some(en) = end {
+                    if e.key.as_slice() >= en {
+                        break;
+                    }
+                }
+                results.push((e.key.clone(), e.value.clone()));
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Get SSTable metadata
     pub fn metadata(&self) -> &SstableMetadata {
         &self.metadata
@@ -764,5 +889,16 @@ impl<IO: AsyncIO> SstableReader<IO> {
     /// Check if key might be in this SSTable (based on key range)
     pub fn may_contain(&self, key: &[u8]) -> bool {
         key >= self.metadata.min_key.as_slice() && key <= self.metadata.max_key.as_slice()
+    }
+
+    /// Eagerly load all data blocks into the block cache.
+    ///
+    /// Called after flush/compaction to pre-populate the cache so the first
+    /// scan has zero cold misses.
+    pub async fn eager_load_blocks(&self) -> StorageResult<()> {
+        for entry in &self.index {
+            self.read_data_block(entry.block_offset).await?;
+        }
+        Ok(())
     }
 }

@@ -57,6 +57,35 @@ impl ExplainOutput {
                 .unwrap();
             }
 
+            PhysicalPlan::RangeScan {
+                table,
+                columns,
+                start_key,
+                end_key,
+                inclusive_start,
+                inclusive_end,
+                remaining_filter,
+            } => {
+                let col_names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
+                let start_bound = if *inclusive_start { "[" } else { "(" };
+                let end_bound = if *inclusive_end { "]" } else { ")" };
+                writeln!(
+                    out,
+                    "{}RangeScan: {} [{}] {}{:?}, {:?}{}",
+                    prefix,
+                    table,
+                    col_names.join(", "),
+                    start_bound,
+                    start_key,
+                    end_key,
+                    end_bound,
+                )
+                .unwrap();
+                if let Some(f) = remaining_filter {
+                    writeln!(out, "{}  remaining_filter: {:?}", prefix, f).unwrap();
+                }
+            }
+
             PhysicalPlan::Filter { input, predicate } => {
                 writeln!(out, "{}Filter: {:?}", prefix, predicate).unwrap();
                 Self::format_node(input, indent + 1, out);
