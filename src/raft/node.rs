@@ -63,18 +63,34 @@ impl RaftNode {
         tls_config: RaftTlsConfig,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        single_node: bool,
     ) -> Result<Self, RaftNodeError> {
-        let config = Config {
-            cluster_name: "roodb".to_string(),
-            election_timeout_min: 150,
-            election_timeout_max: 300,
-            heartbeat_interval: 50,
-            ..Default::default()
+        let config = if single_node {
+            // Single-node: disable all unnecessary Raft overhead
+            Config {
+                cluster_name: "roodb".to_string(),
+                heartbeat_interval: 1,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                enable_tick: false,
+                enable_heartbeat: false,
+                enable_elect: false,
+                purge_batch_size: 1000,
+                ..Default::default()
+            }
+        } else {
+            Config {
+                cluster_name: "roodb".to_string(),
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                heartbeat_interval: 50,
+                ..Default::default()
+            }
         };
         let config = Arc::new(config);
 
         // Create LSM-backed storage that persists all Raft state
-        let lsm_storage = LsmRaftStorage::new(storage, catalog)
+        let lsm_storage = LsmRaftStorage::new(storage, catalog, single_node)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
@@ -207,11 +223,13 @@ impl RaftNode {
         }
 
         let cmd = Command::DataChange(changeset);
+        let start = std::time::Instant::now();
         let resp = self
             .raft
             .client_write(cmd)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        tracing::debug!(target: "roodb::perf", client_write_us = start.elapsed().as_micros() as u64, "raft_propose");
 
         // Check the state machine apply result for application-level errors
         // (e.g., OCC conflicts, duplicate keys)
@@ -223,11 +241,13 @@ impl RaftNode {
 
     /// Write a raw command to the Raft log
     pub async fn write(&self, cmd: Command) -> Result<CommandResponse, RaftNodeError> {
+        let start = std::time::Instant::now();
         let resp = self
             .raft
             .client_write(cmd)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        tracing::debug!(target: "roodb::perf", client_write_us = start.elapsed().as_micros() as u64, "raft_write");
         Ok(resp.data)
     }
 

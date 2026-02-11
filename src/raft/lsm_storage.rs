@@ -145,6 +145,8 @@ pub struct LsmRaftStorage {
     cached_membership: Arc<RwLock<StoredMembership>>,
     cached_last_log_id: Arc<RwLock<Option<LogId>>>,
     cached_last_purged: Arc<RwLock<Option<LogId>>>,
+    /// Single-node mode: skip expensive durability operations that only matter for multi-node
+    single_node: bool,
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -164,6 +166,7 @@ impl LsmRaftStorage {
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        single_node: bool,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
@@ -174,6 +177,7 @@ impl LsmRaftStorage {
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_last_log_id: Arc::new(RwLock::new(None)),
             cached_last_purged: Arc::new(RwLock::new(None)),
+            single_node,
         };
 
         // Load existing state from LSM into caches
@@ -676,17 +680,21 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError> {
+        let start = std::time::Instant::now();
         let data = bincode::serialize(vote).map_err(write_err)?;
 
         self.storage.put(VOTE_KEY, &data).await.map_err(write_err)?;
 
-        // CRITICAL: flush to disk before returning - vote durability prevents double-voting
-        // Uses Critical priority to bypass backpressure and ensure durability
-        self.storage.flush_critical().await.map_err(write_err)?;
+        if !self.single_node {
+            // CRITICAL: flush to disk before returning - vote durability prevents double-voting
+            // Uses Critical priority to bypass backpressure and ensure durability
+            // Single-node: skip flush (can't have split-brain with 1 node)
+            self.storage.flush_critical().await.map_err(write_err)?;
+        }
 
         *self.cached_vote.write() = Some(*vote);
 
-        tracing::debug!(?vote, "Saved vote to LSM");
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, ?vote, "save_vote");
         Ok(())
     }
 
@@ -708,10 +716,12 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let start = std::time::Instant::now();
         // Serialize with other log operations to ensure visibility before cache update
         let _lock = self.log_mutex.lock().await;
 
         let mut last_log_id = None;
+        let mut count = 0u64;
 
         for entry in entries {
             let log_id = *entry.get_log_id();
@@ -721,6 +731,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
             self.storage.put(&key, &data).await.map_err(write_err)?;
 
             last_log_id = Some(log_id);
+            count += 1;
         }
 
         if let Some(log_id) = last_log_id {
@@ -729,6 +740,8 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 
         // Notify that log is persisted (in memtable, will be flushed with next flush cycle)
         callback.log_io_completed(Ok(()));
+
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, "raft_append");
 
         Ok(())
     }
@@ -770,6 +783,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        let start = std::time::Instant::now();
         // Serialize with other log operations
         let _lock = self.log_mutex.lock().await;
 
@@ -782,6 +796,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
             .await
             .map_err(read_err)?;
 
+        let count = entries.len() as u64;
         for (key, _) in entries {
             self.storage.delete(&key).await.map_err(write_err)?;
         }
@@ -795,7 +810,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 
         *self.cached_last_purged.write() = Some(log_id);
 
-        tracing::debug!(?log_id, "Purged log entries");
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, ?log_id, "raft_purge");
         Ok(())
     }
 }
@@ -820,6 +835,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     {
         use std::collections::HashSet;
 
+        let start = std::time::Instant::now();
         let mut results = Vec::new();
 
         // Track system table changes for catalog updates
@@ -1043,14 +1059,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 }
             }
 
-            // Persist last applied
-            let data = bincode::serialize(&log_id).map_err(write_err)?;
+            // Track last applied log_id (persisted once after all entries)
+            *self.cached_last_applied.write() = Some(log_id);
+        }
+
+        // Persist last applied once after the entire batch
+        let last_applied_snapshot = *self.cached_last_applied.read();
+        if let Some(last_applied) = last_applied_snapshot {
+            let data = bincode::serialize(&last_applied).map_err(write_err)?;
             self.storage
                 .put(LAST_APPLIED_KEY, &data)
                 .await
                 .map_err(write_err)?;
-            *self.cached_last_applied.write() = Some(log_id);
         }
+
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, entries = results.len(), "raft_apply");
 
         // Rebuild catalog for affected system table entries
         if !affected_tables.is_empty() || !dropped_tables.is_empty() {

@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        true,
     )
     .await?;
 

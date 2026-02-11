@@ -116,13 +116,13 @@ async fn test_leader_election_timing() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 
@@ -189,13 +189,13 @@ async fn test_replication_consistency() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 
@@ -256,13 +256,13 @@ async fn test_follower_read() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 
@@ -328,13 +328,13 @@ async fn test_write_delete_sequence() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 

@@ -227,6 +227,7 @@ pub async fn start_test_server(
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        true,
     )
     .await
     .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
@@ -244,8 +245,8 @@ pub async fn start_test_server(
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
-    // Wait for leader election to complete (single-node should be immediate)
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Brief wait for single-node leader election (with tick disabled, should be near-instant)
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let raft_node = Arc::new(raft_node);
 
