@@ -1,6 +1,6 @@
 [package]
 name = "roodb"
-version = "0.5.1"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 
@@ -87,6 +87,10 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 [lib]
 name = "roodb"
 path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
 
 [[bin]]
 name = "roodb"
