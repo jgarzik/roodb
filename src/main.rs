@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use roodb::catalog::Catalog;
-use roodb::io::default_io_factory;
+use roodb::io::scheduled_io_factory;
 use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RaftTlsConfig::from_files_with_ca(&cert_path, &key_path, &raft_ca_cert_path).await?;
 
     // Initialize storage engine
-    let io_factory = Arc::new(default_io_factory());
+    let io_factory = Arc::new(scheduled_io_factory());
     let storage_config = LsmConfig { dir: data_dir };
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io_factory, storage_config).await?);
@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        true,
     )
     .await?;
 

@@ -18,6 +18,7 @@ pub mod ddl;
 pub mod dml;
 pub mod edge_cases;
 pub mod errors;
+pub mod prepared;
 pub mod queries;
 pub mod types;
 

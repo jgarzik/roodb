@@ -94,7 +94,7 @@ async fn test_single_node_bootstrap() {
     let storage = test_storage("single_bootstrap").await;
     let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog)
+    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog, true)
         .await
         .unwrap();
 
@@ -125,7 +125,7 @@ async fn test_single_node_multiple_writes() {
     let storage = test_storage("single_writes").await;
     let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog)
+    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog, true)
         .await
         .unwrap();
     node.start_rpc_server().await.unwrap();
@@ -166,13 +166,13 @@ async fn test_three_node_cluster_bootstrap() {
     let catalog3 = test_catalog();
 
     // Create nodes with unique per-node mTLS certs
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 
@@ -221,13 +221,13 @@ async fn test_log_replication() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
         .await
         .unwrap();
 

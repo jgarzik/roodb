@@ -154,6 +154,22 @@ impl CostEstimator {
                 io: 0.0,
             },
 
+            PhysicalPlan::PointGet { .. } => Cost {
+                rows: 1.0,
+                cpu: 1.0,
+                io: 1.0, // Single key lookup
+            },
+
+            PhysicalPlan::RangeScan { .. } => {
+                // Range scan reads ~1% of table (tight PK bounds)
+                let rows = Self::DEFAULT_TABLE_ROWS * Self::DEFAULT_SELECTIVITY;
+                Cost {
+                    rows,
+                    cpu: rows,
+                    io: rows / 100.0,
+                }
+            }
+
             PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }

@@ -117,4 +117,19 @@ impl TransactionContext {
             .map(|(k, v)| (k, v.as_ref()))
             .collect()
     }
+
+    /// Get all buffered writes within a key range (for range scans)
+    ///
+    /// Returns entries where start <= key < end.
+    pub fn get_buffered_for_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<(&Vec<u8>, Option<&Vec<u8>>)> {
+        self.write_buffer
+            .iter()
+            .filter(|(k, _)| k.as_slice() >= start && k.as_slice() < end)
+            .map(|(k, v)| (k, v.as_ref()))
+            .collect()
+    }
 }

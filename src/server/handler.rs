@@ -31,6 +31,11 @@ pub async fn handle_connection(
 ) {
     info!(%peer_addr, connection_id, "Client connected");
 
+    // Disable Nagle's algorithm for low-latency request-response
+    if let Err(e) = stream.set_nodelay(true) {
+        error!(%peer_addr, connection_id, error = %e, "Failed to set TCP_NODELAY");
+    }
+
     // Perform STARTTLS handshake
     let (tls_stream, scramble) = match starttls_handshake(stream, acceptor, connection_id).await {
         Ok(result) => result,

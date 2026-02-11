@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
-/// Maximum memtable size before flush (4MB)
-pub const MEMTABLE_SIZE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Maximum memtable size before flush (64MB)
+pub const MEMTABLE_SIZE_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// Tombstone marker for deleted keys
 pub const TOMBSTONE: Option<Vec<u8>> = None;

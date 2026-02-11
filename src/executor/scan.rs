@@ -16,7 +16,7 @@ use super::eval::eval;
 use super::row::Row;
 use super::Executor;
 
-/// Table scan executor
+/// Table scan executor (streaming: decodes rows lazily in next())
 pub struct TableScan {
     /// Table name
     table: String,
@@ -26,12 +26,10 @@ pub struct TableScan {
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility)
     txn_context: Option<TransactionContext>,
-    /// Buffered rows from storage scan
-    rows: Vec<Row>,
-    /// Current position in rows
+    /// Raw key-value pairs from storage (decoded lazily in next())
+    raw_pairs: Vec<Vec<u8>>,
+    /// Current position in raw_pairs
     position: usize,
-    /// Whether we've scanned the table yet
-    scanned: bool,
 }
 
 impl TableScan {
@@ -47,9 +45,8 @@ impl TableScan {
             filter,
             mvcc,
             txn_context,
-            rows: Vec::new(),
+            raw_pairs: Vec::new(),
             position: 0,
-            scanned: false,
         }
     }
 }
@@ -57,7 +54,7 @@ impl TableScan {
 #[async_trait]
 impl Executor for TableScan {
     async fn open(&mut self) -> ExecutorResult<()> {
-        // Scan the table
+        // Scan the table — store raw values, decode lazily in next()
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
 
@@ -83,17 +80,32 @@ impl Executor for TableScan {
         let buffered_keys: HashSet<&[u8]> =
             buffered_entries.iter().map(|(k, _)| k.as_slice()).collect();
 
-        // Decode rows from storage, excluding keys that are buffered (will be replaced)
-        self.rows.clear();
+        // Collect raw values (not decoded yet) — skip keys overridden by buffer
+        self.raw_pairs.clear();
         for (key, value) in kv_pairs {
-            // Skip if this key is overwritten in the buffer
             if buffered_keys.contains(key.as_slice()) {
                 continue;
             }
+            self.raw_pairs.push(value);
+        }
 
-            let row = decode_row(&value)?;
+        // Append buffered writes (uncommitted inserts/updates, skip deletes)
+        for (_key, value_opt) in buffered_entries {
+            if let Some(value) = value_opt {
+                self.raw_pairs.push(value.to_vec());
+            }
+        }
 
-            // Apply pushed-down filter
+        self.position = 0;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        // Decode and filter one row at a time (streaming)
+        while self.position < self.raw_pairs.len() {
+            let row = decode_row(&self.raw_pairs[self.position])?;
+            self.position += 1;
+
             if let Some(filter) = &self.filter {
                 let result = eval(filter, &row)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -101,43 +113,13 @@ impl Executor for TableScan {
                 }
             }
 
-            self.rows.push(row);
+            return Ok(Some(row));
         }
-
-        // Add buffered writes (uncommitted inserts/updates, skip deletes)
-        for (_key, value_opt) in buffered_entries {
-            if let Some(value) = value_opt {
-                let row = decode_row(value)?;
-
-                // Apply pushed-down filter
-                if let Some(filter) = &self.filter {
-                    let result = eval(filter, &row)?;
-                    if !result.as_bool().unwrap_or(false) {
-                        continue;
-                    }
-                }
-
-                self.rows.push(row);
-            }
-            // If value_opt is None, it's a delete - don't add to results
-        }
-
-        self.position = 0;
-        self.scanned = true;
-        Ok(())
-    }
-
-    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
-        if self.position >= self.rows.len() {
-            return Ok(None);
-        }
-        let row = self.rows[self.position].clone();
-        self.position += 1;
-        Ok(Some(row))
+        Ok(None)
     }
 
     async fn close(&mut self) -> ExecutorResult<()> {
-        self.rows.clear();
+        self.raw_pairs.clear();
         self.position = 0;
         Ok(())
     }
@@ -147,7 +129,7 @@ impl Executor for TableScan {
 mod tests {
     use super::*;
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::encode_row;
+    use crate::executor::encoding::{encode_pk_key, encode_row};
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
@@ -198,14 +180,12 @@ mod tests {
     }
 
     fn make_test_mvcc() -> Arc<MvccStorage> {
-        use crate::executor::encoding::encode_row_key;
-
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
 
         let data = vec![
-            (encode_row_key("users", 1), encode_row(&row1)),
-            (encode_row_key("users", 2), encode_row(&row2)),
+            (encode_pk_key("users", &[Datum::Int(1)]), encode_row(&row1)),
+            (encode_pk_key("users", &[Datum::Int(2)]), encode_row(&row2)),
         ];
 
         let storage = Arc::new(MockStorage { data }) as Arc<dyn StorageEngine>;

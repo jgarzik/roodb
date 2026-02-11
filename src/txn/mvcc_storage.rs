@@ -104,34 +104,50 @@ impl MvccStorage {
             None => return Ok(None),
         };
 
-        self.find_visible_version(&encoded, read_view).await
+        self.find_visible_version_owned(encoded, read_view).await
     }
 
-    /// Find the visible version of a row, traversing version chain if needed
-    async fn find_visible_version(
+    /// Get a row with its version (txn_id) for OCC conflict detection.
+    ///
+    /// Like `get()` but also returns the txn_id of the visible version,
+    /// needed by UPDATE/DELETE PointGet paths for optimistic concurrency control.
+    pub async fn get_with_version(
         &self,
-        encoded: &[u8],
+        key: &[u8],
+        read_view: &ReadView,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let encoded = match self.inner.get(key).await? {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        self.find_visible_version_with_txn_id(&encoded, read_view)
+            .await
+    }
+
+    /// Find visible version, taking ownership of the encoded bytes to avoid copying
+    async fn find_visible_version_owned(
+        &self,
+        mut encoded: Vec<u8>,
         read_view: &ReadView,
     ) -> StorageResult<Option<Vec<u8>>> {
-        let (txn_id, roll_ptr, deleted, data) = match Self::decode_row(encoded) {
-            Some(decoded) => decoded,
+        let (txn_id, roll_ptr, deleted) = match Self::decode_row(&encoded) {
+            Some((tid, rp, del, _data)) => (tid, rp, del),
             None => {
                 // Legacy row without MVCC header - treat as always visible
-                return Ok(Some(encoded.to_vec()));
+                return Ok(Some(encoded));
             }
         };
 
-        // Check if this version is visible
         if read_view.is_visible(txn_id) {
-            // If visible and deleted, the row doesn't exist for this transaction's view
             if deleted {
                 return Ok(None);
             }
-            return Ok(Some(data.to_vec()));
+            // Strip MVCC header in-place — zero copy
+            encoded.drain(..ROW_HEADER_SIZE);
+            return Ok(Some(encoded));
         }
 
-        // This version is not visible, traverse the version chain
-        // to find an older version that IS visible
         self.find_older_visible_version(roll_ptr, read_view).await
     }
 
@@ -262,9 +278,9 @@ impl MvccStorage {
     ) -> StorageResult<Vec<KeyValue>> {
         let all_rows = self.inner.scan(start, end).await?;
 
-        let mut visible_rows = Vec::new();
+        let mut visible_rows = Vec::with_capacity(all_rows.len());
         for (key, value) in all_rows {
-            if let Some(data) = self.find_visible_version(&value, read_view).await? {
+            if let Some(data) = self.find_visible_version_owned(value, read_view).await? {
                 visible_rows.push((key, data));
             }
         }

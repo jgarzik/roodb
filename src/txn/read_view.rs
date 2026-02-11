@@ -29,6 +29,10 @@ pub struct ReadView {
     /// The highest transaction ID that had been assigned when this read view was created
     /// Transactions with ID > this started after us and are NOT visible
     pub max_txn_id: u64,
+
+    /// Fast path: true when no transactions were active at snapshot time
+    /// When true, is_visible() reduces to `row_txn_id <= max_txn_id`
+    pub all_committed: bool,
 }
 
 impl ReadView {
@@ -39,6 +43,7 @@ impl ReadView {
     /// * `active_txn_ids` - Set of currently active transaction IDs
     /// * `max_txn_id` - The highest transaction ID assigned so far
     pub fn new(creator_txn_id: u64, active_txn_ids: HashSet<u64>, max_txn_id: u64) -> Self {
+        let all_committed = active_txn_ids.is_empty();
         let min_active_txn_id = active_txn_ids
             .iter()
             .copied()
@@ -50,6 +55,7 @@ impl ReadView {
             active_txn_ids,
             min_active_txn_id,
             max_txn_id,
+            all_committed,
         }
     }
 
@@ -62,6 +68,11 @@ impl ReadView {
     /// 4. Rows from transactions in active_txn_ids are NOT visible (they were uncommitted)
     /// 5. All other rows are visible (committed between min and max)
     pub fn is_visible(&self, row_txn_id: u64) -> bool {
+        // Fast path: when no transactions were active, all committed rows are visible
+        if self.all_committed {
+            return row_txn_id <= self.max_txn_id;
+        }
+
         // Rule 1: My own writes are always visible
         if row_txn_id == self.creator_txn_id {
             return true;

@@ -7,6 +7,8 @@
 //! - Compaction: Background merge of SSTables
 
 pub mod block;
+pub mod block_cache;
+pub mod bloom;
 pub mod compaction;
 pub mod engine;
 pub mod manifest;

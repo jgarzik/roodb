@@ -145,6 +145,8 @@ pub struct LsmRaftStorage {
     cached_membership: Arc<RwLock<StoredMembership>>,
     cached_last_log_id: Arc<RwLock<Option<LogId>>>,
     cached_last_purged: Arc<RwLock<Option<LogId>>>,
+    /// Single-node mode: skip expensive durability operations that only matter for multi-node
+    single_node: bool,
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -164,6 +166,7 @@ impl LsmRaftStorage {
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        single_node: bool,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
@@ -174,6 +177,7 @@ impl LsmRaftStorage {
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_last_log_id: Arc::new(RwLock::new(None)),
             cached_last_purged: Arc::new(RwLock::new(None)),
+            single_node,
         };
 
         // Load existing state from LSM into caches
@@ -676,17 +680,21 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError> {
+        let start = std::time::Instant::now();
         let data = bincode::serialize(vote).map_err(write_err)?;
 
         self.storage.put(VOTE_KEY, &data).await.map_err(write_err)?;
 
-        // CRITICAL: flush to disk before returning - vote durability prevents double-voting
-        // Uses Critical priority to bypass backpressure and ensure durability
-        self.storage.flush_critical().await.map_err(write_err)?;
+        if !self.single_node {
+            // CRITICAL: flush to disk before returning - vote durability prevents double-voting
+            // Uses Critical priority to bypass backpressure and ensure durability
+            // Single-node: skip flush (can't have split-brain with 1 node)
+            self.storage.flush_critical().await.map_err(write_err)?;
+        }
 
         *self.cached_vote.write() = Some(*vote);
 
-        tracing::debug!(?vote, "Saved vote to LSM");
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, ?vote, "save_vote");
         Ok(())
     }
 
@@ -708,10 +716,12 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let start = std::time::Instant::now();
         // Serialize with other log operations to ensure visibility before cache update
         let _lock = self.log_mutex.lock().await;
 
         let mut last_log_id = None;
+        let mut count = 0u64;
 
         for entry in entries {
             let log_id = *entry.get_log_id();
@@ -721,6 +731,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
             self.storage.put(&key, &data).await.map_err(write_err)?;
 
             last_log_id = Some(log_id);
+            count += 1;
         }
 
         if let Some(log_id) = last_log_id {
@@ -729,6 +740,8 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 
         // Notify that log is persisted (in memtable, will be flushed with next flush cycle)
         callback.log_io_completed(Ok(()));
+
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, "raft_append");
 
         Ok(())
     }
@@ -770,6 +783,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        let start = std::time::Instant::now();
         // Serialize with other log operations
         let _lock = self.log_mutex.lock().await;
 
@@ -782,6 +796,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
             .await
             .map_err(read_err)?;
 
+        let count = entries.len() as u64;
         for (key, _) in entries {
             self.storage.delete(&key).await.map_err(write_err)?;
         }
@@ -795,7 +810,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 
         *self.cached_last_purged.write() = Some(log_id);
 
-        tracing::debug!(?log_id, "Purged log entries");
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, ?log_id, "raft_purge");
         Ok(())
     }
 }
@@ -820,6 +835,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     {
         use std::collections::HashSet;
 
+        let start = std::time::Instant::now();
         let mut results = Vec::new();
 
         // Track system table changes for catalog updates
@@ -850,11 +866,16 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             // This is the unified write path for both leader and follower:
                             // - Leader: collected changes during execution, now persisting after Raft commit
                             // - Follower: received changes via AppendEntries, now persisting locally
+                            //
+                            // Two-pass approach: OCC checks first, then applies.
+                            // This prevents false conflicts when multiple changes in
+                            // the same changeset target the same key (e.g., UPDATE + DELETE
+                            // on the same row). All OCC checks see the pre-changeset
+                            // storage state, matching what executors saw during scan.
                             let mut conflict_error: Option<String> = None;
 
+                            // Pass 1: OCC version checks (before any writes)
                             for change in &changeset.changes {
-                                // OCC version check for UPDATE/DELETE operations
-                                // If expected_version is set, verify the row hasn't been modified
                                 if let Some(expected_version) = change.expected_version {
                                     if let Ok(Some(current_data)) =
                                         self.storage.get(&change.key).await
@@ -862,7 +883,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                         let current_version =
                                             extract_row_version(&current_data).unwrap_or(0);
                                         if current_version != expected_version {
-                                            // Conflict detected - row was modified by another transaction
                                             tracing::warn!(
                                                 table = %change.table,
                                                 expected = expected_version,
@@ -875,9 +895,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                             ));
                                             break;
                                         }
-                                    }
-                                    // If row doesn't exist anymore, that's also a conflict for UPDATE
-                                    else if change.op == ChangeOp::Update {
+                                    } else if change.op == ChangeOp::Update {
                                         tracing::warn!(
                                             table = %change.table,
                                             "OCC conflict: row no longer exists"
@@ -890,130 +908,129 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                     }
                                     // For DELETE, if row doesn't exist, that's ok (idempotent)
                                 }
+                            }
 
-                                match change.op {
-                                    ChangeOp::Insert | ChangeOp::Update => {
-                                        // Encode with MVCC header and write
-                                        if let Some(ref value) = change.value {
-                                            // Check for duplicate key on INSERT for user tables
-                                            // This prevents INSERT from silently overwriting existing rows
-                                            if change.op == ChangeOp::Insert
-                                                && !is_system_table(&change.table)
-                                            {
-                                                if let Ok(Some(existing_data)) =
-                                                    self.storage.get(&change.key).await
+                            // Pass 2: Apply changes (only if no OCC conflict)
+                            if conflict_error.is_none() {
+                                for change in &changeset.changes {
+                                    match change.op {
+                                        ChangeOp::Insert | ChangeOp::Update => {
+                                            if let Some(ref value) = change.value {
+                                                // Check for duplicate key on INSERT for user tables
+                                                if change.op == ChangeOp::Insert
+                                                    && !is_system_table(&change.table)
                                                 {
-                                                    // Check if the existing row is not deleted
-                                                    if existing_data.len() > 16
-                                                        && existing_data[16] != 1
+                                                    if let Ok(Some(existing_data)) =
+                                                        self.storage.get(&change.key).await
                                                     {
-                                                        tracing::warn!(
-                                                            table = %change.table,
-                                                            "INSERT conflict: row already exists with this key"
-                                                        );
-                                                        conflict_error = Some(format!(
+                                                        if existing_data.len() > 16
+                                                            && existing_data[16] != 1
+                                                        {
+                                                            tracing::warn!(
+                                                                table = %change.table,
+                                                                "INSERT conflict: row already exists with this key"
+                                                            );
+                                                            conflict_error = Some(format!(
                                                             "Duplicate key: row in '{}' already exists",
                                                             change.table
                                                         ));
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            // Check for duplicate table creation (race condition fix)
-                                            // This makes apply() idempotent for CREATE TABLE
-                                            // Uses precomputed existing_tables set to avoid lock contention
-                                            if change.table == SYSTEM_TABLES
-                                                && change.op == ChangeOp::Insert
-                                            {
-                                                if let Ok(row) = decode_row(value) {
-                                                    if let Some(crate::executor::Datum::String(
-                                                        table_name,
-                                                    )) = row.values().first()
-                                                    {
-                                                        if existing_tables.contains(table_name) {
-                                                            // Table already exists - skip this insert
-                                                            // This handles the race condition where two
-                                                            // CREATE TABLE proposals both passed local
-                                                            // checks but Raft serializes them here
-                                                            tracing::debug!(
-                                                                table = %table_name,
-                                                                "Skipping duplicate CREATE TABLE in apply()"
-                                                            );
-                                                            continue;
+                                                            break;
                                                         }
-                                                        // Track this table as now existing for subsequent entries
-                                                        existing_tables.insert(table_name.clone());
                                                     }
                                                 }
-                                            }
 
-                                            // Check for duplicate index creation
-                                            // Uses precomputed existing_indexes set to avoid lock contention
-                                            if change.table == SYSTEM_INDEXES
-                                                && change.op == ChangeOp::Insert
-                                            {
-                                                if let Ok(row) = decode_row(value) {
-                                                    if let Some(crate::executor::Datum::String(
-                                                        index_name,
-                                                    )) = row.values().first()
-                                                    {
-                                                        if existing_indexes.contains(index_name) {
-                                                            tracing::debug!(
-                                                                index = %index_name,
-                                                                "Skipping duplicate CREATE INDEX in apply()"
-                                                            );
-                                                            continue;
+                                                // Check for duplicate table creation (race condition fix)
+                                                if change.table == SYSTEM_TABLES
+                                                    && change.op == ChangeOp::Insert
+                                                {
+                                                    if let Ok(row) = decode_row(value) {
+                                                        if let Some(
+                                                            crate::executor::Datum::String(
+                                                                table_name,
+                                                            ),
+                                                        ) = row.values().first()
+                                                        {
+                                                            if existing_tables.contains(table_name)
+                                                            {
+                                                                tracing::debug!(
+                                                                    table = %table_name,
+                                                                    "Skipping duplicate CREATE TABLE in apply()"
+                                                                );
+                                                                continue;
+                                                            }
+                                                            existing_tables
+                                                                .insert(table_name.clone());
                                                         }
-                                                        // Track this index as now existing for subsequent entries
-                                                        existing_indexes.insert(index_name.clone());
                                                     }
                                                 }
-                                            }
 
+                                                // Check for duplicate index creation
+                                                if change.table == SYSTEM_INDEXES
+                                                    && change.op == ChangeOp::Insert
+                                                {
+                                                    if let Ok(row) = decode_row(value) {
+                                                        if let Some(
+                                                            crate::executor::Datum::String(
+                                                                index_name,
+                                                            ),
+                                                        ) = row.values().first()
+                                                        {
+                                                            if existing_indexes.contains(index_name)
+                                                            {
+                                                                tracing::debug!(
+                                                                    index = %index_name,
+                                                                    "Skipping duplicate CREATE INDEX in apply()"
+                                                                );
+                                                                continue;
+                                                            }
+                                                            existing_indexes
+                                                                .insert(index_name.clone());
+                                                        }
+                                                    }
+                                                }
+
+                                                let encoded =
+                                                    encode_mvcc_row(changeset.txn_id, false, value);
+
+                                                self.storage
+                                                    .put(&change.key, &encoded)
+                                                    .await
+                                                    .map_err(write_err)?;
+
+                                                self.track_system_table_change(
+                                                    &change.table,
+                                                    value,
+                                                    false,
+                                                    &mut affected_tables,
+                                                    &mut dropped_tables,
+                                                    &mut affected_indexes,
+                                                    &mut dropped_indexes,
+                                                );
+                                            }
+                                        }
+                                        ChangeOp::Delete => {
                                             let encoded =
-                                                encode_mvcc_row(changeset.txn_id, false, value);
+                                                encode_mvcc_row(changeset.txn_id, true, &[]);
                                             self.storage
                                                 .put(&change.key, &encoded)
                                                 .await
                                                 .map_err(write_err)?;
 
-                                            // Track system table changes for catalog rebuild
-                                            self.track_system_table_change(
-                                                &change.table,
-                                                value,
-                                                false, // not a delete
-                                                &mut affected_tables,
-                                                &mut dropped_tables,
-                                                &mut affected_indexes,
-                                                &mut dropped_indexes,
-                                            );
-                                        }
-                                    }
-                                    ChangeOp::Delete => {
-                                        // Write tombstone (deleted=true, empty data)
-                                        let encoded = encode_mvcc_row(changeset.txn_id, true, &[]);
-                                        self.storage
-                                            .put(&change.key, &encoded)
-                                            .await
-                                            .map_err(write_err)?;
-
-                                        // Track system table deletions
-                                        // For deletes, we need to read the existing value to find table name
-                                        if let Some(ref value) = change.value {
-                                            self.track_system_table_change(
-                                                &change.table,
-                                                value,
-                                                true, // is a delete
-                                                &mut affected_tables,
-                                                &mut dropped_tables,
-                                                &mut affected_indexes,
-                                                &mut dropped_indexes,
-                                            );
+                                            if let Some(ref value) = change.value {
+                                                self.track_system_table_change(
+                                                    &change.table,
+                                                    value,
+                                                    true,
+                                                    &mut affected_tables,
+                                                    &mut dropped_tables,
+                                                    &mut affected_indexes,
+                                                    &mut dropped_indexes,
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
+                            } // end pass 2
 
                             // Return conflict error or success
                             if let Some(err_msg) = conflict_error {
@@ -1051,14 +1068,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 }
             }
 
-            // Persist last applied
-            let data = bincode::serialize(&log_id).map_err(write_err)?;
+            // Track last applied log_id (persisted once after all entries)
+            *self.cached_last_applied.write() = Some(log_id);
+        }
+
+        // Persist last applied once after the entire batch
+        let last_applied_snapshot = *self.cached_last_applied.read();
+        if let Some(last_applied) = last_applied_snapshot {
+            let data = bincode::serialize(&last_applied).map_err(write_err)?;
             self.storage
                 .put(LAST_APPLIED_KEY, &data)
                 .await
                 .map_err(write_err)?;
-            *self.cached_last_applied.write() = Some(log_id);
         }
+
+        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, entries = results.len(), "raft_apply");
 
         // Rebuild catalog for affected system table entries
         if !affected_tables.is_empty() || !dropped_tables.is_empty() {

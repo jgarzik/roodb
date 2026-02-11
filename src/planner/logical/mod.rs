@@ -64,6 +64,8 @@ pub enum Literal {
     Float(f64),
     String(String),
     Blob(Vec<u8>),
+    /// Parameter placeholder (index into params array) for prepared statement plan caching
+    Placeholder(usize),
 }
 
 // ============ Resolved types (after name resolution) ============
@@ -137,6 +139,7 @@ impl ResolvedExpr {
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Blob(_) => DataType::Blob,
+                Literal::Placeholder(_) => DataType::BigInt, // Placeholder type determined at substitution
             },
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
             ResolvedExpr::UnaryOp { result_type, .. } => result_type.clone(),

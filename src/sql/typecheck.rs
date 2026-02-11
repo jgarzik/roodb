@@ -145,6 +145,11 @@ impl TypeChecker {
         }
     }
 
+    /// Check if expression is a placeholder (compatible with any type)
+    fn is_placeholder(expr: &ResolvedExpr) -> bool {
+        matches!(expr, ResolvedExpr::Literal(Literal::Placeholder(_)))
+    }
+
     /// Check if two types are compatible
     fn check_type_compatible(
         target: &DataType,
@@ -153,6 +158,11 @@ impl TypeChecker {
     ) -> SqlResult<()> {
         // NULL is compatible with any nullable type
         if Self::is_definitely_null(expr) {
+            return Ok(());
+        }
+
+        // Placeholders are compatible with any type (resolved at execution time)
+        if Self::is_placeholder(expr) {
             return Ok(());
         }
 

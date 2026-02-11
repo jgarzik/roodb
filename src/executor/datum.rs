@@ -124,6 +124,9 @@ impl Datum {
             Literal::Float(f) => Datum::Float(*f),
             Literal::String(s) => Datum::String(s.clone()),
             Literal::Blob(b) => Datum::Bytes(b.clone()),
+            Literal::Placeholder(i) => {
+                panic!("Unsubstituted placeholder ?{} in plan execution", i)
+            }
         }
     }
 
