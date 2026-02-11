@@ -185,7 +185,7 @@ impl<IO: AsyncIO> SstableWriter<IO> {
             self.offset += BLOCK_SIZE as u64;
         }
 
-        // Write bloom filter (rebuild with correct size, padded to BLOCK_SIZE)
+        // Write bloom filter (take ownership via swap, pad to BLOCK_SIZE)
         let bloom_offset = self.offset;
         let mut bloom = BloomFilter::new(self.num_keys);
         std::mem::swap(&mut bloom, &mut self.bloom);

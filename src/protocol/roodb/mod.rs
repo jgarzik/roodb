@@ -664,7 +664,7 @@ where
         if let Some(cached) = cached {
             // Cache hit: clone plan and substitute params directly
             let mut physical = cached.physical.clone();
-            physical.substitute_params(&params);
+            physical.substitute_params(&params)?;
 
             // Check authorization
             if !cached.required_privileges.is_empty() {
@@ -753,7 +753,7 @@ where
 
         // Substitute params into a copy of the plan for this execution
         let mut physical = plan_template;
-        physical.substitute_params(params);
+        physical.substitute_params(params)?;
 
         // Check authorization
         if !required_privileges.is_empty() {

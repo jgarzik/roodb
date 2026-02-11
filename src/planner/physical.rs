@@ -5,7 +5,7 @@
 
 use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::executor::datum::Datum;
-use crate::planner::error::PlannerResult;
+use crate::planner::error::{PlannerError, PlannerResult};
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
 use crate::planner::logical::{BinaryOp, JoinType, ResolvedColumn, ResolvedExpr};
 use crate::planner::logical::{Literal, LogicalPlan};
@@ -307,15 +307,15 @@ impl PhysicalPlan {
 
     /// Substitute `Literal::Placeholder(n)` with concrete values from `params`.
     /// Used for prepared statement plan caching — clone the cached plan, then substitute.
-    pub fn substitute_params(&mut self, params: &[Datum]) {
+    pub fn substitute_params(&mut self, params: &[Datum]) -> PlannerResult<()> {
         match self {
             PhysicalPlan::TableScan { filter, .. } => {
                 if let Some(f) = filter {
-                    substitute_expr(f, params);
+                    substitute_expr(f, params)?;
                 }
             }
             PhysicalPlan::PointGet { key_value, .. } => {
-                substitute_expr(key_value, params);
+                substitute_expr(key_value, params)?;
             }
             PhysicalPlan::RangeScan {
                 start_key,
@@ -324,25 +324,25 @@ impl PhysicalPlan {
                 ..
             } => {
                 if let Some(sk) = start_key {
-                    substitute_expr(sk, params);
+                    substitute_expr(sk, params)?;
                 }
                 if let Some(ek) = end_key {
-                    substitute_expr(ek, params);
+                    substitute_expr(ek, params)?;
                 }
                 if let Some(rf) = remaining_filter {
-                    substitute_expr(rf, params);
+                    substitute_expr(rf, params)?;
                 }
             }
             PhysicalPlan::Filter { input, predicate } => {
-                input.substitute_params(params);
-                substitute_expr(predicate, params);
+                input.substitute_params(params)?;
+                substitute_expr(predicate, params)?;
             }
             PhysicalPlan::Project {
                 input, expressions, ..
             } => {
-                input.substitute_params(params);
+                input.substitute_params(params)?;
                 for (expr, _) in expressions {
-                    substitute_expr(expr, params);
+                    substitute_expr(expr, params)?;
                 }
             }
             PhysicalPlan::NestedLoopJoin {
@@ -351,38 +351,38 @@ impl PhysicalPlan {
                 condition,
                 ..
             } => {
-                left.substitute_params(params);
-                right.substitute_params(params);
+                left.substitute_params(params)?;
+                right.substitute_params(params)?;
                 if let Some(c) = condition {
-                    substitute_expr(c, params);
+                    substitute_expr(c, params)?;
                 }
             }
             PhysicalPlan::HashAggregate {
                 input, group_by, ..
             } => {
-                input.substitute_params(params);
+                input.substitute_params(params)?;
                 for expr in group_by {
-                    substitute_expr(expr, params);
+                    substitute_expr(expr, params)?;
                 }
             }
             PhysicalPlan::Sort {
                 input, order_by, ..
             } => {
-                input.substitute_params(params);
+                input.substitute_params(params)?;
                 for (expr, _) in order_by {
-                    substitute_expr(expr, params);
+                    substitute_expr(expr, params)?;
                 }
             }
             PhysicalPlan::Limit { input, .. } => {
-                input.substitute_params(params);
+                input.substitute_params(params)?;
             }
             PhysicalPlan::HashDistinct { input } => {
-                input.substitute_params(params);
+                input.substitute_params(params)?;
             }
             PhysicalPlan::Insert { values, .. } => {
                 for row in values {
                     for expr in row {
-                        substitute_expr(expr, params);
+                        substitute_expr(expr, params)?;
                     }
                 }
             }
@@ -393,23 +393,23 @@ impl PhysicalPlan {
                 ..
             } => {
                 for (_, expr) in assignments {
-                    substitute_expr(expr, params);
+                    substitute_expr(expr, params)?;
                 }
                 if let Some(f) = filter {
-                    substitute_expr(f, params);
+                    substitute_expr(f, params)?;
                 }
                 if let Some(kv) = key_value {
-                    substitute_expr(kv, params);
+                    substitute_expr(kv, params)?;
                 }
             }
             PhysicalPlan::Delete {
                 filter, key_value, ..
             } => {
                 if let Some(f) = filter {
-                    substitute_expr(f, params);
+                    substitute_expr(f, params)?;
                 }
                 if let Some(kv) = key_value {
-                    substitute_expr(kv, params);
+                    substitute_expr(kv, params)?;
                 }
             }
             // DDL/Auth operations have no expression parameters
@@ -426,52 +426,56 @@ impl PhysicalPlan {
             | PhysicalPlan::Revoke { .. }
             | PhysicalPlan::ShowGrants { .. } => {}
         }
+        Ok(())
     }
 }
 
 /// Replace `Literal::Placeholder(n)` in a `ResolvedExpr` with concrete values.
-fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) {
+fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<()> {
     match expr {
         ResolvedExpr::Literal(lit) => {
             if let Literal::Placeholder(idx) = lit {
-                let datum = if *idx < params.len() {
-                    &params[*idx]
-                } else {
-                    &Datum::Null
-                };
-                *lit = datum_to_literal(datum);
+                if *idx >= params.len() {
+                    return Err(PlannerError::InvalidPlan(format!(
+                        "placeholder index {} out of range for {} parameters",
+                        idx,
+                        params.len()
+                    )));
+                }
+                *lit = datum_to_literal(&params[*idx]);
             }
         }
         ResolvedExpr::BinaryOp { left, right, .. } => {
-            substitute_expr(left, params);
-            substitute_expr(right, params);
+            substitute_expr(left, params)?;
+            substitute_expr(right, params)?;
         }
         ResolvedExpr::UnaryOp { expr: inner, .. } => {
-            substitute_expr(inner, params);
+            substitute_expr(inner, params)?;
         }
         ResolvedExpr::Function { args, .. } => {
             for arg in args {
-                substitute_expr(arg, params);
+                substitute_expr(arg, params)?;
             }
         }
         ResolvedExpr::IsNull { expr: inner, .. } => {
-            substitute_expr(inner, params);
+            substitute_expr(inner, params)?;
         }
         ResolvedExpr::InList { expr, list, .. } => {
-            substitute_expr(expr, params);
+            substitute_expr(expr, params)?;
             for item in list {
-                substitute_expr(item, params);
+                substitute_expr(item, params)?;
             }
         }
         ResolvedExpr::Between {
             expr, low, high, ..
         } => {
-            substitute_expr(expr, params);
-            substitute_expr(low, params);
-            substitute_expr(high, params);
+            substitute_expr(expr, params)?;
+            substitute_expr(low, params)?;
+            substitute_expr(high, params)?;
         }
         ResolvedExpr::Column(_) => {}
     }
+    Ok(())
 }
 
 /// Convert a Datum to a Literal for plan substitution.
