@@ -71,38 +71,9 @@ impl Update {
             super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
         })?;
 
-        // Check write buffer first (read-your-writes)
-        if let Some(buffered) = ctx.get_buffered(&storage_key) {
-            if let Some(buf_data) = buffered {
-                let mut row = decode_row(buf_data)?;
-                // Apply filter (even on PointGet, filter may have extra predicates)
-                if let Some(filter) = &self.filter {
-                    let result = eval(filter, &row)?;
-                    if !result.as_bool().unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                for (col, expr) in &self.assignments {
-                    let new_value = eval(expr, &row)?;
-                    row.set(col.index, new_value)?;
-                }
-                let new_value = encode_row(&row);
-                let ctx = self.txn_context.as_mut().unwrap();
-                // Buffered rows are from our own txn, use txn_id as version
-                ctx.add_change(RowChange::update_with_version(
-                    &self.table,
-                    storage_key.clone(),
-                    new_value.clone(),
-                    ctx.read_view.creator_txn_id,
-                ));
-                ctx.buffer_write(storage_key, new_value);
-                self.rows_updated += 1;
-            }
-            // else: buffered delete, row doesn't exist
-            return Ok(());
-        }
-
-        // Single-key MVCC lookup with version for OCC
+        // Always read from MVCC storage (not write buffer) to get the correct
+        // OCC version. The full-scan path also reads from MVCC, not the buffer.
+        // The write buffer is for SELECT read-your-writes, not DML OCC checks.
         let result = self
             .mvcc
             .get_with_version(&storage_key, &ctx.read_view)

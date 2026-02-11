@@ -67,30 +67,9 @@ impl Delete {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
         })?;
 
-        // Check write buffer first (read-your-writes)
-        if let Some(buffered) = ctx.get_buffered(&storage_key) {
-            if let Some(buf_data) = buffered {
-                let row = decode_row(buf_data)?;
-                if let Some(filter) = &self.filter {
-                    let result = eval(filter, &row)?;
-                    if !result.as_bool().unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                let ctx = self.txn_context.as_mut().unwrap();
-                ctx.add_change(RowChange::delete_with_version(
-                    &self.table,
-                    storage_key.clone(),
-                    ctx.read_view.creator_txn_id,
-                ));
-                ctx.buffer_delete(storage_key);
-                self.rows_deleted += 1;
-            }
-            // else: already deleted in buffer, nothing to do
-            return Ok(());
-        }
-
-        // Single-key MVCC lookup with version for OCC
+        // Always read from MVCC storage (not write buffer) to get the correct
+        // OCC version. The full-scan path also reads from MVCC, not the buffer.
+        // The write buffer is for SELECT read-your-writes, not DML OCC checks.
         let result = self
             .mvcc
             .get_with_version(&storage_key, &ctx.read_view)
