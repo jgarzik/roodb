@@ -455,6 +455,7 @@ async fn test_delete_with_filter() {
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(2))),
             result_type: DataType::Boolean,
         }),
+        key_value: None,
     };
 
     let mut exec = engine.build(plan).unwrap();
@@ -529,18 +530,9 @@ async fn test_distinct() {
     let row3 = Row::new(vec![Datum::Int(2)]);
 
     let initial = vec![
-        (
-            encode_pk_key("nums", &[Datum::Int(1)]),
-            encode_row(&row1),
-        ),
-        (
-            encode_pk_key("nums", &[Datum::Int(2)]),
-            encode_row(&row2),
-        ),
-        (
-            encode_pk_key("nums", &[Datum::Int(3)]),
-            encode_row(&row3),
-        ),
+        (encode_pk_key("nums", &[Datum::Int(1)]), encode_row(&row1)),
+        (encode_pk_key("nums", &[Datum::Int(2)]), encode_row(&row2)),
+        (encode_pk_key("nums", &[Datum::Int(3)]), encode_row(&row3)),
     ];
 
     let storage = Arc::new(MockStorage::new(initial));

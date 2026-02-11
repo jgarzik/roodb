@@ -107,6 +107,24 @@ impl MvccStorage {
         self.find_visible_version_owned(encoded, read_view).await
     }
 
+    /// Get a row with its version (txn_id) for OCC conflict detection.
+    ///
+    /// Like `get()` but also returns the txn_id of the visible version,
+    /// needed by UPDATE/DELETE PointGet paths for optimistic concurrency control.
+    pub async fn get_with_version(
+        &self,
+        key: &[u8],
+        read_view: &ReadView,
+    ) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let encoded = match self.inner.get(key).await? {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        self.find_visible_version_with_txn_id(&encoded, read_view)
+            .await
+    }
+
     /// Find visible version, taking ownership of the encoded bytes to avoid copying
     async fn find_visible_version_owned(
         &self,

@@ -912,115 +912,124 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
 
                             // Pass 2: Apply changes (only if no OCC conflict)
                             if conflict_error.is_none() {
-                            for change in &changeset.changes {
-                                match change.op {
-                                    ChangeOp::Insert | ChangeOp::Update => {
-                                        if let Some(ref value) = change.value {
-                                            // Check for duplicate key on INSERT for user tables
-                                            if change.op == ChangeOp::Insert
-                                                && !is_system_table(&change.table)
-                                            {
-                                                if let Ok(Some(existing_data)) =
-                                                    self.storage.get(&change.key).await
+                                for change in &changeset.changes {
+                                    match change.op {
+                                        ChangeOp::Insert | ChangeOp::Update => {
+                                            if let Some(ref value) = change.value {
+                                                // Check for duplicate key on INSERT for user tables
+                                                if change.op == ChangeOp::Insert
+                                                    && !is_system_table(&change.table)
                                                 {
-                                                    if existing_data.len() > 16
-                                                        && existing_data[16] != 1
+                                                    if let Ok(Some(existing_data)) =
+                                                        self.storage.get(&change.key).await
                                                     {
-                                                        tracing::warn!(
-                                                            table = %change.table,
-                                                            "INSERT conflict: row already exists with this key"
-                                                        );
-                                                        conflict_error = Some(format!(
+                                                        if existing_data.len() > 16
+                                                            && existing_data[16] != 1
+                                                        {
+                                                            tracing::warn!(
+                                                                table = %change.table,
+                                                                "INSERT conflict: row already exists with this key"
+                                                            );
+                                                            conflict_error = Some(format!(
                                                             "Duplicate key: row in '{}' already exists",
                                                             change.table
                                                         ));
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            // Check for duplicate table creation (race condition fix)
-                                            if change.table == SYSTEM_TABLES
-                                                && change.op == ChangeOp::Insert
-                                            {
-                                                if let Ok(row) = decode_row(value) {
-                                                    if let Some(crate::executor::Datum::String(
-                                                        table_name,
-                                                    )) = row.values().first()
-                                                    {
-                                                        if existing_tables.contains(table_name) {
-                                                            tracing::debug!(
-                                                                table = %table_name,
-                                                                "Skipping duplicate CREATE TABLE in apply()"
-                                                            );
-                                                            continue;
+                                                            break;
                                                         }
-                                                        existing_tables.insert(table_name.clone());
                                                     }
                                                 }
-                                            }
 
-                                            // Check for duplicate index creation
-                                            if change.table == SYSTEM_INDEXES
-                                                && change.op == ChangeOp::Insert
-                                            {
-                                                if let Ok(row) = decode_row(value) {
-                                                    if let Some(crate::executor::Datum::String(
-                                                        index_name,
-                                                    )) = row.values().first()
-                                                    {
-                                                        if existing_indexes.contains(index_name) {
-                                                            tracing::debug!(
-                                                                index = %index_name,
-                                                                "Skipping duplicate CREATE INDEX in apply()"
-                                                            );
-                                                            continue;
+                                                // Check for duplicate table creation (race condition fix)
+                                                if change.table == SYSTEM_TABLES
+                                                    && change.op == ChangeOp::Insert
+                                                {
+                                                    if let Ok(row) = decode_row(value) {
+                                                        if let Some(
+                                                            crate::executor::Datum::String(
+                                                                table_name,
+                                                            ),
+                                                        ) = row.values().first()
+                                                        {
+                                                            if existing_tables.contains(table_name)
+                                                            {
+                                                                tracing::debug!(
+                                                                    table = %table_name,
+                                                                    "Skipping duplicate CREATE TABLE in apply()"
+                                                                );
+                                                                continue;
+                                                            }
+                                                            existing_tables
+                                                                .insert(table_name.clone());
                                                         }
-                                                        existing_indexes.insert(index_name.clone());
                                                     }
                                                 }
-                                            }
 
+                                                // Check for duplicate index creation
+                                                if change.table == SYSTEM_INDEXES
+                                                    && change.op == ChangeOp::Insert
+                                                {
+                                                    if let Ok(row) = decode_row(value) {
+                                                        if let Some(
+                                                            crate::executor::Datum::String(
+                                                                index_name,
+                                                            ),
+                                                        ) = row.values().first()
+                                                        {
+                                                            if existing_indexes.contains(index_name)
+                                                            {
+                                                                tracing::debug!(
+                                                                    index = %index_name,
+                                                                    "Skipping duplicate CREATE INDEX in apply()"
+                                                                );
+                                                                continue;
+                                                            }
+                                                            existing_indexes
+                                                                .insert(index_name.clone());
+                                                        }
+                                                    }
+                                                }
+
+                                                let encoded =
+                                                    encode_mvcc_row(changeset.txn_id, false, value);
+
+                                                self.storage
+                                                    .put(&change.key, &encoded)
+                                                    .await
+                                                    .map_err(write_err)?;
+
+                                                self.track_system_table_change(
+                                                    &change.table,
+                                                    value,
+                                                    false,
+                                                    &mut affected_tables,
+                                                    &mut dropped_tables,
+                                                    &mut affected_indexes,
+                                                    &mut dropped_indexes,
+                                                );
+                                            }
+                                        }
+                                        ChangeOp::Delete => {
                                             let encoded =
-                                                encode_mvcc_row(changeset.txn_id, false, value);
-
+                                                encode_mvcc_row(changeset.txn_id, true, &[]);
                                             self.storage
                                                 .put(&change.key, &encoded)
                                                 .await
                                                 .map_err(write_err)?;
 
-                                            self.track_system_table_change(
-                                                &change.table,
-                                                value,
-                                                false,
-                                                &mut affected_tables,
-                                                &mut dropped_tables,
-                                                &mut affected_indexes,
-                                                &mut dropped_indexes,
-                                            );
-                                        }
-                                    }
-                                    ChangeOp::Delete => {
-                                        let encoded = encode_mvcc_row(changeset.txn_id, true, &[]);
-                                        self.storage
-                                            .put(&change.key, &encoded)
-                                            .await
-                                            .map_err(write_err)?;
-
-                                        if let Some(ref value) = change.value {
-                                            self.track_system_table_change(
-                                                &change.table,
-                                                value,
-                                                true,
-                                                &mut affected_tables,
-                                                &mut dropped_tables,
-                                                &mut affected_indexes,
-                                                &mut dropped_indexes,
-                                            );
+                                            if let Some(ref value) = change.value {
+                                                self.track_system_table_change(
+                                                    &change.table,
+                                                    value,
+                                                    true,
+                                                    &mut affected_tables,
+                                                    &mut dropped_tables,
+                                                    &mut affected_indexes,
+                                                    &mut dropped_indexes,
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
                             } // end pass 2
 
                             // Return conflict error or success

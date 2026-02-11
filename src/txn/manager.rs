@@ -5,9 +5,9 @@
 //! - COMMIT: Mark transaction as committed, persist to WAL
 //! - ROLLBACK: Apply undo log in reverse, mark as aborted
 
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::RwLock;
 
 use super::{
     IsolationLevel, ReadView, TimeoutConfig, Transaction, TransactionError, TransactionResult,

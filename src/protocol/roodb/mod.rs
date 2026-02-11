@@ -115,10 +115,7 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let mvcc = Arc::new(MvccStorage::new(
-            storage.clone(),
-            txn_manager.clone(),
-        ));
+        let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
         RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
@@ -155,10 +152,7 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let mvcc = Arc::new(MvccStorage::new(
-            storage.clone(),
-            txn_manager.clone(),
-        ));
+        let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
         RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
@@ -739,7 +733,8 @@ where
                 PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
 
             Ok((physical, required_privileges, schema_version))
-        })();
+        })(
+        );
 
         let (plan_template, required_privileges, schema_version) = match plan_result {
             Ok((p, privs, sv)) => (p, privs, sv),

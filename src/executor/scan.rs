@@ -184,14 +184,8 @@ mod tests {
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
 
         let data = vec![
-            (
-                encode_pk_key("users", &[Datum::Int(1)]),
-                encode_row(&row1),
-            ),
-            (
-                encode_pk_key("users", &[Datum::Int(2)]),
-                encode_row(&row2),
-            ),
+            (encode_pk_key("users", &[Datum::Int(1)]), encode_row(&row1)),
+            (encode_pk_key("users", &[Datum::Int(2)]), encode_row(&row2)),
         ];
 
         let storage = Arc::new(MockStorage { data }) as Arc<dyn StorageEngine>;

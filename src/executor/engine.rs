@@ -206,17 +206,24 @@ impl ExecutorEngine {
                 table,
                 assignments,
                 filter,
+                key_value,
             } => Ok(Box::new(Update::new(
                 table,
                 assignments,
                 filter,
+                key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
             ))),
 
-            PhysicalPlan::Delete { table, filter } => Ok(Box::new(Delete::new(
+            PhysicalPlan::Delete {
                 table,
                 filter,
+                key_value,
+            } => Ok(Box::new(Delete::new(
+                table,
+                filter,
+                key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
             ))),
@@ -504,18 +511,9 @@ mod tests {
         let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
 
         let initial = vec![
-            (
-                encode_pk_key("users", &[Datum::Int(1)]),
-                encode_row(&row1),
-            ),
-            (
-                encode_pk_key("users", &[Datum::Int(2)]),
-                encode_row(&row2),
-            ),
-            (
-                encode_pk_key("users", &[Datum::Int(3)]),
-                encode_row(&row3),
-            ),
+            (encode_pk_key("users", &[Datum::Int(1)]), encode_row(&row1)),
+            (encode_pk_key("users", &[Datum::Int(2)]), encode_row(&row2)),
+            (encode_pk_key("users", &[Datum::Int(3)]), encode_row(&row3)),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));

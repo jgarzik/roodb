@@ -174,7 +174,7 @@ impl ExplainOutput {
                 }
             }
 
-            PhysicalPlan::Delete { table, filter } => {
+            PhysicalPlan::Delete { table, filter, .. } => {
                 writeln!(out, "{}Delete: {}", prefix, table).unwrap();
                 if let Some(f) = filter {
                     writeln!(out, "{}  filter: {:?}", prefix, f).unwrap();

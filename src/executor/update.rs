@@ -11,7 +11,7 @@ use crate::raft::RowChange;
 use crate::txn::MvccStorage;
 
 use super::context::TransactionContext;
-use super::encoding::{decode_row, encode_row, table_key_end, table_key_prefix};
+use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::eval;
 use super::row::Row;
@@ -25,6 +25,8 @@ pub struct Update {
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
+    /// PK value for PointGet fast path (O(1) instead of full scan)
+    key_value: Option<ResolvedExpr>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility and versioning)
@@ -41,6 +43,7 @@ impl Update {
         table: String,
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
+        key_value: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
     ) -> Self {
@@ -48,11 +51,138 @@ impl Update {
             table,
             assignments,
             filter,
+            key_value,
             mvcc,
             txn_context,
             rows_updated: 0,
             done: false,
         }
+    }
+}
+
+impl Update {
+    /// PointGet fast path: O(1) single-key lookup + update
+    async fn next_point_get(&mut self) -> ExecutorResult<()> {
+        let key_expr = self.key_value.as_ref().unwrap();
+        let key_datum = eval(key_expr, &Row::empty())?;
+        let storage_key = encode_pk_key(&self.table, &[key_datum]);
+
+        let ctx = self.txn_context.as_ref().ok_or_else(|| {
+            super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
+        })?;
+
+        // Check write buffer first (read-your-writes)
+        if let Some(buffered) = ctx.get_buffered(&storage_key) {
+            if let Some(buf_data) = buffered {
+                let mut row = decode_row(buf_data)?;
+                // Apply filter (even on PointGet, filter may have extra predicates)
+                if let Some(filter) = &self.filter {
+                    let result = eval(filter, &row)?;
+                    if !result.as_bool().unwrap_or(false) {
+                        return Ok(());
+                    }
+                }
+                for (col, expr) in &self.assignments {
+                    let new_value = eval(expr, &row)?;
+                    row.set(col.index, new_value)?;
+                }
+                let new_value = encode_row(&row);
+                let ctx = self.txn_context.as_mut().unwrap();
+                // Buffered rows are from our own txn, use txn_id as version
+                ctx.add_change(RowChange::update_with_version(
+                    &self.table,
+                    storage_key.clone(),
+                    new_value.clone(),
+                    ctx.read_view.creator_txn_id,
+                ));
+                ctx.buffer_write(storage_key, new_value);
+                self.rows_updated += 1;
+            }
+            // else: buffered delete, row doesn't exist
+            return Ok(());
+        }
+
+        // Single-key MVCC lookup with version for OCC
+        let result = self
+            .mvcc
+            .get_with_version(&storage_key, &ctx.read_view)
+            .await?;
+
+        if let Some((data, row_version)) = result {
+            let mut row = decode_row(&data)?;
+            if let Some(filter) = &self.filter {
+                let result = eval(filter, &row)?;
+                if !result.as_bool().unwrap_or(false) {
+                    return Ok(());
+                }
+            }
+            for (col, expr) in &self.assignments {
+                let new_value = eval(expr, &row)?;
+                row.set(col.index, new_value)?;
+            }
+            let new_value = encode_row(&row);
+            let ctx = self.txn_context.as_mut().unwrap();
+            ctx.add_change(RowChange::update_with_version(
+                &self.table,
+                storage_key.clone(),
+                new_value.clone(),
+                row_version,
+            ));
+            ctx.buffer_write(storage_key, new_value);
+            self.rows_updated += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Full scan path: scan all rows in the table
+    async fn next_full_scan(&mut self) -> ExecutorResult<()> {
+        let prefix = table_key_prefix(&self.table);
+        let end = table_key_end(&self.table);
+
+        let kv_pairs = if let Some(ref ctx) = self.txn_context {
+            self.mvcc
+                .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
+                .await?
+        } else {
+            self.mvcc
+                .inner()
+                .scan(Some(&prefix), Some(&end))
+                .await?
+                .into_iter()
+                .map(|(k, v)| (k, v, 0u64))
+                .collect()
+        };
+
+        for (key, value, row_version) in kv_pairs {
+            let mut row = decode_row(&value)?;
+            if let Some(filter) = &self.filter {
+                let result = eval(filter, &row)?;
+                if !result.as_bool().unwrap_or(false) {
+                    continue;
+                }
+            }
+            for (col, expr) in &self.assignments {
+                let new_value = eval(expr, &row)?;
+                row.set(col.index, new_value)?;
+            }
+            let new_value = encode_row(&row);
+            let ctx = self.txn_context.as_mut().ok_or_else(|| {
+                super::error::ExecutorError::Internal(
+                    "UPDATE requires transaction context".to_string(),
+                )
+            })?;
+            ctx.add_change(RowChange::update_with_version(
+                &self.table,
+                key.clone(),
+                new_value.clone(),
+                row_version,
+            ));
+            ctx.buffer_write(key, new_value);
+            self.rows_updated += 1;
+        }
+
+        Ok(())
     }
 }
 
@@ -69,62 +199,10 @@ impl Executor for Update {
             return Ok(None);
         }
 
-        // Scan the table
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
-
-        // Use MVCC scan with version tracking for OCC conflict detection
-        // Returns (key, value, txn_id) tuples where txn_id is the row's version
-        let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
-                .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
-                .await?
+        if self.key_value.is_some() {
+            self.next_point_get().await?;
         } else {
-            // Without transaction context, use regular scan (no OCC)
-            self.mvcc
-                .inner()
-                .scan(Some(&prefix), Some(&end))
-                .await?
-                .into_iter()
-                .map(|(k, v)| (k, v, 0u64))
-                .collect()
-        };
-
-        for (key, value, row_version) in kv_pairs {
-            let mut row = decode_row(&value)?;
-
-            // Apply filter
-            if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
-                if !result.as_bool().unwrap_or(false) {
-                    continue;
-                }
-            }
-
-            // Apply updates
-            for (col, expr) in &self.assignments {
-                let new_value = eval(expr, &row)?;
-                row.set(col.index, new_value)?;
-            }
-
-            // Collect the change for Raft replication with OCC version check.
-            // apply() will verify the row hasn't been modified since we read it.
-            let new_value = encode_row(&row);
-
-            let ctx = self.txn_context.as_mut().ok_or_else(|| {
-                super::error::ExecutorError::Internal(
-                    "UPDATE requires transaction context".to_string(),
-                )
-            })?;
-            ctx.add_change(RowChange::update_with_version(
-                &self.table,
-                key.clone(),
-                new_value.clone(),
-                row_version,
-            ));
-            // Buffer for read-your-writes within this transaction
-            ctx.buffer_write(key, new_value);
-            self.rows_updated += 1;
+            self.next_full_scan().await?;
         }
 
         self.done = true;
@@ -289,6 +367,7 @@ mod tests {
             "users".to_string(),
             assignments,
             Some(filter),
+            None,
             mvcc,
             Some(txn_context),
         );

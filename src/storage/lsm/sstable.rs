@@ -203,7 +203,8 @@ impl<IO: AsyncIO> SstableWriter<IO> {
         }
 
         // Write footer
-        let footer = self.build_footer(index_offset, index_size, bloom_offset, bloom_bytes.len())?;
+        let footer =
+            self.build_footer(index_offset, index_size, bloom_offset, bloom_bytes.len())?;
         let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
         buf.copy_from_slice(&footer)?;
         self.io

@@ -7,8 +7,8 @@ use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::executor::datum::Datum;
 use crate::planner::error::PlannerResult;
 use crate::planner::logical::expr::{AggregateFunc, OutputColumn};
-use crate::planner::logical::{Literal, LogicalPlan};
 use crate::planner::logical::{BinaryOp, JoinType, ResolvedColumn, ResolvedExpr};
+use crate::planner::logical::{Literal, LogicalPlan};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 /// Physical plan node
@@ -113,12 +113,16 @@ pub enum PhysicalPlan {
         /// (column, new value)
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
+        /// PK value for PointGet fast path (O(1) instead of full scan)
+        key_value: Option<ResolvedExpr>,
     },
 
     /// DELETE rows from a table
     Delete {
         table: String,
         filter: Option<ResolvedExpr>,
+        /// PK value for PointGet fast path (O(1) instead of full scan)
+        key_value: Option<ResolvedExpr>,
     },
 
     // ============ DDL Operations ============
@@ -385,6 +389,7 @@ impl PhysicalPlan {
             PhysicalPlan::Update {
                 assignments,
                 filter,
+                key_value,
                 ..
             } => {
                 for (_, expr) in assignments {
@@ -393,10 +398,18 @@ impl PhysicalPlan {
                 if let Some(f) = filter {
                     substitute_expr(f, params);
                 }
+                if let Some(kv) = key_value {
+                    substitute_expr(kv, params);
+                }
             }
-            PhysicalPlan::Delete { filter, .. } => {
+            PhysicalPlan::Delete {
+                filter, key_value, ..
+            } => {
                 if let Some(f) = filter {
                     substitute_expr(f, params);
+                }
+                if let Some(kv) = key_value {
+                    substitute_expr(kv, params);
                 }
             }
             // DDL/Auth operations have no expression parameters
@@ -526,17 +539,13 @@ impl PhysicalPlanner {
         {
             // Check Column = Literal
             if let ResolvedExpr::Column(col) = left.as_ref() {
-                if col.index == pk_col_index
-                    && matches!(right.as_ref(), ResolvedExpr::Literal(_))
-                {
+                if col.index == pk_col_index && matches!(right.as_ref(), ResolvedExpr::Literal(_)) {
                     return Some(right.as_ref().clone());
                 }
             }
             // Check Literal = Column
             if let ResolvedExpr::Column(col) = right.as_ref() {
-                if col.index == pk_col_index
-                    && matches!(left.as_ref(), ResolvedExpr::Literal(_))
-                {
+                if col.index == pk_col_index && matches!(left.as_ref(), ResolvedExpr::Literal(_)) {
                     return Some(left.as_ref().clone());
                 }
             }
@@ -685,10 +694,7 @@ impl PhysicalPlanner {
     }
 
     /// Extract a PK bound from a comparison expression
-    fn extract_pk_bound(
-        expr: &ResolvedExpr,
-        pk_col_index: usize,
-    ) -> Option<BoundType> {
+    fn extract_pk_bound(expr: &ResolvedExpr, pk_col_index: usize) -> Option<BoundType> {
         if let ResolvedExpr::BinaryOp {
             left, op, right, ..
         } = expr
@@ -838,33 +844,31 @@ impl PhysicalPlanner {
                 values,
             } => {
                 // Look up auto_increment and PK columns from catalog
-                let (auto_increment_indices, pk_column_indices) =
-                    if let Some(table_def) = catalog.get_table(&table) {
-                        let auto_inc: Vec<usize> = columns
+                let (auto_increment_indices, pk_column_indices) = if let Some(table_def) =
+                    catalog.get_table(&table)
+                {
+                    let auto_inc: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, col)| {
+                            table_def
+                                .get_column(&col.name)
+                                .is_some_and(|cd| cd.auto_increment)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
+                        pk_cols
                             .iter()
-                            .enumerate()
-                            .filter(|(_, col)| {
-                                table_def
-                                    .get_column(&col.name)
-                                    .is_some_and(|cd| cd.auto_increment)
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
-                        let pk_indices: Vec<usize> =
-                            if let Some(pk_cols) = table_def.primary_key() {
-                                pk_cols
-                                    .iter()
-                                    .filter_map(|pk_name| {
-                                        columns.iter().position(|c| c.name == *pk_name)
-                                    })
-                                    .collect()
-                            } else {
-                                vec![]
-                            };
-                        (auto_inc, pk_indices)
+                            .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
+                            .collect()
                     } else {
-                        (vec![], vec![])
+                        vec![]
                     };
+                    (auto_inc, pk_indices)
+                } else {
+                    (vec![], vec![])
+                };
                 Ok(PhysicalPlan::Insert {
                     table,
                     columns,
@@ -878,13 +882,28 @@ impl PhysicalPlanner {
                 table,
                 assignments,
                 filter,
-            } => Ok(PhysicalPlan::Update {
-                table,
-                assignments,
-                filter,
-            }),
+            } => {
+                let key_value = filter
+                    .as_ref()
+                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                Ok(PhysicalPlan::Update {
+                    table,
+                    assignments,
+                    filter,
+                    key_value,
+                })
+            }
 
-            LogicalPlan::Delete { table, filter } => Ok(PhysicalPlan::Delete { table, filter }),
+            LogicalPlan::Delete { table, filter } => {
+                let key_value = filter
+                    .as_ref()
+                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                Ok(PhysicalPlan::Delete {
+                    table,
+                    filter,
+                    key_value,
+                })
+            }
 
             // DDL passthrough
             LogicalPlan::CreateTable {
@@ -1013,7 +1032,13 @@ mod tests {
         match physical {
             PhysicalPlan::Project { input, .. } => {
                 assert!(
-                    matches!(*input, PhysicalPlan::TableScan { filter: Some(_), .. }),
+                    matches!(
+                        *input,
+                        PhysicalPlan::TableScan {
+                            filter: Some(_),
+                            ..
+                        }
+                    ),
                     "Expected TableScan with pushed-down filter"
                 );
             }
@@ -1024,27 +1049,28 @@ mod tests {
     #[test]
     fn test_physical_plan_range_scan_between() {
         let catalog = test_catalog();
-        let physical = plan_sql(&catalog, "SELECT id, name FROM users WHERE id BETWEEN 10 AND 20");
+        let physical = plan_sql(
+            &catalog,
+            "SELECT id, name FROM users WHERE id BETWEEN 10 AND 20",
+        );
 
         // Should produce: Project -> RangeScan (BETWEEN on PK)
         match physical {
-            PhysicalPlan::Project { input, .. } => {
-                match *input {
-                    PhysicalPlan::RangeScan {
-                        ref table,
-                        inclusive_start,
-                        inclusive_end,
-                        ref remaining_filter,
-                        ..
-                    } => {
-                        assert_eq!(table, "users");
-                        assert!(inclusive_start);
-                        assert!(inclusive_end);
-                        assert!(remaining_filter.is_none());
-                    }
-                    _ => panic!("Expected RangeScan, got {:?}", *input),
+            PhysicalPlan::Project { input, .. } => match *input {
+                PhysicalPlan::RangeScan {
+                    ref table,
+                    inclusive_start,
+                    inclusive_end,
+                    ref remaining_filter,
+                    ..
+                } => {
+                    assert_eq!(table, "users");
+                    assert!(inclusive_start);
+                    assert!(inclusive_end);
+                    assert!(remaining_filter.is_none());
                 }
-            }
+                _ => panic!("Expected RangeScan, got {:?}", *input),
+            },
             _ => panic!("Expected Project"),
         }
     }
@@ -1063,8 +1089,8 @@ mod tests {
                         inclusive_end,
                         ..
                     } => {
-                        assert!(inclusive_start);   // >= is inclusive
-                        assert!(!inclusive_end);     // < is exclusive
+                        assert!(inclusive_start); // >= is inclusive
+                        assert!(!inclusive_end); // < is exclusive
                     }
                     _ => panic!("Expected RangeScan, got {:?}", *input),
                 }
