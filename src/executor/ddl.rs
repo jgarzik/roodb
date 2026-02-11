@@ -401,6 +401,19 @@ impl Executor for DropTable {
                 }
             }
 
+            // Delete all user data rows for this table
+            let prefix = super::encoding::table_key_prefix(&self.name);
+            let end = super::encoding::table_key_end(&self.name);
+            let data_rows = mvcc
+                .scan_raw(&prefix, &end)
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            for (key, _value) in data_rows {
+                changeset.push(RowChange::delete(&self.name, key.clone()));
+                self.changes.push(RowChange::delete(&self.name, key));
+            }
+
             // Propose to Raft - catalog is updated synchronously in apply()
             raft_node
                 .propose_changes(changeset)
