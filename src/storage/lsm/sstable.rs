@@ -855,7 +855,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
             }
         }
 
-        // Process all blocks and collect results
+        // Process all blocks and collect results — take ownership to avoid clones
         let mut results = Vec::new();
         for (i, &(_, offset)) in needed_blocks.iter().enumerate() {
             let block_data = cached_blocks[i]
@@ -863,7 +863,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
                 .expect("all blocks should be loaded after batch read");
 
             let reader = BlockReader::parse(block_data, offset)?;
-            for e in reader.entries() {
+            for e in reader.into_entries() {
                 if let Some(s) = start {
                     if e.key.as_slice() < s {
                         continue;
@@ -874,7 +874,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
                         break;
                     }
                 }
-                results.push((e.key.clone(), e.value.clone()));
+                results.push((e.key, e.value));
             }
         }
 

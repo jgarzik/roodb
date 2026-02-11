@@ -7,6 +7,7 @@ pub mod binary;
 pub mod command;
 pub mod error;
 pub mod handshake;
+pub mod metrics;
 pub mod packet;
 pub mod prepared;
 pub mod resultset;
@@ -18,6 +19,7 @@ pub use handshake::status_flags;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadHalf, WriteHalf};
@@ -93,6 +95,8 @@ where
     raft_node: Arc<RaftNode>,
     /// Prepared statement manager (per-connection)
     prepared_stmts: PreparedStatementManager,
+    /// Per-connection MVCC storage (avoids Arc::new per query)
+    mvcc: Arc<MvccStorage>,
 }
 
 impl<S> RooDbConnection<S>
@@ -111,6 +115,10 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone(),
+            txn_manager.clone(),
+        ));
         RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
@@ -126,6 +134,7 @@ where
             txn_manager,
             raft_node,
             prepared_stmts: PreparedStatementManager::new(),
+            mvcc,
         }
     }
 
@@ -146,6 +155,10 @@ where
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone(),
+            txn_manager.clone(),
+        ));
         RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
@@ -161,6 +174,7 @@ where
             txn_manager,
             raft_node,
             prepared_stmts: PreparedStatementManager::new(),
+            mvcc,
         }
     }
 
@@ -395,6 +409,7 @@ where
 
     /// Run the command loop
     pub async fn run(&mut self) -> ProtocolResult<()> {
+        let mut last_cmd_end = Instant::now();
         loop {
             // Reset sequence for each command
             self.reader.reset_sequence();
@@ -415,11 +430,24 @@ where
                 Err(e) => return Err(e),
             };
 
+            let read_wait_ns = metrics::elapsed_ns(last_cmd_end);
+
             // Parse and handle command
+            let cmd_start = Instant::now();
             let cmd = parse_command(&packet)?;
 
             match self.handle_command(cmd).await {
-                Ok(true) => continue,       // Continue command loop
+                Ok(true) => {
+                    let cmd_ns = metrics::elapsed_ns(cmd_start);
+                    tracing::debug!(
+                        target: "roodb::perf",
+                        read_wait_us = read_wait_ns / 1000,
+                        cmd_us = cmd_ns / 1000,
+                        "cmd_loop"
+                    );
+                    last_cmd_end = Instant::now();
+                    continue;
+                }
                 Ok(false) => return Ok(()), // Client quit
                 Err(e) => {
                     // Try to send error to client
@@ -747,6 +775,8 @@ where
 
     /// Execute a physical plan and send results in binary format (for prepared statements).
     async fn execute_plan_binary(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+        let query_start = Instant::now();
+
         let returns_rows = matches!(
             plan,
             PhysicalPlan::TableScan { .. }
@@ -769,10 +799,7 @@ where
                 | PhysicalPlan::DropIndex { .. }
         );
 
-        let mvcc = Arc::new(MvccStorage::new(
-            self.storage.clone(),
-            self.txn_manager.clone(),
-        ));
+        let mvcc = self.mvcc.clone();
 
         let (txn_context, implicit_txn_id) = if is_ddl {
             (None, None)
@@ -799,6 +826,8 @@ where
             (Some(TransactionContext::new(0, read_view)), None)
         };
 
+        let plan_ns = metrics::elapsed_ns(query_start);
+
         if returns_rows {
             let columns = plan.output_columns();
 
@@ -810,7 +839,24 @@ where
             );
             let mut executor = engine.build(plan)?;
 
-            self.send_binary_result_set(&columns, &mut *executor).await
+            let t_open = Instant::now();
+            executor.open().await?;
+            let exec_open_ns = metrics::elapsed_ns(t_open);
+
+            let t_iter = Instant::now();
+            let result = self.send_binary_result_set(&columns, &mut *executor).await;
+            let exec_iter_ns = metrics::elapsed_ns(t_iter);
+
+            let m = metrics::QueryMetrics {
+                total: query_start.elapsed(),
+                plan_ns,
+                exec_open_ns,
+                exec_iter_ns,
+                send_ns: 0,
+            };
+            m.log("binary_select");
+
+            result
         } else {
             let engine = ExecutorEngine::with_raft(
                 mvcc,
@@ -820,7 +866,11 @@ where
             );
             let mut executor = engine.build(plan)?;
 
+            let t_open = Instant::now();
             executor.open().await?;
+            let exec_open_ns = metrics::elapsed_ns(t_open);
+
+            let t_iter = Instant::now();
             let mut affected = 0u64;
             let mut last_insert_id = 0u64;
             while let Some(row) = executor.next().await? {
@@ -834,6 +884,7 @@ where
                 }
             }
             executor.close().await?;
+            let exec_iter_ns = metrics::elapsed_ns(t_iter);
 
             let changes = executor.take_changes();
             if !changes.is_empty() {
@@ -852,6 +903,15 @@ where
             if let Some(txn_id) = implicit_txn_id {
                 self.txn_manager.commit(txn_id).await?;
             }
+
+            let m = metrics::QueryMetrics {
+                total: query_start.elapsed(),
+                plan_ns,
+                exec_open_ns,
+                exec_iter_ns,
+                send_ns: 0,
+            };
+            m.log("binary_dml");
 
             self.send_ok(affected, last_insert_id).await
         }
@@ -1189,11 +1249,8 @@ where
                 | PhysicalPlan::DropIndex { .. }
         );
 
-        // Create MVCC storage wrapper
-        let mvcc = Arc::new(MvccStorage::new(
-            self.storage.clone(),
-            self.txn_manager.clone(),
-        ));
+        // Reuse per-connection MVCC storage wrapper
+        let mvcc = self.mvcc.clone();
 
         // Determine transaction context
         let (txn_context, implicit_txn_id) = if is_ddl {

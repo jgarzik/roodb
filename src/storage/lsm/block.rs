@@ -254,6 +254,11 @@ impl BlockReader {
         &self.entries
     }
 
+    /// Take ownership of entries (zero-copy for scan paths)
+    pub fn into_entries(self) -> Vec<Entry> {
+        self.entries
+    }
+
     /// Find an entry by key using binary search
     pub fn get(&self, key: &[u8]) -> Option<&Entry> {
         self.entries
