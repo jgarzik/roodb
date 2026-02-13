@@ -97,6 +97,12 @@ impl HashJoin {
             .collect()
     }
 
+    /// Returns true if any datum in the key is NULL.
+    /// Per SQL semantics, NULL keys must never match in joins.
+    fn key_has_null(key: &[Datum]) -> bool {
+        key.iter().any(|d| matches!(d, Datum::Null))
+    }
+
     fn null_row(width: usize) -> Row {
         Row::new(vec![Datum::Null; width])
     }
@@ -127,7 +133,10 @@ impl Executor for HashJoin {
             let key = Self::extract_key(&row, &self.right_keys);
             let idx = self.right_rows.len();
             self.right_rows.push(row);
-            self.hash_table.entry(key).or_default().push(idx);
+            // SQL: NULL keys never match, so skip indexing them
+            if !Self::key_has_null(&key) {
+                self.hash_table.entry(key).or_default().push(idx);
+            }
         }
 
         self.right_matched = vec![false; self.right_rows.len()];
@@ -136,7 +145,12 @@ impl Executor for HashJoin {
         self.current_left = self.left.next().await?;
         if let Some(ref left_row) = self.current_left {
             let key = Self::extract_key(left_row, &self.left_keys);
-            self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
+            // SQL: NULL keys never match
+            self.current_matches = if Self::key_has_null(&key) {
+                Vec::new()
+            } else {
+                self.hash_table.get(&key).cloned().unwrap_or_default()
+            };
         }
         self.match_pos = 0;
         self.left_matched = false;
@@ -184,8 +198,11 @@ impl Executor for HashJoin {
                     self.current_left = self.left.next().await?;
                     if let Some(ref lr) = self.current_left {
                         let key = Self::extract_key(lr, &self.left_keys);
-                        self.current_matches =
-                            self.hash_table.get(&key).cloned().unwrap_or_default();
+                        self.current_matches = if Self::key_has_null(&key) {
+                            Vec::new()
+                        } else {
+                            self.hash_table.get(&key).cloned().unwrap_or_default()
+                        };
                     }
                     self.match_pos = 0;
                     self.left_matched = false;
@@ -197,7 +214,11 @@ impl Executor for HashJoin {
                 self.current_left = self.left.next().await?;
                 if let Some(ref lr) = self.current_left {
                     let key = Self::extract_key(lr, &self.left_keys);
-                    self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
+                    self.current_matches = if Self::key_has_null(&key) {
+                        Vec::new()
+                    } else {
+                        self.hash_table.get(&key).cloned().unwrap_or_default()
+                    };
                 }
                 self.match_pos = 0;
                 self.left_matched = false;
@@ -510,6 +531,144 @@ mod tests {
         // (1,"b") matches (1,"b",200)
         assert_eq!(results[1].get(4).unwrap().as_int(), Some(200));
 
+        join.close().await.unwrap();
+    }
+
+    // --- NULL key handling tests (SQL: NULL != NULL in join keys) ---
+
+    #[tokio::test]
+    async fn test_hash_join_inner_null_keys_do_not_match() {
+        let left = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("left_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("left_one".into())]),
+        ]);
+        let right = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("right_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
+        ]);
+
+        let mut join = HashJoin::new(
+            left, right, JoinType::Inner, vec![0], vec![0], None, 2, 2,
+        );
+        join.open().await.unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = join.next().await.unwrap() {
+            results.push(row);
+        }
+
+        // Only Int(1) matches; NULL keys must not join
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get(0).unwrap().as_int(), Some(1));
+        assert_eq!(results[0].get(2).unwrap().as_int(), Some(1));
+        join.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hash_join_left_outer_null_keys() {
+        let left = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("left_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("left_one".into())]),
+        ]);
+        let right = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("right_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
+        ]);
+
+        let mut join = HashJoin::new(
+            left, right, JoinType::Left, vec![0], vec![0], None, 2, 2,
+        );
+        join.open().await.unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = join.next().await.unwrap() {
+            results.push(row);
+        }
+
+        // Both left rows appear; NULL-keyed left row gets NULL right columns
+        assert_eq!(results.len(), 2);
+        for row in &results {
+            if row.get(0).unwrap().is_null() {
+                // Unmatched: right side must be NULL
+                assert!(row.get(2).unwrap().is_null());
+                assert!(row.get(3).unwrap().is_null());
+            } else {
+                // Matched: right side has real values
+                assert_eq!(row.get(2).unwrap().as_int(), Some(1));
+            }
+        }
+        join.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hash_join_full_outer_null_keys() {
+        let left = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("left_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("left_one".into())]),
+        ]);
+        let right = mock(vec![
+            Row::new(vec![Datum::Null, Datum::String("right_null".into())]),
+            Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
+        ]);
+
+        let mut join = HashJoin::new(
+            left, right, JoinType::Full, vec![0], vec![0], None, 2, 2,
+        );
+        join.open().await.unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = join.next().await.unwrap() {
+            results.push(row);
+        }
+
+        // 3 rows: joined(1,1), unmatched left(NULL), unmatched right(NULL)
+        assert_eq!(results.len(), 3);
+
+        let mut saw_joined = false;
+        let mut saw_left_null = false;
+        let mut saw_right_null = false;
+        for row in &results {
+            match (row.get(0).unwrap().is_null(), row.get(2).unwrap().is_null()) {
+                (false, false) => {
+                    // Joined row
+                    assert_eq!(row.get(0).unwrap().as_int(), Some(1));
+                    assert_eq!(row.get(2).unwrap().as_int(), Some(1));
+                    saw_joined = true;
+                }
+                (false, true) => {
+                    // Unmatched left (NULL-keyed), right side padded with NULLs
+                    // But left key is NULL here... actually this is left_null row
+                    panic!("non-null left with null right shouldn't happen in this dataset");
+                }
+                (true, true) => {
+                    // Unmatched left NULL-key row (right side padded) or
+                    // unmatched right NULL-key row (left side padded)
+                    let left_payload = row.get(1).unwrap();
+                    let right_payload = row.get(3).unwrap();
+                    if left_payload.as_str() == Some("left_null") && right_payload.is_null() {
+                        saw_left_null = true;
+                    } else if left_payload.is_null()
+                        && right_payload.as_str() == Some("right_null")
+                    {
+                        saw_right_null = true;
+                    } else {
+                        panic!("Unexpected NULL/NULL row: {row:?}");
+                    }
+                }
+                (true, false) => {
+                    // Unmatched right row (left padded with NULLs)
+                    // right key is NULL but right payload present
+                    if row.get(3).unwrap().as_str() == Some("right_null") {
+                        saw_right_null = true;
+                    } else {
+                        panic!("Unexpected row");
+                    }
+                }
+            }
+        }
+        assert!(saw_joined, "missing joined row");
+        assert!(saw_left_null, "missing unmatched left NULL-key row");
+        assert!(saw_right_null, "missing unmatched right NULL-key row");
         join.close().await.unwrap();
     }
 }
