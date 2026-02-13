@@ -1264,7 +1264,8 @@ impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
         // while log operations only touch Raft-prefixed keys. OpenRaft serializes all
         // state machine operations, so no concurrent apply() can modify user data.
         // No flush needed: LSM scan reads from active memtable + immutable memtables +
-        // SSTables, so all committed data is visible without a flush.
+        // SSTables, so all applied data is visible in the snapshot. Memtable data may be
+        // lost on crash before flush — Raft's log provides durability, not the snapshot.
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
