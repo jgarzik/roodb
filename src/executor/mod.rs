@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 pub mod eval;
 pub mod filter;
+pub mod hash_join;
 pub mod insert;
 pub mod join;
 pub mod limit;

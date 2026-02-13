@@ -59,11 +59,24 @@ pub enum PhysicalPlan {
         expressions: Vec<(ResolvedExpr, String)>,
     },
 
-    /// Nested loop join
+    /// Nested loop join (fallback for non-equi joins and cross joins)
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         join_type: JoinType,
+        condition: Option<ResolvedExpr>,
+    },
+
+    /// Hash join for equi-joins (O(n+m) vs O(n*m) nested loop)
+    HashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        join_type: JoinType,
+        /// Equi-join key column indices in the left input
+        left_keys: Vec<usize>,
+        /// Equi-join key column indices in the right input
+        right_keys: Vec<usize>,
+        /// Remaining non-equi condition (evaluated on combined row)
         condition: Option<ResolvedExpr>,
     },
 
@@ -224,7 +237,8 @@ impl PhysicalPlan {
                 })
                 .collect(),
 
-            PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::HashJoin { left, right, .. } => {
                 let mut cols = left.output_columns();
                 let offset = cols.len();
                 for mut col in right.output_columns() {
@@ -346,6 +360,12 @@ impl PhysicalPlan {
                 }
             }
             PhysicalPlan::NestedLoopJoin {
+                left,
+                right,
+                condition,
+                ..
+            }
+            | PhysicalPlan::HashJoin {
                 left,
                 right,
                 condition,
@@ -488,6 +508,84 @@ fn datum_to_literal(datum: &Datum) -> Literal {
         Datum::String(s) => Literal::String(s.clone()),
         Datum::Bytes(b) => Literal::Blob(b.clone()),
         Datum::Timestamp(t) => Literal::Integer(*t),
+    }
+}
+
+/// Extract equi-join key pairs from a join condition.
+///
+/// Returns `(equi_keys, remaining_condition)` where:
+/// - `equi_keys` is a vec of `(left_col_index, right_col_index)` pairs
+///   (right indices are relative to the right input, i.e., offset by left_width)
+/// - `remaining_condition` is the non-equi portion of the condition, if any
+fn extract_equi_keys(
+    condition: &ResolvedExpr,
+    left_width: usize,
+) -> (Vec<(usize, usize)>, Option<ResolvedExpr>) {
+    let mut equi_keys = Vec::new();
+    let mut remaining_parts = Vec::new();
+    collect_equi_keys(condition, left_width, &mut equi_keys, &mut remaining_parts);
+
+    let remaining = if remaining_parts.is_empty() {
+        None
+    } else {
+        Some(
+            remaining_parts
+                .into_iter()
+                .reduce(|acc, part| ResolvedExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: BinaryOp::And,
+                    right: Box::new(part),
+                    result_type: DataType::Boolean,
+                })
+                .unwrap(),
+        )
+    };
+
+    (equi_keys, remaining)
+}
+
+/// Recursively collect equi-join key pairs from AND-connected conditions.
+fn collect_equi_keys(
+    expr: &ResolvedExpr,
+    left_width: usize,
+    equi_keys: &mut Vec<(usize, usize)>,
+    remaining: &mut Vec<ResolvedExpr>,
+) {
+    match expr {
+        ResolvedExpr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_equi_keys(left, left_width, equi_keys, remaining);
+            collect_equi_keys(right, left_width, equi_keys, remaining);
+        }
+        ResolvedExpr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } => {
+            // Check if this is Column(left_side) = Column(right_side)
+            if let (ResolvedExpr::Column(lc), ResolvedExpr::Column(rc)) =
+                (left.as_ref(), right.as_ref())
+            {
+                if lc.index < left_width && rc.index >= left_width {
+                    equi_keys.push((lc.index, rc.index - left_width));
+                    return;
+                }
+                if rc.index < left_width && lc.index >= left_width {
+                    equi_keys.push((rc.index, lc.index - left_width));
+                    return;
+                }
+            }
+            // Not an equi-join on left/right columns
+            remaining.push(expr.clone());
+        }
+        _ => {
+            remaining.push(expr.clone());
+        }
     }
 }
 
@@ -800,11 +898,34 @@ impl PhysicalPlanner {
                 join_type,
                 condition,
             } => {
-                // For now, always use nested loop join
-                // Future: could choose hash join based on cost/statistics
+                let left_plan = Box::new(Self::plan_node(*left, catalog)?);
+                let right_plan = Box::new(Self::plan_node(*right, catalog)?);
+                let left_width = left_plan.output_columns().len();
+
+                // Try to extract equi-join keys for hash join
+                if join_type != JoinType::Cross {
+                    if let Some(ref cond) = condition {
+                        let (equi_keys, remaining) =
+                            extract_equi_keys(cond, left_width);
+                        if !equi_keys.is_empty() {
+                            let (left_keys, right_keys): (Vec<_>, Vec<_>) =
+                                equi_keys.into_iter().unzip();
+                            return Ok(PhysicalPlan::HashJoin {
+                                left: left_plan,
+                                right: right_plan,
+                                join_type,
+                                left_keys,
+                                right_keys,
+                                condition: remaining,
+                            });
+                        }
+                    }
+                }
+
+                // Fallback to nested loop join
                 Ok(PhysicalPlan::NestedLoopJoin {
-                    left: Box::new(Self::plan_node(*left, catalog)?),
-                    right: Box::new(Self::plan_node(*right, catalog)?),
+                    left: left_plan,
+                    right: right_plan,
                     join_type,
                     condition,
                 })
