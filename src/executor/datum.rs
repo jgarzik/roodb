@@ -256,15 +256,28 @@ impl Ord for Datum {
 
 impl Hash for Datum {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
         match self {
-            Datum::Null => {}
-            Datum::Bool(b) => b.hash(state),
-            Datum::Int(i) => i.hash(state),
-            Datum::Float(f) => f.to_bits().hash(state),
-            Datum::String(s) => s.hash(state),
-            Datum::Bytes(b) => b.hash(state),
-            Datum::Timestamp(t) => t.hash(state),
+            // Int and Float share a discriminant tag so that cross-type
+            // equal values (e.g. Int(1) == Float(1.0)) hash identically.
+            Datum::Int(i) => {
+                0u8.hash(state);
+                (*i as f64).to_bits().hash(state);
+            }
+            Datum::Float(f) => {
+                0u8.hash(state);
+                f.to_bits().hash(state);
+            }
+            other => {
+                std::mem::discriminant(other).hash(state);
+                match other {
+                    Datum::Null => {}
+                    Datum::Bool(b) => b.hash(state),
+                    Datum::String(s) => s.hash(state),
+                    Datum::Bytes(b) => b.hash(state),
+                    Datum::Timestamp(t) => t.hash(state),
+                    Datum::Int(_) | Datum::Float(_) => unreachable!(),
+                }
+            }
         }
     }
 }
@@ -346,5 +359,53 @@ mod tests {
     fn test_datum_not() {
         assert_eq!(Datum::Bool(true).not(), Some(Datum::Bool(false)));
         assert_eq!(Datum::Bool(false).not(), Some(Datum::Bool(true)));
+    }
+
+    #[test]
+    fn test_hash_eq_consistency_int_float() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn compute_hash(d: &Datum) -> u64 {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        }
+
+        // Int(N) == Float(N.0) must imply identical hashes
+        for n in [0, 1, -1, 42, i64::MIN, i64::MAX] {
+            let int_val = Datum::Int(n);
+            let float_val = Datum::Float(n as f64);
+            assert_eq!(int_val, float_val, "PartialEq failed for {n}");
+            assert_eq!(
+                compute_hash(&int_val),
+                compute_hash(&float_val),
+                "Hash mismatch for Int({n}) vs Float({}.0)",
+                n
+            );
+        }
+
+        // Different values must not be equal
+        assert_ne!(Datum::Int(1), Datum::Float(2.0));
+
+        // Non-numeric types must still hash distinctly from numerics
+        assert_ne!(compute_hash(&Datum::Bool(true)), compute_hash(&Datum::Int(1)));
+    }
+
+    #[test]
+    fn test_int_float_hashmap_lookup() {
+        use std::collections::HashMap;
+
+        // Simulate the hash join scenario: build with Float, probe with Int
+        let mut map: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map.insert(vec![Datum::Float(1.0)], "matched");
+
+        // Probing with Int(1) must find the Float(1.0) entry
+        assert_eq!(map.get(&vec![Datum::Int(1)]), Some(&"matched"));
+
+        // And vice versa
+        let mut map2: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map2.insert(vec![Datum::Int(42)], "found");
+        assert_eq!(map2.get(&vec![Datum::Float(42.0)]), Some(&"found"));
     }
 }
