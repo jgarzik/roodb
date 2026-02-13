@@ -186,6 +186,146 @@ pub fn finalize_l0_compaction(
     Ok(())
 }
 
+/// Information gathered for a level compaction job (L1+→L2+)
+pub struct LevelCompactionJob {
+    /// Source level
+    pub source_level: u32,
+    /// Target level (source_level + 1)
+    pub target_level: u32,
+    /// Files from source level to compact
+    pub source_files: Vec<SstableInfo>,
+    /// Overlapping files from target level
+    pub target_files: Vec<SstableInfo>,
+    /// Reserved name for output SSTable
+    pub output_name: String,
+    /// Path for output SSTable
+    pub output_path: std::path::PathBuf,
+    /// Paths to input files (source first, then target)
+    pub input_paths: Vec<std::path::PathBuf>,
+}
+
+/// Phase 1: Gather level compaction job info (L1+→L2+) with manifest lock held
+///
+/// Picks the largest file from the source level and finds overlapping files
+/// in the target level.
+pub fn prepare_level_compaction(manifest: &mut Manifest, level: u32) -> Option<LevelCompactionJob> {
+    if level == 0 {
+        return None; // Use prepare_l0_compaction for L0
+    }
+    if !needs_level_compaction(manifest, level) {
+        return None;
+    }
+
+    let source_files_all = manifest.get_level(level);
+    if source_files_all.is_empty() {
+        return None;
+    }
+
+    // Pick the largest file (most compaction benefit)
+    let source_file = source_files_all
+        .iter()
+        .max_by_key(|f| f.size)?
+        .clone();
+    let source_files = vec![source_file.clone()];
+
+    // Find overlapping files in target level
+    let target_level = level + 1;
+    let target_files: Vec<_> = manifest
+        .get_level(target_level)
+        .iter()
+        .filter(|f| ranges_overlap(&f.min_key, &f.max_key, &source_file.min_key, &source_file.max_key))
+        .cloned()
+        .collect();
+
+    let output_name = manifest.next_sstable_name();
+    let output_path = manifest.sstable_path(&output_name);
+
+    // Source files have higher priority (lower index in merge = wins on ties)
+    let input_paths: Vec<_> = source_files
+        .iter()
+        .chain(target_files.iter())
+        .map(|info| manifest.sstable_path(&info.name))
+        .collect();
+
+    Some(LevelCompactionJob {
+        source_level: level,
+        target_level,
+        source_files,
+        target_files,
+        output_name,
+        output_path,
+        input_paths,
+    })
+}
+
+/// Phase 2: Execute level compaction I/O (L1+→L2+, without manifest lock)
+pub async fn execute_level_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
+    factory: &F,
+    job: &LevelCompactionJob,
+) -> StorageResult<Option<SstableInfo>> {
+    let mut merger = MergeIterator::new();
+
+    for (idx, path) in job.input_paths.iter().enumerate() {
+        let reader = SstableReader::open(factory, path, IoPriority::Compaction).await?;
+        let entries = reader.scan().await?;
+        merger.add(entries, idx);
+    }
+
+    let deduped = merger.merge_live();
+
+    if deduped.is_empty() {
+        return Ok(None);
+    }
+
+    let mut writer =
+        SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
+
+    for (key, value) in &deduped {
+        writer.add(key.clone(), Some(value.clone())).await?;
+    }
+
+    writer.finish().await?;
+
+    let size = std::fs::metadata(&job.output_path)?.len();
+    let min_key = deduped.first().unwrap().0.clone();
+    let max_key = deduped.last().unwrap().0.clone();
+
+    Ok(Some(SstableInfo {
+        name: job.output_name.clone(),
+        min_key,
+        max_key,
+        size,
+    }))
+}
+
+/// Phase 3: Finalize level compaction (L1+→L2+, with manifest lock)
+pub fn finalize_level_compaction(
+    manifest: &mut Manifest,
+    job: &LevelCompactionJob,
+    new_file: Option<SstableInfo>,
+) -> StorageResult<()> {
+    for f in &job.source_files {
+        manifest.remove_sstable(job.source_level, &f.name);
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during level compaction");
+        }
+    }
+    for f in &job.target_files {
+        manifest.remove_sstable(job.target_level, &f.name);
+        let path = manifest.sstable_path(&f.name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = ?path, error = %e, "Failed to delete old SSTable during level compaction");
+        }
+    }
+
+    if let Some(file) = new_file {
+        manifest.add_sstable(job.target_level, file);
+    }
+    manifest.save()?;
+    Ok(())
+}
+
 /// Find overall key range from a set of files
 fn find_key_range(files: &[SstableInfo]) -> (Vec<u8>, Vec<u8>) {
     let min = files

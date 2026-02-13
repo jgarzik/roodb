@@ -14,7 +14,9 @@ use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block_cache::{BlockCache, DEFAULT_CACHE_CAPACITY};
 use crate::storage::lsm::compaction::{
-    execute_l0_compaction, finalize_l0_compaction, needs_l0_compaction, prepare_l0_compaction,
+    execute_l0_compaction, execute_level_compaction, finalize_l0_compaction,
+    finalize_level_compaction, needs_l0_compaction, prepare_l0_compaction,
+    prepare_level_compaction,
 };
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
@@ -46,9 +48,12 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     imm_memtables: RwLock<Vec<Arc<Memtable>>>,
     /// Manifest for SSTable tracking (RwLock: readers concurrent, writers exclusive)
     manifest: RwLock<Manifest>,
-    /// Compaction serialization - prevents concurrent compactions from racing
-    /// on file deletion. Separate from manifest lock to allow reads during compaction.
-    compaction_mutex: TokioMutex<()>,
+    /// L0→L1 compaction mutex. Separate from level_compaction_mutex to allow
+    /// L0→L1 and L1+→L2+ compactions to run concurrently.
+    l0_compaction_mutex: TokioMutex<()>,
+    /// L1+→L2+ compaction mutex. Serializes higher-level compactions to prevent
+    /// adjacent-level races (e.g., L1→L2 and L2→L3 sharing L2 files).
+    level_compaction_mutex: TokioMutex<()>,
     /// LRU block cache shared across all SSTable reads
     block_cache: Arc<BlockCache>,
     /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
@@ -103,7 +108,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             memtable: RwLock::new(Arc::new(Memtable::new())),
             imm_memtables: RwLock::new(Vec::new()),
             manifest: RwLock::new(manifest),
-            compaction_mutex: TokioMutex::new(()),
+            l0_compaction_mutex: TokioMutex::new(()),
+            level_compaction_mutex: TokioMutex::new(()),
             block_cache,
             reader_cache: RwLock::new(reader_map),
             closed: AtomicBool::new(false),
@@ -203,38 +209,38 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         Ok(())
     }
 
-    /// Trigger compaction if needed
+    /// Trigger compaction if needed (L0→L1 + cascading L1+→L2+).
     ///
-    /// # Locking
-    /// Uses split-phase locking to minimize manifest lock contention:
-    /// 1. Acquire compaction_mutex to serialize compactions (prevents file deletion races)
-    /// 2. Brief manifest lock to check if compaction needed and gather job info
-    /// 3. Release manifest lock during expensive I/O operations
-    /// 4. Re-acquire manifest lock to finalize manifest updates
-    ///
-    /// The compaction_mutex ensures only one compaction runs at a time, preventing
-    /// races where one compaction deletes files another is about to read.
-    /// The manifest lock is released during I/O to allow concurrent reads.
+    /// Uses two independent mutexes so L0→L1 and L1+→L2+ compactions can run
+    /// concurrently. Each uses split-phase locking on the manifest to minimize
+    /// contention.
     async fn maybe_compact(&self) -> StorageResult<()> {
-        // Serialize compactions to prevent file deletion races
-        let _compaction_guard = self.compaction_mutex.lock().await;
+        // Run L0→L1 compaction under its own mutex
+        self.maybe_compact_l0().await?;
 
-        // Phase 1: Brief manifest write lock to check and prepare compaction job
+        // Cascade: check L1→L2, L2→L3 under the level mutex
+        self.maybe_compact_levels().await?;
+
+        Ok(())
+    }
+
+    /// L0→L1 compaction (guarded by l0_compaction_mutex)
+    async fn maybe_compact_l0(&self) -> StorageResult<()> {
+        let _guard = self.l0_compaction_mutex.lock().await;
+
         let job = {
             let mut manifest = self.manifest.write();
             prepare_l0_compaction(&mut manifest)
         };
 
-        // If no compaction needed, we're done
         let job = match job {
             Some(j) => j,
             None => return Ok(()),
         };
 
-        // Phase 2: Execute I/O without holding manifest lock (but with compaction_mutex)
         let new_file = execute_l0_compaction(&*self.factory, &job).await?;
 
-        // Invalidate block cache and reader cache for SSTables being removed
+        // Invalidate caches for removed SSTables
         {
             let mut rc = self.reader_cache.write();
             for f in &job.l0_files {
@@ -247,36 +253,98 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             }
         }
 
-        // Write-through: open reader for new compaction output and eager-load (async, outside manifest lock)
-        if let Some(ref _nf) = new_file {
-            let output_path = &job.output_path;
-            let cache_name: Arc<str> = job.output_name.as_str().into();
-            match SstableReader::open_with_cache(
-                &*self.factory,
-                output_path,
-                IoPriority::QueryRead,
-                Some(self.block_cache.clone()),
-            )
-            .await
-            {
-                Ok(reader) => {
-                    let reader = Arc::new(reader);
-                    let _ = reader.eager_load_blocks().await;
-                    self.reader_cache.write().insert(cache_name, reader);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to cache compaction output reader");
-                }
-            }
+        // Cache the new compaction output reader
+        if new_file.is_some() {
+            self.cache_compaction_output(&job.output_path, &job.output_name)
+                .await;
         }
 
-        // Phase 3: Brief write lock to finalize manifest
+        // Finalize manifest
         {
             let mut manifest = self.manifest.write();
             finalize_l0_compaction(&mut manifest, &job, new_file)?;
         }
 
         Ok(())
+    }
+
+    /// Cascading L1+→L2+ compaction (guarded by level_compaction_mutex)
+    ///
+    /// Checks L1, L2, L3 in order and compacts any level that exceeds its
+    /// size threshold. After each compaction, re-checks higher levels since
+    /// the output may have pushed them over their threshold.
+    async fn maybe_compact_levels(&self) -> StorageResult<()> {
+        let _guard = self.level_compaction_mutex.lock().await;
+
+        // Check levels 1, 2, 3 for compaction needs
+        for level in 1..4u32 {
+            let job = {
+                let mut manifest = self.manifest.write();
+                prepare_level_compaction(&mut manifest, level)
+            };
+
+            let job = match job {
+                Some(j) => j,
+                None => continue,
+            };
+
+            tracing::debug!(
+                source = level,
+                target = level + 1,
+                source_files = job.source_files.len(),
+                target_files = job.target_files.len(),
+                "Starting level compaction"
+            );
+
+            let new_file = execute_level_compaction(&*self.factory, &job).await?;
+
+            // Invalidate caches for removed SSTables
+            {
+                let mut rc = self.reader_cache.write();
+                for f in &job.source_files {
+                    self.block_cache.invalidate_sstable(&f.name);
+                    rc.remove(f.name.as_str());
+                }
+                for f in &job.target_files {
+                    self.block_cache.invalidate_sstable(&f.name);
+                    rc.remove(f.name.as_str());
+                }
+            }
+
+            if new_file.is_some() {
+                self.cache_compaction_output(&job.output_path, &job.output_name)
+                    .await;
+            }
+
+            {
+                let mut manifest = self.manifest.write();
+                finalize_level_compaction(&mut manifest, &job, new_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Open and cache a compaction output SSTable reader
+    async fn cache_compaction_output(&self, path: &std::path::Path, name: &str) {
+        let cache_name: Arc<str> = name.into();
+        match SstableReader::open_with_cache(
+            &*self.factory,
+            path,
+            IoPriority::QueryRead,
+            Some(self.block_cache.clone()),
+        )
+        .await
+        {
+            Ok(reader) => {
+                let reader = Arc::new(reader);
+                let _ = reader.eager_load_blocks().await;
+                self.reader_cache.write().insert(cache_name, reader);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to cache compaction output reader");
+            }
+        }
     }
 
     /// Read from all levels (memtable, imm memtables, SSTables)
