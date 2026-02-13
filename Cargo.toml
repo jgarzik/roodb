@@ -47,6 +47,9 @@ bytes = "1.0"
 # Synchronization primitives
 parking_lot = "0.12"
 
+# Lock-free concurrent skip list (memtable)
+crossbeam-skiplist = "0.1"
+
 # Compression
 lz4_flex = "0.11"
 
