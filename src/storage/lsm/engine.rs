@@ -12,26 +12,40 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::lsm::block_cache::{BlockCache, DEFAULT_CACHE_CAPACITY};
+use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::compaction::{
-    execute_l0_compaction, finalize_l0_compaction, needs_l0_compaction, prepare_l0_compaction,
+    execute_l0_compaction, execute_level_compaction, finalize_l0_compaction,
+    finalize_level_compaction, needs_l0_compaction, prepare_l0_compaction,
+    prepare_level_compaction,
 };
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
+use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 use crate::storage::traits::{KeyValue, StorageEngine};
+
+/// Default total memory budget: 128MB (block cache + memtables share this pool)
+pub const DEFAULT_TOTAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Minimum block cache size to prevent starvation under heavy write pressure
+const MIN_BLOCK_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 /// LSM-Tree storage engine configuration
 #[derive(Debug, Clone)]
 pub struct LsmConfig {
     /// Data directory
     pub dir: PathBuf,
+    /// Unified memory budget shared between block cache and memtables.
+    /// Block cache capacity is dynamically adjusted based on memtable pressure.
+    /// Memtable flush threshold is derived as `total_cache_bytes / 2`.
+    pub total_cache_bytes: usize,
 }
 
 impl Default for LsmConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("data"),
+            total_cache_bytes: DEFAULT_TOTAL_CACHE_BYTES,
         }
     }
 }
@@ -45,9 +59,14 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     imm_memtables: RwLock<Vec<Arc<Memtable>>>,
     /// Manifest for SSTable tracking (RwLock: readers concurrent, writers exclusive)
     manifest: RwLock<Manifest>,
-    /// Compaction serialization - prevents concurrent compactions from racing
-    /// on file deletion. Separate from manifest lock to allow reads during compaction.
-    compaction_mutex: TokioMutex<()>,
+    /// L0→L1 compaction mutex. Separate from level_compaction_mutex to allow
+    /// L0→L1 and L1+→L2+ compactions to run concurrently.
+    l0_compaction_mutex: TokioMutex<()>,
+    /// L1+→L2+ compaction mutex. Serializes higher-level compactions to prevent
+    /// adjacent-level races (e.g., L1→L2 and L2→L3 sharing L2 files).
+    level_compaction_mutex: TokioMutex<()>,
+    /// Unified memory budget for block cache + memtables
+    total_cache_bytes: usize,
     /// LRU block cache shared across all SSTable reads
     block_cache: Arc<BlockCache>,
     /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
@@ -66,7 +85,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         // Open manifest
         let manifest = Manifest::open(&config.dir)?;
-        let block_cache = Arc::new(BlockCache::new(DEFAULT_CACHE_CAPACITY));
+        let total_cache_bytes = config.total_cache_bytes;
+        // Memtable starts empty, so full budget goes to block cache
+        let block_cache = Arc::new(BlockCache::new(total_cache_bytes));
 
         // Warmup: open readers for all existing SSTables and eager-load blocks
         let mut reader_map: HashMap<Arc<str>, Arc<SstableReader<IO>>> = HashMap::new();
@@ -84,8 +105,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 {
                     Ok(reader) => {
                         let reader = Arc::new(reader);
-                        // Eager-load blocks for small SSTables (< 16MB)
-                        if info.size < (DEFAULT_CACHE_CAPACITY / 4) as u64 {
+                        // Eager-load blocks for small SSTables (< 25% of budget)
+                        if info.size < (total_cache_bytes / 4) as u64 {
                             let _ = reader.eager_load_blocks().await;
                         }
                         reader_map.insert(cache_name, reader);
@@ -102,7 +123,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             memtable: RwLock::new(Arc::new(Memtable::new())),
             imm_memtables: RwLock::new(Vec::new()),
             manifest: RwLock::new(manifest),
-            compaction_mutex: TokioMutex::new(()),
+            l0_compaction_mutex: TokioMutex::new(()),
+            level_compaction_mutex: TokioMutex::new(()),
+            total_cache_bytes,
             block_cache,
             reader_cache: RwLock::new(reader_map),
             closed: AtomicBool::new(false),
@@ -202,38 +225,38 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         Ok(())
     }
 
-    /// Trigger compaction if needed
+    /// Trigger compaction if needed (L0→L1 + cascading L1+→L2+).
     ///
-    /// # Locking
-    /// Uses split-phase locking to minimize manifest lock contention:
-    /// 1. Acquire compaction_mutex to serialize compactions (prevents file deletion races)
-    /// 2. Brief manifest lock to check if compaction needed and gather job info
-    /// 3. Release manifest lock during expensive I/O operations
-    /// 4. Re-acquire manifest lock to finalize manifest updates
-    ///
-    /// The compaction_mutex ensures only one compaction runs at a time, preventing
-    /// races where one compaction deletes files another is about to read.
-    /// The manifest lock is released during I/O to allow concurrent reads.
+    /// Uses two independent mutexes so L0→L1 and L1+→L2+ compactions can run
+    /// concurrently. Each uses split-phase locking on the manifest to minimize
+    /// contention.
     async fn maybe_compact(&self) -> StorageResult<()> {
-        // Serialize compactions to prevent file deletion races
-        let _compaction_guard = self.compaction_mutex.lock().await;
+        // Run L0→L1 compaction under its own mutex
+        self.maybe_compact_l0().await?;
 
-        // Phase 1: Brief manifest write lock to check and prepare compaction job
+        // Cascade: check L1→L2, L2→L3 under the level mutex
+        self.maybe_compact_levels().await?;
+
+        Ok(())
+    }
+
+    /// L0→L1 compaction (guarded by l0_compaction_mutex)
+    async fn maybe_compact_l0(&self) -> StorageResult<()> {
+        let _guard = self.l0_compaction_mutex.lock().await;
+
         let job = {
             let mut manifest = self.manifest.write();
             prepare_l0_compaction(&mut manifest)
         };
 
-        // If no compaction needed, we're done
         let job = match job {
             Some(j) => j,
             None => return Ok(()),
         };
 
-        // Phase 2: Execute I/O without holding manifest lock (but with compaction_mutex)
         let new_file = execute_l0_compaction(&*self.factory, &job).await?;
 
-        // Invalidate block cache and reader cache for SSTables being removed
+        // Invalidate caches for removed SSTables
         {
             let mut rc = self.reader_cache.write();
             for f in &job.l0_files {
@@ -246,36 +269,118 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             }
         }
 
-        // Write-through: open reader for new compaction output and eager-load (async, outside manifest lock)
-        if let Some(ref _nf) = new_file {
-            let output_path = &job.output_path;
-            let cache_name: Arc<str> = job.output_name.as_str().into();
-            match SstableReader::open_with_cache(
-                &*self.factory,
-                output_path,
-                IoPriority::QueryRead,
-                Some(self.block_cache.clone()),
-            )
-            .await
-            {
-                Ok(reader) => {
-                    let reader = Arc::new(reader);
-                    let _ = reader.eager_load_blocks().await;
-                    self.reader_cache.write().insert(cache_name, reader);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to cache compaction output reader");
-                }
-            }
+        // Cache the new compaction output reader
+        if new_file.is_some() {
+            self.cache_compaction_output(&job.output_path, &job.output_name)
+                .await;
         }
 
-        // Phase 3: Brief write lock to finalize manifest
+        // Finalize manifest
         {
             let mut manifest = self.manifest.write();
             finalize_l0_compaction(&mut manifest, &job, new_file)?;
         }
 
         Ok(())
+    }
+
+    /// Cascading L1+→L2+ compaction (guarded by level_compaction_mutex)
+    ///
+    /// Checks L1, L2, L3 in order and compacts any level that exceeds its
+    /// size threshold. After each compaction, re-checks higher levels since
+    /// the output may have pushed them over their threshold.
+    async fn maybe_compact_levels(&self) -> StorageResult<()> {
+        let _guard = self.level_compaction_mutex.lock().await;
+
+        // Check levels 1, 2, 3 for compaction needs
+        for level in 1..4u32 {
+            let job = {
+                let mut manifest = self.manifest.write();
+                prepare_level_compaction(&mut manifest, level)
+            };
+
+            let job = match job {
+                Some(j) => j,
+                None => continue,
+            };
+
+            tracing::debug!(
+                source = level,
+                target = level + 1,
+                source_files = job.source_files.len(),
+                target_files = job.target_files.len(),
+                "Starting level compaction"
+            );
+
+            let new_file = execute_level_compaction(&*self.factory, &job).await?;
+
+            // Invalidate caches for removed SSTables
+            {
+                let mut rc = self.reader_cache.write();
+                for f in &job.source_files {
+                    self.block_cache.invalidate_sstable(&f.name);
+                    rc.remove(f.name.as_str());
+                }
+                for f in &job.target_files {
+                    self.block_cache.invalidate_sstable(&f.name);
+                    rc.remove(f.name.as_str());
+                }
+            }
+
+            if new_file.is_some() {
+                self.cache_compaction_output(&job.output_path, &job.output_name)
+                    .await;
+            }
+
+            {
+                let mut manifest = self.manifest.write();
+                finalize_level_compaction(&mut manifest, &job, new_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Open and cache a compaction output SSTable reader
+    async fn cache_compaction_output(&self, path: &std::path::Path, name: &str) {
+        let cache_name: Arc<str> = name.into();
+        match SstableReader::open_with_cache(
+            &*self.factory,
+            path,
+            IoPriority::QueryRead,
+            Some(self.block_cache.clone()),
+        )
+        .await
+        {
+            Ok(reader) => {
+                let reader = Arc::new(reader);
+                let _ = reader.eager_load_blocks().await;
+                self.reader_cache.write().insert(cache_name, reader);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to cache compaction output reader");
+            }
+        }
+    }
+
+    /// Current block cache capacity in bytes (for testing/observability).
+    pub fn block_cache_capacity(&self) -> usize {
+        self.block_cache.capacity()
+    }
+
+    /// Rebalance block cache capacity based on current memtable pressure.
+    ///
+    /// Gives block cache all remaining budget after subtracting active + immutable
+    /// memtable sizes, with a minimum floor to prevent starvation.
+    fn rebalance_cache(&self) {
+        let mem_size = self.memtable.read().size();
+        let imm_size: usize = self.imm_memtables.read().iter().map(|m| m.size()).sum();
+        let mem_total = mem_size + imm_size;
+        let new_cap = self
+            .total_cache_bytes
+            .saturating_sub(mem_total)
+            .max(MIN_BLOCK_CACHE_BYTES);
+        self.block_cache.set_capacity(new_cap);
     }
 
     /// Read from all levels (memtable, imm memtables, SSTables)
@@ -391,14 +496,15 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
         let current_mem = Arc::clone(&*self.memtable.read());
         current_mem.put(key, value);
 
-        // Check if memtable needs flushing
-        if current_mem.should_flush() {
+        // Check if memtable needs flushing (threshold = half of total budget)
+        let flush_threshold = self.total_cache_bytes / 2;
+        if current_mem.size() >= flush_threshold {
             // Rotate memtable: create new one and move old to immutables
             let new_mem = Arc::new(Memtable::new());
             {
                 let mut mem_guard = self.memtable.write();
                 // Only rotate if we're still looking at the same memtable.
-                // Another thread may have already rotated between our should_flush check
+                // Another thread may have already rotated between our size check
                 // and acquiring this write lock.
                 if Arc::ptr_eq(&current_mem, &*mem_guard) {
                     let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
@@ -407,6 +513,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                 }
                 // If not the same, another thread already rotated - nothing to do
             }
+            self.rebalance_cache();
             // Note: Flush happens in background or on explicit flush() call
         }
 
@@ -493,47 +600,25 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
         let lock_ns = t_start.elapsed().as_nanos() as u64;
 
-        // Collect entries from all sources — lock-free from here
-        let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
+        // K-way merge: each source is pre-sorted, merge via min-heap
+        let mut merger = MergeIterator::new();
 
-        // Add from active memtable snapshot (source 0 = newest)
-        for (key, value) in memtable_snapshot.scan(start, end) {
-            all_entries.push((key, value, 0));
-        }
+        // Active memtable (priority 0 = newest)
+        merger.add(memtable_snapshot.scan(start, end), 0);
 
-        // Add from immutable memtables snapshot
+        // Immutable memtables (priorities 1, 2, ... — newest first)
         for (idx, mem) in imm_snapshot.iter().rev().enumerate() {
-            for (key, value) in mem.scan(start, end) {
-                all_entries.push((key, value, idx + 1));
-            }
+            merger.add(mem.scan(start, end), idx + 1);
         }
 
-        // Add from SSTables (using pre-resolved readers, no lock needed)
+        // SSTables (using pre-resolved readers, no lock needed)
         for (reader, source_idx) in &readers {
-            for (key, value) in reader.scan_range_batched(start, end).await? {
-                all_entries.push((key, value, *source_idx));
-            }
+            let entries = reader.scan_range_batched(start, end).await?;
+            merger.add(entries, *source_idx);
         }
 
-        // Sort by key, then source (newer first)
-        all_entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
-            other => other,
-        });
-
-        // Deduplicate: keep newest version of each key, skip tombstones
-        // Use swap-ownership to avoid key.clone()
-        let mut result: Vec<KeyValue> = Vec::new();
-        let mut last_key: Option<Vec<u8>> = None;
-
-        for (key, value, _) in all_entries {
-            if last_key.as_ref() != Some(&key) {
-                if let Some(v) = value {
-                    result.push((key.clone(), v));
-                }
-                last_key = Some(key);
-            }
-        }
+        // Merge, dedup, and strip tombstones in O(n log k)
+        let result: Vec<KeyValue> = merger.merge_live();
 
         let io_ns = t_start.elapsed().as_nanos() as u64 - lock_ns;
         tracing::debug!(
@@ -586,6 +671,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         Ok(())
@@ -631,6 +717,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         Ok(())
@@ -668,6 +755,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         self.closed.store(true, Ordering::SeqCst);

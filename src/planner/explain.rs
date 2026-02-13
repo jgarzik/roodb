@@ -113,6 +113,36 @@ impl ExplainOutput {
                 Self::format_node(right, indent + 2, out);
             }
 
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+                condition,
+            } => {
+                let keys: Vec<_> = left_keys
+                    .iter()
+                    .zip(right_keys.iter())
+                    .map(|(l, r)| format!("L{} = R{}", l, r))
+                    .collect();
+                writeln!(
+                    out,
+                    "{}HashJoin: {:?} on [{}]",
+                    prefix,
+                    join_type,
+                    keys.join(", ")
+                )
+                .unwrap();
+                if let Some(cond) = condition {
+                    writeln!(out, "{}  remaining: {:?}", prefix, cond).unwrap();
+                }
+                writeln!(out, "{}  left:", prefix).unwrap();
+                Self::format_node(left, indent + 2, out);
+                writeln!(out, "{}  right:", prefix).unwrap();
+                Self::format_node(right, indent + 2, out);
+            }
+
             PhysicalPlan::HashAggregate {
                 input,
                 group_by,

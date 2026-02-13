@@ -123,6 +123,9 @@ fn log_key_end() -> Vec<u8> {
 ///   This ensures that when get_log_state() reports log entry N exists, any subsequent
 ///   try_get_log_entries() will find it. Required because LsmRaftStorage is Clone with
 ///   shared state, but OpenRaft's `&mut self` methods imply serialized access.
+///   **Not held by snapshot operations** (`build_snapshot`, `get_current_snapshot`):
+///   snapshots only read non-Raft-prefixed keys (user data), log operations only touch
+///   Raft-prefixed keys, and OpenRaft serializes state machine operations.
 /// - `catalog` - Schema metadata. Acquired briefly during apply() for DDL changes.
 ///   Never held during storage I/O operations.
 /// - `cached_*` - In-memory caches for Raft state. Each is updated independently
@@ -1213,10 +1216,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
-        // Serialize with log operations to ensure snapshot reflects a consistent state.
-        // Without this, concurrent log operations could modify state while we're reading,
-        // leading to snapshots that don't match any valid point in time.
-        let _lock = self.log_mutex.lock().await;
+        // No log_mutex needed: see build_snapshot() comment for rationale.
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
@@ -1260,15 +1260,14 @@ const RAFT_PREFIX: &[u8] = b"_raft:";
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
-        // Serialize with log operations to ensure snapshot reflects a consistent state.
-        // Without this, concurrent log operations could modify state while we're reading,
-        // leading to snapshots that don't match any valid point in time.
-        let _lock = self.log_mutex.lock().await;
+        // No log_mutex needed: snapshots read only non-Raft-prefixed keys (user data),
+        // while log operations only touch Raft-prefixed keys. OpenRaft serializes all
+        // state machine operations, so no concurrent apply() can modify user data.
+        // No flush needed: LSM scan reads from active memtable + immutable memtables +
+        // SSTables, so all applied data is visible in the snapshot. Memtable data may be
+        // lost on crash before flush — Raft's log provides durability, not the snapshot.
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
-
-        // Flush storage to ensure all data is persisted
-        self.storage.flush().await.map_err(write_err)?;
 
         // Scan all user data (exclude Raft metadata keys)
         let all_data = self.storage.scan(None, None).await.map_err(read_err)?;

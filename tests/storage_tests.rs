@@ -236,7 +236,10 @@ async fn test_lsm_put_get() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(PosixIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
 
@@ -263,7 +266,10 @@ async fn test_lsm_delete() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(PosixIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
 
@@ -283,7 +289,10 @@ async fn test_lsm_scan() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(PosixIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
 
@@ -313,7 +322,10 @@ async fn test_lsm_flush() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(PosixIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
 
@@ -341,7 +353,10 @@ async fn test_lsm_recovery() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(PosixIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     // Write and flush
     {
@@ -388,7 +403,10 @@ async fn test_uring_lsm_basic() {
     cleanup_dir(&dir);
 
     let factory = Arc::new(UringIOFactory);
-    let config = LsmConfig { dir: dir.clone() };
+    let config = LsmConfig {
+        dir: dir.clone(),
+        ..Default::default()
+    };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
 
@@ -443,5 +461,80 @@ async fn test_uring_sstable_write_read() {
         assert_eq!(all.len(), 100);
     }
 
+    cleanup_dir(&dir);
+}
+
+// ============ Memory Budget Tests ============
+
+#[tokio::test]
+async fn test_lsm_memory_budget() {
+    let dir = test_dir("lsm_memory_budget");
+    cleanup_dir(&dir);
+
+    let factory = Arc::new(PosixIOFactory);
+    // Small budget: 1MB total → flush threshold = 512KB
+    let config = LsmConfig {
+        dir: dir.clone(),
+        total_cache_bytes: 1024 * 1024,
+    };
+
+    let engine = LsmEngine::open(factory, config).await.unwrap();
+
+    // Write enough data to trigger at least one flush (~600KB of 1KB values)
+    for i in 0..600u32 {
+        let key = format!("key{:06}", i);
+        let value = vec![i as u8; 1024]; // 1KB values
+        engine.put(key.as_bytes(), &value).await.unwrap();
+    }
+
+    // Explicit flush to ensure all data is persisted
+    engine.flush().await.unwrap();
+
+    // Verify data survives round-trip
+    for i in (0..600u32).step_by(100) {
+        let key = format!("key{:06}", i);
+        let result = engine.get(key.as_bytes()).await.unwrap();
+        assert!(result.is_some(), "key {} missing after flush", key);
+    }
+
+    engine.close().await.unwrap();
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn test_lsm_custom_budget() {
+    let dir = test_dir("lsm_custom_budget");
+    cleanup_dir(&dir);
+
+    let factory = Arc::new(PosixIOFactory);
+    // 8MB budget → flush threshold = 4MB
+    let budget = 8 * 1024 * 1024;
+    let config = LsmConfig {
+        dir: dir.clone(),
+        total_cache_bytes: budget,
+    };
+
+    let engine = LsmEngine::open(factory, config).await.unwrap();
+
+    // Write enough to trigger flush (threshold = 4MB, ~5000 x 1KB = ~5MB)
+    for i in 0..5000u32 {
+        let key = format!("key{:06}", i);
+        let value = vec![i as u8; 1024];
+        engine.put(key.as_bytes(), &value).await.unwrap();
+    }
+
+    engine.flush().await.unwrap();
+
+    // After flush, all memtable memory is freed → block cache should get full budget
+    let block_cache_cap = engine.block_cache_capacity();
+    assert_eq!(block_cache_cap, budget);
+
+    // Data integrity check
+    let result = engine.get(b"key000000").await.unwrap();
+    assert!(result.is_some());
+    let result = engine.get(b"key004999").await.unwrap();
+    assert!(result.is_some());
+
+    engine.close().await.unwrap();
     cleanup_dir(&dir);
 }

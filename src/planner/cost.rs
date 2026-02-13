@@ -89,6 +89,18 @@ impl CostEstimator {
                 }
             }
 
+            PhysicalPlan::HashJoin { left, right, .. } => {
+                let left_cost = Self::estimate_node(left);
+                let right_cost = Self::estimate_node(right);
+                let rows = left_cost.rows * right_cost.rows * Self::DEFAULT_SELECTIVITY;
+                Cost {
+                    rows,
+                    // Hash join: build hash table O(right) + probe O(left)
+                    cpu: left_cost.cpu + right_cost.cpu + left_cost.rows + right_cost.rows,
+                    io: left_cost.io + right_cost.io,
+                }
+            }
+
             PhysicalPlan::HashAggregate { input, .. } => {
                 let input_cost = Self::estimate_node(input);
                 // Assume ~10% of rows are unique groups

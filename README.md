@@ -1,24 +1,34 @@
 # RooDB
 
-A highly available, high performance, easy to use distributed SQL database.
+The fastest SQL database on a single machine.
+
+RooDB is built to extract every last drop of performance from modern
+multi-core CPUs and high-speed storage devices (NVMe SSDs, Optane).
+On single-node and leader-replica configurations, nothing should be faster.
 
 ## Goals
 
-* A general SQL database that is fast out-of-the-box for everyone
-* General purpose, Highly available, Self-tuning
-* Single node or multi-node (leader+replicas) configurations
-* Near-zero config
+* **Maximum single-node throughput** — saturate all cores and I/O bandwidth with lock-free data structures, io_uring, and a unified memory budget that adapts to workload in real time
+* **General purpose SQL** — not a niche engine; a real database for real workloads, fast out-of-the-box without tuning
+* **High availability** — optional Raft replication across leader + replicas, with reads served locally
+* **Near-zero config** — self-tuning defaults that just work; no knob-turning required
 
-roodb should be high performance for all but the most massive,
-sharded-cluster workloads.
+## Why RooDB?
+
+Most SQL databases were designed in an era of slow disks and single-core CPUs.
+RooDB is designed from scratch for today's hardware: dozens of cores, millions
+of IOPS from NVMe, and kernel-bypass I/O via io_uring. The result is a database
+that keeps the hardware busy instead of waiting on locks and syscalls.
 
 ## Features
 
-- **Raft Consensus**: Distributed replication via OpenRaft for high availability
-- **LSM Storage Engine**
-- **SQL Support**: Parser (sqlparser-rs), query planner with optimizer, Volcano-style executor
-- **Cross-Platform I/O**: io_uring on Linux, async POSIX fallback on other platforms
-- **MySQL-Compatible Protocol**: Connect using standard `mysql` CLI or any MySQL client library (TLS required)
+- **io_uring I/O** — zero-copy, kernel-bypass I/O on Linux; async POSIX fallback elsewhere
+- **Lock-free memtable** — concurrent skip list for zero-contention writes
+- **Unified memory budget** — block cache and memtables share a single adaptive pool
+- **LSM storage engine** — write-optimized with cascading compaction
+- **Raft consensus** — distributed replication via OpenRaft for high availability
+- **Full SQL** — parser, query planner with optimizer, Volcano-style executor
+- **MySQL-compatible protocol** — connect with `mysql` CLI or any MySQL client library (TLS required)
 
 ## Quick Start
 

@@ -64,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize storage engine
     let io_factory = Arc::new(scheduled_io_factory());
-    let storage_config = LsmConfig { dir: data_dir };
+    let storage_config = LsmConfig {
+        dir: data_dir,
+        ..Default::default()
+    };
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io_factory, storage_config).await?);
 

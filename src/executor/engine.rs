@@ -19,6 +19,7 @@ use super::delete::Delete;
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
 use super::filter::Filter;
+use super::hash_join::HashJoin;
 use super::insert::Insert;
 use super::join::NestedLoopJoin;
 use super::limit::Limit;
@@ -151,6 +152,31 @@ impl ExecutorEngine {
                     left_exec,
                     right_exec,
                     join_type,
+                    condition,
+                    left_width,
+                    right_width,
+                )))
+            }
+
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+                condition,
+            } => {
+                let left_width = left.output_columns().len();
+                let right_width = right.output_columns().len();
+
+                let left_exec = self.build_node(*left)?;
+                let right_exec = self.build_node(*right)?;
+                Ok(Box::new(HashJoin::new(
+                    left_exec,
+                    right_exec,
+                    join_type,
+                    left_keys,
+                    right_keys,
                     condition,
                     left_width,
                     right_width,

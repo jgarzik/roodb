@@ -13,6 +13,7 @@ pub mod compaction;
 pub mod engine;
 pub mod manifest;
 pub mod memtable;
+pub mod merge_iter;
 pub mod sstable;
 
 pub use engine::{LsmConfig, LsmEngine};
