@@ -11,6 +11,7 @@ use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::StorageResult;
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
+use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 
 /// Maximum files in L0 before compaction triggers
@@ -112,36 +113,17 @@ pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     factory: &F,
     job: &L0CompactionJob,
 ) -> StorageResult<Option<SstableInfo>> {
-    // Load all entries from all files
-    let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
+    // K-way merge: each SSTable is a pre-sorted source
+    let mut merger = MergeIterator::new();
 
     for (idx, path) in job.input_paths.iter().enumerate() {
         let reader = SstableReader::open(factory, path, IoPriority::Compaction).await?;
         let entries = reader.scan().await?;
-        for (key, value) in entries {
-            all_entries.push((key, value, idx));
-        }
+        merger.add(entries, idx);
     }
 
-    // Sort by key, then by source index (lower = newer)
-    all_entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-        std::cmp::Ordering::Equal => a.2.cmp(&b.2),
-        other => other,
-    });
-
-    // Deduplicate: keep only the first (newest) entry for each key
-    let mut deduped: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    let mut last_key: Option<Vec<u8>> = None;
-
-    for (key, value, _idx) in all_entries {
-        if last_key.as_ref() != Some(&key) {
-            // Skip tombstones during compaction (they're cleaned up)
-            if value.is_some() {
-                deduped.push((key.clone(), value));
-            }
-            last_key = Some(key);
-        }
-    }
+    // Merge, dedup, and strip tombstones in O(n log k)
+    let deduped = merger.merge_live();
 
     // If all entries were tombstones, don't create an empty SSTable
     if deduped.is_empty() {
@@ -153,7 +135,7 @@ pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
 
     for (key, value) in &deduped {
-        writer.add(key.clone(), value.clone()).await?;
+        writer.add(key.clone(), Some(value.clone())).await?;
     }
 
     writer.finish().await?;

@@ -18,6 +18,7 @@ use crate::storage::lsm::compaction::{
 };
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
+use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 use crate::storage::traits::{KeyValue, StorageEngine};
 
@@ -493,47 +494,25 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
 
         let lock_ns = t_start.elapsed().as_nanos() as u64;
 
-        // Collect entries from all sources — lock-free from here
-        let mut all_entries: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
+        // K-way merge: each source is pre-sorted, merge via min-heap
+        let mut merger = MergeIterator::new();
 
-        // Add from active memtable snapshot (source 0 = newest)
-        for (key, value) in memtable_snapshot.scan(start, end) {
-            all_entries.push((key, value, 0));
-        }
+        // Active memtable (priority 0 = newest)
+        merger.add(memtable_snapshot.scan(start, end), 0);
 
-        // Add from immutable memtables snapshot
+        // Immutable memtables (priorities 1, 2, ... — newest first)
         for (idx, mem) in imm_snapshot.iter().rev().enumerate() {
-            for (key, value) in mem.scan(start, end) {
-                all_entries.push((key, value, idx + 1));
-            }
+            merger.add(mem.scan(start, end), idx + 1);
         }
 
-        // Add from SSTables (using pre-resolved readers, no lock needed)
+        // SSTables (using pre-resolved readers, no lock needed)
         for (reader, source_idx) in &readers {
-            for (key, value) in reader.scan_range_batched(start, end).await? {
-                all_entries.push((key, value, *source_idx));
-            }
+            let entries = reader.scan_range_batched(start, end).await?;
+            merger.add(entries, *source_idx);
         }
 
-        // Sort by key, then source (newer first)
-        all_entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
-            other => other,
-        });
-
-        // Deduplicate: keep newest version of each key, skip tombstones
-        // Use swap-ownership to avoid key.clone()
-        let mut result: Vec<KeyValue> = Vec::new();
-        let mut last_key: Option<Vec<u8>> = None;
-
-        for (key, value, _) in all_entries {
-            if last_key.as_ref() != Some(&key) {
-                if let Some(v) = value {
-                    result.push((key.clone(), v));
-                }
-                last_key = Some(key);
-            }
-        }
+        // Merge, dedup, and strip tombstones in O(n log k)
+        let result: Vec<KeyValue> = merger.merge_live();
 
         let io_ns = t_start.elapsed().as_nanos() as u64 - lock_ns;
         tracing::debug!(
