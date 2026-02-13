@@ -281,10 +281,7 @@ mod tests {
     fn test_many_sources() {
         let mut m = MergeIterator::new();
         for i in 0..10u8 {
-            m.add(
-                vec![(vec![i], Some(vec![i]))],
-                i as usize,
-            );
+            m.add(vec![(vec![i], Some(vec![i]))], i as usize);
         }
         let result = m.merge_live();
         assert_eq!(result.len(), 10);

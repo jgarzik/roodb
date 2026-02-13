@@ -222,10 +222,7 @@ pub fn prepare_level_compaction(manifest: &mut Manifest, level: u32) -> Option<L
     }
 
     // Pick the largest file (most compaction benefit)
-    let source_file = source_files_all
-        .iter()
-        .max_by_key(|f| f.size)?
-        .clone();
+    let source_file = source_files_all.iter().max_by_key(|f| f.size)?.clone();
     let source_files = vec![source_file.clone()];
 
     // Find overlapping files in target level
@@ -233,7 +230,14 @@ pub fn prepare_level_compaction(manifest: &mut Manifest, level: u32) -> Option<L
     let target_files: Vec<_> = manifest
         .get_level(target_level)
         .iter()
-        .filter(|f| ranges_overlap(&f.min_key, &f.max_key, &source_file.min_key, &source_file.max_key))
+        .filter(|f| {
+            ranges_overlap(
+                &f.min_key,
+                &f.max_key,
+                &source_file.min_key,
+                &source_file.max_key,
+            )
+        })
         .cloned()
         .collect();
 

@@ -135,11 +135,7 @@ impl Executor for HashJoin {
         self.current_left = self.left.next().await?;
         if let Some(ref left_row) = self.current_left {
             let key = Self::extract_key(left_row, &self.left_keys);
-            self.current_matches = self
-                .hash_table
-                .get(&key)
-                .cloned()
-                .unwrap_or_default();
+            self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
         }
         self.match_pos = 0;
         self.left_matched = false;
@@ -179,9 +175,7 @@ impl Executor for HashJoin {
 
                 // No more matches for this left row
                 // For left/full outer join, emit unmatched left row with NULL right
-                if !self.left_matched
-                    && matches!(self.join_type, JoinType::Left | JoinType::Full)
-                {
+                if !self.left_matched && matches!(self.join_type, JoinType::Left | JoinType::Full) {
                     let null_right = Self::null_row(self.right_width);
                     let combined = Row::concat_ref(&left_row, &null_right);
 
@@ -189,11 +183,8 @@ impl Executor for HashJoin {
                     self.current_left = self.left.next().await?;
                     if let Some(ref lr) = self.current_left {
                         let key = Self::extract_key(lr, &self.left_keys);
-                        self.current_matches = self
-                            .hash_table
-                            .get(&key)
-                            .cloned()
-                            .unwrap_or_default();
+                        self.current_matches =
+                            self.hash_table.get(&key).cloned().unwrap_or_default();
                     }
                     self.match_pos = 0;
                     self.left_matched = false;
@@ -205,11 +196,7 @@ impl Executor for HashJoin {
                 self.current_left = self.left.next().await?;
                 if let Some(ref lr) = self.current_left {
                     let key = Self::extract_key(lr, &self.left_keys);
-                    self.current_matches = self
-                        .hash_table
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default();
+                    self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
                 }
                 self.match_pos = 0;
                 self.left_matched = false;
@@ -297,10 +284,11 @@ mod tests {
             left,
             right,
             JoinType::Inner,
-            vec![0],    // left key: col 0
-            vec![0],    // right key: col 0
+            vec![0], // left key: col 0
+            vec![0], // right key: col 0
             None,
-            2, 2,
+            2,
+            2,
         );
         join.open().await.unwrap();
 
@@ -326,13 +314,7 @@ mod tests {
             Row::new(vec![Datum::Int(2), Datum::String("b".into())]),
         ]);
 
-        let mut join = HashJoin::new(
-            left, right,
-            JoinType::Left,
-            vec![0], vec![0],
-            None,
-            1, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Left, vec![0], vec![0], None, 1, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -362,13 +344,7 @@ mod tests {
             Row::new(vec![Datum::Int(3), Datum::String("c".into())]), // no match
         ]);
 
-        let mut join = HashJoin::new(
-            left, right,
-            JoinType::Right,
-            vec![0], vec![0],
-            None,
-            1, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Right, vec![0], vec![0], None, 1, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -391,13 +367,7 @@ mod tests {
             Row::new(vec![Datum::Int(2), Datum::String("b".into())]), // no match on left
         ]);
 
-        let mut join = HashJoin::new(
-            left, right,
-            JoinType::Full,
-            vec![0], vec![0],
-            None,
-            1, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Full, vec![0], vec![0], None, 1, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -418,9 +388,7 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::Int(10)]),
             Row::new(vec![Datum::Int(1), Datum::Int(5)]),
         ]);
-        let right = mock(vec![
-            Row::new(vec![Datum::Int(1), Datum::Int(7)]),
-        ]);
+        let right = mock(vec![Row::new(vec![Datum::Int(1), Datum::Int(7)])]);
 
         // Remaining condition: combined col 1 (left.val) > combined col 3 (right.threshold)
         let remaining = ResolvedExpr::BinaryOp {
@@ -443,11 +411,14 @@ mod tests {
         };
 
         let mut join = HashJoin::new(
-            left, right,
+            left,
+            right,
             JoinType::Inner,
-            vec![0], vec![0],
+            vec![0],
+            vec![0],
             Some(remaining),
-            2, 2,
+            2,
+            2,
         );
         join.open().await.unwrap();
 
@@ -465,18 +436,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_join_empty_right() {
-        let left = mock(vec![
-            Row::new(vec![Datum::Int(1)]),
-        ]);
+        let left = mock(vec![Row::new(vec![Datum::Int(1)])]);
         let right = mock(vec![]);
 
-        let mut join = HashJoin::new(
-            left, right,
-            JoinType::Inner,
-            vec![0], vec![0],
-            None,
-            1, 1,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 1, 1);
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -490,17 +453,9 @@ mod tests {
     #[tokio::test]
     async fn test_hash_join_empty_left() {
         let left = mock(vec![]);
-        let right = mock(vec![
-            Row::new(vec![Datum::Int(1)]),
-        ]);
+        let right = mock(vec![Row::new(vec![Datum::Int(1)])]);
 
-        let mut join = HashJoin::new(
-            left, right,
-            JoinType::Inner,
-            vec![0], vec![0],
-            None,
-            1, 1,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 1, 1);
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -519,17 +474,27 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("b".into())]),
         ]);
         let right = mock(vec![
-            Row::new(vec![Datum::Int(1), Datum::String("a".into()), Datum::Int(100)]),
-            Row::new(vec![Datum::Int(1), Datum::String("b".into()), Datum::Int(200)]),
+            Row::new(vec![
+                Datum::Int(1),
+                Datum::String("a".into()),
+                Datum::Int(100),
+            ]),
+            Row::new(vec![
+                Datum::Int(1),
+                Datum::String("b".into()),
+                Datum::Int(200),
+            ]),
         ]);
 
         let mut join = HashJoin::new(
-            left, right,
+            left,
+            right,
             JoinType::Inner,
             vec![0, 1], // left keys
             vec![0, 1], // right keys
             None,
-            2, 3,
+            2,
+            3,
         );
         join.open().await.unwrap();
 

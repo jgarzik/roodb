@@ -256,10 +256,8 @@ impl AsyncIO for UringIO {
         let fd = self.file.as_raw_fd();
         let requests_owned: Vec<(u64, usize)> = requests.to_vec();
 
-        match tokio::task::spawn_blocking(move || {
-            read_batch_blocking(ring, fd, &requests_owned)
-        })
-        .await
+        match tokio::task::spawn_blocking(move || read_batch_blocking(ring, fd, &requests_owned))
+            .await
         {
             Ok(results) => results,
             Err(e) => {
@@ -295,10 +293,8 @@ impl AsyncIO for UringIO {
             })
             .collect();
 
-        match tokio::task::spawn_blocking(move || {
-            write_batch_blocking(ring, fd, &owned_requests)
-        })
-        .await
+        match tokio::task::spawn_blocking(move || write_batch_blocking(ring, fd, &owned_requests))
+            .await
         {
             Ok(results) => results,
             Err(e) => {

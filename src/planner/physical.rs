@@ -905,8 +905,7 @@ impl PhysicalPlanner {
                 // Try to extract equi-join keys for hash join
                 if join_type != JoinType::Cross {
                     if let Some(ref cond) = condition {
-                        let (equi_keys, remaining) =
-                            extract_equi_keys(cond, left_width);
+                        let (equi_keys, remaining) = extract_equi_keys(cond, left_width);
                         if !equi_keys.is_empty() {
                             let (left_keys, right_keys): (Vec<_>, Vec<_>) =
                                 equi_keys.into_iter().unzip();
