@@ -1,6 +1,6 @@
 [package]
 name = "roodb"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 
@@ -9,13 +9,13 @@ license = "MIT"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time", "process"] }
 
 # Error handling
-thiserror = "1.0"
+thiserror = "1"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env"] }
 
 # Platform detection
-cfg-if = "1.0"
+cfg-if = "1"
 
 # Raft consensus
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
@@ -42,7 +42,7 @@ webpki-roots = "0.26"
 rustls-pemfile = "2"
 
 # Bytes handling
-bytes = "1.0"
+bytes = "1"
 
 # Synchronization primitives
 parking_lot = "0.12"
@@ -57,7 +57,7 @@ lz4_flex = "0.11"
 sqlparser = { version = "0.50", features = ["visitor"] }
 
 # Ordered floats for sorting
-ordered-float = "4.2"
+ordered-float = "4"
 
 # LRU cache for block cache
 lru = "0.12"
@@ -65,9 +65,9 @@ lru = "0.12"
 # MySQL protocol support
 sha1 = "0.10"
 rand = "0.8"
-bitflags = "2.4"
+bitflags = "2"
 regex = "1"
-lazy_static = "1.4"
+lazy_static = "1"
 
 # Password hashing
 argon2 = "0.5"
