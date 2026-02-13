@@ -31,12 +31,16 @@ pub struct UringIO {
     ring: Arc<Mutex<IoUring>>,
 }
 
-// SAFETY: UringIO is Send+Sync because:
-// - File is Send+Sync
-// - Arc<Mutex<IoUring>> is Send+Sync
-// - All io_uring operations are serialized by the Mutex
-unsafe impl Send for UringIO {}
-unsafe impl Sync for UringIO {}
+// Static assertions: UringIO is Send+Sync because all fields are.
+// (IoUring 0.7+ explicitly implements Send+Sync.)
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _check() {
+        _assert_send::<UringIO>();
+        _assert_sync::<UringIO>();
+    }
+};
 
 impl UringIO {
     /// Open a file for io_uring operations
