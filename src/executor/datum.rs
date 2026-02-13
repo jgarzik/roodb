@@ -389,7 +389,10 @@ mod tests {
         assert_ne!(Datum::Int(1), Datum::Float(2.0));
 
         // Non-numeric types must still hash distinctly from numerics
-        assert_ne!(compute_hash(&Datum::Bool(true)), compute_hash(&Datum::Int(1)));
+        assert_ne!(
+            compute_hash(&Datum::Bool(true)),
+            compute_hash(&Datum::Int(1))
+        );
     }
 
     #[test]

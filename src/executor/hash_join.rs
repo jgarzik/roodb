@@ -547,9 +547,7 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(
-            left, right, JoinType::Inner, vec![0], vec![0], None, 2, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 2, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -575,9 +573,7 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(
-            left, right, JoinType::Left, vec![0], vec![0], None, 2, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Left, vec![0], vec![0], None, 2, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -611,9 +607,7 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(
-            left, right, JoinType::Full, vec![0], vec![0], None, 2, 2,
-        );
+        let mut join = HashJoin::new(left, right, JoinType::Full, vec![0], vec![0], None, 2, 2);
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -647,8 +641,7 @@ mod tests {
                     let right_payload = row.get(3).unwrap();
                     if left_payload.as_str() == Some("left_null") && right_payload.is_null() {
                         saw_left_null = true;
-                    } else if left_payload.is_null()
-                        && right_payload.as_str() == Some("right_null")
+                    } else if left_payload.is_null() && right_payload.as_str() == Some("right_null")
                     {
                         saw_right_null = true;
                     } else {
