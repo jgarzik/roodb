@@ -45,7 +45,10 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
     ));
     let _ = std::fs::create_dir_all(&path);
     let factory = Arc::new(default_io_factory());
-    let config = LsmConfig { dir: path };
+    let config = LsmConfig {
+        dir: path,
+        ..Default::default()
+    };
     Arc::new(LsmEngine::open(factory, config).await.unwrap())
 }
 

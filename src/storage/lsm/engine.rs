@@ -12,7 +12,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::io::scheduler::IoPriority;
 use crate::io::{AsyncIO, AsyncIOFactory};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::lsm::block_cache::{BlockCache, DEFAULT_CACHE_CAPACITY};
+use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::compaction::{
     execute_l0_compaction, execute_level_compaction, finalize_l0_compaction,
     finalize_level_compaction, needs_l0_compaction, prepare_l0_compaction,
@@ -24,17 +24,28 @@ use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 use crate::storage::traits::{KeyValue, StorageEngine};
 
+/// Default total memory budget: 128MB (block cache + memtables share this pool)
+pub const DEFAULT_TOTAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Minimum block cache size to prevent starvation under heavy write pressure
+const MIN_BLOCK_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 /// LSM-Tree storage engine configuration
 #[derive(Debug, Clone)]
 pub struct LsmConfig {
     /// Data directory
     pub dir: PathBuf,
+    /// Unified memory budget shared between block cache and memtables.
+    /// Block cache capacity is dynamically adjusted based on memtable pressure.
+    /// Memtable flush threshold is derived as `total_cache_bytes / 2`.
+    pub total_cache_bytes: usize,
 }
 
 impl Default for LsmConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("data"),
+            total_cache_bytes: DEFAULT_TOTAL_CACHE_BYTES,
         }
     }
 }
@@ -54,6 +65,8 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     /// L1+→L2+ compaction mutex. Serializes higher-level compactions to prevent
     /// adjacent-level races (e.g., L1→L2 and L2→L3 sharing L2 files).
     level_compaction_mutex: TokioMutex<()>,
+    /// Unified memory budget for block cache + memtables
+    total_cache_bytes: usize,
     /// LRU block cache shared across all SSTable reads
     block_cache: Arc<BlockCache>,
     /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
@@ -72,7 +85,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         // Open manifest
         let manifest = Manifest::open(&config.dir)?;
-        let block_cache = Arc::new(BlockCache::new(DEFAULT_CACHE_CAPACITY));
+        let total_cache_bytes = config.total_cache_bytes;
+        // Memtable starts empty, so full budget goes to block cache
+        let block_cache = Arc::new(BlockCache::new(total_cache_bytes));
 
         // Warmup: open readers for all existing SSTables and eager-load blocks
         let mut reader_map: HashMap<Arc<str>, Arc<SstableReader<IO>>> = HashMap::new();
@@ -90,8 +105,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 {
                     Ok(reader) => {
                         let reader = Arc::new(reader);
-                        // Eager-load blocks for small SSTables (< 16MB)
-                        if info.size < (DEFAULT_CACHE_CAPACITY / 4) as u64 {
+                        // Eager-load blocks for small SSTables (< 25% of budget)
+                        if info.size < (total_cache_bytes / 4) as u64 {
                             let _ = reader.eager_load_blocks().await;
                         }
                         reader_map.insert(cache_name, reader);
@@ -110,6 +125,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             manifest: RwLock::new(manifest),
             l0_compaction_mutex: TokioMutex::new(()),
             level_compaction_mutex: TokioMutex::new(()),
+            total_cache_bytes,
             block_cache,
             reader_cache: RwLock::new(reader_map),
             closed: AtomicBool::new(false),
@@ -347,6 +363,26 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         }
     }
 
+    /// Current block cache capacity in bytes (for testing/observability).
+    pub fn block_cache_capacity(&self) -> usize {
+        self.block_cache.capacity()
+    }
+
+    /// Rebalance block cache capacity based on current memtable pressure.
+    ///
+    /// Gives block cache all remaining budget after subtracting active + immutable
+    /// memtable sizes, with a minimum floor to prevent starvation.
+    fn rebalance_cache(&self) {
+        let mem_size = self.memtable.read().size();
+        let imm_size: usize = self.imm_memtables.read().iter().map(|m| m.size()).sum();
+        let mem_total = mem_size + imm_size;
+        let new_cap = self
+            .total_cache_bytes
+            .saturating_sub(mem_total)
+            .max(MIN_BLOCK_CACHE_BYTES);
+        self.block_cache.set_capacity(new_cap);
+    }
+
     /// Read from all levels (memtable, imm memtables, SSTables)
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
         // SNAPSHOT ISOLATION: Capture consistent point-in-time view of memtables.
@@ -460,14 +496,15 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
         let current_mem = Arc::clone(&*self.memtable.read());
         current_mem.put(key, value);
 
-        // Check if memtable needs flushing
-        if current_mem.should_flush() {
+        // Check if memtable needs flushing (threshold = half of total budget)
+        let flush_threshold = self.total_cache_bytes / 2;
+        if current_mem.size() >= flush_threshold {
             // Rotate memtable: create new one and move old to immutables
             let new_mem = Arc::new(Memtable::new());
             {
                 let mut mem_guard = self.memtable.write();
                 // Only rotate if we're still looking at the same memtable.
-                // Another thread may have already rotated between our should_flush check
+                // Another thread may have already rotated between our size check
                 // and acquiring this write lock.
                 if Arc::ptr_eq(&current_mem, &*mem_guard) {
                     let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
@@ -476,6 +513,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                 }
                 // If not the same, another thread already rotated - nothing to do
             }
+            self.rebalance_cache();
             // Note: Flush happens in background or on explicit flush() call
         }
 
@@ -633,6 +671,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         Ok(())
@@ -678,6 +717,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         Ok(())
@@ -715,6 +755,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                     imm.remove(0);
                 }
             }
+            self.rebalance_cache();
         }
 
         self.closed.store(true, Ordering::SeqCst);

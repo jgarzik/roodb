@@ -35,7 +35,10 @@ async fn main() {
 
     // Open storage engine
     let io_factory = Arc::new(default_io_factory());
-    let storage_config = LsmConfig { dir: data_dir };
+    let storage_config = LsmConfig {
+        dir: data_dir,
+        ..Default::default()
+    };
     let storage: Arc<dyn StorageEngine> = match LsmEngine::open(io_factory, storage_config).await {
         Ok(engine) => Arc::new(engine),
         Err(e) => {

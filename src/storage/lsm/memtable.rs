@@ -9,9 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_skiplist::SkipMap;
 
-/// Maximum memtable size before flush (64MB)
-pub const MEMTABLE_SIZE_THRESHOLD: usize = 64 * 1024 * 1024;
-
 /// Tombstone marker for deleted keys
 pub const TOMBSTONE: Option<Vec<u8>> = None;
 
@@ -106,11 +103,6 @@ impl Memtable {
     /// Get approximate size in bytes
     pub fn size(&self) -> usize {
         self.size.load(Ordering::Relaxed)
-    }
-
-    /// Check if memtable should be flushed
-    pub fn should_flush(&self) -> bool {
-        self.size() >= MEMTABLE_SIZE_THRESHOLD
     }
 
     /// Check if memtable is empty

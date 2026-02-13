@@ -399,6 +399,7 @@ async fn test_server_integration_e2e() {
     let factory = Arc::new(PosixIOFactory);
     let config = LsmConfig {
         dir: data_dir.clone(),
+        ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
@@ -502,6 +503,7 @@ async fn test_transaction_begin_commit() {
     let factory = Arc::new(PosixIOFactory);
     let config = LsmConfig {
         dir: data_dir.clone(),
+        ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
@@ -605,6 +607,7 @@ async fn test_transaction_rollback() {
     let factory = Arc::new(PosixIOFactory);
     let config = LsmConfig {
         dir: data_dir.clone(),
+        ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
@@ -710,6 +713,7 @@ async fn test_autocommit() {
     let factory = Arc::new(PosixIOFactory);
     let config = LsmConfig {
         dir: data_dir.clone(),
+        ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
