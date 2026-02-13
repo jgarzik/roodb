@@ -57,6 +57,7 @@ pub struct HashJoin {
 }
 
 impl HashJoin {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         left: Box<dyn Executor>,
         right: Box<dyn Executor>,

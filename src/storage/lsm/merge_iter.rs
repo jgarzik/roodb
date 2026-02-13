@@ -49,13 +49,16 @@ impl PartialOrd for HeapEntry {
     }
 }
 
+/// A list of key-value entries (key bytes, optional value bytes).
+type EntryList = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// K-way merge over pre-sorted sources using a min-heap.
 ///
 /// Each source must yield entries in ascending key order. The merge
 /// deduplicates by key, keeping the entry from the source with the
 /// lowest priority value (newest data).
 pub struct MergeIterator {
-    sources: Vec<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    sources: Vec<EntryList>,
     priorities: Vec<usize>,
     heap: BinaryHeap<HeapEntry>,
 }
@@ -70,7 +73,7 @@ impl MergeIterator {
     }
 
     /// Add a pre-sorted source with a priority (lower = newer = wins dedup).
-    pub fn add(&mut self, entries: Vec<(Vec<u8>, Option<Vec<u8>>)>, priority: usize) {
+    pub fn add(&mut self, entries: EntryList, priority: usize) {
         if entries.is_empty() {
             return;
         }
@@ -93,7 +96,7 @@ impl MergeIterator {
     /// Returns entries in ascending key order. For duplicate keys,
     /// keeps the entry with the lowest priority (newest). Tombstones
     /// (`None` values) are included — use [`merge_live`] to strip them.
-    pub fn merge(mut self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    pub fn merge(mut self) -> EntryList {
         let mut result = Vec::new();
 
         while let Some(entry) = self.heap.pop() {
