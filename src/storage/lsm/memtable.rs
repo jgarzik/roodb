@@ -117,9 +117,7 @@ impl Memtable {
 
     /// Clear the memtable
     pub fn clear(&self) {
-        while let Some(entry) = self.data.front() {
-            entry.remove();
-        }
+        self.data.clear();
         self.size.store(0, Ordering::Relaxed);
     }
 }
@@ -200,5 +198,25 @@ mod tests {
         mem.delete(b"key");
         // Size should change (tombstone replaces value)
         assert!(mem.size() != size_after_put || mem.size() > 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mem = Memtable::new();
+
+        mem.put(b"a", b"1");
+        mem.put(b"b", b"2");
+        mem.put(b"c", b"3");
+        assert_eq!(mem.len(), 3);
+        assert!(mem.size() > 0);
+
+        mem.clear();
+
+        assert!(mem.is_empty());
+        assert_eq!(mem.len(), 0);
+        assert_eq!(mem.size(), 0);
+        assert_eq!(mem.get(b"a"), None);
+        assert_eq!(mem.get(b"b"), None);
+        assert_eq!(mem.get(b"c"), None);
     }
 }
