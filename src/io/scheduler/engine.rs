@@ -469,9 +469,6 @@ pub struct IoEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     limiter: AdaptiveLimiter,
     /// I/O metrics
     metrics: Arc<IoMetrics>,
-    /// Configuration (stored for future use in deadline calculation)
-    #[allow(dead_code)]
-    config: SchedulerConfig,
     /// Next file ID
     next_file_id: AtomicU64,
     /// Shutdown flag
@@ -498,7 +495,6 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
             throughput,
             limiter,
             metrics,
-            config,
             next_file_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
             work_notify: Notify::new(),

@@ -129,6 +129,7 @@ pub trait Executor: Send {
     async fn open(&mut self) -> ExecutorResult<()>;
     async fn next(&mut self) -> ExecutorResult<Option<Row>>;
     async fn close(&mut self) -> ExecutorResult<()>;
+    fn take_changes(&mut self) -> Vec<RowChange>;  // DML row changes (default: empty)
 }
 ```
 
@@ -137,13 +138,31 @@ pub trait Executor: Send {
 | Operator | Algorithm | Notes |
 |----------|-----------|-------|
 | `TableScan` | Sequential scan | Pushed-down filter, MVCC visibility |
+| `PointGet` | PK equality lookup | O(log n) direct key access |
+| `RangeScan` | Bounded PK range | Start/end keys, inclusive flags, remaining filter |
 | `Filter` | Predicate evaluation | Loop until match or exhausted |
 | `Project` | Expression evaluation | Transforms columns |
-| `NestedLoopJoin` | Nested loop | Materializes right side |
+| `NestedLoopJoin` | Nested loop | Materializes right side (fallback) |
+| `HashJoin` | Hash equi-join | O(n+m), builds hash on right side |
 | `HashAggregate` | Hash grouping | In-memory HashMap |
 | `HashDistinct` | Hash dedup | In-memory HashSet |
 | `Sort` | In-memory sort | Materializes all rows |
 | `Limit` | Row counting | Offset + limit support |
+| `SingleRow` | Constant eval | Expressions with no FROM clause |
+| `Insert` | DML | Collects RowChanges via `take_changes()` |
+| `Update` | DML | Scan + modify, collects RowChanges |
+| `Delete` | DML | Scan + tombstone, collects RowChanges |
+| `CreateTable` | DDL | System table writes |
+| `DropTable` | DDL | System table deletes |
+| `CreateIndex` | DDL | Index metadata + backfill |
+| `DropIndex` | DDL | Index metadata removal |
+| `CreateUser` | Auth | `system.users` insert |
+| `AlterUser` | Auth | `system.users` update |
+| `DropUser` | Auth | `system.users` + `system.grants` delete |
+| `Grant` | Auth | `system.grants` insert |
+| `Revoke` | Auth | `system.grants` delete |
+| `SetPassword` | Auth | `system.users` update |
+| `ShowGrants` | Auth | `system.grants` query |
 
 **Expression Eval** (`eval.rs`): Recursive evaluation of `ResolvedExpr` against `Row`. Handles literals, column refs, binary ops, functions, IS NULL, IN list, BETWEEN.
 
@@ -179,6 +198,8 @@ Cross-platform async I/O with priority scheduling.
 
 **Scheduler** (`scheduler/`):
 
+**Files**: `engine.rs` (core scheduler), `backpressure.rs` (saturation tracking), `batcher.rs` / `batch.rs` (batch submission), `limiter.rs` (rate limiting), `throughput.rs` (throughput tracking), `metrics.rs` (I/O metrics), `config.rs` (tuning parameters).
+
 Two-dimensional I/O context:
 ```rust
 pub enum Urgency {
@@ -210,6 +231,16 @@ Backpressure behavior:
 - `Layout::from_size_align()` for 4KB alignment
 - Manual `NonNull<u8>` management
 - Implements `Send + Sync`
+
+### `init/`
+
+Initialization module (`roodb_init` binary). Run before first server startup.
+
+- Creates root user with SHA1(SHA1(password)) hash in `system.users`
+- Grants ALL PRIVILEGES on `*.*` with GRANT OPTION in `system.grants`
+- Writes schema version marker to storage
+- Direct storage writes (bypasses Raft — pre-cluster bootstrap)
+- Password via env: `ROODB_ROOT_PASSWORD` (direct) or `ROODB_ROOT_PASSWORD_FILE` (Docker secrets)
 
 ### `planner/`
 
@@ -246,10 +277,18 @@ pub enum LogicalPlan {
 - `PredicatePushdown`: Push filters toward scans, merge into scan filter
 - `FilterMerge`: Combine consecutive filters with AND
 
-**Physical Plan**: 1-to-1 mapping with algorithm selection:
-- `Join` → `NestedLoopJoin`
+**Physical Plan** (`physical.rs`): Smart algorithm selection with index utilization:
+- `Scan` with PK equality filter → `PointGet` (O(log n) lookup via `extract_point_get()`)
+- `Scan` with PK range filter → `RangeScan` (bounded scan via `extract_range_scan()`)
+- `Scan` (otherwise) → `TableScan`
+- `Join` with equi-keys → `HashJoin` (extracted via `extract_equi_keys()`)
+- `Join` (fallback) → `NestedLoopJoin`
 - `Aggregate` → `HashAggregate`
 - `Distinct` → `HashDistinct`
+
+**Cost Model** (`cost.rs`): Estimates operator costs for plan selection.
+
+**EXPLAIN** (`explain.rs`): Query plan visualization.
 
 ### `protocol/`
 
@@ -275,6 +314,13 @@ MySQL-compatible wire protocol (branded as RooDB, version `8.0.0-RooDB`).
 - `COM_PING` (0x0e): Health check
 - `COM_INIT_DB` (0x02): USE database
 - `COM_RESET_CONNECTION` (0x1f): Reset session
+- `COM_STMT_PREPARE` / `COM_STMT_EXECUTE` / `COM_STMT_CLOSE`: Prepared statements
+
+**Additional Files**:
+- `prepared.rs` — Prepared statement lifecycle (prepare, execute, close)
+- `metrics.rs` — Protocol-level metrics (packets, bytes, errors)
+- `starttls.rs` — TLS upgrade handshake
+- `types.rs` — Wire type encoding/decoding
 
 **Result Encoding**:
 1. Column count packet
@@ -391,6 +437,12 @@ SQL parsing and semantic analysis.
 - Validates expression types
 - Infers result types for operations
 
+**Privileges** (`privileges.rs`):
+- MySQL-compatible privilege checking with hierarchical scope: global (`*.*`), database (`db.*`), table (`db.table`)
+- `Privilege` enum: All, Select, Insert, Update, Delete, Create, Drop, Alter, Index, GrantOption
+- `HostPattern`: MySQL-style `'user'@'host'` wildcard matching with specificity ranking
+- `check_privilege()` / `check_privileges()`: Verify grants from `system.users` / `system.grants`
+
 ### `storage/`
 
 LSM-Tree storage engine.
@@ -398,7 +450,7 @@ LSM-Tree storage engine.
 **Architecture**:
 ```
 ┌─────────────┐
-│  Memtable   │  Active (BTreeMap, ~4MB)
+│  Memtable   │  Active (SkipMap, dynamic flush threshold)
 ├─────────────┤
 │  Immutable  │  Pending flush
 ├─────────────┤
@@ -409,8 +461,8 @@ LSM-Tree storage engine.
 ```
 
 **Memtable** (`lsm/memtable.rs`):
-- `BTreeMap<Vec<u8>, Option<Vec<u8>>>` (None = tombstone)
-- Flush threshold: 4MB
+- `crossbeam_skiplist::SkipMap<Vec<u8>, Option<Vec<u8>>>` — lock-free concurrent skip list (None = tombstone)
+- Flush threshold: `total_cache_bytes / 2` (default 128MB budget → 64MB threshold)
 - Atomic size tracking
 
 **SSTable** (`lsm/sstable.rs`):
@@ -435,6 +487,14 @@ Entry: | Key Len (2B) | Val Len (2B) | Key | Value |
 - `get()`: Check memtable → immutables → SSTables (newest first)
 - `put()`: Insert to memtable, trigger flush if needed
 - `scan()`: Merge all sources, deduplicate by key, skip tombstones
+
+**Bloom Filters** (`lsm/bloom.rs`): Per-SSTable Bloom filters for accelerating point lookups. Avoids reading SSTables that definitely don't contain a key.
+
+**Block Cache** (`lsm/block_cache.rs`): LRU block cache with dynamic sizing. Part of the unified memory budget (128MB default) shared with memtables. Starts at full budget, shrinks as memtable grows (minimum 4MB).
+
+**Merge Iterator** (`lsm/merge_iter.rs`): Multi-way merge iterator for range scans across memtables and SSTables. Deduplicates by key, resolves to newest version.
+
+**Memory Budget**: Unified 128MB default (`DEFAULT_TOTAL_CACHE_BYTES`) shared between block cache and memtables. Block cache dynamically rebalances as memtable pressure changes.
 
 **Compaction** (`lsm/compaction.rs`):
 - L0 trigger: 4 files
@@ -505,13 +565,23 @@ impl ReadView {
 
 **UndoLog**: Version chain storage for MVCC rollback
 
+**Purge** (`purge.rs`): Background garbage collection of old MVCC versions. Periodically removes undo records no longer needed for visibility — safe when no active transaction references the old version. Uses `min_active_txn_id()` to determine the purge horizon.
+
+**TimeoutConfig** (`mod.rs`):
+- `idle_in_transaction_timeout`: 10 minutes (600s) — kills idle transactions
+- `statement_timeout`: disabled by default — per-statement deadline
+- `lock_timeout`: disabled by default — max wait for row locks
+
 ---
 
 ## Key Constants
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| Memtable flush threshold | 4 MB | `storage/lsm/memtable.rs` |
+| Memory budget | 128 MB (default) | `storage/lsm/engine.rs` |
+| Memtable flush threshold | `total_cache_bytes / 2` (default 64 MB) | `storage/lsm/engine.rs` |
+| Block cache minimum | 4 MB | `storage/lsm/engine.rs` |
+| Block cache size | Dynamic (budget minus memtable usage) | `storage/lsm/engine.rs` |
 | SSTable block size | 4 KB | `storage/lsm/block.rs` |
 | L0 compaction trigger | 4 files | `storage/lsm/compaction.rs` |
 | Level size ratio | 10x | `storage/lsm/compaction.rs` |
@@ -520,3 +590,4 @@ impl ReadView {
 | Page alignment | 4 KB | `io/traits.rs` |
 | Raft election timeout | 150-300 ms | `raft/node.rs` |
 | Raft heartbeat interval | 50 ms | `raft/node.rs` |
+| Idle-in-transaction timeout | 10 min | `txn/mod.rs` |

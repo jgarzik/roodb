@@ -17,7 +17,7 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 | Type | Library | Use Case |
 |------|---------|----------|
 | `RwLock` | parking_lot | Sync contexts (catalog, txn state, raft caches) |
-| `Mutex` | tokio::sync | Async contexts where lock is held across await (LSM manifest) |
+| `Mutex` | tokio::sync | Async contexts where lock is held across await (compaction, Raft log) |
 | `Mutex` | parking_lot | Short sync critical sections (I/O handles) |
 | `Atomic*` | std::sync::atomic | Counters and flags |
 
@@ -27,9 +27,9 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 - Better performance than std::sync
 - Simpler API (no `.unwrap()` needed)
 
-### Why tokio::sync::Mutex for manifest?
+### Why tokio::sync::Mutex for compaction/log?
 
-The LSM manifest lock is held across `await` points during flush/compaction. Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
+The compaction mutexes (`l0_compaction_mutex`, `level_compaction_mutex`) and Raft `log_mutex` are held across `await` points. Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
 
 ## Module Locking Inventory
 
@@ -86,8 +86,11 @@ Multiple RwLocks but NEVER nested - each acquired/released independently.
 | `memtable.data` | parking_lot::RwLock | In-memory KV store |
 | `memtable.size` | AtomicUsize | Approximate size tracking |
 | `imm_memtables` | parking_lot::RwLock | Pending flush memtables |
-| `manifest` | tokio::sync::Mutex | SSTable metadata |
-| `compaction_mutex` | tokio::sync::Mutex | Serializes compactions |
+| `manifest` | parking_lot::RwLock | SSTable metadata (readers concurrent, writers exclusive) |
+| `l0_compaction_mutex` | tokio::sync::Mutex | Serializes L0→L1 compactions |
+| `level_compaction_mutex` | tokio::sync::Mutex | Serializes L1+→L2+ compactions |
+| `reader_cache` | parking_lot::RwLock | Cached open SSTable readers (avoids re-opening per scan) |
+| `block_cache.inner` | parking_lot::Mutex | LRU cache of SSTable data blocks (Mutex: all ops mutate LRU order) |
 | `closed` | AtomicBool | Engine shutdown flag |
 
 **Critical pattern:** Atomic memtable snapshots prevent rotation races:
@@ -130,18 +133,24 @@ loop {
 
 **Critical pattern:** Compaction uses split-phase locking:
 ```rust
-// Phase 1: Brief lock to prepare job
+// Phase 1: Brief write-lock to prepare job
 let job = {
-    let mut manifest = self.manifest.lock().await;
+    let mut manifest = self.manifest.write();
     prepare_l0_compaction(&mut manifest)
     // Lock released here
 };
 // Phase 2: I/O without lock
-let new_file = execute_l0_compaction(&factory, &job).await?;
-// Phase 3: Re-acquire lock to finalize
-let mut manifest = self.manifest.lock().await;
-finalize_l0_compaction(&mut manifest, &job, new_file)?;
+let new_file = execute_l0_compaction(&*self.factory, &job).await?;
+// Phase 3: Re-acquire write-lock to finalize
+{
+    let mut manifest = self.manifest.write();
+    finalize_l0_compaction(&mut manifest, &job, new_file)?;
+}
 ```
+
+L0 and level compactions use separate tokio Mutexes, allowing concurrent L0→L1
+and L1+→L2+ compaction. Within each path, the manifest RwLock is held only briefly
+(prepare and finalize phases), while the expensive I/O phase runs without any lock.
 
 ### I/O (`src/io/`)
 
@@ -151,6 +160,14 @@ finalize_l0_compaction(&mut manifest, &job, new_file)?;
 | `PosixIO::file` | parking_lot::Mutex | POSIX file handle |
 
 Single lock per I/O instance; never nested.
+
+### I/O Scheduler (`src/io/scheduler/`)
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `IoScheduler::files` | parking_lot::RwLock | Open files registry |
+| `IoEngine::rings` | parking_lot::RwLock | Hot/cold ring allocation |
+| `AdaptiveLimiter::bucket` | parking_lot::Mutex | Token bucket for background I/O rate limiting |
 
 ### Raft (`src/raft/`)
 
@@ -182,12 +199,13 @@ cached_last_log_id = 49;        // Acquires cache lock
 // Without log_mutex, Thread B could see cache=49 but miss the memtable entry
 ```
 
-**Critical pattern:** Snapshot methods protected by log_mutex for consistency:
+**Critical pattern:** Only `applied_state()` acquires `log_mutex`:
 
-The `applied_state()`, `get_current_snapshot()`, and `build_snapshot()` methods all acquire
-`log_mutex` to ensure they see a consistent view of cached state alongside log operations.
-Without this, concurrent log appends could modify cached_last_log_id while these methods
-read cached_last_applied, leading to inconsistent state views under high concurrency.
+Of the state machine methods, only `applied_state()` acquires `log_mutex` — it must see
+a consistent view of cached state alongside log operations. `get_current_snapshot()` and
+`build_snapshot()` do NOT hold `log_mutex`; they read only non-Raft-prefixed keys (user data)
+while OpenRaft serializes all state machine operations, so no concurrent apply() can
+modify user data. This avoids write stalls under snapshot load.
 
 **Critical pattern:** Async work (storage scans) done before catalog lock:
 ```rust
@@ -210,21 +228,29 @@ let mut catalog = self.catalog.write();
 
 | Use Case | Ordering |
 |----------|----------|
-| Counter increment (ID allocation) | SeqCst |
+| Transaction/row ID allocation | SeqCst |
+| Connection ID allocation | Relaxed (uniqueness only, no ordering requirement) |
 | Approximate size tracking | Relaxed |
 | Leader flag | SeqCst |
 | Closed/shutdown flags | SeqCst |
 
 ## Row ID Generation
 
-All row IDs are generated from a single global counter (`src/storage/row_id.rs`):
+Row IDs are cluster-unique via node-ID-in-high-bits encoding (`src/storage/row_id.rs`):
+
+- **Format:** `[16-bit node_id][48-bit local counter]` — supports 65536 nodes, 281T rows/node
+- **`NODE_ID: AtomicU64`** — static, set once at startup from the Raft node ID (SeqCst)
+- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — single global counter (SeqCst `fetch_add`)
+- **`next_row_id()`** — allocates one ID, encodes with node_id
+- **`allocate_row_id_batch(count)`** — batch allocation reducing atomic contention for bulk INSERTs
+
 ```rust
 pub fn next_row_id() -> u64 {
-    GLOBAL_ROW_ID_GEN.next()
+    let local = GLOBAL_ROW_ID_GEN.next();
+    let node_id = NODE_ID.load(Ordering::SeqCst);
+    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
 }
 ```
-
-This ensures globally unique row IDs across all operations (INSERT, DDL, auth).
 
 ## Adding New Locks
 
