@@ -30,6 +30,9 @@ struct Cli {
     key_path: PathBuf,
     #[arg(long, default_value = "./certs/ca.crt", env = "ROODB_CA_CERT_PATH")]
     raft_ca_cert_path: PathBuf,
+    /// Enable TDS 8.0 protocol support (in addition to MySQL protocol)
+    #[arg(long, default_value_t = false, env = "ROODB_TDS")]
+    tds: bool,
 }
 
 #[tokio::main]
@@ -51,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cert_path,
         key_path,
         raft_ca_cert_path,
+        tds,
     } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
@@ -107,7 +111,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start RooDB server
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let mut server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    if tds {
+        tracing::info!("TDS 8.0 protocol enabled");
+        server.enable_tds();
+    }
     server.run().await?;
 
     Ok(())

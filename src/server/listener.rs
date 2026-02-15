@@ -36,6 +36,7 @@ pub struct RooDbServer {
     txn_manager: Arc<TransactionManager>,
     raft_node: Arc<RaftNode>,
     next_conn_id: AtomicU32,
+    tds_enabled: bool,
 }
 
 impl RooDbServer {
@@ -56,7 +57,13 @@ impl RooDbServer {
             txn_manager,
             raft_node,
             next_conn_id: AtomicU32::new(1),
+            tds_enabled: false,
         }
+    }
+
+    /// Enable TDS 8.0 protocol support
+    pub fn enable_tds(&mut self) {
+        self.tds_enabled = true;
     }
 
     /// Create a new RooDB server with custom transaction manager
@@ -76,6 +83,7 @@ impl RooDbServer {
             txn_manager,
             raft_node,
             next_conn_id: AtomicU32::new(1),
+            tds_enabled: false,
         }
     }
 
@@ -98,8 +106,9 @@ impl RooDbServer {
         let raft_node = self.raft_node;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
+        let tds_enabled = self.tds_enabled;
 
-        tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
+        tracing::info!(addr = %self.addr, tds_enabled, "RooDB server listening (STARTTLS enabled)");
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -110,7 +119,6 @@ impl RooDbServer {
             let raft_node = raft_node.clone();
             let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
 
-            // Handle connection with STARTTLS (TLS upgrade happens in handler)
             tokio::spawn(async move {
                 handle_connection(
                     stream,
@@ -121,6 +129,7 @@ impl RooDbServer {
                     catalog,
                     txn_manager,
                     raft_node,
+                    tds_enabled,
                 )
                 .await;
             });
@@ -151,8 +160,9 @@ impl RooDbServer {
         let raft_node = self.raft_node;
         let acceptor = self.tls_acceptor;
         let next_conn_id = Arc::new(self.next_conn_id);
+        let tds_enabled = self.tds_enabled;
 
-        tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
+        tracing::info!(addr = %self.addr, tds_enabled, "RooDB server listening (STARTTLS enabled)");
 
         loop {
             tokio::select! {
@@ -175,6 +185,7 @@ impl RooDbServer {
                             catalog,
                             txn_manager,
                             raft_node,
+                            tds_enabled,
                         ).await;
                     });
                 }

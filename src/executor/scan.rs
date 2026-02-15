@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use tracing::debug;
+
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
@@ -58,14 +60,23 @@ impl Executor for TableScan {
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
 
+        debug!(table = %self.table, "TableScan: starting scan");
+
         // Use MVCC scan with visibility filtering if we have a transaction context,
         // otherwise fall back to raw storage scan (for DDL or legacy tests)
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
+            debug!(table = %self.table, "TableScan: calling mvcc.scan()");
+            let result = self
+                .mvcc
                 .scan(Some(&prefix), Some(&end), &ctx.read_view)
-                .await?
+                .await?;
+            debug!(table = %self.table, rows = result.len(), "TableScan: mvcc.scan() returned");
+            result
         } else {
-            self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
+            debug!(table = %self.table, "TableScan: calling inner.scan()");
+            let result = self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?;
+            debug!(table = %self.table, rows = result.len(), "TableScan: inner.scan() returned");
+            result
         };
 
         // Collect keys that are buffered (for read-your-writes merge)
