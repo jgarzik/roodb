@@ -50,14 +50,14 @@ impl LatencyHistogram {
         self.count.fetch_add(1, Ordering::Relaxed);
 
         let bucket = match us {
-            0..=999 => 0,         // <1ms
-            1000..=4999 => 1,     // <5ms
-            5000..=9999 => 2,     // <10ms
-            10000..=49999 => 3,   // <50ms
-            50000..=99999 => 4,   // <100ms
-            100000..=499999 => 5, // <500ms
-            500000..=999999 => 6, // <1s
-            _ => 7,               // >1s
+            0..=999 => 0,           // <1ms
+            1000..=4999 => 1,       // <5ms
+            5000..=9999 => 2,       // <10ms
+            10_000..=49_999 => 3,   // <50ms
+            50_000..=99_999 => 4,   // <100ms
+            100_000..=499_999 => 5, // <500ms
+            500_000..=999_999 => 6, // <1s
+            _ => 7,                 // >1s
         };
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
@@ -89,7 +89,16 @@ impl LatencyHistogram {
         let target = (total as f64 * p / 100.0) as u64;
         let mut cumulative = 0u64;
 
-        let bucket_bounds_us = [1000, 5000, 10000, 50000, 100000, 500000, 1000000, u64::MAX];
+        let bucket_bounds_us = [
+            1000,
+            5000,
+            10_000,
+            50_000,
+            100_000,
+            500_000,
+            1_000_000,
+            u64::MAX,
+        ];
 
         for (i, bound) in bucket_bounds_us.iter().enumerate() {
             cumulative += self.buckets[i].load(Ordering::Relaxed);

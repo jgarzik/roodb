@@ -37,7 +37,7 @@ fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
     result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
     result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR = 0 (no version chain)
-    result.push(if deleted { 1 } else { 0 }); // deleted flag
+    result.push(u8::from(deleted)); // deleted flag
     result.extend_from_slice(data);
     result
 }
@@ -549,7 +549,7 @@ impl LsmRaftStorage {
             .list_tables()
             .iter()
             .filter(|t| !is_system_table(t))
-            .map(|t| t.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         for table_name in existing_tables {
             let _ = catalog.drop_table(&table_name);
@@ -644,7 +644,7 @@ impl RaftLogReader<TypeConfig> for LsmRaftStorage {
         };
 
         let start_key = log_key(start_index);
-        let end_key = end_index.map(log_key).unwrap_or_else(log_key_end);
+        let end_key = end_index.map_or_else(log_key_end, log_key);
 
         let entries = self
             .storage

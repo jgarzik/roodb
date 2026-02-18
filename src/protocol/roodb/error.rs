@@ -40,18 +40,18 @@ pub enum ProtocolError {
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProtocolError::Io(e) => write!(f, "I/O error: {}", e),
-            ProtocolError::InvalidPacket(msg) => write!(f, "Invalid packet: {}", msg),
-            ProtocolError::AuthFailed(msg) => write!(f, "Authentication failed: {}", msg),
-            ProtocolError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
-            ProtocolError::Sql(e) => write!(f, "SQL error: {}", e),
-            ProtocolError::Planner(e) => write!(f, "Planner error: {}", e),
-            ProtocolError::Executor(e) => write!(f, "Executor error: {}", e),
-            ProtocolError::Transaction(e) => write!(f, "Transaction error: {}", e),
+            ProtocolError::Io(e) => write!(f, "I/O error: {e}"),
+            ProtocolError::InvalidPacket(msg) => write!(f, "Invalid packet: {msg}"),
+            ProtocolError::AuthFailed(msg) => write!(f, "Authentication failed: {msg}"),
+            ProtocolError::Unsupported(msg) => write!(f, "Unsupported: {msg}"),
+            ProtocolError::Sql(e) => write!(f, "SQL error: {e}"),
+            ProtocolError::Planner(e) => write!(f, "Planner error: {e}"),
+            ProtocolError::Executor(e) => write!(f, "Executor error: {e}"),
+            ProtocolError::Transaction(e) => write!(f, "Transaction error: {e}"),
             ProtocolError::ConnectionClosed => write!(f, "Connection closed"),
-            ProtocolError::Tls(msg) => write!(f, "TLS error: {}", msg),
-            ProtocolError::Raft(msg) => write!(f, "Raft error: {}", msg),
-            ProtocolError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            ProtocolError::Tls(msg) => write!(f, "TLS error: {msg}"),
+            ProtocolError::Raft(msg) => write!(f, "Raft error: {msg}"),
+            ProtocolError::Internal(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }

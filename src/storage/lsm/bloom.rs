@@ -80,17 +80,17 @@ impl BloomFilter {
 /// Double hash using FNV-1a with two different seeds
 fn double_hash(key: &[u8]) -> (u64, u64) {
     // FNV-1a hash
-    let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in key {
         h1 ^= b as u64;
-        h1 = h1.wrapping_mul(0x100000001b3);
+        h1 = h1.wrapping_mul(0x0100_0000_01b3);
     }
 
     // Second hash: FNV-1a with different offset
-    let mut h2: u64 = 0x6c62272e07bb0142;
+    let mut h2: u64 = 0x6c62_272e_07bb_0142;
     for &b in key {
         h2 ^= b as u64;
-        h2 = h2.wrapping_mul(0x100000001b3);
+        h2 = h2.wrapping_mul(0x0100_0000_01b3);
     }
 
     (h1, h2)

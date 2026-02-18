@@ -73,7 +73,7 @@ impl Datum {
         match self {
             Datum::Int(i) => Some(*i),
             Datum::Float(f) => Some(*f as i64),
-            Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+            Datum::Bool(b) => Some(i64::from(*b)),
             Datum::Null => None,
             _ => None,
         }
@@ -125,7 +125,7 @@ impl Datum {
             Literal::String(s) => Datum::String(s.clone()),
             Literal::Blob(b) => Datum::Bytes(b.clone()),
             Literal::Placeholder(i) => {
-                panic!("Unsubstituted placeholder ?{} in plan execution", i)
+                panic!("Unsubstituted placeholder ?{i} in plan execution")
             }
         }
     }

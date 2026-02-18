@@ -157,10 +157,9 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
             Ok(Datum::Float(*a as f64 + b))
         }
-        (Datum::String(a), Datum::String(b)) => Ok(Datum::String(format!("{}{}", a, b))),
+        (Datum::String(a), Datum::String(b)) => Ok(Datum::String(format!("{a}{b}"))),
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "cannot add {:?} and {:?}",
-            left, right
+            "cannot add {left:?} and {right:?}"
         ))),
     }
 }
@@ -172,8 +171,7 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 - b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a - *b as f64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "cannot subtract {:?} from {:?}",
-            right, left
+            "cannot subtract {right:?} from {left:?}"
         ))),
     }
 }
@@ -186,8 +184,7 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
             Ok(Datum::Float(*a as f64 * b))
         }
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "cannot multiply {:?} and {:?}",
-            left, right
+            "cannot multiply {left:?} and {right:?}"
         ))),
     }
 }
@@ -214,8 +211,7 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 / b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a / *b as f64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "cannot divide {:?} by {:?}",
-            left, right
+            "cannot divide {left:?} by {right:?}"
         ))),
     }
 }
@@ -230,8 +226,7 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     match (left, right) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a % b)),
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "cannot compute modulo of {:?} and {:?}",
-            left, right
+            "cannot compute modulo of {left:?} and {right:?}"
         ))),
     }
 }
@@ -377,8 +372,7 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
         _ => Err(ExecutorError::InvalidOperation(format!(
-            "unknown function: {}",
-            name
+            "unknown function: {name}"
         ))),
     }
 }

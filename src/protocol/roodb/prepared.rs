@@ -158,14 +158,12 @@ pub fn count_placeholders(stmt: &Statement) -> u16 {
 /// or `None` if the column count cannot be determined statically
 /// (e.g. `SELECT *` requires catalog lookup).
 pub fn select_column_names(stmt: &Statement) -> Option<Vec<String>> {
-    let query = match stmt {
-        Statement::Query(q) => q,
-        _ => return None,
+    let Statement::Query(query) = stmt else {
+        return None;
     };
 
-    let select = match query.body.as_ref() {
-        sp::SetExpr::Select(s) => s,
-        _ => return None,
+    let sp::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
     };
 
     let mut names = Vec::new();
@@ -261,7 +259,7 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
                     expr: Box::new(Expr::Value(Value::Number(format!("{}", f.abs()), false))),
                 }
             } else {
-                Expr::Value(Value::Number(format!("{}", f), false))
+                Expr::Value(Value::Number(format!("{f}"), false))
             }
         }
         Datum::String(s) => Expr::Value(Value::SingleQuotedString(s.clone())),

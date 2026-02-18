@@ -343,21 +343,19 @@ where
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {e}")))?;
 
         // Find matching user row
         // system.users schema: username, host, password_hash, auth_plugin,
         //   ssl_subject, ssl_issuer, account_locked, password_expired, created_at, updated_at
         for (_key, value) in rows {
-            let row = match decode_row(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let Ok(row) = decode_row(&value) else {
+                continue;
             };
 
             // Get username from row (column 0)
-            let row_username = match row.get_opt(0) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
+            let Some(Datum::String(row_username)) = row.get_opt(0) else {
+                continue;
             };
 
             if row_username != username {
@@ -365,9 +363,8 @@ where
             }
 
             // Get host pattern from row (column 1)
-            let row_host = match row.get_opt(1) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
+            let Some(Datum::String(row_host)) = row.get_opt(1) else {
+                continue;
             };
 
             // Check if client host matches the host pattern
@@ -533,7 +530,7 @@ where
                 self.send_error(
                     codes::ER_UNKNOWN_COM_ERROR,
                     states::GENERAL_ERROR,
-                    &format!("Unsupported command: {:?}", cmd),
+                    &format!("Unsupported command: {cmd:?}"),
                 )
                 .await?;
                 Ok(true)
@@ -624,7 +621,7 @@ where
                     .send_error(
                         codes::ER_UNKNOWN_ERROR,
                         states::GENERAL_ERROR,
-                        &format!("Unknown prepared statement id: {}", statement_id),
+                        &format!("Unknown prepared statement id: {statement_id}"),
                     )
                     .await;
             }
@@ -1113,7 +1110,7 @@ where
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| format!("Failed to query grants: {}", e))?;
+            .map_err(|e| format!("Failed to query grants: {e}"))?;
 
         // Parse grants for this user
         let mut user_grants = Vec::new();
@@ -1157,9 +1154,8 @@ where
                     Datum::String(s) => s.as_str(),
                     _ => continue,
                 };
-                let privilege = match Privilege::parse(privilege_str) {
-                    Some(p) => p,
-                    None => continue,
+                let Some(privilege) = Privilege::parse(privilege_str) else {
+                    continue;
                 };
 
                 let object_type = match &values[4] {
@@ -1522,7 +1518,7 @@ where
                         .send_error(
                             codes::ER_UNKNOWN_ERROR,
                             states::GENERAL_ERROR,
-                            &format!("Raft commit failed: {}", e),
+                            &format!("Raft commit failed: {e}"),
                         )
                         .await;
                 }
@@ -1712,7 +1708,7 @@ where
                 "version_comment" => "RooDB",
                 _ => "", // Unknown variable, return empty string
             };
-            col_names.push(format!("@@{}", var_lower));
+            col_names.push(format!("@@{var_lower}"));
             values.push(value.to_string());
         }
 

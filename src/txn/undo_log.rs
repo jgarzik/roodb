@@ -290,7 +290,7 @@ impl UndoLog {
 
     /// Get count of undo records (for metrics/debugging)
     pub fn record_count(&self) -> usize {
-        self.records.read().values().map(|v| v.len()).sum()
+        self.records.read().values().map(std::vec::Vec::len).sum()
     }
 
     /// Get count of transactions with undo records

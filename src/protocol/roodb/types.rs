@@ -88,8 +88,8 @@ pub fn datatype_column_length(dt: &DataType) -> u32 {
         DataType::Float => 12,
         DataType::Double => 22,
         DataType::Varchar(n) => *n,
-        DataType::Text => 65535,
-        DataType::Blob => 65535,
+        DataType::Text => 65_535,
+        DataType::Blob => 65_535,
         DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
     }
 }
@@ -136,7 +136,7 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         Datum::Float(f) => {
             // Use enough precision for round-trip
             encode_length_encoded_string(
-                format!("{:.15}", f)
+                format!("{f:.15}")
                     .trim_end_matches('0')
                     .trim_end_matches('.'),
             )
@@ -155,8 +155,8 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
 fn format_timestamp(ts_millis: i64) -> String {
     // Simple formatting - in production would use chrono
     let secs = ts_millis / 1000;
-    let days_since_epoch = secs / 86400;
-    let time_of_day = (secs % 86400).unsigned_abs();
+    let days_since_epoch = secs / 86_400;
+    let time_of_day = (secs % 86_400).unsigned_abs();
 
     // Very basic date calculation (doesn't handle negative correctly, just for MVP)
     let (year, month, day) = days_to_ymd(days_since_epoch);
@@ -164,20 +164,17 @@ fn format_timestamp(ts_millis: i64) -> String {
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
 
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, hour, minute, second
-    )
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 
 /// Convert days since Unix epoch to (year, month, day)
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     // Simplified calculation - good enough for MVP
     // Based on the algorithm from Howard Hinnant
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -235,7 +232,7 @@ mod tests {
     #[test]
     fn test_format_timestamp() {
         // 2024-01-15 12:30:45 UTC
-        let ts = 1705321845000i64;
+        let ts = 1_705_321_845_000i64;
         let formatted = format_timestamp(ts);
         assert!(formatted.contains("2024"));
     }

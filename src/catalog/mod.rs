@@ -241,15 +241,15 @@ pub enum CatalogError {
 impl std::fmt::Display for CatalogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CatalogError::TableExists(name) => write!(f, "Table '{}' already exists", name),
-            CatalogError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
-            CatalogError::IndexExists(name) => write!(f, "Index '{}' already exists", name),
-            CatalogError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
+            CatalogError::TableExists(name) => write!(f, "Table '{name}' already exists"),
+            CatalogError::TableNotFound(name) => write!(f, "Table '{name}' not found"),
+            CatalogError::IndexExists(name) => write!(f, "Index '{name}' already exists"),
+            CatalogError::IndexNotFound(name) => write!(f, "Index '{name}' not found"),
             CatalogError::ColumnNotFound(table, col) => {
-                write!(f, "Column '{}' not found in table '{}'", col, table)
+                write!(f, "Column '{col}' not found in table '{table}'")
             }
-            CatalogError::InvalidName(msg) => write!(f, "Invalid name: {}", msg),
-            CatalogError::InvalidConstraint(msg) => write!(f, "Invalid constraint: {}", msg),
+            CatalogError::InvalidName(msg) => write!(f, "Invalid name: {msg}"),
+            CatalogError::InvalidConstraint(msg) => write!(f, "Invalid constraint: {msg}"),
         }
     }
 }
@@ -384,7 +384,10 @@ impl Catalog {
 
     /// List all table names
     pub fn list_tables(&self) -> Vec<&str> {
-        self.tables.keys().map(|s| s.as_str()).collect()
+        self.tables
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Get all table names as a HashSet (for efficient duplicate checking)

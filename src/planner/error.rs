@@ -16,9 +16,9 @@ pub enum PlannerError {
 impl fmt::Display for PlannerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlannerError::InvalidPlan(msg) => write!(f, "Invalid plan: {}", msg),
-            PlannerError::UnsupportedOperation(msg) => write!(f, "Unsupported operation: {}", msg),
-            PlannerError::Internal(msg) => write!(f, "Internal planner error: {}", msg),
+            PlannerError::InvalidPlan(msg) => write!(f, "Invalid plan: {msg}"),
+            PlannerError::UnsupportedOperation(msg) => write!(f, "Unsupported operation: {msg}"),
+            PlannerError::Internal(msg) => write!(f, "Internal planner error: {msg}"),
         }
     }
 }

@@ -50,8 +50,8 @@ pub enum ExecutorError {
 impl fmt::Display for ExecutorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExecutorError::Storage(e) => write!(f, "storage error: {}", e),
-            ExecutorError::Transaction(e) => write!(f, "transaction error: {}", e),
+            ExecutorError::Storage(e) => write!(f, "storage error: {e}"),
+            ExecutorError::Transaction(e) => write!(f, "transaction error: {e}"),
             ExecutorError::TypeMismatch {
                 expected,
                 got,
@@ -59,25 +59,23 @@ impl fmt::Display for ExecutorError {
             } => {
                 write!(
                     f,
-                    "type mismatch: expected {:?}, got {:?} in {}",
-                    expected, got, context
+                    "type mismatch: expected {expected:?}, got {got:?} in {context}"
                 )
             }
-            ExecutorError::InvalidOperation(msg) => write!(f, "invalid operation: {}", msg),
+            ExecutorError::InvalidOperation(msg) => write!(f, "invalid operation: {msg}"),
             ExecutorError::ColumnNotFound { table, column } => {
-                write!(f, "column not found: {}.{}", table, column)
+                write!(f, "column not found: {table}.{column}")
             }
             ExecutorError::ColumnIndexOutOfBounds { index, row_len } => {
                 write!(
                     f,
-                    "column index {} out of bounds (row has {} columns)",
-                    index, row_len
+                    "column index {index} out of bounds (row has {row_len} columns)"
                 )
             }
-            ExecutorError::NullValue(context) => write!(f, "null value in {}", context),
-            ExecutorError::TableNotFound(name) => write!(f, "table not found: {}", name),
-            ExecutorError::Encoding(msg) => write!(f, "encoding error: {}", msg),
-            ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
+            ExecutorError::NullValue(context) => write!(f, "null value in {context}"),
+            ExecutorError::TableNotFound(name) => write!(f, "table not found: {name}"),
+            ExecutorError::Encoding(msg) => write!(f, "encoding error: {msg}"),
+            ExecutorError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
 }

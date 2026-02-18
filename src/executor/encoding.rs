@@ -154,7 +154,7 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
         }
         Datum::Bool(b) => {
             buf.push(TAG_BOOL);
-            buf.push(if *b { 1 } else { 0 });
+            buf.push(u8::from(*b));
         }
         Datum::Int(i) => {
             buf.push(TAG_INT);
@@ -299,10 +299,7 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             Ok((Datum::Timestamp(t), 9))
         }
 
-        _ => Err(ExecutorError::Encoding(format!(
-            "unknown datum tag: {}",
-            tag
-        ))),
+        _ => Err(ExecutorError::Encoding(format!("unknown datum tag: {tag}"))),
     }
 }
 
