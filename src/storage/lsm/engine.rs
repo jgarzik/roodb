@@ -249,9 +249,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             prepare_l0_compaction(&mut manifest)
         };
 
-        let job = match job {
-            Some(j) => j,
-            None => return Ok(()),
+        let Some(job) = job else {
+            return Ok(());
         };
 
         let new_file = execute_l0_compaction(&*self.factory, &job).await?;
@@ -299,9 +298,8 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 prepare_level_compaction(&mut manifest, level)
             };
 
-            let job = match job {
-                Some(j) => j,
-                None => continue,
+            let Some(job) = job else {
+                continue;
             };
 
             tracing::debug!(
@@ -656,9 +654,8 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                 imm.first().cloned()
             };
 
-            let mem = match mem {
-                Some(m) => m,
-                None => break, // No more memtables to flush
+            let Some(mem) = mem else {
+                break; // No more memtables to flush
             };
 
             // Flush to disk (memtable still visible in imm_memtables during this)
@@ -667,7 +664,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             // Now safe to remove - data is on disk
             {
                 let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                if imm.first().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
                     imm.remove(0);
                 }
             }
@@ -701,9 +698,8 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                 imm.first().cloned()
             };
 
-            let mem = match mem {
-                Some(m) => m,
-                None => break, // No more memtables to flush
+            let Some(mem) = mem else {
+                break; // No more memtables to flush
             };
 
             // Flush to disk (memtable still visible in imm_memtables during this)
@@ -713,7 +709,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             // Now safe to remove - data is on disk
             {
                 let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                if imm.first().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
                     imm.remove(0);
                 }
             }
@@ -742,16 +738,15 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
                 imm.first().cloned()
             };
 
-            let mem = match mem {
-                Some(m) => m,
-                None => break,
+            let Some(mem) = mem else {
+                break;
             };
 
             self.flush_memtable(Arc::clone(&mem)).await?;
 
             {
                 let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
+                if imm.first().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
                     imm.remove(0);
                 }
             }

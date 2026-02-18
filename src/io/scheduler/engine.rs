@@ -830,24 +830,17 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
 
         // If file not found, try to open it (for background ops that arrive
         // before explicit open, e.g., compaction on previously closed files)
-        let io = match io_opt {
-            Some(io) => io,
-            None => {
-                // File not registered - fail all ops
-                for op in ops {
-                    let result = match op.op {
-                        BatchOp::Read { .. } => {
-                            BatchResult::Read(Err("File not found".to_string()))
-                        }
-                        BatchOp::Write { .. } => {
-                            BatchResult::Write(Err("File not found".to_string()))
-                        }
-                        BatchOp::Sync => BatchResult::Sync(Err("File not found".to_string())),
-                    };
-                    let _ = op.tx.send(result);
-                }
-                return;
+        let Some(io) = io_opt else {
+            // File not registered - fail all ops
+            for op in ops {
+                let result = match op.op {
+                    BatchOp::Read { .. } => BatchResult::Read(Err("File not found".to_string())),
+                    BatchOp::Write { .. } => BatchResult::Write(Err("File not found".to_string())),
+                    BatchOp::Sync => BatchResult::Sync(Err("File not found".to_string())),
+                };
+                let _ = op.tx.send(result);
             }
+            return;
         };
 
         // Separate operations by type for batch submission
@@ -885,7 +878,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
             for tx in syncs {
                 let batch_result = match &result {
                     Ok(()) => BatchResult::Sync(Ok(())),
-                    Err(e) => BatchResult::Sync(Err(format!("{}", e))),
+                    Err(e) => BatchResult::Sync(Err(format!("{e}"))),
                 };
                 let _ = tx.send(batch_result);
             }
@@ -911,7 +904,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                         self.metrics.record_read(buf.len());
                         BatchResult::Read(Ok(buf))
                     }
-                    Err(e) => BatchResult::Read(Err(format!("{}", e))),
+                    Err(e) => BatchResult::Read(Err(format!("{e}"))),
                 };
                 let _ = tx.send(batch_result);
             }
@@ -921,7 +914,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                 let mut buf = match AlignedBuffer::new(size) {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = tx.send(BatchResult::Read(Err(format!("{}", e))));
+                        let _ = tx.send(BatchResult::Read(Err(format!("{e}"))));
                         continue;
                     }
                 };
@@ -934,7 +927,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                         self.metrics.record_read(buf.len());
                         BatchResult::Read(Ok(buf))
                     }
-                    Err(e) => BatchResult::Read(Err(format!("{}", e))),
+                    Err(e) => BatchResult::Read(Err(format!("{e}"))),
                 };
                 let _ = tx.send(batch_result);
             }
@@ -972,7 +965,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                         self.metrics.record_write(bytes);
                         BatchResult::Write(Ok(bytes))
                     }
-                    Err(e) => BatchResult::Write(Err(format!("{}", e))),
+                    Err(e) => BatchResult::Write(Err(format!("{e}"))),
                 };
                 let _ = tx.send(batch_result);
             }
@@ -988,7 +981,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                         self.metrics.record_write(bytes);
                         BatchResult::Write(Ok(bytes))
                     }
-                    Err(e) => BatchResult::Write(Err(format!("{}", e))),
+                    Err(e) => BatchResult::Write(Err(format!("{e}"))),
                 };
                 let _ = tx.send(batch_result);
             }

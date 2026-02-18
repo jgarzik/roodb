@@ -305,7 +305,7 @@ impl LogicalPlanBuilder {
         for (idx, item) in columns.iter().enumerate() {
             if let ResolvedSelectItem::Expr { expr, alias } = item {
                 if let Some(agg) = Self::extract_aggregate(expr) {
-                    let name = alias.clone().unwrap_or_else(|| format!("agg_{}", idx));
+                    let name = alias.clone().unwrap_or_else(|| format!("agg_{idx}"));
                     aggregates.push((agg, name));
                 }
             }
@@ -633,9 +633,9 @@ impl LogicalPlanBuilder {
                 Literal::Boolean(b) => b.to_string(),
                 Literal::Null => "NULL".to_string(),
                 Literal::Blob(_) => "blob".to_string(),
-                Literal::Placeholder(n) => format!("?{}", n),
+                Literal::Placeholder(n) => format!("?{n}"),
             },
-            _ => format!("expr_{}", idx),
+            _ => format!("expr_{idx}"),
         }
     }
 

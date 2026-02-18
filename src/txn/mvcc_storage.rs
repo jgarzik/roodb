@@ -58,7 +58,7 @@ impl MvccStorage {
         let mut result = Vec::with_capacity(ROW_HEADER_SIZE + data.len());
         result.extend_from_slice(&txn_id.to_le_bytes());
         result.extend_from_slice(&roll_ptr.to_le_bytes());
-        result.push(if deleted { 1 } else { 0 });
+        result.push(u8::from(deleted));
         result.extend_from_slice(data);
         result
     }
@@ -99,9 +99,8 @@ impl MvccStorage {
     ///
     /// Traverses the version chain if needed to find a visible version.
     pub async fn get(&self, key: &[u8], read_view: &ReadView) -> StorageResult<Option<Vec<u8>>> {
-        let encoded = match self.inner.get(key).await? {
-            Some(data) => data,
-            None => return Ok(None),
+        let Some(encoded) = self.inner.get(key).await? else {
+            return Ok(None);
         };
 
         self.find_visible_version_owned(encoded, read_view).await
@@ -116,9 +115,8 @@ impl MvccStorage {
         key: &[u8],
         read_view: &ReadView,
     ) -> StorageResult<Option<(Vec<u8>, u64)>> {
-        let encoded = match self.inner.get(key).await? {
-            Some(data) => data,
-            None => return Ok(None),
+        let Some(encoded) = self.inner.get(key).await? else {
+            return Ok(None);
         };
 
         self.find_visible_version_with_txn_id(&encoded, read_view)
@@ -131,12 +129,9 @@ impl MvccStorage {
         mut encoded: Vec<u8>,
         read_view: &ReadView,
     ) -> StorageResult<Option<Vec<u8>>> {
-        let (txn_id, roll_ptr, deleted) = match Self::decode_row(&encoded) {
-            Some((tid, rp, del, _data)) => (tid, rp, del),
-            None => {
-                // Legacy row without MVCC header - treat as always visible
-                return Ok(Some(encoded));
-            }
+        let Some((txn_id, roll_ptr, deleted, _data)) = Self::decode_row(&encoded) else {
+            // Legacy row without MVCC header - treat as always visible
+            return Ok(Some(encoded));
         };
 
         if read_view.is_visible(txn_id) {
@@ -163,12 +158,9 @@ impl MvccStorage {
         }
 
         // Get the undo record
-        let undo_record = match self.txn_manager.undo_log().get_by_roll_ptr(roll_ptr) {
-            Some(record) => record,
-            None => {
-                // Undo record was purged - no older versions available
-                return Ok(None);
-            }
+        let Some(undo_record) = self.txn_manager.undo_log().get_by_roll_ptr(roll_ptr) else {
+            // Undo record was purged - no older versions available
+            return Ok(None);
         };
 
         // Check if this older version is visible
@@ -239,9 +231,8 @@ impl MvccStorage {
     /// allowing older transactions to still see it.
     pub async fn delete(&self, key: &[u8], txn_id: u64) -> TransactionResult<()> {
         // Get existing row
-        let existing = match self.inner.get(key).await? {
-            Some(data) => data,
-            None => return Ok(()), // Row doesn't exist, nothing to delete
+        let Some(existing) = self.inner.get(key).await? else {
+            return Ok(()); // Row doesn't exist, nothing to delete
         };
 
         let (old_txn_id, old_roll_ptr, old_data) =
@@ -320,12 +311,9 @@ impl MvccStorage {
         encoded: &[u8],
         read_view: &ReadView,
     ) -> StorageResult<Option<(Vec<u8>, u64)>> {
-        let (txn_id, roll_ptr, deleted, data) = match Self::decode_row(encoded) {
-            Some(decoded) => decoded,
-            None => {
-                // Legacy row without MVCC header - treat as always visible with txn_id 0
-                return Ok(Some((encoded.to_vec(), 0)));
-            }
+        let Some((txn_id, roll_ptr, deleted, data)) = Self::decode_row(encoded) else {
+            // Legacy row without MVCC header - treat as always visible with txn_id 0
+            return Ok(Some((encoded.to_vec(), 0)));
         };
 
         // Check if this version is visible
@@ -352,9 +340,8 @@ impl MvccStorage {
             return Ok(None);
         }
 
-        let undo_record = match self.txn_manager.undo_log().get_by_roll_ptr(roll_ptr) {
-            Some(record) => record,
-            None => return Ok(None),
+        let Some(undo_record) = self.txn_manager.undo_log().get_by_roll_ptr(roll_ptr) else {
+            return Ok(None);
         };
 
         if read_view.is_visible(undo_record.old_trx_id) {

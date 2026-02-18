@@ -36,7 +36,7 @@ impl ExplainOutput {
                 )
                 .unwrap();
                 if let Some(f) = filter {
-                    writeln!(out, "{}  filter: {:?}", prefix, f).unwrap();
+                    writeln!(out, "{prefix}  filter: {f:?}").unwrap();
                 }
             }
 
@@ -82,12 +82,12 @@ impl ExplainOutput {
                 )
                 .unwrap();
                 if let Some(f) = remaining_filter {
-                    writeln!(out, "{}  remaining_filter: {:?}", prefix, f).unwrap();
+                    writeln!(out, "{prefix}  remaining_filter: {f:?}").unwrap();
                 }
             }
 
             PhysicalPlan::Filter { input, predicate } => {
-                writeln!(out, "{}Filter: {:?}", prefix, predicate).unwrap();
+                writeln!(out, "{prefix}Filter: {predicate:?}").unwrap();
                 Self::format_node(input, indent + 1, out);
             }
 
@@ -103,13 +103,13 @@ impl ExplainOutput {
                 join_type,
                 condition,
             } => {
-                writeln!(out, "{}NestedLoopJoin: {:?}", prefix, join_type).unwrap();
+                writeln!(out, "{prefix}NestedLoopJoin: {join_type:?}").unwrap();
                 if let Some(cond) = condition {
-                    writeln!(out, "{}  condition: {:?}", prefix, cond).unwrap();
+                    writeln!(out, "{prefix}  condition: {cond:?}").unwrap();
                 }
-                writeln!(out, "{}  left:", prefix).unwrap();
+                writeln!(out, "{prefix}  left:").unwrap();
                 Self::format_node(left, indent + 2, out);
-                writeln!(out, "{}  right:", prefix).unwrap();
+                writeln!(out, "{prefix}  right:").unwrap();
                 Self::format_node(right, indent + 2, out);
             }
 
@@ -124,7 +124,7 @@ impl ExplainOutput {
                 let keys: Vec<_> = left_keys
                     .iter()
                     .zip(right_keys.iter())
-                    .map(|(l, r)| format!("L{} = R{}", l, r))
+                    .map(|(l, r)| format!("L{l} = R{r}"))
                     .collect();
                 writeln!(
                     out,
@@ -135,11 +135,11 @@ impl ExplainOutput {
                 )
                 .unwrap();
                 if let Some(cond) = condition {
-                    writeln!(out, "{}  remaining: {:?}", prefix, cond).unwrap();
+                    writeln!(out, "{prefix}  remaining: {cond:?}").unwrap();
                 }
-                writeln!(out, "{}  left:", prefix).unwrap();
+                writeln!(out, "{prefix}  left:").unwrap();
                 Self::format_node(left, indent + 2, out);
-                writeln!(out, "{}  right:", prefix).unwrap();
+                writeln!(out, "{prefix}  right:").unwrap();
                 Self::format_node(right, indent + 2, out);
             }
 
@@ -149,7 +149,7 @@ impl ExplainOutput {
                 aggregates,
             } => {
                 let agg_names: Vec<_> = aggregates.iter().map(|(a, _)| a.name.as_str()).collect();
-                writeln!(out, "{}HashAggregate", prefix).unwrap();
+                writeln!(out, "{prefix}HashAggregate").unwrap();
                 if !group_by.is_empty() {
                     writeln!(out, "{}  group by: {} expressions", prefix, group_by.len()).unwrap();
                 }
@@ -175,22 +175,22 @@ impl ExplainOutput {
             } => {
                 let mut parts = Vec::new();
                 if let Some(l) = limit {
-                    parts.push(format!("limit={}", l));
+                    parts.push(format!("limit={l}"));
                 }
                 if let Some(o) = offset {
-                    parts.push(format!("offset={}", o));
+                    parts.push(format!("offset={o}"));
                 }
                 writeln!(out, "{}Limit: {}", prefix, parts.join(", ")).unwrap();
                 Self::format_node(input, indent + 1, out);
             }
 
             PhysicalPlan::HashDistinct { input } => {
-                writeln!(out, "{}HashDistinct", prefix).unwrap();
+                writeln!(out, "{prefix}HashDistinct").unwrap();
                 Self::format_node(input, indent + 1, out);
             }
 
             PhysicalPlan::SingleRow => {
-                writeln!(out, "{}SingleRow (TABLE_DEE)", prefix).unwrap();
+                writeln!(out, "{prefix}SingleRow (TABLE_DEE)").unwrap();
             }
 
             PhysicalPlan::Insert { table, values, .. } => {
@@ -198,33 +198,33 @@ impl ExplainOutput {
             }
 
             PhysicalPlan::Update { table, filter, .. } => {
-                writeln!(out, "{}Update: {}", prefix, table).unwrap();
+                writeln!(out, "{prefix}Update: {table}").unwrap();
                 if let Some(f) = filter {
-                    writeln!(out, "{}  filter: {:?}", prefix, f).unwrap();
+                    writeln!(out, "{prefix}  filter: {f:?}").unwrap();
                 }
             }
 
             PhysicalPlan::Delete { table, filter, .. } => {
-                writeln!(out, "{}Delete: {}", prefix, table).unwrap();
+                writeln!(out, "{prefix}Delete: {table}").unwrap();
                 if let Some(f) = filter {
-                    writeln!(out, "{}  filter: {:?}", prefix, f).unwrap();
+                    writeln!(out, "{prefix}  filter: {f:?}").unwrap();
                 }
             }
 
             PhysicalPlan::CreateTable { name, .. } => {
-                writeln!(out, "{}CreateTable: {}", prefix, name).unwrap();
+                writeln!(out, "{prefix}CreateTable: {name}").unwrap();
             }
 
             PhysicalPlan::DropTable { name, .. } => {
-                writeln!(out, "{}DropTable: {}", prefix, name).unwrap();
+                writeln!(out, "{prefix}DropTable: {name}").unwrap();
             }
 
             PhysicalPlan::CreateIndex { name, table, .. } => {
-                writeln!(out, "{}CreateIndex: {} on {}", prefix, name, table).unwrap();
+                writeln!(out, "{prefix}CreateIndex: {name} on {table}").unwrap();
             }
 
             PhysicalPlan::DropIndex { name } => {
-                writeln!(out, "{}DropIndex: {}", prefix, name).unwrap();
+                writeln!(out, "{prefix}DropIndex: {name}").unwrap();
             }
 
             PhysicalPlan::CreateUser { username, host, .. } => {
@@ -277,7 +277,7 @@ impl ExplainOutput {
                 if let Some((user, host)) = for_user {
                     writeln!(out, "{}ShowGrants: for {}@{}", prefix, user, host.as_str()).unwrap();
                 } else {
-                    writeln!(out, "{}ShowGrants: for current user", prefix).unwrap();
+                    writeln!(out, "{prefix}ShowGrants: for current user").unwrap();
                 }
             }
         }

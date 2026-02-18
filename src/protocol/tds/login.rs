@@ -70,7 +70,7 @@ fn decode_password(data: &[u8]) -> String {
         .iter()
         .map(|&b| {
             let unswapped = b ^ 0xA5;
-            (unswapped >> 4) | (unswapped << 4)
+            unswapped.rotate_left(4)
         })
         .collect();
     decode_ucs2(&deobfuscated)

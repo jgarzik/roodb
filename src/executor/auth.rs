@@ -98,7 +98,7 @@ impl Executor for CreateUser {
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
         for (_key, value) in rows {
             let row = super::encoding::decode_row(&value)?;
@@ -155,7 +155,7 @@ impl Executor for CreateUser {
         self.raft_node
             .propose_changes(changeset)
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
 
         // Store change for take_changes
         self.changes
@@ -234,7 +234,7 @@ impl Executor for DropUser {
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
         let mut found = false;
         let mut changeset = ChangeSet::new(0);
@@ -272,7 +272,7 @@ impl Executor for DropUser {
                 .storage
                 .scan(Some(&grant_prefix), Some(&grant_end))
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
             for (key, value) in grant_rows {
                 let row = super::encoding::decode_row(&value)?;
@@ -290,11 +290,11 @@ impl Executor for DropUser {
             self.raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
         }
 
         self.done = true;
-        Ok(Some(Row::new(vec![Datum::Int(if found { 1 } else { 0 })])))
+        Ok(Some(Row::new(vec![Datum::Int(i64::from(found))])))
     }
 
     async fn close(&mut self) -> ExecutorResult<()> {
@@ -366,7 +366,7 @@ impl Executor for AlterUser {
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
         let mut found_key = None;
         let mut found_row = None;
@@ -384,15 +384,12 @@ impl Executor for AlterUser {
             }
         }
 
-        let (key, old_row) = match (found_key, found_row) {
-            (Some(k), Some(r)) => (k, r),
-            _ => {
-                return Err(ExecutorError::Internal(format!(
-                    "User '{}@{}' does not exist",
-                    self.username,
-                    self.host.as_str()
-                )));
-            }
+        let (Some(key), Some(old_row)) = (found_key, found_row) else {
+            return Err(ExecutorError::Internal(format!(
+                "User '{}@{}' does not exist",
+                self.username,
+                self.host.as_str()
+            )));
         };
 
         // Build updated row with new password hash
@@ -421,7 +418,7 @@ impl Executor for AlterUser {
         self.raft_node
             .propose_changes(changeset)
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(1)])))
@@ -496,7 +493,7 @@ impl Executor for SetPassword {
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
         let mut found_key = None;
         let mut found_row = None;
@@ -514,15 +511,12 @@ impl Executor for SetPassword {
             }
         }
 
-        let (key, old_row) = match (found_key, found_row) {
-            (Some(k), Some(r)) => (k, r),
-            _ => {
-                return Err(ExecutorError::Internal(format!(
-                    "User '{}@{}' does not exist",
-                    self.username,
-                    self.host.as_str()
-                )));
-            }
+        let (Some(key), Some(old_row)) = (found_key, found_row) else {
+            return Err(ExecutorError::Internal(format!(
+                "User '{}@{}' does not exist",
+                self.username,
+                self.host.as_str()
+            )));
         };
 
         // Build updated row with new password hash
@@ -548,7 +542,7 @@ impl Executor for SetPassword {
         self.raft_node
             .propose_changes(changeset)
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(1)])))
@@ -675,7 +669,7 @@ impl Executor for Grant {
         self.raft_node
             .propose_changes(changeset)
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(count)])))
@@ -741,11 +735,11 @@ impl Revoke {
         match (&self.object, object_type.as_deref()) {
             (PrivilegeObject::Global, Some("GLOBAL")) => true,
             (PrivilegeObject::Database(db), Some("DATABASE")) => {
-                db_name.as_ref().map(|d| d == db).unwrap_or(false)
+                db_name.as_ref().is_some_and(|d| d == db)
             }
             (PrivilegeObject::Table { database, table }, Some("TABLE")) => {
-                db_name.as_ref().map(|d| d == database).unwrap_or(false)
-                    && table_name.as_ref().map(|t| t == table).unwrap_or(false)
+                db_name.as_ref().is_some_and(|d| d == database)
+                    && table_name.as_ref().is_some_and(|t| t == table)
             }
             _ => false,
         }
@@ -786,7 +780,7 @@ impl Executor for Revoke {
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
         let mut changeset = ChangeSet::new(0);
         let mut count = 0;
@@ -799,19 +793,14 @@ impl Executor for Revoke {
             let grantee_host = get_string(row.get_opt(1));
             let privilege = get_string(row.get_opt(3));
 
-            if grantee
-                .as_ref()
-                .map(|g| g == &self.grantee)
-                .unwrap_or(false)
+            if grantee.as_ref().is_some_and(|g| g == &self.grantee)
                 && grantee_host
                     .as_deref()
-                    .map(|h| h == self.grantee_host.as_str())
-                    .unwrap_or(false)
+                    .is_some_and(|h| h == self.grantee_host.as_str())
                 && self.matches_object(&row)
                 && privilege
                     .as_ref()
-                    .map(|p| privs_to_revoke.contains(p))
-                    .unwrap_or(false)
+                    .is_some_and(|p| privs_to_revoke.contains(p))
             {
                 changeset.push(RowChange::delete(SYSTEM_GRANTS, key.clone()));
                 self.changes.push(RowChange::delete(SYSTEM_GRANTS, key));
@@ -823,7 +812,7 @@ impl Executor for Revoke {
             self.raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
         }
 
         self.done = true;
@@ -888,7 +877,7 @@ impl Executor for ShowGrants {
                 .storage
                 .scan(Some(&prefix), Some(&end))
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Storage error: {e}")))?;
 
             for (_key, value) in rows {
                 let row = super::encoding::decode_row(&value)?;
@@ -898,11 +887,8 @@ impl Executor for ShowGrants {
 
                 // Check if this grant is for the requested user
                 if let Some((ref username, ref host)) = self.for_user {
-                    if grantee.as_ref().map(|g| g != username).unwrap_or(true)
-                        || grantee_host
-                            .as_deref()
-                            .map(|h| h != host.as_str())
-                            .unwrap_or(true)
+                    if (grantee.as_ref() != Some(username))
+                        || grantee_host.as_deref().is_none_or(|h| h != host.as_str())
                     {
                         continue;
                     }

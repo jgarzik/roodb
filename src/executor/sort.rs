@@ -65,7 +65,7 @@ impl Executor for Sort {
         // Sort by keys
         keyed_rows.sort_by(|(keys_a, _), (keys_b, _)| {
             for (i, (key_a, key_b)) in keys_a.iter().zip(keys_b.iter()).enumerate() {
-                let ascending = order_by.get(i).map(|(_, asc)| *asc).unwrap_or(true);
+                let ascending = order_by.get(i).is_none_or(|(_, asc)| *asc);
                 let cmp = key_a.cmp(key_b);
                 let cmp = if ascending { cmp } else { cmp.reverse() };
                 if cmp != std::cmp::Ordering::Equal {

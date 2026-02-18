@@ -57,7 +57,7 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
     match datum {
         Datum::Null => vec![], // handled by null bitmap
 
-        Datum::Bool(b) => vec![if *b { 1 } else { 0 }],
+        Datum::Bool(b) => vec![u8::from(*b)],
 
         Datum::Int(i) => match data_type {
             DataType::TinyInt | DataType::Boolean => vec![*i as u8],
@@ -100,8 +100,8 @@ fn encode_binary_timestamp(ts_millis: i64) -> Vec<u8> {
     }
 
     let secs = ts_millis / 1000;
-    let days_since_epoch = secs / 86400;
-    let time_of_day = (secs % 86400).unsigned_abs();
+    let days_since_epoch = secs / 86_400;
+    let time_of_day = (secs % 86_400).unsigned_abs();
 
     let (year, month, day) = days_to_ymd(days_since_epoch);
     let hour = (time_of_day / 3600) as u8;
@@ -124,10 +124,10 @@ fn encode_binary_timestamp(ts_millis: i64) -> Vec<u8> {
 /// Convert days since Unix epoch to (year, month, day)
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     // Reuse the algorithm from types.rs
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;

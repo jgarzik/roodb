@@ -90,7 +90,7 @@ impl<R: AsyncRead + Unpin> TdsReader<R> {
             let status = header[1];
             let length = u16::from_be_bytes([header[2], header[3]]) as usize;
 
-            if length < HEADER_SIZE || length > MAX_PACKET_SIZE {
+            if !(HEADER_SIZE..=MAX_PACKET_SIZE).contains(&length) {
                 return Err(PacketError::TooLarge(length));
             }
 

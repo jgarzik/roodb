@@ -26,21 +26,17 @@ pub enum SqlError {
 impl fmt::Display for SqlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SqlError::Parse(msg) => write!(f, "Parse error: {}", msg),
-            SqlError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
-            SqlError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
+            SqlError::Parse(msg) => write!(f, "Parse error: {msg}"),
+            SqlError::TableNotFound(name) => write!(f, "Table '{name}' not found"),
+            SqlError::ColumnNotFound(name) => write!(f, "Column '{name}' not found"),
             SqlError::AmbiguousColumn(name) => {
-                write!(f, "Column '{}' is ambiguous", name)
+                write!(f, "Column '{name}' is ambiguous")
             }
             SqlError::TypeMismatch { expected, found } => {
-                write!(
-                    f,
-                    "Type mismatch: expected {:?}, found {:?}",
-                    expected, found
-                )
+                write!(f, "Type mismatch: expected {expected:?}, found {found:?}")
             }
-            SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
-            SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {msg}"),
+            SqlError::Unsupported(msg) => write!(f, "Unsupported: {msg}"),
         }
     }
 }

@@ -73,7 +73,7 @@ impl Entry {
 
     /// Get encoded size of this entry
     pub fn encoded_size(&self) -> usize {
-        ENTRY_HEADER_SIZE + self.key.len() + self.value.as_ref().map(|v| v.len()).unwrap_or(0)
+        ENTRY_HEADER_SIZE + self.key.len() + self.value.as_ref().map_or(0, std::vec::Vec::len)
     }
 
     /// Encode entry to bytes

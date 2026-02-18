@@ -170,8 +170,7 @@ pub fn table_def_to_columns_rows(def: &TableDef) -> Vec<Row> {
                 Datum::Bool(col.nullable),
                 col.default
                     .as_ref()
-                    .map(|d| Datum::String(d.clone()))
-                    .unwrap_or(Datum::Null),
+                    .map_or(Datum::Null, |d| Datum::String(d.clone())),
                 Datum::Bool(col.auto_increment),
             ])
         })
@@ -188,7 +187,7 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::BigInt => "BIGINT".to_string(),
         DataType::Float => "FLOAT".to_string(),
         DataType::Double => "DOUBLE".to_string(),
-        DataType::Varchar(n) => format!("VARCHAR({})", n),
+        DataType::Varchar(n) => format!("VARCHAR({n})"),
         DataType::Text => "TEXT".to_string(),
         DataType::Blob => "BLOB".to_string(),
         DataType::Timestamp => "TIMESTAMP".to_string(),
@@ -257,10 +256,10 @@ pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
                 Datum::String(def.name.clone()),
                 Datum::Int(ordinal as i64),
                 Datum::String(constraint_type.to_string()),
-                columns.map(Datum::String).unwrap_or(Datum::Null),
-                ref_table.map(Datum::String).unwrap_or(Datum::Null),
-                ref_columns.map(Datum::String).unwrap_or(Datum::Null),
-                check_expr.map(Datum::String).unwrap_or(Datum::Null),
+                columns.map_or(Datum::Null, Datum::String),
+                ref_table.map_or(Datum::Null, Datum::String),
+                ref_columns.map_or(Datum::Null, Datum::String),
+                check_expr.map_or(Datum::Null, Datum::String),
             ])
         })
         .collect()
@@ -287,7 +286,11 @@ pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
             };
 
             let columns = match &row.values()[3] {
-                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
+                Datum::String(s) => Some(
+                    s.split(',')
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>(),
+                ),
                 Datum::Null => None,
                 _ => return None,
             };
@@ -299,7 +302,11 @@ pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
             };
 
             let ref_columns = match &row.values()[5] {
-                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
+                Datum::String(s) => Some(
+                    s.split(',')
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>(),
+                ),
                 Datum::Null => None,
                 _ => return None,
             };
@@ -411,7 +418,10 @@ pub fn row_to_index_def(row: &Row) -> Option<IndexDef> {
         _ => return None,
     };
 
-    let columns: Vec<String> = columns_str.split(',').map(|s| s.to_string()).collect();
+    let columns: Vec<String> = columns_str
+        .split(',')
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let mut def = IndexDef::new(index_name, table_name, columns);
     if is_unique {

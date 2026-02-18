@@ -4,7 +4,7 @@
 //! packet type with sp_executesql (proc ID 10). The parameters are:
 //!   1. SQL text (unnamed, NVARCHAR max/PLP)
 //!   2. Parameter declarations string (unnamed, NVARCHAR max/PLP)
-//!   3+ Named parameter values (various types)
+//!      3+ Named parameter values (various types)
 //!
 //! This module parses those parameters from the wire format and substitutes
 //! @name references in the SQL with their literal values.
@@ -129,7 +129,7 @@ fn read_plp_string(data: &[u8], pos: &mut usize, is_nchar: bool) -> Option<Strin
     *pos += 8;
 
     // NULL
-    if total_size == 0xFFFFFFFFFFFFFFFF {
+    if total_size == 0xFFFF_FFFF_FFFF_FFFF {
         return Some(String::new());
     }
 
@@ -171,7 +171,7 @@ fn read_plp_bytes(data: &[u8], pos: &mut usize) -> Option<Option<Vec<u8>>> {
     ]);
     *pos += 8;
 
-    if total_size == 0xFFFFFFFFFFFFFFFF {
+    if total_size == 0xFFFF_FFFF_FFFF_FFFF {
         return Some(None); // NULL
     }
 
@@ -386,7 +386,7 @@ fn parse_decimal_value(data: &[u8], pos: &mut usize) -> Option<String> {
     // Format as decimal string with proper scale
     if scale == 0 {
         let s = magnitude.to_string();
-        return Some(if sign == 0 { format!("-{}", s) } else { s });
+        return Some(if sign == 0 { format!("-{s}") } else { s });
     }
 
     let s = magnitude.to_string();
@@ -400,7 +400,7 @@ fn parse_decimal_value(data: &[u8], pos: &mut usize) -> Option<String> {
     };
 
     Some(if sign == 0 {
-        format!("-{}", literal)
+        format!("-{literal}")
     } else {
         literal
     })
@@ -440,7 +440,7 @@ fn parse_nvarchar_value(data: &[u8], pos: &mut usize, is_nchar: bool) -> Option<
 
     // Escape for SQL literal: replace ' with ''
     let escaped = raw_str.replace('\'', "''");
-    Some(format!("'{}'", escaped))
+    Some(format!("'{escaped}'"))
 }
 
 /// VARBINARY (0xA5) parameter value.
@@ -493,7 +493,7 @@ fn parse_datetime2_value(data: &[u8], pos: &mut usize) -> Option<String> {
     // time bytes = val_len - 3, date bytes = 3
     let time_len = val_len - 3;
     let (time_str, date_str) = decode_time_date(val_data, time_len, scale);
-    Some(format!("'{} {}'", date_str, time_str))
+    Some(format!("'{date_str} {time_str}'"))
 }
 
 /// DATENTYPE (0x28): no scale byte, value_len(1) + 3 bytes date.
@@ -511,7 +511,7 @@ fn parse_date_value(data: &[u8], pos: &mut usize) -> Option<String> {
     *pos += val_len;
 
     let date_str = days_to_date(days);
-    Some(format!("'{}'", date_str))
+    Some(format!("'{date_str}'"))
 }
 
 /// TIMENTYPE (0x29): scale(1) then value_len(1) + time bytes.
@@ -531,7 +531,7 @@ fn parse_time_value(data: &[u8], pos: &mut usize) -> Option<String> {
     check_remaining(data, *pos, val_len)?;
     let time_str = decode_time_only(&data[*pos..*pos + val_len], scale);
     *pos += val_len;
-    Some(format!("'{}'", time_str))
+    Some(format!("'{time_str}'"))
 }
 
 /// DATETIMEOFFSETNTYPE (0x2B): scale(1) then value_len(1) + time + date + offset(2).
@@ -558,10 +558,7 @@ fn parse_datetimeoffset_value(data: &[u8], pos: &mut usize) -> Option<String> {
     let offset_minutes = i16::from_le_bytes([val_data[val_len - 2], val_data[val_len - 1]]) as i32;
     let off_h = offset_minutes / 60;
     let off_m = (offset_minutes % 60).abs();
-    Some(format!(
-        "'{} {}{:+03}:{:02}'",
-        date_str, time_str, off_h, off_m
-    ))
+    Some(format!("'{date_str} {time_str}{off_h:+03}:{off_m:02}'"))
 }
 
 /// DATETIMNTYPE (0x6F): width(1) then value_len(1) + value.
@@ -590,7 +587,7 @@ fn parse_datetimen_value(data: &[u8], pos: &mut usize) -> Option<String> {
                 u32::from_le_bytes([val_data[4], val_data[5], val_data[6], val_data[7]]) as u64;
 
             // days since 1900-01-01
-            let total_days = 693595 + days as i64; // 1900-01-01 is day 693595 from 0001-01-01
+            let total_days = 693_595 + days as i64; // 1900-01-01 is day 693_595 from 0001-01-01
             let date_str = days_to_date(total_days);
 
             let total_ms = ticks * 10 / 3; // 1/300 sec to milliseconds
@@ -599,20 +596,17 @@ fn parse_datetimen_value(data: &[u8], pos: &mut usize) -> Option<String> {
             let h = secs / 3600;
             let m = (secs % 3600) / 60;
             let s = secs % 60;
-            Some(format!(
-                "'{} {:02}:{:02}:{:02}.{:03}'",
-                date_str, h, m, s, ms
-            ))
+            Some(format!("'{date_str} {h:02}:{m:02}:{s:02}.{ms:03}'"))
         }
         4 => {
             // smalldatetime: 2 bytes days since 1900-01-01 + 2 bytes minutes
             let days = u16::from_le_bytes([val_data[0], val_data[1]]) as i64;
             let mins = u16::from_le_bytes([val_data[2], val_data[3]]) as u64;
-            let total_days = 693595 + days;
+            let total_days = 693_595 + days;
             let date_str = days_to_date(total_days);
             let h = mins / 60;
             let m = mins % 60;
-            Some(format!("'{} {:02}:{:02}:00'", date_str, h, m))
+            Some(format!("'{date_str} {h:02}:{m:02}:00'"))
         }
         _ => Some("NULL".to_string()),
     }
@@ -670,17 +664,17 @@ fn parse_money_value(data: &[u8], pos: &mut usize) -> Option<String> {
             let hi = i32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]);
             let lo = u32::from_le_bytes([val_data[4], val_data[5], val_data[6], val_data[7]]);
             let raw = ((hi as i64) << 32) | lo as i64;
-            let whole = raw / 10000;
-            let frac = (raw % 10000).unsigned_abs();
-            Some(format!("{}.{:04}", whole, frac))
+            let whole = raw / 10_000;
+            let frac = (raw % 10_000).unsigned_abs();
+            Some(format!("{whole}.{frac:04}"))
         }
         4 => {
             // smallmoney: i32 in units of 1/10000
             let raw =
                 i32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as i64;
-            let whole = raw / 10000;
-            let frac = (raw % 10000).unsigned_abs();
-            Some(format!("{}.{:04}", whole, frac))
+            let whole = raw / 10_000;
+            let frac = (raw % 10_000).unsigned_abs();
+            Some(format!("{whole}.{frac:04}"))
         }
         _ => Some("NULL".to_string()),
     }
@@ -718,7 +712,7 @@ fn format_time(time_val: u64, scale: u8) -> String {
     let s = total_seconds % 60;
 
     if scale == 0 {
-        format!("{:02}:{:02}:{:02}", h, m, s)
+        format!("{h:02}:{m:02}:{s:02}")
     } else {
         format!(
             "{:02}:{:02}:{:02}.{:0width$}",
@@ -736,16 +730,16 @@ fn days_to_date(days: i64) -> String {
     // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     // TDS epoch is 0001-01-01; Hinnant internal epoch is 0000-03-01 (306 days earlier)
     let z = days + 306;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Read up to 8 bytes as a little-endian unsigned integer.
@@ -761,7 +755,7 @@ fn read_le_uint(data: &[u8]) -> u64 {
 fn hex_encode(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
     for &b in data {
-        s.push_str(&format!("{:02X}", b));
+        s.push_str(&format!("{b:02X}"));
     }
     s
 }
@@ -943,15 +937,15 @@ mod tests {
     #[test]
     fn test_days_to_date() {
         // 2000-01-01 is day 730119 from 0001-01-01
-        assert_eq!(days_to_date(730119), "2000-01-01");
+        assert_eq!(days_to_date(730_119), "2000-01-01");
         // 1970-01-01 is day 719162
-        assert_eq!(days_to_date(719162), "1970-01-01");
+        assert_eq!(days_to_date(719_162), "1970-01-01");
     }
 
     #[test]
     fn test_decimal_formatting() {
         // Simulate parsing a decimal: magnitude=12345, scale=2 → "123.45"
-        let magnitude: u128 = 12345;
+        let magnitude: u128 = 12_345;
         let scale: u32 = 2;
         let s = magnitude.to_string();
         let split = s.len() - scale as usize;

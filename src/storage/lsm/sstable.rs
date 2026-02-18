@@ -37,7 +37,7 @@ use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::bloom::BloomFilter;
 
 /// SSTable magic number
-const SSTABLE_MAGIC: u32 = 0x4C534D54; // "LSMT"
+const SSTABLE_MAGIC: u32 = 0x4C53_4D54; // "LSMT"
 
 /// SSTable version (v2 adds bloom filter)
 const SSTABLE_VERSION: u32 = 2;
@@ -504,8 +504,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
         ]);
         if magic != SSTABLE_MAGIC {
             return Err(StorageError::InvalidSstable(format!(
-                "invalid magic: expected {:#x}, got {:#x}",
-                SSTABLE_MAGIC, magic
+                "invalid magic: expected {SSTABLE_MAGIC:#x}, got {magic:#x}"
             )));
         }
 
@@ -518,8 +517,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
         ]);
         if version != 1 && version != SSTABLE_VERSION {
             return Err(StorageError::InvalidSstable(format!(
-                "unsupported version: {}",
-                version
+                "unsupported version: {version}"
             )));
         }
 
@@ -849,7 +847,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
                     }
                     Err(e) => {
                         return Err(StorageError::Io(crate::io::IoError::Io(
-                            std::io::Error::other(format!("batch read failed: {}", e)),
+                            std::io::Error::other(format!("batch read failed: {e}")),
                         )));
                     }
                 }

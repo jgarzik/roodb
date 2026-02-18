@@ -178,7 +178,7 @@ impl Executor for Delete {
     fn take_changes(&mut self) -> Vec<RowChange> {
         self.txn_context
             .as_mut()
-            .map(|ctx| ctx.take_changes())
+            .map(super::context::TransactionContext::take_changes)
             .unwrap_or_default()
     }
 }

@@ -137,7 +137,7 @@ fn encode_value(buf: &mut Vec<u8>, datum: &Datum, data_type: &DataType) {
         }
         Datum::Bool(v) => {
             buf.push(1); // length
-            buf.push(if *v { 1 } else { 0 });
+            buf.push(u8::from(*v));
         }
         Datum::Int(v) => {
             match data_type {

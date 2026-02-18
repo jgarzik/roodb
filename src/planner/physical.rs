@@ -258,7 +258,7 @@ impl PhysicalPlan {
                     .enumerate()
                     .map(|(i, expr)| OutputColumn {
                         id: i,
-                        name: format!("group_{}", i),
+                        name: format!("group_{i}"),
                         data_type: expr.data_type(),
                         nullable: expr.is_nullable(),
                     })

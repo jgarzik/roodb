@@ -45,7 +45,7 @@ impl TlsConfig {
         // Parse certificates
         let certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(cert_pem))
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .collect();
 
         if certs.is_empty() {
@@ -127,7 +127,7 @@ impl RaftTlsConfig {
         // Parse node certificate
         let certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(cert_pem))
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .collect();
 
         if certs.is_empty() {
@@ -141,7 +141,7 @@ impl RaftTlsConfig {
         // Parse CA certificate(s) for peer verification
         let ca_certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(ca_pem))
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .collect();
 
         if ca_certs.is_empty() {

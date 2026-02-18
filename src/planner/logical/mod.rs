@@ -158,10 +158,10 @@ impl ResolvedExpr {
             ResolvedExpr::Literal(_) => false,
             ResolvedExpr::BinaryOp { left, right, .. } => left.is_nullable() || right.is_nullable(),
             ResolvedExpr::UnaryOp { expr, .. } => expr.is_nullable(),
-            ResolvedExpr::Function { args, .. } => args.iter().any(|a| a.is_nullable()),
+            ResolvedExpr::Function { args, .. } => args.iter().any(ResolvedExpr::is_nullable),
             ResolvedExpr::IsNull { .. } => false,
             ResolvedExpr::InList { expr, list, .. } => {
-                expr.is_nullable() || list.iter().any(|e| e.is_nullable())
+                expr.is_nullable() || list.iter().any(ResolvedExpr::is_nullable)
             }
             ResolvedExpr::Between {
                 expr, low, high, ..
@@ -515,7 +515,7 @@ impl LogicalPlan {
                     .enumerate()
                     .map(|(i, expr)| OutputColumn {
                         id: i,
-                        name: format!("group_{}", i),
+                        name: format!("group_{i}"),
                         data_type: expr.data_type(),
                         nullable: expr.is_nullable(),
                     })

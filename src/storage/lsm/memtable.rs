@@ -52,7 +52,7 @@ impl Memtable {
         // since this is an approximate threshold for flush decisions)
         let entry_size = key.len() + value.len() + 16; // overhead estimate
         if let Some(old) = self.data.get(key) {
-            let old_size = key.len() + old.value().as_ref().map(|v| v.len()).unwrap_or(0) + 16;
+            let old_size = key.len() + old.value().as_ref().map_or(0, std::vec::Vec::len) + 16;
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
         self.size.fetch_add(entry_size, Ordering::Relaxed);
@@ -67,7 +67,7 @@ impl Memtable {
         // Update size estimate
         let entry_size = key.len() + 16;
         if let Some(old) = self.data.get(key) {
-            let old_size = key.len() + old.value().as_ref().map(|v| v.len()).unwrap_or(0) + 16;
+            let old_size = key.len() + old.value().as_ref().map_or(0, std::vec::Vec::len) + 16;
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
         self.size.fetch_add(entry_size, Ordering::Relaxed);

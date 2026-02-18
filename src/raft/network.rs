@@ -25,13 +25,8 @@ fn rpc_error<E: std::error::Error>(
     operation: &str,
     err: impl std::fmt::Display,
 ) -> RPCError<NodeId, Node, RaftError<NodeId, E>> {
-    let addr_str = addr
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let msg = format!(
-        "Raft RPC {} to node {} ({}): {}",
-        operation, target, addr_str, err
-    );
+    let addr_str = addr.map_or_else(|| "unknown".to_string(), |a| a.to_string());
+    let msg = format!("Raft RPC {operation} to node {target} ({addr_str}): {err}");
     RPCError::Unreachable(Unreachable::new(&NetworkError::new(
         &std::io::Error::other(msg),
     )))
@@ -119,7 +114,7 @@ impl RaftNetworkConnection {
         Resp: serde::de::DeserializeOwned,
         E: std::error::Error,
     {
-        let operation = format!("{:?}", msg_type);
+        let operation = format!("{msg_type:?}");
 
         let addr = self.addr.ok_or_else(|| {
             rpc_error::<E>(self.target, None, &operation, "address not configured")
@@ -222,7 +217,7 @@ impl RaftRpcHandler {
     /// Handle an incoming RPC request
     pub async fn handle_request(&self, msg_type: u8, body: &[u8]) -> Result<Bytes, String> {
         let msg_type = MessageType::try_from(msg_type)
-            .map_err(|_| format!("Unknown message type: {}", msg_type))?;
+            .map_err(|_| format!("Unknown message type: {msg_type}"))?;
 
         match msg_type {
             MessageType::Vote => {
@@ -253,7 +248,7 @@ impl RaftRpcHandler {
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }
-            _ => Err(format!("Unexpected message type: {:?}", msg_type)),
+            _ => Err(format!("Unexpected message type: {msg_type:?}")),
         }
     }
 }

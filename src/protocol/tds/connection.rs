@@ -28,6 +28,8 @@ use super::prelogin;
 use super::token;
 use super::types;
 
+type MessageReceiver = mpsc::Receiver<Result<(PacketType, Vec<u8>), PacketError>>;
+
 /// TDS connection handler
 pub struct TdsConnection<S>
 where
@@ -36,7 +38,7 @@ where
     /// Direct reader for pre-login/login phase (before reader task starts).
     reader: Option<TdsReader<BufReader<ReadHalf<S>>>>,
     /// Channel for receiving messages from the reader task (post-login).
-    msg_rx: Option<mpsc::Receiver<Result<(PacketType, Vec<u8>), PacketError>>>,
+    msg_rx: Option<MessageReceiver>,
     /// Cancellation flag set by the reader task when Attention arrives.
     cancelled: Arc<AtomicBool>,
     writer: TdsWriter<BufWriter<WriteHalf<S>>>,
@@ -231,7 +233,7 @@ where
         let user_info = self
             .lookup_user(&login.username, &client_host)
             .await
-            .map_err(|e| PacketError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| PacketError::Io(std::io::Error::other(e)))?;
 
         // Verify password
         match user_info {
@@ -312,26 +314,23 @@ where
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
-            .map_err(|e| format!("Storage error: {}", e))?;
+            .map_err(|e| format!("Storage error: {e}"))?;
 
         for (_key, value) in rows {
-            let row = match decode_row(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let Ok(row) = decode_row(&value) else {
+                continue;
             };
 
-            let row_username = match row.get_opt(0) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
+            let Some(Datum::String(row_username)) = row.get_opt(0) else {
+                continue;
             };
 
             if row_username != username {
                 continue;
             }
 
-            let row_host = match row.get_opt(1) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
+            let Some(Datum::String(row_host)) = row.get_opt(1) else {
+                continue;
             };
 
             let host_pattern = HostPattern::new(row_host);
@@ -403,7 +402,7 @@ where
                         0,
                         1,
                         16,
-                        &format!("Unsupported packet type: {:?}", other),
+                        &format!("Unsupported packet type: {other:?}"),
                         "RooDB",
                     );
                     let done = token::encode_done(token::DONE_ERROR, 0, 0);
@@ -577,12 +576,10 @@ where
         let (txn_context, implicit_txn_id) = if is_ddl {
             (None, None)
         } else if let Some(txn_id) = self.session.current_txn {
-            let read_view = self.txn_manager.create_read_view(txn_id).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let read_view = self
+                .txn_manager
+                .create_read_view(txn_id)
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             let pending = self.session.get_pending_changes();
             (
                 Some(TransactionContext::with_pending_changes(
@@ -594,29 +591,20 @@ where
             let txn = self
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)
-                .map_err(|e| {
-                    PacketError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-            let read_view = self.txn_manager.create_read_view(txn.txn_id).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
+            let read_view = self
+                .txn_manager
+                .create_read_view(txn.txn_id)
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             (
                 Some(TransactionContext::new(txn.txn_id, read_view)),
                 Some(txn.txn_id),
             )
         } else {
-            let read_view = self.txn_manager.create_read_view(0).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let read_view = self
+                .txn_manager
+                .create_read_view(0)
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             (Some(TransactionContext::new(0, read_view)), None)
         };
 
@@ -629,23 +617,18 @@ where
                 self.raft_node.clone(),
             );
             debug!(connection_id = self.connection_id, "Building executor");
-            let mut executor = engine.build(plan).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let mut executor = engine
+                .build(plan)
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
             debug!(
                 connection_id = self.connection_id,
                 "Calling executor.open()"
             );
-            executor.open().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            executor
+                .open()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             debug!(
                 connection_id = self.connection_id,
                 "executor.open() returned"
@@ -660,12 +643,11 @@ where
             // ROW tokens — check for cancellation between rows
             let mut row_count: u64 = 0;
             let mut cancelled = false;
-            while let Some(row) = executor.next().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })? {
+            while let Some(row) = executor
+                .next()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?
+            {
                 if self.is_cancelled() {
                     debug!(
                         connection_id = self.connection_id,
@@ -678,12 +660,10 @@ where
                 row_count += 1;
             }
 
-            executor.close().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            executor
+                .close()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
             if cancelled {
                 // Discard buffered response and send DONE with ATTN flag
@@ -727,39 +707,31 @@ where
                 txn_context,
                 self.raft_node.clone(),
             );
-            let mut executor = engine.build(plan).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let mut executor = engine
+                .build(plan)
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
-            executor.open().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            executor
+                .open()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
             let mut affected = 0u64;
-            while let Some(row) = executor.next().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })? {
+            while let Some(row) = executor
+                .next()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?
+            {
                 if let Some(Datum::Int(n)) = row.get_opt(0) {
                     affected += *n as u64;
                 } else {
                     affected += 1;
                 }
             }
-            executor.close().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            executor
+                .close()
+                .await
+                .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
             // Commit changes
             let changes = executor.take_changes();
@@ -772,22 +744,15 @@ where
                     self.raft_node
                         .propose_changes(changeset)
                         .await
-                        .map_err(|e| {
-                            PacketError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
                 }
             }
 
             if let Some(txn_id) = implicit_txn_id {
-                self.txn_manager.commit(txn_id).await.map_err(|e| {
-                    PacketError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
+                self.txn_manager
+                    .commit(txn_id)
+                    .await
+                    .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             }
 
             // Send DONE with count
@@ -837,8 +802,7 @@ where
             }
             _ => {
                 self.send_tds_error(&format!(
-                    "Unsupported transaction manager request: {}",
-                    request_type
+                    "Unsupported transaction manager request: {request_type}"
                 ))
                 .await
             }
@@ -864,12 +828,7 @@ where
         let txn = self
             .txn_manager
             .begin(isolation, self.session.is_read_only)
-            .map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
 
         self.session.begin_transaction(txn.txn_id);
 
@@ -902,12 +861,7 @@ where
                 self.raft_node
                     .propose_changes(changeset)
                     .await
-                    .map_err(|e| {
-                        PacketError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?;
+                    .map_err(|e| PacketError::Io(std::io::Error::other(e.to_string())))?;
             }
 
             let _ = self.txn_manager.commit(txn_id).await;
@@ -986,7 +940,7 @@ where
                     }
                     _ => {
                         return self
-                            .send_tds_error(&format!("Unsupported RPC proc ID: {}", proc_id))
+                            .send_tds_error(&format!("Unsupported RPC proc ID: {proc_id}"))
                             .await;
                     }
                 }
@@ -998,13 +952,10 @@ where
 
     /// Handle sp_executesql RPC: extract the SQL and parameters, substitute, and execute.
     async fn handle_sp_executesql(&mut self, param_data: &[u8]) -> Result<(), PacketError> {
-        let sql = match super::params::parse_and_substitute(param_data) {
-            Some(s) => s,
-            None => {
-                return self
-                    .send_tds_error("Could not parse sp_executesql parameters")
-                    .await;
-            }
+        let Some(sql) = super::params::parse_and_substitute(param_data) else {
+            return self
+                .send_tds_error("Could not parse sp_executesql parameters")
+                .await;
         };
 
         let sql = sql.trim();

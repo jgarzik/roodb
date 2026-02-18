@@ -187,7 +187,7 @@ impl Executor for CreateTable {
             raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
             // No need to update catalog here - apply() already did it before propose returns
         } else {
             // No Raft - update catalog directly (for tests without Raft)
@@ -418,7 +418,7 @@ impl Executor for DropTable {
             raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
             // No need to update catalog here - apply() already did it before propose returns
         } else {
             // No Raft - update catalog directly (for tests without Raft)
@@ -556,7 +556,7 @@ impl Executor for CreateIndex {
             raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
             // No need to update catalog here - apply() already did it before propose returns
         } else {
             // No Raft - update catalog directly (for tests without Raft)
@@ -680,7 +680,7 @@ impl Executor for DropIndex {
             raft_node
                 .propose_changes(changeset)
                 .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {e}")))?;
             // No need to update catalog here - apply() already did it before propose returns
         } else {
             // No Raft - update catalog directly (for tests without Raft)

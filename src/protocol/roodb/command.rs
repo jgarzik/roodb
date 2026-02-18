@@ -112,8 +112,7 @@ impl TryFrom<u8> for Command {
             0x1e => Ok(Command::BinlogDumpGtid),
             0x1f => Ok(Command::ResetConnection),
             _ => Err(ProtocolError::Unsupported(format!(
-                "unknown command: 0x{:02x}",
-                value
+                "unknown command: 0x{value:02x}"
             ))),
         }
     }

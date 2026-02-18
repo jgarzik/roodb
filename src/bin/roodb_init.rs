@@ -42,7 +42,7 @@ async fn main() {
     let storage: Arc<dyn StorageEngine> = match LsmEngine::open(io_factory, storage_config).await {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
-            eprintln!("ERROR: Failed to open storage: {}", e);
+            eprintln!("ERROR: Failed to open storage: {e}");
             std::process::exit(3);
         }
     };
@@ -58,7 +58,7 @@ async fn main() {
             // Continue with initialization
         }
         Err(e) => {
-            eprintln!("ERROR: Failed to check initialization status: {}", e);
+            eprintln!("ERROR: Failed to check initialization status: {e}");
             let _ = storage.close().await;
             std::process::exit(3);
         }
@@ -71,12 +71,12 @@ async fn main() {
     let password = match config.determine_password() {
         Ok(p) => p,
         Err(InitError::Config(msg)) => {
-            eprintln!("ERROR: {}", msg);
+            eprintln!("ERROR: {msg}");
             let _ = storage.close().await;
             std::process::exit(2);
         }
         Err(e) => {
-            eprintln!("ERROR: {}", e);
+            eprintln!("ERROR: {e}");
             let _ = storage.close().await;
             std::process::exit(2);
         }
@@ -89,7 +89,7 @@ async fn main() {
             eprintln!("Root user 'root'@'%' created with ALL PRIVILEGES");
         }
         Err(e) => {
-            eprintln!("ERROR: Failed to initialize database: {}", e);
+            eprintln!("ERROR: Failed to initialize database: {e}");
             let _ = storage.close().await;
             std::process::exit(3);
         }
@@ -97,7 +97,7 @@ async fn main() {
 
     // Close storage
     if let Err(e) = storage.close().await {
-        eprintln!("WARNING: Failed to close storage cleanly: {}", e);
+        eprintln!("WARNING: Failed to close storage cleanly: {e}");
     }
 
     std::process::exit(0);

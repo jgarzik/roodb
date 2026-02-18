@@ -90,7 +90,7 @@ impl<'a> Resolver<'a> {
                 ..
             } => self.resolve_revoke(&privileges, &objects, &grantees),
 
-            _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
+            _ => Err(SqlError::Unsupported(format!("Statement type: {stmt:?}"))),
         }
     }
 
@@ -135,7 +135,7 @@ impl<'a> Resolver<'a> {
         match object_type {
             sp::ObjectType::Table => Ok(ResolvedStatement::DropTable { name, if_exists }),
             sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
-            _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
+            _ => Err(SqlError::Unsupported(format!("DROP {object_type:?}"))),
         }
     }
 
@@ -144,7 +144,7 @@ impl<'a> Resolver<'a> {
         let name = create
             .name
             .as_ref()
-            .map(|n| n.to_string())
+            .map(std::string::ToString::to_string)
             .ok_or_else(|| SqlError::Parse("CREATE INDEX requires a name".to_string()))?;
 
         let table = create.table_name.to_string();
@@ -219,9 +219,11 @@ impl<'a> Resolver<'a> {
         }
 
         // Parse values
-        let values_rows = match insert.source.as_ref().map(|s| s.body.as_ref()) {
-            Some(sp::SetExpr::Values(sp::Values { rows, .. })) => rows,
-            _ => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
+        let Some(sp::SetExpr::Values(sp::Values {
+            rows: values_rows, ..
+        })) = insert.source.as_ref().map(|s| s.body.as_ref())
+        else {
+            return Err(SqlError::Unsupported("INSERT without VALUES".to_string()));
         };
 
         // Resolve values - expand to full rows
@@ -250,8 +252,7 @@ impl<'a> Resolver<'a> {
                 // Check NOT NULL constraint for non-NULL values
                 if !nullable && matches!(resolved_expr, ResolvedExpr::Literal(Literal::Null)) {
                     return Err(SqlError::InvalidOperation(format!(
-                        "Column '{}' cannot be NULL",
-                        col_name
+                        "Column '{col_name}' cannot be NULL"
                     )));
                 }
 
@@ -436,14 +437,15 @@ impl<'a> Resolver<'a> {
 
         // Handle LIMIT/OFFSET
         if let Some(sp::Expr::Value(sp::Value::Number(n, _))) = &query.limit {
-            result.limit = Some(n.parse().map_err(|_| {
-                SqlError::InvalidOperation(format!("Invalid LIMIT value: '{}'", n))
-            })?);
+            result.limit =
+                Some(n.parse().map_err(|_| {
+                    SqlError::InvalidOperation(format!("Invalid LIMIT value: '{n}'"))
+                })?);
         }
         if let Some(offset) = &query.offset {
             if let sp::Expr::Value(sp::Value::Number(n, _)) = &offset.value {
                 result.offset = Some(n.parse().map_err(|_| {
-                    SqlError::InvalidOperation(format!("Invalid OFFSET value: '{}'", n))
+                    SqlError::InvalidOperation(format!("Invalid OFFSET value: '{n}'"))
                 })?);
             }
         }
@@ -794,7 +796,7 @@ impl<'a> Resolver<'a> {
                     result_type: DataType::Boolean,
                 })
             }
-            _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
+            _ => Err(SqlError::Unsupported(format!("Expression: {expr:?}"))),
         }
     }
 
@@ -1029,8 +1031,7 @@ fn convert_single_privilege(action: &sp::Action) -> SqlResult<Privilege> {
         sp::Action::Create => Ok(Privilege::Create),
         sp::Action::Truncate => Ok(Privilege::Delete), // Map truncate to delete privilege
         other => Err(SqlError::Unsupported(format!(
-            "Unsupported privilege: {:?}",
-            other
+            "Unsupported privilege: {other:?}"
         ))),
     }
 }
@@ -1163,7 +1164,7 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
             sp::ColumnOption::DialectSpecific(tokens) => {
                 let token_str: String = tokens
                     .iter()
-                    .map(|t| t.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<String>()
                     .to_uppercase();
                 if token_str.contains("AUTO_INCREMENT") || token_str.contains("AUTOINCREMENT") {
@@ -1201,7 +1202,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
             Ok(DataType::Blob)
         }
         sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
-        _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
+        _ => Err(SqlError::Unsupported(format!("Data type: {dt:?}"))),
     }
 }
 
@@ -1289,12 +1290,12 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::Number(n, _) => {
             if n.contains('.') {
                 let val = n.parse().map_err(|_| {
-                    SqlError::InvalidOperation(format!("Invalid float literal: '{}'", n))
+                    SqlError::InvalidOperation(format!("Invalid float literal: '{n}'"))
                 })?;
                 Ok(Literal::Float(val))
             } else {
                 let val = n.parse().map_err(|_| {
-                    SqlError::InvalidOperation(format!("Invalid integer literal: '{}'", n))
+                    SqlError::InvalidOperation(format!("Invalid integer literal: '{n}'"))
                 })?;
                 Ok(Literal::Integer(val))
             }
@@ -1306,7 +1307,7 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
             let bytes = hex_decode(s).unwrap_or_default();
             Ok(Literal::Blob(bytes))
         }
-        _ => Err(SqlError::Unsupported(format!("Value: {:?}", val))),
+        _ => Err(SqlError::Unsupported(format!("Value: {val:?}"))),
     }
 }
 
@@ -1339,7 +1340,7 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
         sp::BinaryOperator::And => Ok(BinaryOp::And),
         sp::BinaryOperator::Or => Ok(BinaryOp::Or),
-        _ => Err(SqlError::Unsupported(format!("Binary operator: {:?}", op))),
+        _ => Err(SqlError::Unsupported(format!("Binary operator: {op:?}"))),
     }
 }
 
@@ -1348,7 +1349,7 @@ fn convert_unary_op(op: &sp::UnaryOperator) -> SqlResult<UnaryOp> {
     match op {
         sp::UnaryOperator::Not => Ok(UnaryOp::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOp::Neg),
-        _ => Err(SqlError::Unsupported(format!("Unary operator: {:?}", op))),
+        _ => Err(SqlError::Unsupported(format!("Unary operator: {op:?}"))),
     }
 }
 
@@ -1430,8 +1431,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         }
         "NOW" | "CURRENT_TIMESTAMP" => Ok(DataType::Timestamp),
         _ => Err(SqlError::InvalidOperation(format!(
-            "Unknown function: {}",
-            name
+            "Unknown function: {name}"
         ))),
     }
 }

@@ -85,7 +85,7 @@ impl Manifest {
         let data = if manifest_path.exists() {
             let content = std::fs::read_to_string(&manifest_path)?;
             serde_json::from_str(&content)
-                .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {}", e)))?
+                .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {e}")))?
         } else {
             ManifestData::default()
         };
@@ -104,11 +104,11 @@ impl Manifest {
     /// 3. Rename to final path (atomic on POSIX)
     pub fn save(&self) -> StorageResult<()> {
         let manifest_path = self.dir.join(MANIFEST_FILE);
-        let temp_path = self.dir.join(format!("{}.tmp", MANIFEST_FILE));
+        let temp_path = self.dir.join(format!("{MANIFEST_FILE}.tmp"));
 
         // Serialize content
         let content = serde_json::to_string_pretty(&self.data)
-            .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
+            .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {e}")))?;
 
         // Write to temporary file
         {
@@ -169,8 +169,7 @@ impl Manifest {
         self.data
             .levels
             .get(level as usize)
-            .map(|l| l.files.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], |l| l.files.as_slice())
     }
 
     /// Get total size of a level in bytes

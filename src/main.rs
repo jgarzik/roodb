@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Raft node (single-node mode)
     // Raft RPC uses port + 1000 by convention
     let raft_port = port + 1000;
-    let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
+    let raft_addr: SocketAddr = format!("0.0.0.0:{raft_port}").parse()?;
 
     let node_id = 1;
     let mut raft_node = RaftNode::new(
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(raft_port, "Raft node bootstrapped (single-node mode)");
 
     // Start RooDB server
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
     let mut server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
     if tds {
         tracing::info!("TDS 8.0 protocol enabled");

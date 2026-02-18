@@ -80,8 +80,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 let new_size = payload.len().saturating_add(length);
                 if new_size > MAX_TOTAL_PAYLOAD_SIZE {
                     return Err(ProtocolError::InvalidPacket(format!(
-                        "Payload exceeds maximum size of {} bytes",
-                        MAX_TOTAL_PAYLOAD_SIZE
+                        "Payload exceeds maximum size of {MAX_TOTAL_PAYLOAD_SIZE} bytes"
                     )));
                 }
                 let start = payload.len();
