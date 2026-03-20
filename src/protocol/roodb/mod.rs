@@ -715,9 +715,7 @@ where
             sqlparser::ast::Statement::Rollback { .. } => {
                 return self.handle_rollback().await;
             }
-            sqlparser::ast::Statement::SetVariable { .. }
-            | sqlparser::ast::Statement::SetNames { .. }
-            | sqlparser::ast::Statement::SetNamesDefault { .. } => {
+            sqlparser::ast::Statement::Set(_) => {
                 // Handle SET statements via the text path
                 let sql = parsed_stmt.to_string();
                 return self.try_handle_transaction_command(&sql).await.map(|_| ());
@@ -847,6 +845,7 @@ where
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
+                self.session.user_variables(),
             );
             let mut executor = engine.build(plan)?;
 
@@ -874,6 +873,7 @@ where
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
+                self.session.user_variables(),
             );
             let mut executor = engine.build(plan)?;
 
@@ -1005,16 +1005,23 @@ where
             return Ok(result);
         }
 
+        // Handle SET @var = expr (user variables)
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("SET @") && !upper.starts_with("SET @@") {
+                return self.handle_set_user_variable(sql).await;
+            }
+        }
+
         // Handle statements as no-ops for MySQL compatibility
         {
             let upper = sql.trim().to_uppercase();
-            // SET NAMES, SET CHARACTER SET, SET sql_mode, SET @var, etc.
+            // SET NAMES, SET CHARACTER SET, SET sql_mode, etc.
             if upper.starts_with("SET NAMES")
                 || upper.starts_with("SET CHARACTER SET")
                 || upper.starts_with("SET CHARACTER_SET")
                 || upper.starts_with("SET SQL_MODE")
                 || upper.starts_with("SET @@")
-                || upper.starts_with("SET @")
                 || upper.starts_with("SET SESSION ")
                 || upper.starts_with("SET GLOBAL ")
             {
@@ -1407,6 +1414,7 @@ where
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
+                self.session.user_variables(),
             );
             let mut executor = engine.build(plan)?;
 
@@ -1418,6 +1426,7 @@ where
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
+                self.session.user_variables(),
             );
             let mut executor = engine.build(plan)?;
 
@@ -1577,8 +1586,14 @@ where
         }
 
         // Catch-all: silently accept any other SET statement (SET NAMES, SET charset, etc.)
-        if sql_upper.starts_with("SET ") {
+        // Exception: SET @var is handled by handle_set_user_variable
+        if sql_upper.starts_with("SET ") && !sql_upper.starts_with("SET @") {
             debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET statement");
+            return self.send_ok(0, 0).await.map(Some);
+        }
+        // Also accept SET @@system_var as no-op
+        if sql_upper.starts_with("SET @@") {
+            debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET @@var statement");
             return self.send_ok(0, 0).await.map(Some);
         }
 
@@ -2450,6 +2465,60 @@ where
         self.send_custom_result_set(&["DATABASE()"], &rows)
             .await
             .map(Some)
+    }
+
+    /// Handle SET @var = expr (user variable assignment)
+    async fn handle_set_user_variable(&mut self, sql: &str) -> ProtocolResult<()> {
+        let trimmed = sql.trim();
+        // Parse: after "SET @", extract var name and value
+        let rest = match trimmed
+            .strip_prefix("SET ")
+            .or_else(|| trimmed.strip_prefix("set "))
+        {
+            Some(r) => r.trim(),
+            None => return self.send_ok(0, 0).await,
+        };
+        let rest = match rest.strip_prefix('@') {
+            Some(r) => r,
+            None => return self.send_ok(0, 0).await,
+        };
+        // Find = or :=
+        let (var_name, val_str) = if let Some(pos) = rest.find(":=") {
+            (&rest[..pos], rest[pos + 2..].trim())
+        } else if let Some(pos) = rest.find('=') {
+            (&rest[..pos], rest[pos + 1..].trim())
+        } else {
+            return self.send_ok(0, 0).await;
+        };
+        let var_name = var_name.trim().to_lowercase();
+
+        // Try to evaluate the value expression by wrapping in SELECT
+        let scope_expr = format!("SELECT {} AS v", val_str);
+
+        // Resolve inside a block so the catalog guard is dropped before await
+        let datum = (|| -> Option<Datum> {
+            let val_stmt = Parser::parse_one(&scope_expr).ok()?;
+            let catalog = self.catalog.read();
+            let resolver = Resolver::new(&catalog);
+            let resolved = resolver.resolve(val_stmt).ok()?;
+
+            if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
+                if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
+                    expr: resolved_expr,
+                    ..
+                }) = sel.columns.first()
+                {
+                    let empty_row = crate::executor::row::Row::empty();
+                    let vars = self.session.user_variables();
+                    return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars).ok();
+                }
+            }
+            None
+        })();
+
+        let value = datum.unwrap_or(Datum::String(val_str.to_string()));
+        self.session.set_user_variable(&var_name, value);
+        self.send_ok(0, 0).await
     }
 
     async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {

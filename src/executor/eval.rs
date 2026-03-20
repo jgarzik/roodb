@@ -3,13 +3,14 @@
 //! Evaluates ResolvedExpr against a Row to produce a Datum.
 
 use crate::planner::logical::{BinaryOp, BooleanTestType, ResolvedExpr, UnaryOp};
+use crate::server::session::UserVariables;
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 
-/// Evaluate an expression against a row
-pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
+/// Evaluate an expression against a row, with access to user variables
+pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> ExecutorResult<Datum> {
     match expr {
         ResolvedExpr::Column(col) => {
             let datum = row.get(col.index)?;
@@ -19,32 +20,46 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
         ResolvedExpr::Literal(lit) => Ok(Datum::from_literal(lit)),
 
         ResolvedExpr::BinaryOp {
+            left,
+            op: BinaryOp::Assign,
+            right,
+            ..
+        } => {
+            // @var := expr — evaluate right side, store in vars, return value
+            let rval = evaluate(right, row, vars)?;
+            if let ResolvedExpr::UserVariable { name } = left.as_ref() {
+                vars.write().insert(name.clone(), rval.clone());
+            }
+            Ok(rval)
+        }
+
+        ResolvedExpr::BinaryOp {
             left, op, right, ..
         } => {
-            let lval = eval(left, row)?;
-            let rval = eval(right, row)?;
+            let lval = evaluate(left, row, vars)?;
+            let rval = evaluate(right, row, vars)?;
             eval_binary_op(op, &lval, &rval)
         }
 
         ResolvedExpr::UnaryOp { op, expr, .. } => {
-            let val = eval(expr, row)?;
+            let val = evaluate(expr, row, vars)?;
             eval_unary_op(op, &val)
         }
 
         ResolvedExpr::Function { name, args, .. } => {
             // IF() requires short-circuit evaluation — only compute the taken branch
             if name.eq_ignore_ascii_case("IF") {
-                return eval_if_function(args, row);
+                return eval_if_function(args, row, vars);
             }
             let arg_vals: Vec<Datum> = args
                 .iter()
-                .map(|a| eval(a, row))
+                .map(|a| evaluate(a, row, vars))
                 .collect::<Result<_, _>>()?;
             eval_function(name, &arg_vals)
         }
 
         ResolvedExpr::IsNull { expr, negated } => {
-            let val = eval(expr, row)?;
+            let val = evaluate(expr, row, vars)?;
             let is_null = val.is_null();
             Ok(Datum::Bool(if *negated { !is_null } else { is_null }))
         }
@@ -54,13 +69,13 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
             list,
             negated,
         } => {
-            let val = eval(expr, row)?;
+            let val = evaluate(expr, row, vars)?;
             if val.is_null() {
                 return Ok(Datum::Null);
             }
             let mut found = false;
             for item in list {
-                let item_val = eval(item, row)?;
+                let item_val = evaluate(item, row, vars)?;
                 if item_val.is_null() {
                     continue;
                 }
@@ -78,9 +93,9 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
             high,
             negated,
         } => {
-            let val = eval(expr, row)?;
-            let low_val = eval(low, row)?;
-            let high_val = eval(high, row)?;
+            let val = evaluate(expr, row, vars)?;
+            let low_val = evaluate(low, row, vars)?;
+            let high_val = evaluate(high, row, vars)?;
 
             if val.is_null() || low_val.is_null() || high_val.is_null() {
                 return Ok(Datum::Null);
@@ -99,25 +114,25 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
         } => {
             if let Some(op) = operand {
                 // Simple CASE: CASE op WHEN val1 THEN res1 ...
-                let op_val = eval(op, row)?;
+                let op_val = evaluate(op, row, vars)?;
                 for (cond, result) in conditions.iter().zip(results.iter()) {
-                    let cond_val = eval(cond, row)?;
+                    let cond_val = evaluate(cond, row, vars)?;
                     if !op_val.is_null() && !cond_val.is_null() && op_val == cond_val {
-                        return eval(result, row);
+                        return evaluate(result, row, vars);
                     }
                 }
             } else {
                 // Searched CASE: CASE WHEN cond1 THEN res1 ...
                 for (cond, result) in conditions.iter().zip(results.iter()) {
-                    let cond_val = eval(cond, row)?;
+                    let cond_val = evaluate(cond, row, vars)?;
                     if cond_val.as_bool() == Some(true) {
-                        return eval(result, row);
+                        return evaluate(result, row, vars);
                     }
                 }
             }
             // No match — return ELSE or NULL
             match else_result {
-                Some(e) => eval(e, row),
+                Some(e) => evaluate(e, row, vars),
                 None => Ok(Datum::Null),
             }
         }
@@ -125,12 +140,17 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
         ResolvedExpr::Cast {
             expr, target_type, ..
         } => {
-            let val = eval(expr, row)?;
+            let val = evaluate(expr, row, vars)?;
             eval_cast(&val, target_type)
         }
 
+        ResolvedExpr::UserVariable { name } => {
+            let val = vars.read().get(name).cloned().unwrap_or(Datum::Null);
+            Ok(val)
+        }
+
         ResolvedExpr::BooleanTest { expr, test } => {
-            let val = eval(expr, row)?;
+            let val = evaluate(expr, row, vars)?;
             let result = match test {
                 BooleanTestType::IsTrue => val.as_bool() == Some(true),
                 BooleanTestType::IsNotTrue => val.as_bool() != Some(true),
@@ -217,6 +237,11 @@ fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<
 
         // NULL-safe equality (<=>)
         BinaryOp::Spaceship => Ok(Datum::Bool(eval_spaceship(left, right))),
+
+        // Assignment (:=) — handled at the top level in evaluate()
+        BinaryOp::Assign => Err(ExecutorError::InvalidOperation(
+            "Assignment operator handled at expression level".to_string(),
+        )),
     }
 }
 
@@ -1347,18 +1372,22 @@ fn crc32_compute(data: &[u8]) -> u32 {
 
 /// Evaluate IF(cond, then_expr, else_expr) with short-circuit evaluation.
 /// NULL condition takes the else branch (MySQL semantics).
-fn eval_if_function(args: &[ResolvedExpr], row: &Row) -> ExecutorResult<Datum> {
+fn eval_if_function(
+    args: &[ResolvedExpr],
+    row: &Row,
+    vars: &UserVariables,
+) -> ExecutorResult<Datum> {
     if args.len() != 3 {
         return Err(ExecutorError::InvalidOperation(
             "IF requires 3 arguments".to_string(),
         ));
     }
-    let cond = eval(&args[0], row)?;
+    let cond = evaluate(&args[0], row, vars)?;
     let is_true = cond.as_bool().unwrap_or_default();
     if is_true {
-        eval(&args[1], row)
+        evaluate(&args[1], row, vars)
     } else {
-        eval(&args[2], row)
+        evaluate(&args[2], row, vars)
     }
 }
 
@@ -1367,6 +1396,18 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::{Literal, ResolvedColumn};
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// Test helper: evaluate with empty user variables
+    fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
+        evaluate(expr, row, &empty_vars())
+    }
 
     fn make_row() -> Row {
         Row::new(vec![

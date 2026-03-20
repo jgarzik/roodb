@@ -60,35 +60,33 @@ impl<'a> Resolver<'a> {
             } => self.resolve_drop(&object_type, &names, if_exists),
             sp::Statement::CreateIndex(create_index) => self.resolve_create_index(&create_index),
             sp::Statement::Insert(insert) => self.resolve_insert(&insert),
-            sp::Statement::Update {
-                table,
-                assignments,
-                selection,
-                ..
-            } => self.resolve_update(&table, &assignments, &selection),
+            sp::Statement::Update(update) => {
+                self.resolve_update(&update.table, &update.assignments, &update.selection)
+            }
             sp::Statement::Delete(delete) => self.resolve_delete(&delete),
             sp::Statement::Query(query) => self.resolve_query(&query),
 
             // Auth statements
-            sp::Statement::CreateRole {
-                names,
-                if_not_exists,
-                password,
-                ..
-            } => self.resolve_create_user(&names, if_not_exists, &password),
-            sp::Statement::Grant {
-                privileges,
-                objects,
-                grantees,
-                with_grant_option,
-                ..
-            } => self.resolve_grant(&privileges, &objects, &grantees, with_grant_option),
-            sp::Statement::Revoke {
-                privileges,
-                objects,
-                grantees,
-                ..
-            } => self.resolve_revoke(&privileges, &objects, &grantees),
+            sp::Statement::CreateRole(create_role) => self.resolve_create_user(
+                &create_role.names,
+                create_role.if_not_exists,
+                &create_role.password,
+            ),
+            sp::Statement::Grant(grant) => {
+                let default_objects = sp::GrantObjects::Schemas(Vec::new());
+                let objects = grant.objects.as_ref().unwrap_or(&default_objects);
+                self.resolve_grant(
+                    &grant.privileges,
+                    objects,
+                    &grant.grantees,
+                    grant.with_grant_option,
+                )
+            }
+            sp::Statement::Revoke(revoke) => {
+                let default_objects = sp::GrantObjects::Schemas(Vec::new());
+                let objects = revoke.objects.as_ref().unwrap_or(&default_objects);
+                self.resolve_revoke(&revoke.privileges, objects, &revoke.grantees)
+            }
 
             // CREATE DATABASE / SCHEMA
             sp::Statement::CreateDatabase {
@@ -101,8 +99,12 @@ impl<'a> Resolver<'a> {
             }),
 
             // ANALYZE TABLE
-            sp::Statement::Analyze { table_name, .. } => {
-                let table = table_name.to_string();
+            sp::Statement::Analyze(analyze) => {
+                let table = analyze
+                    .table_name
+                    .as_ref()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
                 // Verify table exists
                 self.catalog
                     .get_table(&table)
@@ -111,8 +113,12 @@ impl<'a> Resolver<'a> {
             }
 
             // TRUNCATE TABLE — resolve as DELETE with no filter (deletes all rows)
-            sp::Statement::Truncate { table_name, .. } => {
-                let table = table_name.to_string();
+            sp::Statement::Truncate(truncate) => {
+                let table = truncate
+                    .table_names
+                    .first()
+                    .map(|t| t.name.to_string())
+                    .unwrap_or_default();
                 // Verify table exists
                 self.catalog
                     .get_table(&table)
@@ -187,8 +193,7 @@ impl<'a> Resolver<'a> {
             sp::ObjectType::Table | sp::ObjectType::View => {
                 if names.len() > 1 {
                     // Multi-table DROP: DROP TABLE t1, t2, t3
-                    let table_names: Vec<String> =
-                        names.iter().map(|n| n.to_string()).collect();
+                    let table_names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
                     Ok(ResolvedStatement::DropMultipleTables {
                         names: table_names,
                         if_exists,
@@ -222,7 +227,7 @@ impl<'a> Resolver<'a> {
 
         let mut resolved_cols = Vec::new();
         for col_expr in &create.columns {
-            let col_name = col_expr.expr.to_string();
+            let col_name = col_expr.column.expr.to_string();
             let idx = table_def
                 .get_column_index(&col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
@@ -239,7 +244,7 @@ impl<'a> Resolver<'a> {
 
     /// Resolve INSERT statement
     fn resolve_insert(&self, insert: &sp::Insert) -> SqlResult<ResolvedStatement> {
-        let table = insert.table_name.to_string();
+        let table = insert.table.to_string();
 
         let table_def = self
             .catalog
@@ -490,25 +495,56 @@ impl<'a> Resolver<'a> {
                 }
             }
 
-            for item in &order_by.exprs {
-                result.order_by.push(ResolvedOrderByItem {
-                    expr: self.resolve_expr(&item.expr, &scope)?,
-                    ascending: item.asc.unwrap_or(true),
-                });
+            if let sp::OrderByKind::Expressions(exprs) = &order_by.kind {
+                for item in exprs {
+                    result.order_by.push(ResolvedOrderByItem {
+                        expr: self.resolve_expr(&item.expr, &scope)?,
+                        ascending: item.options.asc.unwrap_or(true),
+                    });
+                }
             }
         }
 
         // Handle LIMIT/OFFSET
-        if let Some(sp::Expr::Value(sp::Value::Number(n, _))) = &query.limit {
-            result.limit = Some(n.parse().map_err(|_| {
-                SqlError::InvalidOperation(format!("Invalid LIMIT value: '{}'", n))
-            })?);
-        }
-        if let Some(offset) = &query.offset {
-            if let sp::Expr::Value(sp::Value::Number(n, _)) = &offset.value {
-                result.offset = Some(n.parse().map_err(|_| {
-                    SqlError::InvalidOperation(format!("Invalid OFFSET value: '{}'", n))
-                })?);
+        if let Some(ref limit_clause) = query.limit_clause {
+            match limit_clause {
+                sp::LimitClause::LimitOffset { limit, offset, .. } => {
+                    if let Some(sp::Expr::Value(ref val_with_span)) = limit {
+                        if let sp::Value::Number(ref n, _) = val_with_span.value {
+                            result.limit = Some(n.parse().map_err(|_| {
+                                SqlError::InvalidOperation(format!("Invalid LIMIT value: '{}'", n))
+                            })?);
+                        }
+                    }
+                    if let Some(ref off) = offset {
+                        if let sp::Expr::Value(ref val_with_span) = off.value {
+                            if let sp::Value::Number(ref n, _) = val_with_span.value {
+                                result.offset = Some(n.parse().map_err(|_| {
+                                    SqlError::InvalidOperation(format!(
+                                        "Invalid OFFSET value: '{}'",
+                                        n
+                                    ))
+                                })?);
+                            }
+                        }
+                    }
+                }
+                sp::LimitClause::OffsetCommaLimit { offset, limit } => {
+                    if let sp::Expr::Value(ref val_with_span) = limit {
+                        if let sp::Value::Number(ref n, _) = val_with_span.value {
+                            result.limit = Some(n.parse().map_err(|_| {
+                                SqlError::InvalidOperation(format!("Invalid LIMIT value: '{}'", n))
+                            })?);
+                        }
+                    }
+                    if let sp::Expr::Value(ref val_with_span) = offset {
+                        if let sp::Value::Number(ref n, _) = val_with_span.value {
+                            result.offset = Some(n.parse().map_err(|_| {
+                                SqlError::InvalidOperation(format!("Invalid OFFSET value: '{}'", n))
+                            })?);
+                        }
+                    }
+                }
             }
         }
 
@@ -686,8 +722,11 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(ResolvedSelectItem::Columns(columns))
             }
-            sp::SelectItem::QualifiedWildcard(name, _) => {
-                let table = name.to_string();
+            sp::SelectItem::QualifiedWildcard(kind, _) => {
+                let table = match kind {
+                    sp::SelectItemQualifiedWildcardKind::ObjectName(name) => name.to_string(),
+                    sp::SelectItemQualifiedWildcardKind::Expr(expr) => expr.to_string(),
+                };
                 let table_info = scope
                     .tables
                     .get(&table)
@@ -717,6 +756,13 @@ impl<'a> Resolver<'a> {
     /// Resolve expression
     fn resolve_expr(&self, expr: &sp::Expr, scope: &Scope) -> SqlResult<ResolvedExpr> {
         match expr {
+            sp::Expr::Identifier(ident)
+                if ident.value.starts_with('@') && !ident.value.starts_with("@@") =>
+            {
+                Ok(ResolvedExpr::UserVariable {
+                    name: ident.value[1..].to_lowercase(),
+                })
+            }
             sp::Expr::Identifier(ident) => self.resolve_column(None, &ident.value, scope),
             sp::Expr::CompoundIdentifier(idents) => {
                 if idents.len() == 2 {
@@ -725,7 +771,8 @@ impl<'a> Resolver<'a> {
                     Err(SqlError::Unsupported("Compound identifier".to_string()))
                 }
             }
-            sp::Expr::Value(val) => {
+            sp::Expr::Value(val_with_span) => {
+                let val = &val_with_span.value;
                 // Handle `?` placeholders in placeholder mode (prepared statement plan caching)
                 if self.placeholder_mode {
                     if let sp::Value::Placeholder(s) = val {
@@ -856,8 +903,8 @@ impl<'a> Resolver<'a> {
             sp::Expr::Case {
                 operand,
                 conditions,
-                results,
                 else_result,
+                ..
             } => {
                 let resolved_operand = operand
                     .as_ref()
@@ -866,11 +913,11 @@ impl<'a> Resolver<'a> {
                     .map(Box::new);
                 let resolved_conditions: Vec<ResolvedExpr> = conditions
                     .iter()
-                    .map(|c| self.resolve_expr(c, scope))
+                    .map(|cw| self.resolve_expr(&cw.condition, scope))
                     .collect::<SqlResult<Vec<_>>>()?;
-                let resolved_results: Vec<ResolvedExpr> = results
+                let resolved_results: Vec<ResolvedExpr> = conditions
                     .iter()
-                    .map(|r| self.resolve_expr(r, scope))
+                    .map(|cw| self.resolve_expr(&cw.result, scope))
                     .collect::<SqlResult<Vec<_>>>()?;
                 let resolved_else = else_result
                     .as_ref()
@@ -922,15 +969,19 @@ impl<'a> Resolver<'a> {
                     result_type: DataType::Boolean,
                 })
             }
-            // TypedString: _utf8'string' or N'string' — just treat as a string literal
-            sp::Expr::TypedString { value, .. } => {
-                Ok(ResolvedExpr::Literal(Literal::String(value.clone())))
+            // TypedString: DATE '2020-01-01' etc. — extract string value
+            sp::Expr::TypedString(typed_string) => {
+                let s = match &typed_string.value.value {
+                    sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
+                        s.clone()
+                    }
+                    other => other.to_string(),
+                };
+                Ok(ResolvedExpr::Literal(Literal::String(s)))
             }
 
-            // IntroducedString: _charset 'string' — treat as string literal
-            sp::Expr::IntroducedString { value, .. } => {
-                Ok(ResolvedExpr::Literal(convert_value(value)?))
-            }
+            // Prefixed: _charset 'string' — treat as string literal (was IntroducedString)
+            sp::Expr::Prefixed { value, .. } => self.resolve_expr(value, scope),
 
             // Collate: expr COLLATE collation — ignore collation, return expr
             sp::Expr::Collate { expr, .. } => self.resolve_expr(expr, scope),
@@ -1061,7 +1112,7 @@ impl<'a> Resolver<'a> {
         &self,
         privileges: &sp::Privileges,
         objects: &sp::GrantObjects,
-        grantees: &[sp::Ident],
+        grantees: &[sp::Grantee],
         with_grant_option: bool,
     ) -> SqlResult<ResolvedStatement> {
         let resolved_privileges = convert_privileges(privileges)?;
@@ -1074,7 +1125,7 @@ impl<'a> Resolver<'a> {
         }
 
         // Parse first grantee's 'user'@'host' format
-        let (grantee, grantee_host) = parse_grantee(&grantees[0])?;
+        let (grantee, grantee_host) = parse_grantee_obj(&grantees[0])?;
 
         Ok(ResolvedStatement::Grant {
             privileges: resolved_privileges,
@@ -1090,7 +1141,7 @@ impl<'a> Resolver<'a> {
         &self,
         privileges: &sp::Privileges,
         objects: &sp::GrantObjects,
-        grantees: &[sp::Ident],
+        grantees: &[sp::Grantee],
     ) -> SqlResult<ResolvedStatement> {
         let resolved_privileges = convert_privileges(privileges)?;
         let object = convert_grant_objects(objects)?;
@@ -1102,7 +1153,7 @@ impl<'a> Resolver<'a> {
         }
 
         // Parse first grantee's 'user'@'host' format
-        let (grantee, grantee_host) = parse_grantee(&grantees[0])?;
+        let (grantee, grantee_host) = parse_grantee_obj(&grantees[0])?;
 
         Ok(ResolvedStatement::Revoke {
             privileges: resolved_privileges,
@@ -1134,26 +1185,44 @@ fn parse_user_host(name: &sp::ObjectName) -> SqlResult<(String, HostPattern)> {
     }
 }
 
-/// Parse grantee identifier (may include host)
-fn parse_grantee(ident: &sp::Ident) -> SqlResult<(String, HostPattern)> {
-    let full_name = ident.value.clone();
-
-    // Check for @host pattern
-    if let Some(at_pos) = full_name.find('@') {
-        let username = full_name[..at_pos].trim_matches('\'').to_string();
-        let host = full_name[at_pos + 1..].trim_matches('\'').to_string();
-        Ok((username, HostPattern::new(host)))
-    } else {
-        // No host specified - default to '%' (any host)
-        Ok((full_name, HostPattern::any()))
+/// Parse grantee from sqlparser Grantee struct
+fn parse_grantee_obj(grantee: &sp::Grantee) -> SqlResult<(String, HostPattern)> {
+    match &grantee.name {
+        Some(sp::GranteeName::UserHost { user, host }) => {
+            Ok((user.value.clone(), HostPattern::new(host.value.clone())))
+        }
+        Some(sp::GranteeName::ObjectName(name)) => {
+            let full_name = name.to_string();
+            if let Some(at_pos) = full_name.find('@') {
+                let username = full_name[..at_pos].trim_matches('\'').to_string();
+                let host = full_name[at_pos + 1..].trim_matches('\'').to_string();
+                Ok((username, HostPattern::new(host)))
+            } else {
+                Ok((full_name, HostPattern::any()))
+            }
+        }
+        None => {
+            // Fallback: use to_string on the grantee
+            let full_name = grantee.to_string().trim().to_string();
+            if let Some(at_pos) = full_name.find('@') {
+                let username = full_name[..at_pos].trim_matches('\'').to_string();
+                let host = full_name[at_pos + 1..].trim_matches('\'').to_string();
+                Ok((username, HostPattern::new(host)))
+            } else {
+                Ok((full_name, HostPattern::any()))
+            }
+        }
     }
 }
 
 /// Extract string literal from expression
 fn extract_string_literal(expr: &sp::Expr) -> Option<String> {
     match expr {
-        sp::Expr::Value(sp::Value::SingleQuotedString(s)) => Some(s.clone()),
-        sp::Expr::Value(sp::Value::DoubleQuotedString(s)) => Some(s.clone()),
+        sp::Expr::Value(val_with_span) => match &val_with_span.value {
+            sp::Value::SingleQuotedString(s) => Some(s.clone()),
+            sp::Value::DoubleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1185,7 +1254,7 @@ fn convert_single_privilege(action: &sp::Action) -> SqlResult<Privilege> {
         sp::Action::Insert { .. } => Ok(Privilege::Insert),
         sp::Action::Update { .. } => Ok(Privilege::Update),
         sp::Action::Delete => Ok(Privilege::Delete),
-        sp::Action::Create => Ok(Privilege::Create),
+        sp::Action::Create { .. } => Ok(Privilege::Create),
         sp::Action::Truncate => Ok(Privilege::Delete), // Map truncate to delete privilege
         other => Err(SqlError::Unsupported(format!(
             "Unsupported privilege: {:?}",
@@ -1241,6 +1310,7 @@ fn convert_grant_objects(objects: &sp::GrantObjects) -> SqlResult<PrivilegeObjec
             // Schema-level - treat as database-level
             Ok(PrivilegeObject::Global)
         }
+        _ => Ok(PrivilegeObject::Global),
     }
 }
 
@@ -1314,10 +1384,11 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
             sp::ColumnOption::Default(expr) => {
                 col_def = col_def.default(expr.to_string());
             }
-            sp::ColumnOption::Unique { is_primary, .. } => {
-                if *is_primary {
-                    col_def = col_def.nullable(false);
-                }
+            sp::ColumnOption::Unique(_) => {
+                // Unique constraint on column — no special handling needed
+            }
+            sp::ColumnOption::PrimaryKey(_) => {
+                col_def = col_def.nullable(false);
             }
             sp::ColumnOption::DialectSpecific(tokens) => {
                 let token_str: String = tokens
@@ -1346,7 +1417,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         sp::DataType::Int(_) | sp::DataType::Integer(_) => Ok(DataType::Int),
         sp::DataType::BigInt(_) => Ok(DataType::BigInt),
         sp::DataType::Float(_) | sp::DataType::Real => Ok(DataType::Float),
-        sp::DataType::Double | sp::DataType::DoublePrecision => Ok(DataType::Double),
+        sp::DataType::Double(_) | sp::DataType::DoublePrecision => Ok(DataType::Double),
         sp::DataType::Varchar(len) => {
             let n = extract_varchar_length(len).unwrap_or(255);
             Ok(DataType::Varchar(n))
@@ -1362,15 +1433,13 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         sp::DataType::Date => Ok(DataType::Timestamp),
         sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
         // UNSIGNED variants — map to corresponding signed types (we don't track signedness)
-        sp::DataType::UnsignedTinyInt(_) => Ok(DataType::TinyInt),
-        sp::DataType::UnsignedSmallInt(_) | sp::DataType::UnsignedInt2(_) => {
-            Ok(DataType::SmallInt)
-        }
-        sp::DataType::UnsignedMediumInt(_) => Ok(DataType::Int),
-        sp::DataType::UnsignedInt(_)
-        | sp::DataType::UnsignedInt4(_)
-        | sp::DataType::UnsignedInteger(_) => Ok(DataType::Int),
-        sp::DataType::UnsignedBigInt(_) | sp::DataType::UnsignedInt8(_) => Ok(DataType::BigInt),
+        sp::DataType::TinyIntUnsigned(_) => Ok(DataType::TinyInt),
+        sp::DataType::SmallIntUnsigned(_) => Ok(DataType::SmallInt),
+        sp::DataType::MediumIntUnsigned(_) => Ok(DataType::Int),
+        sp::DataType::IntUnsigned(_)
+        | sp::DataType::IntegerUnsigned(_)
+        | sp::DataType::UnsignedInteger => Ok(DataType::Int),
+        sp::DataType::BigIntUnsigned(_) => Ok(DataType::BigInt),
         // MediumInt
         sp::DataType::MediumInt(_) => Ok(DataType::Int),
         // Int2/Int4/Int8 aliases
@@ -1378,7 +1447,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         sp::DataType::Int4(_) => Ok(DataType::Int),
         sp::DataType::Int8(_) => Ok(DataType::BigInt),
         // ENUM and SET — map to Text (we don't enforce the value set)
-        sp::DataType::Enum(_) => Ok(DataType::Text),
+        sp::DataType::Enum(..) => Ok(DataType::Text),
         sp::DataType::Set(_) => Ok(DataType::Text),
         // DECIMAL/NUMERIC — map to Double
         sp::DataType::Decimal(_) | sp::DataType::Numeric(_) | sp::DataType::Dec(_) => {
@@ -1396,9 +1465,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 "UNSIGNED" => Ok(DataType::BigInt), // CAST AS UNSIGNED
                 "SIGNED" => Ok(DataType::BigInt),   // CAST AS SIGNED
                 "YEAR" => Ok(DataType::SmallInt),
-                "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => {
-                    Ok(DataType::Text)
-                }
+                "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => Ok(DataType::Text),
                 "MEDIUMBLOB" | "LONGBLOB" | "TINYBLOB" => Ok(DataType::Blob),
                 "FIXED" => Ok(DataType::Double),
                 _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
@@ -1420,29 +1487,36 @@ fn extract_varchar_length(len: &Option<sp::CharacterLength>) -> Option<u32> {
 /// Convert table constraint
 fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Option<Constraint>> {
     match constraint {
-        sp::TableConstraint::PrimaryKey { columns, .. } => {
-            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+        sp::TableConstraint::PrimaryKey(pk) => {
+            let cols: Vec<String> = pk
+                .columns
+                .iter()
+                .map(|c| c.column.expr.to_string())
+                .collect();
             Ok(Some(Constraint::PrimaryKey(cols)))
         }
-        sp::TableConstraint::Unique { columns, .. } => {
-            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+        sp::TableConstraint::Unique(uc) => {
+            let cols: Vec<String> = uc
+                .columns
+                .iter()
+                .map(|c| c.column.expr.to_string())
+                .collect();
             Ok(Some(Constraint::Unique(cols)))
         }
-        sp::TableConstraint::ForeignKey {
-            columns,
-            foreign_table,
-            referred_columns,
-            ..
-        } => {
-            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-            let ref_cols: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
+        sp::TableConstraint::ForeignKey(fk) => {
+            let cols: Vec<String> = fk.columns.iter().map(|c| c.value.clone()).collect();
+            let ref_cols: Vec<String> = fk
+                .referred_columns
+                .iter()
+                .map(|c| c.value.clone())
+                .collect();
             Ok(Some(Constraint::ForeignKey {
                 columns: cols,
-                ref_table: foreign_table.to_string(),
+                ref_table: fk.foreign_table.to_string(),
                 ref_columns: ref_cols,
             }))
         }
-        sp::TableConstraint::Check { expr, .. } => Ok(Some(Constraint::Check(expr.to_string()))),
+        sp::TableConstraint::Check(check) => Ok(Some(Constraint::Check(check.expr.to_string()))),
         _ => Ok(None),
     }
 }
@@ -1450,12 +1524,7 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
 /// Extract column name from assignment target
 fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String> {
     match target {
-        sp::AssignmentTarget::ColumnName(names) => Ok(names
-            .0
-            .iter()
-            .map(|i| i.value.clone())
-            .collect::<Vec<_>>()
-            .join(".")),
+        sp::AssignmentTarget::ColumnName(names) => Ok(names.to_string()),
         sp::AssignmentTarget::Tuple(_) => {
             Err(SqlError::Unsupported("Tuple assignment".to_string()))
         }
@@ -1465,11 +1534,12 @@ fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String>
 /// Convert JOIN type
 fn convert_join_type(join_op: &sp::JoinOperator) -> SqlResult<JoinType> {
     match join_op {
-        sp::JoinOperator::Inner(_) => Ok(JoinType::Inner),
-        sp::JoinOperator::LeftOuter(_) => Ok(JoinType::Left),
-        sp::JoinOperator::RightOuter(_) => Ok(JoinType::Right),
+        sp::JoinOperator::Join(_) | sp::JoinOperator::Inner(_) => Ok(JoinType::Inner),
+        sp::JoinOperator::Left(_) | sp::JoinOperator::LeftOuter(_) => Ok(JoinType::Left),
+        sp::JoinOperator::Right(_) | sp::JoinOperator::RightOuter(_) => Ok(JoinType::Right),
         sp::JoinOperator::FullOuter(_) => Ok(JoinType::Full),
-        sp::JoinOperator::CrossJoin => Ok(JoinType::Cross),
+        sp::JoinOperator::CrossJoin(_) => Ok(JoinType::Cross),
+        sp::JoinOperator::StraightJoin(_) => Ok(JoinType::Inner),
         _ => Err(SqlError::Unsupported("Join type".to_string())),
     }
 }
@@ -1477,10 +1547,14 @@ fn convert_join_type(join_op: &sp::JoinOperator) -> SqlResult<JoinType> {
 /// Extract JOIN condition
 fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
     match join_op {
-        sp::JoinOperator::Inner(sp::JoinConstraint::On(expr))
+        sp::JoinOperator::Join(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::Inner(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::Left(sp::JoinConstraint::On(expr))
         | sp::JoinOperator::LeftOuter(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::Right(sp::JoinConstraint::On(expr))
         | sp::JoinOperator::RightOuter(sp::JoinConstraint::On(expr))
-        | sp::JoinOperator::FullOuter(sp::JoinConstraint::On(expr)) => Some(expr),
+        | sp::JoinOperator::FullOuter(sp::JoinConstraint::On(expr))
+        | sp::JoinOperator::StraightJoin(sp::JoinConstraint::On(expr)) => Some(expr),
         _ => None,
     }
 }
@@ -1548,6 +1622,7 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
         sp::BinaryOperator::Xor => Ok(BinaryOp::Xor),
         sp::BinaryOperator::Spaceship => Ok(BinaryOp::Spaceship),
+        sp::BinaryOperator::Assignment => Ok(BinaryOp::Assign),
         _ => Err(SqlError::Unsupported(format!("Binary operator: {:?}", op))),
     }
 }
@@ -1599,6 +1674,9 @@ fn infer_binary_result_type(
 
         // NULL-safe equality returns boolean (never NULL)
         BinaryOp::Spaceship => Ok(DataType::Boolean),
+
+        // Assignment (:=) returns the assigned value type
+        BinaryOp::Assign => Ok(right.data_type()),
     }
 }
 
@@ -1778,6 +1856,31 @@ mod tests {
             ResolvedStatement::Select(select) => {
                 assert_eq!(select.columns.len(), 2);
                 assert!(select.filter.is_some());
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_user_variable() {
+        let catalog = test_catalog();
+        let resolver = Resolver::new(&catalog);
+
+        let stmt = Parser::parse_one("SELECT @x").unwrap();
+        let resolved = resolver.resolve(stmt).unwrap();
+        match resolved {
+            ResolvedStatement::Select(select) => {
+                assert_eq!(select.columns.len(), 1);
+                match &select.columns[0] {
+                    ResolvedSelectItem::Expr { expr, .. } => {
+                        assert!(
+                            matches!(expr, ResolvedExpr::UserVariable { name } if name == "x"),
+                            "Expected UserVariable, got {:?}",
+                            expr
+                        );
+                    }
+                    other => panic!("Expected Expr, got {:?}", other),
+                }
             }
             _ => panic!("Expected SELECT"),
         }

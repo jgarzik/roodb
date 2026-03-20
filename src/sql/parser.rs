@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn test_parse_update() {
         let stmt = Parser::parse_one("UPDATE users SET name = 'Bob' WHERE id = 1").unwrap();
-        assert!(matches!(stmt, sp::Statement::Update { .. }));
+        assert!(matches!(stmt, sp::Statement::Update(_)));
     }
 
     #[test]

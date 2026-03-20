@@ -6,9 +6,11 @@ use async_trait::async_trait;
 
 use crate::planner::logical::{JoinType, ResolvedExpr};
 
+use crate::server::session::UserVariables;
+
 use super::datum::Datum;
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -40,6 +42,8 @@ pub struct NestedLoopJoin {
     unmatched_right_pos: usize,
     /// Whether we've finished the main join loop
     main_loop_done: bool,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl NestedLoopJoin {
@@ -55,6 +59,7 @@ impl NestedLoopJoin {
         condition: Option<ResolvedExpr>,
         left_width: usize,
         right_width: usize,
+        user_variables: UserVariables,
     ) -> Self {
         NestedLoopJoin {
             left,
@@ -70,6 +75,7 @@ impl NestedLoopJoin {
             right_matched: Vec::new(),
             unmatched_right_pos: 0,
             main_loop_done: false,
+            user_variables,
         }
     }
 
@@ -82,7 +88,7 @@ impl NestedLoopJoin {
     fn matches(&self, combined: &Row) -> ExecutorResult<bool> {
         match &self.condition {
             Some(cond) => {
-                let result = eval(cond, combined)?;
+                let result = evaluate(cond, combined, &self.user_variables)?;
                 Ok(result.as_bool().unwrap_or(false))
             }
             None => Ok(true), // No condition = cross join
@@ -187,6 +193,14 @@ impl Executor for NestedLoopJoin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -231,7 +245,7 @@ mod tests {
             position: 0,
         });
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Cross, None, 1, 1);
+        let mut join = NestedLoopJoin::new(left, right, JoinType::Cross, None, 1, 1, empty_vars());
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -290,7 +304,15 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Inner, Some(condition), 2, 2);
+        let mut join = NestedLoopJoin::new(
+            left,
+            right,
+            JoinType::Inner,
+            Some(condition),
+            2,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -346,7 +368,15 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut join = NestedLoopJoin::new(left, right, JoinType::Left, Some(condition), 1, 2);
+        let mut join = NestedLoopJoin::new(
+            left,
+            right,
+            JoinType::Left,
+            Some(condition),
+            1,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();

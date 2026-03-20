@@ -8,10 +8,12 @@ use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{encode_pk_key, encode_row, encode_row_key};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -43,6 +45,8 @@ pub struct Insert {
     last_insert_id: u64,
     /// Primary key column indices (for PK-based storage keys)
     pk_column_indices: Vec<usize>,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Insert {
@@ -54,6 +58,7 @@ impl Insert {
         txn_context: Option<TransactionContext>,
         auto_increment_indices: Vec<usize>,
         pk_column_indices: Vec<usize>,
+        user_variables: UserVariables,
     ) -> Self {
         Insert {
             table,
@@ -67,6 +72,7 @@ impl Insert {
             auto_increment_indices,
             last_insert_id: 0,
             pk_column_indices,
+            user_variables,
         }
     }
 
@@ -110,7 +116,7 @@ impl Executor for Insert {
             // Evaluate expressions to get datum values
             let mut datums = Vec::with_capacity(value_row.len());
             for expr in value_row {
-                let datum = eval(expr, &empty_row)?;
+                let datum = evaluate(expr, &empty_row, &self.user_variables)?;
                 datums.push(datum);
             }
 
@@ -183,6 +189,14 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::Literal;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     #[tokio::test]
     async fn test_insert() {
@@ -220,6 +234,7 @@ mod tests {
             Some(txn_context),
             vec![],
             vec![0], // id is PK at index 0
+            empty_vars(),
         );
         insert.open().await.unwrap();
 

@@ -8,4 +8,5 @@ mod grouping;
 mod joins;
 mod ordering;
 mod select_basic;
+mod user_variables;
 mod where_clause;

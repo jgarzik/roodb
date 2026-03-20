@@ -54,7 +54,7 @@ crossbeam-skiplist = "0.1"
 lz4_flex = "0.11"
 
 # SQL parsing
-sqlparser = { version = "0.50", features = ["visitor"] }
+sqlparser = { version = "0.61", features = ["visitor"] }
 
 # Ordered floats for sorting
 ordered-float = "4"

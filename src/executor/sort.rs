@@ -6,8 +6,10 @@ use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedExpr;
 
+use crate::server::session::UserVariables;
+
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -21,16 +23,23 @@ pub struct Sort {
     rows: Vec<Row>,
     /// Current position in sorted rows
     position: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Sort {
     /// Create a new sort executor
-    pub fn new(input: Box<dyn Executor>, order_by: Vec<(ResolvedExpr, bool)>) -> Self {
+    pub fn new(
+        input: Box<dyn Executor>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        user_variables: UserVariables,
+    ) -> Self {
         Sort {
             input,
             order_by,
             rows: Vec::new(),
             position: 0,
+            user_variables,
         }
     }
 }
@@ -57,7 +66,7 @@ impl Executor for Sort {
         for row in self.rows.drain(..) {
             let mut keys = Vec::with_capacity(order_by.len());
             for (expr, _) in order_by {
-                keys.push(eval(expr, &row)?);
+                keys.push(evaluate(expr, &row, &self.user_variables)?);
             }
             keyed_rows.push((keys, row));
         }
@@ -104,6 +113,14 @@ mod tests {
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
     use crate::planner::logical::ResolvedColumn;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -151,7 +168,7 @@ mod tests {
             true, // ascending
         )];
 
-        let mut sort = Sort::new(input, order_by);
+        let mut sort = Sort::new(input, order_by, empty_vars());
         sort.open().await.unwrap();
 
         assert_eq!(
@@ -191,7 +208,7 @@ mod tests {
             false, // descending
         )];
 
-        let mut sort = Sort::new(input, order_by);
+        let mut sort = Sort::new(input, order_by, empty_vars());
         sort.open().await.unwrap();
 
         assert_eq!(

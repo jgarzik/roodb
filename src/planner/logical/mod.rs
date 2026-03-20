@@ -44,6 +44,8 @@ pub enum BinaryOp {
     Xor,
     // NULL-safe comparison
     Spaceship,
+    // Assignment (:=)
+    Assign,
 }
 
 /// Unary operators
@@ -155,6 +157,8 @@ pub enum ResolvedExpr {
         expr: Box<ResolvedExpr>,
         target_type: DataType,
     },
+    /// User variable reference (@var)
+    UserVariable { name: String },
     /// CASE expression (simple and searched)
     Case {
         /// Simple CASE: the operand to compare against; None for searched CASE
@@ -192,6 +196,7 @@ impl ResolvedExpr {
             ResolvedExpr::Between { .. } => DataType::Boolean,
             ResolvedExpr::BooleanTest { .. } => DataType::Boolean,
             ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
+            ResolvedExpr::UserVariable { .. } => DataType::Text,
             ResolvedExpr::Case { result_type, .. } => result_type.clone(),
         }
     }
@@ -214,6 +219,7 @@ impl ResolvedExpr {
             } => expr.is_nullable() || low.is_nullable() || high.is_nullable(),
             ResolvedExpr::BooleanTest { .. } => false, // Always returns true/false, never NULL
             ResolvedExpr::Cast { expr, .. } => expr.is_nullable(),
+            ResolvedExpr::UserVariable { .. } => true,
             ResolvedExpr::Case {
                 results,
                 else_result,
@@ -296,10 +302,7 @@ pub enum ResolvedStatement {
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables {
-        names: Vec<String>,
-        if_exists: bool,
-    },
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -482,10 +485,7 @@ pub enum LogicalPlan {
     DropTable { name: String, if_exists: bool },
 
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables {
-        names: Vec<String>,
-        if_exists: bool,
-    },
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {

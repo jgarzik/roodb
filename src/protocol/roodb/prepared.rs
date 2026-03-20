@@ -138,9 +138,11 @@ pub fn count_placeholders(stmt: &Statement) -> u16 {
     impl Visitor for Counter {
         type Break = ();
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            if let Expr::Value(Value::Placeholder(s)) = expr {
-                if s == "?" {
-                    self.0 += 1;
+            if let Expr::Value(vws) = expr {
+                if let Value::Placeholder(s) = &vws.value {
+                    if s == "?" {
+                        self.0 += 1;
+                    }
                 }
             }
             ControlFlow::Continue(())
@@ -203,21 +205,24 @@ pub fn substitute_params(stmt: &Statement, params: &[Datum]) -> ProtocolResult<S
     impl sp::VisitorMut for Replacer<'_> {
         type Break = ();
         fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-            if let Expr::Value(Value::Placeholder(s)) = expr {
-                if s == "?" {
-                    // SAFETY: single-threaded visitor
-                    let i = unsafe { &mut *self.idx };
-                    if *i >= self.params.len() {
-                        self.err = Some(ProtocolError::InvalidPacket(format!(
-                            "Not enough parameters: need at least {}, got {}",
-                            *i + 1,
-                            self.params.len()
-                        )));
-                        return ControlFlow::Break(());
-                    }
-                    *expr = datum_to_sqlparser_expr(&self.params[*i]);
-                    *i += 1;
+            let is_placeholder = if let Expr::Value(vws) = &*expr {
+                matches!(&vws.value, Value::Placeholder(s) if s == "?")
+            } else {
+                false
+            };
+            if is_placeholder {
+                // SAFETY: single-threaded visitor
+                let i = unsafe { &mut *self.idx };
+                if *i >= self.params.len() {
+                    self.err = Some(ProtocolError::InvalidPacket(format!(
+                        "Not enough parameters: need at least {}, got {}",
+                        *i + 1,
+                        self.params.len()
+                    )));
+                    return ControlFlow::Break(());
                 }
+                *expr = datum_to_sqlparser_expr(&self.params[*i]);
+                *i += 1;
             }
             ControlFlow::Continue(())
         }
@@ -238,35 +243,36 @@ pub fn substitute_params(stmt: &Statement, params: &[Datum]) -> ProtocolResult<S
 
 /// Convert a `Datum` into an sqlparser `Expr` for substitution.
 fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
+    /// Helper: wrap a Value into Expr::Value(ValueWithSpan)
+    fn val(v: Value) -> Expr {
+        Expr::Value(v.into())
+    }
     match datum {
-        Datum::Null => Expr::Value(Value::Null),
-        Datum::Bool(b) => Expr::Value(Value::Boolean(*b)),
+        Datum::Null => val(Value::Null),
+        Datum::Bool(b) => val(Value::Boolean(*b)),
         Datum::Int(i) => {
             if *i < 0 {
                 Expr::UnaryOp {
                     op: sp::UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(Value::Number(
-                        i.unsigned_abs().to_string(),
-                        false,
-                    ))),
+                    expr: Box::new(val(Value::Number(i.unsigned_abs().to_string(), false))),
                 }
             } else {
-                Expr::Value(Value::Number(i.to_string(), false))
+                val(Value::Number(i.to_string(), false))
             }
         }
         Datum::Float(f) => {
             if *f < 0.0 {
                 Expr::UnaryOp {
                     op: sp::UnaryOperator::Minus,
-                    expr: Box::new(Expr::Value(Value::Number(format!("{}", f.abs()), false))),
+                    expr: Box::new(val(Value::Number(format!("{}", f.abs()), false))),
                 }
             } else {
-                Expr::Value(Value::Number(format!("{}", f), false))
+                val(Value::Number(format!("{}", f), false))
             }
         }
-        Datum::String(s) => Expr::Value(Value::SingleQuotedString(s.clone())),
-        Datum::Bytes(b) => Expr::Value(Value::HexStringLiteral(hex::encode(b))),
-        Datum::Timestamp(ts) => Expr::Value(Value::Number(ts.to_string(), false)),
+        Datum::String(s) => val(Value::SingleQuotedString(s.clone())),
+        Datum::Bytes(b) => val(Value::HexStringLiteral(hex::encode(b))),
+        Datum::Timestamp(ts) => val(Value::Number(ts.to_string(), false)),
     }
 }
 
@@ -657,13 +663,15 @@ mod tests {
     #[test]
     fn test_datum_to_sqlparser_expr() {
         let e = datum_to_sqlparser_expr(&Datum::Int(42));
-        assert!(matches!(e, Expr::Value(Value::Number(n, false)) if n == "42"));
+        assert!(
+            matches!(e, Expr::Value(vws) if matches!(&vws.value, Value::Number(n, false) if n == "42"))
+        );
 
         let e = datum_to_sqlparser_expr(&Datum::Null);
-        assert!(matches!(e, Expr::Value(Value::Null)));
+        assert!(matches!(e, Expr::Value(vws) if matches!(vws.value, Value::Null)));
 
         let e = datum_to_sqlparser_expr(&Datum::Bool(true));
-        assert!(matches!(e, Expr::Value(Value::Boolean(true))));
+        assert!(matches!(e, Expr::Value(vws) if matches!(vws.value, Value::Boolean(true))));
     }
 
     #[test]

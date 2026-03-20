@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use crate::planner::logical::expr::AggregateFunc;
 use crate::planner::logical::{Literal, ResolvedExpr};
 
+use crate::server::session::UserVariables;
+
 use super::datum::Datum;
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -156,6 +158,8 @@ pub struct HashAggregate {
     output: Vec<Row>,
     /// Current position in output
     position: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl HashAggregate {
@@ -164,6 +168,7 @@ impl HashAggregate {
         input: Box<dyn Executor>,
         group_by: Vec<ResolvedExpr>,
         aggregates: Vec<(AggregateFunc, String)>,
+        user_variables: UserVariables,
     ) -> Self {
         HashAggregate {
             input,
@@ -172,6 +177,7 @@ impl HashAggregate {
             groups: HashMap::new(),
             output: Vec::new(),
             position: 0,
+            user_variables,
         }
     }
 
@@ -210,7 +216,7 @@ impl Executor for HashAggregate {
             // Evaluate group by expressions
             let mut group_values = Vec::with_capacity(self.group_by.len());
             for expr in &self.group_by {
-                group_values.push(eval(expr, &row)?);
+                group_values.push(evaluate(expr, &row, &self.user_variables)?);
             }
 
             let group_key = Self::make_group_key(&group_values);
@@ -232,7 +238,7 @@ impl Executor for HashAggregate {
                     // COUNT(*) case - count every row
                     Datum::Int(1)
                 } else {
-                    eval(&agg.args[0], &row)?
+                    evaluate(&agg.args[0], &row, &self.user_variables)?
                 };
                 accumulators[i].accumulate(&value);
             }
@@ -282,6 +288,14 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::ResolvedColumn;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -328,7 +342,7 @@ mod tests {
             "count".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -363,7 +377,7 @@ mod tests {
             "sum".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -406,7 +420,7 @@ mod tests {
             "sum".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, group_by, aggregates);
+        let mut agg = HashAggregate::new(input, group_by, aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let mut results: HashMap<String, f64> = HashMap::new();
@@ -451,7 +465,7 @@ mod tests {
             "count_distinct".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -488,7 +502,7 @@ mod tests {
             "sum_distinct".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();

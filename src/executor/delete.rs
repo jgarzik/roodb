@@ -10,10 +10,12 @@ use crate::planner::logical::ResolvedExpr;
 use crate::raft::RowChange;
 use crate::txn::MvccStorage;
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{decode_row, encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -33,6 +35,8 @@ pub struct Delete {
     rows_deleted: u64,
     /// Whether execution is complete
     done: bool,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Delete {
@@ -43,6 +47,7 @@ impl Delete {
         key_value: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         Delete {
             table,
@@ -52,6 +57,7 @@ impl Delete {
             txn_context,
             rows_deleted: 0,
             done: false,
+            user_variables,
         }
     }
 }
@@ -60,7 +66,7 @@ impl Delete {
     /// PointGet fast path: O(1) single-key lookup + delete
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
-        let key_datum = eval(key_expr, &Row::empty())?;
+        let key_datum = evaluate(key_expr, &Row::empty(), &self.user_variables)?;
         let storage_key = encode_pk_key(&self.table, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
@@ -78,7 +84,7 @@ impl Delete {
         if let Some((data, row_version)) = result {
             let row = decode_row(&data)?;
             if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     return Ok(());
                 }
@@ -120,7 +126,7 @@ impl Delete {
         for (key, value, row_version) in kv_pairs {
             let row = decode_row(&value)?;
             if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }
@@ -190,10 +196,17 @@ mod tests {
     use crate::executor::datum::Datum;
     use crate::executor::encoding::{encode_pk_key, encode_row};
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
+    use crate::server::session::UserVariables;
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
-    use std::sync::Mutex;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockStorage {
         data: Mutex<Vec<KeyValue>>,
@@ -317,6 +330,7 @@ mod tests {
             None,
             mvcc,
             Some(txn_context),
+            empty_vars(),
         );
         delete.open().await.unwrap();
 
@@ -359,7 +373,14 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut delete = Delete::new("users".to_string(), None, None, mvcc, Some(txn_context));
+        let mut delete = Delete::new(
+            "users".to_string(),
+            None,
+            None,
+            mvcc,
+            Some(txn_context),
+            empty_vars(),
+        );
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();

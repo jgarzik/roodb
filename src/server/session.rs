@@ -1,8 +1,17 @@
 //! Session state for RooDB connections
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use crate::executor::Datum;
 use crate::raft::RowChange;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 use crate::txn::{IsolationLevel, TimeoutConfig};
+
+/// Thread-safe per-session user variable storage (@var)
+pub type UserVariables = Arc<RwLock<HashMap<String, Datum>>>;
 
 /// Default batch size for row ID allocation
 const ROW_ID_BATCH_SIZE: u64 = 1000;
@@ -100,6 +109,10 @@ pub struct Session {
     // Warning tracking
     /// Warnings accumulated during the current statement
     warnings: Vec<Warning>,
+
+    // User variables (@var)
+    /// Per-session user variable storage
+    user_variables: UserVariables,
 }
 
 impl Session {
@@ -120,6 +133,8 @@ impl Session {
             row_id_batch: IdBatch::empty(),
             // Warnings
             warnings: Vec::new(),
+            // User variables
+            user_variables: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -249,5 +264,26 @@ impl Session {
     /// Get a reference to accumulated warnings
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
+    }
+
+    // ============ User variables (@var) ============
+
+    /// Get a clone of the user variables handle (Arc-cloned, cheap)
+    pub fn user_variables(&self) -> UserVariables {
+        self.user_variables.clone()
+    }
+
+    /// Get a user variable value, returns Datum::Null if not set
+    pub fn get_user_variable(&self, name: &str) -> Datum {
+        let vars = self.user_variables.read();
+        vars.get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or(Datum::Null)
+    }
+
+    /// Set a user variable
+    pub fn set_user_variable(&self, name: &str, value: Datum) {
+        let mut vars = self.user_variables.write();
+        vars.insert(name.to_lowercase(), value);
     }
 }

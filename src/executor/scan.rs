@@ -9,10 +9,12 @@ use async_trait::async_trait;
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{decode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -30,6 +32,8 @@ pub struct TableScan {
     raw_pairs: Vec<Vec<u8>>,
     /// Current position in raw_pairs
     position: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl TableScan {
@@ -39,6 +43,7 @@ impl TableScan {
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         TableScan {
             table,
@@ -47,6 +52,7 @@ impl TableScan {
             txn_context,
             raw_pairs: Vec::new(),
             position: 0,
+            user_variables,
         }
     }
 }
@@ -107,7 +113,7 @@ impl Executor for TableScan {
             self.position += 1;
 
             if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }
@@ -130,9 +136,17 @@ mod tests {
     use super::*;
     use crate::executor::datum::Datum;
     use crate::executor::encoding::{encode_pk_key, encode_row};
+    use crate::server::session::UserVariables;
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockStorage {
         data: Vec<KeyValue>,
@@ -197,7 +211,7 @@ mod tests {
     async fn test_table_scan_basic() {
         let mvcc = make_test_mvcc();
         // No txn_context = use inner storage directly (legacy mode)
-        let mut scan = TableScan::new("users".to_string(), None, mvcc, None);
+        let mut scan = TableScan::new("users".to_string(), None, mvcc, None, empty_vars());
 
         scan.open().await.unwrap();
 

@@ -151,10 +151,7 @@ pub enum PhysicalPlan {
     DropTable { name: String, if_exists: bool },
 
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables {
-        names: Vec<String>,
-        if_exists: bool,
-    },
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
@@ -581,6 +578,7 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
             substitute_expr(high, params)?;
         }
         ResolvedExpr::Column(_) => {}
+        ResolvedExpr::UserVariable { .. } => {}
         ResolvedExpr::BooleanTest { expr: inner, .. } => {
             substitute_expr(inner, params)?;
         }

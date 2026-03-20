@@ -10,10 +10,12 @@ use async_trait::async_trait;
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{decode_row, encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -39,6 +41,8 @@ pub struct RangeScan {
     raw_pairs: Vec<Vec<u8>>,
     /// Current position in raw_pairs
     position: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 /// Configuration for a range scan's bounds
@@ -56,6 +60,7 @@ impl RangeScan {
         bounds: RangeScanBounds,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         RangeScan {
             table,
@@ -68,6 +73,7 @@ impl RangeScan {
             txn_context,
             raw_pairs: Vec::new(),
             position: 0,
+            user_variables,
         }
     }
 
@@ -87,7 +93,7 @@ impl Executor for RangeScan {
 
         // Compute start bound
         let start_key = if let Some(ref expr) = self.start_expr {
-            let datum = eval(expr, &empty_row)?;
+            let datum = evaluate(expr, &empty_row, &self.user_variables)?;
             let key = encode_pk_key(&self.table, &[datum]);
             if self.inclusive_start {
                 key
@@ -101,7 +107,7 @@ impl Executor for RangeScan {
 
         // Compute end bound (storage scan end is always exclusive)
         let end_key = if let Some(ref expr) = self.end_expr {
-            let datum = eval(expr, &empty_row)?;
+            let datum = evaluate(expr, &empty_row, &self.user_variables)?;
             let key = encode_pk_key(&self.table, &[datum]);
             if self.inclusive_end {
                 // Inclusive end: increment so storage scan includes this key
@@ -164,7 +170,7 @@ impl Executor for RangeScan {
             self.position += 1;
 
             if let Some(filter) = &self.remaining_filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }

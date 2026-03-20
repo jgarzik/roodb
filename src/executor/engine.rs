@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use crate::catalog::Catalog;
 use crate::planner::PhysicalPlan;
 use crate::raft::RaftNode;
+use crate::server::session::UserVariables;
 use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
@@ -44,6 +45,8 @@ pub struct ExecutorEngine {
     txn_context: Option<TransactionContext>,
     /// Optional Raft node for replication (DDL goes through Raft)
     raft_node: Option<Arc<RaftNode>>,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl ExecutorEngine {
@@ -52,12 +55,14 @@ impl ExecutorEngine {
         mvcc: Arc<MvccStorage>,
         catalog: Arc<RwLock<Catalog>>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         ExecutorEngine {
             mvcc,
             catalog,
             txn_context,
             raft_node: None,
+            user_variables,
         }
     }
 
@@ -67,12 +72,14 @@ impl ExecutorEngine {
         catalog: Arc<RwLock<Catalog>>,
         txn_context: Option<TransactionContext>,
         raft_node: Arc<RaftNode>,
+        user_variables: UserVariables,
     ) -> Self {
         ExecutorEngine {
             mvcc,
             catalog,
             txn_context,
             raft_node: Some(raft_node),
+            user_variables,
         }
     }
 
@@ -94,6 +101,7 @@ impl ExecutorEngine {
                 filter,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::PointGet {
@@ -105,6 +113,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::RangeScan {
@@ -126,16 +135,25 @@ impl ExecutorEngine {
                 },
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::Filter { input, predicate } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Filter::new(input_exec, predicate)))
+                Ok(Box::new(Filter::new(
+                    input_exec,
+                    predicate,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::Project { input, expressions } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Project::new(input_exec, expressions)))
+                Ok(Box::new(Project::new(
+                    input_exec,
+                    expressions,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::NestedLoopJoin {
@@ -157,6 +175,7 @@ impl ExecutorEngine {
                     condition,
                     left_width,
                     right_width,
+                    self.user_variables.clone(),
                 )))
             }
 
@@ -182,6 +201,7 @@ impl ExecutorEngine {
                     condition,
                     left_width,
                     right_width,
+                    self.user_variables.clone(),
                 )))
             }
 
@@ -192,13 +212,20 @@ impl ExecutorEngine {
             } => {
                 let input_exec = self.build_node(*input)?;
                 Ok(Box::new(HashAggregate::new(
-                    input_exec, group_by, aggregates,
+                    input_exec,
+                    group_by,
+                    aggregates,
+                    self.user_variables.clone(),
                 )))
             }
 
             PhysicalPlan::Sort { input, order_by } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Sort::new(input_exec, order_by)))
+                Ok(Box::new(Sort::new(
+                    input_exec,
+                    order_by,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::Limit {
@@ -228,6 +255,7 @@ impl ExecutorEngine {
                 self.txn_context.clone(),
                 auto_increment_indices,
                 pk_column_indices,
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::Update {
@@ -242,6 +270,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::Delete {
@@ -254,6 +283,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::CreateTable {
@@ -638,7 +668,8 @@ mod tests {
         }
 
         // No transaction context for simple tests (legacy behavior)
-        let engine = ExecutorEngine::new(mvcc.clone(), catalog, None);
+        let user_variables = UserVariables::default();
+        let engine = ExecutorEngine::new(mvcc.clone(), catalog, None, user_variables);
         (engine, mvcc)
     }
 

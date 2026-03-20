@@ -6,8 +6,10 @@ use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedExpr;
 
+use crate::server::session::UserVariables;
+
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -17,12 +19,22 @@ pub struct Project {
     input: Box<dyn Executor>,
     /// Expressions to evaluate (with aliases)
     expressions: Vec<(ResolvedExpr, String)>,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Project {
     /// Create a new project executor
-    pub fn new(input: Box<dyn Executor>, expressions: Vec<(ResolvedExpr, String)>) -> Self {
-        Project { input, expressions }
+    pub fn new(
+        input: Box<dyn Executor>,
+        expressions: Vec<(ResolvedExpr, String)>,
+        user_variables: UserVariables,
+    ) -> Self {
+        Project {
+            input,
+            expressions,
+            user_variables,
+        }
     }
 }
 
@@ -37,7 +49,7 @@ impl Executor for Project {
             Some(input_row) => {
                 let mut values = Vec::with_capacity(self.expressions.len());
                 for (expr, _alias) in &self.expressions {
-                    let datum = eval(expr, &input_row)?;
+                    let datum = evaluate(expr, &input_row, &self.user_variables)?;
                     values.push(datum);
                 }
                 Ok(Some(Row::new(values)))
@@ -84,6 +96,15 @@ mod tests {
         }
     }
 
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
     #[tokio::test]
     async fn test_project() {
         let rows = vec![
@@ -128,7 +149,7 @@ mod tests {
             ),
         ];
 
-        let mut project = Project::new(input, expressions);
+        let mut project = Project::new(input, expressions, empty_vars());
         project.open().await.unwrap();
 
         let r1 = project.next().await.unwrap().unwrap();
