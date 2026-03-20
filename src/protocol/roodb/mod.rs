@@ -1879,7 +1879,10 @@ where
         let sql_trimmed = sql.trim();
         let sql_upper = sql_trimmed.to_uppercase();
 
-        if !sql_upper.starts_with("SHOW ") {
+        if !sql_upper.starts_with("SHOW ")
+            && !sql_upper.starts_with("DESCRIBE ")
+            && !sql_upper.starts_with("DESC ")
+        {
             return Ok(None);
         }
 

@@ -237,6 +237,48 @@ impl LsmRaftStorage {
             "Loaded Raft state from LSM"
         );
 
+        // Load databases from system.databases into catalog
+        // These may have been written by roodb_init (without MVCC headers)
+        // or via Raft apply (with MVCC headers). Handle both.
+        self.load_databases_into_catalog().await?;
+
+        Ok(())
+    }
+
+    /// Load database names from system.databases into the catalog
+    ///
+    /// Handles both raw rows (from roodb_init) and MVCC-wrapped rows (from Raft apply).
+    async fn load_databases_into_catalog(&self) -> Result<(), StorageError> {
+        let prefix = table_key_prefix(SYSTEM_DATABASES);
+        let end = table_key_end(SYSTEM_DATABASES);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(read_err)?;
+
+        let mut catalog = self.catalog.write();
+        for (_key, value) in rows {
+            // Try MVCC-wrapped row first (17-byte header)
+            let row_data = if value.len() > MVCC_HEADER_SIZE {
+                // Check deleted flag
+                if value[16] == 1 {
+                    continue;
+                }
+                &value[MVCC_HEADER_SIZE..]
+            } else {
+                // Raw row (from roodb_init, no MVCC header)
+                &value
+            };
+
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                    catalog.register_database(db_name.clone());
+                }
+            }
+        }
+
         Ok(())
     }
 

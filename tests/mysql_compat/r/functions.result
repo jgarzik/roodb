@@ -1,0 +1,31 @@
+# Test: Built-in functions
+# String functions
+SELECT UPPER('hello');
+UPPER
+HELLO
+SELECT LOWER('HELLO');
+LOWER
+hello
+SELECT LENGTH('hello');
+LENGTH
+5
+SELECT CONCAT('hello', ' ', 'world');
+CONCAT
+hello world
+# Numeric functions
+SELECT ABS(-5);
+ABS
+5
+SELECT ABS(5);
+ABS
+5
+# NULL functions
+SELECT COALESCE(NULL, 'fallback');
+COALESCE
+fallback
+SELECT COALESCE('first', 'second');
+COALESCE
+first
+SELECT COALESCE(NULL, NULL, 'third');
+COALESCE
+third

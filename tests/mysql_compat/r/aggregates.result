@@ -1,0 +1,63 @@
+# Test: Aggregates, GROUP BY, ORDER BY, LIMIT
+CREATE TABLE agg_t (id INT NOT NULL, category VARCHAR(20), val INT, PRIMARY KEY (id));
+INSERT INTO agg_t VALUES (1, 'A', 10);
+INSERT INTO agg_t VALUES (2, 'B', 20);
+INSERT INTO agg_t VALUES (3, 'A', 30);
+INSERT INTO agg_t VALUES (4, 'B', 40);
+INSERT INTO agg_t VALUES (5, 'C', 50);
+# COUNT, SUM, AVG, MIN, MAX
+SELECT COUNT(*) FROM agg_t;
+COUNT
+5
+SELECT SUM(val) FROM agg_t;
+SUM
+150
+SELECT MIN(val) FROM agg_t;
+MIN
+10
+SELECT MAX(val) FROM agg_t;
+MAX
+50
+# GROUP BY
+SELECT category, COUNT(*) FROM agg_t GROUP BY category ORDER BY category;
+category	COUNT
+A	2
+B	2
+C	1
+SELECT category, SUM(val) FROM agg_t GROUP BY category ORDER BY category;
+category	SUM
+A	40
+B	60
+C	50
+# ORDER BY
+SELECT id, val FROM agg_t ORDER BY val;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM agg_t ORDER BY val DESC;
+id	val
+5	50
+4	40
+3	30
+2	20
+1	10
+# LIMIT / OFFSET
+SELECT id FROM agg_t ORDER BY id LIMIT 3;
+id
+1
+2
+3
+SELECT id FROM agg_t ORDER BY id LIMIT 2 OFFSET 2;
+id
+3
+4
+# DISTINCT
+SELECT DISTINCT category FROM agg_t ORDER BY category;
+category
+A
+B
+C
+DROP TABLE agg_t;

@@ -1,0 +1,27 @@
+# Test: System variables and SET commands
+SELECT @@version;
+@@version
+8.0.0-RooDB
+SELECT @@version_comment;
+@@version_comment
+RooDB
+SELECT @@max_allowed_packet;
+@@max_allowed_packet
+16777216
+SELECT @@character_set_client;
+@@character_set_client
+utf8mb4
+SELECT @@collation_connection;
+@@collation_connection
+utf8mb4_general_ci
+SELECT @@autocommit;
+@@autocommit
+1
+SELECT @@sql_mode;
+@@sql_mode
+STRICT_TRANS_TABLES
+SELECT @@transaction_isolation;
+@@transaction_isolation
+REPEATABLE-READ
+SET NAMES utf8mb4;
+SET character_set_results = NULL;

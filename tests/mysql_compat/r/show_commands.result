@@ -1,0 +1,35 @@
+# Test: SHOW commands
+SHOW DATABASES;
+Database
+default
+test
+SHOW TABLES;
+Tables_in_test
+CREATE TABLE show_t1 (id INT NOT NULL, name VARCHAR(50), PRIMARY KEY (id));
+SHOW TABLES;
+Tables_in_test
+show_t1
+DESCRIBE show_t1;
+Field	Type	Null	Key	Default	Extra
+id	INT	NO	PRI	NULL	
+name	VARCHAR(50)	YES		NULL	
+DESC show_t1;
+Field	Type	Null	Key	Default	Extra
+id	INT	NO	PRI	NULL	
+name	VARCHAR(50)	YES		NULL	
+SHOW COLUMNS FROM show_t1;
+Field	Type	Null	Key	Default	Extra
+id	INT	NO	PRI	NULL	
+name	VARCHAR(50)	YES		NULL	
+SHOW CREATE TABLE show_t1;
+Table	Create Table
+show_t1	CREATE TABLE `show_t1` (
+  `id` INT NOT NULL,
+  `name` VARCHAR(50),
+  PRIMARY KEY (`id`)
+) ENGINE=RooDB DEFAULT CHARSET=utf8mb4
+SHOW WARNINGS;
+Level	Code	Message
+DROP TABLE show_t1;
+SHOW TABLES;
+Tables_in_test

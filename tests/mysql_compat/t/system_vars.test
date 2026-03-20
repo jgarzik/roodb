@@ -1,0 +1,12 @@
+--echo # Test: System variables and SET commands
+
+SELECT @@version;
+SELECT @@version_comment;
+SELECT @@max_allowed_packet;
+SELECT @@character_set_client;
+SELECT @@collation_connection;
+SELECT @@autocommit;
+SELECT @@sql_mode;
+SELECT @@transaction_isolation;
+SET NAMES utf8mb4;
+SET character_set_results = NULL;

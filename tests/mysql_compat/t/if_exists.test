@@ -1,0 +1,18 @@
+--echo # Test: IF EXISTS / IF NOT EXISTS
+
+CREATE TABLE if_t1 (id INT NOT NULL, PRIMARY KEY (id));
+
+--echo # CREATE IF NOT EXISTS (should succeed silently)
+CREATE TABLE IF NOT EXISTS if_t1 (id INT NOT NULL, PRIMARY KEY (id));
+
+--echo # DROP IF EXISTS (table exists)
+DROP TABLE IF EXISTS if_t1;
+
+--echo # DROP IF EXISTS (table does not exist, should succeed silently)
+DROP TABLE IF EXISTS if_t1;
+
+--echo # CREATE DATABASE IF NOT EXISTS
+CREATE DATABASE IF NOT EXISTS test;
+
+--echo # DROP DATABASE IF EXISTS
+DROP DATABASE IF EXISTS nonexistent_db_xyz;

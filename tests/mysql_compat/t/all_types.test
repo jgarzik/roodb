@@ -1,0 +1,22 @@
+--echo # Test: All supported data types
+
+CREATE TABLE all_types_t (
+    t_tinyint TINYINT,
+    t_smallint SMALLINT,
+    t_int INT NOT NULL,
+    t_bigint BIGINT,
+    t_float FLOAT,
+    t_double DOUBLE,
+    t_bool BOOLEAN,
+    t_varchar VARCHAR(100),
+    t_text TEXT,
+    PRIMARY KEY (t_int)
+);
+
+INSERT INTO all_types_t VALUES (1, 100, 1, 9999999999, 1.5, 3.14159, true, 'hello', 'long text');
+INSERT INTO all_types_t VALUES (2, -100, 2, -9999999999, -1.5, -3.14159, false, '', '');
+INSERT INTO all_types_t VALUES (NULL, NULL, 3, NULL, NULL, NULL, NULL, NULL, NULL);
+
+SELECT * FROM all_types_t;
+
+DROP TABLE all_types_t;

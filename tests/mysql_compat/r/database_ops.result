@@ -1,0 +1,26 @@
+# Test: Database operations
+SHOW DATABASES;
+Database
+default
+test
+CREATE DATABASE mydb1;
+SHOW DATABASES;
+Database
+default
+mydb1
+test
+CREATE DATABASE IF NOT EXISTS mydb1;
+USE mydb1;
+SELECT DATABASE();
+DATABASE()
+mydb1
+USE test;
+SELECT DATABASE();
+DATABASE()
+test
+DROP DATABASE mydb1;
+SHOW DATABASES;
+Database
+default
+test
+DROP DATABASE IF EXISTS mydb1;

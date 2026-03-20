@@ -1,0 +1,31 @@
+--echo # Test: Aggregates, GROUP BY, ORDER BY, LIMIT
+
+CREATE TABLE agg_t (id INT NOT NULL, category VARCHAR(20), val INT, PRIMARY KEY (id));
+INSERT INTO agg_t VALUES (1, 'A', 10);
+INSERT INTO agg_t VALUES (2, 'B', 20);
+INSERT INTO agg_t VALUES (3, 'A', 30);
+INSERT INTO agg_t VALUES (4, 'B', 40);
+INSERT INTO agg_t VALUES (5, 'C', 50);
+
+--echo # COUNT, SUM, AVG, MIN, MAX
+SELECT COUNT(*) FROM agg_t;
+SELECT SUM(val) FROM agg_t;
+SELECT MIN(val) FROM agg_t;
+SELECT MAX(val) FROM agg_t;
+
+--echo # GROUP BY
+SELECT category, COUNT(*) FROM agg_t GROUP BY category ORDER BY category;
+SELECT category, SUM(val) FROM agg_t GROUP BY category ORDER BY category;
+
+--echo # ORDER BY
+SELECT id, val FROM agg_t ORDER BY val;
+SELECT id, val FROM agg_t ORDER BY val DESC;
+
+--echo # LIMIT / OFFSET
+SELECT id FROM agg_t ORDER BY id LIMIT 3;
+SELECT id FROM agg_t ORDER BY id LIMIT 2 OFFSET 2;
+
+--echo # DISTINCT
+SELECT DISTINCT category FROM agg_t ORDER BY category;
+
+DROP TABLE agg_t;
