@@ -196,7 +196,8 @@ impl CostEstimator {
             | PhysicalPlan::Revoke { .. }
             | PhysicalPlan::ShowGrants { .. }
             | PhysicalPlan::AnalyzeTable { .. }
-            | PhysicalPlan::Explain { .. } => Cost::zero(),
+            | PhysicalPlan::Explain { .. }
+            | PhysicalPlan::DropMultipleTables { .. } => Cost::zero(),
         }
     }
 }

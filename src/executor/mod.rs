@@ -16,6 +16,7 @@ pub mod engine;
 pub mod error;
 pub mod eval;
 pub mod explain_exec;
+pub mod multi_exec;
 pub mod filter;
 pub mod hash_join;
 pub mod insert;

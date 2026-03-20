@@ -62,6 +62,11 @@ impl LogicalPlanBuilder {
             ResolvedStatement::DropTable { name, if_exists } => {
                 Ok(LogicalPlan::DropTable { name, if_exists })
             }
+            // Multi-table DROP: plan as first table, remaining handled by executor
+            ResolvedStatement::DropMultipleTables { names, if_exists } => {
+                // Build first drop; executor will handle all of them
+                Ok(LogicalPlan::DropMultipleTables { names, if_exists })
+            }
             ResolvedStatement::CreateIndex {
                 name,
                 table,

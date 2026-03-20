@@ -300,6 +300,28 @@ impl ExecutorEngine {
                 }
             }
 
+            PhysicalPlan::DropMultipleTables { names, if_exists } => {
+                let mut executors: Vec<Box<dyn Executor>> = Vec::new();
+                for name in names {
+                    if let Some(ref raft_node) = self.raft_node {
+                        executors.push(Box::new(DropTable::with_raft(
+                            name,
+                            if_exists,
+                            self.catalog.clone(),
+                            raft_node.clone(),
+                            self.mvcc.clone(),
+                        )));
+                    } else {
+                        executors.push(Box::new(DropTable::new(
+                            name,
+                            if_exists,
+                            self.catalog.clone(),
+                        )));
+                    }
+                }
+                Ok(Box::new(super::multi_exec::MultiExecutor::new(executors)))
+            }
+
             PhysicalPlan::CreateIndex {
                 name,
                 table,

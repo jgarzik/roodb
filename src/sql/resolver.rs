@@ -184,11 +184,21 @@ impl<'a> Resolver<'a> {
         let name = names[0].to_string();
 
         match object_type {
-            sp::ObjectType::Table => Ok(ResolvedStatement::DropTable { name, if_exists }),
+            sp::ObjectType::Table | sp::ObjectType::View => {
+                if names.len() > 1 {
+                    // Multi-table DROP: DROP TABLE t1, t2, t3
+                    let table_names: Vec<String> =
+                        names.iter().map(|n| n.to_string()).collect();
+                    Ok(ResolvedStatement::DropMultipleTables {
+                        names: table_names,
+                        if_exists,
+                    })
+                } else {
+                    Ok(ResolvedStatement::DropTable { name, if_exists })
+                }
+            }
             sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
             sp::ObjectType::Schema => Ok(ResolvedStatement::DropDatabase { name, if_exists }),
-            // DROP VIEW — treat as DROP TABLE (we don't distinguish views from tables)
-            sp::ObjectType::View => Ok(ResolvedStatement::DropTable { name, if_exists }),
             _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
         }
     }
@@ -841,6 +851,43 @@ impl<'a> Resolver<'a> {
             }
             sp::Expr::IsNotUnknown(e) => {
                 self.resolve_boolean_test(e, scope, BooleanTestType::IsNotUnknown)
+            }
+
+            sp::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                let resolved_operand = operand
+                    .as_ref()
+                    .map(|e| self.resolve_expr(e, scope))
+                    .transpose()?
+                    .map(Box::new);
+                let resolved_conditions: Vec<ResolvedExpr> = conditions
+                    .iter()
+                    .map(|c| self.resolve_expr(c, scope))
+                    .collect::<SqlResult<Vec<_>>>()?;
+                let resolved_results: Vec<ResolvedExpr> = results
+                    .iter()
+                    .map(|r| self.resolve_expr(r, scope))
+                    .collect::<SqlResult<Vec<_>>>()?;
+                let resolved_else = else_result
+                    .as_ref()
+                    .map(|e| self.resolve_expr(e, scope))
+                    .transpose()?
+                    .map(Box::new);
+
+                // Infer result type from all result branches
+                let result_type = infer_case_result_type(&resolved_results, &resolved_else);
+
+                Ok(ResolvedExpr::Case {
+                    operand: resolved_operand,
+                    conditions: resolved_conditions,
+                    results: resolved_results,
+                    else_result: resolved_else,
+                    result_type,
+                })
             }
 
             sp::Expr::Cast {
@@ -1596,6 +1643,28 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             "Unknown function: {}",
             name
         ))),
+    }
+}
+
+/// Infer result type for CASE expression from all result branches
+fn infer_case_result_type(
+    results: &[ResolvedExpr],
+    else_result: &Option<Box<ResolvedExpr>>,
+) -> DataType {
+    let mut types: Vec<DataType> = results.iter().map(|r| r.data_type()).collect();
+    if let Some(e) = else_result {
+        types.push(e.data_type());
+    }
+    if types.is_empty() {
+        return DataType::Int;
+    }
+    // If all numeric, use widest; otherwise use first type
+    if types.iter().all(|t| t.is_numeric()) {
+        types
+            .iter()
+            .fold(types[0].clone(), |acc, t| wider_numeric_type(&acc, t))
+    } else {
+        types[0].clone()
     }
 }
 

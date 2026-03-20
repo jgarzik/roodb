@@ -1005,6 +1005,23 @@ where
             return Ok(result);
         }
 
+        // Handle SET statements as no-ops for MySQL compatibility
+        // SET NAMES, SET CHARACTER SET, SET sql_mode, SET @var, etc.
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("SET NAMES")
+                || upper.starts_with("SET CHARACTER SET")
+                || upper.starts_with("SET CHARACTER_SET")
+                || upper.starts_with("SET SQL_MODE")
+                || upper.starts_with("SET @@")
+                || upper.starts_with("SET @")
+                || upper.starts_with("SET SESSION ")
+                || upper.starts_with("SET GLOBAL ")
+            {
+                return self.send_ok(0, 0).await;
+            }
+        }
+
         // Parse
         let stmt = match Parser::parse_one(sql) {
             Ok(s) => s,
@@ -1104,6 +1121,10 @@ where
             ResolvedStatement::DropTable { name, .. } => {
                 vec![RequiredPrivilege::drop_table(db, name)]
             }
+            ResolvedStatement::DropMultipleTables { names, .. } => names
+                .iter()
+                .map(|name| RequiredPrivilege::drop_table(db, name))
+                .collect(),
             ResolvedStatement::CreateIndex { table, .. } => {
                 vec![RequiredPrivilege::create_index(db, table)]
             }

@@ -155,6 +155,19 @@ pub enum ResolvedExpr {
         expr: Box<ResolvedExpr>,
         target_type: DataType,
     },
+    /// CASE expression (simple and searched)
+    Case {
+        /// Simple CASE: the operand to compare against; None for searched CASE
+        operand: Option<Box<ResolvedExpr>>,
+        /// WHEN conditions
+        conditions: Vec<ResolvedExpr>,
+        /// THEN results (parallel to conditions)
+        results: Vec<ResolvedExpr>,
+        /// Optional ELSE result
+        else_result: Option<Box<ResolvedExpr>>,
+        /// Inferred result type
+        result_type: DataType,
+    },
 }
 
 impl ResolvedExpr {
@@ -179,6 +192,7 @@ impl ResolvedExpr {
             ResolvedExpr::Between { .. } => DataType::Boolean,
             ResolvedExpr::BooleanTest { .. } => DataType::Boolean,
             ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
+            ResolvedExpr::Case { result_type, .. } => result_type.clone(),
         }
     }
 
@@ -200,6 +214,14 @@ impl ResolvedExpr {
             } => expr.is_nullable() || low.is_nullable() || high.is_nullable(),
             ResolvedExpr::BooleanTest { .. } => false, // Always returns true/false, never NULL
             ResolvedExpr::Cast { expr, .. } => expr.is_nullable(),
+            ResolvedExpr::Case {
+                results,
+                else_result,
+                ..
+            } => {
+                // Case is nullable if any result is nullable or there's no ELSE
+                else_result.is_none() || results.iter().any(|r| r.is_nullable())
+            }
         }
     }
 }
@@ -273,6 +295,11 @@ pub enum ResolvedStatement {
     },
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -454,6 +481,12 @@ pub enum LogicalPlan {
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
 
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -599,6 +632,7 @@ impl LogicalPlan {
             // DDL operations don't produce output columns
             LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::DropMultipleTables { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateDatabase { .. }
@@ -627,6 +661,7 @@ impl LogicalPlan {
             self,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::DropTable { .. }
+                | LogicalPlan::DropMultipleTables { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::DropIndex { .. }
                 | LogicalPlan::CreateDatabase { .. }

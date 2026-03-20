@@ -51,6 +51,9 @@ impl TypeChecker {
             // ANALYZE TABLE doesn't need type checking
             ResolvedStatement::AnalyzeTable { .. } => Ok(()),
 
+            // Multi-table DROP doesn't need type checking
+            ResolvedStatement::DropMultipleTables { .. } => Ok(()),
+
             // EXPLAIN - type check the inner statement
             ResolvedStatement::Explain { inner } => Self::check(inner),
         }

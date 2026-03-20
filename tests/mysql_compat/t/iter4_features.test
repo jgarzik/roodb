@@ -1,0 +1,38 @@
+--echo # Test: Iteration 4 features — CASE, multi-DROP, TRUNCATE, SET NAMES
+
+--echo # CASE expression (searched)
+SELECT CASE WHEN 1=1 THEN 'yes' ELSE 'no' END;
+SELECT CASE WHEN 1=0 THEN 'yes' ELSE 'no' END;
+SELECT CASE WHEN 1=0 THEN 'a' WHEN 2=2 THEN 'b' ELSE 'c' END;
+
+--echo # CASE expression (simple)
+SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+
+--echo # CASE with NULL
+SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'no match' END;
+SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END;
+
+--echo # Multi-table DROP
+CREATE TABLE mt1 (id INT NOT NULL, PRIMARY KEY (id));
+CREATE TABLE mt2 (id INT NOT NULL, PRIMARY KEY (id));
+DROP TABLE IF EXISTS mt1, mt2;
+
+--echo # Verify tables are gone
+--error 1146
+SELECT * FROM mt1;
+
+--echo # TRUNCATE TABLE
+CREATE TABLE trunc_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
+INSERT INTO trunc_t VALUES (1, 10);
+INSERT INTO trunc_t VALUES (2, 20);
+SELECT COUNT(*) FROM trunc_t;
+TRUNCATE TABLE trunc_t;
+SELECT COUNT(*) FROM trunc_t;
+DROP TABLE trunc_t;
+
+--echo # SET NAMES (no-op for compat)
+SET NAMES utf8;
+SET NAMES default;
+SELECT 1;

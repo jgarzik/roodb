@@ -150,6 +150,12 @@ pub enum PhysicalPlan {
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
 
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -298,6 +304,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
             | PhysicalPlan::CreateDatabase { .. }
@@ -376,6 +383,7 @@ impl PhysicalPlan {
             self,
             PhysicalPlan::CreateTable { .. }
                 | PhysicalPlan::DropTable { .. }
+                | PhysicalPlan::DropMultipleTables { .. }
                 | PhysicalPlan::CreateIndex { .. }
                 | PhysicalPlan::DropIndex { .. }
                 | PhysicalPlan::CreateDatabase { .. }
@@ -511,6 +519,7 @@ impl PhysicalPlan {
             PhysicalPlan::SingleRow
             | PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
             | PhysicalPlan::CreateDatabase { .. }
@@ -577,6 +586,26 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
         }
         ResolvedExpr::Cast { expr: inner, .. } => {
             substitute_expr(inner, params)?;
+        }
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                substitute_expr(op, params)?;
+            }
+            for cond in conditions {
+                substitute_expr(cond, params)?;
+            }
+            for result in results {
+                substitute_expr(result, params)?;
+            }
+            if let Some(e) = else_result {
+                substitute_expr(e, params)?;
+            }
         }
     }
     Ok(())
@@ -1128,6 +1157,10 @@ impl PhysicalPlanner {
 
             LogicalPlan::DropTable { name, if_exists } => {
                 Ok(PhysicalPlan::DropTable { name, if_exists })
+            }
+
+            LogicalPlan::DropMultipleTables { names, if_exists } => {
+                Ok(PhysicalPlan::DropMultipleTables { names, if_exists })
             }
 
             LogicalPlan::CreateIndex {

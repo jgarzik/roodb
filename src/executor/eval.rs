@@ -90,6 +90,38 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
             Ok(Datum::Bool(if *negated { !in_range } else { in_range }))
         }
 
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                // Simple CASE: CASE op WHEN val1 THEN res1 ...
+                let op_val = eval(op, row)?;
+                for (cond, result) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval(cond, row)?;
+                    if !op_val.is_null() && !cond_val.is_null() && op_val == cond_val {
+                        return eval(result, row);
+                    }
+                }
+            } else {
+                // Searched CASE: CASE WHEN cond1 THEN res1 ...
+                for (cond, result) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval(cond, row)?;
+                    if cond_val.as_bool() == Some(true) {
+                        return eval(result, row);
+                    }
+                }
+            }
+            // No match — return ELSE or NULL
+            match else_result {
+                Some(e) => eval(e, row),
+                None => Ok(Datum::Null),
+            }
+        }
+
         ResolvedExpr::Cast {
             expr, target_type, ..
         } => {

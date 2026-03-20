@@ -219,6 +219,10 @@ impl ExplainOutput {
                 writeln!(out, "{}DropTable: {}", prefix, name).unwrap();
             }
 
+            PhysicalPlan::DropMultipleTables { names, .. } => {
+                writeln!(out, "{}DropMultipleTables: {}", prefix, names.join(", ")).unwrap();
+            }
+
             PhysicalPlan::CreateIndex { name, table, .. } => {
                 writeln!(out, "{}CreateIndex: {} on {}", prefix, name, table).unwrap();
             }
