@@ -40,6 +40,10 @@ pub enum BinaryOp {
     BitwiseOr,
     BitwiseAnd,
     BitwiseXor,
+    // Logical
+    Xor,
+    // NULL-safe comparison
+    Spaceship,
 }
 
 /// Unary operators
@@ -47,6 +51,7 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Not,
     Neg,
+    Plus,
 }
 
 /// JOIN type
@@ -145,6 +150,11 @@ pub enum ResolvedExpr {
         expr: Box<ResolvedExpr>,
         test: BooleanTestType,
     },
+    /// CAST(expr AS type)
+    Cast {
+        expr: Box<ResolvedExpr>,
+        target_type: DataType,
+    },
 }
 
 impl ResolvedExpr {
@@ -168,6 +178,7 @@ impl ResolvedExpr {
             ResolvedExpr::InList { .. } => DataType::Boolean,
             ResolvedExpr::Between { .. } => DataType::Boolean,
             ResolvedExpr::BooleanTest { .. } => DataType::Boolean,
+            ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
         }
     }
 
@@ -188,6 +199,7 @@ impl ResolvedExpr {
                 expr, low, high, ..
             } => expr.is_nullable() || low.is_nullable() || high.is_nullable(),
             ResolvedExpr::BooleanTest { .. } => false, // Always returns true/false, never NULL
+            ResolvedExpr::Cast { expr, .. } => expr.is_nullable(),
         }
     }
 }

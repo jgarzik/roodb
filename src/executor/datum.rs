@@ -115,6 +115,32 @@ impl Datum {
         }
     }
 
+    /// Convert to display string for CAST and output formatting
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Datum::Null => "NULL".to_string(),
+            Datum::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+            Datum::Int(i) => i.to_string(),
+            Datum::Float(f) => {
+                if f.fract() == 0.0 && f.abs() < 1e15 {
+                    format!("{:.1}", f) // Show at least one decimal
+                } else {
+                    f.to_string()
+                }
+            }
+            Datum::String(s) => s.clone(),
+            Datum::Bytes(b) => {
+                let mut s = String::with_capacity(2 + b.len() * 2);
+                s.push_str("0x");
+                for byte in b {
+                    s.push_str(&format!("{:02X}", byte));
+                }
+                s
+            }
+            Datum::Timestamp(t) => t.to_string(),
+        }
+    }
+
     /// Create a Datum from a Literal
     pub fn from_literal(lit: &Literal) -> Self {
         match lit {

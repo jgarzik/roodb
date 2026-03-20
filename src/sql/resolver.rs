@@ -110,6 +110,29 @@ impl<'a> Resolver<'a> {
                 Ok(ResolvedStatement::AnalyzeTable { table })
             }
 
+            // TRUNCATE TABLE — resolve as DELETE with no filter (deletes all rows)
+            sp::Statement::Truncate { table_name, .. } => {
+                let table = table_name.to_string();
+                // Verify table exists
+                self.catalog
+                    .get_table(&table)
+                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+                Ok(ResolvedStatement::Delete {
+                    table: table.clone(),
+                    table_columns: self
+                        .catalog
+                        .get_table(&table)
+                        .map(|td| {
+                            td.columns
+                                .iter()
+                                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    filter: None,
+                })
+            }
+
             // EXPLAIN statement
             sp::Statement::Explain { statement, .. } => {
                 let inner = self.resolve(*statement)?;
@@ -164,6 +187,8 @@ impl<'a> Resolver<'a> {
             sp::ObjectType::Table => Ok(ResolvedStatement::DropTable { name, if_exists }),
             sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
             sp::ObjectType::Schema => Ok(ResolvedStatement::DropDatabase { name, if_exists }),
+            // DROP VIEW — treat as DROP TABLE (we don't distinguish views from tables)
+            sp::ObjectType::View => Ok(ResolvedStatement::DropTable { name, if_exists }),
             _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
         }
     }
@@ -818,6 +843,17 @@ impl<'a> Resolver<'a> {
                 self.resolve_boolean_test(e, scope, BooleanTestType::IsNotUnknown)
             }
 
+            sp::Expr::Cast {
+                expr, data_type, ..
+            } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                let target_type = convert_data_type(data_type)?;
+                Ok(ResolvedExpr::Cast {
+                    expr: Box::new(resolved_expr),
+                    target_type,
+                })
+            }
+
             sp::Expr::Nested(inner) => self.resolve_expr(inner, scope),
             sp::Expr::Like {
                 expr,
@@ -1401,6 +1437,8 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::BitwiseOr => Ok(BinaryOp::BitwiseOr),
         sp::BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),
         sp::BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
+        sp::BinaryOperator::Xor => Ok(BinaryOp::Xor),
+        sp::BinaryOperator::Spaceship => Ok(BinaryOp::Spaceship),
         _ => Err(SqlError::Unsupported(format!("Binary operator: {:?}", op))),
     }
 }
@@ -1410,6 +1448,7 @@ fn convert_unary_op(op: &sp::UnaryOperator) -> SqlResult<UnaryOp> {
     match op {
         sp::UnaryOperator::Not => Ok(UnaryOp::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOp::Neg),
+        sp::UnaryOperator::Plus => Ok(UnaryOp::Plus),
         _ => Err(SqlError::Unsupported(format!("Unary operator: {:?}", op))),
     }
 }
@@ -1445,6 +1484,12 @@ fn infer_binary_result_type(
 
         // Bitwise operators return BigInt
         BinaryOp::BitwiseOr | BinaryOp::BitwiseAnd | BinaryOp::BitwiseXor => Ok(DataType::BigInt),
+
+        // Logical XOR returns boolean
+        BinaryOp::Xor => Ok(DataType::Boolean),
+
+        // NULL-safe equality returns boolean (never NULL)
+        BinaryOp::Spaceship => Ok(DataType::Boolean),
     }
 }
 
@@ -1452,7 +1497,7 @@ fn infer_binary_result_type(
 fn infer_unary_result_type(op: UnaryOp, expr: &ResolvedExpr) -> SqlResult<DataType> {
     match op {
         UnaryOp::Not => Ok(DataType::Boolean),
-        UnaryOp::Neg => Ok(expr.data_type()),
+        UnaryOp::Neg | UnaryOp::Plus => Ok(expr.data_type()),
     }
 }
 
@@ -1510,6 +1555,43 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             }
         }
         "NOW" | "CURRENT_TIMESTAMP" => Ok(DataType::Timestamp),
+        "HEX" | "UNHEX" => Ok(DataType::Text),
+        "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
+        | "INSERT" => Ok(DataType::Text),
+        "STRCMP" => Ok(DataType::BigInt),
+        "MOD" => {
+            if args.is_empty() {
+                Ok(DataType::BigInt)
+            } else {
+                Ok(args[0].data_type())
+            }
+        }
+        "FORMAT" => Ok(DataType::Text),
+        "SHA" | "SHA1" | "SHA2" | "MD5" => Ok(DataType::Text),
+        "CRC32" => Ok(DataType::BigInt),
+        "CONNECTION_ID" | "LAST_INSERT_ID" => Ok(DataType::BigInt),
+        "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" | "VERSION" | "DATABASE"
+        | "SCHEMA" => Ok(DataType::Text),
+        "SLEEP" => Ok(DataType::BigInt),
+        "FOUND_ROWS" | "ROW_COUNT" => Ok(DataType::BigInt),
+        "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
+        "CHAR" => Ok(DataType::Text),
+        "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
+        | "LOCATE" | "INSTR" | "FIND_IN_SET" | "POSITION" => Ok(DataType::BigInt),
+        "ELT" | "MAKE_SET" | "EXPORT_SET" => Ok(DataType::Text),
+        "GREATEST" | "LEAST" => {
+            if args.is_empty() {
+                Ok(DataType::Int)
+            } else {
+                Ok(args[0].data_type())
+            }
+        }
+        "CAST" | "CONVERT" => Ok(DataType::Text), // actual type resolved at Cast expr level
+        "TRUNCATE" => Ok(DataType::Double),       // TRUNCATE(number, decimals)
+        "SIGN" => Ok(DataType::BigInt),
+        "POW" | "POWER" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "PI" | "RADIANS"
+        | "DEGREES" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "COT"
+        | "RAND" => Ok(DataType::Double),
         _ => Err(SqlError::InvalidOperation(format!(
             "Unknown function: {}",
             name

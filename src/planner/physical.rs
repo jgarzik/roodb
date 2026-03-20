@@ -575,6 +575,9 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
         ResolvedExpr::BooleanTest { expr: inner, .. } => {
             substitute_expr(inner, params)?;
         }
+        ResolvedExpr::Cast { expr: inner, .. } => {
+            substitute_expr(inner, params)?;
+        }
     }
     Ok(())
 }

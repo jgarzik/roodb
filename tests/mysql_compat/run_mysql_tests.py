@@ -182,6 +182,24 @@ def run_mysqltest(test_file, result_file, certs, port=PORT, record=False):
     if not os.path.exists(MYSQLTEST_BIN):
         return (TestResult.CONNECT_FAIL, f"mysqltest not found at {MYSQLTEST_BIN}")
 
+    # Reset the test database before each test for isolation
+    reset_cmd = [
+        MYSQLTEST_BIN,
+        f"--host={HOST}",
+        f"--port={port}",
+        f"--user={USER}",
+        f"--password={PASSWORD}",
+        "--ssl-mode=REQUIRED",
+        f"--ssl-ca={certs.ca_cert}",
+    ]
+    subprocess.run(
+        reset_cmd,
+        input="DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n",
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
     cmd = [
         MYSQLTEST_BIN,
         f"--host={HOST}",
@@ -196,6 +214,7 @@ def run_mysqltest(test_file, result_file, certs, port=PORT, record=False):
     if record:
         cmd.append("--record")
 
+    cmd.append(f"--basedir={MYSQL_TEST_DIR}")
     cmd.append(f"--result-file={result_file}")
 
     try:
@@ -287,8 +306,16 @@ def main():
             # Gather tests
             if args.mysql_tests:
                 tests = find_mysql_suite_tests()
-                result_dir = os.path.join(tmpdir, "mysql_results")
-                os.makedirs(result_dir, exist_ok=True)
+                if args.record:
+                    # Record mode: write results to tmpdir
+                    result_dir = os.path.join(tmpdir, "mysql_results")
+                    os.makedirs(result_dir, exist_ok=True)
+                else:
+                    # Compare mode: use MySQL's own result files
+                    result_dir = os.path.join(MYSQL_TEST_DIR, "r")
+                    if not os.path.exists(result_dir):
+                        result_dir = os.path.join(tmpdir, "mysql_results")
+                        os.makedirs(result_dir, exist_ok=True)
             else:
                 tests = find_custom_tests()
                 result_dir = os.path.join(SCRIPT_DIR, "r")
