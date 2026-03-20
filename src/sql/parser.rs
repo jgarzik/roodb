@@ -47,6 +47,25 @@ mod tests {
     use sqlparser::ast as sp;
 
     #[test]
+    fn test_parse_drop_view() {
+        let stmt = Parser::parse_one("drop view if exists v1").unwrap();
+        match &stmt {
+            sp::Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                ..
+            } => {
+                assert_eq!(*object_type, sp::ObjectType::View);
+                assert!(*if_exists);
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].to_string(), "v1");
+            }
+            other => panic!("Expected Drop, got: {:#?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_select() {
         let stmt = Parser::parse_one("SELECT id, name FROM users WHERE id = 1").unwrap();
         assert!(matches!(stmt, sp::Statement::Query(_)));

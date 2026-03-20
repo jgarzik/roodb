@@ -1052,6 +1052,17 @@ where
             }
         };
 
+        // Handle parsed statements that are no-ops
+        {
+            use sqlparser::ast::Statement as S;
+            match &stmt {
+                S::LockTables { .. } | S::UnlockTables => {
+                    return self.send_ok(0, 0).await;
+                }
+                _ => {}
+            }
+        }
+
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
         // Returns both the physical plan and required privileges for authorization
