@@ -115,6 +115,10 @@ impl PredicatePushdown {
                 input: Box::new(self.transform(*input)),
             },
 
+            LogicalPlan::Explain { inner } => LogicalPlan::Explain {
+                inner: Box::new(self.transform(*inner)),
+            },
+
             // Leaf nodes and DML/DDL pass through unchanged
             other => other,
         }
@@ -208,6 +212,10 @@ impl FilterMerge {
 
             LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
                 input: Box::new(self.transform(*input)),
+            },
+
+            LogicalPlan::Explain { inner } => LogicalPlan::Explain {
+                inner: Box::new(self.transform(*inner)),
             },
 
             // Leaf nodes and DML/DDL pass through unchanged

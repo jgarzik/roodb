@@ -50,6 +50,9 @@ impl TypeChecker {
 
             // ANALYZE TABLE doesn't need type checking
             ResolvedStatement::AnalyzeTable { .. } => Ok(()),
+
+            // EXPLAIN - type check the inner statement
+            ResolvedStatement::Explain { inner } => Self::check(inner),
         }
     }
 
@@ -143,13 +146,16 @@ impl TypeChecker {
     }
 
     /// Check if expression evaluates to boolean
+    /// MySQL treats non-zero numeric values as true, so accept numeric types too
     fn check_is_boolean(expr: &ResolvedExpr) -> SqlResult<()> {
-        match expr.data_type() {
-            DataType::Boolean => Ok(()),
-            other => Err(SqlError::TypeMismatch {
+        let dt = expr.data_type();
+        if dt == DataType::Boolean || dt.is_numeric() {
+            Ok(())
+        } else {
+            Err(SqlError::TypeMismatch {
                 expected: DataType::Boolean,
-                found: other,
-            }),
+                found: dt,
+            })
         }
     }
 

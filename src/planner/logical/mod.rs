@@ -36,6 +36,10 @@ pub enum BinaryOp {
     // String
     Like,
     NotLike,
+    // Bitwise
+    BitwiseOr,
+    BitwiseAnd,
+    BitwiseXor,
 }
 
 /// Unary operators
@@ -53,6 +57,17 @@ pub enum JoinType {
     Right,
     Full,
     Cross,
+}
+
+/// Boolean test type for IS TRUE / IS FALSE / IS UNKNOWN predicates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanTestType {
+    IsTrue,
+    IsNotTrue,
+    IsFalse,
+    IsNotFalse,
+    IsUnknown,
+    IsNotUnknown,
 }
 
 /// Literal value
@@ -125,6 +140,11 @@ pub enum ResolvedExpr {
         high: Box<ResolvedExpr>,
         negated: bool,
     },
+    /// IS TRUE / IS FALSE / IS UNKNOWN predicates
+    BooleanTest {
+        expr: Box<ResolvedExpr>,
+        test: BooleanTestType,
+    },
 }
 
 impl ResolvedExpr {
@@ -147,6 +167,7 @@ impl ResolvedExpr {
             ResolvedExpr::IsNull { .. } => DataType::Boolean,
             ResolvedExpr::InList { .. } => DataType::Boolean,
             ResolvedExpr::Between { .. } => DataType::Boolean,
+            ResolvedExpr::BooleanTest { .. } => DataType::Boolean,
         }
     }
 
@@ -166,6 +187,7 @@ impl ResolvedExpr {
             ResolvedExpr::Between {
                 expr, low, high, ..
             } => expr.is_nullable() || low.is_nullable() || high.is_nullable(),
+            ResolvedExpr::BooleanTest { .. } => false, // Always returns true/false, never NULL
         }
     }
 }
@@ -322,6 +344,8 @@ pub enum ResolvedStatement {
     },
     /// ANALYZE TABLE
     AnalyzeTable { table: String },
+    /// EXPLAIN statement
+    Explain { inner: Box<ResolvedStatement> },
 }
 
 /// Logical plan node
@@ -489,6 +513,9 @@ pub enum LogicalPlan {
 
     /// ANALYZE TABLE
     AnalyzeTable { table: String },
+
+    /// EXPLAIN — wraps the inner plan for EXPLAIN output
+    Explain { inner: Box<LogicalPlan> },
 }
 
 impl LogicalPlan {
@@ -576,6 +603,9 @@ impl LogicalPlan {
 
             // ANALYZE TABLE returns a result set (handled by executor)
             LogicalPlan::AnalyzeTable { .. } => vec![],
+
+            // EXPLAIN returns MySQL-format result set (handled by executor)
+            LogicalPlan::Explain { .. } => vec![],
         }
     }
 

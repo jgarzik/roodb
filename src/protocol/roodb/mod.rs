@@ -799,6 +799,7 @@ where
                 | PhysicalPlan::HashAggregate { .. }
                 | PhysicalPlan::NestedLoopJoin { .. }
                 | PhysicalPlan::AnalyzeTable { .. }
+                | PhysicalPlan::Explain { .. }
         );
 
         let is_ddl = matches!(
@@ -1059,8 +1060,14 @@ where
             }
         }
 
-        // Execute
-        self.execute_plan(physical).await
+        // Execute — catch executor errors so they don't kill the connection
+        match self.execute_plan(physical).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Query execution error: {}", e);
+                self.send_error_from_protocol_error(&e).await
+            }
+        }
     }
 
     /// Extract required privileges from a resolved statement
@@ -1129,6 +1136,8 @@ where
             ResolvedStatement::AnalyzeTable { .. } => {
                 vec![]
             }
+            // EXPLAIN - same privileges as inner statement
+            ResolvedStatement::Explain { inner } => self.extract_required_privileges(inner),
         }
     }
 
@@ -1273,6 +1282,7 @@ where
                 | PhysicalPlan::HashAggregate { .. }
                 | PhysicalPlan::NestedLoopJoin { .. }
                 | PhysicalPlan::AnalyzeTable { .. }
+                | PhysicalPlan::Explain { .. }
         );
 
         // Check if this is DDL (no MVCC needed)

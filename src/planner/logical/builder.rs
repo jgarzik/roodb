@@ -142,6 +142,13 @@ impl LogicalPlanBuilder {
 
             ResolvedStatement::AnalyzeTable { table } => Ok(LogicalPlan::AnalyzeTable { table }),
 
+            ResolvedStatement::Explain { inner } => {
+                let inner_plan = Self::build(*inner)?;
+                Ok(LogicalPlan::Explain {
+                    inner: Box::new(inner_plan),
+                })
+            }
+
             // Database DDL - passthrough
             ResolvedStatement::CreateDatabase {
                 name,

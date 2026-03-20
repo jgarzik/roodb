@@ -1,0 +1,18 @@
+# Test: Error recovery — connection survives SQL errors
+# Invalid table reference should error but not kill connection
+SELECT * FROM nonexistent_table_xyz;
+ERROR 42S02: Table 'nonexistent_table_xyz' not found
+# Connection still alive — run valid query
+SELECT 1;
+1
+1
+# Create table, then test bad column error
+CREATE TABLE err_t (id INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO err_t VALUES (1);
+SELECT nonexistent_col FROM err_t;
+ERROR HY000: Column 'nonexistent_col' not found
+# Connection still alive
+SELECT id FROM err_t;
+id
+1
+DROP TABLE err_t;

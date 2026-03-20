@@ -2,3 +2,4 @@
 plan.md
 /profiles
 tests/mysql_compat/r/*.log
+__pycache__/

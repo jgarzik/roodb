@@ -305,6 +305,11 @@ impl ExplainOutput {
             PhysicalPlan::AnalyzeTable { table } => {
                 writeln!(out, "{}AnalyzeTable: {}", prefix, table).unwrap();
             }
+
+            PhysicalPlan::Explain { inner } => {
+                writeln!(out, "{}Explain:", prefix).unwrap();
+                Self::format_node(inner, indent + 1, out);
+            }
         }
     }
 }

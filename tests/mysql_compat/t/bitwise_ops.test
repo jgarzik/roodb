@@ -1,0 +1,19 @@
+--echo # Test: Bitwise operators
+
+--echo # Bitwise OR
+SELECT 1 | 2;
+SELECT 5 | 3;
+
+--echo # Bitwise AND
+SELECT 5 & 3;
+SELECT 7 & 2;
+
+--echo # Bitwise XOR
+SELECT 5 ^ 3;
+SELECT 7 ^ 2;
+
+--echo # NULL propagation for bitwise ops
+SELECT 1 | NULL;
+SELECT 1 & NULL;
+SELECT 1 ^ NULL;
+SELECT NULL | NULL;

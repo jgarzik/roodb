@@ -1,0 +1,20 @@
+--echo # Test: Error recovery — connection survives SQL errors
+
+--echo # Invalid table reference should error but not kill connection
+--error 1146
+SELECT * FROM nonexistent_table_xyz;
+
+--echo # Connection still alive — run valid query
+SELECT 1;
+
+--echo # Create table, then test bad column error
+CREATE TABLE err_t (id INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO err_t VALUES (1);
+
+--error 1105
+SELECT nonexistent_col FROM err_t;
+
+--echo # Connection still alive
+SELECT id FROM err_t;
+
+DROP TABLE err_t;

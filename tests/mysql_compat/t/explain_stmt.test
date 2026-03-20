@@ -1,0 +1,18 @@
+--echo # Test: EXPLAIN statement
+
+--echo # EXPLAIN simple expression query
+EXPLAIN SELECT 1;
+
+--echo # EXPLAIN with table scan
+CREATE TABLE ex_t (id INT NOT NULL, name VARCHAR(100), PRIMARY KEY (id));
+INSERT INTO ex_t VALUES (1, 'alice');
+INSERT INTO ex_t VALUES (2, 'bob');
+EXPLAIN SELECT * FROM ex_t;
+
+--echo # EXPLAIN with WHERE filter (point get)
+EXPLAIN SELECT * FROM ex_t WHERE id = 1;
+
+--echo # EXPLAIN with non-PK filter
+EXPLAIN SELECT * FROM ex_t WHERE name = 'alice';
+
+DROP TABLE ex_t;

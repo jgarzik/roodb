@@ -2,7 +2,7 @@
 //!
 //! Evaluates ResolvedExpr against a Row to produce a Datum.
 
-use crate::planner::logical::{BinaryOp, ResolvedExpr, UnaryOp};
+use crate::planner::logical::{BinaryOp, BooleanTestType, ResolvedExpr, UnaryOp};
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
@@ -89,6 +89,19 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
             let in_range = val >= low_val && val <= high_val;
             Ok(Datum::Bool(if *negated { !in_range } else { in_range }))
         }
+
+        ResolvedExpr::BooleanTest { expr, test } => {
+            let val = eval(expr, row)?;
+            let result = match test {
+                BooleanTestType::IsTrue => val.as_bool() == Some(true),
+                BooleanTestType::IsNotTrue => val.as_bool() != Some(true),
+                BooleanTestType::IsFalse => val.as_bool() == Some(false),
+                BooleanTestType::IsNotFalse => val.as_bool() != Some(false),
+                BooleanTestType::IsUnknown => val.is_null(),
+                BooleanTestType::IsNotUnknown => !val.is_null(),
+            };
+            Ok(Datum::Bool(result))
+        }
     }
 }
 
@@ -110,6 +123,9 @@ fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<
             | BinaryOp::GtEq
             | BinaryOp::Like
             | BinaryOp::NotLike
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseXor
     ) && (left.is_null() || right.is_null())
     {
         return Ok(Datum::Null);
@@ -151,6 +167,11 @@ fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<
                 )),
             }
         }
+
+        // Bitwise
+        BinaryOp::BitwiseOr => eval_bitwise_or(left, right),
+        BinaryOp::BitwiseAnd => eval_bitwise_and(left, right),
+        BinaryOp::BitwiseXor => eval_bitwise_xor(left, right),
     }
 }
 
@@ -231,6 +252,46 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a % *b as f64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot compute modulo of {:?} and {:?}",
+            left, right
+        ))),
+    }
+}
+
+/// Coerce a Datum to i64 for bitwise operations (MySQL truncates floats).
+fn to_bitwise_int(d: &Datum) -> Option<i64> {
+    match d {
+        Datum::Int(i) => Some(*i),
+        Datum::Float(f) => Some(*f as i64),
+        Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn eval_bitwise_or(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    match (to_bitwise_int(left), to_bitwise_int(right)) {
+        (Some(a), Some(b)) => Ok(Datum::Int(a | b)),
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot bitwise OR {:?} and {:?}",
+            left, right
+        ))),
+    }
+}
+
+fn eval_bitwise_and(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    match (to_bitwise_int(left), to_bitwise_int(right)) {
+        (Some(a), Some(b)) => Ok(Datum::Int(a & b)),
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot bitwise AND {:?} and {:?}",
+            left, right
+        ))),
+    }
+}
+
+fn eval_bitwise_xor(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    match (to_bitwise_int(left), to_bitwise_int(right)) {
+        (Some(a), Some(b)) => Ok(Datum::Int(a ^ b)),
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot bitwise XOR {:?} and {:?}",
             left, right
         ))),
     }
@@ -678,5 +739,152 @@ mod tests {
         };
         let result = eval(&expr, &row).unwrap();
         assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_eval_boolean_test_is_true() {
+        let row = make_row();
+        // 1 IS TRUE = true
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
+            test: BooleanTestType::IsTrue,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(true));
+
+        // 0 IS TRUE = false
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Integer(0))),
+            test: BooleanTestType::IsTrue,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+
+        // NULL IS TRUE = false
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            test: BooleanTestType::IsTrue,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+    }
+
+    #[test]
+    fn test_eval_boolean_test_is_false() {
+        let row = make_row();
+        // 0 IS FALSE = true
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Integer(0))),
+            test: BooleanTestType::IsFalse,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(true));
+
+        // NULL IS FALSE = false (NULL is unknown, not false)
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            test: BooleanTestType::IsFalse,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+    }
+
+    #[test]
+    fn test_eval_boolean_test_is_unknown() {
+        let row = make_row();
+        // NULL IS UNKNOWN = true
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            test: BooleanTestType::IsUnknown,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(true));
+
+        // 1 IS UNKNOWN = false
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
+            test: BooleanTestType::IsUnknown,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+    }
+
+    #[test]
+    fn test_eval_boolean_test_negated() {
+        let row = make_row();
+        // 1 IS NOT TRUE = false
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
+            test: BooleanTestType::IsNotTrue,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+
+        // NULL IS NOT TRUE = true
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            test: BooleanTestType::IsNotTrue,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(true));
+
+        // NULL IS NOT UNKNOWN = false
+        let expr = ResolvedExpr::BooleanTest {
+            expr: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            test: BooleanTestType::IsNotUnknown,
+        };
+        assert_eq!(eval(&expr, &row).unwrap(), Datum::Bool(false));
+    }
+
+    #[test]
+    fn test_eval_bitwise_or() {
+        let row = make_row();
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Literal(Literal::Integer(5))),
+            op: BinaryOp::BitwiseOr,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(3))),
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(7));
+    }
+
+    #[test]
+    fn test_eval_bitwise_and() {
+        let row = make_row();
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Literal(Literal::Integer(5))),
+            op: BinaryOp::BitwiseAnd,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(3))),
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_eval_bitwise_xor() {
+        let row = make_row();
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Literal(Literal::Integer(5))),
+            op: BinaryOp::BitwiseXor,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(3))),
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(6));
+    }
+
+    #[test]
+    fn test_eval_bitwise_null_propagation() {
+        let row = make_row();
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
+            op: BinaryOp::BitwiseOr,
+            right: Box::new(ResolvedExpr::Literal(Literal::Null)),
+            result_type: DataType::BigInt,
+        };
+        assert!(eval(&expr, &row).unwrap().is_null());
+    }
+
+    #[test]
+    fn test_eval_bitwise_float_coercion() {
+        let row = make_row();
+        // 1.9 | 2 should truncate 1.9 to 1, giving 1 | 2 = 3
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Literal(Literal::Float(1.9))),
+            op: BinaryOp::BitwiseOr,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(2))),
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(3));
     }
 }

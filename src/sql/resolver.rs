@@ -12,9 +12,9 @@ use sqlparser::ast as sp;
 
 use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::planner::logical::{
-    BinaryOp, JoinType, Literal, ResolvedAssignment, ResolvedColumn, ResolvedExpr, ResolvedJoin,
-    ResolvedOrderByItem, ResolvedSelect, ResolvedSelectItem, ResolvedStatement, ResolvedTableRef,
-    UnaryOp,
+    BinaryOp, BooleanTestType, JoinType, Literal, ResolvedAssignment, ResolvedColumn, ResolvedExpr,
+    ResolvedJoin, ResolvedOrderByItem, ResolvedSelect, ResolvedSelectItem, ResolvedStatement,
+    ResolvedTableRef, UnaryOp,
 };
 use crate::sql::error::{SqlError, SqlResult};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
@@ -108,6 +108,14 @@ impl<'a> Resolver<'a> {
                     .get_table(&table)
                     .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
                 Ok(ResolvedStatement::AnalyzeTable { table })
+            }
+
+            // EXPLAIN statement
+            sp::Statement::Explain { statement, .. } => {
+                let inner = self.resolve(*statement)?;
+                Ok(ResolvedStatement::Explain {
+                    inner: Box::new(inner),
+                })
             }
 
             _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
@@ -794,6 +802,22 @@ impl<'a> Resolver<'a> {
                 high: Box::new(self.resolve_expr(high, scope)?),
                 negated: *negated,
             }),
+            // IS TRUE / IS FALSE / IS UNKNOWN predicates
+            sp::Expr::IsTrue(e) => self.resolve_boolean_test(e, scope, BooleanTestType::IsTrue),
+            sp::Expr::IsNotTrue(e) => {
+                self.resolve_boolean_test(e, scope, BooleanTestType::IsNotTrue)
+            }
+            sp::Expr::IsFalse(e) => self.resolve_boolean_test(e, scope, BooleanTestType::IsFalse),
+            sp::Expr::IsNotFalse(e) => {
+                self.resolve_boolean_test(e, scope, BooleanTestType::IsNotFalse)
+            }
+            sp::Expr::IsUnknown(e) => {
+                self.resolve_boolean_test(e, scope, BooleanTestType::IsUnknown)
+            }
+            sp::Expr::IsNotUnknown(e) => {
+                self.resolve_boolean_test(e, scope, BooleanTestType::IsNotUnknown)
+            }
+
             sp::Expr::Nested(inner) => self.resolve_expr(inner, scope),
             sp::Expr::Like {
                 expr,
@@ -886,6 +910,19 @@ impl<'a> Resolver<'a> {
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
             }
         }
+    }
+
+    /// Resolve IS TRUE / IS FALSE / IS UNKNOWN boolean test predicate
+    fn resolve_boolean_test(
+        &self,
+        inner: &sp::Expr,
+        scope: &Scope,
+        test: BooleanTestType,
+    ) -> SqlResult<ResolvedExpr> {
+        Ok(ResolvedExpr::BooleanTest {
+            expr: Box::new(self.resolve_expr(inner, scope)?),
+            test,
+        })
     }
 
     // ============ Auth statement resolution ============
@@ -1361,6 +1398,9 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
         sp::BinaryOperator::And => Ok(BinaryOp::And),
         sp::BinaryOperator::Or => Ok(BinaryOp::Or),
+        sp::BinaryOperator::BitwiseOr => Ok(BinaryOp::BitwiseOr),
+        sp::BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),
+        sp::BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
         _ => Err(SqlError::Unsupported(format!("Binary operator: {:?}", op))),
     }
 }
@@ -1402,6 +1442,9 @@ fn infer_binary_result_type(
             let right_type = right.data_type();
             Ok(wider_numeric_type(&left_type, &right_type))
         }
+
+        // Bitwise operators return BigInt
+        BinaryOp::BitwiseOr | BinaryOp::BitwiseAnd | BinaryOp::BitwiseXor => Ok(DataType::BigInt),
     }
 }
 

@@ -221,6 +221,9 @@ pub enum PhysicalPlan {
 
     /// ANALYZE TABLE
     AnalyzeTable { table: String },
+
+    /// EXPLAIN — wraps the inner plan for MySQL-format EXPLAIN output
+    Explain { inner: Box<PhysicalPlan> },
 }
 
 impl PhysicalPlan {
@@ -308,6 +311,34 @@ impl PhysicalPlan {
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
             | PhysicalPlan::ShowGrants { .. } => vec![],
+
+            // EXPLAIN returns MySQL-format 12-column result set
+            PhysicalPlan::Explain { .. } => {
+                let col_names = [
+                    "id",
+                    "select_type",
+                    "table",
+                    "partitions",
+                    "type",
+                    "possible_keys",
+                    "key",
+                    "key_len",
+                    "ref",
+                    "rows",
+                    "filtered",
+                    "Extra",
+                ];
+                col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| OutputColumn {
+                        id: i,
+                        name: name.to_string(),
+                        data_type: DataType::Varchar(255),
+                        nullable: true,
+                    })
+                    .collect()
+            }
 
             // ANALYZE TABLE returns a result set (columns handled by executor)
             PhysicalPlan::AnalyzeTable { .. } => vec![
@@ -473,6 +504,9 @@ impl PhysicalPlan {
                     substitute_expr(kv, params)?;
                 }
             }
+            PhysicalPlan::Explain { inner } => {
+                inner.substitute_params(params)?;
+            }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
             | PhysicalPlan::CreateTable { .. }
@@ -538,6 +572,9 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
             substitute_expr(high, params)?;
         }
         ResolvedExpr::Column(_) => {}
+        ResolvedExpr::BooleanTest { expr: inner, .. } => {
+            substitute_expr(inner, params)?;
+        }
     }
     Ok(())
 }
@@ -1183,6 +1220,13 @@ impl PhysicalPlanner {
             LogicalPlan::ShowGrants { for_user } => Ok(PhysicalPlan::ShowGrants { for_user }),
 
             LogicalPlan::AnalyzeTable { table } => Ok(PhysicalPlan::AnalyzeTable { table }),
+
+            LogicalPlan::Explain { inner } => {
+                let inner_plan = Self::plan_node(*inner, catalog)?;
+                Ok(PhysicalPlan::Explain {
+                    inner: Box::new(inner_plan),
+                })
+            }
         }
     }
 }

@@ -19,6 +19,7 @@ use super::ddl::{CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropInd
 use super::delete::Delete;
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
+use super::explain_exec::ExplainExecutor;
 use super::filter::Filter;
 use super::hash_join::HashJoin;
 use super::insert::Insert;
@@ -502,6 +503,8 @@ impl ExecutorEngine {
                     raft_node,
                 )))
             }
+
+            PhysicalPlan::Explain { inner } => Ok(Box::new(ExplainExecutor::new(*inner))),
         }
     }
 }
