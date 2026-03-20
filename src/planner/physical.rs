@@ -161,6 +161,12 @@ pub enum PhysicalPlan {
     /// DROP INDEX
     DropIndex { name: String },
 
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
+
     // ============ Auth Operations ============
     /// CREATE USER
     CreateUser {
@@ -287,7 +293,9 @@ impl PhysicalPlan {
             | PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
-            | PhysicalPlan::DropIndex { .. } => vec![],
+            | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. } => vec![],
 
             // Auth operations don't produce query output columns
             PhysicalPlan::CreateUser { .. }
@@ -308,6 +316,8 @@ impl PhysicalPlan {
                 | PhysicalPlan::DropTable { .. }
                 | PhysicalPlan::CreateIndex { .. }
                 | PhysicalPlan::DropIndex { .. }
+                | PhysicalPlan::CreateDatabase { .. }
+                | PhysicalPlan::DropDatabase { .. }
         )
     }
 
@@ -438,6 +448,8 @@ impl PhysicalPlan {
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. }
             | PhysicalPlan::CreateUser { .. }
             | PhysicalPlan::DropUser { .. }
             | PhysicalPlan::AlterUser { .. }
@@ -1059,6 +1071,19 @@ impl PhysicalPlanner {
             }),
 
             LogicalPlan::DropIndex { name } => Ok(PhysicalPlan::DropIndex { name }),
+
+            // Database DDL passthrough
+            LogicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => Ok(PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            }),
+
+            LogicalPlan::DropDatabase { name, if_exists } => {
+                Ok(PhysicalPlan::DropDatabase { name, if_exists })
+            }
 
             // Auth operations - passthrough
             LogicalPlan::CreateUser {

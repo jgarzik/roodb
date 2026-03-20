@@ -469,9 +469,23 @@ where
 
             ParsedCommand::InitDb(db) => {
                 debug!(connection_id = self.connection_id, database = %db, "COM_INIT_DB");
-                // Accept but don't actually switch (single database for MVP)
-                self.database = Some(db);
-                self.send_ok(0, 0).await?;
+                // Validate database exists
+                let exists = {
+                    let catalog = self.catalog.read();
+                    catalog.database_exists(&db)
+                };
+                if exists {
+                    self.database = Some(db.clone());
+                    self.session.set_database(Some(db));
+                    self.send_ok(0, 0).await?;
+                } else {
+                    self.send_error(
+                        codes::ER_BAD_DB_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Unknown database '{}'", db),
+                    )
+                    .await?;
+                }
                 Ok(true)
             }
 
@@ -961,8 +975,26 @@ where
 
     /// Handle a SQL query
     async fn handle_query(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Clear warnings at the start of each statement
+        self.session.clear_warnings();
+
         // Check for transaction commands first
         if let Some(()) = self.try_handle_transaction_command(sql).await? {
+            return Ok(());
+        }
+
+        // Check for USE database command
+        if let Some(()) = self.try_handle_use_command(sql).await? {
+            return Ok(());
+        }
+
+        // Check for SHOW commands
+        if let Some(()) = self.try_handle_show_command(sql).await? {
+            return Ok(());
+        }
+
+        // Check for DROP DATABASE (text intercept since sqlparser doesn't support DROP DATABASE)
+        if let Some(()) = self.try_handle_drop_database(sql).await? {
             return Ok(());
         }
 
@@ -1086,6 +1118,10 @@ where
             }
             ResolvedStatement::ShowGrants { .. } => {
                 // Users can always see their own grants
+                vec![]
+            }
+            // Database DDL - requires CREATE privilege (root bypasses anyway)
+            ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
                 vec![]
             }
         }
@@ -1234,13 +1270,7 @@ where
         );
 
         // Check if this is DDL (no MVCC needed)
-        let is_ddl = matches!(
-            plan,
-            PhysicalPlan::CreateTable { .. }
-                | PhysicalPlan::DropTable { .. }
-                | PhysicalPlan::CreateIndex { .. }
-                | PhysicalPlan::DropIndex { .. }
-        );
+        let is_ddl = plan.is_ddl();
 
         // Reuse per-connection MVCC storage wrapper
         let mvcc = self.mvcc.clone();
@@ -1654,11 +1684,425 @@ where
         Ok(())
     }
 
+    /// Try to handle DROP DATABASE command via text intercept
+    async fn try_handle_drop_database(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let sql_trimmed = sql.trim().trim_end_matches(';').trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+
+        if !sql_upper.starts_with("DROP DATABASE") && !sql_upper.starts_with("DROP SCHEMA") {
+            return Ok(None);
+        }
+
+        // Parse: DROP DATABASE [IF EXISTS] name
+        let if_exists = sql_upper.contains("IF EXISTS");
+        let name_part = if if_exists {
+            sql_upper
+                .replace("DROP DATABASE IF EXISTS", "")
+                .replace("DROP SCHEMA IF EXISTS", "")
+        } else {
+            sql_upper
+                .replace("DROP DATABASE", "")
+                .replace("DROP SCHEMA", "")
+        };
+
+        let db_name = name_part
+            .trim()
+            .trim_matches('`')
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+
+        if db_name.is_empty() {
+            return self
+                .send_error(
+                    codes::ER_SYNTAX_ERROR,
+                    states::SYNTAX_ERROR,
+                    "DROP DATABASE requires a database name",
+                )
+                .await
+                .map(|_| Some(()));
+        }
+
+        if db_name == "DEFAULT" || db_name == "default" {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    "Cannot drop the 'default' database",
+                )
+                .await
+                .map(|_| Some(()));
+        }
+
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.database_exists(&db_name.to_lowercase())
+        };
+
+        if !exists {
+            if if_exists {
+                return self.send_ok(0, 0).await.map(Some);
+            }
+            return self
+                .send_error(
+                    codes::ER_BAD_DB_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Can't drop database '{}'; database doesn't exist", db_name),
+                )
+                .await
+                .map(|_| Some(()));
+        }
+
+        // Drop the database from the catalog
+        {
+            let mut catalog = self.catalog.write();
+            let _ = catalog.drop_database(&db_name.to_lowercase());
+        }
+
+        self.send_ok(0, 0).await.map(Some)
+    }
+
+    /// Try to handle USE database command via SQL
+    ///
+    /// Returns Some(()) if handled, None if not a USE command.
+    async fn try_handle_use_command(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let sql_trimmed = sql.trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+
+        if !sql_upper.starts_with("USE ") {
+            return Ok(None);
+        }
+
+        // Extract database name (strip quotes if present)
+        let db_name = sql_trimmed[4..]
+            .trim()
+            .trim_matches('`')
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+
+        if db_name.is_empty() {
+            return self
+                .send_error(
+                    codes::ER_SYNTAX_ERROR,
+                    states::SYNTAX_ERROR,
+                    "USE requires a database name",
+                )
+                .await
+                .map(|_| Some(()));
+        }
+
+        // Check if database exists in the catalog
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.database_exists(&db_name)
+        };
+        if !exists {
+            return self
+                .send_error(
+                    codes::ER_BAD_DB_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Unknown database '{}'", db_name),
+                )
+                .await
+                .map(|_| Some(()));
+        }
+
+        self.database = Some(db_name.clone());
+        self.session.set_database(Some(db_name));
+        self.send_ok(0, 0).await.map(Some)
+    }
+
+    /// Send a result set from in-memory column names and rows
+    async fn send_custom_result_set(
+        &mut self,
+        col_names: &[&str],
+        rows: &[Vec<String>],
+    ) -> ProtocolResult<()> {
+        use crate::catalog::DataType;
+        use crate::planner::logical::OutputColumn;
+
+        self.writer.set_sequence(1);
+
+        // Column count
+        let count_packet = encode_column_count(col_names.len() as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        // Column definitions
+        let schema = self.database.as_deref().unwrap_or("default");
+        for (i, name) in col_names.iter().enumerate() {
+            let col = OutputColumn {
+                id: i,
+                name: (*name).to_string(),
+                data_type: DataType::Varchar(255),
+                nullable: true,
+            };
+            let def = ColumnDefinition41::from_output_column(&col, "", schema);
+            self.writer.write_packet(&def.encode()).await?;
+        }
+
+        // EOF after columns
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        // Send rows
+        for row_data in rows {
+            let row = crate::executor::row::Row::new(
+                row_data
+                    .iter()
+                    .map(|v| crate::executor::datum::Datum::String(v.clone()))
+                    .collect(),
+            );
+            let row_packet = encode_text_row(&row);
+            self.writer.write_packet(&row_packet).await?;
+        }
+
+        // Final EOF/OK
+        if self.deprecate_eof {
+            let ok = encode_eof_ok_packet(default_status(), 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Try to handle SHOW commands
+    ///
+    /// Returns Some(()) if handled, None if not a SHOW command.
+    async fn try_handle_show_command(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let sql_trimmed = sql.trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+
+        if !sql_upper.starts_with("SHOW ") {
+            return Ok(None);
+        }
+
+        // SHOW DATABASES
+        if sql_upper.starts_with("SHOW DATABASES") || sql_upper.starts_with("SHOW SCHEMAS") {
+            let databases = {
+                let catalog = self.catalog.read();
+                catalog.list_databases()
+            };
+            let rows: Vec<Vec<String>> = databases.into_iter().map(|db| vec![db]).collect();
+            self.send_custom_result_set(&["Database"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW TABLES FROM db / SHOW TABLES IN db
+        else if sql_upper.starts_with("SHOW TABLES FROM ")
+            || sql_upper.starts_with("SHOW TABLES IN ")
+        {
+            let db_name = sql_trimmed
+                .split_whitespace()
+                .nth(3)
+                .unwrap_or("")
+                .trim_matches('`')
+                .trim_matches('\'')
+                .trim_matches('"');
+
+            let tables = {
+                let catalog = self.catalog.read();
+                catalog.get_tables_in_database(db_name)
+            };
+            let col_name = format!("Tables_in_{}", db_name);
+            let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
+            self.send_custom_result_set(&[&col_name], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW TABLES
+        else if sql_upper == "SHOW TABLES"
+            || sql_upper.starts_with("SHOW TABLES;")
+            || sql_upper.starts_with("SHOW FULL TABLES")
+        {
+            let db = self
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let tables = {
+                let catalog = self.catalog.read();
+                catalog.get_tables_in_database(&db)
+            };
+            let col_name = format!("Tables_in_{}", db);
+            let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
+            self.send_custom_result_set(&[&col_name], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW CREATE TABLE
+        else if sql_upper.starts_with("SHOW CREATE TABLE ") {
+            let table_name = sql_trimmed[18..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('`')
+                .trim_matches('\'')
+                .trim_matches('"');
+
+            let result = {
+                let catalog = self.catalog.read();
+                catalog.get_table(table_name).map(reconstruct_create_table)
+            };
+
+            match result {
+                Some(ddl) => {
+                    let rows = vec![vec![table_name.to_string(), ddl]];
+                    self.send_custom_result_set(&["Table", "Create Table"], &rows)
+                        .await
+                        .map(Some)
+                }
+                None => self
+                    .send_error(
+                        codes::ER_NO_SUCH_TABLE,
+                        states::NO_SUCH_TABLE,
+                        &format!("Table '{}' doesn't exist", table_name),
+                    )
+                    .await
+                    .map(|_| Some(())),
+            }
+        }
+        // DESCRIBE / DESC / SHOW COLUMNS FROM
+        else if sql_upper.starts_with("DESCRIBE ")
+            || sql_upper.starts_with("DESC ")
+            || sql_upper.starts_with("SHOW COLUMNS FROM ")
+            || sql_upper.starts_with("SHOW FIELDS FROM ")
+        {
+            let table_name = if sql_upper.starts_with("SHOW COLUMNS FROM ")
+                || sql_upper.starts_with("SHOW FIELDS FROM ")
+            {
+                sql_trimmed
+                    .split_whitespace()
+                    .nth(3)
+                    .unwrap_or("")
+                    .trim_end_matches(';')
+                    .trim_matches('`')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+            } else {
+                // DESCRIBE / DESC
+                let start = if sql_upper.starts_with("DESCRIBE ") {
+                    9
+                } else {
+                    5
+                };
+                sql_trimmed[start..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_matches('`')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+            };
+
+            let result = {
+                let catalog = self.catalog.read();
+                catalog.get_table(table_name).map(describe_table)
+            };
+
+            match result {
+                Some(rows) => self
+                    .send_custom_result_set(
+                        &["Field", "Type", "Null", "Key", "Default", "Extra"],
+                        &rows,
+                    )
+                    .await
+                    .map(Some),
+                None => self
+                    .send_error(
+                        codes::ER_NO_SUCH_TABLE,
+                        states::NO_SUCH_TABLE,
+                        &format!("Table '{}' doesn't exist", table_name),
+                    )
+                    .await
+                    .map(|_| Some(())),
+            }
+        }
+        // SHOW WARNINGS
+        else if sql_upper.starts_with("SHOW WARNINGS") {
+            let rows: Vec<Vec<String>> = self
+                .session
+                .warnings()
+                .iter()
+                .map(|w| vec![w.level.clone(), w.code.to_string(), w.message.clone()])
+                .collect();
+            self.send_custom_result_set(&["Level", "Code", "Message"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW COUNT(*) WARNINGS
+        else if sql_upper.contains("SHOW COUNT") && sql_upper.contains("WARNINGS") {
+            let count = self.session.warning_count();
+            let rows = vec![vec![count.to_string()]];
+            self.send_custom_result_set(&["@@session.warning_count"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW VARIABLES / SHOW STATUS / SHOW PROCESSLIST - return empty for compatibility
+        else if sql_upper.starts_with("SHOW VARIABLES")
+            || sql_upper.starts_with("SHOW SESSION VARIABLES")
+            || sql_upper.starts_with("SHOW GLOBAL VARIABLES")
+            || sql_upper.starts_with("SHOW STATUS")
+            || sql_upper.starts_with("SHOW SESSION STATUS")
+            || sql_upper.starts_with("SHOW GLOBAL STATUS")
+        {
+            let rows: Vec<Vec<String>> = Vec::new();
+            self.send_custom_result_set(&["Variable_name", "Value"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW PROCESSLIST
+        else if sql_upper.starts_with("SHOW PROCESSLIST")
+            || sql_upper.starts_with("SHOW FULL PROCESSLIST")
+        {
+            let rows: Vec<Vec<String>> = Vec::new();
+            self.send_custom_result_set(
+                &[
+                    "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Try to handle system variable queries (SELECT @@variable)
     ///
     /// Returns Some(()) if handled, None if not a system variable query.
+    /// Try to handle SELECT DATABASE() query
+    async fn try_handle_database_function(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let sql_upper = sql.trim().to_uppercase();
+
+        // Match SELECT DATABASE()
+        if !sql_upper.contains("DATABASE()") {
+            return Ok(None);
+        }
+
+        let db_value = self
+            .database
+            .clone()
+            .or_else(|| self.session.database.clone())
+            .unwrap_or_default();
+
+        let rows = vec![vec![db_value]];
+        self.send_custom_result_set(&["DATABASE()"], &rows)
+            .await
+            .map(Some)
+    }
+
     async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         use regex::Regex;
+
+        // Check for DATABASE() function first
+        if let Some(()) = self.try_handle_database_function(sql).await? {
+            return Ok(Some(()));
+        }
 
         // Simple pattern matching for SELECT @@variable queries
         let sql_upper = sql.to_uppercase();
@@ -1841,6 +2285,129 @@ where
 
         self.send_error(code, state, &msg).await
     }
+}
+
+/// Reconstruct a CREATE TABLE DDL statement from a TableDef
+fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
+    use crate::catalog::system_tables::data_type_to_string;
+    use crate::catalog::Constraint;
+
+    let mut parts = Vec::new();
+
+    for col in &td.columns {
+        let mut col_str = format!("`{}` {}", col.name, data_type_to_string(&col.data_type));
+        if !col.nullable {
+            col_str.push_str(" NOT NULL");
+        }
+        if let Some(ref default) = col.default {
+            col_str.push_str(&format!(" DEFAULT {}", default));
+        }
+        if col.auto_increment {
+            col_str.push_str(" AUTO_INCREMENT");
+        }
+        parts.push(col_str);
+    }
+
+    for constraint in &td.constraints {
+        match constraint {
+            Constraint::PrimaryKey(cols) => {
+                let col_list: Vec<String> = cols.iter().map(|c| format!("`{}`", c)).collect();
+                parts.push(format!("PRIMARY KEY ({})", col_list.join(", ")));
+            }
+            Constraint::Unique(cols) => {
+                let col_list: Vec<String> = cols.iter().map(|c| format!("`{}`", c)).collect();
+                parts.push(format!("UNIQUE KEY ({})", col_list.join(", ")));
+            }
+            Constraint::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+            } => {
+                let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c)).collect();
+                let ref_list: Vec<String> =
+                    ref_columns.iter().map(|c| format!("`{}`", c)).collect();
+                parts.push(format!(
+                    "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                    col_list.join(", "),
+                    ref_table,
+                    ref_list.join(", ")
+                ));
+            }
+            Constraint::Check(expr) => {
+                parts.push(format!("CHECK ({})", expr));
+            }
+        }
+    }
+
+    format!(
+        "CREATE TABLE `{}` (\n  {}\n) ENGINE=RooDB DEFAULT CHARSET=utf8mb4",
+        td.name,
+        parts.join(",\n  ")
+    )
+}
+
+/// Generate DESCRIBE output rows from a TableDef
+fn describe_table(td: &crate::catalog::TableDef) -> Vec<Vec<String>> {
+    use crate::catalog::system_tables::data_type_to_string;
+    use crate::catalog::Constraint;
+
+    // Collect primary key columns
+    let pk_cols: std::collections::HashSet<String> = td
+        .constraints
+        .iter()
+        .filter_map(|c| {
+            if let Constraint::PrimaryKey(cols) = c {
+                Some(cols.clone())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    // Collect unique key columns
+    let uni_cols: std::collections::HashSet<String> = td
+        .constraints
+        .iter()
+        .filter_map(|c| {
+            if let Constraint::Unique(cols) = c {
+                Some(cols.clone())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    td.columns
+        .iter()
+        .map(|col| {
+            let field = col.name.clone();
+            let type_str = data_type_to_string(&col.data_type);
+            let null_str = if col.nullable { "YES" } else { "NO" };
+            let key = if pk_cols.contains(&col.name) {
+                "PRI"
+            } else if uni_cols.contains(&col.name) {
+                "UNI"
+            } else {
+                ""
+            };
+            let default = col.default.clone().unwrap_or_else(|| "NULL".to_string());
+            let extra = if col.auto_increment {
+                "auto_increment".to_string()
+            } else {
+                String::new()
+            };
+            vec![
+                field,
+                type_str,
+                null_str.to_string(),
+                key.to_string(),
+                default,
+                extra,
+            ]
+        })
+        .collect()
 }
 
 #[cfg(test)]

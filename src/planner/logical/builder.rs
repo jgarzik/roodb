@@ -139,6 +139,18 @@ impl LogicalPlanBuilder {
                 grantee_host,
             }),
             ResolvedStatement::ShowGrants { for_user } => Ok(LogicalPlan::ShowGrants { for_user }),
+
+            // Database DDL - passthrough
+            ResolvedStatement::CreateDatabase {
+                name,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            }),
+            ResolvedStatement::DropDatabase { name, if_exists } => {
+                Ok(LogicalPlan::DropDatabase { name, if_exists })
+            }
         }
     }
 

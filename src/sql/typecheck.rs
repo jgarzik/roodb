@@ -34,6 +34,11 @@ impl TypeChecker {
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
 
+            // Database DDL doesn't need type checking
+            ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
+                Ok(())
+            }
+
             // Auth statements don't need type checking
             ResolvedStatement::CreateUser { .. }
             | ResolvedStatement::AlterUser { .. }

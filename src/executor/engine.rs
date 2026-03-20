@@ -14,7 +14,7 @@ use crate::txn::MvccStorage;
 use super::aggregate::HashAggregate;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
-use super::ddl::{CreateIndex, CreateTable, DropIndex, DropTable};
+use super::ddl::{CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex, DropTable};
 use super::delete::Delete;
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
@@ -334,6 +334,44 @@ impl ExecutorEngine {
                     )))
                 } else {
                     Ok(Box::new(DropIndex::new(name, self.catalog.clone())))
+                }
+            }
+
+            PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(CreateDatabase::with_raft(
+                        name,
+                        if_not_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(CreateDatabase::new(
+                        name,
+                        if_not_exists,
+                        self.catalog.clone(),
+                    )))
+                }
+            }
+
+            PhysicalPlan::DropDatabase { name, if_exists } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(DropDatabase::with_raft(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                        self.mvcc.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(DropDatabase::new(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                    )))
                 }
             }
 

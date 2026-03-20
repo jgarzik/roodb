@@ -16,7 +16,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
     is_system_table, row_to_index_def, rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS,
-    SYSTEM_CONSTRAINTS, SYSTEM_INDEXES, SYSTEM_TABLES,
+    SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES, SYSTEM_TABLES,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -541,6 +541,33 @@ impl LsmRaftStorage {
             }
         }
 
+        // Scan system.databases to rebuild database list
+        let mut database_names: Vec<String> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_DATABASES);
+            let end = table_key_end(SYSTEM_DATABASES);
+            let db_rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+
+            for (_key, value) in db_rows {
+                if value.len() <= MVCC_HEADER_SIZE {
+                    continue;
+                }
+                if value[16] == 1 {
+                    continue; // Skip deleted
+                }
+                let row_data = &value[MVCC_HEADER_SIZE..];
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                        database_names.push(db_name.clone());
+                    }
+                }
+            }
+        }
+
         // Update catalog (clear and rebuild)
         let mut catalog = self.catalog.write();
 
@@ -565,6 +592,12 @@ impl LsmRaftStorage {
         for index_def in index_defs {
             tracing::debug!(index = %index_def.name, "Rebuilding index from snapshot");
             let _ = catalog.create_index(index_def);
+        }
+
+        // Rebuild databases
+        catalog.clear_user_databases();
+        for db_name in database_names {
+            catalog.register_database(db_name);
         }
 
         tracing::info!("Rebuilt catalog from system tables after snapshot install");
@@ -614,6 +647,18 @@ impl LsmRaftStorage {
                         dropped_indexes.insert(index_name.clone());
                     } else {
                         affected_indexes.insert(index_name.clone());
+                    }
+                }
+            }
+        } else if table == SYSTEM_DATABASES {
+            // Database name changes — update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                    let mut catalog = self.catalog.write();
+                    if is_delete {
+                        let _ = catalog.drop_database(db_name);
+                    } else {
+                        catalog.register_database(db_name.clone());
                     }
                 }
             }

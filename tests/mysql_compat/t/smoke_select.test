@@ -1,0 +1,8 @@
+--echo # Smoke test: basic SELECT expressions
+
+SELECT 1;
+SELECT 1+1;
+SELECT 1 AS one;
+SELECT 1+1 AS two;
+SELECT 'hello' AS greeting;
+SELECT 1, 2, 3;

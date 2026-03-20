@@ -58,6 +58,17 @@ impl IdBatch {
     }
 }
 
+/// A warning generated during query execution
+#[derive(Debug, Clone)]
+pub struct Warning {
+    /// Warning level (Note, Warning, Error)
+    pub level: String,
+    /// MySQL-compatible warning code
+    pub code: u16,
+    /// Human-readable message
+    pub message: String,
+}
+
 /// Per-connection session state
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -85,6 +96,10 @@ pub struct Session {
     // ID batching for reduced atomic contention
     /// Pre-allocated batch of row IDs for this session
     row_id_batch: IdBatch,
+
+    // Warning tracking
+    /// Warnings accumulated during the current statement
+    warnings: Vec<Warning>,
 }
 
 impl Session {
@@ -103,6 +118,8 @@ impl Session {
             pending_changes: Vec::new(),
             // ID batching
             row_id_batch: IdBatch::empty(),
+            // Warnings
+            warnings: Vec::new(),
         }
     }
 
@@ -206,5 +223,31 @@ impl Session {
         self.row_id_batch
             .next_id()
             .expect("freshly refilled batch should have IDs")
+    }
+
+    // ============ Warning tracking ============
+
+    /// Add a warning to the current statement's warning list
+    pub fn add_warning(&mut self, level: &str, code: u16, message: String) {
+        self.warnings.push(Warning {
+            level: level.to_string(),
+            code,
+            message,
+        });
+    }
+
+    /// Clear warnings (called at start of each statement)
+    pub fn clear_warnings(&mut self) {
+        self.warnings.clear();
+    }
+
+    /// Get the current warning count
+    pub fn warning_count(&self) -> u16 {
+        self.warnings.len() as u16
+    }
+
+    /// Get a reference to accumulated warnings
+    pub fn warnings(&self) -> &[Warning] {
+        &self.warnings
     }
 }

@@ -90,6 +90,16 @@ impl<'a> Resolver<'a> {
                 ..
             } => self.resolve_revoke(&privileges, &objects, &grantees),
 
+            // CREATE DATABASE / SCHEMA
+            sp::Statement::CreateDatabase {
+                db_name,
+                if_not_exists,
+                ..
+            } => Ok(ResolvedStatement::CreateDatabase {
+                name: db_name.to_string(),
+                if_not_exists,
+            }),
+
             _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
         }
     }
@@ -135,6 +145,7 @@ impl<'a> Resolver<'a> {
         match object_type {
             sp::ObjectType::Table => Ok(ResolvedStatement::DropTable { name, if_exists }),
             sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
+            sp::ObjectType::Schema => Ok(ResolvedStatement::DropDatabase { name, if_exists }),
             _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
         }
     }

@@ -248,6 +248,10 @@ pub enum ResolvedStatement {
     },
     /// DROP INDEX
     DropIndex { name: String },
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
     /// INSERT with resolved columns
     Insert {
         table: String,
@@ -423,6 +427,12 @@ pub enum LogicalPlan {
     /// DROP INDEX
     DropIndex { name: String },
 
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
+
     // ============ Auth Operations ============
     /// CREATE USER
     CreateUser {
@@ -546,7 +556,9 @@ impl LogicalPlan {
             LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::CreateIndex { .. }
-            | LogicalPlan::DropIndex { .. } => vec![],
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::CreateDatabase { .. }
+            | LogicalPlan::DropDatabase { .. } => vec![],
 
             // Auth operations don't produce output columns (except ShowGrants which returns rows)
             LogicalPlan::CreateUser { .. }
@@ -567,6 +579,8 @@ impl LogicalPlan {
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::DropIndex { .. }
+                | LogicalPlan::CreateDatabase { .. }
+                | LogicalPlan::DropDatabase { .. }
         )
     }
 

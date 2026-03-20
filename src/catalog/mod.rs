@@ -8,7 +8,7 @@
 
 pub mod system_tables;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// SQL data types supported by the database
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +259,30 @@ impl std::error::Error for CatalogError {}
 /// Result type for catalog operations
 pub type CatalogResult<T> = Result<T, CatalogError>;
 
+/// Catalog error for database operations
+#[derive(Debug, Clone)]
+pub enum DatabaseError {
+    /// Database already exists
+    DatabaseExists(String),
+    /// Database not found
+    DatabaseNotFound(String),
+}
+
+impl std::fmt::Display for DatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseError::DatabaseExists(name) => {
+                write!(f, "Can't create database '{}'; database exists", name)
+            }
+            DatabaseError::DatabaseNotFound(name) => {
+                write!(f, "Unknown database '{}'", name)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatabaseError {}
+
 /// Database catalog - stores schema metadata
 #[derive(Debug, Default)]
 pub struct Catalog {
@@ -268,15 +292,20 @@ pub struct Catalog {
     indexes: HashMap<String, IndexDef>,
     /// Schema version counter (incremented on DDL operations)
     schema_version: u64,
+    /// Known databases
+    databases: HashSet<String>,
 }
 
 impl Catalog {
     /// Create a new empty catalog
     pub fn new() -> Self {
+        let mut databases = HashSet::new();
+        databases.insert("default".to_string());
         Self {
             tables: HashMap::new(),
             indexes: HashMap::new(),
             schema_version: 0,
+            databases,
         }
     }
 
@@ -319,6 +348,67 @@ impl Catalog {
             .retain(|name, _| system_tables::is_system_table(name));
         self.indexes.clear();
     }
+
+    // ============ Database operations ============
+
+    /// Create a database
+    pub fn create_database(&mut self, name: &str) -> Result<(), DatabaseError> {
+        if self.databases.contains(name) {
+            return Err(DatabaseError::DatabaseExists(name.to_string()));
+        }
+        self.databases.insert(name.to_string());
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Drop a database
+    pub fn drop_database(&mut self, name: &str) -> Result<(), DatabaseError> {
+        if !self.databases.remove(name) {
+            return Err(DatabaseError::DatabaseNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Check if a database exists
+    pub fn database_exists(&self, name: &str) -> bool {
+        self.databases.contains(name)
+    }
+
+    /// List all databases (sorted)
+    pub fn list_databases(&self) -> Vec<String> {
+        let mut dbs: Vec<String> = self.databases.iter().cloned().collect();
+        dbs.sort();
+        dbs
+    }
+
+    /// Get tables that belong to a specific database
+    ///
+    /// Currently returns all non-system user tables (since tables don't have
+    /// database prefixes yet). When qualified names are added, this will filter
+    /// by database prefix.
+    pub fn get_tables_in_database(&self, _db: &str) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|name| !system_tables::is_system_table(name))
+            .cloned()
+            .collect();
+        tables.sort();
+        tables
+    }
+
+    /// Register a database directly (for rebuilding from storage)
+    pub fn register_database(&mut self, name: String) {
+        self.databases.insert(name);
+    }
+
+    /// Clear all non-default databases (for re-initialization)
+    pub fn clear_user_databases(&mut self) {
+        self.databases.retain(|name| name == "default");
+    }
+
+    // ============ Table operations ============
 
     /// Create a table
     pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {

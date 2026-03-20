@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
+use crate::catalog::system_tables::{SYSTEM_DATABASES, SYSTEM_GRANTS, SYSTEM_USERS};
 use crate::executor::encoding::{encode_row, encode_row_key};
 use crate::executor::{Datum, Row};
 use crate::protocol::roodb::auth::compute_password_hash;
@@ -162,6 +162,23 @@ pub async fn initialize_database(
     // Write grant row
     storage
         .put(&grant_key, &grant_value)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
+    // Bootstrap default databases: "default" and "test"
+    let default_db_row = Row::new(vec![Datum::String("default".to_string())]);
+    let default_db_key = encode_row_key(SYSTEM_DATABASES, 3);
+    let default_db_value = encode_row(&default_db_row);
+    storage
+        .put(&default_db_key, &default_db_value)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
+    let test_db_row = Row::new(vec![Datum::String("test".to_string())]);
+    let test_db_key = encode_row_key(SYSTEM_DATABASES, 4);
+    let test_db_value = encode_row(&test_db_row);
+    storage
+        .put(&test_db_key, &test_db_value)
         .await
         .map_err(|e| InitError::Storage(e.to_string()))?;
 

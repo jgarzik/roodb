@@ -703,6 +703,249 @@ impl Executor for DropIndex {
     }
 }
 
+/// CREATE DATABASE executor
+pub struct CreateDatabase {
+    name: String,
+    if_not_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    raft_node: Option<Arc<RaftNode>>,
+    done: bool,
+    changes: Vec<RowChange>,
+}
+
+impl CreateDatabase {
+    pub fn new(name: String, if_not_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        CreateDatabase {
+            name,
+            if_not_exists,
+            catalog,
+            raft_node: None,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn with_raft(
+        name: String,
+        if_not_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+    ) -> Self {
+        CreateDatabase {
+            name,
+            if_not_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for CreateDatabase {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Check if database already exists
+        {
+            let catalog = self.catalog.read();
+            if catalog.database_exists(&self.name) {
+                if self.if_not_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "Can't create database '{}'; database exists",
+                    self.name
+                )));
+            }
+        }
+
+        if let Some(ref raft_node) = self.raft_node {
+            use crate::catalog::system_tables::SYSTEM_DATABASES;
+
+            // Write to system.databases via Raft
+            let (start, node_id) = allocate_row_id_batch(1);
+            let row_id = encode_row_id(start, node_id);
+
+            let row = Row::new(vec![Datum::String(self.name.clone())]);
+            let key = encode_row_key(SYSTEM_DATABASES, row_id);
+            let value = encode_row(&row);
+
+            let change = RowChange::insert(SYSTEM_DATABASES.to_string(), key, value);
+            let changeset = ChangeSet::new_with_changes(0, vec![change]);
+
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        } else {
+            // Direct catalog update (no Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .create_database(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+/// DROP DATABASE executor
+pub struct DropDatabase {
+    name: String,
+    if_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    raft_node: Option<Arc<RaftNode>>,
+    mvcc: Option<Arc<crate::txn::MvccStorage>>,
+    done: bool,
+    changes: Vec<RowChange>,
+}
+
+impl DropDatabase {
+    pub fn new(name: String, if_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        DropDatabase {
+            name,
+            if_exists,
+            catalog,
+            raft_node: None,
+            mvcc: None,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn with_raft(
+        name: String,
+        if_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+        mvcc: Arc<crate::txn::MvccStorage>,
+    ) -> Self {
+        DropDatabase {
+            name,
+            if_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            mvcc: Some(mvcc),
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for DropDatabase {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Prevent dropping the "default" database
+        if self.name == "default" {
+            return Err(ExecutorError::Internal(
+                "Cannot drop the 'default' database".to_string(),
+            ));
+        }
+
+        // Check if database exists
+        {
+            let catalog = self.catalog.read();
+            if !catalog.database_exists(&self.name) {
+                if self.if_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "Can't drop database '{}'; database doesn't exist",
+                    self.name
+                )));
+            }
+        }
+
+        if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
+            use crate::catalog::system_tables::SYSTEM_DATABASES;
+
+            // Scan system.databases to find the row to delete
+            let prefix = format!("t:{SYSTEM_DATABASES}:");
+            let end = format!("t:{SYSTEM_DATABASES};\x00");
+
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            let mut changeset = ChangeSet::new(0);
+            for (key, value) in rows {
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(db_name)) = row.get_opt(0) {
+                        if db_name == &self.name {
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_DATABASES,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if !changeset.changes.is_empty() {
+                raft_node
+                    .propose_changes(changeset)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            }
+        } else {
+            // Direct catalog update (no Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .drop_database(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

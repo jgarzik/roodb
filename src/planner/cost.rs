@@ -186,6 +186,8 @@ impl CostEstimator {
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. }
             | PhysicalPlan::CreateUser { .. }
             | PhysicalPlan::DropUser { .. }
             | PhysicalPlan::AlterUser { .. }

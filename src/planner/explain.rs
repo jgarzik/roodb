@@ -280,6 +280,27 @@ impl ExplainOutput {
                     writeln!(out, "{}ShowGrants: for current user", prefix).unwrap();
                 }
             }
+
+            PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
+                writeln!(
+                    out,
+                    "{}CreateDatabase: {} (if_not_exists={})",
+                    prefix, name, if_not_exists
+                )
+                .unwrap();
+            }
+
+            PhysicalPlan::DropDatabase { name, if_exists } => {
+                writeln!(
+                    out,
+                    "{}DropDatabase: {} (if_exists={})",
+                    prefix, name, if_exists
+                )
+                .unwrap();
+            }
         }
     }
 }
