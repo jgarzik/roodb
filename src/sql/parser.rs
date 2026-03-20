@@ -13,7 +13,9 @@ impl Parser {
     /// Parse a single SQL statement
     pub fn parse_one(sql: &str) -> SqlResult<Statement> {
         let dialect = MySqlDialect {};
-        let ast = SqlParser::parse_sql(&dialect, sql)?;
+        // Normalize MySQL-specific syntax that sqlparser doesn't handle
+        let normalized = Self::normalize_mysql_syntax(sql);
+        let ast = SqlParser::parse_sql(&dialect, &normalized)?;
 
         if ast.is_empty() {
             return Err(SqlError::Parse("Empty SQL statement".to_string()));
@@ -25,6 +27,17 @@ impl Parser {
         }
 
         Ok(ast.into_iter().next().unwrap())
+    }
+    /// Normalize MySQL-specific syntax that sqlparser 0.50 doesn't handle:
+    /// - `) charset xxx` → `) DEFAULT CHARSET=xxx`
+    /// - `) engine=xxx` → `) ENGINE=xxx` (case normalization)
+    fn normalize_mysql_syntax(sql: &str) -> String {
+        use regex::Regex;
+        // Replace bare `charset <name>` (not preceded by DEFAULT or CHARACTER)
+        // after a closing paren or table option context
+        let re = Regex::new(r"(?i)\)\s+charset\s+(\w+)").unwrap();
+        let result = re.replace_all(sql, ") DEFAULT CHARSET=$1");
+        result.into_owned()
     }
 }
 

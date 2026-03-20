@@ -23,7 +23,7 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 MYSQLTEST_BIN = "/usr/lib/mysql-test/bin/mysqltest"
-MYSQL_TEST_DIR = "/usr/lib/mysql-test"
+MYSQL_TEST_DIR = "/usr/lib/mysql-test/"
 
 PORT = 13308  # Use different port from integration tests
 HOST = "127.0.0.1"

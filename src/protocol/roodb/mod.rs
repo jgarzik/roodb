@@ -1005,10 +1005,10 @@ where
             return Ok(result);
         }
 
-        // Handle SET statements as no-ops for MySQL compatibility
-        // SET NAMES, SET CHARACTER SET, SET sql_mode, SET @var, etc.
+        // Handle statements as no-ops for MySQL compatibility
         {
             let upper = sql.trim().to_uppercase();
+            // SET NAMES, SET CHARACTER SET, SET sql_mode, SET @var, etc.
             if upper.starts_with("SET NAMES")
                 || upper.starts_with("SET CHARACTER SET")
                 || upper.starts_with("SET CHARACTER_SET")
@@ -1017,6 +1017,26 @@ where
                 || upper.starts_with("SET @")
                 || upper.starts_with("SET SESSION ")
                 || upper.starts_with("SET GLOBAL ")
+            {
+                return self.send_ok(0, 0).await;
+            }
+            // LOCK/UNLOCK TABLES — no-op (MVCC provides isolation)
+            if upper.starts_with("LOCK TABLE")
+                || upper.starts_with("LOCK TABLES")
+                || upper.starts_with("UNLOCK TABLE")
+                || upper.starts_with("UNLOCK TABLES")
+            {
+                return self.send_ok(0, 0).await;
+            }
+            // FLUSH — no-op
+            if upper.starts_with("FLUSH ") {
+                return self.send_ok(0, 0).await;
+            }
+            // DROP PROCEDURE/FUNCTION/VIEW IF EXISTS — no-op (we don't have these)
+            if (upper.starts_with("DROP PROCEDURE")
+                || upper.starts_with("DROP FUNCTION")
+                || upper.starts_with("DROP VIEW"))
+                && upper.contains("IF EXISTS")
             {
                 return self.send_ok(0, 0).await;
             }
@@ -2080,6 +2100,73 @@ where
             self.send_custom_result_set(&["@@session.warning_count"], &rows)
                 .await
                 .map(Some)
+        }
+        // SHOW COLLATION
+        else if sql_upper.starts_with("SHOW COLLATION") {
+            let rows: Vec<Vec<String>> = vec![vec![
+                "utf8mb4_general_ci".to_string(),
+                "utf8mb4".to_string(),
+                "45".to_string(),
+                "Yes".to_string(),
+                "Yes".to_string(),
+                "1".to_string(),
+                "PAD SPACE".to_string(),
+            ]];
+            self.send_custom_result_set(
+                &[
+                    "Collation",
+                    "Charset",
+                    "Id",
+                    "Default",
+                    "Compiled",
+                    "Sortlen",
+                    "Pad_attribute",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
+        }
+        // SHOW CHARACTER SET
+        else if sql_upper.starts_with("SHOW CHARACTER SET")
+            || sql_upper.starts_with("SHOW CHARSET")
+        {
+            let rows: Vec<Vec<String>> = vec![vec![
+                "utf8mb4".to_string(),
+                "UTF-8 Unicode".to_string(),
+                "utf8mb4_general_ci".to_string(),
+                "4".to_string(),
+            ]];
+            self.send_custom_result_set(
+                &["Charset", "Description", "Default collation", "Maxlen"],
+                &rows,
+            )
+            .await
+            .map(Some)
+        }
+        // SHOW ENGINES
+        else if sql_upper.starts_with("SHOW ENGINES") || sql_upper.starts_with("SHOW STORAGE") {
+            let rows: Vec<Vec<String>> = vec![vec![
+                "RooDB".to_string(),
+                "DEFAULT".to_string(),
+                "RooDB LSM storage engine".to_string(),
+                "YES".to_string(),
+                "YES".to_string(),
+                "YES".to_string(),
+            ]];
+            self.send_custom_result_set(
+                &[
+                    "Engine",
+                    "Support",
+                    "Comment",
+                    "Transactions",
+                    "XA",
+                    "Savepoints",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
         }
         // SHOW VARIABLES / SHOW STATUS / SHOW PROCESSLIST - return empty for compatibility
         else if sql_upper.starts_with("SHOW VARIABLES")

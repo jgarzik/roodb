@@ -1343,6 +1343,50 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         }
         sp::DataType::Date => Ok(DataType::Timestamp),
         sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
+        // UNSIGNED variants — map to corresponding signed types (we don't track signedness)
+        sp::DataType::UnsignedTinyInt(_) => Ok(DataType::TinyInt),
+        sp::DataType::UnsignedSmallInt(_) | sp::DataType::UnsignedInt2(_) => {
+            Ok(DataType::SmallInt)
+        }
+        sp::DataType::UnsignedMediumInt(_) => Ok(DataType::Int),
+        sp::DataType::UnsignedInt(_)
+        | sp::DataType::UnsignedInt4(_)
+        | sp::DataType::UnsignedInteger(_) => Ok(DataType::Int),
+        sp::DataType::UnsignedBigInt(_) | sp::DataType::UnsignedInt8(_) => Ok(DataType::BigInt),
+        // MediumInt
+        sp::DataType::MediumInt(_) => Ok(DataType::Int),
+        // Int2/Int4/Int8 aliases
+        sp::DataType::Int2(_) => Ok(DataType::SmallInt),
+        sp::DataType::Int4(_) => Ok(DataType::Int),
+        sp::DataType::Int8(_) => Ok(DataType::BigInt),
+        // ENUM and SET — map to Text (we don't enforce the value set)
+        sp::DataType::Enum(_) => Ok(DataType::Text),
+        sp::DataType::Set(_) => Ok(DataType::Text),
+        // DECIMAL/NUMERIC — map to Double
+        sp::DataType::Decimal(_) | sp::DataType::Numeric(_) | sp::DataType::Dec(_) => {
+            Ok(DataType::Double)
+        }
+        // TIME — map to Text (we don't have a native Time type)
+        sp::DataType::Time(_, _) => Ok(DataType::Text),
+        // JSON
+        sp::DataType::JSON => Ok(DataType::Text),
+        // SERIAL — MySQL alias for BIGINT UNSIGNED AUTO_INCREMENT
+        sp::DataType::Custom(name, _) => {
+            let upper = name.to_string().to_uppercase();
+            match upper.as_str() {
+                "SERIAL" => Ok(DataType::BigInt),
+                "UNSIGNED" => Ok(DataType::BigInt), // CAST AS UNSIGNED
+                "SIGNED" => Ok(DataType::BigInt),   // CAST AS SIGNED
+                "YEAR" => Ok(DataType::SmallInt),
+                "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => {
+                    Ok(DataType::Text)
+                }
+                "MEDIUMBLOB" | "LONGBLOB" | "TINYBLOB" => Ok(DataType::Blob),
+                "FIXED" => Ok(DataType::Double),
+                _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
+            }
+        }
+        // Catch-all
         _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
     }
 }

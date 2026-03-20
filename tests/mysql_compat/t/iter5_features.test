@@ -1,0 +1,81 @@
+--echo # Test: Iteration 5 features
+
+--echo # DROP VIEW IF EXISTS (no-op)
+DROP VIEW IF EXISTS nonexistent_v1;
+SELECT 1;
+
+--echo # DROP PROCEDURE IF EXISTS (no-op)
+DROP PROCEDURE IF EXISTS nonexistent_p1;
+SELECT 2;
+
+--echo # DROP FUNCTION IF EXISTS (no-op)
+DROP FUNCTION IF EXISTS nonexistent_f1;
+SELECT 3;
+
+--echo # LOCK/UNLOCK TABLES (no-op)
+CREATE TABLE lock_t (id INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO lock_t VALUES (1);
+LOCK TABLES lock_t WRITE;
+SELECT * FROM lock_t;
+UNLOCK TABLES;
+DROP TABLE lock_t;
+
+--echo # FLUSH (no-op)
+FLUSH STATUS;
+SELECT 4;
+
+--echo # SET NAMES / SET sql_mode
+SET NAMES utf8;
+SET NAMES utf8mb4;
+SET NAMES default;
+SET sql_mode = '';
+SET @myvar = 42;
+SELECT 5;
+
+--echo # CREATE TABLE with charset
+CREATE TABLE charset_t (a CHAR(10) NOT NULL) DEFAULT CHARSET=utf8;
+INSERT INTO charset_t VALUES ('hello');
+SELECT * FROM charset_t;
+DROP TABLE charset_t;
+
+--echo # CREATE TABLE with charset shorthand (MySQL syntax normalization)
+CREATE TABLE charset_t2 (a CHAR(10) NOT NULL) charset latin1;
+INSERT INTO charset_t2 VALUES ('hello');
+SELECT * FROM charset_t2;
+DROP TABLE charset_t2;
+
+--echo # UNSIGNED types
+CREATE TABLE uint_t (a INT UNSIGNED, b BIGINT UNSIGNED, c MEDIUMINT, PRIMARY KEY (a));
+INSERT INTO uint_t VALUES (1, 2, 3);
+SELECT * FROM uint_t;
+DROP TABLE uint_t;
+
+--echo # ENUM and SET types
+CREATE TABLE enum_t (id INT NOT NULL, status ENUM('active','inactive'), PRIMARY KEY (id));
+INSERT INTO enum_t VALUES (1, 'active');
+SELECT * FROM enum_t;
+DROP TABLE enum_t;
+
+--echo # DECIMAL type
+CREATE TABLE dec_t (id INT NOT NULL, price DECIMAL(10,2), PRIMARY KEY (id));
+INSERT INTO dec_t VALUES (1, 19.99);
+SELECT * FROM dec_t;
+DROP TABLE dec_t;
+
+--echo # CAST AS UNSIGNED
+SELECT CAST(1-2 AS UNSIGNED);
+SELECT CAST(-1 AS SIGNED);
+SELECT CAST('123' AS SIGNED);
+
+--echo # Multi-table DROP
+CREATE TABLE mt_a (id INT NOT NULL, PRIMARY KEY (id));
+CREATE TABLE mt_b (id INT NOT NULL, PRIMARY KEY (id));
+CREATE TABLE mt_c (id INT NOT NULL, PRIMARY KEY (id));
+DROP TABLE IF EXISTS mt_a, mt_b, mt_c;
+SELECT 6;
+
+--echo # SHOW COLLATION
+SHOW COLLATION LIKE 'utf8mb4%';
+
+--echo # SHOW CHARACTER SET
+SHOW CHARACTER SET LIKE 'utf8mb4%';
