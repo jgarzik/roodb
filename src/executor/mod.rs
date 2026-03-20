@@ -4,6 +4,7 @@
 //! iterator model: each operator implements open/next/close methods.
 
 pub mod aggregate;
+pub mod analyze;
 pub mod auth;
 pub mod context;
 pub mod datum;

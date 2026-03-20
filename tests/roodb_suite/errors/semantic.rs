@@ -145,17 +145,13 @@ async fn test_division_by_zero() {
     let server = TestServer::start("err_div_zero").await;
     let mut conn = server.connect().await;
 
-    // Division by zero
-    let result: Result<Vec<(i64,)>, _> = conn.query("SELECT 1 / 0").await;
-    // Note: Some DBs return NULL, others error. Check behavior.
-    // If it's NULL, the query succeeds but with NULL result
-    if let Ok(rows) = result {
-        if !rows.is_empty() {
-            // This is OK - some implementations return NULL or Infinity
-        }
-    }
-    // If it errors, that's also acceptable
-    // This test documents the behavior either way
+    // Division by zero returns NULL (MySQL semantics)
+    let result: Vec<(Option<i64>,)> = conn
+        .query("SELECT 1 / 0")
+        .await
+        .expect("SELECT 1/0 should succeed");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].0, None, "1/0 should return NULL");
 
     drop(conn);
     server.shutdown().await;

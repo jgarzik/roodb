@@ -47,6 +47,9 @@ impl TypeChecker {
             | ResolvedStatement::Grant { .. }
             | ResolvedStatement::Revoke { .. }
             | ResolvedStatement::ShowGrants { .. } => Ok(()),
+
+            // ANALYZE TABLE doesn't need type checking
+            ResolvedStatement::AnalyzeTable { .. } => Ok(()),
         }
     }
 

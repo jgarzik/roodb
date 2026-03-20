@@ -140,6 +140,8 @@ impl LogicalPlanBuilder {
             }),
             ResolvedStatement::ShowGrants { for_user } => Ok(LogicalPlan::ShowGrants { for_user }),
 
+            ResolvedStatement::AnalyzeTable { table } => Ok(LogicalPlan::AnalyzeTable { table }),
+
             // Database DDL - passthrough
             ResolvedStatement::CreateDatabase {
                 name,

@@ -218,6 +218,9 @@ pub enum PhysicalPlan {
     ShowGrants {
         for_user: Option<(String, HostPattern)>,
     },
+
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
 }
 
 impl PhysicalPlan {
@@ -305,6 +308,34 @@ impl PhysicalPlan {
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
             | PhysicalPlan::ShowGrants { .. } => vec![],
+
+            // ANALYZE TABLE returns a result set (columns handled by executor)
+            PhysicalPlan::AnalyzeTable { .. } => vec![
+                OutputColumn {
+                    id: 0,
+                    name: "Table".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 1,
+                    name: "Op".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 2,
+                    name: "Msg_type".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 3,
+                    name: "Msg_text".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+            ],
         }
     }
 
@@ -456,7 +487,8 @@ impl PhysicalPlan {
             | PhysicalPlan::SetPassword { .. }
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
-            | PhysicalPlan::ShowGrants { .. } => {}
+            | PhysicalPlan::ShowGrants { .. }
+            | PhysicalPlan::AnalyzeTable { .. } => {}
         }
         Ok(())
     }
@@ -1149,6 +1181,8 @@ impl PhysicalPlanner {
                 grantee_host,
             }),
             LogicalPlan::ShowGrants { for_user } => Ok(PhysicalPlan::ShowGrants { for_user }),
+
+            LogicalPlan::AnalyzeTable { table } => Ok(PhysicalPlan::AnalyzeTable { table }),
         }
     }
 }

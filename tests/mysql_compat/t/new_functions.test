@@ -1,0 +1,35 @@
+--echo # Test: IF(), ISNULL(), IFNULL(), division by zero, DATE type
+
+--echo # Division by zero returns NULL
+SELECT 1 / 0;
+SELECT 10 / 0;
+SELECT 5 % 0;
+
+--echo # IF() function
+SELECT IF(1, 'yes', 'no');
+SELECT IF(0, 'yes', 'no');
+SELECT IF(NULL, 'yes', 'no');
+
+--echo # IF() with expressions
+CREATE TABLE if_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
+INSERT INTO if_t VALUES (1, 10);
+INSERT INTO if_t VALUES (2, NULL);
+INSERT INTO if_t VALUES (3, 0);
+SELECT id, IF(val, 'truthy', 'falsy') FROM if_t;
+DROP TABLE if_t;
+
+--echo # ISNULL() function
+SELECT ISNULL(1);
+SELECT ISNULL(NULL);
+SELECT ISNULL('hello');
+
+--echo # IFNULL() function
+SELECT IFNULL(1, 2);
+SELECT IFNULL(NULL, 2);
+SELECT IFNULL(NULL, 'default');
+
+--echo # DATE column type
+CREATE TABLE date_t (id INT NOT NULL, d DATE, PRIMARY KEY (id));
+INSERT INTO date_t VALUES (1, '2024-01-15');
+SELECT id, d FROM date_t;
+DROP TABLE date_t;

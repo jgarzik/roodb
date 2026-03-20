@@ -320,6 +320,8 @@ pub enum ResolvedStatement {
         /// If None, show grants for current user
         for_user: Option<(String, HostPattern)>,
     },
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
 }
 
 /// Logical plan node
@@ -484,6 +486,9 @@ pub enum LogicalPlan {
     ShowGrants {
         for_user: Option<(String, HostPattern)>,
     },
+
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
 }
 
 impl LogicalPlan {
@@ -568,6 +573,9 @@ impl LogicalPlan {
             | LogicalPlan::Grant { .. }
             | LogicalPlan::Revoke { .. }
             | LogicalPlan::ShowGrants { .. } => vec![],
+
+            // ANALYZE TABLE returns a result set (handled by executor)
+            LogicalPlan::AnalyzeTable { .. } => vec![],
         }
     }
 

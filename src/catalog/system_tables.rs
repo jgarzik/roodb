@@ -21,6 +21,9 @@ pub const SYSTEM_ROLE_GRANTS: &str = "system.role_grants";
 // Database registry
 pub const SYSTEM_DATABASES: &str = "system.databases";
 
+// Table statistics
+pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
+
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
     name.starts_with("system.")
@@ -140,6 +143,16 @@ pub fn role_grants_table_def() -> TableDef {
         ]))
 }
 
+/// Create the TableDef for system.table_statistics
+pub fn table_statistics_table_def() -> TableDef {
+    TableDef::new(SYSTEM_TABLE_STATISTICS)
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("row_count", DataType::BigInt).nullable(false))
+        .column(ColumnDef::new("data_size", DataType::BigInt).nullable(false))
+        .column(ColumnDef::new("last_analyzed", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::PrimaryKey(vec!["table_name".to_string()]))
+}
+
 /// Create the TableDef for system.databases
 pub fn databases_table_def() -> TableDef {
     TableDef::new(SYSTEM_DATABASES)
@@ -159,6 +172,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         roles_table_def(),
         role_grants_table_def(),
         databases_table_def(),
+        table_statistics_table_def(),
     ]
 }
 
@@ -519,7 +533,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 9);
+        assert_eq!(tables.len(), 10);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -531,6 +545,7 @@ mod tests {
         assert!(names.contains(&SYSTEM_ROLES));
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
         assert!(names.contains(&SYSTEM_DATABASES));
+        assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
     }
 
     #[test]

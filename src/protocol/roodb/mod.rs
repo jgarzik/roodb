@@ -798,6 +798,7 @@ where
                 | PhysicalPlan::HashDistinct { .. }
                 | PhysicalPlan::HashAggregate { .. }
                 | PhysicalPlan::NestedLoopJoin { .. }
+                | PhysicalPlan::AnalyzeTable { .. }
         );
 
         let is_ddl = matches!(
@@ -1124,6 +1125,10 @@ where
             ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
                 vec![]
             }
+            // ANALYZE TABLE - no special privileges needed (root bypasses anyway)
+            ResolvedStatement::AnalyzeTable { .. } => {
+                vec![]
+            }
         }
     }
 
@@ -1267,6 +1272,7 @@ where
                 | PhysicalPlan::HashDistinct { .. }
                 | PhysicalPlan::HashAggregate { .. }
                 | PhysicalPlan::NestedLoopJoin { .. }
+                | PhysicalPlan::AnalyzeTable { .. }
         );
 
         // Check if this is DDL (no MVCC needed)
@@ -2274,11 +2280,22 @@ where
             ProtocolError::Planner(plan_err) => {
                 return self.send_planner_error(plan_err).await;
             }
-            ProtocolError::Executor(exec_err) => (
-                codes::ER_UNKNOWN_ERROR,
-                states::GENERAL_ERROR,
-                exec_err.to_string(),
-            ),
+            ProtocolError::Executor(exec_err) => {
+                // Map specific executor errors to MySQL error codes
+                if let crate::executor::ExecutorError::TableNotFound(_) = exec_err {
+                    (
+                        codes::ER_BAD_TABLE_ERROR,
+                        states::NO_SUCH_TABLE,
+                        exec_err.to_string(),
+                    )
+                } else {
+                    (
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        exec_err.to_string(),
+                    )
+                }
+            }
             _ => (
                 codes::ER_UNKNOWN_ERROR,
                 states::GENERAL_ERROR,

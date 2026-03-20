@@ -194,7 +194,8 @@ impl CostEstimator {
             | PhysicalPlan::SetPassword { .. }
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
-            | PhysicalPlan::ShowGrants { .. } => Cost::zero(),
+            | PhysicalPlan::ShowGrants { .. }
+            | PhysicalPlan::AnalyzeTable { .. } => Cost::zero(),
         }
     }
 }

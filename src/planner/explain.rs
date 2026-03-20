@@ -301,6 +301,10 @@ impl ExplainOutput {
                 )
                 .unwrap();
             }
+
+            PhysicalPlan::AnalyzeTable { table } => {
+                writeln!(out, "{}AnalyzeTable: {}", prefix, table).unwrap();
+            }
         }
     }
 }

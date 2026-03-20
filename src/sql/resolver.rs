@@ -100,6 +100,16 @@ impl<'a> Resolver<'a> {
                 if_not_exists,
             }),
 
+            // ANALYZE TABLE
+            sp::Statement::Analyze { table_name, .. } => {
+                let table = table_name.to_string();
+                // Verify table exists
+                self.catalog
+                    .get_table(&table)
+                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+                Ok(ResolvedStatement::AnalyzeTable { table })
+            }
+
             _ => Err(SqlError::Unsupported(format!("Statement type: {:?}", stmt))),
         }
     }
@@ -1211,6 +1221,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         sp::DataType::Blob(_) | sp::DataType::Binary(_) | sp::DataType::Varbinary(_) => {
             Ok(DataType::Blob)
         }
+        sp::DataType::Date => Ok(DataType::Timestamp),
         sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
         _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
     }
@@ -1426,6 +1437,22 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
                 Ok(DataType::Int)
             } else {
                 Ok(args[0].data_type())
+            }
+        }
+        "ISNULL" => Ok(DataType::BigInt),
+        "IF" => {
+            // IF(cond, then, else) — return type = wider type of args[1] and args[2]
+            if args.len() < 3 {
+                return Err(SqlError::InvalidOperation(
+                    "IF requires 3 arguments".to_string(),
+                ));
+            }
+            let t1 = args[1].data_type();
+            let t2 = args[2].data_type();
+            if t1.is_numeric() && t2.is_numeric() {
+                Ok(wider_numeric_type(&t1, &t2))
+            } else {
+                Ok(t1)
             }
         }
         "CONCAT" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "SUBSTRING" | "SUBSTR" => {

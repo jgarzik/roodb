@@ -32,6 +32,10 @@ pub fn eval(expr: &ResolvedExpr, row: &Row) -> ExecutorResult<Datum> {
         }
 
         ResolvedExpr::Function { name, args, .. } => {
+            // IF() requires short-circuit evaluation — only compute the taken branch
+            if name.eq_ignore_ascii_case("IF") {
+                return eval_if_function(args, row);
+            }
             let arg_vals: Vec<Datum> = args
                 .iter()
                 .map(|a| eval(a, row))
@@ -193,18 +197,10 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    // Check for division by zero
+    // Division by zero returns NULL (MySQL semantics)
     match right {
-        Datum::Int(0) => {
-            return Err(ExecutorError::InvalidOperation(
-                "division by zero".to_string(),
-            ))
-        }
-        Datum::Float(f) if *f == 0.0 => {
-            return Err(ExecutorError::InvalidOperation(
-                "division by zero".to_string(),
-            ))
-        }
+        Datum::Int(0) => return Ok(Datum::Null),
+        Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
 
@@ -221,14 +217,18 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    if let Datum::Int(0) = right {
-        return Err(ExecutorError::InvalidOperation(
-            "modulo by zero".to_string(),
-        ));
+    // Modulo by zero returns NULL (MySQL semantics)
+    match right {
+        Datum::Int(0) => return Ok(Datum::Null),
+        Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
+        _ => {}
     }
 
     match (left, right) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a % b)),
+        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a % b)),
+        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
+        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a % *b as f64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot compute modulo of {:?} and {:?}",
             left, right
@@ -374,12 +374,51 @@ fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
         }
 
+        "ISNULL" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ISNULL requires 1 argument".to_string(),
+                ));
+            }
+            Ok(Datum::Int(if args[0].is_null() { 1 } else { 0 }))
+        }
+
+        "IFNULL" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "IFNULL requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                Ok(args[1].clone())
+            } else {
+                Ok(args[0].clone())
+            }
+        }
+
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
         _ => Err(ExecutorError::InvalidOperation(format!(
             "unknown function: {}",
             name
         ))),
+    }
+}
+
+/// Evaluate IF(cond, then_expr, else_expr) with short-circuit evaluation.
+/// NULL condition takes the else branch (MySQL semantics).
+fn eval_if_function(args: &[ResolvedExpr], row: &Row) -> ExecutorResult<Datum> {
+    if args.len() != 3 {
+        return Err(ExecutorError::InvalidOperation(
+            "IF requires 3 arguments".to_string(),
+        ));
+    }
+    let cond = eval(&args[0], row)?;
+    let is_true = cond.as_bool().unwrap_or_default();
+    if is_true {
+        eval(&args[1], row)
+    } else {
+        eval(&args[2], row)
     }
 }
 
@@ -515,7 +554,121 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_div_by_zero() {
+    fn test_eval_mod_by_zero_returns_null() {
+        let row = make_row();
+        let expr = ResolvedExpr::BinaryOp {
+            left: Box::new(col_expr(0)),
+            op: BinaryOp::Mod,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(0))),
+            result_type: DataType::BigInt,
+        };
+        let result = eval(&expr, &row).unwrap();
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_eval_if_true() {
+        let row = make_row();
+        let expr = ResolvedExpr::Function {
+            name: "IF".to_string(),
+            args: vec![
+                ResolvedExpr::Literal(Literal::Integer(1)),
+                ResolvedExpr::Literal(Literal::String("yes".to_string())),
+                ResolvedExpr::Literal(Literal::String("no".to_string())),
+            ],
+            distinct: false,
+            result_type: DataType::Text,
+        };
+        let result = eval(&expr, &row).unwrap();
+        assert_eq!(result.as_str(), Some("yes"));
+    }
+
+    #[test]
+    fn test_eval_if_false() {
+        let row = make_row();
+        let expr = ResolvedExpr::Function {
+            name: "IF".to_string(),
+            args: vec![
+                ResolvedExpr::Literal(Literal::Integer(0)),
+                ResolvedExpr::Literal(Literal::String("yes".to_string())),
+                ResolvedExpr::Literal(Literal::String("no".to_string())),
+            ],
+            distinct: false,
+            result_type: DataType::Text,
+        };
+        let result = eval(&expr, &row).unwrap();
+        assert_eq!(result.as_str(), Some("no"));
+    }
+
+    #[test]
+    fn test_eval_if_null_condition() {
+        let row = make_row();
+        let expr = ResolvedExpr::Function {
+            name: "IF".to_string(),
+            args: vec![
+                ResolvedExpr::Literal(Literal::Null),
+                ResolvedExpr::Literal(Literal::String("yes".to_string())),
+                ResolvedExpr::Literal(Literal::String("no".to_string())),
+            ],
+            distinct: false,
+            result_type: DataType::Text,
+        };
+        let result = eval(&expr, &row).unwrap();
+        assert_eq!(result.as_str(), Some("no"));
+    }
+
+    #[test]
+    fn test_eval_isnull() {
+        let row = make_row();
+        // ISNULL(NULL) = 1
+        let expr = ResolvedExpr::Function {
+            name: "ISNULL".to_string(),
+            args: vec![ResolvedExpr::Literal(Literal::Null)],
+            distinct: false,
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
+
+        // ISNULL(42) = 0
+        let expr = ResolvedExpr::Function {
+            name: "ISNULL".to_string(),
+            args: vec![ResolvedExpr::Literal(Literal::Integer(42))],
+            distinct: false,
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(0));
+    }
+
+    #[test]
+    fn test_eval_ifnull() {
+        let row = make_row();
+        // IFNULL(NULL, 2) = 2
+        let expr = ResolvedExpr::Function {
+            name: "IFNULL".to_string(),
+            args: vec![
+                ResolvedExpr::Literal(Literal::Null),
+                ResolvedExpr::Literal(Literal::Integer(2)),
+            ],
+            distinct: false,
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(2));
+
+        // IFNULL(1, 2) = 1
+        let expr = ResolvedExpr::Function {
+            name: "IFNULL".to_string(),
+            args: vec![
+                ResolvedExpr::Literal(Literal::Integer(1)),
+                ResolvedExpr::Literal(Literal::Integer(2)),
+            ],
+            distinct: false,
+            result_type: DataType::BigInt,
+        };
+        assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
+    }
+
+    #[test]
+    fn test_eval_div_by_zero_returns_null() {
         let row = make_row();
         let expr = ResolvedExpr::BinaryOp {
             left: Box::new(col_expr(0)),
@@ -523,6 +676,7 @@ mod tests {
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(0))),
             result_type: DataType::BigInt,
         };
-        assert!(eval(&expr, &row).is_err());
+        let result = eval(&expr, &row).unwrap();
+        assert!(result.is_null());
     }
 }

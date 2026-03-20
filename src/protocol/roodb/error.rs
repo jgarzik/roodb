@@ -109,6 +109,7 @@ pub mod codes {
     pub const ER_UNKNOWN_ERROR: u16 = 1105;
     pub const ER_ACCESS_DENIED: u16 = 1045;
     pub const ER_BAD_DB_ERROR: u16 = 1049;
+    pub const ER_BAD_TABLE_ERROR: u16 = 1051;
     pub const ER_UNKNOWN_COM_ERROR: u16 = 1047;
     pub const ER_CANT_CHANGE_TX_CHARACTERISTICS: u16 = 1568;
 }

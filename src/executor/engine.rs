@@ -12,6 +12,7 @@ use crate::raft::RaftNode;
 use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
+use super::analyze::AnalyzeTable;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
 use super::ddl::{CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex, DropTable};
@@ -487,6 +488,18 @@ impl ExecutorEngine {
                     password,
                     raft_node,
                     self.mvcc.inner().clone(),
+                )))
+            }
+
+            PhysicalPlan::AnalyzeTable { table } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("ANALYZE TABLE requires Raft".to_string())
+                })?;
+                Ok(Box::new(AnalyzeTable::new(
+                    table,
+                    self.mvcc.clone(),
+                    self.catalog.clone(),
+                    raft_node,
                 )))
             }
         }
