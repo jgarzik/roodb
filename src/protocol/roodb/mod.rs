@@ -1042,6 +1042,29 @@ where
             }
         }
 
+        // Handle INFORMATION_SCHEMA and performance_schema queries
+        if let Some(()) = self.try_handle_information_schema(sql).await? {
+            return Ok(());
+        }
+
+        // Handle CHECK TABLE as no-op
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("CHECK TABLE") || upper.starts_with("CHECKSUM TABLE") {
+                return self
+                    .send_custom_result_set(
+                        &["Table", "Op", "Msg_type", "Msg_text"],
+                        &[vec![
+                            "test.t1".to_string(),
+                            "check".to_string(),
+                            "status".to_string(),
+                            "OK".to_string(),
+                        ]],
+                    )
+                    .await;
+            }
+        }
+
         // Parse
         let stmt = match Parser::parse_one(sql) {
             Ok(s) => s,
@@ -2214,6 +2237,201 @@ where
     ///
     /// Returns Some(()) if handled, None if not a system variable query.
     /// Try to handle SELECT DATABASE() query
+    /// Handle queries against INFORMATION_SCHEMA and performance_schema virtual tables
+    async fn try_handle_information_schema(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let upper = sql.trim().to_uppercase();
+
+        // Only intercept SELECT queries that reference these schemas
+        if !upper.contains("INFORMATION_SCHEMA") && !upper.contains("PERFORMANCE_SCHEMA") {
+            return Ok(None);
+        }
+
+        // INFORMATION_SCHEMA.ENGINES
+        if upper.contains("INFORMATION_SCHEMA.ENGINES")
+            || upper.contains("INFORMATION_SCHEMA.`ENGINES`")
+        {
+            let rows = vec![vec![
+                "RooDB".to_string(),
+                "DEFAULT".to_string(),
+                "RooDB distributed LSM storage engine".to_string(),
+                "YES".to_string(),
+                "YES".to_string(),
+                "NO".to_string(),
+            ]];
+            return self
+                .send_custom_result_set(
+                    &[
+                        "ENGINE",
+                        "SUPPORT",
+                        "COMMENT",
+                        "TRANSACTIONS",
+                        "XA",
+                        "SAVEPOINTS",
+                    ],
+                    &rows,
+                )
+                .await
+                .map(Some);
+        }
+
+        // INFORMATION_SCHEMA.SCHEMATA
+        if upper.contains("INFORMATION_SCHEMA.SCHEMATA") {
+            let databases = {
+                let catalog = self.catalog.read();
+                catalog.list_databases()
+            };
+            let rows: Vec<Vec<String>> = databases
+                .into_iter()
+                .map(|db| {
+                    vec![
+                        "def".to_string(),
+                        db,
+                        "utf8mb4".to_string(),
+                        "utf8mb4_general_ci".to_string(),
+                        String::new(),
+                        "NO".to_string(),
+                    ]
+                })
+                .collect();
+            return self
+                .send_custom_result_set(
+                    &[
+                        "CATALOG_NAME",
+                        "SCHEMA_NAME",
+                        "DEFAULT_CHARACTER_SET_NAME",
+                        "DEFAULT_COLLATION_NAME",
+                        "SQL_PATH",
+                        "DEFAULT_ENCRYPTION",
+                    ],
+                    &rows,
+                )
+                .await
+                .map(Some);
+        }
+
+        // INFORMATION_SCHEMA.TABLES
+        if upper.contains("INFORMATION_SCHEMA.TABLES") {
+            let db = self
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let tables = {
+                let catalog = self.catalog.read();
+                catalog.get_tables_in_database(&db)
+            };
+            let rows: Vec<Vec<String>> = tables
+                .into_iter()
+                .map(|t| {
+                    vec![
+                        "def".to_string(),
+                        db.clone(),
+                        t,
+                        "BASE TABLE".to_string(),
+                        "RooDB".to_string(),
+                        "10".to_string(),
+                        "Dynamic".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        String::new(),
+                        "utf8mb4_general_ci".to_string(),
+                        String::new(),
+                        String::new(),
+                    ]
+                })
+                .collect();
+            return self
+                .send_custom_result_set(
+                    &[
+                        "TABLE_CATALOG",
+                        "TABLE_SCHEMA",
+                        "TABLE_NAME",
+                        "TABLE_TYPE",
+                        "ENGINE",
+                        "VERSION",
+                        "ROW_FORMAT",
+                        "TABLE_ROWS",
+                        "AVG_ROW_LENGTH",
+                        "DATA_LENGTH",
+                        "MAX_DATA_LENGTH",
+                        "INDEX_LENGTH",
+                        "DATA_FREE",
+                        "CREATE_OPTIONS",
+                        "TABLE_COLLATION",
+                        "CHECKSUM",
+                        "TABLE_COMMENT",
+                    ],
+                    &rows,
+                )
+                .await
+                .map(Some);
+        }
+
+        // INFORMATION_SCHEMA.PLUGINS
+        if upper.contains("INFORMATION_SCHEMA.PLUGINS") {
+            let rows: Vec<Vec<String>> = Vec::new();
+            return self
+                .send_custom_result_set(
+                    &[
+                        "PLUGIN_NAME",
+                        "PLUGIN_VERSION",
+                        "PLUGIN_STATUS",
+                        "PLUGIN_TYPE",
+                        "PLUGIN_TYPE_VERSION",
+                        "PLUGIN_LIBRARY",
+                        "PLUGIN_LIBRARY_VERSION",
+                        "PLUGIN_AUTHOR",
+                        "PLUGIN_DESCRIPTION",
+                        "PLUGIN_LICENSE",
+                        "LOAD_OPTION",
+                    ],
+                    &rows,
+                )
+                .await
+                .map(Some);
+        }
+
+        // INFORMATION_SCHEMA.COLUMNS
+        if upper.contains("INFORMATION_SCHEMA.COLUMNS") {
+            let rows: Vec<Vec<String>> = Vec::new();
+            return self
+                .send_custom_result_set(
+                    &[
+                        "TABLE_CATALOG",
+                        "TABLE_SCHEMA",
+                        "TABLE_NAME",
+                        "COLUMN_NAME",
+                        "ORDINAL_POSITION",
+                        "COLUMN_DEFAULT",
+                        "IS_NULLABLE",
+                        "DATA_TYPE",
+                        "CHARACTER_MAXIMUM_LENGTH",
+                        "COLUMN_TYPE",
+                        "COLUMN_KEY",
+                        "EXTRA",
+                        "PRIVILEGES",
+                        "COLUMN_COMMENT",
+                    ],
+                    &rows,
+                )
+                .await
+                .map(Some);
+        }
+
+        // PERFORMANCE_SCHEMA.* — return empty result sets
+        if upper.contains("PERFORMANCE_SCHEMA.") {
+            return self
+                .send_custom_result_set(&["VARIABLE_NAME", "VARIABLE_VALUE"], &[])
+                .await
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
     async fn try_handle_database_function(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         let sql_upper = sql.trim().to_uppercase();
 

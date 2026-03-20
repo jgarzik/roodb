@@ -215,6 +215,12 @@ def run_mysqltest(test_file, result_file, certs, port=PORT, record=False):
         cmd.append("--record")
 
     cmd.append(f"--basedir={MYSQL_TEST_DIR}")
+    # Use tmpdir for log files (MySQL result dir is read-only)
+    log_dir = os.path.dirname(result_file)
+    if not os.access(log_dir, os.W_OK):
+        import tempfile
+        log_dir = tempfile.mkdtemp(prefix="roodb_logs_")
+    cmd.append(f"--logdir={log_dir}")
     cmd.append(f"--result-file={result_file}")
 
     try:

@@ -922,6 +922,24 @@ impl<'a> Resolver<'a> {
                     result_type: DataType::Boolean,
                 })
             }
+            // TypedString: _utf8'string' or N'string' — just treat as a string literal
+            sp::Expr::TypedString { value, .. } => {
+                Ok(ResolvedExpr::Literal(Literal::String(value.clone())))
+            }
+
+            // IntroducedString: _charset 'string' — treat as string literal
+            sp::Expr::IntroducedString { value, .. } => {
+                Ok(ResolvedExpr::Literal(convert_value(value)?))
+            }
+
+            // Collate: expr COLLATE collation — ignore collation, return expr
+            sp::Expr::Collate { expr, .. } => self.resolve_expr(expr, scope),
+
+            // Subquery: (SELECT ...) — resolve as scalar subquery
+            sp::Expr::Subquery(_) => Err(SqlError::Unsupported(
+                "Subqueries not yet supported".to_string(),
+            )),
+
             _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }
