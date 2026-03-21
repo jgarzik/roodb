@@ -1185,24 +1185,25 @@ impl<'a> Resolver<'a> {
         scope: &Scope,
     ) -> SqlResult<ResolvedExpr> {
         if let Some(table_name) = table {
-            // Qualified column reference
+            // Qualified column reference (case-insensitive table name)
+            let table_key = table_name.to_lowercase();
             let table_info = scope
                 .tables
-                .get(table_name)
+                .get(&table_key)
                 .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
 
             let (local_idx, col_info) = table_info
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, (n, _, _))| n == name)
+                .find(|(_, (n, _, _))| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
 
             let global_idx = table_info.column_offset + local_idx;
 
             Ok(ResolvedExpr::Column(ResolvedColumn {
                 table: table_name.to_string(),
-                name: name.to_string(),
+                name: col_info.0.clone(), // Use the original column name from catalog
                 index: global_idx,
                 data_type: col_info.1.clone(),
                 nullable: col_info.2,
@@ -1216,7 +1217,7 @@ impl<'a> Resolver<'a> {
                     .columns
                     .iter()
                     .enumerate()
-                    .find(|(_, (n, _, _))| n == name)
+                    .find(|(_, (n, _, _))| n.eq_ignore_ascii_case(name))
                 {
                     if found.is_some() {
                         return Err(SqlError::AmbiguousColumn(name.to_string()));
@@ -1529,8 +1530,9 @@ impl Scope {
         let column_offset = self.total_columns;
         let num_columns = table_def.columns.len();
 
+        // Store with original case but also support case-insensitive lookups
         self.tables.insert(
-            alias.to_string(),
+            alias.to_lowercase(),
             TableInfo {
                 columns: table_def
                     .columns
@@ -1541,7 +1543,7 @@ impl Scope {
             },
         );
 
-        self.table_order.push((alias.to_string(), column_offset));
+        self.table_order.push((alias.to_lowercase(), column_offset));
         self.total_columns += num_columns;
     }
 }
