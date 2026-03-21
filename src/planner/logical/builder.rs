@@ -553,7 +553,54 @@ impl LogicalPlanBuilder {
                 ca.table == cb.table && ca.name == cb.name && ca.index == cb.index
             }
             (ResolvedExpr::Literal(la), ResolvedExpr::Literal(lb)) => la == lb,
-            _ => false, // Simplified - could be more thorough
+            (
+                ResolvedExpr::BinaryOp {
+                    left: la,
+                    op: oa,
+                    right: ra,
+                    ..
+                },
+                ResolvedExpr::BinaryOp {
+                    left: lb,
+                    op: ob,
+                    right: rb,
+                    ..
+                },
+            ) => oa == ob && Self::exprs_equal(la, lb) && Self::exprs_equal(ra, rb),
+            (
+                ResolvedExpr::UnaryOp {
+                    op: oa, expr: ea, ..
+                },
+                ResolvedExpr::UnaryOp {
+                    op: ob, expr: eb, ..
+                },
+            ) => oa == ob && Self::exprs_equal(ea, eb),
+            (
+                ResolvedExpr::Function {
+                    name: na, args: aa, ..
+                },
+                ResolvedExpr::Function {
+                    name: nb, args: ab, ..
+                },
+            ) => {
+                na == nb
+                    && aa.len() == ab.len()
+                    && aa
+                        .iter()
+                        .zip(ab.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+            }
+            (
+                ResolvedExpr::Cast {
+                    expr: ea,
+                    target_type: ta,
+                },
+                ResolvedExpr::Cast {
+                    expr: eb,
+                    target_type: tb,
+                },
+            ) => ta == tb && Self::exprs_equal(ea, eb),
+            _ => false,
         }
     }
 
