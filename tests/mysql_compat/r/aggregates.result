@@ -7,25 +7,25 @@ INSERT INTO agg_t VALUES (4, 'B', 40);
 INSERT INTO agg_t VALUES (5, 'C', 50);
 # COUNT, SUM, AVG, MIN, MAX
 SELECT COUNT(*) FROM agg_t;
-count(NULL)
+COUNT(NULL)
 5
 SELECT SUM(val) FROM agg_t;
-sum(val)
+SUM(val)
 150
 SELECT MIN(val) FROM agg_t;
-min(val)
+MIN(val)
 10
 SELECT MAX(val) FROM agg_t;
-max(val)
+MAX(val)
 50
 # GROUP BY
 SELECT category, COUNT(*) FROM agg_t GROUP BY category ORDER BY category;
-category	count(NULL)
+category	COUNT(NULL)
 A	2
 B	2
 C	1
 SELECT category, SUM(val) FROM agg_t GROUP BY category ORDER BY category;
-category	sum(val)
+category	SUM(val)
 A	40
 B	60
 C	50

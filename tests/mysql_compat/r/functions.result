@@ -1,31 +1,31 @@
 # Test: Built-in functions
 # String functions
 SELECT UPPER('hello');
-upper('hello')
+UPPER('hello')
 HELLO
 SELECT LOWER('HELLO');
-lower('HELLO')
+LOWER('HELLO')
 hello
 SELECT LENGTH('hello');
-length('hello')
+LENGTH('hello')
 5
 SELECT CONCAT('hello', ' ', 'world');
-concat('hello',' ','world')
+CONCAT('hello',' ','world')
 hello world
 # Numeric functions
 SELECT ABS(-5);
-abs(-5)
+ABS(-5)
 5
 SELECT ABS(5);
-abs(5)
+ABS(5)
 5
 # NULL functions
 SELECT COALESCE(NULL, 'fallback');
-coalesce(NULL,'fallback')
+COALESCE(NULL,'fallback')
 fallback
 SELECT COALESCE('first', 'second');
-coalesce('first','second')
+COALESCE('first','second')
 first
 SELECT COALESCE(NULL, NULL, 'third');
-coalesce(NULL,NULL,'third')
+COALESCE(NULL,NULL,'third')
 third

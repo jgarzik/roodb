@@ -11,13 +11,13 @@ SELECT 5 % 0;
 NULL
 # IF() function
 SELECT IF(1, 'yes', 'no');
-if(1,'yes','no')
+IF(1,'yes','no')
 yes
 SELECT IF(0, 'yes', 'no');
-if(0,'yes','no')
+IF(0,'yes','no')
 no
 SELECT IF(NULL, 'yes', 'no');
-if(NULL,'yes','no')
+IF(NULL,'yes','no')
 no
 # IF() with expressions
 CREATE TABLE if_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
@@ -25,30 +25,30 @@ INSERT INTO if_t VALUES (1, 10);
 INSERT INTO if_t VALUES (2, NULL);
 INSERT INTO if_t VALUES (3, 0);
 SELECT id, IF(val, 'truthy', 'falsy') FROM if_t;
-id	if(val,'truthy','falsy')
+id	IF(val,'truthy','falsy')
 1	truthy
 2	falsy
 3	falsy
 DROP TABLE if_t;
 # ISNULL() function
 SELECT ISNULL(1);
-isnull(1)
+ISNULL(1)
 0
 SELECT ISNULL(NULL);
-isnull(NULL)
+ISNULL(NULL)
 1
 SELECT ISNULL('hello');
-isnull('hello')
+ISNULL('hello')
 0
 # IFNULL() function
 SELECT IFNULL(1, 2);
-ifnull(1,2)
+IFNULL(1,2)
 1
 SELECT IFNULL(NULL, 2);
-ifnull(NULL,2)
+IFNULL(NULL,2)
 2
 SELECT IFNULL(NULL, 'default');
-ifnull(NULL,'default')
+IFNULL(NULL,'default')
 default
 # DATE column type
 CREATE TABLE date_t (id INT NOT NULL, d DATE, PRIMARY KEY (id));

@@ -668,11 +668,11 @@ impl LogicalPlanBuilder {
             ResolvedExpr::Column(col) => col.name.clone(),
             ResolvedExpr::Function { name, args, .. } => {
                 let arg_strs: Vec<String> = args.iter().map(Self::expr_to_sql).collect();
-                // Undo internal name mangling for display
+                // Undo internal name mangling for display; preserve original casing
                 let display_name = if let Some(stripped) = name.strip_prefix("_ROODB_") {
-                    stripped.to_lowercase()
+                    stripped.to_string()
                 } else {
-                    name.to_lowercase()
+                    name.clone()
                 };
                 format!("{}({})", display_name, arg_strs.join(","))
             }

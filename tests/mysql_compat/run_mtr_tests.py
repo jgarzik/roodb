@@ -197,6 +197,7 @@ def reset_test_db(certs, port):
         f"--host={HOST}", f"--port={port}", f"--user={USER}",
         f"--password={PASSWORD}", "--ssl-mode=REQUIRED",
         f"--ssl-ca={certs.ca_cert}",
+        "--database=test",
     ]
     # First get list of all tables
     result = subprocess.run(
@@ -208,19 +209,21 @@ def reset_test_db(certs, port):
     tables = []
     if result.returncode == 0:
         for line in result.stdout.strip().split('\n'):
-            line = line.strip()
-            # Skip header, empty lines, and system tables
-            if line and not line.startswith('Tables_in_') and not line.startswith('system.'):
-                tables.append(line)
+            name = line.strip()
+            # Skip header, empty lines, system tables, and invalid names
+            if (name and not name.startswith('Tables_in_')
+                    and not name.startswith('system.')
+                    and '`' not in name):
+                tables.append(name)
 
-    # Drop all user tables
+    # Drop all user tables, then recreate the database
     drop_sql = ""
     for table in tables:
         drop_sql += f"DROP TABLE IF EXISTS `{table}`;\n"
     drop_sql += "DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n"
 
     subprocess.run(
-        cmd,
+        cmd[:len(cmd)-1],  # Remove --database=test since we're dropping it
         input=drop_sql,
         capture_output=True, text=True, timeout=10,
     )

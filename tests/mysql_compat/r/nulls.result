@@ -22,9 +22,9 @@ id	val + 1
 3	1
 # COUNT with NULLs
 SELECT COUNT(*) FROM null_t;
-count(NULL)
+COUNT(NULL)
 3
 SELECT COUNT(val) FROM null_t;
-count(val)
+COUNT(val)
 2
 DROP TABLE null_t;

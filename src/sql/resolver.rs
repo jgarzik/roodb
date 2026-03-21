@@ -636,8 +636,8 @@ impl<'a> Resolver<'a> {
                             // Try resolving against table scope first
                             match self.resolve_expr(expr, &scope) {
                                 Ok(resolved) => resolved_group_by.push(resolved),
-                                Err(_) => {
-                                    // If it fails, check if it's a SELECT alias
+                                Err(SqlError::ColumnNotFound(_)) => {
+                                    // Column not in table scope — check SELECT aliases
                                     if let sp::Expr::Identifier(ident) = expr {
                                         let alias_name = &ident.value;
                                         let mut found = false;
@@ -663,6 +663,7 @@ impl<'a> Resolver<'a> {
                                         return Err(SqlError::ColumnNotFound(expr.to_string()));
                                     }
                                 }
+                                Err(e) => return Err(e),
                             }
                         }
                     }
@@ -1759,12 +1760,27 @@ fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
     }
 }
 
-/// Parse a default value expression string into a Literal.
-/// Handles common patterns: integers, floats, quoted strings, NULL.
+/// Parse a static default value expression string into a Literal.
+///
+/// Handles: integers, floats, quoted strings, NULL, TRUE/FALSE.
+/// Dynamic expressions (CURRENT_TIMESTAMP, NOW(), etc.) are mapped to
+/// appropriate values where possible; unrecognized expressions fall back
+/// to Literal::Null to avoid silently inserting wrong string values.
 fn parse_default_value(expr: &str) -> Literal {
     let trimmed = expr.trim();
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Literal::Null;
+    }
+    // Handle dynamic default expressions that we can evaluate at insert time
+    let upper = trimmed.to_uppercase();
+    if upper == "CURRENT_TIMESTAMP"
+        || upper == "NOW()"
+        || upper == "CURRENT_TIMESTAMP()"
+        || upper == "CURRENT_DATE"
+        || upper == "CURRENT_TIME"
+    {
+        // Return 0 for timestamp defaults (MySQL stores epoch when not able to resolve)
+        return Literal::Integer(0);
     }
     // Try integer
     if let Ok(i) = trimmed.parse::<i64>() {
@@ -1774,9 +1790,10 @@ fn parse_default_value(expr: &str) -> Literal {
     if let Ok(f) = trimmed.parse::<f64>() {
         return Literal::Float(f);
     }
-    // Quoted string: 'value' or "value"
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    // Quoted string: 'value' or "value" (must be >1 char to have content)
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
     {
         let inner = &trimmed[1..trimmed.len() - 1];
         return Literal::String(inner.to_string());
@@ -1788,8 +1805,8 @@ fn parse_default_value(expr: &str) -> Literal {
     if trimmed.eq_ignore_ascii_case("FALSE") {
         return Literal::Boolean(false);
     }
-    // Fallback: treat as string
-    Literal::String(trimmed.to_string())
+    // Unrecognized expression — use NULL rather than silently inserting the expression text
+    Literal::Null
 }
 
 /// Convert literal value
@@ -1804,11 +1821,15 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                 })?;
                 Ok(Literal::Float(val))
             } else {
-                // Try i64 first, fall back to u64→i64 reinterpret for values like 9223372036854775808
+                // Try i64 first, fall back to u64 for values > i64::MAX.
+                // MySQL treats unsigned literals (e.g. 9223372036854775808) as BIGINT UNSIGNED.
+                // Since we store all integers as i64, values in [i64::MAX+1, u64::MAX] are
+                // reinterpreted as negative i64 (two's complement). This matches MySQL's
+                // behavior for -9223372036854775808 (parsed as -(9223372036854775808u64 as i64)).
                 match n.parse::<i64>() {
                     Ok(val) => Ok(Literal::Integer(val)),
                     Err(_) => {
-                        // Try parsing as u64 (handles values > i64::MAX)
+                        // Try parsing as u64 (reinterpret as i64 bit pattern)
                         match n.parse::<u64>() {
                             Ok(val) => Ok(Literal::Integer(val as i64)),
                             Err(_) => {

@@ -253,8 +253,8 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
     }
 }
 
-/// Promote Bit and String to numeric for arithmetic operations (MySQL implicit coercion).
-fn promote_bit(d: &Datum) -> std::borrow::Cow<'_, Datum> {
+/// Promote Bit and String to numeric types for arithmetic operations (MySQL implicit coercion).
+fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
         Datum::String(s) => {
@@ -280,8 +280,8 @@ fn promote_bit(d: &Datum) -> std::borrow::Cow<'_, Datum> {
 }
 
 fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a + b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a + b)),
@@ -297,8 +297,8 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a - b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a - b)),
@@ -312,8 +312,8 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a * b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a * b)),
@@ -328,8 +328,8 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     // Division by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
@@ -351,8 +351,8 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     // Modulo by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
@@ -373,8 +373,8 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 /// Parse leading integer from a string (MySQL semantics: "123abc" → 123, "abc" → 0).
+/// Caller should pass pre-trimmed input.
 fn parse_leading_int(s: &str) -> i64 {
-    let s = s.trim();
     if s.is_empty() {
         return 0;
     }
@@ -445,8 +445,8 @@ fn eval_bitwise_xor(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 fn eval_shift_left(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     match (to_bitwise_int(left), to_bitwise_int(right)) {
         (Some(a), Some(b)) => {
-            let shift = b as u32;
-            // MySQL: shift >= 64 gives 0
+            // MySQL treats shift count as u64; any value >= 64 gives 0
+            let shift = b as u64;
             let result = if shift >= 64 {
                 0u64
             } else {
@@ -464,8 +464,7 @@ fn eval_shift_left(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 fn eval_shift_right(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     match (to_bitwise_int(left), to_bitwise_int(right)) {
         (Some(a), Some(b)) => {
-            let shift = b as u32;
-            // MySQL: shift >= 64 gives 0
+            let shift = b as u64;
             let result = if shift >= 64 {
                 0u64
             } else {
@@ -481,19 +480,20 @@ fn eval_shift_right(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    let left = promote_bit(left);
-    let right = promote_bit(right);
+    let left = promote_to_numeric(left);
+    let right = promote_to_numeric(right);
     // DIV by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
+    // MySQL DIV: perform float division, then truncate toward zero
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a / b)),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Int((*a as i64) / (*b as i64))),
-        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Int(a / *b as i64)),
-        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Int(*a as i64 / b)),
+        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Int((a / b).trunc() as i64)),
+        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Int((*a as f64 / b).trunc() as i64)),
+        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Int((a / *b as f64).trunc() as i64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot integer divide {:?} by {:?}",
             left, right
