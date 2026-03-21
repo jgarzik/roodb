@@ -229,6 +229,7 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::Varchar(n) => format!("VARCHAR({})", n),
         DataType::Text => "TEXT".to_string(),
         DataType::Blob => "BLOB".to_string(),
+        DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
     }
 }
@@ -238,8 +239,16 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
     let s = s.to_uppercase();
     if s.starts_with("VARCHAR(") && s.ends_with(')') {
         let len_str = &s[8..s.len() - 1];
-        len_str.parse().ok().map(DataType::Varchar)
-    } else {
+        return len_str.parse().ok().map(DataType::Varchar);
+    }
+    if s.starts_with("BIT(") && s.ends_with(')') {
+        let n_str = &s[4..s.len() - 1];
+        return n_str
+            .parse::<u8>()
+            .ok()
+            .map(|n| DataType::Bit(n.clamp(1, 64)));
+    }
+    {
         match s.as_str() {
             "BOOLEAN" => Some(DataType::Boolean),
             "TINYINT" => Some(DataType::TinyInt),
@@ -509,6 +518,9 @@ mod tests {
             DataType::Varchar(100),
             DataType::Text,
             DataType::Blob,
+            DataType::Bit(1),
+            DataType::Bit(8),
+            DataType::Bit(64),
             DataType::Timestamp,
         ];
 

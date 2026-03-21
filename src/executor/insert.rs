@@ -115,8 +115,14 @@ impl Executor for Insert {
         for value_row in &self.values {
             // Evaluate expressions to get datum values
             let mut datums = Vec::with_capacity(value_row.len());
-            for expr in value_row {
+            for (col_idx, expr) in value_row.iter().enumerate() {
                 let datum = evaluate(expr, &empty_row, &self.user_variables)?;
+                // Coerce value to match column type (e.g. Bytes → Bit)
+                let datum = if col_idx < self._columns.len() {
+                    super::eval::coerce_to_column_type(datum, &self._columns[col_idx].data_type)
+                } else {
+                    datum
+                };
                 datums.push(datum);
             }
 

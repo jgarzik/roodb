@@ -40,6 +40,7 @@ RooDB is a distributed SQL database in Rust with these key design decisions:
 - `ExecutorEngine` (`src/executor/engine.rs`) - Query execution
 - `LsmEngine` (`src/storage/lsm/engine.rs`) - LSM storage backend
 - `Catalog` (`src/catalog/mod.rs`) - Schema metadata
+- `DataType::Bit(u8)` — BIT(M) with M=1..64, stored as u64
 
 ### Query Execution Flow
 

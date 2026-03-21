@@ -1507,8 +1507,13 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         | sp::DataType::LongBlob
         | sp::DataType::Bytes(_)
         | sp::DataType::Bytea => Ok(DataType::Blob),
-        sp::DataType::Bit(_) | sp::DataType::BitVarying(_) | sp::DataType::VarBit(_) => {
-            Ok(DataType::Blob)
+        sp::DataType::Bit(len) => {
+            let width = len.unwrap_or(1) as u8;
+            Ok(DataType::Bit(width.clamp(1, 64)))
+        }
+        sp::DataType::BitVarying(len) | sp::DataType::VarBit(len) => {
+            let width = len.unwrap_or(64) as u8;
+            Ok(DataType::Bit(width.clamp(1, 64)))
         }
         // Timestamp
         sp::DataType::Date | sp::DataType::Date32 => Ok(DataType::Timestamp),
@@ -1827,6 +1832,8 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         | "SCHEMA" => Ok(DataType::Text),
         "SLEEP" => Ok(DataType::BigInt),
         "FOUND_ROWS" | "ROW_COUNT" => Ok(DataType::BigInt),
+        "BIT_COUNT" => Ok(DataType::BigInt),
+        "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
@@ -1880,6 +1887,7 @@ fn wider_numeric_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Double, _) | (_, DataType::Double) => DataType::Double,
         (DataType::Float, _) | (_, DataType::Float) => DataType::Float,
         (DataType::BigInt, _) | (_, DataType::BigInt) => DataType::BigInt,
+        (DataType::Bit(_), _) | (_, DataType::Bit(_)) => DataType::BigInt,
         (DataType::Int, _) | (_, DataType::Int) => DataType::Int,
         (DataType::SmallInt, _) | (_, DataType::SmallInt) => DataType::SmallInt,
         _ => DataType::Int,
@@ -2254,14 +2262,21 @@ mod tests {
             DataType::Blob
         );
         assert_eq!(convert_data_type(&SpDt::Bytea).unwrap(), DataType::Blob);
-        assert_eq!(convert_data_type(&SpDt::Bit(None)).unwrap(), DataType::Blob);
+        assert_eq!(
+            convert_data_type(&SpDt::Bit(None)).unwrap(),
+            DataType::Bit(1)
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Bit(Some(8))).unwrap(),
+            DataType::Bit(8)
+        );
         assert_eq!(
             convert_data_type(&SpDt::BitVarying(None)).unwrap(),
-            DataType::Blob
+            DataType::Bit(64)
         );
         assert_eq!(
             convert_data_type(&SpDt::VarBit(None)).unwrap(),
-            DataType::Blob
+            DataType::Bit(64)
         );
 
         // Timestamp variants

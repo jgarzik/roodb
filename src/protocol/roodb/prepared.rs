@@ -272,6 +272,7 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
         }
         Datum::String(s) => val(Value::SingleQuotedString(s.clone())),
         Datum::Bytes(b) => val(Value::HexStringLiteral(hex::encode(b))),
+        Datum::Bit { value, .. } => val(Value::Number(value.to_string(), false)),
         Datum::Timestamp(ts) => val(Value::Number(ts.to_string(), false)),
     }
 }
@@ -464,6 +465,20 @@ fn decode_binary_value(data: &[u8], type_code: ColumnType) -> ProtocolResult<(Da
                 Ok(s) => Ok((Datum::String(s), consumed)),
                 Err(_) => Ok((Datum::Bytes(bytes), consumed)),
             }
+        }
+
+        ColumnType::Bit => {
+            let (bytes, consumed) = decode_length_encoded_bytes(data)?;
+            let byte_count = bytes.len().min(8);
+            if byte_count == 0 {
+                return Ok((Datum::Null, consumed));
+            }
+            let mut padded = [0u8; 8];
+            let start = 8 - byte_count;
+            padded[start..].copy_from_slice(&bytes[..byte_count]);
+            let value = u64::from_be_bytes(padded);
+            let width = ((byte_count * 8) as u8).min(64);
+            Ok((Datum::Bit { value, width }, consumed))
         }
 
         // Timestamp/Date/Datetime - length-prefixed, parse as string

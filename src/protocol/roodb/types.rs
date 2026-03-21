@@ -73,6 +73,7 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
         DataType::Varchar(_) => ColumnType::Varchar,
         DataType::Text => ColumnType::Blob,
         DataType::Blob => ColumnType::Blob,
+        DataType::Bit(_) => ColumnType::Bit,
         DataType::Timestamp => ColumnType::Datetime,
     }
 }
@@ -90,6 +91,7 @@ pub fn datatype_column_length(dt: &DataType) -> u32 {
         DataType::Varchar(n) => *n,
         DataType::Text => 65535,
         DataType::Blob => 65535,
+        DataType::Bit(n) => *n as u32,
         DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
     }
 }
@@ -115,6 +117,9 @@ pub fn datatype_flags(dt: &DataType, nullable: bool) -> u16 {
         }
         DataType::Blob | DataType::Text => {
             flags |= column_flags::BLOB;
+        }
+        DataType::Bit(_) => {
+            flags |= column_flags::UNSIGNED | column_flags::NUM;
         }
         _ => {}
     }
@@ -143,6 +148,12 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         }
         Datum::String(s) => encode_length_encoded_string(s),
         Datum::Bytes(b) => super::packet::encode_length_encoded_bytes(b),
+        Datum::Bit { value, width } => {
+            // MySQL text protocol: send BIT as binary bytes (width+7)/8
+            let byte_len = (*width as usize).div_ceil(8);
+            let bytes = &value.to_be_bytes()[8 - byte_len..];
+            super::packet::encode_length_encoded_bytes(bytes)
+        }
         Datum::Timestamp(ts) => {
             // Convert unix millis to datetime format
             let datetime = format_timestamp(*ts);

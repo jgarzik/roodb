@@ -22,6 +22,8 @@ pub enum Datum {
     String(String),
     /// Binary data (Blob)
     Bytes(Vec<u8>),
+    /// Bit string value (width 1..64, value masked to width)
+    Bit { value: u64, width: u8 },
     /// Timestamp as unix milliseconds
     Timestamp(i64),
 }
@@ -42,6 +44,7 @@ impl Datum {
             Datum::String(_) => 4,
             Datum::Bytes(_) => 5,
             Datum::Timestamp(_) => 6,
+            Datum::Bit { .. } => 7,
         }
     }
 
@@ -54,6 +57,7 @@ impl Datum {
             Datum::Float(_) => Some(DataType::Double),
             Datum::String(_) => Some(DataType::Text),
             Datum::Bytes(_) => Some(DataType::Blob),
+            Datum::Bit { width, .. } => Some(DataType::Bit(*width)),
             Datum::Timestamp(_) => Some(DataType::Timestamp),
         }
     }
@@ -63,6 +67,7 @@ impl Datum {
         match self {
             Datum::Bool(b) => Some(*b),
             Datum::Int(i) => Some(*i != 0),
+            Datum::Bit { value, .. } => Some(*value != 0),
             Datum::Null => None,
             _ => None,
         }
@@ -74,6 +79,7 @@ impl Datum {
             Datum::Int(i) => Some(*i),
             Datum::Float(f) => Some(*f as i64),
             Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+            Datum::Bit { value, .. } => Some(*value as i64),
             Datum::Null => None,
             _ => None,
         }
@@ -84,6 +90,7 @@ impl Datum {
         match self {
             Datum::Float(f) => Some(*f),
             Datum::Int(i) => Some(*i as f64),
+            Datum::Bit { value, .. } => Some(*value as f64),
             Datum::Null => None,
             _ => None,
         }
@@ -137,6 +144,16 @@ impl Datum {
                 s.push('\'');
                 s
             }
+            Datum::Bit { value, width } => {
+                let w = *width as usize;
+                let mut s = String::with_capacity(w + 2);
+                s.push_str("b'");
+                for i in (0..w).rev() {
+                    s.push(if (value >> i) & 1 == 1 { '1' } else { '0' });
+                }
+                s.push('\'');
+                s
+            }
             Datum::Timestamp(t) => t.to_string(),
         }
     }
@@ -163,6 +180,7 @@ impl Datum {
                 }
                 s
             }
+            Datum::Bit { value, .. } => value.to_string(),
             Datum::Timestamp(t) => t.to_string(),
         }
     }
@@ -188,6 +206,7 @@ impl Datum {
             Datum::Int(i) => Some(Datum::Int(-i)),
             Datum::Float(f) => Some(Datum::Float(-f)),
             Datum::Null => Some(Datum::Null),
+            Datum::Bit { .. } => None,
             _ => None,
         }
     }
@@ -264,6 +283,10 @@ impl PartialEq for Datum {
             (Datum::String(a), Datum::String(b)) => a == b,
             (Datum::Bytes(a), Datum::Bytes(b)) => a == b,
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a == b,
+            (Datum::Bit { value: a, .. }, Datum::Bit { value: b, .. }) => a == b,
+            // Cross-type: Bit/Int — BIT is unsigned, compare as u64
+            (Datum::Bit { value, .. }, Datum::Int(i))
+            | (Datum::Int(i), Datum::Bit { value, .. }) => *value == *i as u64,
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
                 (*a as f64).to_bits() == b.to_bits()
@@ -295,6 +318,11 @@ impl Ord for Datum {
             (Datum::String(a), Datum::String(b)) => a.cmp(b),
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
             (Datum::Timestamp(a), Datum::Timestamp(b)) => a.cmp(b),
+            (Datum::Bit { value: a, .. }, Datum::Bit { value: b, .. }) => a.cmp(b),
+
+            // Cross-type: Bit/Int — BIT is unsigned, compare as u64
+            (Datum::Bit { value, .. }, Datum::Int(i)) => value.cmp(&(*i as u64)),
+            (Datum::Int(i), Datum::Bit { value, .. }) => (*i as u64).cmp(value),
 
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) => (*a as f64).total_cmp(b),
@@ -319,6 +347,14 @@ impl Hash for Datum {
                 0u8.hash(state);
                 f.to_bits().hash(state);
             }
+            Datum::Bit { value, .. } => {
+                // Use same discriminant tag as Int/Float so Bit(N) == Int(N) hashes match.
+                // Cross-type PartialEq compares as u64 (*value == *i as u64), which is
+                // equivalent to comparing as i64 for values that fit. Hash via the same
+                // i64→f64 path as Datum::Int to stay consistent.
+                0u8.hash(state);
+                (*value as i64 as f64).to_bits().hash(state);
+            }
             other => {
                 std::mem::discriminant(other).hash(state);
                 match other {
@@ -327,7 +363,7 @@ impl Hash for Datum {
                     Datum::String(s) => s.hash(state),
                     Datum::Bytes(b) => b.hash(state),
                     Datum::Timestamp(t) => t.hash(state),
-                    Datum::Int(_) | Datum::Float(_) => unreachable!(),
+                    Datum::Int(_) | Datum::Float(_) | Datum::Bit { .. } => unreachable!(),
                 }
             }
         }
@@ -462,5 +498,136 @@ mod tests {
         let mut map2: HashMap<Vec<Datum>, &str> = HashMap::new();
         map2.insert(vec![Datum::Int(42)], "found");
         assert_eq!(map2.get(&vec![Datum::Float(42.0)]), Some(&"found"));
+    }
+
+    #[test]
+    fn test_datum_bit_basic() {
+        let d = Datum::Bit { value: 5, width: 8 };
+        assert!(!d.is_null());
+        assert_eq!(d.as_bool(), Some(true));
+        assert_eq!(d.as_int(), Some(5));
+        assert_eq!(d.as_float(), Some(5.0));
+        assert_eq!(d.data_type(), Some(DataType::Bit(8)));
+        assert_eq!(d.to_display_string(), "5");
+        assert_eq!(d.to_sql_literal(), "b'00000101'");
+    }
+
+    #[test]
+    fn test_datum_bit_zero() {
+        let d = Datum::Bit { value: 0, width: 1 };
+        assert_eq!(d.as_bool(), Some(false));
+        assert_eq!(d.as_int(), Some(0));
+    }
+
+    #[test]
+    fn test_datum_bit_negate() {
+        let d = Datum::Bit { value: 5, width: 8 };
+        assert_eq!(d.negate(), None);
+    }
+
+    #[test]
+    fn test_datum_bit_equality() {
+        // Bit-Bit: same value, different width → equal
+        assert_eq!(
+            Datum::Bit { value: 5, width: 8 },
+            Datum::Bit {
+                value: 5,
+                width: 16
+            }
+        );
+
+        // Bit-Int cross-type
+        assert_eq!(
+            Datum::Bit {
+                value: 42,
+                width: 8
+            },
+            Datum::Int(42)
+        );
+        assert_eq!(
+            Datum::Int(42),
+            Datum::Bit {
+                value: 42,
+                width: 8
+            }
+        );
+
+        // Not equal
+        assert_ne!(Datum::Bit { value: 1, width: 1 }, Datum::Int(2));
+    }
+
+    #[test]
+    fn test_datum_bit_ordering() {
+        // Bit-Bit ordering: unsigned
+        assert!(Datum::Bit { value: 1, width: 8 } < Datum::Bit { value: 2, width: 8 });
+        assert!(
+            Datum::Bit {
+                value: 255,
+                width: 8
+            } > Datum::Bit { value: 0, width: 8 }
+        );
+
+        // Cross-type Bit/Int ordering
+        assert!(
+            Datum::Bit {
+                value: 10,
+                width: 8
+            } > Datum::Int(5)
+        );
+        assert!(
+            Datum::Int(5)
+                < Datum::Bit {
+                    value: 10,
+                    width: 8
+                }
+        );
+    }
+
+    #[test]
+    fn test_datum_bit_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn compute_hash(d: &Datum) -> u64 {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        }
+
+        // Bit(N) == Int(N) must hash identically for small values
+        for n in [0u64, 1, 42, 255] {
+            let bit_val = Datum::Bit { value: n, width: 8 };
+            let int_val = Datum::Int(n as i64);
+            assert_eq!(bit_val, int_val, "PartialEq failed for {n}");
+            assert_eq!(
+                compute_hash(&bit_val),
+                compute_hash(&int_val),
+                "Hash mismatch for Bit({n}) vs Int({n})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_datum_bit_hashmap_lookup() {
+        use std::collections::HashMap;
+
+        // Build with Bit, probe with Int
+        let mut map: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map.insert(
+            vec![Datum::Bit {
+                value: 42,
+                width: 8,
+            }],
+            "found",
+        );
+        assert_eq!(map.get(&vec![Datum::Int(42)]), Some(&"found"));
+
+        // Build with Int, probe with Bit
+        let mut map2: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map2.insert(vec![Datum::Int(7)], "found");
+        assert_eq!(
+            map2.get(&vec![Datum::Bit { value: 7, width: 8 }]),
+            Some(&"found")
+        );
     }
 }

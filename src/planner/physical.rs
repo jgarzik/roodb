@@ -618,6 +618,7 @@ fn datum_to_literal(datum: &Datum) -> Literal {
         Datum::Float(f) => Literal::Float(*f),
         Datum::String(s) => Literal::String(s.clone()),
         Datum::Bytes(b) => Literal::Blob(b.clone()),
+        Datum::Bit { value, .. } => Literal::Integer(*value as i64),
         Datum::Timestamp(t) => Literal::Integer(*t),
     }
 }

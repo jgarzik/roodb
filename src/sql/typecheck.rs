@@ -207,7 +207,7 @@ impl TypeChecker {
             ResolvedExpr::Function { name, args, .. } => {
                 let is_agg = matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
                 );
                 is_agg || args.iter().any(Self::expr_has_aggregate)
             }
@@ -235,7 +235,7 @@ impl TypeChecker {
                 // Inside an aggregate function, column references are OK
                 let is_agg = matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
                 );
                 if is_agg {
                     false
@@ -279,6 +279,11 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         | (DataType::Boolean, DataType::SmallInt)
         | (DataType::Boolean, DataType::Int)
         | (DataType::Boolean, DataType::BigInt) => true,
+
+        // Bit is numeric-compatible and accepts Blob (hex literals)
+        (DataType::Bit(_), b) if b.is_numeric() => true,
+        (a, DataType::Bit(_)) if a.is_numeric() => true,
+        (DataType::Bit(_), DataType::Blob) | (DataType::Blob, DataType::Bit(_)) => true,
 
         _ => false,
     }

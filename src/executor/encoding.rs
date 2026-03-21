@@ -125,6 +125,7 @@ const TAG_FLOAT: u8 = 3;
 const TAG_STRING: u8 = 4;
 const TAG_BYTES: u8 = 5;
 const TAG_TIMESTAMP: u8 = 6;
+const TAG_BIT: u8 = 7;
 
 /// Encode a row value
 ///
@@ -174,6 +175,11 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.push(TAG_BYTES);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
+        }
+        Datum::Bit { value, width } => {
+            buf.push(TAG_BIT);
+            buf.push(*width);
+            buf.extend_from_slice(&value.to_le_bytes());
         }
         Datum::Timestamp(t) => {
             buf.push(TAG_TIMESTAMP);
@@ -284,6 +290,19 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             Ok((Datum::Bytes(data[5..5 + len].to_vec()), 5 + len))
         }
 
+        TAG_BIT => {
+            if data.len() < 10 {
+                return Err(ExecutorError::Encoding("bit data too short".to_string()));
+            }
+            let width = data[1];
+            let value = u64::from_le_bytes(
+                data[2..10]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
+            Ok((Datum::Bit { value, width }, 10))
+        }
+
         TAG_TIMESTAMP => {
             if data.len() < 9 {
                 return Err(ExecutorError::Encoding(
@@ -365,5 +384,57 @@ mod tests {
         let encoded = encode_row(&row);
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.get(0).unwrap().as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_encode_decode_bit() {
+        // Test various BIT widths and values
+        let test_cases = vec![
+            Datum::Bit { value: 0, width: 1 },
+            Datum::Bit { value: 1, width: 1 },
+            Datum::Bit {
+                value: 255,
+                width: 8,
+            },
+            Datum::Bit {
+                value: 42,
+                width: 8,
+            },
+            Datum::Bit {
+                value: 0,
+                width: 64,
+            },
+            Datum::Bit {
+                value: u64::MAX,
+                width: 64,
+            },
+            Datum::Bit {
+                value: 9999,
+                width: 64,
+            },
+        ];
+
+        for original in &test_cases {
+            let row = Row::new(vec![original.clone()]);
+            let encoded = encode_row(&row);
+            let decoded = decode_row(&encoded).unwrap();
+            let result = decoded.get(0).unwrap();
+            match (original, result) {
+                (
+                    Datum::Bit {
+                        value: ov,
+                        width: ow,
+                    },
+                    Datum::Bit {
+                        value: rv,
+                        width: rw,
+                    },
+                ) => {
+                    assert_eq!(ov, rv, "value mismatch for width={ow}");
+                    assert_eq!(ow, rw, "width mismatch");
+                }
+                _ => panic!("expected Bit, got {:?}", result),
+            }
+        }
     }
 }

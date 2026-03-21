@@ -309,7 +309,10 @@ impl LogicalPlanBuilder {
         match expr {
             ResolvedExpr::Function { name, .. } => {
                 let upper = name.to_uppercase();
-                matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                matches!(
+                    upper.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                )
             }
             ResolvedExpr::BinaryOp { left, right, .. } => {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
@@ -354,7 +357,10 @@ impl LogicalPlanBuilder {
                 result_type,
             } => {
                 let upper = name.to_uppercase();
-                if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                if matches!(
+                    upper.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                ) {
                     Some(AggregateFunc::new(
                         upper,
                         args.clone(),
@@ -532,7 +538,10 @@ impl LogicalPlanBuilder {
         match expr {
             ResolvedExpr::Function { name, args, .. } => {
                 let upper = name.to_uppercase();
-                if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                if matches!(
+                    upper.as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                ) {
                     // This is an aggregate function - find its index in the aggregate output
                     if let Some(agg_idx) = Self::find_aggregate_index(expr, columns) {
                         let col_idx = group_by.len() + agg_idx;

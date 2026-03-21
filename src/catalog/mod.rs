@@ -34,6 +34,8 @@ pub enum DataType {
     Text,
     /// Binary data
     Blob,
+    /// Bit string with width 1..64
+    Bit(u8),
     /// Timestamp (date and time)
     Timestamp,
 }
@@ -49,6 +51,7 @@ impl DataType {
                 | DataType::BigInt
                 | DataType::Float
                 | DataType::Double
+                | DataType::Bit(_)
         )
     }
 

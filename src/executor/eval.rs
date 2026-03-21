@@ -245,8 +245,18 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
     }
 }
 
+/// Promote Bit to Int for arithmetic operations
+fn promote_bit(d: &Datum) -> std::borrow::Cow<'_, Datum> {
+    match d {
+        Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
+        other => std::borrow::Cow::Borrowed(other),
+    }
+}
+
 fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    match (left, right) {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
+    match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a + b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a + b)),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
@@ -261,7 +271,9 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    match (left, right) {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
+    match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a - b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a - b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 - b)),
@@ -274,7 +286,9 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
-    match (left, right) {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
+    match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a * b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a * b)),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
@@ -288,14 +302,16 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
     // Division by zero returns NULL (MySQL semantics)
-    match right {
+    match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
 
-    match (left, right) {
+    match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a / b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a / b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 / b)),
@@ -308,14 +324,16 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
     // Modulo by zero returns NULL (MySQL semantics)
-    match right {
+    match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
 
-    match (left, right) {
+    match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a % b)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a % b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
@@ -333,6 +351,7 @@ fn to_bitwise_int(d: &Datum) -> Option<i64> {
         Datum::Int(i) => Some(*i),
         Datum::Float(f) => Some(*f as i64),
         Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+        Datum::Bit { value, .. } => Some(*value as i64),
         _ => None,
     }
 }
@@ -384,6 +403,20 @@ fn eval_spaceship(left: &Datum, right: &Datum) -> bool {
     }
 }
 
+/// Coerce a datum to match a target column type for implicit conversion (e.g. INSERT).
+/// Only performs conversion when the source type doesn't match the target and a safe
+/// conversion exists. Returns the datum unchanged for non-Bit types.
+pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) -> Datum {
+    use crate::catalog::DataType;
+    if datum.is_null() {
+        return datum;
+    }
+    if matches!(target, DataType::Bit(_)) && !matches!(datum, Datum::Bit { .. }) {
+        return eval_cast(&datum, target).unwrap_or(datum);
+    }
+    datum
+}
+
 /// CAST(expr AS type)
 fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<Datum> {
     use crate::catalog::DataType;
@@ -409,6 +442,49 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
         },
         DataType::Varchar(_) | DataType::Text => Ok(Datum::String(val.to_display_string())),
         DataType::Boolean => Ok(Datum::Bool(val.as_bool().unwrap_or(false))),
+        DataType::Bit(w) => {
+            let mask = if *w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            match val {
+                Datum::Int(i) => Ok(Datum::Bit {
+                    value: (*i as u64) & mask,
+                    width: *w,
+                }),
+                Datum::Bit { value, .. } => Ok(Datum::Bit {
+                    value: value & mask,
+                    width: *w,
+                }),
+                Datum::Float(f) => Ok(Datum::Bit {
+                    value: (*f as u64) & mask,
+                    width: *w,
+                }),
+                Datum::Bool(b) => Ok(Datum::Bit {
+                    value: if *b { 1 } else { 0 },
+                    width: *w,
+                }),
+                Datum::String(s) => {
+                    let v = s.parse::<u64>().unwrap_or(0);
+                    Ok(Datum::Bit {
+                        value: v & mask,
+                        width: *w,
+                    })
+                }
+                Datum::Bytes(b) => {
+                    // Convert big-endian bytes to u64
+                    let mut padded = [0u8; 8];
+                    let start = 8 - b.len().min(8);
+                    padded[start..].copy_from_slice(&b[..b.len().min(8)]);
+                    let v = u64::from_be_bytes(padded);
+                    Ok(Datum::Bit {
+                        value: v & mask,
+                        width: *w,
+                    })
+                }
+                _ => Ok(Datum::Bit {
+                    value: 0,
+                    width: *w,
+                }),
+            }
+        }
         _ => Ok(Datum::String(val.to_display_string())),
     }
 }
@@ -1302,6 +1378,18 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
         "LAST_INSERT_ID" => Ok(Datum::Int(0)),
 
         "FOUND_ROWS" | "ROW_COUNT" => Ok(Datum::Int(0)),
+
+        "BIT_COUNT" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "BIT_COUNT requires 1 argument".to_string(),
+                ));
+            }
+            match to_bitwise_int(&args[0]) {
+                Some(v) => Ok(Datum::Int((v as u64).count_ones() as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
 
         "CRC32" => {
             if args.len() != 1 {

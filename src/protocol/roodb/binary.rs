@@ -86,6 +86,15 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             out
         }
 
+        Datum::Bit { value, width } => {
+            let byte_len = (*width as usize).div_ceil(8);
+            let be_bytes = value.to_be_bytes();
+            let bytes = &be_bytes[8 - byte_len..];
+            let mut out = encode_length_encoded_int(bytes.len() as u64);
+            out.extend_from_slice(bytes);
+            out
+        }
+
         Datum::Timestamp(ts) => {
             // Encode as MySQL binary datetime: length-prefixed fields
             encode_binary_timestamp(*ts)

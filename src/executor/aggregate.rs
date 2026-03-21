@@ -25,6 +25,9 @@ enum Accumulator {
     Avg { sum: f64, count: i64 },
     Min(Option<Datum>),
     Max(Option<Datum>),
+    BitAnd(Option<u64>),
+    BitOr(u64),
+    BitXor(u64),
 }
 
 impl Accumulator {
@@ -35,6 +38,9 @@ impl Accumulator {
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
+            "BIT_AND" => Accumulator::BitAnd(None),
+            "BIT_OR" => Accumulator::BitOr(0),
+            "BIT_XOR" => Accumulator::BitXor(0),
             _ => Accumulator::Count(0), // fallback
         }
     }
@@ -80,6 +86,34 @@ impl Accumulator {
                     }
                 }
             }
+            Accumulator::BitAnd(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc = Some(acc.map_or(v, |a| a & v));
+                }
+            }
+            Accumulator::BitOr(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc |= v;
+                }
+            }
+            Accumulator::BitXor(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc ^= v;
+                }
+            }
+        }
+    }
+
+    /// Extract u64 from a Datum for bitwise aggregate operations.
+    /// BIT values are used directly; integers are reinterpreted as u64 bit patterns.
+    fn as_bitwise_u64(value: &Datum) -> Option<u64> {
+        match value {
+            Datum::Bit { value, .. } => Some(*value),
+            Datum::Int(i) => Some(*i as u64),
+            Datum::Float(f) => Some(*f as u64),
+            Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+            Datum::Null => None,
+            _ => None,
         }
     }
 
@@ -99,6 +133,9 @@ impl Accumulator {
             }
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
+            Accumulator::BitAnd(acc) => acc.map_or(Datum::Null, |v| Datum::Int(v as i64)),
+            Accumulator::BitOr(v) => Datum::Int(*v as i64),
+            Accumulator::BitXor(v) => Datum::Int(*v as i64),
         }
     }
 }
