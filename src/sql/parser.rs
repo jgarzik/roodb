@@ -10,6 +10,11 @@ use crate::sql::error::{SqlError, SqlResult};
 pub struct Parser;
 
 impl Parser {
+    /// Normalize SQL for ALTER TABLE parsing (subset of full normalization)
+    pub fn normalize_for_alter(sql: &str) -> String {
+        Self::normalize_mysql_syntax(sql)
+    }
+
     /// Parse a single SQL statement
     pub fn parse_one(sql: &str) -> SqlResult<Statement> {
         let dialect = MySqlDialect {};

@@ -1577,6 +1577,18 @@ fn derive_columns_from_select(select: &ResolvedSelect) -> Vec<ColumnDef> {
     columns
 }
 
+/// Public wrapper for convert_column_def (used by ALTER TABLE handler)
+pub fn convert_column_def_pub(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
+    convert_column_def(col)
+}
+
+/// Public wrapper for convert_table_constraint (used by ALTER TABLE handler)
+pub fn convert_table_constraint_pub(
+    constraint: &sp::TableConstraint,
+) -> SqlResult<Option<Constraint>> {
+    convert_table_constraint(constraint)
+}
+
 /// Convert column definition
 fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
     let name = col.name.value.clone();
@@ -2163,7 +2175,10 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
         | "LOCATE" | "INSTR" | "FIND_IN_SET" | "POSITION" => Ok(DataType::BigInt),
-        "ELT" | "MAKE_SET" | "EXPORT_SET" => Ok(DataType::Text),
+        "ELT" | "MAKE_SET" | "EXPORT_SET" | "TIMEDIFF" => Ok(DataType::Text),
+        "GET_LOCK" | "RELEASE_LOCK" | "IS_FREE_LOCK" => Ok(DataType::BigInt),
+        "INET_NTOA" | "INET6_NTOA" => Ok(DataType::Text),
+        "INET_ATON" | "INET6_ATON" => Ok(DataType::BigInt),
         "GREATEST" | "LEAST" => {
             if args.is_empty() {
                 Ok(DataType::Int)

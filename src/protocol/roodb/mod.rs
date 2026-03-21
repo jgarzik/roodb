@@ -1018,6 +1018,11 @@ where
             return Ok(());
         }
 
+        // Handle ALTER TABLE
+        if let Some(()) = self.try_handle_alter_table(sql).await? {
+            return Ok(());
+        }
+
         // Handle SET @var = expr (user variables)
         {
             let upper = sql.trim().to_uppercase();
@@ -1952,6 +1957,82 @@ where
         }
 
         self.send_ok(0, 0).await.map(Some)
+    }
+
+    /// Handle ALTER TABLE statements.
+    /// Modifies the in-memory catalog directly.
+    async fn try_handle_alter_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let upper = sql.trim().to_uppercase();
+        if !upper.starts_with("ALTER TABLE ") {
+            return Ok(None);
+        }
+
+        // Parse using sqlparser
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let normalized = crate::sql::Parser::normalize_for_alter(sql);
+        let ast = sqlparser::parser::Parser::parse_sql(&dialect, &normalized)
+            .map_err(|e| ProtocolError::Sql(crate::sql::SqlError::Parse(e.to_string())))?;
+
+        if ast.is_empty() {
+            return self.send_ok(0, 0).await.map(|_| Some(()));
+        }
+
+        match &ast[0] {
+            sqlparser::ast::Statement::AlterTable(alter) => {
+                let table_name = alter.name.to_string();
+
+                for op in &alter.operations {
+                    use sqlparser::ast::AlterTableOperation;
+                    match op {
+                        AlterTableOperation::AddConstraint { constraint, .. } => {
+                            let resolved =
+                                crate::sql::resolver::convert_table_constraint_pub(constraint)?;
+                            if let Some(c) = resolved {
+                                let mut catalog = self.catalog.write();
+                                if let Some(table_def) = catalog.get_table_mut(&table_name) {
+                                    table_def.constraints.push(c);
+                                } else {
+                                    return Err(ProtocolError::Sql(
+                                        crate::sql::SqlError::TableNotFound(table_name.clone()),
+                                    ));
+                                }
+                            }
+                        }
+                        AlterTableOperation::AddColumn { column_def, .. } => {
+                            let col = crate::sql::resolver::convert_column_def_pub(column_def)?;
+                            let mut catalog = self.catalog.write();
+                            if let Some(table_def) = catalog.get_table_mut(&table_name) {
+                                table_def.columns.push(col);
+                            } else {
+                                return Err(ProtocolError::Sql(
+                                    crate::sql::SqlError::TableNotFound(table_name.clone()),
+                                ));
+                            }
+                        }
+                        AlterTableOperation::DropColumn { column_names, .. } => {
+                            let col_name = column_names
+                                .first()
+                                .map(|i| i.value.clone())
+                                .unwrap_or_default();
+                            let mut catalog = self.catalog.write();
+                            if let Some(table_def) = catalog.get_table_mut(&table_name) {
+                                table_def.columns.retain(|c| c.name != col_name);
+                            } else {
+                                return Err(ProtocolError::Sql(
+                                    crate::sql::SqlError::TableNotFound(table_name.clone()),
+                                ));
+                            }
+                        }
+                        _ => {
+                            // Other ALTER TABLE operations: treat as no-op for now
+                        }
+                    }
+                }
+
+                self.send_ok(0, 0).await.map(|_| Some(()))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Handle SQL-level PREPARE/EXECUTE/DEALLOCATE for text protocol prepared statements.
