@@ -147,6 +147,15 @@ pub enum PhysicalPlan {
         if_not_exists: bool,
     },
 
+    /// CREATE TABLE ... SELECT
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        source: Box<PhysicalPlan>,
+    },
+
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
 
@@ -300,6 +309,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateTableAs { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
@@ -511,6 +521,9 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Explain { inner } => {
                 inner.substitute_params(params)?;
+            }
+            PhysicalPlan::CreateTableAs { source, .. } => {
+                source.substitute_params(params)?;
             }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
@@ -1153,6 +1166,23 @@ impl PhysicalPlanner {
                 constraints,
                 if_not_exists,
             }),
+
+            LogicalPlan::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                source,
+            } => {
+                let source_plan = Self::plan_node(*source, catalog)?;
+                Ok(PhysicalPlan::CreateTableAs {
+                    name,
+                    columns,
+                    constraints,
+                    if_not_exists,
+                    source: Box::new(source_plan),
+                })
+            }
 
             LogicalPlan::DropTable { name, if_exists } => {
                 Ok(PhysicalPlan::DropTable { name, if_exists })

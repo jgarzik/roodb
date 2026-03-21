@@ -342,6 +342,14 @@ pub enum ResolvedStatement {
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
+    /// CREATE TABLE ... SELECT (CTAS)
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        select: ResolvedSelect,
+    },
 
     // ============ Auth/User Management ============
     /// CREATE USER 'name'@'host' IDENTIFIED BY 'password'
@@ -484,6 +492,15 @@ pub enum LogicalPlan {
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
+    },
+
+    /// CREATE TABLE ... SELECT
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        source: Box<LogicalPlan>,
     },
 
     /// DROP TABLE
@@ -636,6 +653,7 @@ impl LogicalPlan {
 
             // DDL operations don't produce output columns
             LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateTableAs { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::DropMultipleTables { .. }
             | LogicalPlan::CreateIndex { .. }

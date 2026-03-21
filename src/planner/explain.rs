@@ -214,6 +214,10 @@ impl ExplainOutput {
             PhysicalPlan::CreateTable { name, .. } => {
                 writeln!(out, "{}CreateTable: {}", prefix, name).unwrap();
             }
+            PhysicalPlan::CreateTableAs { name, source, .. } => {
+                writeln!(out, "{}CreateTableAs: {}", prefix, name).unwrap();
+                Self::format_node(source, indent + 1, out);
+            }
 
             PhysicalPlan::DropTable { name, .. } => {
                 writeln!(out, "{}DropTable: {}", prefix, name).unwrap();

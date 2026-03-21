@@ -16,7 +16,9 @@ use super::aggregate::HashAggregate;
 use super::analyze::AnalyzeTable;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
-use super::ddl::{CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex, DropTable};
+use super::ddl::{
+    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, DropDatabase, DropIndex, DropTable,
+};
 use super::delete::Delete;
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
@@ -308,6 +310,38 @@ impl ExecutorEngine {
                         constraints,
                         if_not_exists,
                         self.catalog.clone(),
+                    )))
+                }
+            }
+
+            PhysicalPlan::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                source,
+            } => {
+                let source_exec = self.build_node(*source)?;
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(CreateTableAs::with_raft(
+                        name,
+                        columns,
+                        constraints,
+                        if_not_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                        source_exec,
+                        self.txn_context.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(CreateTableAs::new(
+                        name,
+                        columns,
+                        constraints,
+                        if_not_exists,
+                        self.catalog.clone(),
+                        source_exec,
+                        self.txn_context.clone(),
                     )))
                 }
             }

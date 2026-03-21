@@ -169,6 +169,30 @@ impl<'a> Resolver<'a> {
             }
         }
 
+        // Handle CREATE TABLE ... SELECT (CTAS)
+        if let Some(ref query) = create.query {
+            let select = self.resolve_select_body(query.body.as_ref())?;
+
+            // Derive column definitions from SELECT output
+            let derived_columns = derive_columns_from_select(&select);
+
+            // Merge: explicit columns first, then derived columns from SELECT
+            let mut merged = columns;
+            for dc in derived_columns {
+                if !merged.iter().any(|c| c.name == dc.name) {
+                    merged.push(dc);
+                }
+            }
+
+            return Ok(ResolvedStatement::CreateTableAs {
+                name,
+                columns: merged,
+                constraints,
+                if_not_exists,
+                select,
+            });
+        }
+
         Ok(ResolvedStatement::CreateTable {
             name,
             columns,
@@ -1102,6 +1126,49 @@ impl<'a> Resolver<'a> {
                 })
             }
 
+            // REGEXP / RLIKE — resolve as a function call to REGEXP
+            sp::Expr::RLike {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                let resolved_pattern = self.resolve_expr(pattern, scope)?;
+                let func = ResolvedExpr::Function {
+                    name: "REGEXP".to_string(),
+                    args: vec![resolved_expr, resolved_pattern],
+                    distinct: false,
+                    result_type: DataType::Boolean,
+                };
+                if *negated {
+                    Ok(ResolvedExpr::UnaryOp {
+                        op: UnaryOp::Not,
+                        expr: Box::new(func),
+                        result_type: DataType::Boolean,
+                    })
+                } else {
+                    Ok(func)
+                }
+            }
+
+            // CONVERT(expr, type) — resolve as CAST
+            sp::Expr::Convert {
+                expr, data_type, ..
+            } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                if let Some(dt) = data_type {
+                    let target_type = convert_data_type(dt)?;
+                    Ok(ResolvedExpr::Cast {
+                        expr: Box::new(resolved_expr),
+                        target_type,
+                    })
+                } else {
+                    // CONVERT with charset only — pass through as string
+                    Ok(resolved_expr)
+                }
+            }
+
             _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }
@@ -1476,6 +1543,35 @@ impl Scope {
 }
 
 // ============ Conversion helpers ============
+
+/// Derive column definitions from a resolved SELECT's output items.
+/// Used by CREATE TABLE ... SELECT to determine the schema of the new table.
+fn derive_columns_from_select(select: &ResolvedSelect) -> Vec<ColumnDef> {
+    use crate::planner::logical::builder::LogicalPlanBuilder;
+
+    let mut columns = Vec::new();
+    for (idx, item) in select.columns.iter().enumerate() {
+        match item {
+            ResolvedSelectItem::Expr { expr, alias } => {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| LogicalPlanBuilder::expr_name(expr, idx));
+                let data_type = expr.data_type();
+                let nullable = expr.is_nullable();
+                columns.push(ColumnDef::new(name, data_type).nullable(nullable));
+            }
+            ResolvedSelectItem::Columns(cols) => {
+                for col in cols {
+                    columns.push(
+                        ColumnDef::new(col.name.clone(), col.data_type.clone())
+                            .nullable(col.nullable),
+                    );
+                }
+            }
+        }
+    }
+    columns
+}
 
 /// Convert column definition
 fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
@@ -2045,6 +2141,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "SLEEP" => Ok(DataType::BigInt),
         "FOUND_ROWS" | "ROW_COUNT" => Ok(DataType::BigInt),
         "BIT_COUNT" => Ok(DataType::BigInt),
+        "REGEXP" => Ok(DataType::Boolean),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
         "CHAR" => Ok(DataType::Text),

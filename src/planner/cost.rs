@@ -183,6 +183,7 @@ impl CostEstimator {
             }
 
             PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateTableAs { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }

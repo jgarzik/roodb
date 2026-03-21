@@ -1257,7 +1257,7 @@ where
             ResolvedStatement::Delete { table, .. } => {
                 vec![RequiredPrivilege::delete(db, table)]
             }
-            ResolvedStatement::CreateTable { .. } => {
+            ResolvedStatement::CreateTable { .. } | ResolvedStatement::CreateTableAs { .. } => {
                 vec![RequiredPrivilege::create_table(db)]
             }
             ResolvedStatement::DropTable { name, .. } => {

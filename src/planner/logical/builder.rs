@@ -59,6 +59,22 @@ impl LogicalPlanBuilder {
                 constraints,
                 if_not_exists,
             }),
+            ResolvedStatement::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                select,
+            } => {
+                let source = Self::build_select(select)?;
+                Ok(LogicalPlan::CreateTableAs {
+                    name,
+                    columns,
+                    constraints,
+                    if_not_exists,
+                    source: Box::new(source),
+                })
+            }
             ResolvedStatement::DropTable { name, if_exists } => {
                 Ok(LogicalPlan::DropTable { name, if_exists })
             }
@@ -657,7 +673,7 @@ impl LogicalPlanBuilder {
     }
 
     /// Generate a name for an expression
-    fn expr_name(expr: &ResolvedExpr, _idx: usize) -> String {
+    pub fn expr_name(expr: &ResolvedExpr, _idx: usize) -> String {
         Self::expr_to_sql(expr)
     }
 

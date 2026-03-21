@@ -48,6 +48,11 @@ impl Parser {
         let re_mod = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
         let result = re_mod.replace_all(sql, "_ROODB_MOD(");
 
+        // MySQL allows BLOB(N) and TEXT(N) with size hints that sqlparser doesn't accept.
+        // Strip the size hint: BLOB(250) → BLOB, TEXT(70000) → TEXT
+        let re_blob_size = Regex::new(r"(?i)\b(BLOB|TEXT)\s*\(\s*\d+\s*\)").unwrap();
+        let result = re_blob_size.replace_all(&result, "$1");
+
         // Replace bare `charset <name>` (not preceded by DEFAULT or CHARACTER)
         // after a closing paren or table option context
         let re = Regex::new(r"(?i)\)\s+charset\s+(\w+)").unwrap();

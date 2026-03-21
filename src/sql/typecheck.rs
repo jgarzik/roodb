@@ -33,6 +33,7 @@ impl TypeChecker {
             } => Self::check_update(assignments, filter),
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
+            ResolvedStatement::CreateTableAs { select, .. } => Self::check_select(select),
 
             // Database DDL doesn't need type checking
             ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
@@ -284,6 +285,10 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         (DataType::Bit(_), b) if b.is_numeric() => true,
         (a, DataType::Bit(_)) if a.is_numeric() => true,
         (DataType::Bit(_), DataType::Blob) | (DataType::Blob, DataType::Bit(_)) => true,
+
+        // Blob (hex literals like 0x01) can be inserted into string columns
+        (DataType::Varchar(_), DataType::Blob) | (DataType::Text, DataType::Blob) => true,
+        (DataType::Blob, DataType::Varchar(_)) | (DataType::Blob, DataType::Text) => true,
 
         _ => false,
     }

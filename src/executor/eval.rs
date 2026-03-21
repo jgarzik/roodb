@@ -1569,6 +1569,23 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 
         "FOUND_ROWS" | "ROW_COUNT" => Ok(Datum::Int(0)),
 
+        "REGEXP" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "REGEXP requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let pattern = args[1].to_display_string();
+            match regex::Regex::new(&pattern) {
+                Ok(re) => Ok(Datum::Bool(re.is_match(&s))),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
         "BIT_COUNT" => {
             if args.len() != 1 {
                 return Err(ExecutorError::InvalidOperation(
