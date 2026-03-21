@@ -360,8 +360,9 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         _ => {}
     }
 
+    // Use checked_rem for Int/Int to avoid panic on i64::MIN % -1.
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a % b)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.checked_rem(*b).unwrap_or(0))),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a % b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a % *b as f64)),
@@ -488,9 +489,10 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
-    // MySQL DIV: perform float division, then truncate toward zero
+    // MySQL DIV: perform float division, then truncate toward zero.
+    // Use checked_div for Int/Int to avoid panic on i64::MIN / -1.
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a / b)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.checked_div(*b).unwrap_or(0))),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Int((a / b).trunc() as i64)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Int((*a as f64 / b).trunc() as i64)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Int((a / *b as f64).trunc() as i64)),
