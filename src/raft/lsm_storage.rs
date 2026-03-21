@@ -15,8 +15,9 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS,
-    SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES, SYSTEM_TABLES,
+    is_system_table, row_to_index_def, row_to_procedure_def, rows_to_constraints,
+    rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES,
+    SYSTEM_PROCEDURES, SYSTEM_TABLES,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -610,6 +611,33 @@ impl LsmRaftStorage {
             }
         }
 
+        // Scan system.procedures to rebuild stored procedures
+        let mut procedure_defs: Vec<crate::catalog::ProcedureDef> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_PROCEDURES);
+            let end = table_key_end(SYSTEM_PROCEDURES);
+            let proc_rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+
+            for (_key, value) in proc_rows {
+                if value.len() <= MVCC_HEADER_SIZE {
+                    continue;
+                }
+                if value[16] == 1 {
+                    continue; // Skip deleted
+                }
+                let row_data = &value[MVCC_HEADER_SIZE..];
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(proc_def) = row_to_procedure_def(&row) {
+                        procedure_defs.push(proc_def);
+                    }
+                }
+            }
+        }
+
         // Update catalog (clear and rebuild)
         let mut catalog = self.catalog.write();
 
@@ -640,6 +668,13 @@ impl LsmRaftStorage {
         catalog.clear_user_databases();
         for db_name in database_names {
             catalog.register_database(db_name);
+        }
+
+        // Rebuild procedures
+        catalog.clear_procedures();
+        for proc_def in procedure_defs {
+            tracing::debug!(procedure = %proc_def.name, "Rebuilding procedure from snapshot");
+            catalog.register_procedure(proc_def);
         }
 
         tracing::info!("Rebuilt catalog from system tables after snapshot install");
@@ -701,6 +736,18 @@ impl LsmRaftStorage {
                         let _ = catalog.drop_database(db_name);
                     } else {
                         catalog.register_database(db_name.clone());
+                    }
+                }
+            }
+        } else if table == SYSTEM_PROCEDURES {
+            // Procedure changes — update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if let Some(proc_def) = row_to_procedure_def(&row) {
+                    let mut catalog = self.catalog.write();
+                    if is_delete {
+                        let _ = catalog.drop_procedure(&proc_def.name);
+                    } else {
+                        catalog.register_procedure(proc_def);
                     }
                 }
             }

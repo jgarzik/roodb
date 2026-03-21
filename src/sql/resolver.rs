@@ -1411,59 +1411,125 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
 /// Convert data type
 pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
     match dt {
-        sp::DataType::Boolean => Ok(DataType::Boolean),
-        sp::DataType::TinyInt(_) => Ok(DataType::TinyInt),
-        sp::DataType::SmallInt(_) => Ok(DataType::SmallInt),
-        sp::DataType::Int(_) | sp::DataType::Integer(_) => Ok(DataType::Int),
-        sp::DataType::BigInt(_) => Ok(DataType::BigInt),
-        sp::DataType::Float(_) | sp::DataType::Real => Ok(DataType::Float),
-        sp::DataType::Double(_) | sp::DataType::DoublePrecision => Ok(DataType::Double),
-        sp::DataType::Varchar(len) => {
+        // Boolean
+        sp::DataType::Boolean | sp::DataType::Bool => Ok(DataType::Boolean),
+        // TinyInt
+        sp::DataType::TinyInt(_) | sp::DataType::TinyIntUnsigned(_) | sp::DataType::UTinyInt => {
+            Ok(DataType::TinyInt)
+        }
+        // SmallInt
+        sp::DataType::SmallInt(_)
+        | sp::DataType::SmallIntUnsigned(_)
+        | sp::DataType::USmallInt
+        | sp::DataType::Int2(_)
+        | sp::DataType::Int2Unsigned(_) => Ok(DataType::SmallInt),
+        // Int
+        sp::DataType::Int(_)
+        | sp::DataType::Integer(_)
+        | sp::DataType::MediumInt(_)
+        | sp::DataType::MediumIntUnsigned(_)
+        | sp::DataType::IntUnsigned(_)
+        | sp::DataType::IntegerUnsigned(_)
+        | sp::DataType::UnsignedInteger
+        | sp::DataType::Int4(_)
+        | sp::DataType::Int4Unsigned(_)
+        | sp::DataType::Int16
+        | sp::DataType::Int32
+        | sp::DataType::UInt8
+        | sp::DataType::UInt16
+        | sp::DataType::UInt32 => Ok(DataType::Int),
+        // BigInt
+        sp::DataType::BigInt(_)
+        | sp::DataType::BigIntUnsigned(_)
+        | sp::DataType::Int8(_)
+        | sp::DataType::Int8Unsigned(_)
+        | sp::DataType::Int64
+        | sp::DataType::Int128
+        | sp::DataType::Int256
+        | sp::DataType::UInt64
+        | sp::DataType::UInt128
+        | sp::DataType::UInt256
+        | sp::DataType::UBigInt
+        | sp::DataType::HugeInt
+        | sp::DataType::UHugeInt
+        | sp::DataType::Signed
+        | sp::DataType::SignedInteger
+        | sp::DataType::Unsigned => Ok(DataType::BigInt),
+        // Float
+        sp::DataType::Float(_)
+        | sp::DataType::Real
+        | sp::DataType::Float4
+        | sp::DataType::Float32
+        | sp::DataType::FloatUnsigned(_)
+        | sp::DataType::RealUnsigned => Ok(DataType::Float),
+        // Double
+        sp::DataType::Double(_)
+        | sp::DataType::DoublePrecision
+        | sp::DataType::Float8
+        | sp::DataType::Float64
+        | sp::DataType::DoubleUnsigned(_)
+        | sp::DataType::DoublePrecisionUnsigned => Ok(DataType::Double),
+        // DECIMAL/NUMERIC — map to Double
+        sp::DataType::Decimal(_)
+        | sp::DataType::Numeric(_)
+        | sp::DataType::Dec(_)
+        | sp::DataType::DecimalUnsigned(_)
+        | sp::DataType::DecUnsigned(_)
+        | sp::DataType::BigNumeric(_)
+        | sp::DataType::BigDecimal(_) => Ok(DataType::Double),
+        // Varchar
+        sp::DataType::Varchar(len)
+        | sp::DataType::CharacterVarying(len)
+        | sp::DataType::CharVarying(len)
+        | sp::DataType::Nvarchar(len) => {
             let n = extract_varchar_length(len).unwrap_or(255);
             Ok(DataType::Varchar(n))
         }
-        sp::DataType::Char(len) => {
+        sp::DataType::Char(len) | sp::DataType::Character(len) => {
             let n = extract_varchar_length(len).unwrap_or(1);
             Ok(DataType::Varchar(n))
         }
-        sp::DataType::Text => Ok(DataType::Text),
-        sp::DataType::Blob(_) | sp::DataType::Binary(_) | sp::DataType::Varbinary(_) => {
+        // Text
+        sp::DataType::Text
+        | sp::DataType::TinyText
+        | sp::DataType::MediumText
+        | sp::DataType::LongText => Ok(DataType::Text),
+        sp::DataType::CharacterLargeObject(_)
+        | sp::DataType::CharLargeObject(_)
+        | sp::DataType::Clob(_) => Ok(DataType::Text),
+        sp::DataType::String(_) | sp::DataType::FixedString(_) => Ok(DataType::Text),
+        // Blob
+        sp::DataType::Blob(_)
+        | sp::DataType::Binary(_)
+        | sp::DataType::Varbinary(_)
+        | sp::DataType::TinyBlob
+        | sp::DataType::MediumBlob
+        | sp::DataType::LongBlob
+        | sp::DataType::Bytes(_)
+        | sp::DataType::Bytea => Ok(DataType::Blob),
+        sp::DataType::Bit(_) | sp::DataType::BitVarying(_) | sp::DataType::VarBit(_) => {
             Ok(DataType::Blob)
         }
-        sp::DataType::Date => Ok(DataType::Timestamp),
-        sp::DataType::Timestamp(_, _) | sp::DataType::Datetime(_) => Ok(DataType::Timestamp),
-        // UNSIGNED variants — map to corresponding signed types (we don't track signedness)
-        sp::DataType::TinyIntUnsigned(_) => Ok(DataType::TinyInt),
-        sp::DataType::SmallIntUnsigned(_) => Ok(DataType::SmallInt),
-        sp::DataType::MediumIntUnsigned(_) => Ok(DataType::Int),
-        sp::DataType::IntUnsigned(_)
-        | sp::DataType::IntegerUnsigned(_)
-        | sp::DataType::UnsignedInteger => Ok(DataType::Int),
-        sp::DataType::BigIntUnsigned(_) => Ok(DataType::BigInt),
-        // MediumInt
-        sp::DataType::MediumInt(_) => Ok(DataType::Int),
-        // Int2/Int4/Int8 aliases
-        sp::DataType::Int2(_) => Ok(DataType::SmallInt),
-        sp::DataType::Int4(_) => Ok(DataType::Int),
-        sp::DataType::Int8(_) => Ok(DataType::BigInt),
+        // Timestamp
+        sp::DataType::Date | sp::DataType::Date32 => Ok(DataType::Timestamp),
+        sp::DataType::Timestamp(_, _)
+        | sp::DataType::Datetime(_)
+        | sp::DataType::Datetime64(_, _)
+        | sp::DataType::TimestampNtz(_) => Ok(DataType::Timestamp),
         // ENUM and SET — map to Text (we don't enforce the value set)
         sp::DataType::Enum(..) => Ok(DataType::Text),
         sp::DataType::Set(_) => Ok(DataType::Text),
-        // DECIMAL/NUMERIC — map to Double
-        sp::DataType::Decimal(_) | sp::DataType::Numeric(_) | sp::DataType::Dec(_) => {
-            Ok(DataType::Double)
-        }
         // TIME — map to Text (we don't have a native Time type)
         sp::DataType::Time(_, _) => Ok(DataType::Text),
         // JSON
-        sp::DataType::JSON => Ok(DataType::Text),
-        // SERIAL — MySQL alias for BIGINT UNSIGNED AUTO_INCREMENT
+        sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Text),
+        // Custom type names (backward compat + types not in sqlparser enum)
         sp::DataType::Custom(name, _) => {
             let upper = name.to_string().to_uppercase();
             match upper.as_str() {
                 "SERIAL" => Ok(DataType::BigInt),
-                "UNSIGNED" => Ok(DataType::BigInt), // CAST AS UNSIGNED
-                "SIGNED" => Ok(DataType::BigInt),   // CAST AS SIGNED
+                "UNSIGNED" => Ok(DataType::BigInt),
+                "SIGNED" => Ok(DataType::BigInt),
                 "YEAR" => Ok(DataType::SmallInt),
                 "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => Ok(DataType::Text),
                 "MEDIUMBLOB" | "LONGBLOB" | "TINYBLOB" => Ok(DataType::Blob),
@@ -1934,5 +2000,291 @@ mod tests {
         let result = resolver.resolve(stmt);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_convert_data_type_coverage() {
+        use sqlparser::ast::DataType as SpDt;
+        use sqlparser::ast::ExactNumberInfo;
+
+        // Boolean
+        assert_eq!(
+            convert_data_type(&SpDt::Boolean).unwrap(),
+            DataType::Boolean
+        );
+        assert_eq!(convert_data_type(&SpDt::Bool).unwrap(), DataType::Boolean);
+
+        // TinyInt
+        assert_eq!(
+            convert_data_type(&SpDt::TinyInt(None)).unwrap(),
+            DataType::TinyInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::TinyIntUnsigned(None)).unwrap(),
+            DataType::TinyInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::UTinyInt).unwrap(),
+            DataType::TinyInt
+        );
+
+        // SmallInt
+        assert_eq!(
+            convert_data_type(&SpDt::SmallInt(None)).unwrap(),
+            DataType::SmallInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::SmallIntUnsigned(None)).unwrap(),
+            DataType::SmallInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::USmallInt).unwrap(),
+            DataType::SmallInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Int2(None)).unwrap(),
+            DataType::SmallInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Int2Unsigned(None)).unwrap(),
+            DataType::SmallInt
+        );
+
+        // Int
+        assert_eq!(convert_data_type(&SpDt::Int(None)).unwrap(), DataType::Int);
+        assert_eq!(
+            convert_data_type(&SpDt::Integer(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::MediumInt(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::MediumIntUnsigned(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::IntUnsigned(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::IntegerUnsigned(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::UnsignedInteger).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(convert_data_type(&SpDt::Int4(None)).unwrap(), DataType::Int);
+        assert_eq!(
+            convert_data_type(&SpDt::Int4Unsigned(None)).unwrap(),
+            DataType::Int
+        );
+        assert_eq!(convert_data_type(&SpDt::Int16).unwrap(), DataType::Int);
+        assert_eq!(convert_data_type(&SpDt::Int32).unwrap(), DataType::Int);
+        assert_eq!(convert_data_type(&SpDt::UInt8).unwrap(), DataType::Int);
+        assert_eq!(convert_data_type(&SpDt::UInt16).unwrap(), DataType::Int);
+        assert_eq!(convert_data_type(&SpDt::UInt32).unwrap(), DataType::Int);
+
+        // BigInt
+        assert_eq!(
+            convert_data_type(&SpDt::BigInt(None)).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::BigIntUnsigned(None)).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Int8(None)).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Int8Unsigned(None)).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(convert_data_type(&SpDt::Int64).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::Int128).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::Int256).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::UInt64).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::UInt128).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::UInt256).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::UBigInt).unwrap(), DataType::BigInt);
+        assert_eq!(convert_data_type(&SpDt::HugeInt).unwrap(), DataType::BigInt);
+        assert_eq!(
+            convert_data_type(&SpDt::UHugeInt).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(convert_data_type(&SpDt::Signed).unwrap(), DataType::BigInt);
+        assert_eq!(
+            convert_data_type(&SpDt::SignedInteger).unwrap(),
+            DataType::BigInt
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Unsigned).unwrap(),
+            DataType::BigInt
+        );
+
+        // Float
+        assert_eq!(
+            convert_data_type(&SpDt::Float(ExactNumberInfo::None)).unwrap(),
+            DataType::Float
+        );
+        assert_eq!(convert_data_type(&SpDt::Real).unwrap(), DataType::Float);
+        assert_eq!(convert_data_type(&SpDt::Float4).unwrap(), DataType::Float);
+        assert_eq!(convert_data_type(&SpDt::Float32).unwrap(), DataType::Float);
+        assert_eq!(
+            convert_data_type(&SpDt::FloatUnsigned(ExactNumberInfo::None)).unwrap(),
+            DataType::Float
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::RealUnsigned).unwrap(),
+            DataType::Float
+        );
+
+        // Double
+        assert_eq!(
+            convert_data_type(&SpDt::Double(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::DoublePrecision).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(convert_data_type(&SpDt::Float8).unwrap(), DataType::Double);
+        assert_eq!(convert_data_type(&SpDt::Float64).unwrap(), DataType::Double);
+        assert_eq!(
+            convert_data_type(&SpDt::DoubleUnsigned(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::DoublePrecisionUnsigned).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::DecimalUnsigned(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::DecUnsigned(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::BigNumeric(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::BigDecimal(ExactNumberInfo::None)).unwrap(),
+            DataType::Double
+        );
+
+        // Varchar variants
+        assert_eq!(
+            convert_data_type(&SpDt::Varchar(None)).unwrap(),
+            DataType::Varchar(255)
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::CharacterVarying(None)).unwrap(),
+            DataType::Varchar(255)
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::CharVarying(None)).unwrap(),
+            DataType::Varchar(255)
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Nvarchar(None)).unwrap(),
+            DataType::Varchar(255)
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Character(None)).unwrap(),
+            DataType::Varchar(1)
+        );
+
+        // Text variants
+        assert_eq!(convert_data_type(&SpDt::Text).unwrap(), DataType::Text);
+        assert_eq!(convert_data_type(&SpDt::TinyText).unwrap(), DataType::Text);
+        assert_eq!(
+            convert_data_type(&SpDt::MediumText).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(convert_data_type(&SpDt::LongText).unwrap(), DataType::Text);
+        assert_eq!(
+            convert_data_type(&SpDt::CharacterLargeObject(None)).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::CharLargeObject(None)).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Clob(None)).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::String(None)).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::FixedString(64)).unwrap(),
+            DataType::Text
+        );
+
+        // Blob variants
+        assert_eq!(
+            convert_data_type(&SpDt::Blob(None)).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Binary(None)).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Varbinary(None)).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(convert_data_type(&SpDt::TinyBlob).unwrap(), DataType::Blob);
+        assert_eq!(
+            convert_data_type(&SpDt::MediumBlob).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(convert_data_type(&SpDt::LongBlob).unwrap(), DataType::Blob);
+        assert_eq!(
+            convert_data_type(&SpDt::Bytes(None)).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(convert_data_type(&SpDt::Bytea).unwrap(), DataType::Blob);
+        assert_eq!(convert_data_type(&SpDt::Bit(None)).unwrap(), DataType::Blob);
+        assert_eq!(
+            convert_data_type(&SpDt::BitVarying(None)).unwrap(),
+            DataType::Blob
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::VarBit(None)).unwrap(),
+            DataType::Blob
+        );
+
+        // Timestamp variants
+        assert_eq!(convert_data_type(&SpDt::Date).unwrap(), DataType::Timestamp);
+        assert_eq!(
+            convert_data_type(&SpDt::Date32).unwrap(),
+            DataType::Timestamp
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Datetime(None)).unwrap(),
+            DataType::Timestamp
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::Datetime64(3, None)).unwrap(),
+            DataType::Timestamp
+        );
+        assert_eq!(
+            convert_data_type(&SpDt::TimestampNtz(None)).unwrap(),
+            DataType::Timestamp
+        );
+
+        // JSON
+        assert_eq!(convert_data_type(&SpDt::JSON).unwrap(), DataType::Text);
+        assert_eq!(convert_data_type(&SpDt::JSONB).unwrap(), DataType::Text);
     }
 }

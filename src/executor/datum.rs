@@ -115,6 +115,32 @@ impl Datum {
         }
     }
 
+    /// Convert to a SQL literal string for substitution into SQL statements.
+    /// Properly escapes and quotes values for safe embedding in SQL.
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            Datum::Null => "NULL".to_string(),
+            Datum::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Datum::Int(i) => i.to_string(),
+            Datum::Float(f) => f.to_string(),
+            Datum::String(s) => {
+                // Single-quote escape: replace ' with ''
+                let escaped = s.replace('\'', "''");
+                format!("'{}'", escaped)
+            }
+            Datum::Bytes(b) => {
+                let mut s = String::with_capacity(3 + b.len() * 2);
+                s.push_str("X'");
+                for byte in b {
+                    s.push_str(&format!("{:02X}", byte));
+                }
+                s.push('\'');
+                s
+            }
+            Datum::Timestamp(t) => t.to_string(),
+        }
+    }
+
     /// Convert to display string for CAST and output formatting
     pub fn to_display_string(&self) -> String {
         match self {

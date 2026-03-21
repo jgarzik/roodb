@@ -165,7 +165,7 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
 }
 
 /// Evaluate a binary operation
-fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // Handle NULL propagation for most operations
     if matches!(
         op,
@@ -432,7 +432,7 @@ fn eval_or(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 }
 
 /// Evaluate a unary operation
-fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
+pub fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
     match op {
         UnaryOp::Not => val
             .not()
@@ -445,7 +445,7 @@ fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
 }
 
 /// Evaluate a scalar function
-fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
+pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
     let name_upper = name.to_uppercase();
     match name_upper.as_str() {
         // String functions

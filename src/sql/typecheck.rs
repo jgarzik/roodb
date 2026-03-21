@@ -248,6 +248,7 @@ impl TypeChecker {
                     || Self::expr_has_non_aggregate_column(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_non_aggregate_column(expr),
+            ResolvedExpr::UserVariable { .. } => false,
             _ => false,
         }
     }

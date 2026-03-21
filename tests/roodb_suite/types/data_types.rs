@@ -347,6 +347,261 @@ async fn test_timestamp_type() {
 }
 
 #[tokio::test]
+async fn test_bit_type() {
+    let server = TestServer::start("type_bit").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_bit_tbl (val BIT(1))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_bit_tbl (val) VALUES (X'01'), (X'00')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(Vec<u8>,)> = conn
+        .query("SELECT val FROM type_bit_tbl ORDER BY val")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+
+    conn.query_drop("DROP TABLE type_bit_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_character_varying_type() {
+    let server = TestServer::start("type_charvar").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_charvar_tbl (val CHARACTER VARYING(50))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_charvar_tbl (val) VALUES ('hello'), ('world')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(String,)> = conn
+        .query("SELECT val FROM type_charvar_tbl ORDER BY val")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "hello");
+    assert_eq!(rows[1].0, "world");
+
+    conn.query_drop("DROP TABLE type_charvar_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_nvarchar_type() {
+    let server = TestServer::start("type_nvarchar").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_nvarchar_tbl (val NVARCHAR(100))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_nvarchar_tbl (val) VALUES ('unicode test')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(String,)> = conn
+        .query("SELECT val FROM type_nvarchar_tbl")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "unicode test");
+
+    conn.query_drop("DROP TABLE type_nvarchar_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_bool_alias_type() {
+    let server = TestServer::start("type_bool_alias").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_bool_alias_tbl (val BOOL)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_bool_alias_tbl (val) VALUES (true), (false)")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(bool,)> = conn
+        .query("SELECT val FROM type_bool_alias_tbl ORDER BY val")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, false);
+    assert_eq!(rows[1].0, true);
+
+    conn.query_drop("DROP TABLE type_bool_alias_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_tinytext_type() {
+    let server = TestServer::start("type_tinytext").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_tinytext_tbl (val TINYTEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_tinytext_tbl (val) VALUES ('small text')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(String,)> = conn
+        .query("SELECT val FROM type_tinytext_tbl")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "small text");
+
+    conn.query_drop("DROP TABLE type_tinytext_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_mediumblob_type() {
+    let server = TestServer::start("type_mediumblob").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_mediumblob_tbl (val MEDIUMBLOB)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_mediumblob_tbl (val) VALUES (X'DEADBEEF')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(Vec<u8>,)> = conn
+        .query("SELECT val FROM type_mediumblob_tbl")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+    conn.query_drop("DROP TABLE type_mediumblob_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_clob_type() {
+    let server = TestServer::start("type_clob").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_clob_tbl (val CLOB)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_clob_tbl (val) VALUES ('large text object')")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(String,)> = conn
+        .query("SELECT val FROM type_clob_tbl")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "large text object");
+
+    conn.query_drop("DROP TABLE type_clob_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_double_unsigned_type() {
+    let server = TestServer::start("type_dbl_uns").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_dbl_uns_tbl (val DOUBLE UNSIGNED)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_dbl_uns_tbl (val) VALUES (3.14), (2.71)")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(f64,)> = conn
+        .query("SELECT val FROM type_dbl_uns_tbl ORDER BY val")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert!((rows[0].0 - 2.71).abs() < 1e-10);
+    assert!((rows[1].0 - 3.14).abs() < 1e-10);
+
+    conn.query_drop("DROP TABLE type_dbl_uns_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_decimal_unsigned_type() {
+    let server = TestServer::start("type_dec_uns").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE type_dec_uns_tbl (val DECIMAL(10,2) UNSIGNED)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO type_dec_uns_tbl (val) VALUES (99.99), (0.01)")
+        .await
+        .expect("INSERT failed");
+
+    let rows: Vec<(f64,)> = conn
+        .query("SELECT val FROM type_dec_uns_tbl ORDER BY val")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert!((rows[0].0 - 0.01).abs() < 0.001);
+    assert!((rows[1].0 - 99.99).abs() < 0.001);
+
+    conn.query_drop("DROP TABLE type_dec_uns_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 #[allow(clippy::type_complexity)]
 async fn test_null_all_types() {
     let server = TestServer::start("type_null_all").await;

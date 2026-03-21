@@ -28,16 +28,102 @@ impl Parser {
 
         Ok(ast.into_iter().next().unwrap())
     }
-    /// Normalize MySQL-specific syntax that sqlparser 0.50 doesn't handle:
+    /// Normalize MySQL-specific syntax that sqlparser doesn't handle:
     /// - `) charset xxx` → `) DEFAULT CHARSET=xxx`
-    /// - `) engine=xxx` → `) ENGINE=xxx` (case normalization)
+    /// - CREATE PROCEDURE name() BEGIN → CREATE PROCEDURE name() AS BEGIN
+    ///   (sqlparser expects AS before BEGIN for procedure bodies)
+    /// - DECLARE var TYPE [DEFAULT expr]; → SET var = expr; (inside procedure bodies)
+    ///   (sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...)
     fn normalize_mysql_syntax(sql: &str) -> String {
         use regex::Regex;
         // Replace bare `charset <name>` (not preceded by DEFAULT or CHARACTER)
         // after a closing paren or table option context
         let re = Regex::new(r"(?i)\)\s+charset\s+(\w+)").unwrap();
         let result = re.replace_all(sql, ") DEFAULT CHARSET=$1");
-        result.into_owned()
+
+        // Normalize CREATE PROCEDURE: insert AS before BEGIN if missing
+        // MySQL: CREATE PROCEDURE name(...) BEGIN ... END
+        // sqlparser expects: CREATE PROCEDURE name(...) AS BEGIN ... END
+        let re_proc = Regex::new(r"(?i)(CREATE\s+PROCEDURE\s+\w+\s*\([^)]*\))\s+BEGIN\b").unwrap();
+        let result = re_proc.replace_all(&result, "$1 AS BEGIN");
+
+        // Normalize DECLARE variable statements inside procedure bodies.
+        // sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...,
+        // not DECLARE var TYPE [DEFAULT expr]. Convert to SET statements.
+        Self::normalize_declare_in_body(&result)
+    }
+
+    /// Normalize MySQL procedure body syntax that sqlparser doesn't support:
+    /// - DECLARE var TYPE [DEFAULT expr]; → SET var = [expr|NULL];
+    /// - WHILE cond DO ... END WHILE → WHILE cond BEGIN ... END
+    fn normalize_declare_in_body(sql: &str) -> String {
+        use regex::Regex;
+        let upper = sql.to_uppercase();
+        if !upper.contains("BEGIN") {
+            return sql.to_string();
+        }
+
+        // Normalize WHILE: END WHILE → END, DO → BEGIN (for WHILE bodies)
+        let mut sql = sql.to_string();
+        if upper.contains("WHILE") {
+            // Replace END WHILE with END
+            let re_end_while = Regex::new(r"(?i)\bEND\s+WHILE\b").unwrap();
+            sql = re_end_while.replace_all(&sql, "END").to_string();
+
+            // Replace standalone DO keyword (after WHILE condition) with BEGIN
+            // Match: a word boundary + DO + whitespace/newline (not part of another word)
+            // Only safe in procedure body context where DO is only used in WHILE...DO
+            let re_do = Regex::new(r"(?i)\bDO\s").unwrap();
+            sql = re_do.replace_all(&sql, "BEGIN ").to_string();
+        }
+
+        // Only process DECLARE if it exists
+        if !upper.contains("DECLARE ") {
+            return sql;
+        }
+
+        // Process each semicolon-delimited segment
+        let re_declare = Regex::new(r"(?i)\bDECLARE\s+(\w+)\s+").unwrap();
+        let mut result = String::with_capacity(sql.len());
+        let mut last_end = 0;
+
+        // Find each DECLARE statement by scanning for the pattern
+        for m in re_declare.find_iter(&sql) {
+            let start = m.start();
+            // Find the rest of this statement (up to the next semicolon)
+            let rest_start = m.end();
+            let semi_pos = sql[rest_start..].find(';').map(|p| rest_start + p);
+            let stmt_end = semi_pos.unwrap_or(sql.len());
+
+            // Extract the full DECLARE statement
+            let full_stmt = &sql[start..stmt_end];
+            let words: Vec<&str> = full_stmt.split_whitespace().collect();
+
+            // Skip cursor declarations: DECLARE name CURSOR ...
+            if words.len() >= 3 && words[2].eq_ignore_ascii_case("CURSOR") {
+                continue;
+            }
+
+            // This is a variable declaration - replace it
+            let var_name = words.get(1).unwrap_or(&"_");
+            let stmt_upper = full_stmt.to_uppercase();
+
+            let replacement = if let Some(default_pos) = stmt_upper.find(" DEFAULT ") {
+                let default_val = &full_stmt[default_pos + 9..];
+                format!("SET {} = {}", var_name, default_val.trim())
+            } else {
+                format!("SET {} = NULL", var_name)
+            };
+
+            // Copy everything up to this DECLARE, then the replacement
+            result.push_str(&sql[last_end..start]);
+            result.push_str(&replacement);
+            last_end = stmt_end;
+        }
+
+        // Copy remaining text
+        result.push_str(&sql[last_end..]);
+        result
     }
 }
 

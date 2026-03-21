@@ -25,8 +25,8 @@ use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tracing::{debug, info, warn};
 
-use crate::catalog::system_tables::SYSTEM_USERS;
-use crate::catalog::Catalog;
+use crate::catalog::system_tables::{SYSTEM_PROCEDURES, SYSTEM_USERS};
+use crate::catalog::{Catalog, ParamMode, ProcedureDef, ProcedureParam};
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
 use crate::executor::engine::ExecutorEngine;
 use crate::executor::{Datum, Executor, TransactionContext};
@@ -65,7 +65,7 @@ enum PlanError {
 /// RooDB connection handler
 pub struct RooDbConnection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
     /// Packet reader (buffered to reduce syscalls)
     reader: PacketReader<BufReader<ReadHalf<S>>>,
@@ -101,7 +101,7 @@ where
 
 impl<S> RooDbConnection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
     /// Create a new RooDB connection from a TLS stream
     pub fn new(
@@ -976,7 +976,15 @@ where
     }
 
     /// Handle a SQL query
-    async fn handle_query(&mut self, sql: &str) -> ProtocolResult<()> {
+    fn handle_query<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProtocolResult<()>> + Send + 'a>> {
+        Box::pin(async move { self.handle_query_inner(sql).await })
+    }
+
+    /// Inner implementation of handle_query (separated to allow boxing for recursion)
+    async fn handle_query_inner(&mut self, sql: &str) -> ProtocolResult<()> {
         // Clear warnings at the start of each statement
         self.session.clear_warnings();
 
@@ -1039,10 +1047,8 @@ where
             if upper.starts_with("FLUSH ") {
                 return self.send_ok(0, 0).await;
             }
-            // DROP PROCEDURE/FUNCTION/VIEW IF EXISTS — no-op (we don't have these)
-            if (upper.starts_with("DROP PROCEDURE")
-                || upper.starts_with("DROP FUNCTION")
-                || upper.starts_with("DROP VIEW"))
+            // DROP FUNCTION/VIEW IF EXISTS — no-op (we don't have these yet)
+            if (upper.starts_with("DROP FUNCTION") || upper.starts_with("DROP VIEW"))
                 && upper.contains("IF EXISTS")
             {
                 return self.send_ok(0, 0).await;
@@ -1082,16 +1088,89 @@ where
             }
         };
 
-        // Handle parsed statements that are no-ops
-        {
-            use sqlparser::ast::Statement as S;
-            match &stmt {
-                S::LockTables { .. } | S::UnlockTables => {
-                    return self.send_ok(0, 0).await;
-                }
-                _ => {}
-            }
+        // Handle parsed statements that are no-ops or intercepted
+        // Extract data from the statement before calling mutable methods
+        enum Intercept {
+            NoOp,
+            CreateProc {
+                name: sqlparser::ast::ObjectName,
+                params: Option<Vec<sqlparser::ast::ProcedureParam>>,
+                body: sqlparser::ast::ConditionalStatements,
+            },
+            DropProc {
+                name: String,
+                if_exists: bool,
+            },
+            Call(sqlparser::ast::Function),
+            Continue(Box<sqlparser::ast::Statement>),
         }
+
+        let action = {
+            use sqlparser::ast::Statement as S;
+            match stmt {
+                S::LockTables { .. } | S::UnlockTables => Intercept::NoOp,
+                S::CreateProcedure {
+                    name, params, body, ..
+                } => Intercept::CreateProc { name, params, body },
+                S::DropProcedure {
+                    if_exists,
+                    proc_desc,
+                    ..
+                } => {
+                    let proc_name = proc_desc
+                        .first()
+                        .map(|d| d.name.to_string())
+                        .unwrap_or_default();
+                    Intercept::DropProc {
+                        name: proc_name,
+                        if_exists,
+                    }
+                }
+                S::Call(func) => Intercept::Call(func),
+                other => Intercept::Continue(Box::new(other)),
+            }
+        };
+
+        let stmt = match action {
+            Intercept::NoOp => return self.send_ok(0, 0).await,
+            Intercept::CreateProc { name, params, body } => {
+                return self
+                    .handle_create_procedure(&name, params.as_deref(), &body)
+                    .await;
+            }
+            Intercept::DropProc { name, if_exists } => {
+                return self.handle_drop_procedure(&name, if_exists).await;
+            }
+            Intercept::Call(func) => {
+                let proc_name = func.name.to_string().to_lowercase();
+                let call_args: Vec<sqlparser::ast::Expr> = match func.args {
+                    sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                        .args
+                        .into_iter()
+                        .map(|arg| match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => e,
+                            sqlparser::ast::FunctionArg::Named { arg, .. } => {
+                                if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg {
+                                    e
+                                } else {
+                                    sqlparser::ast::Expr::Value(
+                                        sqlparser::ast::Value::Null.with_empty_span(),
+                                    )
+                                }
+                            }
+                            _ => sqlparser::ast::Expr::Value(
+                                sqlparser::ast::Value::Null.with_empty_span(),
+                            ),
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                return self.handle_call(&proc_name, &call_args).await;
+            }
+            Intercept::Continue(stmt) => *stmt,
+        };
 
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
@@ -2640,6 +2719,826 @@ where
         );
 
         Ok(Some(()))
+    }
+
+    // ============ Stored Procedure Handlers ============
+
+    /// Handle CREATE PROCEDURE statement
+    async fn handle_create_procedure(
+        &mut self,
+        name: &sqlparser::ast::ObjectName,
+        params: Option<&[sqlparser::ast::ProcedureParam]>,
+        body: &sqlparser::ast::ConditionalStatements,
+    ) -> ProtocolResult<()> {
+        let proc_name = name.to_string().to_lowercase();
+
+        // Convert sqlparser params to our ProcedureParam
+        let our_params: Vec<ProcedureParam> = params
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| {
+                let mode = match &p.mode {
+                    Some(sqlparser::ast::ArgMode::Out) => ParamMode::Out,
+                    Some(sqlparser::ast::ArgMode::InOut) => ParamMode::InOut,
+                    _ => ParamMode::In,
+                };
+                ProcedureParam {
+                    name: p.name.value.to_lowercase(),
+                    data_type: p.data_type.to_string(),
+                    mode,
+                }
+            })
+            .collect();
+
+        let body_sql = body.to_string();
+
+        // Check if procedure already exists
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.procedure_exists(&proc_name)
+        };
+        if exists {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Procedure '{}' already exists", proc_name),
+                )
+                .await;
+        }
+
+        let proc_def = ProcedureDef {
+            name: proc_name.clone(),
+            params: our_params,
+            body_sql,
+        };
+
+        // Write to system.procedures via Raft
+        use crate::catalog::system_tables::procedure_def_to_row;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let row_id = encode_row_id(local_id, node_id);
+        let proc_row = procedure_def_to_row(&proc_def);
+        let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
+        let value = encode_row(&proc_row);
+
+        use crate::raft::RowChange;
+        let change = RowChange::insert(SYSTEM_PROCEDURES, key, value);
+        let changeset = ChangeSet::new_with_changes(0, vec![change]);
+
+        match self.raft_node.propose_changes(changeset).await {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Failed to create procedure: {}", e),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Handle DROP PROCEDURE statement
+    async fn handle_drop_procedure(
+        &mut self,
+        proc_name: &str,
+        if_exists: bool,
+    ) -> ProtocolResult<()> {
+        let proc_name = proc_name.to_lowercase();
+
+        // Check if procedure exists
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.procedure_exists(&proc_name)
+        };
+        if !exists {
+            if if_exists {
+                return self.send_ok(0, 0).await;
+            }
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Procedure '{}' does not exist", proc_name),
+                )
+                .await;
+        }
+
+        // Scan system.procedures to find the row to delete
+        use crate::executor::encoding::decode_row;
+        use crate::raft::RowChange;
+
+        let prefix = format!("t:{SYSTEM_PROCEDURES}:");
+        let end = format!("t:{SYSTEM_PROCEDURES};\x00");
+
+        let rows = self
+            .mvcc
+            .scan_raw(prefix.as_bytes(), end.as_bytes())
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+
+        let mut changeset = ChangeSet::new(0);
+        for (key, value) in rows {
+            let row_data = if value.len() > 17 {
+                &value[17..]
+            } else {
+                &value
+            };
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(Datum::String(name)) = row.values().first() {
+                    if name.eq_ignore_ascii_case(&proc_name) {
+                        changeset.push(RowChange::delete_with_value(
+                            SYSTEM_PROCEDURES,
+                            key,
+                            row_data.to_vec(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !changeset.changes.is_empty() {
+            match self.raft_node.propose_changes(changeset).await {
+                Ok(()) => self.send_ok(0, 0).await,
+                Err(e) => {
+                    self.send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Failed to drop procedure: {}", e),
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.send_ok(0, 0).await
+        }
+    }
+
+    /// Handle CALL procedure_name(args...) — AST tree-walker interpreter
+    async fn handle_call(
+        &mut self,
+        proc_name: &str,
+        call_args: &[sqlparser::ast::Expr],
+    ) -> ProtocolResult<()> {
+        use crate::executor::procedure::{build_procedure_context, propagate_out_params};
+
+        // Look up procedure in catalog
+        let proc_def = {
+            let catalog = self.catalog.read();
+            catalog.get_procedure(proc_name).cloned()
+        };
+        let proc_def = match proc_def {
+            Some(def) => def,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Procedure '{}' does not exist", proc_name),
+                    )
+                    .await;
+            }
+        };
+
+        // Build context: validate arg count, bind IN/INOUT params, OUT = Null
+        let user_vars = self.session.user_variables();
+        let mut ctx = match build_procedure_context(&proc_def, call_args, &user_vars) {
+            Ok(c) => c,
+            Err(e) => {
+                return self
+                    .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e)
+                    .await;
+            }
+        };
+
+        // Parse procedure body into Vec<Statement>
+        let body_stmts = match Self::parse_body_to_stmts(&proc_def.body_sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Failed to parse procedure body: {}", e),
+                    )
+                    .await;
+            }
+        };
+        // Execute the body
+        match self.execute_procedure_body(&body_stmts, &mut ctx).await {
+            Ok(_) => {}
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Procedure execution error: {}", e),
+                    )
+                    .await;
+            }
+        }
+
+        // Propagate OUT/INOUT params back to user variables
+        propagate_out_params(&proc_def, call_args, &ctx, &user_vars);
+
+        self.send_ok(ctx.rows_affected, 0).await
+    }
+
+    /// Parse procedure body SQL into Vec<Statement>.
+    /// Wraps body in CREATE PROCEDURE to leverage sqlparser's procedure-context
+    /// parsing for WHILE, IF, CASE, cursors, etc.
+    /// Normalizes MySQL DECLARE variable statements (which sqlparser doesn't
+    /// support in MySQL mode) into SET statements.
+    fn parse_body_to_stmts(body_sql: &str) -> Result<Vec<sqlparser::ast::Statement>, String> {
+        use sqlparser::ast::Statement as S;
+
+        let trimmed = body_sql.trim();
+        if trimmed.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Strip outer BEGIN/END
+        let inner = {
+            let upper = trimmed.to_uppercase();
+            if upper.starts_with("BEGIN") && upper.ends_with("END") {
+                trimmed[5..trimmed.len() - 3].trim()
+            } else {
+                trimmed
+            }
+        };
+
+        // Pre-process: convert MySQL DECLARE variable statements to SET.
+        // DECLARE var_name TYPE [DEFAULT expr]; → SET var_name = expr;
+        // DECLARE var_name CURSOR FOR query; → kept as-is (sqlparser handles this)
+        let processed = Self::normalize_declare_stmts(inner);
+
+        // Wrap in BEGIN...END and CREATE PROCEDURE for parsing
+        let wrapper = format!("CREATE PROCEDURE __body__() BEGIN {} END", processed);
+        let stmt = crate::sql::Parser::parse_one(&wrapper).map_err(|e| e.to_string())?;
+
+        // Extract the body statements from the parsed CREATE PROCEDURE
+        if let S::CreateProcedure { body, .. } = stmt {
+            Ok(body.statements().clone())
+        } else {
+            Err("Failed to parse procedure body".to_string())
+        }
+    }
+
+    /// Convert MySQL DECLARE variable statements to SET statements.
+    /// Leaves DECLARE ... CURSOR FOR ... unchanged (sqlparser handles those).
+    fn normalize_declare_stmts(body: &str) -> String {
+        let mut result = String::with_capacity(body.len());
+        // Split on semicolons, process each statement
+        for part in body.split(';') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let upper = trimmed.to_uppercase();
+            if upper.starts_with("DECLARE ") {
+                // Check if this is a cursor declaration (DECLARE name CURSOR FOR ...)
+                let words: Vec<&str> = trimmed.split_whitespace().collect();
+                if words.len() >= 3 && words[2].eq_ignore_ascii_case("CURSOR") {
+                    // Keep cursor declarations as-is
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(trimmed);
+                    result.push(';');
+                } else if let Some(default_pos) = upper.find(" DEFAULT ") {
+                    // DECLARE var_name TYPE DEFAULT expr → SET var_name = expr
+                    let var_name = words.get(1).unwrap_or(&"_");
+                    let default_val = &trimmed[default_pos + 9..]; // skip " DEFAULT "
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(&format!("SET {} = {};", var_name, default_val.trim()));
+                } else {
+                    // DECLARE var_name TYPE → SET var_name = NULL
+                    let var_name = words.get(1).unwrap_or(&"_");
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(&format!("SET {} = NULL;", var_name));
+                }
+            } else {
+                if !result.is_empty() {
+                    result.push(' ');
+                }
+                result.push_str(trimmed);
+                result.push(';');
+            }
+        }
+        result
+    }
+
+    /// Execute a list of procedure body statements. Returns control flow signal.
+    fn execute_procedure_body<'a>(
+        &'a mut self,
+        stmts: &'a [sqlparser::ast::Statement],
+        ctx: &'a mut crate::executor::procedure::ProcedureContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::executor::procedure::ProcControlFlow, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        use crate::executor::procedure::ProcControlFlow;
+        Box::pin(async move {
+            for stmt in stmts {
+                match self.execute_procedure_stmt(stmt, ctx).await? {
+                    ProcControlFlow::Continue => {}
+                    ProcControlFlow::Return => return Ok(ProcControlFlow::Return),
+                }
+            }
+            Ok(ProcControlFlow::Continue)
+        })
+    }
+
+    /// Dispatch a single procedure body statement.
+    async fn execute_procedure_stmt(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+    ) -> Result<crate::executor::procedure::ProcControlFlow, String> {
+        use crate::executor::procedure::{
+            datum_is_true, eval_declare_default, eval_sp_expr, CursorState, ProcControlFlow,
+        };
+        use sqlparser::ast::Statement as S;
+
+        let user_vars = self.session.user_variables();
+
+        match stmt {
+            // DECLARE variables and cursors
+            S::Declare { stmts } => {
+                for decl in stmts {
+                    // Cursor declaration: DECLARE cursor_name CURSOR FOR query
+                    if let Some(query) = &decl.for_query {
+                        let cursor_name = decl
+                            .names
+                            .first()
+                            .map(|i| i.value.to_lowercase())
+                            .unwrap_or_default();
+                        let query_sql = query.to_string();
+                        ctx.cursors
+                            .insert(cursor_name, CursorState::Declared { query_sql });
+                    } else {
+                        // Variable declaration: DECLARE var_name [DEFAULT expr]
+                        let default_val = if let Some(assignment) = &decl.assignment {
+                            eval_declare_default(assignment, ctx, &user_vars)
+                        } else {
+                            Datum::Null
+                        };
+                        for name in &decl.names {
+                            ctx.locals
+                                .insert(name.value.to_lowercase(), default_val.clone());
+                        }
+                    }
+                }
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // SET variable = expr
+            S::Set(set_stmt) => {
+                use sqlparser::ast::Set;
+                match set_stmt {
+                    Set::SingleAssignment {
+                        variable, values, ..
+                    } => {
+                        let var_name_full = variable.to_string();
+                        let val = if let Some(expr) = values.first() {
+                            eval_sp_expr(expr, ctx, &user_vars)?
+                        } else {
+                            Datum::Null
+                        };
+                        self.set_procedure_variable(ctx, &var_name_full, val);
+                        Ok(ProcControlFlow::Continue)
+                    }
+                    Set::MultipleAssignments { assignments } => {
+                        for assignment in assignments {
+                            let var_name_full = assignment.name.to_string();
+                            let val = eval_sp_expr(&assignment.value, ctx, &user_vars)?;
+                            self.set_procedure_variable(ctx, &var_name_full, val);
+                        }
+                        Ok(ProcControlFlow::Continue)
+                    }
+                    _ => {
+                        // Other SET variants (SET NAMES, etc.) — no-op
+                        Ok(ProcControlFlow::Continue)
+                    }
+                }
+            }
+
+            // IF / ELSEIF / ELSE
+            S::If(if_stmt) => {
+                // Check main IF condition
+                if let Some(cond) = &if_stmt.if_block.condition {
+                    let cond_val = eval_sp_expr(cond, ctx, &user_vars)?;
+                    if datum_is_true(&cond_val) {
+                        return self
+                            .execute_procedure_body(if_stmt.if_block.statements(), ctx)
+                            .await;
+                    }
+                }
+
+                // Check ELSEIF blocks
+                for elseif_block in &if_stmt.elseif_blocks {
+                    if let Some(cond) = &elseif_block.condition {
+                        let cond_val = eval_sp_expr(cond, ctx, &user_vars)?;
+                        if datum_is_true(&cond_val) {
+                            return self
+                                .execute_procedure_body(elseif_block.statements(), ctx)
+                                .await;
+                        }
+                    }
+                }
+
+                // ELSE block
+                if let Some(else_block) = &if_stmt.else_block {
+                    return self
+                        .execute_procedure_body(else_block.statements(), ctx)
+                        .await;
+                }
+
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // WHILE loop
+            S::While(while_stmt) => {
+                let max_iterations = 100_000;
+                let mut iterations = 0;
+                loop {
+                    if iterations >= max_iterations {
+                        return Err(format!("WHILE loop exceeded {} iterations", max_iterations));
+                    }
+                    iterations += 1;
+
+                    // Evaluate condition
+                    let user_vars = self.session.user_variables();
+                    if let Some(cond) = &while_stmt.while_block.condition {
+                        let cond_val = eval_sp_expr(cond, ctx, &user_vars)?;
+                        if !datum_is_true(&cond_val) {
+                            break;
+                        }
+                    }
+
+                    // Execute body
+                    match self
+                        .execute_procedure_body(while_stmt.while_block.statements(), ctx)
+                        .await?
+                    {
+                        ProcControlFlow::Return => return Ok(ProcControlFlow::Return),
+                        ProcControlFlow::Continue => {}
+                    }
+                }
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // CASE statement
+            S::Case(case_stmt) => {
+                let user_vars = self.session.user_variables();
+                if let Some(match_expr) = &case_stmt.match_expr {
+                    // Simple CASE: CASE expr WHEN val THEN ...
+                    let match_val = eval_sp_expr(match_expr, ctx, &user_vars)?;
+                    for when_block in &case_stmt.when_blocks {
+                        if let Some(cond) = &when_block.condition {
+                            let when_val = eval_sp_expr(cond, ctx, &user_vars)?;
+                            if match_val == when_val {
+                                return self
+                                    .execute_procedure_body(when_block.statements(), ctx)
+                                    .await;
+                            }
+                        }
+                    }
+                } else {
+                    // Searched CASE: CASE WHEN cond THEN ...
+                    for when_block in &case_stmt.when_blocks {
+                        if let Some(cond) = &when_block.condition {
+                            let cond_val = eval_sp_expr(cond, ctx, &user_vars)?;
+                            if datum_is_true(&cond_val) {
+                                return self
+                                    .execute_procedure_body(when_block.statements(), ctx)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // ELSE block
+                if let Some(else_block) = &case_stmt.else_block {
+                    return self
+                        .execute_procedure_body(else_block.statements(), ctx)
+                        .await;
+                }
+
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // OPEN cursor
+            S::Open(open_stmt) => {
+                let cursor_name = open_stmt.cursor_name.value.to_lowercase();
+                let query_sql = match ctx.cursors.get(&cursor_name) {
+                    Some(CursorState::Declared { query_sql }) => query_sql.clone(),
+                    Some(CursorState::Open { .. }) => {
+                        return Err(format!("Cursor '{}' is already open", cursor_name));
+                    }
+                    Some(CursorState::Closed) => {
+                        return Err(format!("Cursor '{}' is closed", cursor_name));
+                    }
+                    None => {
+                        return Err(format!("Cursor '{}' is not declared", cursor_name));
+                    }
+                };
+                // Substitute local variables into the query SQL
+                let substituted = self.substitute_locals(&query_sql, ctx);
+                let rows = self.execute_select_buffered(&substituted).await?;
+                ctx.cursors
+                    .insert(cursor_name, CursorState::Open { rows, position: 0 });
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // FETCH cursor INTO vars
+            S::Fetch { name, into, .. } => {
+                let cursor_name = name.value.to_lowercase();
+                let into_vars: Vec<String> = into
+                    .as_ref()
+                    .map(|obj| {
+                        obj.0
+                            .iter()
+                            .map(|part| match part {
+                                sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                                    ident.value.to_lowercase()
+                                }
+                                other => other.to_string().to_lowercase(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                match ctx.cursors.get_mut(&cursor_name) {
+                    Some(CursorState::Open { rows, position }) => {
+                        if *position < rows.len() {
+                            let row = &rows[*position];
+                            for (i, var_name) in into_vars.iter().enumerate() {
+                                let val = row.get_opt(i).cloned().unwrap_or(Datum::Null);
+                                ctx.locals.insert(var_name.clone(), val);
+                            }
+                            *position += 1;
+                            ctx.found = true;
+                        } else {
+                            ctx.found = false;
+                        }
+                    }
+                    Some(CursorState::Declared { .. }) => {
+                        return Err(format!("Cursor '{}' is not open", cursor_name));
+                    }
+                    Some(CursorState::Closed) => {
+                        return Err(format!("Cursor '{}' is closed", cursor_name));
+                    }
+                    None => {
+                        return Err(format!("Cursor '{}' is not declared", cursor_name));
+                    }
+                }
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // CLOSE cursor
+            S::Close { cursor } => {
+                use sqlparser::ast::CloseCursor;
+                match cursor {
+                    CloseCursor::Specific { name } => {
+                        let cursor_name = name.value.to_lowercase();
+                        use std::collections::hash_map::Entry;
+                        match ctx.cursors.entry(cursor_name.clone()) {
+                            Entry::Occupied(mut e) => {
+                                e.insert(CursorState::Closed);
+                            }
+                            Entry::Vacant(_) => {
+                                return Err(format!("Cursor '{}' is not declared", cursor_name));
+                            }
+                        }
+                    }
+                    CloseCursor::All => {
+                        let names: Vec<String> = ctx.cursors.keys().cloned().collect();
+                        for name in names {
+                            ctx.cursors.insert(name, CursorState::Closed);
+                        }
+                    }
+                }
+                Ok(ProcControlFlow::Continue)
+            }
+
+            // RETURN
+            S::Return(_) => Ok(ProcControlFlow::Return),
+
+            // Everything else: fallback to string-based execution with local var substitution
+            _ => {
+                let sql = stmt.to_string();
+                let substituted = self.substitute_locals(&sql, ctx);
+                let affected = self.execute_sql_silent(&substituted).await?;
+                ctx.rows_affected += affected;
+                Ok(ProcControlFlow::Continue)
+            }
+        }
+    }
+
+    /// Set a variable in procedure context or session user variables.
+    /// If name starts with @, sets session user variable; otherwise sets local.
+    fn set_procedure_variable(
+        &self,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+        var_name: &str,
+        val: Datum,
+    ) {
+        let trimmed = var_name.trim();
+        if let Some(stripped) = trimmed.strip_prefix('@') {
+            // User variable
+            let name = stripped.trim_start_matches('@').trim().to_lowercase();
+            self.session.set_user_variable(&name, val);
+        } else {
+            // Local variable
+            let name = trimmed.to_lowercase();
+            ctx.locals.insert(name, val);
+        }
+    }
+
+    /// Substitute local variable references in a SQL string with their literal values.
+    fn substitute_locals(
+        &self,
+        sql: &str,
+        ctx: &crate::executor::procedure::ProcedureContext,
+    ) -> String {
+        let mut result = sql.to_string();
+        // Sort by name length descending to avoid partial matches
+        let mut vars: Vec<(&String, &Datum)> = ctx.locals.iter().collect();
+        vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        for (name, val) in vars {
+            result = result.replace(name, &val.to_sql_literal());
+        }
+        result
+    }
+
+    /// Execute a SELECT statement and buffer all result rows.
+    /// Used for OPEN cursor to materialize the query result.
+    async fn execute_select_buffered(
+        &mut self,
+        sql: &str,
+    ) -> Result<Vec<crate::executor::row::Row>, String> {
+        let stmt = crate::sql::Parser::parse_one(sql).map_err(|e| e.to_string())?;
+
+        let plan = {
+            let catalog_guard = self.catalog.read();
+            let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .resolve(stmt)
+                .map_err(|e| e.to_string())?;
+            crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
+            let logical = LogicalPlanBuilder::build(resolved).map_err(|e| e.to_string())?;
+            let optimized = Optimizer::new().optimize(logical);
+            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?
+        };
+
+        let mvcc = self.mvcc.clone();
+        let txn_context = if let Some(txn_id) = self.session.current_txn {
+            let read_view = self
+                .txn_manager
+                .create_read_view(txn_id)
+                .map_err(|e| e.to_string())?;
+            let pending = self.session.get_pending_changes();
+            Some(TransactionContext::with_pending_changes(
+                txn_id, read_view, pending,
+            ))
+        } else {
+            let read_view = self
+                .txn_manager
+                .create_read_view(0)
+                .map_err(|e| e.to_string())?;
+            Some(TransactionContext::new(0, read_view))
+        };
+
+        let engine = ExecutorEngine::with_raft(
+            mvcc,
+            self.catalog.clone(),
+            txn_context,
+            self.raft_node.clone(),
+            self.session.user_variables(),
+        );
+        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+
+        executor.open().await.map_err(|e| e.to_string())?;
+        let mut rows = Vec::new();
+        while let Some(row) = executor.next().await.map_err(|e| e.to_string())? {
+            rows.push(row);
+        }
+        executor.close().await.map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Execute a SQL statement silently (no client response packets).
+    /// Used for executing DML/DDL within procedure bodies.
+    /// Returns the number of rows affected.
+    async fn execute_sql_silent(&mut self, sql: &str) -> Result<u64, String> {
+        // Parse and execute through the pipeline
+        let stmt = match crate::sql::Parser::parse_one(sql) {
+            Ok(s) => s,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let plan = {
+            let catalog_guard = self.catalog.read();
+            let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .resolve(stmt)
+                .map_err(|e| e.to_string())?;
+            crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
+            let logical = LogicalPlanBuilder::build(resolved).map_err(|e| e.to_string())?;
+            let optimized = Optimizer::new().optimize(logical);
+            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?
+        };
+
+        let is_ddl = plan.is_ddl();
+        let mvcc = self.mvcc.clone();
+
+        let (txn_context, implicit_txn_id) = if is_ddl {
+            (None, None)
+        } else if let Some(txn_id) = self.session.current_txn {
+            let read_view = self
+                .txn_manager
+                .create_read_view(txn_id)
+                .map_err(|e| e.to_string())?;
+            let pending = self.session.get_pending_changes();
+            (
+                Some(TransactionContext::with_pending_changes(
+                    txn_id, read_view, pending,
+                )),
+                None,
+            )
+        } else if self.session.autocommit {
+            let txn = self
+                .txn_manager
+                .begin(self.session.isolation_level, self.session.is_read_only)
+                .map_err(|e| e.to_string())?;
+            let read_view = self
+                .txn_manager
+                .create_read_view(txn.txn_id)
+                .map_err(|e| e.to_string())?;
+            (
+                Some(TransactionContext::new(txn.txn_id, read_view)),
+                Some(txn.txn_id),
+            )
+        } else {
+            let read_view = self
+                .txn_manager
+                .create_read_view(0)
+                .map_err(|e| e.to_string())?;
+            (Some(TransactionContext::new(0, read_view)), None)
+        };
+
+        let engine = ExecutorEngine::with_raft(
+            mvcc,
+            self.catalog.clone(),
+            txn_context,
+            self.raft_node.clone(),
+            self.session.user_variables(),
+        );
+        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+
+        executor.open().await.map_err(|e| e.to_string())?;
+        let mut affected = 0u64;
+        while let Some(row) = executor.next().await.map_err(|e| e.to_string())? {
+            if let Some(Datum::Int(n)) = row.get_opt(0) {
+                affected += *n as u64;
+            } else {
+                affected += 1;
+            }
+        }
+        executor.close().await.map_err(|e| e.to_string())?;
+
+        // Handle changes
+        let changes = executor.take_changes();
+        if !changes.is_empty() {
+            if self.session.in_transaction() {
+                self.session.add_pending_changes(changes);
+            } else {
+                let changeset = ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                self.raft_node
+                    .propose_changes(changeset)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        if let Some(txn_id) = implicit_txn_id {
+            self.txn_manager
+                .commit(txn_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(affected)
     }
 
     /// Send an OK packet

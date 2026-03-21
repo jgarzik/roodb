@@ -7,6 +7,7 @@ mod aggregates;
 mod grouping;
 mod joins;
 mod ordering;
+mod procedures;
 mod select_basic;
 mod user_variables;
 mod where_clause;

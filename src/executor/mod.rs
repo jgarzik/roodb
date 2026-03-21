@@ -23,6 +23,7 @@ pub mod join;
 pub mod limit;
 pub mod multi_exec;
 pub mod point_get;
+pub mod procedure;
 pub mod project;
 pub mod range_scan;
 pub mod row;

@@ -3,7 +3,7 @@
 //! Schema metadata is stored in system tables that are replicated via Raft
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
-use super::{ColumnDef, Constraint, DataType, IndexDef, TableDef};
+use super::{ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef};
 use crate::executor::{Datum, Row};
 
 /// System table names
@@ -23,6 +23,9 @@ pub const SYSTEM_DATABASES: &str = "system.databases";
 
 // Table statistics
 pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
+
+// Stored procedures
+pub const SYSTEM_PROCEDURES: &str = "system.procedures";
 
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
@@ -160,6 +163,15 @@ pub fn databases_table_def() -> TableDef {
         .constraint(Constraint::PrimaryKey(vec!["database_name".to_string()]))
 }
 
+/// Create the TableDef for system.procedures
+pub fn procedures_table_def() -> TableDef {
+    TableDef::new(SYSTEM_PROCEDURES)
+        .column(ColumnDef::new("procedure_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("params_json", DataType::Text).nullable(false))
+        .column(ColumnDef::new("body_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
+}
+
 /// Get all system table definitions for bootstrapping
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
     vec![
@@ -173,6 +185,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         role_grants_table_def(),
         databases_table_def(),
         table_statistics_table_def(),
+        procedures_table_def(),
     ]
 }
 
@@ -414,6 +427,38 @@ pub fn rows_to_table_def(table_name: &str, column_rows: &[Row]) -> Option<TableD
     Some(def)
 }
 
+/// Convert a ProcedureDef to a row for system.procedures
+pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
+    let params_json = serde_json::to_string(&def.params).unwrap_or_else(|_| "[]".to_string());
+    Row::new(vec![
+        Datum::String(def.name.clone()),
+        Datum::String(params_json),
+        Datum::String(def.body_sql.clone()),
+    ])
+}
+
+/// Reconstruct a ProcedureDef from a system.procedures row
+pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
+    let name = match &row.values()[0] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let params_json = match &row.values()[1] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let body_sql = match &row.values()[2] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let params: Vec<ProcedureParam> = serde_json::from_str(&params_json).ok()?;
+    Some(ProcedureDef {
+        name,
+        params,
+        body_sql,
+    })
+}
+
 /// Reconstruct an IndexDef from a system.indexes row
 pub fn row_to_index_def(row: &Row) -> Option<IndexDef> {
     let index_name = match &row.values()[0] {
@@ -533,7 +578,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 10);
+        assert_eq!(tables.len(), 11);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -546,6 +591,7 @@ mod tests {
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
         assert!(names.contains(&SYSTEM_DATABASES));
         assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
+        assert!(names.contains(&SYSTEM_PROCEDURES));
     }
 
     #[test]

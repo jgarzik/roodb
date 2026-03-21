@@ -8,6 +8,7 @@
 
 pub mod system_tables;
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// SQL data types supported by the database
@@ -219,6 +220,30 @@ impl IndexDef {
     }
 }
 
+/// Parameter mode for stored procedure parameters
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParamMode {
+    In,
+    Out,
+    InOut,
+}
+
+/// Stored procedure parameter
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcedureParam {
+    pub name: String,
+    pub data_type: String,
+    pub mode: ParamMode,
+}
+
+/// Stored procedure definition
+#[derive(Debug, Clone)]
+pub struct ProcedureDef {
+    pub name: String,
+    pub params: Vec<ProcedureParam>,
+    pub body_sql: String,
+}
+
 /// Catalog error
 #[derive(Debug, Clone)]
 pub enum CatalogError {
@@ -236,6 +261,10 @@ pub enum CatalogError {
     InvalidName(String),
     /// Invalid constraint definition
     InvalidConstraint(String),
+    /// Procedure already exists
+    ProcedureExists(String),
+    /// Procedure not found
+    ProcedureNotFound(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -250,6 +279,12 @@ impl std::fmt::Display for CatalogError {
             }
             CatalogError::InvalidName(msg) => write!(f, "Invalid name: {}", msg),
             CatalogError::InvalidConstraint(msg) => write!(f, "Invalid constraint: {}", msg),
+            CatalogError::ProcedureExists(name) => {
+                write!(f, "Procedure '{}' already exists", name)
+            }
+            CatalogError::ProcedureNotFound(name) => {
+                write!(f, "Procedure '{}' not found", name)
+            }
         }
     }
 }
@@ -294,6 +329,8 @@ pub struct Catalog {
     schema_version: u64,
     /// Known databases
     databases: HashSet<String>,
+    /// Stored procedures by name
+    procedures: HashMap<String, ProcedureDef>,
 }
 
 impl Catalog {
@@ -306,6 +343,7 @@ impl Catalog {
             indexes: HashMap::new(),
             schema_version: 0,
             databases,
+            procedures: HashMap::new(),
         }
     }
 
@@ -528,6 +566,52 @@ impl Catalog {
             .values()
             .filter(|idx| idx.table == table)
             .collect()
+    }
+
+    // ============ Procedure operations ============
+
+    /// Create a stored procedure
+    pub fn create_procedure(&mut self, def: ProcedureDef) -> CatalogResult<()> {
+        if def.name.is_empty() {
+            return Err(CatalogError::InvalidName(
+                "Procedure name cannot be empty".into(),
+            ));
+        }
+        if self.procedures.contains_key(&def.name) {
+            return Err(CatalogError::ProcedureExists(def.name.clone()));
+        }
+        self.procedures.insert(def.name.clone(), def);
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Drop a stored procedure
+    pub fn drop_procedure(&mut self, name: &str) -> CatalogResult<()> {
+        if self.procedures.remove(name).is_none() {
+            return Err(CatalogError::ProcedureNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get a stored procedure definition
+    pub fn get_procedure(&self, name: &str) -> Option<&ProcedureDef> {
+        self.procedures.get(name)
+    }
+
+    /// Register a procedure directly (for rebuilding from storage)
+    pub fn register_procedure(&mut self, def: ProcedureDef) {
+        self.procedures.insert(def.name.clone(), def);
+    }
+
+    /// Check if a procedure exists
+    pub fn procedure_exists(&self, name: &str) -> bool {
+        self.procedures.contains_key(name)
+    }
+
+    /// Clear all procedures (for re-initialization)
+    pub fn clear_procedures(&mut self) {
+        self.procedures.clear();
     }
 }
 

@@ -661,6 +661,7 @@ impl LogicalPlanBuilder {
                 Literal::Blob(_) => "blob".to_string(),
                 Literal::Placeholder(n) => format!("?{}", n),
             },
+            ResolvedExpr::UserVariable { name } => format!("@{}", name),
             _ => format!("expr_{}", idx),
         }
     }
