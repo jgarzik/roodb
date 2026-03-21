@@ -216,10 +216,13 @@ def reset_test_db(certs, port):
                     and '`' not in name):
                 tables.append(name)
 
-    # Drop all user tables, then recreate the database
+    # Drop all user tables, then recreate the database.
+    # Also brute-force drop common test table names (t1-t9) in case SHOW TABLES missed them.
     drop_sql = ""
     for table in tables:
         drop_sql += f"DROP TABLE IF EXISTS `{table}`;\n"
+    for i in range(1, 10):
+        drop_sql += f"DROP TABLE IF EXISTS t{i};\n"
     drop_sql += "DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n"
 
     subprocess.run(
