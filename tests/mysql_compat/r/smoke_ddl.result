@@ -17,6 +17,6 @@ name
 Robert
 DELETE FROM smoke_t1 WHERE id = 3;
 SELECT COUNT(*) FROM smoke_t1;
-COUNT
+count(NULL)
 2
 DROP TABLE smoke_t1;

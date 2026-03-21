@@ -6,16 +6,16 @@ INSERT INTO expr_t VALUES (3, 30, 'cherry');
 INSERT INTO expr_t VALUES (4, NULL, NULL);
 # Arithmetic
 SELECT 2 + 3;
-expr_0
+2 + 3
 5
 SELECT 10 - 4;
-expr_0
+10 - 4
 6
 SELECT 3 * 7;
-expr_0
+3 * 7
 21
 SELECT 15 / 3;
-expr_0
+15 / 3
 5
 # Comparison
 SELECT id, val FROM expr_t WHERE val > 15;

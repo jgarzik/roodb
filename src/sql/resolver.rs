@@ -1542,8 +1542,27 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
             }
         }
-        // Catch-all
-        _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
+        // Catch-all: try to map by Display name for any unsigned/signed variants
+        // we may have missed
+        _ => {
+            let display = dt.to_string().to_uppercase();
+            if display.contains("UNSIGNED") {
+                if display.starts_with("TINYINT") {
+                    Ok(DataType::TinyInt)
+                } else if display.starts_with("SMALLINT") || display.starts_with("INT2") {
+                    Ok(DataType::SmallInt)
+                } else if display.starts_with("BIGINT") || display.starts_with("INT8") {
+                    Ok(DataType::BigInt)
+                } else {
+                    // Default unsigned int → Int
+                    Ok(DataType::Int)
+                }
+            } else if display.contains("SIGNED") {
+                Ok(DataType::BigInt)
+            } else {
+                Err(SqlError::Unsupported(format!("Data type: {:?}", dt)))
+            }
+        }
     }
 }
 
@@ -1636,7 +1655,7 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::Null => Ok(Literal::Null),
         sp::Value::Boolean(b) => Ok(Literal::Boolean(*b)),
         sp::Value::Number(n, _) => {
-            if n.contains('.') {
+            if n.contains('.') || n.contains('E') || n.contains('e') {
                 let val = n.parse().map_err(|_| {
                     SqlError::InvalidOperation(format!("Invalid float literal: '{}'", n))
                 })?;
@@ -1691,6 +1710,9 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::BitwiseOr => Ok(BinaryOp::BitwiseOr),
         sp::BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),
         sp::BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
+        sp::BinaryOperator::PGBitwiseShiftLeft => Ok(BinaryOp::ShiftLeft),
+        sp::BinaryOperator::PGBitwiseShiftRight => Ok(BinaryOp::ShiftRight),
+        sp::BinaryOperator::MyIntegerDivide => Ok(BinaryOp::IntDiv),
         sp::BinaryOperator::Xor => Ok(BinaryOp::Xor),
         sp::BinaryOperator::Spaceship => Ok(BinaryOp::Spaceship),
         sp::BinaryOperator::Assignment => Ok(BinaryOp::Assign),
@@ -1738,7 +1760,14 @@ fn infer_binary_result_type(
         }
 
         // Bitwise operators return BigInt
-        BinaryOp::BitwiseOr | BinaryOp::BitwiseAnd | BinaryOp::BitwiseXor => Ok(DataType::BigInt),
+        BinaryOp::BitwiseOr
+        | BinaryOp::BitwiseAnd
+        | BinaryOp::BitwiseXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => Ok(DataType::BigInt),
+
+        // Integer division returns BigInt
+        BinaryOp::IntDiv => Ok(DataType::BigInt),
 
         // Logical XOR returns boolean
         BinaryOp::Xor => Ok(DataType::Boolean),
@@ -1817,7 +1846,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
         | "INSERT" => Ok(DataType::Text),
         "STRCMP" => Ok(DataType::BigInt),
-        "MOD" => {
+        "MOD" | "_ROODB_MOD" => {
             if args.is_empty() {
                 Ok(DataType::BigInt)
             } else {

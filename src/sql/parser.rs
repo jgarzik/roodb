@@ -36,10 +36,15 @@ impl Parser {
     ///   (sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...)
     fn normalize_mysql_syntax(sql: &str) -> String {
         use regex::Regex;
+        // MOD is a keyword in sqlparser, so MOD(x,y) doesn't parse as a function call.
+        // Replace MOD( with _ROODB_MOD( to make it a normal function name.
+        let re_mod = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
+        let result = re_mod.replace_all(sql, "_ROODB_MOD(");
+
         // Replace bare `charset <name>` (not preceded by DEFAULT or CHARACTER)
         // after a closing paren or table option context
         let re = Regex::new(r"(?i)\)\s+charset\s+(\w+)").unwrap();
-        let result = re.replace_all(sql, ") DEFAULT CHARSET=$1");
+        let result = re.replace_all(&result, ") DEFAULT CHARSET=$1");
 
         // Normalize CREATE PROCEDURE: insert AS before BEGIN if missing
         // MySQL: CREATE PROCEDURE name(...) BEGIN ... END

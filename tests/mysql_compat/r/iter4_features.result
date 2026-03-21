@@ -1,30 +1,30 @@
 # Test: Iteration 4 features — CASE, multi-DROP, TRUNCATE, SET NAMES
 # CASE expression (searched)
 SELECT CASE WHEN 1=1 THEN 'yes' ELSE 'no' END;
-expr_0
+CASE
 yes
 SELECT CASE WHEN 1=0 THEN 'yes' ELSE 'no' END;
-expr_0
+CASE
 no
 SELECT CASE WHEN 1=0 THEN 'a' WHEN 2=2 THEN 'b' ELSE 'c' END;
-expr_0
+CASE
 b
 # CASE expression (simple)
 SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
-expr_0
+CASE
 one
 SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
-expr_0
+CASE
 two
 SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
-expr_0
+CASE
 other
 # CASE with NULL
 SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'no match' END;
-expr_0
+CASE
 no match
 SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END;
-expr_0
+CASE
 no
 # Multi-table DROP
 CREATE TABLE mt1 (id INT NOT NULL, PRIMARY KEY (id));
@@ -38,11 +38,11 @@ CREATE TABLE trunc_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
 INSERT INTO trunc_t VALUES (1, 10);
 INSERT INTO trunc_t VALUES (2, 20);
 SELECT COUNT(*) FROM trunc_t;
-COUNT
+count(NULL)
 2
 TRUNCATE TABLE trunc_t;
 SELECT COUNT(*) FROM trunc_t;
-COUNT
+count(NULL)
 0
 DROP TABLE trunc_t;
 # SET NAMES (no-op for compat)

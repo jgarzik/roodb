@@ -185,6 +185,9 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
             | BinaryOp::BitwiseOr
             | BinaryOp::BitwiseAnd
             | BinaryOp::BitwiseXor
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::IntDiv
     ) && (left.is_null() || right.is_null())
     {
         return Ok(Datum::Null);
@@ -231,6 +234,11 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
         BinaryOp::BitwiseOr => eval_bitwise_or(left, right),
         BinaryOp::BitwiseAnd => eval_bitwise_and(left, right),
         BinaryOp::BitwiseXor => eval_bitwise_xor(left, right),
+        BinaryOp::ShiftLeft => eval_shift_left(left, right),
+        BinaryOp::ShiftRight => eval_shift_right(left, right),
+
+        // Integer division (DIV)
+        BinaryOp::IntDiv => eval_int_div(left, right),
 
         // Logical XOR (with three-valued logic)
         BinaryOp::Xor => eval_xor(left, right),
@@ -312,7 +320,8 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     }
 
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a / b)),
+        // MySQL: integer / integer returns DECIMAL (float), not integer
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Float(*a as f64 / *b as f64)),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a / b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 / b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a / *b as f64)),
@@ -381,6 +390,65 @@ fn eval_bitwise_xor(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Some(a), Some(b)) => Ok(Datum::Int(a ^ b)),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot bitwise XOR {:?} and {:?}",
+            left, right
+        ))),
+    }
+}
+
+fn eval_shift_left(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    match (to_bitwise_int(left), to_bitwise_int(right)) {
+        (Some(a), Some(b)) => {
+            let shift = b as u32;
+            // MySQL: shift >= 64 gives 0
+            let result = if shift >= 64 {
+                0u64
+            } else {
+                (a as u64) << shift
+            };
+            Ok(Datum::Int(result as i64))
+        }
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot shift {:?} << {:?}",
+            left, right
+        ))),
+    }
+}
+
+fn eval_shift_right(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    match (to_bitwise_int(left), to_bitwise_int(right)) {
+        (Some(a), Some(b)) => {
+            let shift = b as u32;
+            // MySQL: shift >= 64 gives 0
+            let result = if shift >= 64 {
+                0u64
+            } else {
+                (a as u64) >> shift
+            };
+            Ok(Datum::Int(result as i64))
+        }
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot shift {:?} >> {:?}",
+            left, right
+        ))),
+    }
+}
+
+fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    let left = promote_bit(left);
+    let right = promote_bit(right);
+    // DIV by zero returns NULL (MySQL semantics)
+    match right.as_ref() {
+        Datum::Int(0) => return Ok(Datum::Null),
+        Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
+        _ => {}
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a / b)),
+        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Int((*a as i64) / (*b as i64))),
+        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Int(a / *b as i64)),
+        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Int(*a as i64 / b)),
+        _ => Err(ExecutorError::InvalidOperation(format!(
+            "cannot integer divide {:?} by {:?}",
             left, right
         ))),
     }
@@ -837,7 +905,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }))
         }
 
-        "MOD" => {
+        "MOD" | "_ROODB_MOD" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
                     "MOD requires 2 arguments".to_string(),

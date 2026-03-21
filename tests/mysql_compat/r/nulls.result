@@ -16,15 +16,15 @@ id
 2
 # NULL in expressions
 SELECT id, val + 1 FROM null_t;
-id	expr_1
+id	val + 1
 1	11
 2	NULL
 3	1
 # COUNT with NULLs
 SELECT COUNT(*) FROM null_t;
-COUNT
+count(NULL)
 3
 SELECT COUNT(val) FROM null_t;
-COUNT
+count(val)
 2
 DROP TABLE null_t;

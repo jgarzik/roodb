@@ -139,12 +139,18 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         Datum::Bool(b) => encode_length_encoded_string(if *b { "1" } else { "0" }),
         Datum::Int(i) => encode_length_encoded_string(&i.to_string()),
         Datum::Float(f) => {
-            // Use enough precision for round-trip
-            encode_length_encoded_string(
-                format!("{:.15}", f)
-                    .trim_end_matches('0')
-                    .trim_end_matches('.'),
-            )
+            // MySQL formats division results as DECIMAL with 4 decimal places.
+            // For floats that are exact decimals (from int/int division), use 4 places.
+            // For others, use enough precision for round-trip but trim trailing zeros.
+            let formatted = format!("{:.15}", f);
+            let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+            // Ensure at least 1 decimal place for non-integer floats
+            let result = if !trimmed.contains('.') && f.fract() != 0.0 {
+                format!("{:.1}", f)
+            } else {
+                trimmed.to_string()
+            };
+            encode_length_encoded_string(&result)
         }
         Datum::String(s) => encode_length_encoded_string(s),
         Datum::Bytes(b) => super::packet::encode_length_encoded_bytes(b),

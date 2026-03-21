@@ -40,6 +40,10 @@ pub enum BinaryOp {
     BitwiseOr,
     BitwiseAnd,
     BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+    // Integer division
+    IntDiv,
     // Logical
     Xor,
     // NULL-safe comparison

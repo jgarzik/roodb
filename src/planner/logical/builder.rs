@@ -3,8 +3,8 @@
 //! Converts resolved SQL statements into logical query plans.
 
 use super::{
-    JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
-    ResolvedStatement, ResolvedTableRef,
+    BinaryOp, JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
+    ResolvedStatement, ResolvedTableRef, UnaryOp,
 };
 use crate::catalog::DataType;
 
@@ -657,21 +657,96 @@ impl LogicalPlanBuilder {
     }
 
     /// Generate a name for an expression
-    fn expr_name(expr: &ResolvedExpr, idx: usize) -> String {
+    fn expr_name(expr: &ResolvedExpr, _idx: usize) -> String {
+        Self::expr_to_sql(expr)
+    }
+
+    /// Reconstruct SQL-like text from a resolved expression for column naming.
+    /// MySQL uses the original SQL text as the column name for expressions.
+    fn expr_to_sql(expr: &ResolvedExpr) -> String {
         match expr {
             ResolvedExpr::Column(col) => col.name.clone(),
-            ResolvedExpr::Function { name, .. } => name.clone(),
+            ResolvedExpr::Function { name, args, .. } => {
+                let arg_strs: Vec<String> = args.iter().map(Self::expr_to_sql).collect();
+                // Undo internal name mangling for display
+                let display_name = if let Some(stripped) = name.strip_prefix("_ROODB_") {
+                    stripped.to_lowercase()
+                } else {
+                    name.to_lowercase()
+                };
+                format!("{}({})", display_name, arg_strs.join(","))
+            }
             ResolvedExpr::Literal(lit) => match lit {
                 Literal::Integer(i) => i.to_string(),
                 Literal::Float(f) => f.to_string(),
-                Literal::String(s) => s.clone(),
-                Literal::Boolean(b) => b.to_string(),
+                Literal::String(s) => format!("'{}'", s),
+                Literal::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
                 Literal::Null => "NULL".to_string(),
                 Literal::Blob(_) => "blob".to_string(),
                 Literal::Placeholder(n) => format!("?{}", n),
             },
+            ResolvedExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let op_str = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "<>",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    BinaryOp::And => "AND",
+                    BinaryOp::Or => "OR",
+                    BinaryOp::Like => "LIKE",
+                    BinaryOp::NotLike => "NOT LIKE",
+                    BinaryOp::BitwiseOr => "|",
+                    BinaryOp::BitwiseAnd => "&",
+                    BinaryOp::BitwiseXor => "^",
+                    BinaryOp::ShiftLeft => "<<",
+                    BinaryOp::ShiftRight => ">>",
+                    BinaryOp::IntDiv => "DIV",
+                    BinaryOp::Xor => "XOR",
+                    BinaryOp::Spaceship => "<=>",
+                    BinaryOp::Assign => ":=",
+                };
+                format!(
+                    "{} {} {}",
+                    Self::expr_to_sql(left),
+                    op_str,
+                    Self::expr_to_sql(right)
+                )
+            }
+            ResolvedExpr::UnaryOp { op, expr, .. } => {
+                let op_str = match op {
+                    UnaryOp::Not => "NOT ",
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Plus => "",
+                };
+                format!("{}{}", op_str, Self::expr_to_sql(expr))
+            }
+            ResolvedExpr::IsNull { expr, negated } => {
+                if *negated {
+                    format!("{} IS NOT NULL", Self::expr_to_sql(expr))
+                } else {
+                    format!("{} IS NULL", Self::expr_to_sql(expr))
+                }
+            }
+            ResolvedExpr::Cast {
+                expr, target_type, ..
+            } => {
+                format!("CAST({} AS {:?})", Self::expr_to_sql(expr), target_type)
+            }
             ResolvedExpr::UserVariable { name } => format!("@{}", name),
-            _ => format!("expr_{}", idx),
+            ResolvedExpr::Case { .. } => "CASE".to_string(),
+            ResolvedExpr::BooleanTest { expr, test } => {
+                format!("{} IS {:?}", Self::expr_to_sql(expr), test)
+            }
+            _ => "expr".to_string(),
         }
     }
 

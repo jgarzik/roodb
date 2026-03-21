@@ -1,35 +1,35 @@
 # Test: Bitwise operators
 # Bitwise OR
 SELECT 1 | 2;
-expr_0
+1 | 2
 3
 SELECT 5 | 3;
-expr_0
+5 | 3
 7
 # Bitwise AND
 SELECT 5 & 3;
-expr_0
+5 & 3
 1
 SELECT 7 & 2;
-expr_0
+7 & 2
 2
 # Bitwise XOR
 SELECT 5 ^ 3;
-expr_0
+5 ^ 3
 6
 SELECT 7 ^ 2;
-expr_0
+7 ^ 2
 5
 # NULL propagation for bitwise ops
 SELECT 1 | NULL;
-expr_0
+1 | NULL
 NULL
 SELECT 1 & NULL;
-expr_0
+1 & NULL
 NULL
 SELECT 1 ^ NULL;
-expr_0
+1 ^ NULL
 NULL
 SELECT NULL | NULL;
-expr_0
+NULL | NULL
 NULL

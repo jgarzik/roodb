@@ -74,13 +74,13 @@ id	price
 DROP TABLE dec_t;
 # CAST AS UNSIGNED
 SELECT CAST(1-2 AS UNSIGNED);
-expr_0
+CAST(1 - 2 AS BigInt)
 -1
 SELECT CAST(-1 AS SIGNED);
-expr_0
+CAST(-1 AS BigInt)
 -1
 SELECT CAST('123' AS SIGNED);
-expr_0
+CAST('123' AS BigInt)
 123
 # Multi-table DROP
 CREATE TABLE mt_a (id INT NOT NULL, PRIMARY KEY (id));
