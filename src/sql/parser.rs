@@ -48,10 +48,13 @@ impl Parser {
     ///   (sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...)
     fn normalize_mysql_syntax(sql: &str) -> String {
         use regex::Regex;
-        // MOD and INSERT are keywords in sqlparser, so MOD(x,y) and INSERT(s,p,l,r)
-        // don't parse as function calls. Replace with internal names.
-        let re_mod = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
-        let result = re_mod.replace_all(sql, "_ROODB_MOD(");
+        // MOD is a keyword in sqlparser. Handle both MOD(x,y) function and x MOD y infix.
+        // Replace MOD( with _ROODB_MOD( for function call form.
+        let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
+        let result = re_mod_fn.replace_all(sql, "_ROODB_MOD(");
+        // Replace infix `x MOD y` with `x % y` (but not _ROODB_MOD)
+        let re_mod_infix = Regex::new(r"(?i)(\d+)\s+MOD\s+(\d+)").unwrap();
+        let result = re_mod_infix.replace_all(&result, "$1 % $2");
         let re_insert_fn = Regex::new(r"(?i)\bINSERT\s*\(").unwrap();
         let result = re_insert_fn.replace_all(&result, "_ROODB_INSERT(");
 
@@ -72,6 +75,10 @@ impl Parser {
                 })
                 .to_string()
         };
+
+        // MySQL ZEROFILL is a display attribute that sqlparser doesn't handle. Strip it.
+        let re_zerofill = Regex::new(r"(?i)\s+ZEROFILL\b").unwrap();
+        let result = re_zerofill.replace_all(&result, "");
 
         // MySQL allows BLOB(N) and TEXT(N) with size hints that sqlparser doesn't accept.
         // Strip the size hint: BLOB(250) → BLOB, TEXT(70000) → TEXT

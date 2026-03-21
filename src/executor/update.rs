@@ -94,7 +94,10 @@ impl Update {
                 }
             }
             for (col, expr) in &self.assignments {
-                let new_value = evaluate(expr, &row, &self.user_variables)?;
+                let mut new_value = evaluate(expr, &row, &self.user_variables)?;
+                if new_value.is_null() && !col.nullable {
+                    new_value = super::datum::Datum::default_for_type(&col.data_type);
+                }
                 row.set(col.index, new_value)?;
             }
             let new_value = encode_row(&row);
@@ -140,7 +143,11 @@ impl Update {
                 }
             }
             for (col, expr) in &self.assignments {
-                let new_value = evaluate(expr, &row, &self.user_variables)?;
+                let mut new_value = evaluate(expr, &row, &self.user_variables)?;
+                // MySQL: SET col=NULL on NOT NULL column → use default value
+                if new_value.is_null() && !col.nullable {
+                    new_value = super::datum::Datum::default_for_type(&col.data_type);
+                }
                 row.set(col.index, new_value)?;
             }
             let new_value = encode_row(&row);

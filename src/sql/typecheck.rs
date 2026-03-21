@@ -90,13 +90,8 @@ impl TypeChecker {
                 &assign.value,
             )?;
 
-            // Check NOT NULL constraints
-            if !assign.column.nullable && Self::is_definitely_null(&assign.value) {
-                return Err(SqlError::InvalidOperation(format!(
-                    "Column '{}' cannot be NULL",
-                    assign.column.name
-                )));
-            }
+            // MySQL: UPDATE SET col=NULL on NOT NULL column silently sets to default.
+            // Don't reject at typecheck time — let the executor handle coercion.
         }
 
         // Check filter is boolean

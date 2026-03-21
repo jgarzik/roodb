@@ -531,8 +531,10 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
     // Check if type already matches
     let already_matches = matches!(
         (&datum, target),
-        (Datum::Int(_), DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt)
-            | (Datum::Float(_), DataType::Float | DataType::Double)
+        (
+            Datum::Int(_),
+            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt
+        ) | (Datum::Float(_), DataType::Float | DataType::Double)
             | (Datum::String(_), DataType::Varchar(_) | DataType::Text)
             | (Datum::Bool(_), DataType::Boolean)
             | (Datum::Bytes(_), DataType::Blob)

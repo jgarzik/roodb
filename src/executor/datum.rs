@@ -34,6 +34,25 @@ impl Datum {
         matches!(self, Datum::Null)
     }
 
+    /// Get the default/zero value for a given data type.
+    /// Used when MySQL silently coerces NULL to default on NOT NULL columns.
+    pub fn default_for_type(dt: &DataType) -> Datum {
+        match dt {
+            DataType::Boolean => Datum::Bool(false),
+            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt => {
+                Datum::Int(0)
+            }
+            DataType::Float | DataType::Double => Datum::Float(0.0),
+            DataType::Varchar(_) | DataType::Text => Datum::String(String::new()),
+            DataType::Blob => Datum::Bytes(Vec::new()),
+            DataType::Bit(w) => Datum::Bit {
+                value: 0,
+                width: *w,
+            },
+            DataType::Timestamp => Datum::Int(0),
+        }
+    }
+
     /// Get a numeric type tag for ordering different types
     fn type_tag(&self) -> u8 {
         match self {
