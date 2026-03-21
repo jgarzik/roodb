@@ -113,6 +113,9 @@ pub struct Session {
     // User variables (@var)
     /// Per-session user variable storage
     user_variables: UserVariables,
+
+    /// SQL-level prepared statements (PREPARE stmt FROM 'sql')
+    pub sql_prepared_stmts: std::collections::HashMap<String, String>,
 }
 
 impl Session {
@@ -135,6 +138,8 @@ impl Session {
             warnings: Vec::new(),
             // User variables
             user_variables: Arc::new(RwLock::new(HashMap::new())),
+            // SQL prepared statements
+            sql_prepared_stmts: std::collections::HashMap::new(),
         }
     }
 

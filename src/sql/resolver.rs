@@ -291,7 +291,11 @@ impl<'a> Resolver<'a> {
             let idx = table_def
                 .get_column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            column_indices.push((idx, col_def.nullable, col_name.clone()));
+            column_indices.push((
+                idx,
+                col_def.nullable || col_def.auto_increment,
+                col_name.clone(),
+            ));
         }
 
         // Build scope for expression resolution
@@ -1984,6 +1988,9 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
         sp::BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
         sp::BinaryOperator::And => Ok(BinaryOp::And),
         sp::BinaryOperator::Or => Ok(BinaryOp::Or),
+        // MySQL: || is OR (not string concat), && is AND
+        sp::BinaryOperator::StringConcat => Ok(BinaryOp::Or),
+        sp::BinaryOperator::PGOverlap => Ok(BinaryOp::And),
         sp::BinaryOperator::BitwiseOr => Ok(BinaryOp::BitwiseOr),
         sp::BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),
         sp::BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
@@ -2000,7 +2007,7 @@ fn convert_binary_op(op: &sp::BinaryOperator) -> SqlResult<BinaryOp> {
 /// Convert unary operator
 fn convert_unary_op(op: &sp::UnaryOperator) -> SqlResult<UnaryOp> {
     match op {
-        sp::UnaryOperator::Not => Ok(UnaryOp::Not),
+        sp::UnaryOperator::Not | sp::UnaryOperator::BangNot => Ok(UnaryOp::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOp::Neg),
         sp::UnaryOperator::Plus => Ok(UnaryOp::Plus),
         sp::UnaryOperator::BitwiseNot => Ok(UnaryOp::BitwiseNot),
@@ -2123,7 +2130,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "NOW" | "CURRENT_TIMESTAMP" => Ok(DataType::Timestamp),
         "HEX" | "UNHEX" => Ok(DataType::Text),
         "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
-        | "INSERT" => Ok(DataType::Text),
+        | "INSERT" | "_ROODB_INSERT" => Ok(DataType::Text),
         "STRCMP" => Ok(DataType::BigInt),
         "MOD" | "_ROODB_MOD" => {
             if args.is_empty() {
@@ -2143,6 +2150,15 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "BIT_COUNT" => Ok(DataType::BigInt),
         "REGEXP" => Ok(DataType::Boolean),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
+        "TO_DAYS" | "FROM_DAYS" | "DATEDIFF" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR"
+        | "HOUR" | "MINUTE" | "SECOND" | "MONTH" | "YEAR" | "WEEK" | "QUARTER" | "WEEKDAY"
+        | "YEARWEEK" | "UNIX_TIMESTAMP" | "TIME_TO_SEC" | "PERIOD_ADD" | "PERIOD_DIFF" => {
+            Ok(DataType::BigInt)
+        }
+        "FROM_UNIXTIME" | "DATE_FORMAT" | "STR_TO_DATE" | "DATE_ADD" | "DATE_SUB" | "ADDDATE"
+        | "SUBDATE" | "MAKEDATE" | "MAKETIME" | "SEC_TO_TIME" | "TIMEDIFF" | "TIMESTAMPADD"
+        | "TIMESTAMPDIFF" | "CURDATE" | "CURTIME" | "SYSDATE" | "UTC_DATE" | "UTC_TIME"
+        | "UTC_TIMESTAMP" => Ok(DataType::Text),
         "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"

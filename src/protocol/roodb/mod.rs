@@ -1013,6 +1013,11 @@ where
             return Ok(result);
         }
 
+        // Handle SQL-level PREPARE/EXECUTE/DEALLOCATE (text protocol prepared statements)
+        if let Some(()) = self.try_handle_sql_prepare(sql).await? {
+            return Ok(());
+        }
+
         // Handle SET @var = expr (user variables)
         {
             let upper = sql.trim().to_uppercase();
@@ -1947,6 +1952,99 @@ where
         }
 
         self.send_ok(0, 0).await.map(Some)
+    }
+
+    /// Handle SQL-level PREPARE/EXECUTE/DEALLOCATE for text protocol prepared statements.
+    ///
+    /// MySQL syntax:
+    ///   PREPARE stmt_name FROM 'sql_text'
+    ///   EXECUTE stmt_name [USING @var1, @var2, ...]
+    ///   DEALLOCATE PREPARE stmt_name / DROP PREPARE stmt_name
+    async fn try_handle_sql_prepare(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_uppercase();
+
+        if upper.starts_with("PREPARE ") {
+            // PREPARE stmt_name FROM 'sql_text'
+            let rest = trimmed[8..].trim();
+            if let Some(from_pos) = rest.to_uppercase().find(" FROM ") {
+                let stmt_name = rest[..from_pos].trim().to_string();
+                let sql_text = rest[from_pos + 6..].trim();
+                // Strip surrounding quotes
+                let sql_text = if (sql_text.starts_with('\'') && sql_text.ends_with('\''))
+                    || (sql_text.starts_with('"') && sql_text.ends_with('"'))
+                {
+                    &sql_text[1..sql_text.len() - 1]
+                } else {
+                    sql_text
+                };
+                self.session
+                    .sql_prepared_stmts
+                    .insert(stmt_name, sql_text.to_string());
+                self.send_ok(0, 0).await?;
+                return Ok(Some(()));
+            }
+        } else if upper.starts_with("EXECUTE ") {
+            // EXECUTE stmt_name [USING @var1, @var2, ...]
+            let rest = trimmed[8..].trim();
+            let parts: Vec<&str> = rest.splitn(2, |c: char| c.is_whitespace()).collect();
+            let stmt_name = parts[0].trim_end_matches(';').to_string();
+            if let Some(sql_text) = self.session.sql_prepared_stmts.get(&stmt_name).cloned() {
+                // Substitute ? placeholders with USING variable values
+                let mut final_sql = sql_text.clone();
+                if let Some(using_part) = rest.to_uppercase().find("USING ") {
+                    let vars_str = &rest[using_part + 6..];
+                    let var_names: Vec<&str> = vars_str
+                        .split(',')
+                        .map(|s| s.trim().trim_end_matches(';'))
+                        .collect();
+                    for var_name in var_names {
+                        let var_key = var_name.trim_start_matches('@').to_lowercase();
+                        let val = self.session.user_variables().read().get(&var_key).cloned();
+                        let replacement = match val {
+                            Some(ref d) => d.to_sql_literal(),
+                            None => "NULL".to_string(),
+                        };
+                        // Replace first ? with the value
+                        if let Some(pos) = final_sql.find('?') {
+                            final_sql = format!(
+                                "{}{}{}",
+                                &final_sql[..pos],
+                                replacement,
+                                &final_sql[pos + 1..]
+                            );
+                        }
+                    }
+                }
+                return self.handle_query(&final_sql).await.map(|_| Some(()));
+            } else {
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!(
+                        "Unknown prepared statement handler ({}) given to EXECUTE",
+                        stmt_name
+                    ),
+                )
+                .await?;
+                return Ok(Some(()));
+            }
+        } else if upper.starts_with("DEALLOCATE PREPARE ") || upper.starts_with("DROP PREPARE ") {
+            let prefix_len = if upper.starts_with("DEALLOCATE") {
+                19
+            } else {
+                13
+            };
+            let stmt_name = trimmed[prefix_len..]
+                .trim()
+                .trim_end_matches(';')
+                .to_string();
+            self.session.sql_prepared_stmts.remove(&stmt_name);
+            self.send_ok(0, 0).await?;
+            return Ok(Some(()));
+        }
+
+        Ok(None)
     }
 
     /// Try to handle USE database command via SQL

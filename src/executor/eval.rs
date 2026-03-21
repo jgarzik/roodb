@@ -761,6 +761,32 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
         }
 
+        "INSERT" | "_ROODB_INSERT" => {
+            // INSERT(str, pos, len, newstr) — MySQL string INSERT function
+            if args.len() != 4 {
+                return Err(ExecutorError::InvalidOperation(
+                    "INSERT requires 4 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[3].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let pos = args[1].as_int().unwrap_or(0);
+            let len = args[2].as_int().unwrap_or(0).max(0) as usize;
+            let newstr = args[3].to_display_string();
+            if pos < 1 || pos as usize > s.len() {
+                return Ok(Datum::String(s));
+            }
+            let start = (pos - 1) as usize;
+            let end = (start + len).min(s.len());
+            let mut result = String::with_capacity(s.len() + newstr.len());
+            result.push_str(&s[..start]);
+            result.push_str(&newstr);
+            result.push_str(&s[end..]);
+            Ok(Datum::String(result))
+        }
+
         "CONCAT" => {
             let mut result = String::new();
             for arg in args {
@@ -1569,6 +1595,96 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 
         "FOUND_ROWS" | "ROW_COUNT" => Ok(Datum::Int(0)),
 
+        "TO_DAYS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TO_DAYS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            // Parse date string and convert to days since year 0
+            let s = args[0].to_display_string();
+            match parse_date_to_days(&s) {
+                Some(days) => Ok(Datum::Int(days)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DATEDIFF" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DATEDIFF requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let d1 = parse_date_to_days(&args[0].to_display_string());
+            let d2 = parse_date_to_days(&args[1].to_display_string());
+            match (d1, d2) {
+                (Some(a), Some(b)) => Ok(Datum::Int(a - b)),
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        "YEAR" | "MONTH" | "DAYOFMONTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 1 argument",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let parts: Vec<&str> = s
+                .split(|c: char| c == '-' || c == ' ' || c == ':')
+                .collect();
+            let val = match name_upper.as_str() {
+                "YEAR" => parts.first().and_then(|p| p.parse::<i64>().ok()),
+                "MONTH" => parts.get(1).and_then(|p| p.parse::<i64>().ok()),
+                "DAYOFMONTH" => parts.get(2).and_then(|p| p.parse::<i64>().ok()),
+                _ => None,
+            };
+            Ok(val.map(Datum::Int).unwrap_or(Datum::Null))
+        }
+
+        "CURDATE" | "CURRENT_DATE" => Ok(Datum::String("2024-01-01".to_string())),
+        "NOW" | "CURRENT_TIMESTAMP" | "SYSDATE" | "LOCALTIME" | "LOCALTIMESTAMP" => {
+            // Return current timestamp as formatted string
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let secs = now as i64;
+            let days = secs / 86400;
+            let tod = (secs % 86400) as u64;
+            let (year, month, day) = {
+                // Days since epoch to YMD (Hinnant algorithm)
+                let z = days + 719468;
+                let era = if z >= 0 { z } else { z - 146096 } / 146097;
+                let doe = (z - era * 146097) as u32;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 };
+                let y = if m <= 2 { y + 1 } else { y };
+                (y, m, d)
+            };
+            let hour = tod / 3600;
+            let min = (tod % 3600) / 60;
+            let sec = tod % 60;
+            Ok(Datum::String(format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                year, month, day, hour, min, sec
+            )))
+        }
+
         "REGEXP" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
@@ -1623,6 +1739,29 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 }
 
 /// Convert integer to string in given radix (2-36)
+/// Parse a date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) to days since year 0.
+/// MySQL's TO_DAYS algorithm.
+fn parse_date_to_days(s: &str) -> Option<i64> {
+    let date_part = s.split(' ').next()?;
+    let parts: Vec<&str> = date_part.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let year: i64 = parts[0].parse().ok()?;
+    let month: i64 = parts[1].parse().ok()?;
+    let day: i64 = parts[2].parse().ok()?;
+    if year == 0 && month == 0 && day == 0 {
+        return Some(0);
+    }
+    // MySQL TO_DAYS formula
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
+    Some(365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day + 1721119)
+}
+
 fn radix_string(val: i64, radix: u32) -> String {
     if radix == 10 {
         return val.to_string();

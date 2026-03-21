@@ -43,15 +43,63 @@ impl Parser {
     ///   (sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...)
     fn normalize_mysql_syntax(sql: &str) -> String {
         use regex::Regex;
-        // MOD is a keyword in sqlparser, so MOD(x,y) doesn't parse as a function call.
-        // Replace MOD( with _ROODB_MOD( to make it a normal function name.
+        // MOD and INSERT are keywords in sqlparser, so MOD(x,y) and INSERT(s,p,l,r)
+        // don't parse as function calls. Replace with internal names.
         let re_mod = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
         let result = re_mod.replace_all(sql, "_ROODB_MOD(");
+        let re_insert_fn = Regex::new(r"(?i)\bINSERT\s*\(").unwrap();
+        let result = re_insert_fn.replace_all(&result, "_ROODB_INSERT(");
+
+        // MySQL `!expr` is NOT — sqlparser doesn't parse `!` as unary NOT in MySQL dialect.
+        // Replace `!` (when used as unary prefix, not !=) with NOT
+        let re_bang = Regex::new(r"!([^=])").unwrap();
+        let result = re_bang.replace_all(&result, "NOT $1");
+
+        // MySQL `DEFAULT` keyword in VALUES context → NULL (auto-fill with default value)
+        let re_default = Regex::new(r"(?i)\bVALUES\b[^;]*").unwrap();
+        let result = {
+            let s = result.to_string();
+            re_default
+                .replace_all(&s, |caps: &regex::Captures| {
+                    caps[0]
+                        .replace("DEFAULT", "NULL")
+                        .replace("default", "NULL")
+                })
+                .to_string()
+        };
 
         // MySQL allows BLOB(N) and TEXT(N) with size hints that sqlparser doesn't accept.
         // Strip the size hint: BLOB(250) → BLOB, TEXT(70000) → TEXT
         let re_blob_size = Regex::new(r"(?i)\b(BLOB|TEXT)\s*\(\s*\d+\s*\)").unwrap();
         let result = re_blob_size.replace_all(&result, "$1");
+
+        // MySQL `LONG` type = MEDIUMTEXT, `LONG BYTE` = MEDIUMBLOB
+        // Must replace LONG BYTE before standalone LONG
+        let re_long_byte = Regex::new(r"(?i)\bLONG\s+BYTE\b").unwrap();
+        let result = re_long_byte.replace_all(&result, "MEDIUMBLOB");
+        // Replace standalone LONG (not followed by known compound types)
+        // We match LONG and check the next word in a callback
+        let result = {
+            let s = result.to_string();
+            let re_long = Regex::new(r"(?i)\bLONG\b").unwrap();
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0;
+            for m in re_long.find_iter(&s) {
+                out.push_str(&s[last..m.start()]);
+                // Check what follows LONG
+                let after = s[m.end()..].trim_start();
+                let next_word = after.split_whitespace().next().unwrap_or("").to_uppercase();
+                if matches!(next_word.as_str(), "VARCHAR" | "BLOB" | "TEXT" | "BYTE") {
+                    // Keep original (LONG VARCHAR, LONG BLOB, etc.)
+                    out.push_str(m.as_str());
+                } else {
+                    out.push_str("MEDIUMTEXT");
+                }
+                last = m.end();
+            }
+            out.push_str(&s[last..]);
+            out
+        };
 
         // Replace bare `charset <name>` (not preceded by DEFAULT or CHARACTER)
         // after a closing paren or table option context
