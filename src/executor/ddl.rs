@@ -969,49 +969,29 @@ pub struct CreateTableAs {
     rows_inserted: u64,
 }
 
-impl CreateTableAs {
-    pub fn new(
-        name: String,
-        columns: Vec<ColumnDef>,
-        constraints: Vec<Constraint>,
-        if_not_exists: bool,
-        catalog: Arc<RwLock<Catalog>>,
-        source: Box<dyn Executor>,
-        txn_context: Option<TransactionContext>,
-    ) -> Self {
-        CreateTableAs {
-            name,
-            columns,
-            constraints,
-            if_not_exists,
-            catalog,
-            raft_node: None,
-            source,
-            txn_context,
-            done: false,
-            rows_inserted: 0,
-        }
-    }
+/// Parameters for creating a CreateTableAs executor.
+pub struct CreateTableAsParams {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    pub constraints: Vec<Constraint>,
+    pub if_not_exists: bool,
+    pub catalog: Arc<RwLock<Catalog>>,
+    pub raft_node: Option<Arc<RaftNode>>,
+    pub source: Box<dyn Executor>,
+    pub txn_context: Option<TransactionContext>,
+}
 
-    pub fn with_raft(
-        name: String,
-        columns: Vec<ColumnDef>,
-        constraints: Vec<Constraint>,
-        if_not_exists: bool,
-        catalog: Arc<RwLock<Catalog>>,
-        raft_node: Arc<RaftNode>,
-        source: Box<dyn Executor>,
-        txn_context: Option<TransactionContext>,
-    ) -> Self {
+impl CreateTableAs {
+    pub fn new(params: CreateTableAsParams) -> Self {
         CreateTableAs {
-            name,
-            columns,
-            constraints,
-            if_not_exists,
-            catalog,
-            raft_node: Some(raft_node),
-            source,
-            txn_context,
+            name: params.name,
+            columns: params.columns,
+            constraints: params.constraints,
+            if_not_exists: params.if_not_exists,
+            catalog: params.catalog,
+            raft_node: params.raft_node,
+            source: params.source,
+            txn_context: params.txn_context,
             done: false,
             rows_inserted: 0,
         }

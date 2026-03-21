@@ -1640,9 +1640,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let parts: Vec<&str> = s
-                .split(|c: char| c == '-' || c == ' ' || c == ':')
-                .collect();
+            let parts: Vec<&str> = s.split(['-', ' ', ':']).collect();
             let val = match name_upper.as_str() {
                 "YEAR" => parts.first().and_then(|p| p.parse::<i64>().ok()),
                 "MONTH" => parts.get(1).and_then(|p| p.parse::<i64>().ok()),

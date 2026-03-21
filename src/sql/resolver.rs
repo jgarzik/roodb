@@ -2175,7 +2175,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
         | "LOCATE" | "INSTR" | "FIND_IN_SET" | "POSITION" => Ok(DataType::BigInt),
-        "ELT" | "MAKE_SET" | "EXPORT_SET" | "TIMEDIFF" => Ok(DataType::Text),
+        "ELT" | "MAKE_SET" | "EXPORT_SET" => Ok(DataType::Text),
         "GET_LOCK" | "RELEASE_LOCK" | "IS_FREE_LOCK" => Ok(DataType::BigInt),
         "INET_NTOA" | "INET6_NTOA" => Ok(DataType::Text),
         "INET_ATON" | "INET6_ATON" => Ok(DataType::BigInt),

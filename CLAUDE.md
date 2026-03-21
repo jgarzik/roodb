@@ -90,6 +90,19 @@ Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`,
 - After benchmarks complete, show a comparison table of ALL workload results (before vs after, RooDB vs MySQL).
 - Use `bench/compare.sh` to compare against baseline when available.
 
+## Code Quality Gates
+
+**All of the following MUST pass with ZERO warnings before committing:**
+
+```bash
+cargo build --release    # must compile clean, zero warnings
+cargo clippy             # must pass with zero warnings
+cargo fmt --check        # must be formatted
+cargo test --release     # all tests must pass
+```
+
+These are non-negotiable. Do not commit code with warnings.
+
 ## Code Policies
 
 - `#[allow(dead_code)]` markers are banned — do not use them
