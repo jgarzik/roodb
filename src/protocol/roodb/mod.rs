@@ -2335,13 +2335,26 @@ where
                     .map(|_| Some(())),
             }
         }
-        // DESCRIBE / DESC / SHOW COLUMNS FROM
+        // DESCRIBE / DESC / SHOW COLUMNS FROM / SHOW FULL COLUMNS FROM
         else if sql_upper.starts_with("DESCRIBE ")
             || sql_upper.starts_with("DESC ")
             || sql_upper.starts_with("SHOW COLUMNS FROM ")
             || sql_upper.starts_with("SHOW FIELDS FROM ")
+            || sql_upper.starts_with("SHOW FULL COLUMNS FROM ")
+            || sql_upper.starts_with("SHOW FULL FIELDS FROM ")
         {
-            let table_name = if sql_upper.starts_with("SHOW COLUMNS FROM ")
+            let table_name = if sql_upper.starts_with("SHOW FULL COLUMNS FROM ")
+                || sql_upper.starts_with("SHOW FULL FIELDS FROM ")
+            {
+                sql_trimmed
+                    .split_whitespace()
+                    .nth(4)
+                    .unwrap_or("")
+                    .trim_end_matches(';')
+                    .trim_matches('`')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+            } else if sql_upper.starts_with("SHOW COLUMNS FROM ")
                 || sql_upper.starts_with("SHOW FIELDS FROM ")
             {
                 sql_trimmed

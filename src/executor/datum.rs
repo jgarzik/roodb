@@ -224,14 +224,20 @@ impl Datum {
     }
 
     /// Check if string matches pattern (SQL LIKE)
+    /// MySQL coerces non-string operands to strings for LIKE comparison
     pub fn like(&self, pattern: &Datum) -> Option<Datum> {
         match (self, pattern) {
+            (Datum::Null, _) | (_, Datum::Null) => Some(Datum::Null),
             (Datum::String(s), Datum::String(p)) => {
                 let matched = like_match(s, p);
                 Some(Datum::Bool(matched))
             }
-            (Datum::Null, _) | (_, Datum::Null) => Some(Datum::Null),
-            _ => None,
+            _ => {
+                // Coerce to string for non-string LIKE comparisons
+                let s = self.to_display_string();
+                let p = pattern.to_display_string();
+                Some(Datum::Bool(like_match(&s, &p)))
+            }
         }
     }
 }

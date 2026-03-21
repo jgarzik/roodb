@@ -788,22 +788,30 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
         }
 
         "CONCAT" => {
-            let mut result = String::new();
+            let mut result = Vec::new();
+            let mut has_binary = false;
             for arg in args {
                 match arg {
-                    Datum::String(s) => result.push_str(s),
-                    Datum::Int(i) => result.push_str(&i.to_string()),
-                    Datum::Float(f) => result.push_str(&f.to_string()),
-                    Datum::Bool(b) => result.push_str(if *b { "true" } else { "false" }),
-                    Datum::Null => return Ok(Datum::Null),
-                    _ => {
-                        return Err(ExecutorError::InvalidOperation(
-                            "CONCAT: unsupported type".to_string(),
-                        ))
+                    Datum::String(s) => result.extend_from_slice(s.as_bytes()),
+                    Datum::Int(i) => result.extend_from_slice(i.to_string().as_bytes()),
+                    Datum::Float(f) => result.extend_from_slice(f.to_string().as_bytes()),
+                    Datum::Bool(b) => result.extend_from_slice(if *b { b"true" } else { b"false" }),
+                    Datum::Bytes(b) => {
+                        result.extend_from_slice(b);
+                        has_binary = true;
                     }
+                    Datum::Bit { value, .. } => {
+                        result.extend_from_slice(value.to_string().as_bytes())
+                    }
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => result.extend_from_slice(arg.to_display_string().as_bytes()),
                 }
             }
-            Ok(Datum::String(result))
+            if has_binary {
+                Ok(Datum::Bytes(result))
+            } else {
+                Ok(Datum::String(String::from_utf8(result).unwrap_or_default()))
+            }
         }
 
         "COALESCE" => {
