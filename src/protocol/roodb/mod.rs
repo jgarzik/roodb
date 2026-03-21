@@ -1023,6 +1023,11 @@ where
             return Ok(());
         }
 
+        // Handle UNION queries by executing each side and concatenating results
+        if let Some(()) = self.try_handle_union(sql).await? {
+            return Ok(());
+        }
+
         // Handle SET @var = expr (user variables)
         {
             let upper = sql.trim().to_uppercase();
@@ -1615,6 +1620,45 @@ where
         Ok(())
     }
 
+    /// Send a result set from pre-collected rows (used for UNION)
+    async fn send_collected_result_set(
+        &mut self,
+        columns: &[crate::planner::logical::OutputColumn],
+        rows: Vec<crate::executor::row::Row>,
+    ) -> ProtocolResult<()> {
+        self.writer.set_sequence(1);
+        let count_packet = encode_column_count(columns.len() as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        let schema = self.database.as_deref().unwrap_or("default");
+        for col in columns {
+            let def = ColumnDefinition41::from_output_column(col, "", schema);
+            let def_packet = def.encode();
+            self.writer.write_packet(&def_packet).await?;
+        }
+
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        for row in &rows {
+            let row_packet = encode_text_row(row);
+            self.writer.write_packet(&row_packet).await?;
+        }
+
+        if self.deprecate_eof {
+            let ok = encode_eof_ok_packet(default_status(), 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     /// Try to handle transaction commands (BEGIN, COMMIT, ROLLBACK, SET)
     ///
     /// Returns Some(()) if handled, None if not a transaction command.
@@ -1957,6 +2001,151 @@ where
         }
 
         self.send_ok(0, 0).await.map(Some)
+    }
+
+    /// Handle UNION queries by parsing with sqlparser, executing each side,
+    /// and concatenating results.
+    async fn try_handle_union(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        // Quick check before expensive parsing
+        let upper = sql.to_uppercase();
+        if !upper.contains(" UNION ") {
+            return Ok(None);
+        }
+
+        // Parse with sqlparser to detect UNION
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let normalized = crate::sql::Parser::normalize_for_alter(sql);
+        let ast = match sqlparser::parser::Parser::parse_sql(&dialect, &normalized) {
+            Ok(ast) => ast,
+            Err(_) => return Ok(None),
+        };
+
+        if ast.len() != 1 {
+            return Ok(None);
+        }
+
+        // Check if it's a UNION query
+        let is_union = match &ast[0] {
+            sqlparser::ast::Statement::Query(q) => {
+                matches!(
+                    q.body.as_ref(),
+                    sqlparser::ast::SetExpr::SetOperation { .. }
+                )
+            }
+            _ => false,
+        };
+
+        if !is_union {
+            return Ok(None);
+        }
+
+        // Extract the parts of the UNION by splitting the SQL
+        // This is a simplified approach — split on UNION keyword
+        let union_re = regex::Regex::new(r"(?i)\bUNION\s+(ALL\s+)?").unwrap();
+        let parts: Vec<&str> = union_re.split(sql.trim().trim_end_matches(';')).collect();
+
+        if parts.len() < 2 {
+            return Ok(None);
+        }
+
+        // Execute first query to get columns and initial rows
+        let first_sql = parts[0].trim();
+        let plan = {
+            let catalog_guard = self.catalog.read();
+            let stmt = crate::sql::Parser::parse_one(first_sql).map_err(ProtocolError::Sql)?;
+            let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .resolve(stmt)
+                .map_err(ProtocolError::Sql)?;
+            crate::sql::TypeChecker::check(&resolved).map_err(ProtocolError::Sql)?;
+            let logical = LogicalPlanBuilder::build(resolved).map_err(ProtocolError::Planner)?;
+            let optimized = Optimizer::new().optimize(logical);
+            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(ProtocolError::Planner)?
+        };
+
+        let columns = plan.output_columns();
+        let mvcc = self.mvcc.clone();
+
+        // Create a read-only transaction context for UNION queries
+        let txn = self.txn_manager.begin(self.session.isolation_level, true)?;
+        let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
+        let txn_context = Some(TransactionContext::new(txn.txn_id, read_view));
+
+        // Execute first query
+        let engine = ExecutorEngine::with_raft(
+            mvcc.clone(),
+            self.catalog.clone(),
+            txn_context.clone(),
+            self.raft_node.clone(),
+            self.session.user_variables(),
+        );
+        let mut executor = engine.build(plan)?;
+        executor.open().await?;
+        let mut all_rows = Vec::new();
+        while let Some(row) = executor.next().await? {
+            all_rows.push(row);
+        }
+        executor.close().await?;
+
+        // Execute remaining parts and collect rows
+        for part in &parts[1..] {
+            let part_sql = part.trim();
+            if part_sql.is_empty() {
+                continue;
+            }
+            let plan = {
+                let catalog_guard = self.catalog.read();
+                let stmt = match crate::sql::Parser::parse_one(part_sql) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let resolved = match crate::sql::Resolver::new(&catalog_guard).resolve(stmt) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let _ = crate::sql::TypeChecker::check(&resolved);
+                let logical = match LogicalPlanBuilder::build(resolved) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let optimized = Optimizer::new().optimize(logical);
+                match PhysicalPlanner::plan(optimized, &catalog_guard) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                }
+            };
+
+            let engine = ExecutorEngine::with_raft(
+                mvcc.clone(),
+                self.catalog.clone(),
+                txn_context.clone(),
+                self.raft_node.clone(),
+                self.session.user_variables(),
+            );
+            let mut executor = engine.build(plan)?;
+            executor.open().await?;
+            while let Some(row) = executor.next().await? {
+                all_rows.push(row);
+            }
+            executor.close().await?;
+        }
+
+        // Check if DISTINCT (UNION without ALL)
+        let is_all = upper.contains("UNION ALL");
+        if !is_all {
+            // UNION DISTINCT: remove duplicate rows
+            let mut seen = std::collections::HashSet::new();
+            all_rows.retain(|row| {
+                let key: Vec<_> = row.values().to_vec();
+                seen.insert(key)
+            });
+        }
+
+        // Clean up read-only transaction
+        self.txn_manager.commit(txn.txn_id).await?;
+
+        // Send result set
+        self.send_collected_result_set(&columns, all_rows).await?;
+        Ok(Some(()))
     }
 
     /// Handle ALTER TABLE statements.
