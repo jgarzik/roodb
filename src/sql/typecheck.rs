@@ -290,6 +290,14 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         (DataType::Varchar(_), DataType::Blob) | (DataType::Text, DataType::Blob) => true,
         (DataType::Blob, DataType::Varchar(_)) | (DataType::Blob, DataType::Text) => true,
 
+        // MySQL implicitly converts strings/blobs to numbers and vice versa
+        (a, DataType::Text) | (a, DataType::Varchar(_)) | (a, DataType::Blob) if a.is_numeric() => {
+            true
+        }
+        (DataType::Text, b) | (DataType::Varchar(_), b) | (DataType::Blob, b) if b.is_numeric() => {
+            true
+        }
+
         _ => false,
     }
 }
@@ -381,8 +389,12 @@ mod tests {
         // String types are compatible
         assert!(types_compatible(&DataType::Text, &DataType::Varchar(100)));
 
-        // Incompatible types
-        assert!(!types_compatible(&DataType::Int, &DataType::Text));
-        assert!(!types_compatible(&DataType::Blob, &DataType::Int));
+        // MySQL implicit conversion: strings/blobs ↔ numbers
+        assert!(types_compatible(&DataType::Int, &DataType::Text));
+        assert!(types_compatible(&DataType::Blob, &DataType::Int));
+
+        // Truly incompatible types
+        assert!(!types_compatible(&DataType::Timestamp, &DataType::Int));
+        assert!(!types_compatible(&DataType::Boolean, &DataType::Text));
     }
 }

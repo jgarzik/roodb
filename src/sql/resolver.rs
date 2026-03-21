@@ -275,6 +275,11 @@ impl<'a> Resolver<'a> {
             .get_table(&table)
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
+        // Handle INSERT ... SET syntax by converting to INSERT ... VALUES
+        if !insert.assignments.is_empty() {
+            return self.resolve_insert_set(insert, &table, table_def);
+        }
+
         // Build column list (explicit or all columns)
         let specified_columns: Vec<String> = if insert.columns.is_empty() {
             table_def.columns.iter().map(|c| c.name.clone()).collect()
@@ -388,6 +393,69 @@ impl<'a> Resolver<'a> {
             table,
             columns: resolved_columns,
             values: resolved_values,
+        })
+    }
+
+    /// Resolve INSERT ... SET syntax (MySQL-specific)
+    /// Converts SET a=1, b=2 to equivalent VALUES form
+    fn resolve_insert_set(
+        &self,
+        insert: &sp::Insert,
+        table: &str,
+        table_def: &crate::catalog::TableDef,
+    ) -> SqlResult<ResolvedStatement> {
+        let scope = Scope::single_table(table, table_def);
+
+        // Build resolved columns for all table columns
+        let mut resolved_columns = Vec::new();
+        for (idx, col_def) in table_def.columns.iter().enumerate() {
+            resolved_columns.push(ResolvedColumn {
+                table: table.to_string(),
+                name: col_def.name.clone(),
+                index: idx,
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable || col_def.auto_increment,
+            });
+        }
+
+        // Start with NULLs for all columns
+        let mut full_row: Vec<ResolvedExpr> = table_def
+            .columns
+            .iter()
+            .map(|_| ResolvedExpr::Literal(Literal::Null))
+            .collect();
+
+        // Fill in SET assignments
+        for assign in &insert.assignments {
+            let col_name = match &assign.target {
+                sp::AssignmentTarget::ColumnName(names) => names.to_string(),
+                sp::AssignmentTarget::Tuple(_) => {
+                    return Err(SqlError::Unsupported("Tuple assignment".to_string()))
+                }
+            };
+            let idx = table_def
+                .get_column_index(&col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            let resolved_expr = self.resolve_expr(&assign.value, &scope)?;
+            full_row[idx] = resolved_expr;
+        }
+
+        // Apply defaults for unspecified NOT NULL columns
+        for (idx, col_def) in table_def.columns.iter().enumerate() {
+            if !col_def.nullable
+                && !col_def.auto_increment
+                && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
+            {
+                if let Some(ref default_expr) = col_def.default {
+                    full_row[idx] = ResolvedExpr::Literal(parse_default_value(default_expr));
+                }
+            }
+        }
+
+        Ok(ResolvedStatement::Insert {
+            table: table.to_string(),
+            columns: resolved_columns,
+            values: vec![full_row],
         })
     }
 

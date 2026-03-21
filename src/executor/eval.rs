@@ -528,10 +528,22 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
     if datum.is_null() {
         return datum;
     }
-    if matches!(target, DataType::Bit(_)) && !matches!(datum, Datum::Bit { .. }) {
-        return eval_cast(&datum, target).unwrap_or(datum);
+    // Check if type already matches
+    let already_matches = matches!(
+        (&datum, target),
+        (Datum::Int(_), DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt)
+            | (Datum::Float(_), DataType::Float | DataType::Double)
+            | (Datum::String(_), DataType::Varchar(_) | DataType::Text)
+            | (Datum::Bool(_), DataType::Boolean)
+            | (Datum::Bytes(_), DataType::Blob)
+            | (Datum::Bit { .. }, DataType::Bit(_))
+            | (Datum::Timestamp(_), DataType::Timestamp)
+    );
+    if !already_matches {
+        eval_cast(&datum, target).unwrap_or(datum)
+    } else {
+        datum
     }
-    datum
 }
 
 /// CAST(expr AS type)
@@ -547,7 +559,15 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
             Datum::Int(i) => Ok(Datum::Int(*i)),
             Datum::Float(f) => Ok(Datum::Int(*f as i64)),
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
-            Datum::String(s) => Ok(Datum::Int(s.parse::<i64>().unwrap_or(0))),
+            Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
+            Datum::Bytes(b) => {
+                // Interpret bytes as big-endian unsigned integer
+                let mut val = 0i64;
+                for &byte in b.iter().take(8) {
+                    val = (val << 8) | byte as i64;
+                }
+                Ok(Datum::Int(val))
+            }
             _ => Ok(Datum::Int(0)),
         },
         DataType::Double | DataType::Float => match val {
