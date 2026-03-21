@@ -1028,6 +1028,55 @@ impl<'a> Resolver<'a> {
                 "Subqueries not yet supported".to_string(),
             )),
 
+            // SUBSTRING(expr, from, for) — sqlparser parses as AST node
+            sp::Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let mut args = vec![self.resolve_expr(expr, scope)?];
+                if let Some(from) = substring_from {
+                    args.push(self.resolve_expr(from, scope)?);
+                }
+                if let Some(for_expr) = substring_for {
+                    args.push(self.resolve_expr(for_expr, scope)?);
+                }
+                let result_type = infer_function_result_type("SUBSTRING", &args)?;
+                Ok(ResolvedExpr::Function {
+                    name: "SUBSTRING".to_string(),
+                    args,
+                    distinct: false,
+                    result_type,
+                })
+            }
+
+            // TRIM(expr) — sqlparser parses as AST node
+            sp::Expr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                ..
+            } => {
+                let resolved = self.resolve_expr(expr, scope)?;
+                let name = match trim_where {
+                    Some(sp::TrimWhereField::Leading) => "LTRIM",
+                    Some(sp::TrimWhereField::Trailing) => "RTRIM",
+                    _ => "TRIM",
+                };
+                let mut args = vec![resolved];
+                if let Some(what) = trim_what {
+                    args.push(self.resolve_expr(what, scope)?);
+                }
+                let result_type = infer_function_result_type(name, &args)?;
+                Ok(ResolvedExpr::Function {
+                    name: name.to_string(),
+                    args,
+                    distinct: false,
+                    result_type,
+                })
+            }
+
             // FLOOR(expr) / CEIL(expr) — sqlparser parses these as AST nodes, not functions
             sp::Expr::Floor { expr, .. } => {
                 let resolved = self.resolve_expr(expr, scope)?;

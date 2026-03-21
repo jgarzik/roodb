@@ -697,6 +697,68 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
         }
 
+        "SUBSTRING" | "SUBSTR" | "MID" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SUBSTRING requires 2-3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let chars: Vec<char> = s.chars().collect();
+            // MySQL SUBSTRING is 1-based; pos=0 returns empty
+            let pos = if args.len() >= 2 {
+                args[1].as_int().unwrap_or(1)
+            } else {
+                1
+            };
+            let len = if args.len() >= 3 {
+                Some(args[2].as_int().unwrap_or(0) as usize)
+            } else {
+                None
+            };
+            // Convert 1-based position to 0-based index
+            let start = if pos > 0 {
+                (pos - 1) as usize
+            } else if pos < 0 {
+                // Negative position: count from end
+                let from_end = (-pos) as usize;
+                chars.len().saturating_sub(from_end)
+            } else {
+                return Ok(Datum::String(String::new()));
+            };
+            if start >= chars.len() {
+                return Ok(Datum::String(String::new()));
+            }
+            let result: String = match len {
+                Some(l) => chars[start..].iter().take(l).collect(),
+                None => chars[start..].iter().collect(),
+            };
+            Ok(Datum::String(result))
+        }
+
+        "TRIM" => {
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "TRIM requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            if args.len() >= 2 {
+                // TRIM with specific character
+                let what = args[1].to_display_string();
+                let trimmed = s.trim_matches(|c: char| what.contains(c));
+                Ok(Datum::String(trimmed.to_string()))
+            } else {
+                Ok(Datum::String(s.trim().to_string()))
+            }
+        }
+
         "CONCAT" => {
             let mut result = String::new();
             for arg in args {
