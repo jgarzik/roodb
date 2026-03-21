@@ -262,9 +262,13 @@ def run_one_test(test_name, certs, port, record, log_dir):
         cmd.append("--record")
 
     try:
+        # Prepend common variable definitions that MySQL tests reference
+        preamble = "--let $DEFAULT_ENGINE = RooDB\n"
+        with open(test_file, "r") as f:
+            test_input = preamble + f.read()
         result = subprocess.run(
             cmd,
-            stdin=open(test_file, "r"),
+            input=test_input,
             capture_output=True, text=True,
             timeout=60,
         )

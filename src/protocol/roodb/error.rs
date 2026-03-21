@@ -112,6 +112,8 @@ pub mod codes {
     pub const ER_BAD_TABLE_ERROR: u16 = 1051;
     pub const ER_UNKNOWN_COM_ERROR: u16 = 1047;
     pub const ER_BAD_FIELD_ERROR: u16 = 1054;
+    pub const ER_BAD_NULL_ERROR: u16 = 1048;
+    pub const ER_DUP_ENTRY: u16 = 1062;
     pub const ER_EMPTY_QUERY: u16 = 1065;
     pub const ER_CANT_CHANGE_TX_CHARACTERISTICS: u16 = 1568;
 }

@@ -2335,6 +2335,61 @@ where
                     .map(|_| Some(())),
             }
         }
+        // SHOW KEYS FROM / SHOW INDEX FROM / SHOW INDEXES FROM
+        else if sql_upper.starts_with("SHOW KEYS FROM ")
+            || sql_upper.starts_with("SHOW INDEX FROM ")
+            || sql_upper.starts_with("SHOW INDEXES FROM ")
+        {
+            let table_name = sql_trimmed
+                .split_whitespace()
+                .nth(3)
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .trim_matches('`');
+
+            let rows = {
+                let catalog = self.catalog.read();
+                let indexes = catalog.get_indexes_for_table(table_name);
+                let mut rows = Vec::new();
+                for idx in &indexes {
+                    for (seq, col) in idx.columns.iter().enumerate() {
+                        rows.push(vec![
+                            table_name.to_string(),
+                            if idx.unique { "0" } else { "1" }.to_string(),
+                            idx.name.clone(),
+                            (seq + 1).to_string(),
+                            col.clone(),
+                        ]);
+                    }
+                }
+                if let Some(table_def) = catalog.get_table(table_name) {
+                    if let Some(pk_cols) = table_def.primary_key() {
+                        for (seq, col) in pk_cols.iter().enumerate() {
+                            rows.push(vec![
+                                table_name.to_string(),
+                                "0".to_string(),
+                                "PRIMARY".to_string(),
+                                (seq + 1).to_string(),
+                                col.clone(),
+                            ]);
+                        }
+                    }
+                }
+                rows
+            };
+            self.send_custom_result_set(
+                &[
+                    "Table",
+                    "Non_unique",
+                    "Key_name",
+                    "Seq_in_index",
+                    "Column_name",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
+        }
         // DESCRIBE / DESC / SHOW COLUMNS FROM / SHOW FULL COLUMNS FROM
         else if sql_upper.starts_with("DESCRIBE ")
             || sql_upper.starts_with("DESC ")
@@ -3763,7 +3818,15 @@ where
             SqlError::ColumnNotFound(_) => (codes::ER_BAD_FIELD_ERROR, "42S22"),
             SqlError::AmbiguousColumn(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::TypeMismatch { .. } => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
-            SqlError::InvalidOperation(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
+            SqlError::InvalidOperation(msg) => {
+                if msg.contains("cannot be NULL") {
+                    (codes::ER_BAD_NULL_ERROR, "23000")
+                } else if msg.contains("already exists") {
+                    (codes::ER_DUP_ENTRY, "23000")
+                } else {
+                    (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR)
+                }
+            }
             SqlError::Unsupported(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::EmptyQuery => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
             SqlError::CommentOnly => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
