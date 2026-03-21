@@ -18,7 +18,14 @@ impl Parser {
         let ast = SqlParser::parse_sql(&dialect, &normalized)?;
 
         if ast.is_empty() {
-            return Err(SqlError::Parse("Empty SQL statement".to_string()));
+            // Distinguish empty query from comment-only query.
+            // sqlparser strips comments, so if the original had content but
+            // no statements, it was comment-only.
+            let stripped = normalized.trim().trim_end_matches(';').trim();
+            if !stripped.is_empty() {
+                return Err(SqlError::CommentOnly);
+            }
+            return Err(SqlError::EmptyQuery);
         }
         if ast.len() > 1 {
             return Err(SqlError::Parse(

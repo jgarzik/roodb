@@ -1081,10 +1081,12 @@ where
         // Parse
         let stmt = match Parser::parse_one(sql) {
             Ok(s) => s,
+            Err(crate::sql::SqlError::CommentOnly) => {
+                // Comment-only SQL: return OK with no result (MySQL behavior)
+                return self.send_ok(0, 0).await;
+            }
             Err(e) => {
-                return self
-                    .send_error(codes::ER_SYNTAX_ERROR, states::SYNTAX_ERROR, &e.to_string())
-                    .await;
+                return self.send_sql_error(&e).await;
             }
         };
 
@@ -3566,11 +3568,13 @@ where
         let (code, state) = match e {
             SqlError::Parse(_) => (codes::ER_SYNTAX_ERROR, states::SYNTAX_ERROR),
             SqlError::TableNotFound(_) => (codes::ER_NO_SUCH_TABLE, states::NO_SUCH_TABLE),
-            SqlError::ColumnNotFound(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
+            SqlError::ColumnNotFound(_) => (codes::ER_BAD_FIELD_ERROR, "42S22"),
             SqlError::AmbiguousColumn(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::TypeMismatch { .. } => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::InvalidOperation(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::Unsupported(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
+            SqlError::EmptyQuery => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
+            SqlError::CommentOnly => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
         };
 
         self.send_error(code, state, &e.to_string()).await

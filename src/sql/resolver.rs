@@ -327,7 +327,7 @@ impl<'a> Resolver<'a> {
                 full_row[*col_idx] = resolved_expr;
             }
 
-            // Check NOT NULL constraints for omitted columns
+            // Check NOT NULL constraints for omitted columns and apply defaults
             // Build set of specified indices for O(1) lookup
             let specified_indices: HashSet<usize> =
                 column_indices.iter().map(|(i, _, _)| *i).collect();
@@ -338,10 +338,17 @@ impl<'a> Resolver<'a> {
                 {
                     let was_specified = specified_indices.contains(&idx);
                     if !was_specified {
-                        return Err(SqlError::InvalidOperation(format!(
-                            "Column '{}' cannot be NULL and was not specified",
-                            col_def.name
-                        )));
+                        // Try to use the column's DEFAULT value
+                        if let Some(ref default_expr) = col_def.default {
+                            // Parse the default expression as a literal
+                            let default_literal = parse_default_value(default_expr);
+                            full_row[idx] = ResolvedExpr::Literal(default_literal);
+                        } else {
+                            return Err(SqlError::InvalidOperation(format!(
+                                "Column '{}' cannot be NULL and was not specified",
+                                col_def.name
+                            )));
+                        }
                     }
                 }
             }
@@ -621,12 +628,42 @@ impl<'a> Resolver<'a> {
                     .map(|f| self.resolve_expr(f, &scope))
                     .transpose()?;
 
-                // Resolve GROUP BY
+                // Resolve GROUP BY — MySQL allows referencing SELECT aliases in GROUP BY
                 let mut resolved_group_by = Vec::new();
                 match &select.group_by {
                     sp::GroupByExpr::Expressions(exprs, _) => {
                         for expr in exprs {
-                            resolved_group_by.push(self.resolve_expr(expr, &scope)?);
+                            // Try resolving against table scope first
+                            match self.resolve_expr(expr, &scope) {
+                                Ok(resolved) => resolved_group_by.push(resolved),
+                                Err(_) => {
+                                    // If it fails, check if it's a SELECT alias
+                                    if let sp::Expr::Identifier(ident) = expr {
+                                        let alias_name = &ident.value;
+                                        let mut found = false;
+                                        for item in &resolved_columns {
+                                            if let ResolvedSelectItem::Expr {
+                                                expr: resolved_expr,
+                                                alias: Some(a),
+                                            } = item
+                                            {
+                                                if a.eq_ignore_ascii_case(alias_name) {
+                                                    resolved_group_by.push(resolved_expr.clone());
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if !found {
+                                            return Err(SqlError::ColumnNotFound(
+                                                alias_name.clone(),
+                                            ));
+                                        }
+                                    } else {
+                                        return Err(SqlError::ColumnNotFound(expr.to_string()));
+                                    }
+                                }
+                            }
                         }
                     }
                     sp::GroupByExpr::All(_) => {
@@ -990,6 +1027,30 @@ impl<'a> Resolver<'a> {
             sp::Expr::Subquery(_) => Err(SqlError::Unsupported(
                 "Subqueries not yet supported".to_string(),
             )),
+
+            // FLOOR(expr) / CEIL(expr) — sqlparser parses these as AST nodes, not functions
+            sp::Expr::Floor { expr, .. } => {
+                let resolved = self.resolve_expr(expr, scope)?;
+                let result_type =
+                    infer_function_result_type("FLOOR", std::slice::from_ref(&resolved))?;
+                Ok(ResolvedExpr::Function {
+                    name: "FLOOR".to_string(),
+                    args: vec![resolved],
+                    distinct: false,
+                    result_type,
+                })
+            }
+            sp::Expr::Ceil { expr, .. } => {
+                let resolved = self.resolve_expr(expr, scope)?;
+                let result_type =
+                    infer_function_result_type("CEIL", std::slice::from_ref(&resolved))?;
+                Ok(ResolvedExpr::Function {
+                    name: "CEIL".to_string(),
+                    args: vec![resolved],
+                    distinct: false,
+                    result_type,
+                })
+            }
 
             _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
@@ -1649,6 +1710,39 @@ fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
     }
 }
 
+/// Parse a default value expression string into a Literal.
+/// Handles common patterns: integers, floats, quoted strings, NULL.
+fn parse_default_value(expr: &str) -> Literal {
+    let trimmed = expr.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return Literal::Null;
+    }
+    // Try integer
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Literal::Integer(i);
+    }
+    // Try float
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return Literal::Float(f);
+    }
+    // Quoted string: 'value' or "value"
+    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return Literal::String(inner.to_string());
+    }
+    // Boolean
+    if trimmed.eq_ignore_ascii_case("TRUE") {
+        return Literal::Boolean(true);
+    }
+    if trimmed.eq_ignore_ascii_case("FALSE") {
+        return Literal::Boolean(false);
+    }
+    // Fallback: treat as string
+    Literal::String(trimmed.to_string())
+}
+
 /// Convert literal value
 fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
     match val {
@@ -1661,10 +1755,27 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                 })?;
                 Ok(Literal::Float(val))
             } else {
-                let val = n.parse().map_err(|_| {
-                    SqlError::InvalidOperation(format!("Invalid integer literal: '{}'", n))
-                })?;
-                Ok(Literal::Integer(val))
+                // Try i64 first, fall back to u64→i64 reinterpret for values like 9223372036854775808
+                match n.parse::<i64>() {
+                    Ok(val) => Ok(Literal::Integer(val)),
+                    Err(_) => {
+                        // Try parsing as u64 (handles values > i64::MAX)
+                        match n.parse::<u64>() {
+                            Ok(val) => Ok(Literal::Integer(val as i64)),
+                            Err(_) => {
+                                // Strip leading zeros and retry
+                                let stripped = n.trim_start_matches('0');
+                                let stripped = if stripped.is_empty() { "0" } else { stripped };
+                                stripped.parse::<i64>().map(Literal::Integer).map_err(|_| {
+                                    SqlError::InvalidOperation(format!(
+                                        "Invalid integer literal: '{}'",
+                                        n
+                                    ))
+                                })
+                            }
+                        }
+                    }
+                }
             }
         }
         sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
@@ -1726,6 +1837,7 @@ fn convert_unary_op(op: &sp::UnaryOperator) -> SqlResult<UnaryOp> {
         sp::UnaryOperator::Not => Ok(UnaryOp::Not),
         sp::UnaryOperator::Minus => Ok(UnaryOp::Neg),
         sp::UnaryOperator::Plus => Ok(UnaryOp::Plus),
+        sp::UnaryOperator::BitwiseNot => Ok(UnaryOp::BitwiseNot),
         _ => Err(SqlError::Unsupported(format!("Unary operator: {:?}", op))),
     }
 }
@@ -1785,6 +1897,7 @@ fn infer_unary_result_type(op: UnaryOp, expr: &ResolvedExpr) -> SqlResult<DataTy
     match op {
         UnaryOp::Not => Ok(DataType::Boolean),
         UnaryOp::Neg | UnaryOp::Plus => Ok(expr.data_type()),
+        UnaryOp::BitwiseNot => Ok(DataType::BigInt),
     }
 }
 
@@ -1834,7 +1947,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             Ok(DataType::Text)
         }
         "LENGTH" | "CHAR_LENGTH" => Ok(DataType::BigInt),
-        "ABS" | "CEIL" | "FLOOR" | "ROUND" => {
+        "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" => {
             if args.is_empty() {
                 Ok(DataType::Double)
             } else {

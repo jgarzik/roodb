@@ -11,7 +11,7 @@ SELECT 1;
 CREATE TABLE err_t (id INT NOT NULL, PRIMARY KEY (id));
 INSERT INTO err_t VALUES (1);
 
---error 1105
+--error 1054
 SELECT nonexistent_col FROM err_t;
 
 --echo # Connection still alive

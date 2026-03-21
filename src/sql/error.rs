@@ -21,6 +21,10 @@ pub enum SqlError {
     InvalidOperation(String),
     /// Unsupported SQL feature
     Unsupported(String),
+    /// Empty query (no SQL statement)
+    EmptyQuery,
+    /// Comment-only query (should return OK, not error)
+    CommentOnly,
 }
 
 impl fmt::Display for SqlError {
@@ -41,6 +45,8 @@ impl fmt::Display for SqlError {
             }
             SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            SqlError::EmptyQuery => write!(f, "Query was empty"),
+            SqlError::CommentOnly => write!(f, "Comment-only query"),
         }
     }
 }

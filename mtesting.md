@@ -75,11 +75,41 @@ Tests are organized by difficulty/likelihood of passing:
 
 | Gap | Tests Blocked | Notes |
 |-----|---------------|-------|
-| INSERT IGNORE | type_uint, compare | MySQL extension for ignoring constraint violations |
-| CREATE TRIGGER | func_equal | Trigger DDL not supported |
-| --error directive matching | comments | Error code mismatch (1064 vs 1105) |
-| NOT on nullable columns | bool | `ifnull(not A, 'N')` type issues |
-| Hex literal INSERT | compare | `INSERT INTO t1 VALUES (0x01)` |
+| MySQL conditional comments `/*!...*/` | comments | Syntax not parsed |
+| SHOW CREATE TABLE | case, func_math | Not implemented |
+| REGEXP operator | null, func_test | Not implemented |
+| ALTER TABLE | type_varchar | Not supported |
+| CREATE TRIGGER | func_equal | Not supported |
+| Unsigned range clamping on INSERT | type_uint | INSERT IGNORE with out-of-range values |
+| Hex literal in INSERT values | compare | `INSERT INTO t1 VALUES (0x01,0x01)` with non-blob columns |
+| NOT on mixed-type IFNULL | bool | `ifnull(not A, 'N')` cross-type in IFNULL |
+| `float(precision)` syntax | type_float, type_ranges | `float(24)`, `float(52)` |
+| `blob(N)`/`text(N)` size hints | type_blob | `blob(250)`, `text(70000)` |
+| `to_days()` function | func_isnull | Not implemented |
+| CONVERT with type | cast | `CONVERT(expr, DATE)` syntax |
+
+### Features Added for MySQL Compat
+
+| Feature | Commit | Tests Helped |
+|---------|--------|-------------|
+| Shift operators `<<` `>>` | mysql-compat | func_op |
+| DIV (integer division) | mysql-compat | func_op |
+| MOD() function | mysql-compat | func_op |
+| Scientific notation (`0E0`) | mysql-compat | func_op, func_equal |
+| Int/Int division returns float | mysql-compat | func_op |
+| Expression column headers | mysql-compat | all tests |
+| Unsigned int catch-all | mysql-compat | type_uint |
+| NOT on integers | mysql-compat-2 | bool |
+| String→int coercion in bitwise | mysql-compat-2 | case |
+| Bitwise NOT `~` operator | mysql-compat-2 | cast |
+| Error code 1065 (empty query) | mysql-compat-2 | comments |
+| Error code 1054 (bad field) | mysql-compat-2 | func_math |
+| DEFAULT values for partial INSERT | mysql-compat-2 | delete |
+| FLOOR/CEIL as AST nodes | mysql-compat-2 | func_math |
+| GROUP BY alias resolution | mysql-compat-2 | case |
+| Comment-only SQL → OK | mysql-compat-2 | comments |
+| Integer overflow → u64 fallback | mysql-compat-2 | bigint |
+| String→number in arithmetic | mysql-compat-2 | type_float |
 
 ## Architecture
 

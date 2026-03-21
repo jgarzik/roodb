@@ -58,6 +58,7 @@ pub enum UnaryOp {
     Not,
     Neg,
     Plus,
+    BitwiseNot,
 }
 
 /// JOIN type

@@ -10,7 +10,7 @@ SELECT 1;
 CREATE TABLE err_t (id INT NOT NULL, PRIMARY KEY (id));
 INSERT INTO err_t VALUES (1);
 SELECT nonexistent_col FROM err_t;
-ERROR HY000: Column 'nonexistent_col' not found
+ERROR 42S22: Column 'nonexistent_col' not found
 # Connection still alive
 SELECT id FROM err_t;
 id

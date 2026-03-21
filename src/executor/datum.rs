@@ -211,10 +211,13 @@ impl Datum {
         }
     }
 
-    /// Logical NOT
+    /// Logical NOT — MySQL treats NOT on integers as: NOT 0 = 1, NOT nonzero = 0
     pub fn not(&self) -> Option<Datum> {
         match self {
             Datum::Bool(b) => Some(Datum::Bool(!b)),
+            Datum::Int(i) => Some(Datum::Bool(*i == 0)),
+            Datum::Float(f) => Some(Datum::Bool(*f == 0.0)),
+            Datum::Bit { value, .. } => Some(Datum::Bool(*value == 0)),
             Datum::Null => Some(Datum::Null),
             _ => None,
         }

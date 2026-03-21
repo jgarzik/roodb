@@ -726,6 +726,7 @@ impl LogicalPlanBuilder {
                     UnaryOp::Not => "NOT ",
                     UnaryOp::Neg => "-",
                     UnaryOp::Plus => "",
+                    UnaryOp::BitwiseNot => "~",
                 };
                 format!("{}{}", op_str, Self::expr_to_sql(expr))
             }

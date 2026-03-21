@@ -253,10 +253,28 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
     }
 }
 
-/// Promote Bit to Int for arithmetic operations
+/// Promote Bit and String to numeric for arithmetic operations (MySQL implicit coercion).
 fn promote_bit(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
+        Datum::String(s) => {
+            // MySQL coerces strings to numbers in arithmetic: "123.5" → 123.5, "abc" → 0
+            let trimmed = s.trim();
+            if let Ok(f) = trimmed.parse::<f64>() {
+                if f.fract() == 0.0
+                    && !trimmed.contains('.')
+                    && !trimmed.contains('e')
+                    && !trimmed.contains('E')
+                {
+                    if let Ok(i) = trimmed.parse::<i64>() {
+                        return std::borrow::Cow::Owned(Datum::Int(i));
+                    }
+                }
+                std::borrow::Cow::Owned(Datum::Float(f))
+            } else {
+                std::borrow::Cow::Owned(Datum::Int(parse_leading_int(trimmed)))
+            }
+        }
         other => std::borrow::Cow::Borrowed(other),
     }
 }
@@ -354,13 +372,42 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     }
 }
 
-/// Coerce a Datum to i64 for bitwise operations (MySQL truncates floats).
+/// Parse leading integer from a string (MySQL semantics: "123abc" → 123, "abc" → 0).
+fn parse_leading_int(s: &str) -> i64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    // Try full parse first
+    if let Ok(v) = s.parse::<i64>() {
+        return v;
+    }
+    if let Ok(v) = s.parse::<f64>() {
+        return v as i64;
+    }
+    // Extract leading numeric chars
+    let mut end = 0;
+    let bytes = s.as_bytes();
+    if !bytes.is_empty() && (bytes[0] == b'-' || bytes[0] == b'+') {
+        end = 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 || (end == 1 && (bytes[0] == b'-' || bytes[0] == b'+')) {
+        return 0;
+    }
+    s[..end].parse::<i64>().unwrap_or(0)
+}
+
+/// Coerce a Datum to i64 for bitwise operations (MySQL truncates floats, parses strings).
 fn to_bitwise_int(d: &Datum) -> Option<i64> {
     match d {
         Datum::Int(i) => Some(*i),
         Datum::Float(f) => Some(*f as i64),
         Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
         Datum::Bit { value, .. } => Some(*value as i64),
+        Datum::String(s) => Some(parse_leading_int(s)),
         _ => None,
     }
 }
@@ -584,7 +631,18 @@ pub fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
         UnaryOp::Neg => val
             .negate()
             .ok_or_else(|| ExecutorError::InvalidOperation("negation requires number".to_string())),
-        UnaryOp::Plus => Ok(val.clone()), // Unary plus is identity
+        UnaryOp::Plus => Ok(val.clone()),
+        UnaryOp::BitwiseNot => {
+            if val.is_null() {
+                return Ok(Datum::Null);
+            }
+            match to_bitwise_int(val) {
+                Some(v) => Ok(Datum::Int(!(v as u64) as i64)),
+                None => Err(ExecutorError::InvalidOperation(
+                    "bitwise NOT requires integer".to_string(),
+                )),
+            }
+        }
     }
 }
 
