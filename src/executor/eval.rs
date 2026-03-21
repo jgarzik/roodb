@@ -868,9 +868,16 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 Datum::Int(i) => Ok(Datum::Int(i.abs())),
                 Datum::Float(f) => Ok(Datum::Float(f.abs())),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation(
-                    "ABS requires number".to_string(),
-                )),
+                Datum::String(s) => {
+                    // MySQL: ABS coerces string to number
+                    let trimmed = s.trim();
+                    if let Ok(f) = trimmed.parse::<f64>() {
+                        Ok(Datum::Float(f.abs()))
+                    } else {
+                        Ok(Datum::Int(parse_leading_int(trimmed).abs()))
+                    }
+                }
+                _ => Ok(Datum::Int(0)),
             }
         }
 
@@ -1253,13 +1260,15 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            if args.len() == 1 {
-                Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).ln()))
+            let result = if args.len() == 1 {
+                args[0].as_float().unwrap_or(0.0).ln()
             } else {
                 let base = args[0].as_float().unwrap_or(0.0);
                 let val = args[1].as_float().unwrap_or(0.0);
-                Ok(Datum::Float(val.log(base)))
-            }
+                val.log(base)
+            };
+            // MySQL returns NULL for NaN/Inf results (log of negative, etc.)
+            Ok(float_or_null(result))
         }
 
         "LOG2" => {
@@ -1271,7 +1280,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).log2()))
+            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).log2()))
         }
 
         "LOG10" => {
@@ -1283,7 +1292,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).log10()))
+            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).log10()))
         }
 
         "LN" => {
@@ -1295,7 +1304,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).ln()))
+            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).ln()))
         }
 
         "EXP" => {
@@ -1742,8 +1751,20 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() || args[1].is_null() {
                 return Ok(Datum::Null);
             }
-            // Simple implementation: parse timestamps and return time difference
-            Ok(Datum::String("00:00:00".to_string()))
+            let s1 = args[0].to_display_string();
+            let s2 = args[1].to_display_string();
+            let secs1 = parse_time_to_secs(&s1);
+            let secs2 = parse_time_to_secs(&s2);
+            let diff = secs1 - secs2;
+            let sign = if diff < 0 { "-" } else { "" };
+            let abs_diff = diff.unsigned_abs();
+            let hours = abs_diff / 3600;
+            let mins = (abs_diff % 3600) / 60;
+            let secs = abs_diff % 60;
+            Ok(Datum::String(format!(
+                "{}{:02}:{:02}:{:02}",
+                sign, hours, mins, secs
+            )))
         }
 
         "GET_LOCK" => {
@@ -1878,6 +1899,47 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
 /// Convert integer to string in given radix (2-36)
 /// Parse a date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) to days since year 0.
 /// MySQL's TO_DAYS algorithm.
+/// Parse a time/datetime string to total seconds from midnight (or epoch for datetimes).
+/// Handles "HH:MM:SS", "YYYY-MM-DD HH:MM:SS", and integer 0.
+/// Return Datum::Float for finite values, Datum::Null for NaN/Infinity.
+/// MySQL returns NULL for mathematically undefined results (log of negative, etc.)
+fn float_or_null(v: f64) -> Datum {
+    if v.is_finite() {
+        Datum::Float(v)
+    } else {
+        Datum::Null
+    }
+}
+
+fn parse_time_to_secs(s: &str) -> i64 {
+    let s = s.trim();
+    // Integer 0 means "00:00:00"
+    if s == "0" {
+        return 0;
+    }
+    let parts: Vec<&str> = s.split([' ', ':', '-']).collect();
+    if parts.len() >= 6 {
+        // YYYY-MM-DD HH:MM:SS
+        let year: i64 = parts[0].parse().unwrap_or(0);
+        let month: i64 = parts[1].parse().unwrap_or(0);
+        let day: i64 = parts[2].parse().unwrap_or(0);
+        let hour: i64 = parts[3].parse().unwrap_or(0);
+        let min: i64 = parts[4].parse().unwrap_or(0);
+        let sec: i64 = parts[5].parse().unwrap_or(0);
+        // Approximate: days since epoch * 86400 + time of day
+        let days = year * 365 + year / 4 - year / 100 + year / 400 + (month * 30) + day;
+        days * 86400 + hour * 3600 + min * 60 + sec
+    } else if parts.len() >= 3 {
+        // HH:MM:SS
+        let hour: i64 = parts[0].parse().unwrap_or(0);
+        let min: i64 = parts[1].parse().unwrap_or(0);
+        let sec: i64 = parts[2].parse().unwrap_or(0);
+        hour * 3600 + min * 60 + sec
+    } else {
+        0
+    }
+}
+
 fn parse_date_to_days(s: &str) -> Option<i64> {
     let date_part = s.split(' ').next()?;
     let parts: Vec<&str> = date_part.split('-').collect();

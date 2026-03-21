@@ -227,7 +227,21 @@ impl LogicalPlanBuilder {
             // After aggregation, build projection that maps to aggregate output columns
             plan = Self::build_post_aggregate_project(plan, &select.columns, &select.group_by)?;
         } else {
-            // 4. Apply projection (SELECT list) for non-aggregate queries
+            // 4. For non-aggregate queries: ORDER BY before Project
+            // so ORDER BY can access columns not in the SELECT list.
+            if !select.order_by.is_empty() {
+                let order_by: Vec<_> = select
+                    .order_by
+                    .iter()
+                    .map(|item| (item.expr.clone(), item.ascending))
+                    .collect();
+                plan = LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    order_by,
+                };
+            }
+
+            // Apply projection (SELECT list)
             plan = Self::build_project(plan, &select.columns)?;
         }
 
@@ -238,9 +252,8 @@ impl LogicalPlanBuilder {
             };
         }
 
-        // 6. Apply ORDER BY (with transformed column references)
-        if !select.order_by.is_empty() {
-            // Transform ORDER BY expressions to reference projection output columns
+        // 6. Apply ORDER BY for aggregate queries (after projection)
+        if !select.order_by.is_empty() && (has_aggregates || !select.group_by.is_empty()) {
             let transformed_order_by: Vec<_> = select
                 .order_by
                 .iter()
