@@ -187,16 +187,41 @@ class RooDbServer:
 
 
 def reset_test_db(certs, port):
-    """Reset the test database between tests."""
+    """Reset the test database between tests.
+
+    RooDB doesn't scope tables to databases, so we need to explicitly
+    drop all user tables, not just recreate the database.
+    """
     cmd = [
         MYSQLTEST_BIN,
         f"--host={HOST}", f"--port={port}", f"--user={USER}",
         f"--password={PASSWORD}", "--ssl-mode=REQUIRED",
         f"--ssl-ca={certs.ca_cert}",
     ]
+    # First get list of all tables
+    result = subprocess.run(
+        cmd,
+        input="SHOW TABLES;\n",
+        capture_output=True, text=True, timeout=10,
+    )
+    # Parse table names from output (skip header line)
+    tables = []
+    if result.returncode == 0:
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            # Skip header, empty lines, and system tables
+            if line and not line.startswith('Tables_in_') and not line.startswith('system.'):
+                tables.append(line)
+
+    # Drop all user tables
+    drop_sql = ""
+    for table in tables:
+        drop_sql += f"DROP TABLE IF EXISTS `{table}`;\n"
+    drop_sql += "DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n"
+
     subprocess.run(
         cmd,
-        input="DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n",
+        input=drop_sql,
         capture_output=True, text=True, timeout=10,
     )
 
