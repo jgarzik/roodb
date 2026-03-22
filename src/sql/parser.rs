@@ -46,12 +46,85 @@ impl Parser {
     ///   (sqlparser expects AS before BEGIN for procedure bodies)
     /// - DECLARE var TYPE [DEFAULT expr]; → SET var = expr; (inside procedure bodies)
     ///   (sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...)
+    // MySQL-compatible version for /*!NNNNN*/ comments (80045 = 8.0.45)
+    const MYSQL_VERSION_ID: u64 = 80045;
+
+    /// Process MySQL conditional comments (`/*!...*/`).
+    ///
+    /// MySQL rules:
+    /// - `/*!NNNNN code */` where NNNNN is exactly 5 digits: if server version >= NNNNN,
+    ///   execute `code`; otherwise treat as comment (strip).
+    /// - `/*!code */` (no 5-digit prefix): execute `code` unconditionally.
+    ///
+    /// sqlparser's `tokenize_comment_hints` incorrectly strips ALL leading digits
+    /// (not just exactly 5), so we must handle this before sqlparser sees the SQL.
+    fn normalize_conditional_comments(sql: &str) -> String {
+        let mut result = String::with_capacity(sql.len());
+        let bytes = sql.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            // Look for /*! pattern
+            if i + 2 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
+                // Find the matching */
+                let content_start = i + 3; // after "/*!"
+                let mut end = content_start;
+                while end + 1 < len {
+                    if bytes[end] == b'*' && bytes[end + 1] == b'/' {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end + 1 >= len {
+                    // Unclosed comment — leave as-is for parser to report error
+                    result.push_str(&sql[i..]);
+                    break;
+                }
+
+                let inner = &sql[content_start..end]; // content between /*! and */
+                let closing = end + 2; // position after */
+                                       // Check if inner starts with exactly 5 digits
+                let digit_count = inner.bytes().take_while(|b| b.is_ascii_digit()).count();
+                if digit_count >= 5 {
+                    // Has a version number (first 5 digits)
+                    let version_str = &inner[..5];
+                    let version: u64 = version_str.parse().unwrap_or(0);
+                    let code = &inner[5..];
+                    if Self::MYSQL_VERSION_ID >= version {
+                        // Our version >= required: include the code
+                        result.push(' ');
+                        result.push_str(code);
+                        result.push(' ');
+                    }
+                    // else: strip entirely (our version is too old)
+                } else {
+                    // No 5-digit version prefix: include content unconditionally
+                    result.push(' ');
+                    result.push_str(inner);
+                    result.push(' ');
+                }
+
+                i = closing;
+            } else {
+                result.push(sql[i..].chars().next().unwrap());
+                i += sql[i..].chars().next().unwrap().len_utf8();
+            }
+        }
+
+        result
+    }
+
     fn normalize_mysql_syntax(sql: &str) -> String {
         use regex::Regex;
+
+        // Process conditional comments first, before any other normalization
+        let sql = Self::normalize_conditional_comments(sql);
+
         // MOD is a keyword in sqlparser. Handle both MOD(x,y) function and x MOD y infix.
         // Replace MOD( with _ROODB_MOD( for function call form.
         let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
-        let result = re_mod_fn.replace_all(sql, "_ROODB_MOD(");
+        let result = re_mod_fn.replace_all(&sql, "_ROODB_MOD(");
         // Replace infix `x MOD y` with `x % y` (but not _ROODB_MOD)
         let re_mod_infix = Regex::new(r"(?i)(-?\d+)\s+MOD\s+(-?\d+)").unwrap();
         let result = re_mod_infix.replace_all(&result, "$1 % $2");
@@ -259,6 +332,45 @@ mod tests {
     fn test_parse_delete() {
         let stmt = Parser::parse_one("DELETE FROM users WHERE id = 1").unwrap();
         assert!(matches!(stmt, sp::Statement::Delete(_)));
+    }
+
+    #[test]
+    fn test_conditional_comment_no_version() {
+        // /*!2*/ has no 5-digit version: content "2" included unconditionally
+        let result = Parser::normalize_conditional_comments("select 1/*!2*/");
+        assert!(
+            result.contains("2"),
+            "content should be included: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_conditional_comment_version_low() {
+        // /*!00000 2 */ version 0 <= our version: include content
+        let result = Parser::normalize_conditional_comments("select 1 + /*!00000 2 */ + 3");
+        assert!(result.contains("2"), "code should be included: {}", result);
+    }
+
+    #[test]
+    fn test_conditional_comment_version_high() {
+        // /*!99999 noise */ version 99999 > our version: strip
+        let result = Parser::normalize_conditional_comments("select 1/*!99999 noise*/");
+        assert!(
+            !result.contains("noise"),
+            "code should be stripped: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_conditional_comment_mixed() {
+        let result = Parser::normalize_conditional_comments(
+            "select 1 + /*!00000 2 */ + 3 /*!99999 noise*/ + 4",
+        );
+        assert!(result.contains("2"), "low version should be included");
+        assert!(!result.contains("noise"), "high version should be stripped");
+        assert!(result.contains("4"), "trailing content preserved");
     }
 
     #[test]
