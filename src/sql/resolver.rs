@@ -1942,6 +1942,19 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
         }
     }
 
+    // MySQL: BLOB/TEXT columns cannot have a non-empty default value
+    if let Some(ref default_val) = col_def.default {
+        if matches!(col_def.data_type, DataType::Text | DataType::Blob) {
+            let trimmed = default_val.trim_matches('\'').trim_matches('"');
+            if !trimmed.is_empty() {
+                return Err(SqlError::InvalidOperation(format!(
+                    "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
+                    col_def.name
+                )));
+            }
+        }
+    }
+
     Ok(col_def)
 }
 
