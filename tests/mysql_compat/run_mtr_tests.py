@@ -248,27 +248,32 @@ def run_one_test(test_name, certs, port, record, log_dir):
     # Reset test DB
     reset_test_db(certs, port)
 
+    # Write preamble + test content to a temp file inside the mysql-test dir
+    # so that --source include/... paths resolve correctly via --basedir.
+    preamble = "--let $DEFAULT_ENGINE = RooDB\n"
+    with open(test_file, "r") as f:
+        test_content = preamble + f.read()
+    tmp_test_file = os.path.join(log_dir, f"{test_name}.test")
+    with open(tmp_test_file, "w") as f:
+        f.write(test_content)
+
     cmd = [
         MYSQLTEST_BIN,
         f"--host={HOST}", f"--port={port}", f"--user={USER}",
         f"--password={PASSWORD}", "--ssl-mode=REQUIRED",
         f"--ssl-ca={certs.ca_cert}",
         "--database=test",
-        f"--basedir={MYSQL_TEST_DIR}",
+        f"--basedir={MYSQL_TEST_DIR}/",
         f"--logdir={log_dir}",
         f"--result-file={result_file}",
+        f"--test-file={tmp_test_file}",
     ]
     if record:
         cmd.append("--record")
 
     try:
-        # Prepend common variable definitions that MySQL tests reference
-        preamble = "--let $DEFAULT_ENGINE = RooDB\n"
-        with open(test_file, "r") as f:
-            test_input = preamble + f.read()
         result = subprocess.run(
             cmd,
-            input=test_input,
             capture_output=True, text=True,
             timeout=60,
         )
