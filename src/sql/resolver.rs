@@ -1849,22 +1849,24 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         | sp::DataType::UInt16
         | sp::DataType::UInt32 => Ok(DataType::Int),
         // BigInt
+        // BigInt (signed)
         sp::DataType::BigInt(_)
-        | sp::DataType::BigIntUnsigned(_)
         | sp::DataType::Int8(_)
-        | sp::DataType::Int8Unsigned(_)
         | sp::DataType::Int64
         | sp::DataType::Int128
         | sp::DataType::Int256
-        | sp::DataType::UInt64
         | sp::DataType::UInt128
         | sp::DataType::UInt256
-        | sp::DataType::UBigInt
         | sp::DataType::HugeInt
         | sp::DataType::UHugeInt
         | sp::DataType::Signed
-        | sp::DataType::SignedInteger
-        | sp::DataType::Unsigned => Ok(DataType::BigInt),
+        | sp::DataType::SignedInteger => Ok(DataType::BigInt),
+        // BigInt Unsigned
+        sp::DataType::BigIntUnsigned(_)
+        | sp::DataType::Int8Unsigned(_)
+        | sp::DataType::UBigInt
+        | sp::DataType::UInt64
+        | sp::DataType::Unsigned => Ok(DataType::BigIntUnsigned),
         // Float
         sp::DataType::Float(_)
         | sp::DataType::Real
@@ -2132,20 +2134,18 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                         // (9223372036854775808 becomes i64::MIN when negated by unary minus).
                         // For other values > i64::MAX, use float to avoid silent wrapping.
                         match n.parse::<u64>() {
-                            Ok(val) if val == 9223372036854775808 => {
-                                // Special case: -(2^63) for i64::MIN
-                                Ok(Literal::Integer(val as i64))
-                            }
                             Ok(val) => {
-                                // Use float for large unsigned values to avoid wrapping
-                                Ok(Literal::Float(val as f64))
+                                // Values > i64::MAX stored as UnsignedInteger
+                                Ok(Literal::UnsignedInteger(val))
                             }
                             Err(_) => {
                                 // Strip leading zeros and retry
                                 let stripped = n.trim_start_matches('0');
                                 let stripped = if stripped.is_empty() { "0" } else { stripped };
-                                // Try as float for very large numbers
-                                if let Ok(f) = stripped.parse::<f64>() {
+                                // Try as u64 first, then float for very large numbers
+                                if let Ok(u) = stripped.parse::<u64>() {
+                                    Ok(Literal::UnsignedInteger(u))
+                                } else if let Ok(f) = stripped.parse::<f64>() {
                                     Ok(Literal::Float(f))
                                 } else {
                                     stripped.parse::<i64>().map(Literal::Integer).map_err(|_| {
@@ -2438,6 +2438,7 @@ fn wider_numeric_type(a: &DataType, b: &DataType) -> DataType {
     match (a, b) {
         (DataType::Double, _) | (_, DataType::Double) => DataType::Double,
         (DataType::Float, _) | (_, DataType::Float) => DataType::Float,
+        (DataType::BigIntUnsigned, _) | (_, DataType::BigIntUnsigned) => DataType::BigIntUnsigned,
         (DataType::BigInt, _) | (_, DataType::BigInt) => DataType::BigInt,
         (DataType::Bit(_), _) | (_, DataType::Bit(_)) => DataType::BigInt,
         (DataType::Int, _) | (_, DataType::Int) => DataType::Int,
@@ -2654,7 +2655,7 @@ mod tests {
         );
         assert_eq!(
             convert_data_type(&SpDt::BigIntUnsigned(None)).unwrap(),
-            DataType::BigInt
+            DataType::BigIntUnsigned
         );
         assert_eq!(
             convert_data_type(&SpDt::Int8(None)).unwrap(),
@@ -2662,15 +2663,21 @@ mod tests {
         );
         assert_eq!(
             convert_data_type(&SpDt::Int8Unsigned(None)).unwrap(),
-            DataType::BigInt
+            DataType::BigIntUnsigned
         );
         assert_eq!(convert_data_type(&SpDt::Int64).unwrap(), DataType::BigInt);
         assert_eq!(convert_data_type(&SpDt::Int128).unwrap(), DataType::BigInt);
         assert_eq!(convert_data_type(&SpDt::Int256).unwrap(), DataType::BigInt);
-        assert_eq!(convert_data_type(&SpDt::UInt64).unwrap(), DataType::BigInt);
+        assert_eq!(
+            convert_data_type(&SpDt::UInt64).unwrap(),
+            DataType::BigIntUnsigned
+        );
         assert_eq!(convert_data_type(&SpDt::UInt128).unwrap(), DataType::BigInt);
         assert_eq!(convert_data_type(&SpDt::UInt256).unwrap(), DataType::BigInt);
-        assert_eq!(convert_data_type(&SpDt::UBigInt).unwrap(), DataType::BigInt);
+        assert_eq!(
+            convert_data_type(&SpDt::UBigInt).unwrap(),
+            DataType::BigIntUnsigned
+        );
         assert_eq!(convert_data_type(&SpDt::HugeInt).unwrap(), DataType::BigInt);
         assert_eq!(
             convert_data_type(&SpDt::UHugeInt).unwrap(),
@@ -2683,7 +2690,7 @@ mod tests {
         );
         assert_eq!(
             convert_data_type(&SpDt::Unsigned).unwrap(),
-            DataType::BigInt
+            DataType::BigIntUnsigned
         );
 
         // Float

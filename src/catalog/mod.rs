@@ -24,6 +24,8 @@ pub enum DataType {
     Int,
     /// 64-bit signed integer
     BigInt,
+    /// 64-bit unsigned integer
+    BigIntUnsigned,
     /// 32-bit floating point
     Float,
     /// 64-bit floating point
@@ -49,6 +51,7 @@ impl DataType {
                 | DataType::SmallInt
                 | DataType::Int
                 | DataType::BigInt
+                | DataType::BigIntUnsigned
                 | DataType::Float
                 | DataType::Double
                 | DataType::Bit(_)
@@ -59,7 +62,11 @@ impl DataType {
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
-            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt
+            DataType::TinyInt
+                | DataType::SmallInt
+                | DataType::Int
+                | DataType::BigInt
+                | DataType::BigIntUnsigned
         )
     }
 

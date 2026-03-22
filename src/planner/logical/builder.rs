@@ -546,13 +546,14 @@ impl LogicalPlanBuilder {
         match expr {
             ResolvedExpr::Column(col) => col.data_type.clone(),
             ResolvedExpr::Literal(lit) => match lit {
-                Literal::Integer(_) => DataType::BigInt, // Use BigInt for integer literals (safer for large values)
+                Literal::Integer(_) => DataType::BigInt,
+                Literal::UnsignedInteger(_) => DataType::BigIntUnsigned,
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Boolean(_) => DataType::Boolean,
-                Literal::Null => DataType::Int, // NULL is polymorphic, default to Int
+                Literal::Null => DataType::Int,
                 Literal::Blob(_) => DataType::Blob,
-                Literal::Placeholder(_) => DataType::BigInt, // Resolved at substitution time
+                Literal::Placeholder(_) => DataType::BigInt,
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
@@ -778,6 +779,7 @@ impl LogicalPlanBuilder {
             }
             ResolvedExpr::Literal(lit) => match lit {
                 Literal::Integer(i) => i.to_string(),
+                Literal::UnsignedInteger(u) => u.to_string(),
                 Literal::Float(f) => f.to_string(),
                 Literal::String(s) => format!("'{}'", s),
                 Literal::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),

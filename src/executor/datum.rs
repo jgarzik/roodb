@@ -16,6 +16,8 @@ pub enum Datum {
     Bool(bool),
     /// Integer value (covers TinyInt, SmallInt, Int, BigInt)
     Int(i64),
+    /// Unsigned 64-bit integer (BIGINT UNSIGNED, CAST AS UNSIGNED, shift results)
+    UnsignedInt(u64),
     /// Floating point value (covers Float, Double)
     Float(f64),
     /// String value (covers Varchar, Text)
@@ -49,6 +51,7 @@ impl Datum {
                 value: 0,
                 width: *w,
             },
+            DataType::BigIntUnsigned => Datum::UnsignedInt(0),
             DataType::Timestamp => Datum::Int(0),
         }
     }
@@ -59,6 +62,7 @@ impl Datum {
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int(_) => 2,
+            Datum::UnsignedInt(_) => 2,
             Datum::Float(_) => 3,
             Datum::String(_) => 4,
             Datum::Bytes(_) => 5,
@@ -73,6 +77,7 @@ impl Datum {
             Datum::Null => None,
             Datum::Bool(_) => Some(DataType::Boolean),
             Datum::Int(_) => Some(DataType::BigInt),
+            Datum::UnsignedInt(_) => Some(DataType::BigIntUnsigned),
             Datum::Float(_) => Some(DataType::Double),
             Datum::String(_) => Some(DataType::Text),
             Datum::Bytes(_) => Some(DataType::Blob),
@@ -86,6 +91,7 @@ impl Datum {
         match self {
             Datum::Bool(b) => Some(*b),
             Datum::Int(i) => Some(*i != 0),
+            Datum::UnsignedInt(u) => Some(*u != 0),
             Datum::Bit { value, .. } => Some(*value != 0),
             Datum::Null => None,
             _ => None,
@@ -96,6 +102,7 @@ impl Datum {
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Datum::Int(i) => Some(*i),
+            Datum::UnsignedInt(u) => Some(*u as i64),
             Datum::Float(f) => Some(*f as i64),
             Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
             Datum::Bit { value, .. } => Some(*value as i64),
@@ -109,6 +116,7 @@ impl Datum {
         match self {
             Datum::Float(f) => Some(*f),
             Datum::Int(i) => Some(*i as f64),
+            Datum::UnsignedInt(u) => Some(*u as f64),
             Datum::Bit { value, .. } => Some(*value as f64),
             Datum::Null => None,
             _ => None,
@@ -148,6 +156,7 @@ impl Datum {
             Datum::Null => "NULL".to_string(),
             Datum::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Datum::Int(i) => i.to_string(),
+            Datum::UnsignedInt(u) => u.to_string(),
             Datum::Float(f) => f.to_string(),
             Datum::String(s) => {
                 // Single-quote escape: replace ' with ''
@@ -183,6 +192,7 @@ impl Datum {
             Datum::Null => "NULL".to_string(),
             Datum::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             Datum::Int(i) => i.to_string(),
+            Datum::UnsignedInt(u) => u.to_string(),
             Datum::Float(f) => {
                 if f.fract() == 0.0 && f.abs() < 1e15 {
                     format!("{:.1}", f) // Show at least one decimal
@@ -210,6 +220,7 @@ impl Datum {
             Literal::Null => Datum::Null,
             Literal::Boolean(b) => Datum::Bool(*b),
             Literal::Integer(i) => Datum::Int(*i),
+            Literal::UnsignedInteger(u) => Datum::UnsignedInt(*u),
             Literal::Float(f) => Datum::Float(*f),
             Literal::String(s) => Datum::String(s.clone()),
             Literal::Blob(b) => Datum::Bytes(b.clone()),
@@ -224,6 +235,10 @@ impl Datum {
         match self {
             Datum::Int(i) => Some(Datum::Int(-i)),
             Datum::Float(f) => Some(Datum::Float(-f)),
+            Datum::UnsignedInt(u) => {
+                // -UnsignedInt: converts to signed via two's complement
+                Some(Datum::Int(-(*u as i64)))
+            }
             Datum::Null => Some(Datum::Null),
             Datum::Bit { .. } => None,
             _ => None,
@@ -235,6 +250,7 @@ impl Datum {
         match self {
             Datum::Bool(b) => Some(Datum::Bool(!b)),
             Datum::Int(i) => Some(Datum::Bool(*i == 0)),
+            Datum::UnsignedInt(u) => Some(Datum::Bool(*u == 0)),
             Datum::Float(f) => Some(Datum::Bool(*f == 0.0)),
             Datum::Bit { value, .. } => Some(Datum::Bool(*value == 0)),
             Datum::Null => Some(Datum::Null),
@@ -307,6 +323,15 @@ impl PartialEq for Datum {
             (Datum::Null, Datum::Null) => true,
             (Datum::Bool(a), Datum::Bool(b)) => a == b,
             (Datum::Int(a), Datum::Int(b)) => a == b,
+            (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => a == b,
+            // Cross-type: Int/UnsignedInt
+            (Datum::Int(i), Datum::UnsignedInt(u)) | (Datum::UnsignedInt(u), Datum::Int(i)) => {
+                if *i < 0 {
+                    false
+                } else {
+                    *i as u64 == *u
+                }
+            }
             (Datum::Float(a), Datum::Float(b)) => a.to_bits() == b.to_bits(),
             (Datum::String(a), Datum::String(b)) => a == b,
             (Datum::Bytes(a), Datum::Bytes(b)) => a == b,
@@ -342,6 +367,22 @@ impl Ord for Datum {
 
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Int(a), Datum::Int(b)) => a.cmp(b),
+            (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => a.cmp(b),
+            // Cross-type: Int/UnsignedInt
+            (Datum::Int(i), Datum::UnsignedInt(u)) => {
+                if *i < 0 {
+                    Ordering::Less
+                } else {
+                    (*i as u64).cmp(u)
+                }
+            }
+            (Datum::UnsignedInt(u), Datum::Int(i)) => {
+                if *i < 0 {
+                    Ordering::Greater
+                } else {
+                    u.cmp(&(*i as u64))
+                }
+            }
             (Datum::Float(a), Datum::Float(b)) => a.total_cmp(b),
             (Datum::String(a), Datum::String(b)) => a.cmp(b),
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
@@ -375,6 +416,17 @@ impl Hash for Datum {
                 0u8.hash(state);
                 f.to_bits().hash(state);
             }
+            Datum::UnsignedInt(u) => {
+                // Values <= i64::MAX are equal to Int(v), so must hash identically.
+                // Values > i64::MAX cannot equal any Int, so use a distinct discriminant.
+                if *u <= i64::MAX as u64 {
+                    0u8.hash(state);
+                    (*u as i64 as f64).to_bits().hash(state);
+                } else {
+                    10u8.hash(state);
+                    u.hash(state);
+                }
+            }
             Datum::Bit { value, .. } => {
                 // Use same discriminant tag as Int/Float so Bit(N) == Int(N) hashes match.
                 // Cross-type PartialEq compares as u64 (*value == *i as u64), which is
@@ -391,7 +443,9 @@ impl Hash for Datum {
                     Datum::String(s) => s.hash(state),
                     Datum::Bytes(b) => b.hash(state),
                     Datum::Timestamp(t) => t.hash(state),
-                    Datum::Int(_) | Datum::Float(_) | Datum::Bit { .. } => unreachable!(),
+                    Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_) | Datum::Bit { .. } => {
+                        unreachable!()
+                    }
                 }
             }
         }

@@ -110,6 +110,7 @@ impl Accumulator {
         match value {
             Datum::Bit { value, .. } => Some(*value),
             Datum::Int(i) => Some(*i as u64),
+            Datum::UnsignedInt(u) => Some(*u),
             Datum::Float(f) => Some(*f as u64),
             Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
             Datum::Null => None,

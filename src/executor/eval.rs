@@ -316,8 +316,26 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(a), Datum::Int(b)) => a.checked_add(*b).map(Datum::Int).ok_or_else(|| {
             ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
         }),
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => {
+            a.checked_add(*b).map(Datum::UnsignedInt).ok_or_else(|| {
+                ExecutorError::DataOutOfRange("BIGINT UNSIGNED value is out of range".to_string())
+            })
+        }
+        (Datum::Int(a), Datum::UnsignedInt(b)) | (Datum::UnsignedInt(b), Datum::Int(a)) => {
+            let result = (*b as i128) + (*a as i128);
+            if result < 0 || result > u64::MAX as i128 {
+                Err(ExecutorError::DataOutOfRange(
+                    "BIGINT UNSIGNED value is out of range".to_string(),
+                ))
+            } else {
+                Ok(Datum::UnsignedInt(result as u64))
+            }
+        }
         (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a + b),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
+            check_float_overflow(*a as f64 + b)
+        }
+        (Datum::UnsignedInt(a), Datum::Float(b)) | (Datum::Float(b), Datum::UnsignedInt(a)) => {
             check_float_overflow(*a as f64 + b)
         }
         (Datum::String(a), Datum::String(b)) => Ok(Datum::String(format!("{}{}", a, b))),
@@ -332,23 +350,39 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => match a.checked_sub(*b) {
-            Some(v) => Ok(Datum::Int(v)),
-            None => {
-                // Allow wrapping for values that might be unsigned (e.g., 1<<63)
-                // MySQL treats bit operation results as unsigned
-                if *a == i64::MIN || *b == i64::MIN {
-                    Ok(Datum::Int(a.wrapping_sub(*b)))
-                } else {
-                    Err(ExecutorError::DataOutOfRange(
-                        "BIGINT value is out of range".to_string(),
-                    ))
-                }
+        (Datum::Int(a), Datum::Int(b)) => a.checked_sub(*b).map(Datum::Int).ok_or_else(|| {
+            ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
+        }),
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => {
+            a.checked_sub(*b).map(Datum::UnsignedInt).ok_or_else(|| {
+                ExecutorError::DataOutOfRange("BIGINT UNSIGNED value is out of range".to_string())
+            })
+        }
+        (Datum::UnsignedInt(a), Datum::Int(b)) => {
+            let result = (*a as i128) - (*b as i128);
+            if result < 0 || result > u64::MAX as i128 {
+                Err(ExecutorError::DataOutOfRange(
+                    "BIGINT UNSIGNED value is out of range".to_string(),
+                ))
+            } else {
+                Ok(Datum::UnsignedInt(result as u64))
             }
-        },
+        }
+        (Datum::Int(a), Datum::UnsignedInt(b)) => {
+            let result = (*a as i128) - (*b as i128);
+            if result < 0 || result > u64::MAX as i128 {
+                Err(ExecutorError::DataOutOfRange(
+                    "BIGINT UNSIGNED value is out of range".to_string(),
+                ))
+            } else {
+                Ok(Datum::UnsignedInt(result as u64))
+            }
+        }
         (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a - b),
         (Datum::Int(a), Datum::Float(b)) => check_float_overflow(*a as f64 - b),
         (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a - *b as f64),
+        (Datum::UnsignedInt(a), Datum::Float(b)) => check_float_overflow(*a as f64 - b),
+        (Datum::Float(a), Datum::UnsignedInt(b)) => check_float_overflow(a - *b as f64),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot subtract {:?} from {:?}",
             right, left
@@ -363,8 +397,26 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(a), Datum::Int(b)) => a.checked_mul(*b).map(Datum::Int).ok_or_else(|| {
             ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
         }),
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => {
+            a.checked_mul(*b).map(Datum::UnsignedInt).ok_or_else(|| {
+                ExecutorError::DataOutOfRange("BIGINT UNSIGNED value is out of range".to_string())
+            })
+        }
+        (Datum::Int(a), Datum::UnsignedInt(b)) | (Datum::UnsignedInt(b), Datum::Int(a)) => {
+            let result = (*a as i128) * (*b as i128);
+            if result < 0 || result > u64::MAX as i128 {
+                Err(ExecutorError::DataOutOfRange(
+                    "BIGINT UNSIGNED value is out of range".to_string(),
+                ))
+            } else {
+                Ok(Datum::UnsignedInt(result as u64))
+            }
+        }
         (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a * b),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
+            check_float_overflow(*a as f64 * b)
+        }
+        (Datum::UnsignedInt(a), Datum::Float(b)) | (Datum::Float(b), Datum::UnsignedInt(a)) => {
             check_float_overflow(*a as f64 * b)
         }
         _ => Err(ExecutorError::InvalidOperation(format!(
@@ -380,6 +432,7 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // Division by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
+        Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
@@ -387,9 +440,16 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     match (left.as_ref(), right.as_ref()) {
         // MySQL: integer / integer returns DECIMAL (float), not integer
         (Datum::Int(a), Datum::Int(b)) => check_float_overflow(*a as f64 / *b as f64),
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => {
+            check_float_overflow(*a as f64 / *b as f64)
+        }
+        (Datum::Int(a), Datum::UnsignedInt(b)) => check_float_overflow(*a as f64 / *b as f64),
+        (Datum::UnsignedInt(a), Datum::Int(b)) => check_float_overflow(*a as f64 / *b as f64),
         (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a / b),
         (Datum::Int(a), Datum::Float(b)) => check_float_overflow(*a as f64 / b),
         (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a / *b as f64),
+        (Datum::UnsignedInt(a), Datum::Float(b)) => check_float_overflow(*a as f64 / b),
+        (Datum::Float(a), Datum::UnsignedInt(b)) => check_float_overflow(a / *b as f64),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot divide {:?} by {:?}",
             left, right
@@ -403,6 +463,7 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // Modulo by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
+        Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
@@ -410,9 +471,14 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // Use checked_rem for Int/Int to avoid panic on i64::MIN % -1.
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.checked_rem(*b).unwrap_or(0))),
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => Ok(Datum::UnsignedInt(a % b)),
+        (Datum::Int(a), Datum::UnsignedInt(b)) => Ok(Datum::UnsignedInt((*a as u64) % b)),
+        (Datum::UnsignedInt(a), Datum::Int(b)) => Ok(Datum::UnsignedInt(a % (*b as u64))),
         (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a % b)),
         (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a % *b as f64)),
+        (Datum::UnsignedInt(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
+        (Datum::Float(a), Datum::UnsignedInt(b)) => Ok(Datum::Float(a % *b as f64)),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot compute modulo of {:?} and {:?}",
             left, right
@@ -452,6 +518,7 @@ fn parse_leading_int(s: &str) -> i64 {
 fn to_bitwise_int(d: &Datum) -> Option<i64> {
     match d {
         Datum::Int(i) => Some(*i),
+        Datum::UnsignedInt(u) => Some(*u as i64),
         Datum::Float(f) => Some(*f as i64),
         Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
         Datum::Bit { value, .. } => Some(*value as i64),
@@ -500,7 +567,7 @@ fn eval_shift_left(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
             } else {
                 (a as u64) << shift
             };
-            Ok(Datum::Int(result as i64))
+            Ok(Datum::UnsignedInt(result))
         }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot shift {:?} << {:?}",
@@ -518,7 +585,7 @@ fn eval_shift_right(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
             } else {
                 (a as u64) >> shift
             };
-            Ok(Datum::Int(result as i64))
+            Ok(Datum::UnsignedInt(result))
         }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot shift {:?} >> {:?}",
@@ -533,6 +600,7 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // DIV by zero returns NULL (MySQL semantics)
     match right.as_ref() {
         Datum::Int(0) => return Ok(Datum::Null),
+        Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
         _ => {}
     }
@@ -545,9 +613,18 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
                 "BIGINT value is out of range".to_string(),
             )),
         },
+        (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => Ok(Datum::UnsignedInt(a / b)),
+        (Datum::Int(a), Datum::UnsignedInt(b)) => {
+            checked_float_to_int((*a as f64 / *b as f64).trunc())
+        }
+        (Datum::UnsignedInt(a), Datum::Int(b)) => {
+            checked_float_to_int((*a as f64 / *b as f64).trunc())
+        }
         (Datum::Float(a), Datum::Float(b)) => checked_float_to_int((a / b).trunc()),
         (Datum::Int(a), Datum::Float(b)) => checked_float_to_int((*a as f64 / b).trunc()),
         (Datum::Float(a), Datum::Int(b)) => checked_float_to_int((a / *b as f64).trunc()),
+        (Datum::UnsignedInt(a), Datum::Float(b)) => checked_float_to_int((*a as f64 / b).trunc()),
+        (Datum::Float(a), Datum::UnsignedInt(b)) => checked_float_to_int((a / *b as f64).trunc()),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot integer divide {:?} by {:?}",
             left, right
@@ -586,7 +663,8 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
         (
             Datum::Int(_),
             DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt
-        ) | (Datum::Float(_), DataType::Float | DataType::Double)
+        ) | (Datum::UnsignedInt(_), DataType::BigIntUnsigned)
+            | (Datum::Float(_), DataType::Float | DataType::Double)
             | (Datum::String(_), DataType::Varchar(_) | DataType::Text)
             | (Datum::Bool(_), DataType::Boolean)
             | (Datum::Bytes(_), DataType::Blob)
@@ -611,6 +689,7 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
     match target {
         DataType::BigInt | DataType::Int | DataType::SmallInt | DataType::TinyInt => match val {
             Datum::Int(i) => Ok(Datum::Int(*i)),
+            Datum::UnsignedInt(u) => Ok(Datum::Int(*u as i64)),
             Datum::Float(f) => Ok(Datum::Int(*f as i64)),
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
             Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
@@ -623,6 +702,29 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 Ok(Datum::Int(val))
             }
             _ => Ok(Datum::Int(0)),
+        },
+        DataType::BigIntUnsigned => match val {
+            Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
+            Datum::Int(i) => Ok(Datum::UnsignedInt(*i as u64)),
+            Datum::Float(f) => Ok(Datum::UnsignedInt(*f as u64)),
+            Datum::Bool(b) => Ok(Datum::UnsignedInt(if *b { 1 } else { 0 })),
+            Datum::String(s) => {
+                let trimmed = s.trim();
+                let v = trimmed.parse::<u64>().unwrap_or_else(|_| {
+                    // Try parsing as i64 first for negative strings
+                    trimmed.parse::<i64>().map(|i| i as u64).unwrap_or(0)
+                });
+                Ok(Datum::UnsignedInt(v))
+            }
+            Datum::Bit { value, .. } => Ok(Datum::UnsignedInt(*value)),
+            Datum::Bytes(b) => {
+                let mut val = 0u64;
+                for &byte in b.iter().take(8) {
+                    val = (val << 8) | byte as u64;
+                }
+                Ok(Datum::UnsignedInt(val))
+            }
+            _ => Ok(Datum::UnsignedInt(0)),
         },
         DataType::Double | DataType::Float => match val {
             Datum::Int(i) => Ok(Datum::Float(*i as f64)),

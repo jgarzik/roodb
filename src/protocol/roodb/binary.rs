@@ -68,6 +68,8 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             _ => i.to_le_bytes().to_vec(),
         },
 
+        Datum::UnsignedInt(u) => u.to_le_bytes().to_vec(),
+
         Datum::Float(f) => match data_type {
             DataType::Float => (*f as f32).to_le_bytes().to_vec(),
             _ => f.to_le_bytes().to_vec(),

@@ -68,6 +68,7 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
         DataType::SmallInt => ColumnType::Short,
         DataType::Int => ColumnType::Long,
         DataType::BigInt => ColumnType::LongLong,
+        DataType::BigIntUnsigned => ColumnType::LongLong,
         DataType::Float => ColumnType::Float,
         DataType::Double => ColumnType::Double,
         DataType::Varchar(_) => ColumnType::Varchar,
@@ -82,10 +83,11 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
 pub fn datatype_column_length(dt: &DataType) -> u32 {
     match dt {
         DataType::Boolean => 1,
-        DataType::TinyInt => 4,  // -128 to 127
-        DataType::SmallInt => 6, // -32768 to 32767
-        DataType::Int => 11,     // -2147483648 to 2147483647
-        DataType::BigInt => 20,  // Full i64 range
+        DataType::TinyInt => 4,         // -128 to 127
+        DataType::SmallInt => 6,        // -32768 to 32767
+        DataType::Int => 11,            // -2147483648 to 2147483647
+        DataType::BigInt => 20,         // Full i64 range
+        DataType::BigIntUnsigned => 20, // Full u64 range
         DataType::Float => 12,
         DataType::Double => 22,
         DataType::Varchar(n) => *n,
@@ -118,6 +120,9 @@ pub fn datatype_flags(dt: &DataType, nullable: bool) -> u16 {
         DataType::Blob | DataType::Text => {
             flags |= column_flags::BLOB;
         }
+        DataType::BigIntUnsigned => {
+            flags |= column_flags::UNSIGNED | column_flags::NUM;
+        }
         DataType::Bit(_) => {
             flags |= column_flags::UNSIGNED | column_flags::NUM;
         }
@@ -138,6 +143,7 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         }
         Datum::Bool(b) => encode_length_encoded_string(if *b { "1" } else { "0" }),
         Datum::Int(i) => encode_length_encoded_string(&i.to_string()),
+        Datum::UnsignedInt(u) => encode_length_encoded_string(&u.to_string()),
         Datum::Float(f) => {
             // Format floats for MySQL wire protocol:
             // - Very small/large values: scientific notation

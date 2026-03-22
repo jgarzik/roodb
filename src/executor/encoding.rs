@@ -126,6 +126,7 @@ const TAG_STRING: u8 = 4;
 const TAG_BYTES: u8 = 5;
 const TAG_TIMESTAMP: u8 = 6;
 const TAG_BIT: u8 = 7;
+const TAG_UINT: u8 = 8;
 
 /// Encode a row value
 ///
@@ -175,6 +176,10 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.push(TAG_BYTES);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
+        }
+        Datum::UnsignedInt(u) => {
+            buf.push(TAG_UINT);
+            buf.extend_from_slice(&u.to_le_bytes());
         }
         Datum::Bit { value, width } => {
             buf.push(TAG_BIT);
@@ -288,6 +293,18 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                 return Err(ExecutorError::Encoding("bytes data too short".to_string()));
             }
             Ok((Datum::Bytes(data[5..5 + len].to_vec()), 5 + len))
+        }
+
+        TAG_UINT => {
+            if data.len() < 9 {
+                return Err(ExecutorError::Encoding("uint data too short".to_string()));
+            }
+            let u = u64::from_le_bytes(
+                data[1..9]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
+            Ok((Datum::UnsignedInt(u), 9))
         }
 
         TAG_BIT => {

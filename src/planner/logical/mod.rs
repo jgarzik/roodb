@@ -88,6 +88,7 @@ pub enum Literal {
     Null,
     Boolean(bool),
     Integer(i64),
+    UnsignedInteger(u64),
     Float(f64),
     String(String),
     Blob(Vec<u8>),
@@ -188,6 +189,7 @@ impl ResolvedExpr {
                 Literal::Null => DataType::Int, // NULL is polymorphic, default to Int
                 Literal::Boolean(_) => DataType::Boolean,
                 Literal::Integer(_) => DataType::BigInt,
+                Literal::UnsignedInteger(_) => DataType::BigIntUnsigned,
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Blob(_) => DataType::Blob,
