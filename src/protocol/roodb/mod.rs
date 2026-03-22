@@ -4486,11 +4486,14 @@ where
                     )
                 }
             }
-            _ => (
-                codes::ER_UNKNOWN_ERROR,
-                states::GENERAL_ERROR,
-                e.to_string(),
-            ),
+            _ => {
+                let msg = e.to_string();
+                if msg.contains("Duplicate key") {
+                    (codes::ER_DUP_ENTRY, "23000", msg)
+                } else {
+                    (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, msg)
+                }
+            }
         };
 
         self.send_error(code, state, &msg).await
