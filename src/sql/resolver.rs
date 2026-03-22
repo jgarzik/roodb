@@ -622,8 +622,35 @@ impl<'a> Resolver<'a> {
 
             if let sp::OrderByKind::Expressions(exprs) = &order_by.kind {
                 for item in exprs {
+                    // Try resolving against table scope first, then SELECT aliases
+                    let resolved = match self.resolve_expr(&item.expr, &scope) {
+                        Ok(expr) => expr,
+                        Err(SqlError::ColumnNotFound(_)) => {
+                            // Check if it matches a SELECT alias
+                            if let sp::Expr::Identifier(ident) = &item.expr {
+                                let alias_name = &ident.value;
+                                let mut found = None;
+                                for col_item in &result.columns {
+                                    if let ResolvedSelectItem::Expr {
+                                        expr: resolved_expr,
+                                        alias: Some(a),
+                                    } = col_item
+                                    {
+                                        if a.eq_ignore_ascii_case(alias_name) {
+                                            found = Some(resolved_expr.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                found.ok_or_else(|| SqlError::ColumnNotFound(alias_name.clone()))?
+                            } else {
+                                return Err(SqlError::ColumnNotFound(item.expr.to_string()));
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    };
                     result.order_by.push(ResolvedOrderByItem {
-                        expr: self.resolve_expr(&item.expr, &scope)?,
+                        expr: resolved,
                         ascending: item.options.asc.unwrap_or(true),
                     });
                 }
