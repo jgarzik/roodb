@@ -355,10 +355,21 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
                     ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
                 })?;
             match a_norm.checked_add(b_norm) {
-                Some(v) => Ok(Datum::Decimal {
-                    value: v,
-                    scale: result_scale,
-                }),
+                Some(v) => {
+                    // For integer-valued decimals (scale 0), check BIGINT range
+                    if result_scale == 0
+                        && (v > i64::MAX as i128 || v < i64::MIN as i128)
+                        && (*sa == 0 && *sb == 0)
+                    {
+                        return Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ));
+                    }
+                    Ok(Datum::Decimal {
+                        value: v,
+                        scale: result_scale,
+                    })
+                }
                 None => Err(ExecutorError::DataOutOfRange(
                     "DECIMAL value is out of range".to_string(),
                 )),
@@ -368,10 +379,18 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         | (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
             let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
             match i_scaled.and_then(|is| d.checked_add(is)) {
-                Some(v) => Ok(Datum::Decimal {
-                    value: v,
-                    scale: *s,
-                }),
+                Some(v) => {
+                    // For integer-valued decimals (scale 0), check BIGINT range
+                    if *s == 0 && (v > i64::MAX as i128 || v < i64::MIN as i128) {
+                        return Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ));
+                    }
+                    Ok(Datum::Decimal {
+                        value: v,
+                        scale: *s,
+                    })
+                }
                 None => Err(ExecutorError::DataOutOfRange(
                     "DECIMAL value is out of range".to_string(),
                 )),
@@ -456,10 +475,20 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
                     ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
                 })?;
             match a_norm.checked_sub(b_norm) {
-                Some(v) => Ok(Datum::Decimal {
-                    value: v,
-                    scale: result_scale,
-                }),
+                Some(v) => {
+                    if result_scale == 0
+                        && (v > i64::MAX as i128 || v < i64::MIN as i128)
+                        && (*sa == 0 && *sb == 0)
+                    {
+                        return Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ));
+                    }
+                    Ok(Datum::Decimal {
+                        value: v,
+                        scale: result_scale,
+                    })
+                }
                 None => Err(ExecutorError::DataOutOfRange(
                     "DECIMAL value is out of range".to_string(),
                 )),
@@ -468,10 +497,17 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Decimal { value: d, scale: s }, Datum::Int(i)) => {
             let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
             match i_scaled.and_then(|is| d.checked_sub(is)) {
-                Some(v) => Ok(Datum::Decimal {
-                    value: v,
-                    scale: *s,
-                }),
+                Some(v) => {
+                    if *s == 0 && (v > i64::MAX as i128 || v < i64::MIN as i128) {
+                        return Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ));
+                    }
+                    Ok(Datum::Decimal {
+                        value: v,
+                        scale: *s,
+                    })
+                }
                 None => Err(ExecutorError::DataOutOfRange(
                     "DECIMAL value is out of range".to_string(),
                 )),
@@ -480,10 +516,17 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
             let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
             match i_scaled.and_then(|is| is.checked_sub(*d)) {
-                Some(v) => Ok(Datum::Decimal {
-                    value: v,
-                    scale: *s,
-                }),
+                Some(v) => {
+                    if *s == 0 && (v > i64::MAX as i128 || v < i64::MIN as i128) {
+                        return Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ));
+                    }
+                    Ok(Datum::Decimal {
+                        value: v,
+                        scale: *s,
+                    })
+                }
                 None => Err(ExecutorError::DataOutOfRange(
                     "DECIMAL value is out of range".to_string(),
                 )),
@@ -922,10 +965,37 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         },
         (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => Ok(Datum::UnsignedInt(a / b)),
         (Datum::Int(a), Datum::UnsignedInt(b)) => {
-            checked_float_to_int((*a as f64 / *b as f64).trunc())
+            if *a < 0 {
+                // Negative / positive unsigned → negative result
+                // Use i128 to avoid overflow
+                let result = (*a as i128) / (*b as i128);
+                if result < i64::MIN as i128 || result > i64::MAX as i128 {
+                    Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ))
+                } else {
+                    Ok(Datum::Int(result as i64))
+                }
+            } else {
+                // Both non-negative: safe to use unsigned
+                Ok(Datum::UnsignedInt(*a as u64 / *b))
+            }
         }
         (Datum::UnsignedInt(a), Datum::Int(b)) => {
-            checked_float_to_int((*a as f64 / *b as f64).trunc())
+            if *b < 0 {
+                // Unsigned / negative → negative result
+                let result = -(*a as i128 / (-*b as i128));
+                if result < i64::MIN as i128 || result > i64::MAX as i128 {
+                    Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ))
+                } else {
+                    Ok(Datum::Int(result as i64))
+                }
+            } else {
+                // Both non-negative: safe to use unsigned
+                Ok(Datum::UnsignedInt(*a / *b as u64))
+            }
         }
         (Datum::Float(a), Datum::Float(b)) => checked_float_to_int((a / b).trunc()),
         (Datum::Int(a), Datum::Float(b)) => checked_float_to_int((*a as f64 / b).trunc()),

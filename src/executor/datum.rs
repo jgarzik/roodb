@@ -267,8 +267,16 @@ impl Datum {
             Datum::Int(i) => Some(Datum::Int(-i)),
             Datum::Float(f) => Some(Datum::Float(-f)),
             Datum::UnsignedInt(u) => {
-                // -UnsignedInt: converts to signed via two's complement
-                Some(Datum::Int(-(*u as i64)))
+                // -UnsignedInt: convert to signed, checking for overflow
+                if *u <= i64::MAX as u64 {
+                    Some(Datum::Int(-(*u as i64)))
+                } else {
+                    // Value too large for i64 negation — use Decimal (i128)
+                    Some(Datum::Decimal {
+                        value: -(*u as i128),
+                        scale: 0,
+                    })
+                }
             }
             Datum::Decimal { value, scale } => Some(Datum::Decimal {
                 value: -value,
