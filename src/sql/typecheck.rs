@@ -63,12 +63,15 @@ impl TypeChecker {
 
     /// Check INSERT statement
     fn check_insert(columns: &[ResolvedColumn], values: &[Vec<ResolvedExpr>]) -> SqlResult<()> {
+        // MySQL behavior: single-row INSERT with explicit NULL into NOT NULL → error 1048.
+        // Multi-row INSERT in non-strict mode → silently convert NULL to column default.
+        let is_multi_row = values.len() > 1;
         for row in values {
             for (col, expr) in columns.iter().zip(row.iter()) {
                 Self::check_type_compatible(&col.data_type, &expr.data_type(), expr)?;
 
-                // Check NOT NULL constraints
-                if !col.nullable && Self::is_definitely_null(expr) {
+                // Check NOT NULL constraints (skip for multi-row — executor handles conversion)
+                if !is_multi_row && !col.nullable && Self::is_definitely_null(expr) {
                     return Err(SqlError::InvalidOperation(format!(
                         "Column '{}' cannot be NULL",
                         col.name
@@ -170,8 +173,8 @@ impl TypeChecker {
         source: &DataType,
         expr: &ResolvedExpr,
     ) -> SqlResult<()> {
-        // NULL is compatible with any nullable type
-        if Self::is_definitely_null(expr) {
+        // NULL is compatible with any type — at runtime, the NOT NULL check handles rejection
+        if Self::is_definitely_null(expr) || Self::could_be_null(expr) {
             return Ok(());
         }
 
@@ -187,6 +190,19 @@ impl TypeChecker {
                 expected: target.clone(),
                 found: source.clone(),
             })
+        }
+    }
+
+    /// Check if expression could evaluate to NULL at runtime (e.g. 1/null, a+null)
+    fn could_be_null(expr: &ResolvedExpr) -> bool {
+        match expr {
+            ResolvedExpr::Literal(Literal::Null) => true,
+            ResolvedExpr::BinaryOp { left, right, .. } => {
+                Self::could_be_null(left) || Self::could_be_null(right)
+            }
+            ResolvedExpr::UnaryOp { expr, .. } => Self::could_be_null(expr),
+            ResolvedExpr::Function { args, .. } => args.iter().any(Self::could_be_null),
+            _ => false,
         }
     }
 

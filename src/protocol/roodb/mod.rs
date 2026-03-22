@@ -4466,6 +4466,8 @@ where
                         states::NO_SUCH_TABLE,
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::NullValue(_) = exec_err {
+                    (codes::ER_BAD_NULL_ERROR, "23000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::DataOutOfRange(_) = exec_err {
                     (codes::ER_DATA_OUT_OF_RANGE, "22003", exec_err.to_string())
                 } else {

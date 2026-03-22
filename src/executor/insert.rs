@@ -140,6 +140,29 @@ impl Executor for Insert {
                 }
             }
 
+            // Validate NOT NULL constraints (after auto_increment so generated values pass).
+            // MySQL behavior: single-row INSERT with explicit NULL → error 1048.
+            // Multi-row INSERT in non-strict mode → convert NULL to column default.
+            let is_multi_row = self.values.len() > 1;
+            for (col_idx, datum) in datums.iter_mut().enumerate() {
+                if col_idx < self._columns.len()
+                    && !self._columns[col_idx].nullable
+                    && datum.is_null()
+                {
+                    if is_multi_row {
+                        // Non-strict mode: replace NULL with type default
+                        *datum = super::datum::Datum::default_for_type(
+                            &self._columns[col_idx].data_type,
+                        );
+                    } else {
+                        return Err(super::error::ExecutorError::NullValue(format!(
+                            "Column '{}' cannot be null",
+                            self._columns[col_idx].name
+                        )));
+                    }
+                }
+            }
+
             let row = Row::new(datums);
 
             // Use PK-based storage key if PK columns are known, else fall back to row_id

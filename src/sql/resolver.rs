@@ -358,12 +358,17 @@ impl<'a> Resolver<'a> {
                 .collect();
 
             // Fill in the specified values at their correct positions
+            let is_multi_row = values_rows.len() > 1;
             for (value_idx, expr) in row.iter().enumerate() {
                 let (col_idx, nullable, col_name) = &column_indices[value_idx];
                 let resolved_expr = self.resolve_expr(expr, &scope)?;
 
-                // Check NOT NULL constraint for non-NULL values
-                if !nullable && matches!(resolved_expr, ResolvedExpr::Literal(Literal::Null)) {
+                // Check NOT NULL constraint for explicitly specified NULL values.
+                // MySQL: single-row INSERT → error 1048; multi-row → convert to default.
+                if !is_multi_row
+                    && !nullable
+                    && matches!(resolved_expr, ResolvedExpr::Literal(Literal::Null))
+                {
                     return Err(SqlError::InvalidOperation(format!(
                         "Column '{}' cannot be NULL",
                         col_name
