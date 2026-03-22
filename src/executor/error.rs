@@ -28,6 +28,9 @@ pub enum ExecutorError {
     /// Invalid operation (e.g., division by zero)
     InvalidOperation(String),
 
+    /// Data out of range (e.g., float overflow)
+    DataOutOfRange(String),
+
     /// Column not found during evaluation
     ColumnNotFound { table: String, column: String },
 
@@ -64,6 +67,7 @@ impl fmt::Display for ExecutorError {
                 )
             }
             ExecutorError::InvalidOperation(msg) => write!(f, "invalid operation: {}", msg),
+            ExecutorError::DataOutOfRange(msg) => write!(f, "{}", msg),
             ExecutorError::ColumnNotFound { table, column } => {
                 write!(f, "column not found: {}.{}", table, column)
             }

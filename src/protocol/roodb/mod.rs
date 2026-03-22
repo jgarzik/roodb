@@ -1602,10 +1602,30 @@ where
             self.writer.write_packet(&eof).await?;
         }
 
-        // Send rows
-        while let Some(row) = executor.next().await? {
-            let row_packet = encode_text_row(&row);
-            self.writer.write_packet(&row_packet).await?;
+        // Send rows — catch executor errors mid-stream and send ERR packet
+        let mut row_error = None;
+        loop {
+            match executor.next().await {
+                Ok(Some(row)) => {
+                    let row_packet = encode_text_row(&row);
+                    self.writer.write_packet(&row_packet).await?;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    row_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // If an error occurred during row streaming, send ERR packet instead of EOF
+        if let Some(e) = row_error {
+            let err_packet =
+                encode_err_packet(codes::ER_DATA_OUT_OF_RANGE, "22003", &e.to_string());
+            self.writer.write_packet(&err_packet).await?;
+            self.writer.flush().await?;
+            executor.close().await?;
+            return Ok(());
         }
 
         // Send final EOF/OK
@@ -4056,6 +4076,8 @@ where
                         states::NO_SUCH_TABLE,
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::DataOutOfRange(_) = exec_err {
+                    (codes::ER_DATA_OUT_OF_RANGE, "22003", exec_err.to_string())
                 } else {
                     (
                         codes::ER_UNKNOWN_ERROR,

@@ -253,6 +253,17 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
     }
 }
 
+/// Check if a float result is infinite (overflow). MySQL raises ER_DATA_OUT_OF_RANGE.
+fn check_float_overflow(v: f64) -> ExecutorResult<Datum> {
+    if v.is_infinite() {
+        Err(ExecutorError::DataOutOfRange(
+            "DOUBLE value is out of range".to_string(),
+        ))
+    } else {
+        Ok(Datum::Float(v))
+    }
+}
+
 /// Promote Bit and String to numeric types for arithmetic operations (MySQL implicit coercion).
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
@@ -283,10 +294,10 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a + b)),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a + b)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.wrapping_add(*b))),
+        (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a + b),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
-            Ok(Datum::Float(*a as f64 + b))
+            check_float_overflow(*a as f64 + b)
         }
         (Datum::String(a), Datum::String(b)) => Ok(Datum::String(format!("{}{}", a, b))),
         _ => Err(ExecutorError::InvalidOperation(format!(
@@ -300,10 +311,10 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a - b)),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a - b)),
-        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 - b)),
-        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a - *b as f64)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.wrapping_sub(*b))),
+        (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a - b),
+        (Datum::Int(a), Datum::Float(b)) => check_float_overflow(*a as f64 - b),
+        (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a - *b as f64),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot subtract {:?} from {:?}",
             right, left
@@ -315,10 +326,10 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a * b)),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a * b)),
+        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.wrapping_mul(*b))),
+        (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a * b),
         (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
-            Ok(Datum::Float(*a as f64 * b))
+            check_float_overflow(*a as f64 * b)
         }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot multiply {:?} and {:?}",
@@ -339,10 +350,10 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
 
     match (left.as_ref(), right.as_ref()) {
         // MySQL: integer / integer returns DECIMAL (float), not integer
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Float(*a as f64 / *b as f64)),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Float(a / b)),
-        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 / b)),
-        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a / *b as f64)),
+        (Datum::Int(a), Datum::Int(b)) => check_float_overflow(*a as f64 / *b as f64),
+        (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a / b),
+        (Datum::Int(a), Datum::Float(b)) => check_float_overflow(*a as f64 / b),
+        (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a / *b as f64),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot divide {:?} by {:?}",
             left, right
@@ -1169,7 +1180,13 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
             let base = args[0].as_float().unwrap_or(0.0);
             let exp = args[1].as_float().unwrap_or(0.0);
-            Ok(Datum::Float(base.powf(exp)))
+            let result = base.powf(exp);
+            if result.is_infinite() {
+                return Err(ExecutorError::DataOutOfRange(
+                    "DOUBLE value is out of range".to_string(),
+                ));
+            }
+            Ok(float_or_null(result))
         }
 
         "SQRT" => {
@@ -1316,7 +1333,13 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).exp()))
+            let result = args[0].as_float().unwrap_or(0.0).exp();
+            if result.is_infinite() {
+                return Err(ExecutorError::DataOutOfRange(
+                    "DOUBLE value is out of range".to_string(),
+                ));
+            }
+            Ok(Datum::Float(result))
         }
 
         "PI" => Ok(Datum::Float(std::f64::consts::PI)),
