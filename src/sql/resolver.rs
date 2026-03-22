@@ -1884,19 +1884,50 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         | sp::DataType::UBigInt
         | sp::DataType::UInt64
         | sp::DataType::Unsigned => Ok(DataType::BigIntUnsigned),
-        // Float
-        sp::DataType::Float(_)
-        | sp::DataType::Real
+        // Float — validate precision (MySQL: 0-24 → FLOAT, 25-53 → DOUBLE, >53 → error)
+        sp::DataType::Float(info) | sp::DataType::FloatUnsigned(info) => {
+            match info {
+                sp::ExactNumberInfo::Precision(p) => {
+                    if *p > 53 {
+                        // FLOAT(p) with p>53 and no scale → error 1063
+                        return Err(SqlError::InvalidOperation(
+                            "Incorrect column specifier".to_string(),
+                        ));
+                    }
+                    if *p > 24 {
+                        return Ok(DataType::Double);
+                    }
+                }
+                sp::ExactNumberInfo::PrecisionAndScale(p, _) => {
+                    if *p > 53 {
+                        // FLOAT(p,s) with p>53 → error 1425
+                        return Err(SqlError::InvalidOperation(
+                            "Display width out of range for column (max = 255)".to_string(),
+                        ));
+                    }
+                }
+                sp::ExactNumberInfo::None => {}
+            }
+            Ok(DataType::Float)
+        }
+        sp::DataType::Real
         | sp::DataType::Float4
         | sp::DataType::Float32
-        | sp::DataType::FloatUnsigned(_)
         | sp::DataType::RealUnsigned => Ok(DataType::Float),
-        // Double
-        sp::DataType::Double(_)
-        | sp::DataType::DoublePrecision
+        // Double — validate precision
+        sp::DataType::Double(info) | sp::DataType::DoubleUnsigned(info) => {
+            if let sp::ExactNumberInfo::PrecisionAndScale(p, _) = info {
+                if *p > 53 {
+                    return Err(SqlError::InvalidOperation(
+                        "Display width out of range for column (max = 255)".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Double)
+        }
+        sp::DataType::DoublePrecision
         | sp::DataType::Float8
         | sp::DataType::Float64
-        | sp::DataType::DoubleUnsigned(_)
         | sp::DataType::DoublePrecisionUnsigned => Ok(DataType::Double),
         // DECIMAL/NUMERIC
         sp::DataType::Decimal(info)
@@ -1916,16 +1947,26 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 scale: s.min(30),
             })
         }
-        // Varchar
+        // Varchar — promote to Text if too large (MySQL behavior)
         sp::DataType::Varchar(len)
         | sp::DataType::CharacterVarying(len)
         | sp::DataType::CharVarying(len)
         | sp::DataType::Nvarchar(len) => {
             let n = extract_varchar_length(len).unwrap_or(255);
-            Ok(DataType::Varchar(n))
+            if n > 65535 {
+                // MySQL promotes large VARCHAR to TEXT
+                Ok(DataType::Text)
+            } else {
+                Ok(DataType::Varchar(n))
+            }
         }
         sp::DataType::Char(len) | sp::DataType::Character(len) => {
             let n = extract_varchar_length(len).unwrap_or(1);
+            if n > 255 {
+                return Err(SqlError::InvalidOperation(
+                    "Column length too big for column (max = 255)".to_string(),
+                ));
+            }
             Ok(DataType::Varchar(n))
         }
         // Text
