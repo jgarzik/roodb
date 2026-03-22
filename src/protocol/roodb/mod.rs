@@ -419,6 +419,7 @@ where
                 Ok(p) => p,
                 Err(ProtocolError::ConnectionClosed) => {
                     debug!(connection_id = self.connection_id, "Client disconnected");
+                    self.cleanup_temp_tables().await;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -442,7 +443,10 @@ where
                     last_cmd_end = Instant::now();
                     continue;
                 }
-                Ok(false) => return Ok(()), // Client quit
+                Ok(false) => {
+                    self.cleanup_temp_tables().await;
+                    return Ok(()); // Client quit
+                }
                 Err(e) => {
                     // Try to send error to client
                     warn!(error = %e, "Command error");
@@ -1018,6 +1022,11 @@ where
             return Ok(());
         }
 
+        // Handle CREATE TEMPORARY TABLE
+        if let Some(()) = self.try_handle_create_temporary_table(sql).await? {
+            return Ok(());
+        }
+
         // Handle ALTER TABLE
         if let Some(()) = self.try_handle_alter_table(sql).await? {
             return Ok(());
@@ -1036,14 +1045,24 @@ where
             }
         }
 
+        // Handle SET sql_mode (track in session)
+        if let Some(mode_val) = Self::extract_sql_mode_value(sql) {
+            self.session.set_sql_mode(&mode_val);
+            // Update evaluator flag immediately for the current session
+            crate::executor::eval::set_no_unsigned_subtraction(
+                &self.session.user_variables(),
+                self.session.has_sql_mode("NO_UNSIGNED_SUBTRACTION"),
+            );
+            return self.send_ok(0, 0).await;
+        }
+
         // Handle statements as no-ops for MySQL compatibility
         {
             let upper = sql.trim().to_uppercase();
-            // SET NAMES, SET CHARACTER SET, SET sql_mode, etc.
+            // SET NAMES, SET CHARACTER SET, etc.
             if upper.starts_with("SET NAMES")
                 || upper.starts_with("SET CHARACTER SET")
                 || upper.starts_with("SET CHARACTER_SET")
-                || upper.starts_with("SET SQL_MODE")
                 || upper.starts_with("SET @@")
                 || upper.starts_with("SET SESSION ")
                 || upper.starts_with("SET GLOBAL ")
@@ -1761,13 +1780,20 @@ where
         }
 
         // Catch-all: silently accept any other SET statement (SET NAMES, SET charset, etc.)
-        // Exception: SET @var is handled by handle_set_user_variable
+        // Exceptions: SET @var (user variables), SET sql_mode (tracked in session)
         if sql_upper.starts_with("SET ") && !sql_upper.starts_with("SET @") {
+            // Let SET sql_mode through to be handled by extract_sql_mode_value
+            if Self::extract_sql_mode_value(sql).is_some() {
+                return Ok(None);
+            }
             debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET statement");
             return self.send_ok(0, 0).await.map(Some);
         }
-        // Also accept SET @@system_var as no-op
+        // Also accept SET @@system_var as no-op (except @@sql_mode)
         if sql_upper.starts_with("SET @@") {
+            if Self::extract_sql_mode_value(sql).is_some() {
+                return Ok(None);
+            }
             debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET @@var statement");
             return self.send_ok(0, 0).await.map(Some);
         }
@@ -2186,6 +2212,148 @@ where
         // Send result set
         self.send_collected_result_set(&columns, all_rows).await?;
         Ok(Some(()))
+    }
+
+    /// Clean up temporary tables when the connection closes.
+    /// Deletes data rows from storage and removes catalog entries.
+    async fn cleanup_temp_tables(&mut self) {
+        let temp_tables = self.session.take_temp_tables();
+        if temp_tables.is_empty() {
+            return;
+        }
+
+        // First pass: delete data rows from storage (async, no catalog lock)
+        let storage = self.mvcc.inner().clone();
+        for name in &temp_tables {
+            let prefix = crate::executor::encoding::table_key_prefix(name);
+            let end = crate::executor::encoding::table_key_end(name);
+            if let Ok(rows) = storage.scan(Some(&prefix), Some(&end)).await {
+                for (key, _) in rows {
+                    let _ = storage.delete(&key).await;
+                }
+            }
+        }
+
+        // Second pass: drop all catalog entries under a single lock
+        {
+            let mut catalog = self.catalog.write();
+            for name in &temp_tables {
+                let _ = catalog.drop_table(name);
+            }
+        }
+
+        debug!(
+            connection_id = self.connection_id,
+            count = temp_tables.len(),
+            "Cleaned up temporary tables"
+        );
+    }
+
+    /// Handle CREATE TEMPORARY TABLE — creates table in catalog without Raft persistence.
+    /// Temporary tables are session-scoped and cleaned up on disconnect.
+    async fn try_handle_create_temporary_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let upper = sql.trim().to_uppercase();
+        if !upper.starts_with("CREATE TEMPORARY TABLE ") {
+            return Ok(None);
+        }
+
+        // Rewrite to regular CREATE TABLE for parsing (case-insensitive removal)
+        let trimmed_sql = sql.trim();
+        let temp_pos = upper.find("TEMPORARY ").unwrap(); // safe: guard above matched
+        let rewritten = format!(
+            "{}{}",
+            &trimmed_sql[..temp_pos],
+            &trimmed_sql[temp_pos + 10..]
+        );
+        let stmt = match crate::sql::Parser::parse_one(&rewritten) {
+            Ok(s) => s,
+            Err(e) => {
+                return self
+                    .send_error(1064, "42000", &format!("Parse error: {}", e))
+                    .await
+                    .map(|_| Some(()));
+            }
+        };
+
+        // Resolve the CREATE TABLE (drop catalog guard before await)
+        let resolved = {
+            let catalog = self.catalog.read();
+            let resolver = crate::sql::Resolver::new(&catalog);
+            resolver.resolve(stmt).map_err(|e| e.to_string())
+        };
+        let resolved = match resolved {
+            Ok(r) => r,
+            Err(e) => {
+                return self.send_error(1064, "42000", &e).await.map(|_| Some(()));
+            }
+        };
+
+        // Extract table name and columns from resolved statement
+        let (name, columns, constraints, if_not_exists) = match resolved {
+            crate::planner::logical::ResolvedStatement::CreateTable {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+            } => (name, columns, constraints, if_not_exists),
+            crate::planner::logical::ResolvedStatement::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                ..
+            } => (name, columns, constraints, if_not_exists),
+            _ => {
+                return self
+                    .send_error(
+                        1064,
+                        "42000",
+                        "Unexpected resolved statement for TEMPORARY TABLE",
+                    )
+                    .await
+                    .map(|_| Some(()));
+            }
+        };
+
+        // Build TableDef with is_temporary flag
+        let mut table_def = crate::catalog::TableDef::new(&name);
+        table_def.is_temporary = true;
+        for col in &columns {
+            table_def = table_def.column(col.clone());
+        }
+        for constraint in &constraints {
+            table_def = table_def.constraint(constraint.clone());
+        }
+
+        // Create directly in catalog (skip Raft, skip system table persistence)
+        let create_result = {
+            let mut catalog = self.catalog.write();
+            if catalog.get_table(&name).is_some() {
+                if if_not_exists {
+                    Ok(true) // already exists, but IF NOT EXISTS
+                } else {
+                    Err(format!("Table '{}' already exists", name))
+                }
+            } else {
+                catalog
+                    .create_table(table_def)
+                    .map_err(|e| ProtocolError::Internal(e.to_string()))?;
+                Ok(false) // newly created
+            }
+        };
+
+        match create_result {
+            Ok(true) => return self.send_ok(0, 0).await.map(|_| Some(())),
+            Err(msg) => {
+                return self.send_error(1050, "42S01", &msg).await.map(|_| Some(()));
+            }
+            Ok(false) => {} // success, continue
+        }
+
+        // Register in session for cleanup on disconnect
+        self.session.register_temp_table(name);
+
+        self.send_ok(0, 0).await.map(|_| Some(()))
     }
 
     /// Handle ALTER TABLE statements.
@@ -3084,6 +3252,19 @@ where
                 .await
                 .map(Some)
         }
+        // SHOW ERRORS
+        else if sql_upper.starts_with("SHOW ERRORS") {
+            let rows: Vec<Vec<String>> = self
+                .session
+                .warnings()
+                .iter()
+                .filter(|w| w.level == "Error")
+                .map(|w| vec![w.level.clone(), w.code.to_string(), w.message.clone()])
+                .collect();
+            self.send_custom_result_set(&["Level", "Code", "Message"], &rows)
+                .await
+                .map(Some)
+        }
         // SHOW COUNT(*) WARNINGS
         else if sql_upper.contains("SHOW COUNT") && sql_upper.contains("WARNINGS") {
             let count = self.session.warning_count();
@@ -3463,6 +3644,43 @@ where
         self.send_ok(0, 0).await
     }
 
+    /// Extract the value from SET sql_mode / SET @@sql_mode / SET SESSION sql_mode.
+    /// Returns None if the SQL is not a sql_mode SET statement.
+    fn extract_sql_mode_value(sql: &str) -> Option<String> {
+        let upper = sql.trim().to_uppercase();
+        // Match: SET SQL_MODE, SET @@SQL_MODE, SET @@SESSION.SQL_MODE, SET SESSION SQL_MODE
+        let rest = if let Some(r) = upper.strip_prefix("SET ") {
+            r.trim()
+        } else {
+            return None;
+        };
+        let rest = if let Some(r) = rest.strip_prefix("@@SESSION.") {
+            r.trim()
+        } else if let Some(r) = rest.strip_prefix("@@GLOBAL.") {
+            r.trim()
+        } else if let Some(r) = rest.strip_prefix("@@") {
+            r.trim()
+        } else if let Some(r) = rest.strip_prefix("SESSION ") {
+            r.trim()
+        } else if let Some(r) = rest.strip_prefix("GLOBAL ") {
+            r.trim()
+        } else {
+            rest
+        };
+        // Must be exactly "SQL_MODE" followed by '=' or whitespace, not "SQL_MODE_FOO"
+        if !rest.starts_with("SQL_MODE") {
+            return None;
+        }
+        let after = &rest["SQL_MODE".len()..];
+        if !after.is_empty() && !after.starts_with('=') && !after.starts_with(' ') {
+            return None;
+        }
+        // Find the '=' and extract value from original sql (preserve case)
+        let eq_pos = sql.find('=')?;
+        let val = sql[eq_pos + 1..].trim().trim_end_matches(';');
+        Some(val.to_string())
+    }
+
     async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         use regex::Regex;
 
@@ -3514,7 +3732,12 @@ where
                 "character_set_connection" => "utf8mb4",
                 "character_set_results" => "utf8mb4",
                 "collation_connection" => "utf8mb4_general_ci",
-                "sql_mode" => "STRICT_TRANS_TABLES",
+                "sql_mode" => {
+                    // Dynamic: return session sql_mode
+                    col_names.push(format!("@@{}", var_lower));
+                    values.push(self.session.sql_mode_string());
+                    continue;
+                }
                 "time_zone" => "SYSTEM",
                 "system_time_zone" => "UTC",
                 "transaction_isolation" | "tx_isolation" => "REPEATABLE-READ",
@@ -3780,6 +4003,9 @@ where
             }
         };
 
+        // Extract DECLARE HANDLER declarations before parsing
+        let handlers = Self::extract_handlers(&proc_def.body_sql);
+
         // Parse procedure body into Vec<Statement>
         let body_stmts = match Self::parse_body_to_stmts(&proc_def.body_sql) {
             Ok(stmts) => stmts,
@@ -3794,7 +4020,10 @@ where
             }
         };
         // Execute the body
-        match self.execute_procedure_body(&body_stmts, &mut ctx).await {
+        match self
+            .execute_procedure_body_with_handlers(&body_stmts, &mut ctx, &handlers)
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 return self
@@ -3855,6 +4084,7 @@ where
 
     /// Convert MySQL DECLARE variable statements to SET statements.
     /// Leaves DECLARE ... CURSOR FOR ... unchanged (sqlparser handles those).
+    /// Strips DECLARE ... HANDLER ... statements (handled separately).
     fn normalize_declare_stmts(body: &str) -> String {
         let mut result = String::with_capacity(body.len());
         // Split on semicolons, process each statement
@@ -3865,8 +4095,17 @@ where
             }
             let upper = trimmed.to_uppercase();
             if upper.starts_with("DECLARE ") {
-                // Check if this is a cursor declaration (DECLARE name CURSOR FOR ...)
                 let words: Vec<&str> = trimmed.split_whitespace().collect();
+                // DECLARE CONTINUE HANDLER ... — strip (handled separately)
+                if words.len() >= 3
+                    && (words[1].eq_ignore_ascii_case("CONTINUE")
+                        || words[1].eq_ignore_ascii_case("EXIT"))
+                    && words[2].eq_ignore_ascii_case("HANDLER")
+                {
+                    // Skip — handlers are extracted by extract_handlers()
+                    continue;
+                }
+                // Check if this is a cursor declaration (DECLARE name CURSOR FOR ...)
                 if words.len() >= 3 && words[2].eq_ignore_ascii_case("CURSOR") {
                     // Keep cursor declarations as-is
                     if !result.is_empty() {
@@ -3901,6 +4140,62 @@ where
         result
     }
 
+    /// Extract DECLARE CONTINUE/EXIT HANDLER declarations from procedure body.
+    /// Returns vec of (handler_type, sqlstate, handler_sql).
+    fn extract_handlers(body_sql: &str) -> Vec<(String, String, String)> {
+        let trimmed = body_sql.trim();
+        let inner = {
+            let upper = trimmed.to_uppercase();
+            if upper.starts_with("BEGIN") && upper.ends_with("END") {
+                trimmed[5..trimmed.len() - 3].trim()
+            } else {
+                trimmed
+            }
+        };
+
+        let mut handlers = Vec::new();
+        for part in inner.split(';') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let upper = trimmed.to_uppercase();
+            if !upper.starts_with("DECLARE ") {
+                continue;
+            }
+            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            // DECLARE CONTINUE HANDLER FOR SQLSTATE 'xxxxx' handler_sql
+            // DECLARE EXIT HANDLER FOR SQLSTATE 'xxxxx' handler_sql
+            if words.len() >= 6
+                && (words[1].eq_ignore_ascii_case("CONTINUE")
+                    || words[1].eq_ignore_ascii_case("EXIT"))
+                && words[2].eq_ignore_ascii_case("HANDLER")
+                && words[3].eq_ignore_ascii_case("FOR")
+                && words[4].eq_ignore_ascii_case("SQLSTATE")
+            {
+                let handler_type = words[1].to_uppercase();
+                let sqlstate = words[5].trim_matches('\'').trim_matches('"').to_string();
+                // The handler body is everything after SQLSTATE 'xxx'
+                if let Some(sqlstate_pos) = upper.find("SQLSTATE") {
+                    let after_sqlstate = trimmed[sqlstate_pos + 8..].trim();
+                    // Find opening quote, then closing quote, then handler body
+                    if let Some(open_q) = after_sqlstate.find(['\'', '"']) {
+                        let quote_char = after_sqlstate.as_bytes()[open_q];
+                        if let Some(close_q) =
+                            after_sqlstate[open_q + 1..].find(|c: char| c as u8 == quote_char)
+                        {
+                            let handler_sql = after_sqlstate[open_q + 1 + close_q + 1..]
+                                .trim()
+                                .to_string();
+                            handlers.push((handler_type, sqlstate, handler_sql));
+                        }
+                    }
+                }
+            }
+        }
+        handlers
+    }
+
     /// Execute a list of procedure body statements. Returns control flow signal.
     fn execute_procedure_body<'a>(
         &'a mut self,
@@ -3924,6 +4219,107 @@ where
             }
             Ok(ProcControlFlow::Continue)
         })
+    }
+
+    /// Execute procedure body with DECLARE HANDLER support.
+    /// When a statement fails and a matching CONTINUE handler exists, the error
+    /// is recorded as a session warning and execution continues.
+    fn execute_procedure_body_with_handlers<'a>(
+        &'a mut self,
+        stmts: &'a [sqlparser::ast::Statement],
+        ctx: &'a mut crate::executor::procedure::ProcedureContext,
+        handlers: &'a [(String, String, String)], // (handler_type, sqlstate, handler_sql)
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::executor::procedure::ProcControlFlow, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        use crate::executor::procedure::ProcControlFlow;
+        Box::pin(async move {
+            if handlers.is_empty() {
+                // No handlers: fast path, same as execute_procedure_body
+                for stmt in stmts {
+                    match self.execute_procedure_stmt(stmt, ctx).await? {
+                        ProcControlFlow::Continue => {}
+                        ProcControlFlow::Return => return Ok(ProcControlFlow::Return),
+                    }
+                }
+                return Ok(ProcControlFlow::Continue);
+            }
+
+            for stmt in stmts {
+                match self.execute_procedure_stmt(stmt, ctx).await {
+                    Ok(ProcControlFlow::Continue) => {}
+                    Ok(ProcControlFlow::Return) => return Ok(ProcControlFlow::Return),
+                    Err(err_msg) => {
+                        // Map error to SQLSTATE
+                        let sqlstate = Self::error_to_sqlstate(&err_msg);
+
+                        // Check if any handler matches
+                        let matching_handler =
+                            handlers.iter().find(|(_, state, _)| *state == sqlstate);
+
+                        if let Some((handler_type, _, handler_sql)) = matching_handler {
+                            // Record the error as a session warning
+                            self.session.add_warning(
+                                "Error",
+                                Self::sqlstate_to_error_code(&sqlstate),
+                                err_msg.clone(),
+                            );
+
+                            // Execute the handler SQL
+                            if !handler_sql.is_empty() {
+                                let _ = self.handle_query(handler_sql).await;
+                            }
+
+                            if handler_type == "CONTINUE" {
+                                continue;
+                            } else {
+                                // EXIT handler: stop execution
+                                return Ok(ProcControlFlow::Continue);
+                            }
+                        } else {
+                            // No matching handler: propagate error
+                            return Err(err_msg);
+                        }
+                    }
+                }
+            }
+            Ok(ProcControlFlow::Continue)
+        })
+    }
+
+    /// Map error message to SQLSTATE code
+    fn error_to_sqlstate(err_msg: &str) -> String {
+        let lower = err_msg.to_lowercase();
+        if lower.contains("out of range") || lower.contains("overflow") {
+            "22003".to_string()
+        } else if (lower.contains("null") && lower.contains("constraint"))
+            || lower.contains("duplicate")
+            || lower.contains("already exists")
+        {
+            "23000".to_string()
+        } else if lower.contains("division by zero") || lower.contains("divide by zero") {
+            "22012".to_string()
+        } else if lower.contains("data truncat") {
+            "22001".to_string()
+        } else {
+            "HY000".to_string() // general error
+        }
+    }
+
+    /// Map SQLSTATE to MySQL error code
+    fn sqlstate_to_error_code(sqlstate: &str) -> u16 {
+        match sqlstate {
+            "22003" => 1264, // ER_WARN_DATA_OUT_OF_RANGE
+            "23000" => 1062, // ER_DUP_ENTRY
+            "22012" => 1365, // ER_DIVISION_BY_ZERO
+            "22001" => 1265, // WARN_DATA_TRUNCATED
+            _ => 1105,       // ER_UNKNOWN_ERROR
+        }
     }
 
     /// Dispatch a single procedure body statement.

@@ -1,7 +1,21 @@
 //! Session state for RooDB connections
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// MySQL 8.0 default sql_mode values
+const DEFAULT_SQL_MODES: &[&str] = &[
+    "ONLY_FULL_GROUP_BY",
+    "STRICT_TRANS_TABLES",
+    "NO_ZERO_IN_DATE",
+    "NO_ZERO_DATE",
+    "ERROR_FOR_DIVISION_BY_ZERO",
+    "NO_ENGINE_SUBSTITUTION",
+];
+
+fn default_sql_modes() -> HashSet<String> {
+    DEFAULT_SQL_MODES.iter().map(|s| s.to_string()).collect()
+}
 
 use parking_lot::RwLock;
 
@@ -116,6 +130,12 @@ pub struct Session {
 
     /// SQL-level prepared statements (PREPARE stmt FROM 'sql')
     pub sql_prepared_stmts: std::collections::HashMap<String, String>,
+
+    /// Active SQL modes (e.g., NO_UNSIGNED_SUBTRACTION, STRICT_TRANS_TABLES)
+    sql_modes: HashSet<String>,
+
+    /// Temporary table names owned by this session (cleaned up on disconnect)
+    temp_table_names: Vec<String>,
 }
 
 impl Session {
@@ -140,6 +160,10 @@ impl Session {
             user_variables: Arc::new(RwLock::new(HashMap::new())),
             // SQL prepared statements
             sql_prepared_stmts: std::collections::HashMap::new(),
+            // SQL modes — MySQL 8.0 defaults
+            sql_modes: default_sql_modes(),
+            // Temporary tables
+            temp_table_names: Vec::new(),
         }
     }
 
@@ -290,5 +314,50 @@ impl Session {
     pub fn set_user_variable(&self, name: &str, value: Datum) {
         let mut vars = self.user_variables.write();
         vars.insert(name.to_lowercase(), value);
+    }
+
+    // ============ SQL Mode ============
+
+    /// Set sql_mode from a comma-separated string. Empty string clears all modes.
+    pub fn set_sql_mode(&mut self, mode_str: &str) {
+        self.sql_modes.clear();
+        let trimmed = mode_str.trim().trim_matches('\'').trim_matches('"');
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.eq_ignore_ascii_case("DEFAULT") {
+            self.sql_modes = default_sql_modes();
+            return;
+        }
+        for mode in trimmed.split(',') {
+            let m = mode.trim().to_uppercase();
+            if !m.is_empty() {
+                self.sql_modes.insert(m);
+            }
+        }
+    }
+
+    /// Check if a specific sql_mode is active
+    pub fn has_sql_mode(&self, mode: &str) -> bool {
+        self.sql_modes.contains(&mode.to_uppercase())
+    }
+
+    /// Get the current sql_mode as a comma-separated string
+    pub fn sql_mode_string(&self) -> String {
+        let mut modes: Vec<&str> = self.sql_modes.iter().map(|s| s.as_str()).collect();
+        modes.sort();
+        modes.join(",")
+    }
+
+    // ============ Temporary Tables ============
+
+    /// Register a temporary table name for cleanup on disconnect
+    pub fn register_temp_table(&mut self, name: String) {
+        self.temp_table_names.push(name);
+    }
+
+    /// Take all temporary table names (called on disconnect for cleanup)
+    pub fn take_temp_tables(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.temp_table_names)
     }
 }

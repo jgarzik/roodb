@@ -183,10 +183,21 @@ impl<'a> Resolver<'a> {
 
         // Handle CREATE TABLE ... SELECT (CTAS)
         if let Some(ref query) = create.query {
-            let select = self.resolve_select_body(query.body.as_ref())?;
+            let resolved = self.resolve_query(query)?;
+
+            // Extract a ResolvedSelect for column derivation
+            let select_for_cols = match &resolved {
+                ResolvedStatement::Select(rs) => rs,
+                ResolvedStatement::Union { left, .. } => left.as_ref(),
+                _ => {
+                    return Err(SqlError::Unsupported(
+                        "CTAS source must be SELECT or UNION".to_string(),
+                    ))
+                }
+            };
 
             // Derive column definitions from SELECT output
-            let derived_columns = derive_columns_from_select(&select);
+            let derived_columns = derive_columns_from_select(select_for_cols);
 
             // Merge: explicit columns first, then derived columns from SELECT
             let mut merged = columns;
@@ -201,7 +212,7 @@ impl<'a> Resolver<'a> {
                 columns: merged,
                 constraints,
                 if_not_exists,
-                select,
+                source: Box::new(resolved),
             });
         }
 

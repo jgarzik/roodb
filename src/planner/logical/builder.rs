@@ -73,15 +73,15 @@ impl LogicalPlanBuilder {
                 columns,
                 constraints,
                 if_not_exists,
-                select,
+                source,
             } => {
-                let source = Self::build_select(select)?;
+                let source_plan = Self::build(*source)?;
                 Ok(LogicalPlan::CreateTableAs {
                     name,
                     columns,
                     constraints,
                     if_not_exists,
-                    source: Box::new(source),
+                    source: Box::new(source_plan),
                 })
             }
             ResolvedStatement::DropTable { name, if_exists } => {

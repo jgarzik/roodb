@@ -9,6 +9,25 @@ use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 
+/// Internal variable name for NO_UNSIGNED_SUBTRACTION flag (stored in UserVariables)
+const NO_UNSIGNED_SUB_VAR: &str = "__sys_no_unsigned_sub";
+
+/// Set the NO_UNSIGNED_SUBTRACTION flag for a session (stored in UserVariables)
+pub fn set_no_unsigned_subtraction(vars: &UserVariables, val: bool) {
+    let mut w = vars.write();
+    if val {
+        w.insert(NO_UNSIGNED_SUB_VAR.to_string(), Datum::Bool(true));
+    } else {
+        w.remove(NO_UNSIGNED_SUB_VAR);
+    }
+}
+
+/// Get the NO_UNSIGNED_SUBTRACTION flag from UserVariables
+fn no_unsigned_subtraction(vars: &UserVariables) -> bool {
+    let r = vars.read();
+    matches!(r.get(NO_UNSIGNED_SUB_VAR), Some(Datum::Bool(true)))
+}
+
 /// Evaluate an expression against a row, with access to user variables
 pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> ExecutorResult<Datum> {
     match expr {
@@ -38,7 +57,7 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
         } => {
             let lval = evaluate(left, row, vars)?;
             let rval = evaluate(right, row, vars)?;
-            eval_binary_op(op, &lval, &rval)
+            eval_binary_op_ex(op, &lval, &rval, Some(vars))
         }
 
         ResolvedExpr::UnaryOp { op, expr, .. } => {
@@ -164,8 +183,18 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
     }
 }
 
-/// Evaluate a binary operation
+/// Evaluate a binary operation.
+/// `vars` is optional — when provided, sql_mode flags (e.g. NO_UNSIGNED_SUBTRACTION) apply.
 pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+    eval_binary_op_ex(op, left, right, None)
+}
+
+fn eval_binary_op_ex(
+    op: &BinaryOp,
+    left: &Datum,
+    right: &Datum,
+    vars: Option<&UserVariables>,
+) -> ExecutorResult<Datum> {
     // Handle NULL propagation for most operations
     if matches!(
         op,
@@ -196,7 +225,7 @@ pub fn eval_binary_op(op: &BinaryOp, left: &Datum, right: &Datum) -> ExecutorRes
     match op {
         // Arithmetic
         BinaryOp::Add => eval_add(left, right),
-        BinaryOp::Sub => eval_sub(left, right),
+        BinaryOp::Sub => eval_sub(left, right, vars),
         BinaryOp::Mul => eval_mul(left, right),
         BinaryOp::Div => eval_div(left, right),
         BinaryOp::Mod => eval_mod(left, right),
@@ -422,9 +451,44 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     }
 }
 
-fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
+fn eval_sub(left: &Datum, right: &Datum, vars: Option<&UserVariables>) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
+
+    // When NO_UNSIGNED_SUBTRACTION is active, mixed/unsigned subtraction produces signed result
+    if vars.is_some_and(no_unsigned_subtraction) {
+        match (left.as_ref(), right.as_ref()) {
+            (Datum::UnsignedInt(a), Datum::UnsignedInt(b)) => {
+                let result = (*a as i128) - (*b as i128);
+                if result > i64::MAX as i128 || result < i64::MIN as i128 {
+                    return Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ));
+                }
+                return Ok(Datum::Int(result as i64));
+            }
+            (Datum::UnsignedInt(a), Datum::Int(b)) => {
+                let result = (*a as i128) - (*b as i128);
+                if result > i64::MAX as i128 || result < i64::MIN as i128 {
+                    return Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ));
+                }
+                return Ok(Datum::Int(result as i64));
+            }
+            (Datum::Int(a), Datum::UnsignedInt(b)) => {
+                let result = (*a as i128) - (*b as i128);
+                if result > i64::MAX as i128 || result < i64::MIN as i128 {
+                    return Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ));
+                }
+                return Ok(Datum::Int(result as i64));
+            }
+            _ => {} // fall through to normal path
+        }
+    }
+
     match (left.as_ref(), right.as_ref()) {
         (Datum::Int(a), Datum::Int(b)) => a.checked_sub(*b).map(Datum::Int).ok_or_else(|| {
             ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
@@ -3241,5 +3305,33 @@ mod tests {
             result_type: DataType::BigInt,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_no_unsigned_subtraction_flag() {
+        use crate::server::session::UserVariables;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let vars: UserVariables = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+        // Without the flag: UnsignedInt(MAX) - Int(1) should succeed
+        set_no_unsigned_subtraction(&vars, false);
+        let result = eval_sub(&Datum::UnsignedInt(u64::MAX), &Datum::Int(1), Some(&vars));
+        assert!(result.is_ok(), "Without flag, should succeed");
+        assert_eq!(result.unwrap(), Datum::UnsignedInt(u64::MAX - 1));
+
+        // With the flag: UnsignedInt(MAX) - Int(1) should overflow (> i64::MAX)
+        set_no_unsigned_subtraction(&vars, true);
+        let result = eval_sub(&Datum::UnsignedInt(u64::MAX), &Datum::Int(1), Some(&vars));
+        assert!(
+            result.is_err(),
+            "With NO_UNSIGNED_SUBTRACTION, u64::MAX - 1 should overflow"
+        );
+
+        // With the flag: UnsignedInt(1) - Int(2) should return -1
+        let result = eval_sub(&Datum::UnsignedInt(1), &Datum::Int(2), Some(&vars));
+        assert!(result.is_ok(), "With flag, 1 - 2 should succeed");
+        assert_eq!(result.unwrap(), Datum::Int(-1));
     }
 }

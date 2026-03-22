@@ -365,13 +365,13 @@ pub enum ResolvedStatement {
         right: Box<ResolvedSelect>,
         all: bool,
     },
-    /// CREATE TABLE ... SELECT (CTAS)
+    /// CREATE TABLE ... SELECT (CTAS) — source can be Select or Union
     CreateTableAs {
         name: String,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
-        select: ResolvedSelect,
+        source: Box<ResolvedStatement>,
     },
 
     // ============ Auth/User Management ============

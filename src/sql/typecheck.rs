@@ -33,7 +33,7 @@ impl TypeChecker {
             } => Self::check_update(assignments, filter),
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
-            ResolvedStatement::CreateTableAs { select, .. } => Self::check_select(select),
+            ResolvedStatement::CreateTableAs { source, .. } => Self::check(source),
             ResolvedStatement::CreateView { .. } | ResolvedStatement::DropView { .. } => Ok(()),
 
             // Database DDL doesn't need type checking

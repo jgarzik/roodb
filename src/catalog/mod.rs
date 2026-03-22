@@ -154,6 +154,8 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     /// Table constraints
     pub constraints: Vec<Constraint>,
+    /// Whether this is a temporary table (session-scoped, not persisted)
+    pub is_temporary: bool,
 }
 
 impl TableDef {
@@ -163,6 +165,7 @@ impl TableDef {
             name: name.into(),
             columns: Vec::new(),
             constraints: Vec::new(),
+            is_temporary: false,
         }
     }
 
