@@ -116,6 +116,7 @@ pub mod codes {
     pub const ER_DUP_ENTRY: u16 = 1062;
     pub const ER_EMPTY_QUERY: u16 = 1065;
     pub const ER_WRONG_FIELD_SPEC: u16 = 1063;
+    pub const ER_BLOB_CANT_HAVE_DEFAULT: u16 = 1101;
     pub const ER_TOO_BIG_FIELDLENGTH: u16 = 1074;
     pub const ER_WRONG_ARGUMENTS: u16 = 1210;
     pub const ER_TOO_BIG_DISPLAYWIDTH: u16 = 1425;

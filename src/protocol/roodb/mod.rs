@@ -4427,6 +4427,8 @@ where
                     (codes::ER_DUP_ENTRY, "23000")
                 } else if msg.contains("Incorrect arguments") {
                     (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
+                } else if msg.contains("can't have a default value") {
+                    (codes::ER_BLOB_CANT_HAVE_DEFAULT, states::SYNTAX_ERROR)
                 } else if msg.contains("Incorrect column specifier") {
                     (codes::ER_WRONG_FIELD_SPEC, states::SYNTAX_ERROR)
                 } else if msg.contains("Column length too big") {

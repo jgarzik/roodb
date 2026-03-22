@@ -1796,6 +1796,24 @@ pub fn convert_table_constraint_pub(
 /// Convert column definition
 fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
     let name = col.name.value.clone();
+
+    // Check if this is a VARCHAR with length > 65535 (would be promoted to TEXT)
+    let has_default = col
+        .options
+        .iter()
+        .any(|o| matches!(o.option, sp::ColumnOption::Default(_)));
+    let is_oversized_varchar = matches!(
+        &col.data_type,
+        sp::DataType::Varchar(len) | sp::DataType::CharacterVarying(len) | sp::DataType::CharVarying(len) | sp::DataType::Nvarchar(len)
+        if extract_varchar_length(len).unwrap_or(255) > 65535
+    );
+    if is_oversized_varchar && has_default {
+        return Err(SqlError::InvalidOperation(format!(
+            "Column length too big for column '{}' (max = 65535)",
+            name
+        )));
+    }
+
     let data_type = convert_data_type(&col.data_type)?;
 
     let mut col_def = ColumnDef::new(name, data_type);
@@ -1830,6 +1848,14 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
             }
             _ => {}
         }
+    }
+
+    // MySQL: BLOB/TEXT columns cannot have a default value
+    if col_def.default.is_some() && matches!(col_def.data_type, DataType::Text | DataType::Blob) {
+        return Err(SqlError::InvalidOperation(format!(
+            "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
+            col_def.name
+        )));
     }
 
     Ok(col_def)
@@ -1947,14 +1973,13 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 scale: s.min(30),
             })
         }
-        // Varchar — promote to Text if too large (MySQL behavior)
+        // Varchar — promote to Text if too large (MySQL silently converts)
         sp::DataType::Varchar(len)
         | sp::DataType::CharacterVarying(len)
         | sp::DataType::CharVarying(len)
         | sp::DataType::Nvarchar(len) => {
             let n = extract_varchar_length(len).unwrap_or(255);
             if n > 65535 {
-                // MySQL promotes large VARCHAR to TEXT
                 Ok(DataType::Text)
             } else {
                 Ok(DataType::Varchar(n))
