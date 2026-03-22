@@ -815,6 +815,18 @@ impl<'a> Resolver<'a> {
                     offset: None,
                 })
             }
+            sp::SetExpr::Query(inner_query) => {
+                // Parenthesized query: (SELECT ... LIMIT ...) ORDER BY ... LIMIT ...
+                // Resolve the inner query fully (including its own ORDER BY/LIMIT),
+                // then the outer ORDER BY/LIMIT is applied by resolve_query().
+                let inner = self.resolve_query(inner_query)?;
+                match inner {
+                    ResolvedStatement::Select(resolved) => Ok(resolved),
+                    _ => Err(SqlError::Unsupported(
+                        "Parenthesized non-SELECT query".to_string(),
+                    )),
+                }
+            }
             _ => Err(SqlError::Unsupported(
                 "Complex query (UNION, etc.)".to_string(),
             )),
