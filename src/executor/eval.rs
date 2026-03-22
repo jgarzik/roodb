@@ -332,7 +332,20 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     let left = promote_to_numeric(left);
     let right = promote_to_numeric(right);
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.wrapping_sub(*b))),
+        (Datum::Int(a), Datum::Int(b)) => match a.checked_sub(*b) {
+            Some(v) => Ok(Datum::Int(v)),
+            None => {
+                // Allow wrapping for values that might be unsigned (e.g., 1<<63)
+                // MySQL treats bit operation results as unsigned
+                if *a == i64::MIN || *b == i64::MIN {
+                    Ok(Datum::Int(a.wrapping_sub(*b)))
+                } else {
+                    Err(ExecutorError::DataOutOfRange(
+                        "BIGINT value is out of range".to_string(),
+                    ))
+                }
+            }
+        },
         (Datum::Float(a), Datum::Float(b)) => check_float_overflow(a - b),
         (Datum::Int(a), Datum::Float(b)) => check_float_overflow(*a as f64 - b),
         (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a - *b as f64),
@@ -904,7 +917,9 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 ));
             }
             match &args[0] {
-                Datum::Int(i) => Ok(Datum::Int(i.abs())),
+                Datum::Int(i) => i.checked_abs().map(Datum::Int).ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
+                }),
                 Datum::Float(f) => Ok(Datum::Float(f.abs())),
                 Datum::Null => Ok(Datum::Null),
                 Datum::String(s) => {
