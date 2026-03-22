@@ -381,15 +381,13 @@ impl LogicalPlanBuilder {
         group_by: &[ResolvedExpr],
         columns: &[ResolvedSelectItem],
     ) -> PlannerResult<LogicalPlan> {
-        let mut aggregates = Vec::new();
+        let mut aggregates: Vec<(AggregateFunc, String)> = Vec::new();
 
-        // Extract aggregate functions from select items
+        // Recursively extract aggregate functions from all select items,
+        // including those nested in arithmetic expressions like max(big)-1.
         for (idx, item) in columns.iter().enumerate() {
             if let ResolvedSelectItem::Expr { expr, alias } = item {
-                if let Some(agg) = Self::extract_aggregate(expr) {
-                    let name = alias.clone().unwrap_or_else(|| format!("agg_{}", idx));
-                    aggregates.push((agg, name));
-                }
+                Self::collect_aggregates(expr, idx, alias.as_deref(), &mut aggregates);
             }
         }
 
@@ -398,6 +396,53 @@ impl LogicalPlanBuilder {
             group_by: group_by.to_vec(),
             aggregates,
         })
+    }
+
+    /// Recursively collect aggregate functions from an expression tree.
+    /// Deduplicates so that `max(big)` appearing twice produces one aggregate.
+    fn collect_aggregates(
+        expr: &ResolvedExpr,
+        idx: usize,
+        alias: Option<&str>,
+        out: &mut Vec<(AggregateFunc, String)>,
+    ) {
+        if let Some(agg) = Self::extract_aggregate(expr) {
+            // Check if this aggregate is already collected (dedup)
+            let already = out
+                .iter()
+                .any(|(a, _)| Self::aggregates_match_func(a, &agg));
+            if !already {
+                let name = alias
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| format!("agg_{}", idx));
+                out.push((agg, name));
+            }
+            return; // Don't recurse into the aggregate's own args
+        }
+        // Recurse into sub-expressions to find nested aggregates
+        match expr {
+            ResolvedExpr::BinaryOp { left, right, .. } => {
+                Self::collect_aggregates(left, idx, None, out);
+                Self::collect_aggregates(right, idx, None, out);
+            }
+            ResolvedExpr::UnaryOp { expr: inner, .. } => {
+                Self::collect_aggregates(inner, idx, None, out);
+            }
+            ResolvedExpr::Function { args, .. } => {
+                for arg in args {
+                    Self::collect_aggregates(arg, idx, None, out);
+                }
+            }
+            ResolvedExpr::Cast { expr: inner, .. } => {
+                Self::collect_aggregates(inner, idx, None, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if two AggregateFunc instances represent the same aggregate.
+    fn aggregates_match_func(a: &AggregateFunc, b: &AggregateFunc) -> bool {
+        a.name == b.name && a.distinct == b.distinct && a.args.len() == b.args.len()
     }
 
     /// Extract aggregate function from expression
@@ -466,28 +511,26 @@ impl LogicalPlanBuilder {
         columns: &[ResolvedSelectItem],
         group_by: &[ResolvedExpr],
     ) -> PlannerResult<LogicalPlan> {
+        // First, collect all aggregates in order (same as build_aggregate)
+        let mut all_aggs: Vec<(AggregateFunc, String)> = Vec::new();
+        for (idx, item) in columns.iter().enumerate() {
+            if let ResolvedSelectItem::Expr { expr, alias } = item {
+                Self::collect_aggregates(expr, idx, alias.as_deref(), &mut all_aggs);
+            }
+        }
+
         let mut expressions = Vec::new();
-        let mut agg_idx = 0usize; // Track which aggregate we're on
 
         for (idx, item) in columns.iter().enumerate() {
             match item {
                 ResolvedSelectItem::Expr { expr, alias } => {
                     let name = alias.clone().unwrap_or_else(|| Self::expr_name(expr, idx));
 
-                    // Check if this expression is an aggregate function
                     if Self::expr_has_aggregate(expr) {
-                        // Map to aggregate result column (after group_by columns)
-                        let col_idx = group_by.len() + agg_idx;
-                        let result_type = Self::get_aggregate_result_type(expr);
-                        let col_ref = ResolvedExpr::Column(ResolvedColumn {
-                            table: String::new(),
-                            name: name.clone(),
-                            index: col_idx,
-                            data_type: result_type,
-                            nullable: true,
-                        });
-                        expressions.push((col_ref, name));
-                        agg_idx += 1;
+                        // Rewrite the expression: replace aggregate sub-expressions
+                        // with column references to the aggregate output
+                        let rewritten = Self::rewrite_agg_refs(expr, group_by.len(), &all_aggs);
+                        expressions.push((rewritten, name));
                     } else {
                         // Non-aggregate expression - check if it's a group-by column
                         if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
@@ -501,14 +544,11 @@ impl LogicalPlanBuilder {
                             });
                             expressions.push((col_ref, name));
                         } else {
-                            // Expression not in GROUP BY - pass through
-                            // (should be an error in strict SQL, but let's allow it)
                             expressions.push((expr.clone(), name));
                         }
                     }
                 }
                 ResolvedSelectItem::Columns(cols) => {
-                    // Wildcards shouldn't appear in aggregate queries typically
                     for col in cols {
                         let expr = ResolvedExpr::Column(col.clone());
                         expressions.push((expr, col.name.clone()));
@@ -521,6 +561,66 @@ impl LogicalPlanBuilder {
             input: Box::new(input),
             expressions,
         })
+    }
+
+    /// Rewrite an expression by replacing aggregate function calls with
+    /// column references to the aggregate output. For example,
+    /// `max(big) - 1` becomes `Column(agg_idx) - 1`.
+    fn rewrite_agg_refs(
+        expr: &ResolvedExpr,
+        group_by_len: usize,
+        all_aggs: &[(AggregateFunc, String)],
+    ) -> ResolvedExpr {
+        // If this expression itself is a direct aggregate, replace it
+        if let Some(agg) = Self::extract_aggregate(expr) {
+            if let Some(pos) = all_aggs
+                .iter()
+                .position(|(a, _)| Self::aggregates_match_func(a, &agg))
+            {
+                let col_idx = group_by_len + pos;
+                let result_type = Self::get_aggregate_result_type(expr);
+                return ResolvedExpr::Column(ResolvedColumn {
+                    table: String::new(),
+                    name: all_aggs[pos].1.clone(),
+                    index: col_idx,
+                    data_type: result_type,
+                    nullable: true,
+                });
+            }
+        }
+
+        // Recurse into sub-expressions
+        match expr {
+            ResolvedExpr::BinaryOp {
+                left,
+                op,
+                right,
+                result_type,
+            } => ResolvedExpr::BinaryOp {
+                left: Box::new(Self::rewrite_agg_refs(left, group_by_len, all_aggs)),
+                op: *op,
+                right: Box::new(Self::rewrite_agg_refs(right, group_by_len, all_aggs)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::UnaryOp {
+                op,
+                expr: inner,
+                result_type,
+            } => ResolvedExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::Cast {
+                expr: inner,
+                target_type,
+            } => ResolvedExpr::Cast {
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                target_type: target_type.clone(),
+            },
+            // For other expression types (Column, Literal, etc.), pass through
+            other => other.clone(),
+        }
     }
 
     /// Get the result type for an aggregate expression

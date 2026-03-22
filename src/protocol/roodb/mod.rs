@@ -3079,7 +3079,7 @@ where
 
         // Extract variable names from the query
         lazy_static::lazy_static! {
-            static ref VAR_RE: Regex = Regex::new(r"@@(\w+)").unwrap();
+            static ref VAR_RE: Regex = Regex::new(r"@@(?:global\.|session\.)?(\w+)").unwrap();
         }
 
         let vars: Vec<&str> = VAR_RE
@@ -3121,6 +3121,9 @@ where
                 "autocommit" => "1",
                 "version" => "8.0.0-RooDB",
                 "version_comment" => "RooDB",
+                "default_storage_engine" | "storage_engine" => "RooDB",
+                "lower_case_table_names" => "0",
+                "have_openssl" | "have_ssl" => "YES",
                 _ => "", // Unknown variable, return empty string
             };
             col_names.push(format!("@@{}", var_lower));

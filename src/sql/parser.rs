@@ -125,9 +125,11 @@ impl Parser {
         // Replace MOD( with _ROODB_MOD( for function call form.
         let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
         let result = re_mod_fn.replace_all(&sql, "_ROODB_MOD(");
-        // Replace infix `x MOD y` with `x % y` (but not _ROODB_MOD)
-        let re_mod_infix = Regex::new(r"(?i)(-?\d+)\s+MOD\s+(-?\d+)").unwrap();
-        let result = re_mod_infix.replace_all(&result, "$1 % $2");
+        // Replace infix `MOD` keyword with `%` operator.
+        // \bMOD\b won't match _ROODB_MOD since \b needs a word boundary.
+        // MOD( was already replaced above, so only standalone MOD remains.
+        let re_mod_infix = Regex::new(r"(?i)\bMOD\b").unwrap();
+        let result = re_mod_infix.replace_all(&result, "%");
         let re_insert_fn = Regex::new(r"(?i)\bINSERT\s*\(").unwrap();
         let result = re_insert_fn.replace_all(&result, "_ROODB_INSERT(");
 
