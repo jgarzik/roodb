@@ -1319,6 +1319,21 @@ where
             ResolvedStatement::AnalyzeTable { .. } => {
                 vec![]
             }
+            // UNION - requires SELECT on both sides' tables
+            ResolvedStatement::Union { left, right, .. } => {
+                let mut privs: Vec<_> = left
+                    .from
+                    .iter()
+                    .map(|t| RequiredPrivilege::select(db, &t.name))
+                    .collect();
+                privs.extend(
+                    right
+                        .from
+                        .iter()
+                        .map(|t| RequiredPrivilege::select(db, &t.name)),
+                );
+                privs
+            }
             // EXPLAIN - same privileges as inner statement
             ResolvedStatement::Explain { inner } => self.extract_required_privileges(inner),
         }

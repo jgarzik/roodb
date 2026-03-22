@@ -147,6 +147,16 @@ impl CostEstimator {
                 }
             }
 
+            PhysicalPlan::Union { left, right, .. } => {
+                let left_cost = Self::estimate_node(left);
+                let right_cost = Self::estimate_node(right);
+                Cost {
+                    rows: left_cost.rows + right_cost.rows,
+                    cpu: left_cost.cpu + right_cost.cpu,
+                    io: left_cost.io + right_cost.io,
+                }
+            }
+
             // DML/DDL have minimal query cost
             PhysicalPlan::Insert { values, .. } => Cost {
                 rows: values.len() as f64,

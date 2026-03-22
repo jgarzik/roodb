@@ -105,6 +105,13 @@ pub enum PhysicalPlan {
     /// Hash-based distinct
     HashDistinct { input: Box<PhysicalPlan> },
 
+    /// UNION of two query plans
+    Union {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        all: bool,
+    },
+
     /// Single empty row (TABLE_DEE)
     SingleRow,
 
@@ -315,6 +322,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { input, .. } => input.output_columns(),
             PhysicalPlan::Limit { input, .. } => input.output_columns(),
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
+            PhysicalPlan::Union { left, .. } => left.output_columns(),
             PhysicalPlan::Materialize { input } => input.output_columns(),
             PhysicalPlan::SingleRow => vec![],
 
@@ -501,6 +509,10 @@ impl PhysicalPlan {
             }
             PhysicalPlan::HashDistinct { input } => {
                 input.substitute_params(params)?;
+            }
+            PhysicalPlan::Union { left, right, .. } => {
+                left.substitute_params(params)?;
+                right.substitute_params(params)?;
             }
             PhysicalPlan::Insert { values, .. } => {
                 for row in values {
@@ -1105,6 +1117,12 @@ impl PhysicalPlanner {
 
             LogicalPlan::Distinct { input } => Ok(PhysicalPlan::HashDistinct {
                 input: Box::new(Self::plan_node(*input, catalog)?),
+            }),
+
+            LogicalPlan::Union { left, right, all } => Ok(PhysicalPlan::Union {
+                left: Box::new(Self::plan_node(*left, catalog)?),
+                right: Box::new(Self::plan_node(*right, catalog)?),
+                all,
             }),
 
             LogicalPlan::SingleRow => Ok(PhysicalPlan::SingleRow),

@@ -35,6 +35,7 @@ use super::range_scan::RangeScan;
 use super::scan::TableScan;
 use super::single_row::SingleRow;
 use super::sort::Sort;
+use super::union::Union;
 use super::update::Update;
 use super::Executor;
 
@@ -247,6 +248,12 @@ impl ExecutorEngine {
             PhysicalPlan::HashDistinct { input } => {
                 let input_exec = self.build_node(*input)?;
                 Ok(Box::new(HashDistinct::new(input_exec)))
+            }
+
+            PhysicalPlan::Union { left, right, all } => {
+                let left_exec = self.build_node(*left)?;
+                let right_exec = self.build_node(*right)?;
+                Ok(Box::new(Union::new(left_exec, right_exec, all)))
             }
 
             PhysicalPlan::Insert {

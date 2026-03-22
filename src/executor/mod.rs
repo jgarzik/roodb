@@ -30,6 +30,7 @@ pub mod row;
 pub mod scan;
 pub mod single_row;
 pub mod sort;
+pub mod union;
 pub mod update;
 
 pub use context::TransactionContext;

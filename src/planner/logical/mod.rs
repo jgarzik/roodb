@@ -359,6 +359,12 @@ pub enum ResolvedStatement {
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
+    /// UNION of two SELECTs
+    Union {
+        left: Box<ResolvedSelect>,
+        right: Box<ResolvedSelect>,
+        all: bool,
+    },
     /// CREATE TABLE ... SELECT (CTAS)
     CreateTableAs {
         name: String,
@@ -484,6 +490,13 @@ pub enum LogicalPlan {
 
     /// Remove duplicate rows
     Distinct { input: Box<LogicalPlan> },
+
+    /// UNION of two query plans
+    Union {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        all: bool,
+    },
 
     /// Single empty row (TABLE_DEE - for expression-only queries)
     SingleRow,
@@ -716,6 +729,9 @@ impl LogicalPlan {
 
             // ANALYZE TABLE returns a result set (handled by executor)
             LogicalPlan::AnalyzeTable { .. } => vec![],
+
+            // UNION: output columns from left side
+            LogicalPlan::Union { left, .. } => left.output_columns(),
 
             // EXPLAIN returns MySQL-format result set (handled by executor)
             LogicalPlan::Explain { .. } => vec![],

@@ -20,6 +20,15 @@ impl LogicalPlanBuilder {
     pub fn build(stmt: ResolvedStatement) -> PlannerResult<LogicalPlan> {
         match stmt {
             ResolvedStatement::Select(select) => Self::build_select(select),
+            ResolvedStatement::Union { left, right, all } => {
+                let left_plan = Self::build_select(*left)?;
+                let right_plan = Self::build_select(*right)?;
+                Ok(LogicalPlan::Union {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    all,
+                })
+            }
             ResolvedStatement::Insert {
                 table,
                 columns,

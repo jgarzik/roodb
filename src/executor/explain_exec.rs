@@ -242,6 +242,11 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
             collect_explain_rows(inner, rows, extra);
         }
 
+        PhysicalPlan::Union { left, right, .. } => {
+            collect_explain_rows(left, rows, extra);
+            collect_explain_rows(right, rows, extra);
+        }
+
         // DDL, Auth, Analyze — no EXPLAIN rows
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::CreateTableAs { .. }

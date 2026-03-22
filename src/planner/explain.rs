@@ -189,6 +189,15 @@ impl ExplainOutput {
                 Self::format_node(input, indent + 1, out);
             }
 
+            PhysicalPlan::Union {
+                left, right, all, ..
+            } => {
+                let op = if *all { "UNION ALL" } else { "UNION" };
+                writeln!(out, "{}{}", prefix, op).unwrap();
+                Self::format_node(left, indent + 1, out);
+                Self::format_node(right, indent + 1, out);
+            }
+
             PhysicalPlan::SingleRow => {
                 writeln!(out, "{}SingleRow (TABLE_DEE)", prefix).unwrap();
             }
