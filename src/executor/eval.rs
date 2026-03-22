@@ -264,6 +264,17 @@ fn check_float_overflow(v: f64) -> ExecutorResult<Datum> {
     }
 }
 
+/// Convert float to i64, raising DataOutOfRange if it exceeds BIGINT range.
+fn checked_float_to_int(v: f64) -> ExecutorResult<Datum> {
+    if v > i64::MAX as f64 || v < i64::MIN as f64 || v.is_infinite() || v.is_nan() {
+        Err(ExecutorError::DataOutOfRange(
+            "BIGINT value is out of range".to_string(),
+        ))
+    } else {
+        Ok(Datum::Int(v as i64))
+    }
+}
+
 /// Promote Bit and String to numeric types for arithmetic operations (MySQL implicit coercion).
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
@@ -503,10 +514,15 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
     // MySQL DIV: perform float division, then truncate toward zero.
     // Use checked_div for Int/Int to avoid panic on i64::MIN / -1.
     match (left.as_ref(), right.as_ref()) {
-        (Datum::Int(a), Datum::Int(b)) => Ok(Datum::Int(a.checked_div(*b).unwrap_or(0))),
-        (Datum::Float(a), Datum::Float(b)) => Ok(Datum::Int((a / b).trunc() as i64)),
-        (Datum::Int(a), Datum::Float(b)) => Ok(Datum::Int((*a as f64 / b).trunc() as i64)),
-        (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Int((a / *b as f64).trunc() as i64)),
+        (Datum::Int(a), Datum::Int(b)) => match a.checked_div(*b) {
+            Some(v) => Ok(Datum::Int(v)),
+            None => Err(ExecutorError::DataOutOfRange(
+                "BIGINT value is out of range".to_string(),
+            )),
+        },
+        (Datum::Float(a), Datum::Float(b)) => checked_float_to_int((a / b).trunc()),
+        (Datum::Int(a), Datum::Float(b)) => checked_float_to_int((*a as f64 / b).trunc()),
+        (Datum::Float(a), Datum::Int(b)) => checked_float_to_int((a / *b as f64).trunc()),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot integer divide {:?} by {:?}",
             left, right
@@ -1370,7 +1386,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(Datum::Float(args[0].as_float().unwrap_or(0.0).to_degrees()))
+            check_float_overflow(args[0].as_float().unwrap_or(0.0).to_degrees())
         }
 
         "SIN" => {
@@ -1461,7 +1477,13 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 return Ok(Datum::Null);
             }
             let v = args[0].as_float().unwrap_or(0.0);
-            Ok(Datum::Float(1.0 / v.tan()))
+            let result = 1.0 / v.tan();
+            if result.is_infinite() {
+                return Err(ExecutorError::DataOutOfRange(
+                    "DOUBLE value is out of range in 'cot'".to_string(),
+                ));
+            }
+            Ok(float_or_null(result))
         }
 
         "CONV" => {
@@ -1864,6 +1886,15 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                 year, month, day, hour, min, sec
             )))
+        }
+
+        "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "STD" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
+            // Statistical aggregate functions — when called as scalar on a single value,
+            // return 0 (stddev of one value is 0)
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            Ok(Datum::Float(0.0))
         }
 
         "REGEXP" => {

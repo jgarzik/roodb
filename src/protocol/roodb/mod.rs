@@ -4037,6 +4037,8 @@ where
                     (codes::ER_BAD_NULL_ERROR, "23000")
                 } else if msg.contains("already exists") {
                     (codes::ER_DUP_ENTRY, "23000")
+                } else if msg.contains("Incorrect arguments") {
+                    (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
                 } else {
                     (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR)
                 }

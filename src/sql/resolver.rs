@@ -2128,19 +2128,33 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                 match n.parse::<i64>() {
                     Ok(val) => Ok(Literal::Integer(val)),
                     Err(_) => {
-                        // Try parsing as u64 (reinterpret as i64 bit pattern)
+                        // Values > i64::MAX: check for the special i64::MIN case
+                        // (9223372036854775808 becomes i64::MIN when negated by unary minus).
+                        // For other values > i64::MAX, use float to avoid silent wrapping.
                         match n.parse::<u64>() {
-                            Ok(val) => Ok(Literal::Integer(val as i64)),
+                            Ok(val) if val == 9223372036854775808 => {
+                                // Special case: -(2^63) for i64::MIN
+                                Ok(Literal::Integer(val as i64))
+                            }
+                            Ok(val) => {
+                                // Use float for large unsigned values to avoid wrapping
+                                Ok(Literal::Float(val as f64))
+                            }
                             Err(_) => {
                                 // Strip leading zeros and retry
                                 let stripped = n.trim_start_matches('0');
                                 let stripped = if stripped.is_empty() { "0" } else { stripped };
-                                stripped.parse::<i64>().map(Literal::Integer).map_err(|_| {
-                                    SqlError::InvalidOperation(format!(
-                                        "Invalid integer literal: '{}'",
-                                        n
-                                    ))
-                                })
+                                // Try as float for very large numbers
+                                if let Ok(f) = stripped.parse::<f64>() {
+                                    Ok(Literal::Float(f))
+                                } else {
+                                    stripped.parse::<i64>().map(Literal::Integer).map_err(|_| {
+                                        SqlError::InvalidOperation(format!(
+                                            "Invalid integer literal: '{}'",
+                                            n
+                                        ))
+                                    })
+                                }
                             }
                         }
                     }
@@ -2348,6 +2362,17 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "FOUND_ROWS" | "ROW_COUNT" => Ok(DataType::BigInt),
         "BIT_COUNT" => Ok(DataType::BigInt),
         "REGEXP" => Ok(DataType::Boolean),
+        "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "STD" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
+            Ok(DataType::Double)
+        }
+        // Spatial functions — not supported, but need type info for error path
+        "ST_LINESTRINGFROMWKB"
+        | "ST_POINTFROMWKB"
+        | "ST_GEOMETRYFROMWKB"
+        | "ST_GEOMFROMTEXT"
+        | "ST_GEOMFROMWKB" => Err(SqlError::InvalidOperation(
+            "Incorrect arguments to spatial function".to_string(),
+        )),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "TO_DAYS" | "FROM_DAYS" | "DATEDIFF" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR"
         | "HOUR" | "MINUTE" | "SECOND" | "MONTH" | "YEAR" | "WEEK" | "QUARTER" | "WEEKDAY"

@@ -53,7 +53,7 @@ impl Parser {
         let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
         let result = re_mod_fn.replace_all(sql, "_ROODB_MOD(");
         // Replace infix `x MOD y` with `x % y` (but not _ROODB_MOD)
-        let re_mod_infix = Regex::new(r"(?i)(\d+)\s+MOD\s+(\d+)").unwrap();
+        let re_mod_infix = Regex::new(r"(?i)(-?\d+)\s+MOD\s+(-?\d+)").unwrap();
         let result = re_mod_infix.replace_all(&result, "$1 % $2");
         let re_insert_fn = Regex::new(r"(?i)\bINSERT\s*\(").unwrap();
         let result = re_insert_fn.replace_all(&result, "_ROODB_INSERT(");

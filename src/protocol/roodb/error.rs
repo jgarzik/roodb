@@ -115,6 +115,7 @@ pub mod codes {
     pub const ER_BAD_NULL_ERROR: u16 = 1048;
     pub const ER_DUP_ENTRY: u16 = 1062;
     pub const ER_EMPTY_QUERY: u16 = 1065;
+    pub const ER_WRONG_ARGUMENTS: u16 = 1210;
     pub const ER_DATA_OUT_OF_RANGE: u16 = 1690;
     pub const ER_CANT_CHANGE_TX_CHARACTERISTICS: u16 = 1568;
 }
