@@ -59,7 +59,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | bigint | FAIL | 361/502 (72%) | mysqltest WHILE loop / HEX() edge case |
 | null | FAIL | 113/324 (35%) | INSERT ... SELECT (INSERT-SELECT) |
-| limit | FAIL | 177/448 (40%) | INSERT INTO t1 () VALUES () (empty column list) |
+| limit | FAIL | 237/448 (53%) | ORDER BY aggregate alias (count(*) c ... ORDER BY c) |
 | case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
 | type_varchar | FAIL | 21/176 (12%) | Duplicate key check on ALTER TABLE ADD PK |
 | type_ranges | FAIL | 59/173 (34%) | ENUM, SET types in INSERT |
@@ -72,10 +72,10 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 130/504 (26%) | CREATE TABLE AS SELECT + UNION |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | FAIL | 327/1271 (26%) | DIV overflow check (error 1690) |
+| func_math | FAIL | 447/1271 (35%) | SQL_MODE NO_UNSIGNED_SUBTRACTION |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
-| func_test | FAIL | 28/483 (6%) | Large unsigned integer literal parsing |
+| func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
 | cast | FAIL | 63/1148 (5%) | Charset introducers (_latin1), CAST with charset |
 | type_year | FAIL | 21/~200 (11%) | NOW() in INSERT with non-timestamp column |
 | type_enum | FAIL | 13/~400 (3%) | ENUM type DDL: CREATE TABLE with ENUM |
@@ -88,8 +88,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | func_if | FAIL | 61/301 (20%) | IF() with mixed aggregate/non-aggregate |
 | insert | FAIL | 29/1077 (3%) | INSERT expression referencing same table cols |
 | update | FAIL | 45/780 (6%) | INSERT with many columns |
-| func_str | FAIL | 18/2630 (1%) | BIT_LENGTH() function |
-| func_concat | FAIL | 16/153 (10%) | CONCAT_WS with mixed types |
+| func_str | FAIL | 25/2630 (1%) | BINARY keyword in POSITION function |
+| func_concat | FAIL | 16/153 (10%) | Non-aggregated column in GROUP BY |
 
 ### Custom Tests — 22/22 pass
 
@@ -99,6 +99,10 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |---------|-------------|
 | UNION queries | UNION ALL and UNION DISTINCT through resolver/planner/executor pipeline |
 | Dup key error mapping | Raft duplicate key errors mapped to MySQL ER_DUP_ENTRY (1062) |
+| Integer overflow detection | Proper BIGINT overflow for negation, add, sub, DIV of large numbers |
+| Empty INSERT defaults | INSERT INTO t1 () VALUES () fills all columns with defaults |
+| BIT_LENGTH/OCTET_LENGTH | String length functions in bits and bytes |
+| CONCAT_WS | Concatenate with separator, skipping NULLs |
 | Full ALTER TABLE | ADD/DROP/MODIFY/CHANGE COLUMN, ADD/DROP PK/FK/INDEX, RENAME, Raft persistence |
 | Lazy row padding | TableScan pads rows with defaults after ALTER TABLE ADD COLUMN |
 | NOT NULL enforcement | Error 1048 for NULL into NOT NULL; multi-row converts to default |
@@ -119,7 +123,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 ## Gap Analysis — Next Steps
 
 ### Quick Wins (unblocks most test progress)
-- INSERT INTO t1 () VALUES () — empty column list (blocks limit at line 177)
+- ORDER BY aggregate alias (blocks limit at line 237)
 - INSERT ... SELECT (blocks null at line 113)
 - Duplicate key validation on ALTER TABLE ADD PK (blocks type_varchar)
 - BIT_LENGTH() function (blocks func_str)
