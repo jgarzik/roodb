@@ -59,7 +59,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | bigint | FAIL | 361/502 (72%) | mysqltest WHILE loop / HEX() edge case |
 | null | FAIL | 113/324 (35%) | INSERT ... SELECT (INSERT-SELECT) |
-| limit | FAIL | 42/448 (9%) | UNION queries |
+| limit | FAIL | 177/448 (40%) | INSERT INTO t1 () VALUES () (empty column list) |
 | case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
 | type_varchar | FAIL | 21/176 (12%) | Duplicate key check on ALTER TABLE ADD PK |
 | type_ranges | FAIL | 59/173 (34%) | ENUM, SET types in INSERT |
@@ -97,6 +97,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Feature | Description |
 |---------|-------------|
+| UNION queries | UNION ALL and UNION DISTINCT through resolver/planner/executor pipeline |
+| Dup key error mapping | Raft duplicate key errors mapped to MySQL ER_DUP_ENTRY (1062) |
 | Full ALTER TABLE | ADD/DROP/MODIFY/CHANGE COLUMN, ADD/DROP PK/FK/INDEX, RENAME, Raft persistence |
 | Lazy row padding | TableScan pads rows with defaults after ALTER TABLE ADD COLUMN |
 | NOT NULL enforcement | Error 1048 for NULL into NOT NULL; multi-row converts to default |
@@ -117,9 +119,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 ## Gap Analysis — Next Steps
 
 ### Quick Wins (unblocks most test progress)
-- UNION queries (blocks limit, type_float)
+- INSERT INTO t1 () VALUES () — empty column list (blocks limit at line 177)
 - INSERT ... SELECT (blocks null at line 113)
-- Duplicate key enforcement (blocks type_varchar, type_binary)
+- Duplicate key validation on ALTER TABLE ADD PK (blocks type_varchar)
 - BIT_LENGTH() function (blocks func_str)
 - CONCAT_WS with mixed types (blocks func_concat)
 
