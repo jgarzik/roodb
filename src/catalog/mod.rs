@@ -517,6 +517,19 @@ impl Catalog {
         Ok(())
     }
 
+    /// Replace a table definition atomically (used by ALTER TABLE)
+    ///
+    /// Swaps the entire table definition after applying ALTER operations.
+    /// The old definition is replaced with the new one. If the table name
+    /// changed (RENAME), the old entry is removed and the new one inserted.
+    pub fn replace_table(&mut self, old_name: &str, def: TableDef) {
+        if old_name != def.name {
+            self.tables.remove(old_name);
+        }
+        self.tables.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
     /// Drop a table
     pub fn drop_table(&mut self, name: &str) -> CatalogResult<()> {
         if self.tables.remove(name).is_none() {

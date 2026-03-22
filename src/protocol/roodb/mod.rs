@@ -2174,7 +2174,7 @@ where
     }
 
     /// Handle ALTER TABLE statements.
-    /// Modifies the in-memory catalog directly.
+    /// Modifies the catalog and persists changes to system tables via Raft.
     async fn try_handle_alter_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         let upper = sql.trim().to_uppercase();
         if !upper.starts_with("ALTER TABLE ") {
@@ -2195,58 +2195,443 @@ where
             sqlparser::ast::Statement::AlterTable(alter) => {
                 let table_name = alter.name.to_string();
 
+                // Clone current table def from catalog
+                let old_table_name = table_name.clone();
+                let mut new_def = {
+                    let catalog = self.catalog.read();
+                    catalog
+                        .get_table(&table_name)
+                        .ok_or_else(|| {
+                            ProtocolError::Sql(crate::sql::SqlError::TableNotFound(
+                                table_name.clone(),
+                            ))
+                        })?
+                        .clone()
+                };
+
+                // Apply each operation to the cloned def
                 for op in &alter.operations {
-                    use sqlparser::ast::AlterTableOperation;
-                    match op {
-                        AlterTableOperation::AddConstraint { constraint, .. } => {
-                            let resolved =
-                                crate::sql::resolver::convert_table_constraint_pub(constraint)?;
-                            if let Some(c) = resolved {
-                                let mut catalog = self.catalog.write();
-                                if let Some(table_def) = catalog.get_table_mut(&table_name) {
-                                    table_def.constraints.push(c);
-                                } else {
-                                    return Err(ProtocolError::Sql(
-                                        crate::sql::SqlError::TableNotFound(table_name.clone()),
-                                    ));
-                                }
-                            }
-                        }
-                        AlterTableOperation::AddColumn { column_def, .. } => {
-                            let col = crate::sql::resolver::convert_column_def_pub(column_def)?;
-                            let mut catalog = self.catalog.write();
-                            if let Some(table_def) = catalog.get_table_mut(&table_name) {
-                                table_def.columns.push(col);
-                            } else {
-                                return Err(ProtocolError::Sql(
-                                    crate::sql::SqlError::TableNotFound(table_name.clone()),
-                                ));
-                            }
-                        }
-                        AlterTableOperation::DropColumn { column_names, .. } => {
-                            let col_name = column_names
-                                .first()
-                                .map(|i| i.value.clone())
-                                .unwrap_or_default();
-                            let mut catalog = self.catalog.write();
-                            if let Some(table_def) = catalog.get_table_mut(&table_name) {
-                                table_def.columns.retain(|c| c.name != col_name);
-                            } else {
-                                return Err(ProtocolError::Sql(
-                                    crate::sql::SqlError::TableNotFound(table_name.clone()),
-                                ));
-                            }
-                        }
-                        _ => {
-                            // Other ALTER TABLE operations: treat as no-op for now
-                        }
-                    }
+                    self.apply_alter_op(&mut new_def, op)?;
                 }
+
+                // Persist via Raft (delete old system rows, insert new ones)
+                self.persist_alter_table(&old_table_name, &new_def).await?;
 
                 self.send_ok(0, 0).await.map(|_| Some(()))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Apply a single ALTER TABLE operation to a cloned TableDef.
+    fn apply_alter_op(
+        &self,
+        def: &mut crate::catalog::TableDef,
+        op: &sqlparser::ast::AlterTableOperation,
+    ) -> ProtocolResult<()> {
+        use sqlparser::ast::AlterTableOperation;
+
+        match op {
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                let col = crate::sql::resolver::convert_column_def_pub(column_def)?;
+                // Check for duplicate column name
+                if def.get_column(&col.name).is_some() {
+                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                        "Duplicate column name '{}'",
+                        col.name
+                    ))));
+                }
+                def.columns.push(col);
+            }
+
+            AlterTableOperation::DropColumn { column_names, .. } => {
+                for ident in column_names {
+                    let col_name = ident.value.clone();
+                    let before = def.columns.len();
+                    def.columns
+                        .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
+                    if def.columns.len() == before {
+                        return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                            "Can't DROP '{}'; check that column/key exists",
+                            col_name
+                        ))));
+                    }
+                    // Also remove from any constraints referencing this column
+                    def.constraints.retain(|c| match c {
+                        crate::catalog::Constraint::PrimaryKey(cols)
+                        | crate::catalog::Constraint::Unique(cols) => {
+                            !cols.iter().any(|c| c.eq_ignore_ascii_case(&col_name))
+                        }
+                        crate::catalog::Constraint::ForeignKey { columns, .. } => {
+                            !columns.iter().any(|c| c.eq_ignore_ascii_case(&col_name))
+                        }
+                        crate::catalog::Constraint::Check(_) => true,
+                    });
+                }
+            }
+
+            AlterTableOperation::AddConstraint { constraint, .. } => {
+                let resolved = crate::sql::resolver::convert_table_constraint_pub(constraint)?;
+                if let Some(c) = resolved {
+                    def.constraints.push(c);
+                }
+            }
+
+            AlterTableOperation::ModifyColumn {
+                col_name,
+                data_type,
+                options,
+                ..
+            } => {
+                let name = col_name.value.clone();
+                let new_type = crate::sql::resolver::convert_data_type(data_type)?;
+                if let Some(col) = def
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    col.data_type = new_type;
+                    // Re-apply options
+                    self.apply_column_options(col, options);
+                } else {
+                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                        "Unknown column '{}' in '{}'",
+                        name, def.name
+                    ))));
+                }
+            }
+
+            AlterTableOperation::ChangeColumn {
+                old_name,
+                new_name,
+                data_type,
+                options,
+                ..
+            } => {
+                let old = old_name.value.clone();
+                let new_type = crate::sql::resolver::convert_data_type(data_type)?;
+                if let Some(col) = def
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&old))
+                {
+                    col.name = new_name.value.clone();
+                    col.data_type = new_type;
+                    self.apply_column_options(col, options);
+                } else {
+                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                        "Unknown column '{}' in '{}'",
+                        old, def.name
+                    ))));
+                }
+            }
+
+            AlterTableOperation::RenameTable { table_name } => {
+                let new_name = match table_name {
+                    sqlparser::ast::RenameTableNameKind::As(name)
+                    | sqlparser::ast::RenameTableNameKind::To(name) => name.to_string(),
+                };
+                def.name = new_name;
+            }
+
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
+                let old = old_column_name.value.clone();
+                if let Some(col) = def
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&old))
+                {
+                    col.name = new_column_name.value.clone();
+                } else {
+                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                        "Unknown column '{}' in '{}'",
+                        old, def.name
+                    ))));
+                }
+            }
+
+            AlterTableOperation::DropPrimaryKey { .. } => {
+                def.constraints
+                    .retain(|c| !matches!(c, crate::catalog::Constraint::PrimaryKey(_)));
+            }
+
+            AlterTableOperation::DropForeignKey { name, .. } => {
+                // MySQL: DROP FOREIGN KEY fk_symbol — we don't track names,
+                // so try to match by removing the first FK constraint, or log warning
+                let _fk_name = name.value.clone();
+                let before = def.constraints.len();
+                def.constraints
+                    .retain(|c| !matches!(c, crate::catalog::Constraint::ForeignKey { .. }));
+                if def.constraints.len() == before {
+                    warn!("DROP FOREIGN KEY '{}': no foreign key found", _fk_name);
+                }
+            }
+
+            AlterTableOperation::DropIndex { name } => {
+                let idx_name = name.value.clone();
+                // Remove from catalog indexes
+                let mut catalog = self.catalog.write();
+                let _ = catalog.drop_index(&idx_name);
+            }
+
+            AlterTableOperation::DropConstraint { name, .. } => {
+                let constraint_name = name.value.clone();
+                // Try to drop as index first, then as a named constraint
+                let mut catalog = self.catalog.write();
+                let _ = catalog.drop_index(&constraint_name);
+            }
+
+            AlterTableOperation::AlterColumn { column_name, op } => {
+                let name = column_name.value.clone();
+                if let Some(col) = def
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    use sqlparser::ast::AlterColumnOperation;
+                    match op {
+                        AlterColumnOperation::SetDefault { value } => {
+                            col.default = Some(value.to_string());
+                        }
+                        AlterColumnOperation::DropDefault => {
+                            col.default = None;
+                        }
+                        AlterColumnOperation::SetNotNull => {
+                            col.nullable = false;
+                        }
+                        AlterColumnOperation::DropNotNull => {
+                            col.nullable = true;
+                        }
+                        AlterColumnOperation::SetDataType { data_type, .. } => {
+                            if let Ok(new_type) = crate::sql::resolver::convert_data_type(data_type)
+                            {
+                                col.data_type = new_type;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                        "Unknown column '{}' in '{}'",
+                        name, def.name
+                    ))));
+                }
+            }
+
+            AlterTableOperation::Algorithm { .. }
+            | AlterTableOperation::Lock { .. }
+            | AlterTableOperation::AutoIncrement { .. } => {
+                // MySQL-specific options that don't affect schema — silently accept
+            }
+
+            _ => {
+                warn!("Unsupported ALTER TABLE operation: {:?}", op);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply sqlparser ColumnOption list to our ColumnDef (used by MODIFY/CHANGE COLUMN).
+    fn apply_column_options(
+        &self,
+        col: &mut crate::catalog::ColumnDef,
+        options: &[sqlparser::ast::ColumnOption],
+    ) {
+        // Reset to defaults before reapplying
+        col.nullable = true;
+        col.default = None;
+        col.auto_increment = false;
+
+        for option in options {
+            match option {
+                sqlparser::ast::ColumnOption::Null => col.nullable = true,
+                sqlparser::ast::ColumnOption::NotNull => col.nullable = false,
+                sqlparser::ast::ColumnOption::Default(expr) => {
+                    col.default = Some(expr.to_string());
+                }
+                sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                    col.nullable = false;
+                }
+                sqlparser::ast::ColumnOption::DialectSpecific(tokens) => {
+                    let token_str: String = tokens
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<String>()
+                        .to_uppercase();
+                    if token_str.contains("AUTO_INCREMENT") || token_str.contains("AUTOINCREMENT") {
+                        col.auto_increment = true;
+                        col.nullable = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Persist ALTER TABLE changes to system tables via Raft.
+    ///
+    /// Pattern: delete old system.columns/constraints rows, insert new ones.
+    /// For RENAME, also updates system.tables row.
+    async fn persist_alter_table(
+        &mut self,
+        old_table_name: &str,
+        new_def: &crate::catalog::TableDef,
+    ) -> ProtocolResult<()> {
+        use crate::catalog::system_tables::{
+            table_def_to_columns_rows, table_def_to_constraints_rows, table_def_to_tables_row,
+            SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_TABLES,
+        };
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::raft::RowChange;
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let mut changeset = ChangeSet::new(0);
+
+        // Scan and delete old system.tables row (for RENAME, or to reinsert)
+        let renamed = old_table_name != new_def.name;
+
+        // Delete old system.columns rows matching old_table_name
+        {
+            let prefix = format!("t:{SYSTEM_COLUMNS}:");
+            let end = format!("t:{SYSTEM_COLUMNS};\x00");
+            let rows = self
+                .mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ProtocolError::Internal(format!("scan system.columns: {}", e)))?;
+
+            for (key, value) in rows {
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(Datum::String(tname)) = row.values().first() {
+                        if tname == old_table_name {
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_COLUMNS,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Delete old system.constraints rows matching old_table_name
+        {
+            let prefix = format!("t:{SYSTEM_CONSTRAINTS}:");
+            let end = format!("t:{SYSTEM_CONSTRAINTS};\x00");
+            let rows = self
+                .mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ProtocolError::Internal(format!("scan system.constraints: {}", e)))?;
+
+            for (key, value) in rows {
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(Datum::String(tname)) = row.values().first() {
+                        if tname == old_table_name {
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_CONSTRAINTS,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // If renamed, delete old system.tables row and insert new one
+        if renamed {
+            let prefix = format!("t:{SYSTEM_TABLES}:");
+            let end = format!("t:{SYSTEM_TABLES};\x00");
+            let rows = self
+                .mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ProtocolError::Internal(format!("scan system.tables: {}", e)))?;
+
+            for (key, value) in rows {
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(Datum::String(tname)) = row.values().first() {
+                        if tname == old_table_name {
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_TABLES,
+                                key,
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Insert new system.tables row
+            let table_row = table_def_to_tables_row(new_def);
+            let (mut next_local, node_id) = allocate_row_id_batch(1);
+            let row_id = encode_row_id(next_local, node_id);
+            next_local += 1;
+            let _ = next_local; // suppress unused warning
+            let key = encode_row_key(SYSTEM_TABLES, row_id);
+            let value = encode_row(&table_row);
+            changeset.push(RowChange::insert(SYSTEM_TABLES, key, value));
+        }
+
+        // Insert new system.columns rows from modified def
+        let column_rows = table_def_to_columns_rows(new_def);
+        let constraint_rows = table_def_to_constraints_rows(new_def);
+        let total_ids = column_rows.len() as u64 + constraint_rows.len() as u64;
+
+        if total_ids > 0 {
+            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+
+            for col_row in column_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_COLUMNS, row_id);
+                let value = encode_row(&col_row);
+                changeset.push(RowChange::insert(SYSTEM_COLUMNS, key, value));
+            }
+
+            for constraint_row in constraint_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
+                let value = encode_row(&constraint_row);
+                changeset.push(RowChange::insert(SYSTEM_CONSTRAINTS, key, value));
+            }
+        }
+
+        if changeset.changes.is_empty() {
+            // No system table changes — just update catalog directly
+            let mut catalog = self.catalog.write();
+            catalog.replace_table(old_table_name, new_def.clone());
+        } else {
+            // Propose via Raft — catalog is updated synchronously in apply()
+            self.raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ProtocolError::Internal(format!("Raft propose ALTER TABLE: {}", e)))?;
+        }
+
+        Ok(())
     }
 
     /// Handle SQL-level PREPARE/EXECUTE/DEALLOCATE for text protocol prepared statements.

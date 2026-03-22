@@ -97,15 +97,19 @@ impl ExecutorEngine {
 
             PhysicalPlan::TableScan {
                 table,
-                columns: _,
+                columns,
                 filter,
-            } => Ok(Box::new(TableScan::new(
-                table,
-                filter,
-                self.mvcc.clone(),
-                self.txn_context.clone(),
-                self.user_variables.clone(),
-            ))),
+            } => {
+                let schema_types: Vec<_> = columns.iter().map(|c| c.data_type.clone()).collect();
+                Ok(Box::new(TableScan::with_schema_types(
+                    table,
+                    filter,
+                    self.mvcc.clone(),
+                    self.txn_context.clone(),
+                    self.user_variables.clone(),
+                    schema_types,
+                )))
+            }
 
             PhysicalPlan::PointGet {
                 table,

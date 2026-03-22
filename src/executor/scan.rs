@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::catalog::DataType;
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
+use super::datum::Datum;
 use super::encoding::{decode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
@@ -34,6 +36,8 @@ pub struct TableScan {
     position: usize,
     /// User variables
     user_variables: UserVariables,
+    /// Expected column types from current schema (for lazy row padding after ALTER TABLE ADD COLUMN)
+    schema_column_types: Vec<DataType>,
 }
 
 impl TableScan {
@@ -53,6 +57,28 @@ impl TableScan {
             raw_pairs: Vec::new(),
             position: 0,
             user_variables,
+            schema_column_types: Vec::new(),
+        }
+    }
+
+    /// Create a new table scan with schema column types for lazy row padding
+    pub fn with_schema_types(
+        table: String,
+        filter: Option<ResolvedExpr>,
+        mvcc: Arc<MvccStorage>,
+        txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
+        schema_column_types: Vec<DataType>,
+    ) -> Self {
+        TableScan {
+            table,
+            filter,
+            mvcc,
+            txn_context,
+            raw_pairs: Vec::new(),
+            position: 0,
+            user_variables,
+            schema_column_types,
         }
     }
 }
@@ -107,10 +133,21 @@ impl Executor for TableScan {
     }
 
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        let expected_cols = self.schema_column_types.len();
         // Decode and filter one row at a time (streaming)
         while self.position < self.raw_pairs.len() {
-            let row = decode_row(&self.raw_pairs[self.position])?;
+            let mut row = decode_row(&self.raw_pairs[self.position])?;
             self.position += 1;
+
+            // Lazy row padding: if the stored row has fewer columns than the
+            // current schema (e.g. after ALTER TABLE ADD COLUMN), pad with defaults.
+            if expected_cols > 0 && row.len() < expected_cols {
+                let mut values = row.into_values();
+                for col_type in &self.schema_column_types[values.len()..] {
+                    values.push(Datum::default_for_type(col_type));
+                }
+                row = Row::new(values);
+            }
 
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
