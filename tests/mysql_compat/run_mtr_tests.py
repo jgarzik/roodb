@@ -251,10 +251,10 @@ def run_one_test(test_name, certs, port, record, log_dir):
     # Write preamble + test content to a temp file inside the mysql-test dir
     # so that --source include/... paths resolve correctly via --basedir.
     preamble = "--let $DEFAULT_ENGINE = RooDB\n"
-    with open(test_file, "r") as f:
+    with open(test_file, "r", encoding="latin-1") as f:
         test_content = preamble + f.read()
     tmp_test_file = os.path.join(log_dir, f"{test_name}.test")
-    with open(tmp_test_file, "w") as f:
+    with open(tmp_test_file, "w", encoding="latin-1") as f:
         f.write(test_content)
 
     cmd = [

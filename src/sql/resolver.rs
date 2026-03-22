@@ -1877,14 +1877,6 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
         }
     }
 
-    // MySQL: BLOB/TEXT columns cannot have a default value
-    if col_def.default.is_some() && matches!(col_def.data_type, DataType::Text | DataType::Blob) {
-        return Err(SqlError::InvalidOperation(format!(
-            "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
-            col_def.name
-        )));
-    }
-
     Ok(col_def)
 }
 
