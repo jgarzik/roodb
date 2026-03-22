@@ -232,6 +232,7 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::Blob => "BLOB".to_string(),
         DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
     }
 }
 
@@ -248,6 +249,17 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
             .parse::<u8>()
             .ok()
             .map(|n| DataType::Bit(n.clamp(1, 64)));
+    }
+    if s.starts_with("DECIMAL(") && s.ends_with(')') {
+        let inner = &s[8..s.len() - 1];
+        if let Some((p_str, s_str)) = inner.split_once(',') {
+            if let (Ok(p), Ok(sc)) = (p_str.parse::<u8>(), s_str.parse::<u8>()) {
+                return Some(DataType::Decimal {
+                    precision: p,
+                    scale: sc,
+                });
+            }
+        }
     }
     {
         match s.as_str() {

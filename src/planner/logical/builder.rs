@@ -553,6 +553,17 @@ impl LogicalPlanBuilder {
                 Literal::Boolean(_) => DataType::Boolean,
                 Literal::Null => DataType::Int,
                 Literal::Blob(_) => DataType::Blob,
+                Literal::Decimal(value, scale) => {
+                    let digits = if *value == 0 {
+                        1
+                    } else {
+                        value.unsigned_abs().ilog10() as u8 + 1
+                    };
+                    DataType::Decimal {
+                        precision: digits.max(*scale),
+                        scale: *scale,
+                    }
+                }
                 Literal::Placeholder(_) => DataType::BigInt,
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),
@@ -785,6 +796,9 @@ impl LogicalPlanBuilder {
                 Literal::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
                 Literal::Null => "NULL".to_string(),
                 Literal::Blob(_) => "blob".to_string(),
+                Literal::Decimal(value, scale) => {
+                    crate::executor::datum::format_decimal(*value, *scale)
+                }
                 Literal::Placeholder(n) => format!("?{}", n),
             },
             ResolvedExpr::BinaryOp {

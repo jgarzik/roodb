@@ -40,6 +40,8 @@ pub enum DataType {
     Bit(u8),
     /// Timestamp (date and time)
     Timestamp,
+    /// Fixed-point decimal with precision and scale
+    Decimal { precision: u8, scale: u8 },
 }
 
 impl DataType {
@@ -55,6 +57,7 @@ impl DataType {
                 | DataType::Float
                 | DataType::Double
                 | DataType::Bit(_)
+                | DataType::Decimal { .. }
         )
     }
 

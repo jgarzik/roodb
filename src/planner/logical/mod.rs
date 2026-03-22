@@ -92,6 +92,8 @@ pub enum Literal {
     Float(f64),
     String(String),
     Blob(Vec<u8>),
+    /// Fixed-point decimal (unscaled value, scale)
+    Decimal(i128, u8),
     /// Parameter placeholder (index into params array) for prepared statement plan caching
     Placeholder(usize),
 }
@@ -193,6 +195,17 @@ impl ResolvedExpr {
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Blob(_) => DataType::Blob,
+                Literal::Decimal(value, scale) => {
+                    let digits = if *value == 0 {
+                        1
+                    } else {
+                        value.unsigned_abs().ilog10() as u8 + 1
+                    };
+                    DataType::Decimal {
+                        precision: digits.max(*scale),
+                        scale: *scale,
+                    }
+                }
                 Literal::Placeholder(_) => DataType::BigInt, // Placeholder type determined at substitution
             },
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),

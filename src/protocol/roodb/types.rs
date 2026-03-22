@@ -76,6 +76,7 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
         DataType::Blob => ColumnType::Blob,
         DataType::Bit(_) => ColumnType::Bit,
         DataType::Timestamp => ColumnType::Datetime,
+        DataType::Decimal { .. } => ColumnType::NewDecimal,
     }
 }
 
@@ -95,6 +96,7 @@ pub fn datatype_column_length(dt: &DataType) -> u32 {
         DataType::Blob => 65535,
         DataType::Bit(n) => *n as u32,
         DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
+        DataType::Decimal { precision, .. } => *precision as u32 + 2, // sign + decimal point
     }
 }
 
@@ -125,6 +127,9 @@ pub fn datatype_flags(dt: &DataType, nullable: bool) -> u16 {
         }
         DataType::Bit(_) => {
             flags |= column_flags::UNSIGNED | column_flags::NUM;
+        }
+        DataType::Decimal { .. } => {
+            flags |= column_flags::NUM;
         }
         _ => {}
     }
@@ -173,6 +178,10 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
             // Convert unix millis to datetime format
             let datetime = format_timestamp(*ts);
             encode_length_encoded_string(&datetime)
+        }
+        Datum::Decimal { value, scale } => {
+            let s = crate::executor::datum::format_decimal(*value, *scale);
+            encode_length_encoded_string(&s)
         }
     }
 }

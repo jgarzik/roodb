@@ -1881,14 +1881,24 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         | sp::DataType::Float64
         | sp::DataType::DoubleUnsigned(_)
         | sp::DataType::DoublePrecisionUnsigned => Ok(DataType::Double),
-        // DECIMAL/NUMERIC — map to Double
-        sp::DataType::Decimal(_)
-        | sp::DataType::Numeric(_)
-        | sp::DataType::Dec(_)
-        | sp::DataType::DecimalUnsigned(_)
-        | sp::DataType::DecUnsigned(_)
-        | sp::DataType::BigNumeric(_)
-        | sp::DataType::BigDecimal(_) => Ok(DataType::Double),
+        // DECIMAL/NUMERIC
+        sp::DataType::Decimal(info)
+        | sp::DataType::Numeric(info)
+        | sp::DataType::Dec(info)
+        | sp::DataType::DecimalUnsigned(info)
+        | sp::DataType::DecUnsigned(info)
+        | sp::DataType::BigNumeric(info)
+        | sp::DataType::BigDecimal(info) => {
+            let (p, s) = match info {
+                sp::ExactNumberInfo::None => (10, 0),
+                sp::ExactNumberInfo::Precision(p) => (*p as u8, 0),
+                sp::ExactNumberInfo::PrecisionAndScale(p, s) => (*p as u8, *s as u8),
+            };
+            Ok(DataType::Decimal {
+                precision: p.min(65),
+                scale: s.min(30),
+            })
+        }
         // Varchar
         sp::DataType::Varchar(len)
         | sp::DataType::CharacterVarying(len)
@@ -2132,7 +2142,7 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                     Err(_) => {
                         // Values > i64::MAX: check for the special i64::MIN case
                         // (9223372036854775808 becomes i64::MIN when negated by unary minus).
-                        // For other values > i64::MAX, use float to avoid silent wrapping.
+                        // For other values > i64::MAX, use unsigned or decimal.
                         match n.parse::<u64>() {
                             Ok(val) => {
                                 // Values > i64::MAX stored as UnsignedInteger
@@ -2142,9 +2152,11 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
                                 // Strip leading zeros and retry
                                 let stripped = n.trim_start_matches('0');
                                 let stripped = if stripped.is_empty() { "0" } else { stripped };
-                                // Try as u64 first, then float for very large numbers
+                                // Try as u64 first, then i128 for very large integers
                                 if let Ok(u) = stripped.parse::<u64>() {
                                     Ok(Literal::UnsignedInteger(u))
+                                } else if let Ok(v) = stripped.parse::<i128>() {
+                                    Ok(Literal::Decimal(v, 0))
                                 } else if let Ok(f) = stripped.parse::<f64>() {
                                     Ok(Literal::Float(f))
                                 } else {
@@ -2731,19 +2743,31 @@ mod tests {
         );
         assert_eq!(
             convert_data_type(&SpDt::DecimalUnsigned(ExactNumberInfo::None)).unwrap(),
-            DataType::Double
+            DataType::Decimal {
+                precision: 10,
+                scale: 0
+            }
         );
         assert_eq!(
             convert_data_type(&SpDt::DecUnsigned(ExactNumberInfo::None)).unwrap(),
-            DataType::Double
+            DataType::Decimal {
+                precision: 10,
+                scale: 0
+            }
         );
         assert_eq!(
             convert_data_type(&SpDt::BigNumeric(ExactNumberInfo::None)).unwrap(),
-            DataType::Double
+            DataType::Decimal {
+                precision: 10,
+                scale: 0
+            }
         );
         assert_eq!(
             convert_data_type(&SpDt::BigDecimal(ExactNumberInfo::None)).unwrap(),
-            DataType::Double
+            DataType::Decimal {
+                precision: 10,
+                scale: 0
+            }
         );
 
         // Varchar variants

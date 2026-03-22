@@ -287,6 +287,7 @@ fn checked_float_to_int(v: f64) -> ExecutorResult<Datum> {
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
+        Datum::Decimal { .. } => std::borrow::Cow::Borrowed(d),
         Datum::String(s) => {
             // MySQL coerces strings to numbers in arithmetic: "123.5" → 123.5, "abc" → 0
             let trimmed = s.trim();
@@ -338,6 +339,62 @@ fn eval_add(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::UnsignedInt(a), Datum::Float(b)) | (Datum::Float(b), Datum::UnsignedInt(a)) => {
             check_float_overflow(*a as f64 + b)
         }
+        // Decimal arithmetic
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => {
+            let (a_norm, b_norm, result_scale) = normalize_decimal_scales(*a, *sa, *b, *sb)
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            match a_norm.checked_add(b_norm) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: result_scale,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::Int(i))
+        | (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
+            let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
+            match i_scaled.and_then(|is| d.checked_add(is)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::UnsignedInt(u))
+        | (Datum::UnsignedInt(u), Datum::Decimal { value: d, scale: s }) => {
+            let u_scaled = (*u as i128).checked_mul(10i128.pow(*s as u32));
+            match u_scaled.and_then(|us| d.checked_add(us)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            check_float_overflow(a + b)
+        }
         (Datum::String(a), Datum::String(b)) => Ok(Datum::String(format!("{}{}", a, b))),
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot add {:?} and {:?}",
@@ -383,6 +440,84 @@ fn eval_sub(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a - *b as f64),
         (Datum::UnsignedInt(a), Datum::Float(b)) => check_float_overflow(*a as f64 - b),
         (Datum::Float(a), Datum::UnsignedInt(b)) => check_float_overflow(a - *b as f64),
+        // Decimal subtraction
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => {
+            let (a_norm, b_norm, result_scale) = normalize_decimal_scales(*a, *sa, *b, *sb)
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            match a_norm.checked_sub(b_norm) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: result_scale,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::Int(i)) => {
+            let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
+            match i_scaled.and_then(|is| d.checked_sub(is)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
+            let i_scaled = (*i as i128).checked_mul(10i128.pow(*s as u32));
+            match i_scaled.and_then(|is| is.checked_sub(*d)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::UnsignedInt(u)) => {
+            let u_scaled = (*u as i128).checked_mul(10i128.pow(*s as u32));
+            match u_scaled.and_then(|us| d.checked_sub(us)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::UnsignedInt(u), Datum::Decimal { value: d, scale: s }) => {
+            let u_scaled = (*u as i128).checked_mul(10i128.pow(*s as u32));
+            match u_scaled.and_then(|us| us.checked_sub(*d)) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            check_float_overflow(a - b)
+        }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot subtract {:?} from {:?}",
             right, left
@@ -419,6 +554,54 @@ fn eval_mul(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::UnsignedInt(a), Datum::Float(b)) | (Datum::Float(b), Datum::UnsignedInt(a)) => {
             check_float_overflow(*a as f64 * b)
         }
+        // Decimal multiplication
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => match a.checked_mul(*b) {
+            Some(v) => Ok(Datum::Decimal {
+                value: v,
+                scale: sa + sb,
+            }),
+            None => Err(ExecutorError::DataOutOfRange(
+                "DECIMAL value is out of range".to_string(),
+            )),
+        },
+        (Datum::Decimal { value: d, scale: s }, Datum::Int(i))
+        | (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
+            match d.checked_mul(*i as i128) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::UnsignedInt(u))
+        | (Datum::UnsignedInt(u), Datum::Decimal { value: d, scale: s }) => {
+            match d.checked_mul(*u as i128) {
+                Some(v) => Ok(Datum::Decimal {
+                    value: v,
+                    scale: *s,
+                }),
+                None => Err(ExecutorError::DataOutOfRange(
+                    "DECIMAL value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            check_float_overflow(a * b)
+        }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot multiply {:?} and {:?}",
             left, right
@@ -434,6 +617,7 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
+        Datum::Decimal { value: v, .. } if *v == 0 => return Ok(Datum::Null),
         _ => {}
     }
 
@@ -450,6 +634,39 @@ fn eval_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Float(a), Datum::Int(b)) => check_float_overflow(a / *b as f64),
         (Datum::UnsignedInt(a), Datum::Float(b)) => check_float_overflow(*a as f64 / b),
         (Datum::Float(a), Datum::UnsignedInt(b)) => check_float_overflow(a / *b as f64),
+        // Decimal division — MySQL adds 4 extra scale digits for division
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => {
+            let extra = 4u8;
+            let result_scale = sa.saturating_add(extra);
+            let scale_diff = result_scale.saturating_add(*sb).saturating_sub(*sa);
+            let factor = 10i128.pow(scale_diff as u32);
+            match a.checked_mul(factor) {
+                Some(scaled_a) => Ok(Datum::Decimal {
+                    value: scaled_a / b,
+                    scale: result_scale,
+                }),
+                None => {
+                    // Fall back to float
+                    let fa = left.as_float().unwrap();
+                    let fb = right.as_float().unwrap();
+                    check_float_overflow(fa / fb)
+                }
+            }
+        }
+        (Datum::Decimal { .. }, _) | (_, Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            check_float_overflow(a / b)
+        }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot divide {:?} by {:?}",
             left, right
@@ -465,6 +682,7 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
+        Datum::Decimal { value: v, .. } if *v == 0 => return Ok(Datum::Null),
         _ => {}
     }
 
@@ -479,10 +697,94 @@ fn eval_mod(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Float(a), Datum::Int(b)) => Ok(Datum::Float(a % *b as f64)),
         (Datum::UnsignedInt(a), Datum::Float(b)) => Ok(Datum::Float(*a as f64 % b)),
         (Datum::Float(a), Datum::UnsignedInt(b)) => Ok(Datum::Float(a % *b as f64)),
+        // Decimal modulo
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => {
+            let (a_norm, b_norm, result_scale) = normalize_decimal_scales(*a, *sa, *b, *sb)
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            Ok(Datum::Decimal {
+                value: a_norm.checked_rem(b_norm).unwrap_or(0),
+                scale: result_scale,
+            })
+        }
+        // Decimal % Int (exact)
+        (Datum::Decimal { value: d, scale: s }, Datum::Int(i)) => {
+            let i_scaled = (*i as i128)
+                .checked_mul(10i128.pow(*s as u32))
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            Ok(Datum::Decimal {
+                value: d.checked_rem(i_scaled).unwrap_or(0),
+                scale: *s,
+            })
+        }
+        (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
+            let i_scaled = (*i as i128)
+                .checked_mul(10i128.pow(*s as u32))
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            Ok(Datum::Decimal {
+                value: i_scaled.checked_rem(*d).unwrap_or(0),
+                scale: *s,
+            })
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::UnsignedInt(u)) => {
+            let u_scaled = (*u as i128)
+                .checked_mul(10i128.pow(*s as u32))
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            Ok(Datum::Decimal {
+                value: d.checked_rem(u_scaled).unwrap_or(0),
+                scale: *s,
+            })
+        }
+        (Datum::UnsignedInt(u), Datum::Decimal { value: d, scale: s }) => {
+            let u_scaled = (*u as i128)
+                .checked_mul(10i128.pow(*s as u32))
+                .ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            Ok(Datum::Decimal {
+                value: u_scaled.checked_rem(*d).unwrap_or(0),
+                scale: *s,
+            })
+        }
+        (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            Ok(Datum::Float(a % b))
+        }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot compute modulo of {:?} and {:?}",
             left, right
         ))),
+    }
+}
+
+/// Normalize two decimal values to the same scale, returning (a_scaled, b_scaled, result_scale).
+/// Returns None if the scaling multiplication overflows i128.
+fn normalize_decimal_scales(a: i128, sa: u8, b: i128, sb: u8) -> Option<(i128, i128, u8)> {
+    if sa == sb {
+        Some((a, b, sa))
+    } else if sa < sb {
+        let factor = 10i128.pow((sb - sa) as u32);
+        Some((a.checked_mul(factor)?, b, sb))
+    } else {
+        let factor = 10i128.pow((sa - sb) as u32);
+        Some((a, b.checked_mul(factor)?, sa))
     }
 }
 
@@ -522,6 +824,10 @@ fn to_bitwise_int(d: &Datum) -> Option<i64> {
         Datum::Float(f) => Some(*f as i64),
         Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
         Datum::Bit { value, .. } => Some(*value as i64),
+        Datum::Decimal { value, scale } => {
+            let divisor = 10i128.pow(*scale as u32);
+            Some((value / divisor) as i64)
+        }
         Datum::String(s) => Some(parse_leading_int(s)),
         _ => None,
     }
@@ -602,6 +908,7 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         Datum::Int(0) => return Ok(Datum::Null),
         Datum::UnsignedInt(0) => return Ok(Datum::Null),
         Datum::Float(f) if *f == 0.0 => return Ok(Datum::Null),
+        Datum::Decimal { value: v, .. } if *v == 0 => return Ok(Datum::Null),
         _ => {}
     }
     // MySQL DIV: perform float division, then truncate toward zero.
@@ -625,6 +932,78 @@ fn eval_int_div(left: &Datum, right: &Datum) -> ExecutorResult<Datum> {
         (Datum::Float(a), Datum::Int(b)) => checked_float_to_int((a / *b as f64).trunc()),
         (Datum::UnsignedInt(a), Datum::Float(b)) => checked_float_to_int((*a as f64 / b).trunc()),
         (Datum::Float(a), Datum::UnsignedInt(b)) => checked_float_to_int((a / *b as f64).trunc()),
+        // Decimal DIV: normalize scales, divide i128 values, return Int
+        (
+            Datum::Decimal {
+                value: a,
+                scale: sa,
+            },
+            Datum::Decimal {
+                value: b,
+                scale: sb,
+            },
+        ) => {
+            let (a_norm, b_norm, _) =
+                normalize_decimal_scales(*a, *sa, *b, *sb).ok_or_else(|| {
+                    ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                })?;
+            match a_norm.checked_div(b_norm) {
+                Some(v) => {
+                    // Result is an integer (truncated)
+                    if v > i64::MAX as i128 || v < i64::MIN as i128 {
+                        Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
+                None => Err(ExecutorError::DataOutOfRange(
+                    "BIGINT value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { value: d, scale: s }, Datum::Int(i)) => {
+            // Decimal DIV Int: divide the unscaled value by (i * 10^scale)
+            let divisor = (*i as i128).checked_mul(10i128.pow(*s as u32));
+            match divisor.and_then(|div| d.checked_div(div)) {
+                Some(v) => {
+                    if v > i64::MAX as i128 || v < i64::MIN as i128 {
+                        Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
+                None => Err(ExecutorError::DataOutOfRange(
+                    "BIGINT value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Int(i), Datum::Decimal { value: d, scale: s }) => {
+            // Int DIV Decimal: (i * 10^scale) / d
+            let numerator = (*i as i128).checked_mul(10i128.pow(*s as u32));
+            match numerator.and_then(|n| n.checked_div(*d)) {
+                Some(v) => {
+                    if v > i64::MAX as i128 || v < i64::MIN as i128 {
+                        Err(ExecutorError::DataOutOfRange(
+                            "BIGINT value is out of range".to_string(),
+                        ))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
+                None => Err(ExecutorError::DataOutOfRange(
+                    "BIGINT value is out of range".to_string(),
+                )),
+            }
+        }
+        (Datum::Decimal { .. }, _) | (_, Datum::Decimal { .. }) => {
+            let a = left.as_float().unwrap();
+            let b = right.as_float().unwrap();
+            checked_float_to_int((a / b).trunc())
+        }
         _ => Err(ExecutorError::InvalidOperation(format!(
             "cannot integer divide {:?} by {:?}",
             left, right
@@ -670,6 +1049,7 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
             | (Datum::Bytes(_), DataType::Blob)
             | (Datum::Bit { .. }, DataType::Bit(_))
             | (Datum::Timestamp(_), DataType::Timestamp)
+            | (Datum::Decimal { .. }, DataType::Decimal { .. })
     );
     if !already_matches {
         eval_cast(&datum, target).unwrap_or(datum)
@@ -778,7 +1158,128 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 }),
             }
         }
+        DataType::Decimal { scale, .. } => {
+            let s = *scale;
+            let factor = 10i128.pow(s as u32);
+            match val {
+                Datum::Int(i) => match (*i as i128).checked_mul(factor) {
+                    Some(v) => Ok(Datum::Decimal { value: v, scale: s }),
+                    None => Err(ExecutorError::DataOutOfRange(
+                        "DECIMAL value is out of range".to_string(),
+                    )),
+                },
+                Datum::UnsignedInt(u) => match (*u as i128).checked_mul(factor) {
+                    Some(v) => Ok(Datum::Decimal { value: v, scale: s }),
+                    None => Err(ExecutorError::DataOutOfRange(
+                        "DECIMAL value is out of range".to_string(),
+                    )),
+                },
+                Datum::Float(f) => {
+                    let scaled = f * factor as f64;
+                    if scaled > i128::MAX as f64 || scaled < i128::MIN as f64 {
+                        Err(ExecutorError::DataOutOfRange(
+                            "DECIMAL value is out of range".to_string(),
+                        ))
+                    } else {
+                        Ok(Datum::Decimal {
+                            value: scaled.round() as i128,
+                            scale: s,
+                        })
+                    }
+                }
+                Datum::Decimal {
+                    value: v,
+                    scale: vs,
+                } => {
+                    // Rescale
+                    if *vs == s {
+                        Ok(Datum::Decimal {
+                            value: *v,
+                            scale: s,
+                        })
+                    } else if s > *vs {
+                        let up = 10i128.pow((s - vs) as u32);
+                        match v.checked_mul(up) {
+                            Some(scaled) => Ok(Datum::Decimal {
+                                value: scaled,
+                                scale: s,
+                            }),
+                            None => Err(ExecutorError::DataOutOfRange(
+                                "DECIMAL value is out of range".to_string(),
+                            )),
+                        }
+                    } else {
+                        let down = 10i128.pow((vs - s) as u32);
+                        Ok(Datum::Decimal {
+                            value: v / down,
+                            scale: s,
+                        })
+                    }
+                }
+                Datum::String(str_val) => parse_decimal_string(str_val, s),
+                _ => Ok(Datum::Decimal { value: 0, scale: s }),
+            }
+        }
         _ => Ok(Datum::String(val.to_display_string())),
+    }
+}
+
+/// Parse a string into a Decimal datum with the given target scale.
+fn parse_decimal_string(s: &str, target_scale: u8) -> ExecutorResult<Datum> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Datum::Decimal {
+            value: 0,
+            scale: target_scale,
+        });
+    }
+
+    let negative = trimmed.starts_with('-');
+    let digits = if negative || trimmed.starts_with('+') {
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+
+    let (integer_part, frac_part) = if let Some((ip, fp)) = digits.split_once('.') {
+        (ip, fp)
+    } else {
+        (digits, "")
+    };
+
+    let src_scale = frac_part.len() as u8;
+
+    // Build unscaled integer
+    let mut combined = String::with_capacity(integer_part.len() + frac_part.len());
+    combined.push_str(integer_part);
+    combined.push_str(frac_part);
+
+    let abs_val = combined.parse::<i128>().unwrap_or(0);
+    let value = if negative { -abs_val } else { abs_val };
+
+    // Rescale to target
+    if src_scale == target_scale {
+        Ok(Datum::Decimal {
+            value,
+            scale: target_scale,
+        })
+    } else if target_scale > src_scale {
+        let factor = 10i128.pow((target_scale - src_scale) as u32);
+        match value.checked_mul(factor) {
+            Some(v) => Ok(Datum::Decimal {
+                value: v,
+                scale: target_scale,
+            }),
+            None => Err(ExecutorError::DataOutOfRange(
+                "DECIMAL value is out of range".to_string(),
+            )),
+        }
+    } else {
+        let factor = 10i128.pow((src_scale - target_scale) as u32);
+        Ok(Datum::Decimal {
+            value: value / factor,
+            scale: target_scale,
+        })
     }
 }
 

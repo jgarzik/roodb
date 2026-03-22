@@ -28,6 +28,8 @@ pub enum Datum {
     Bit { value: u64, width: u8 },
     /// Timestamp as unix milliseconds
     Timestamp(i64),
+    /// Fixed-point decimal (unscaled value, scale)
+    Decimal { value: i128, scale: u8 },
 }
 
 impl Datum {
@@ -53,6 +55,10 @@ impl Datum {
             },
             DataType::BigIntUnsigned => Datum::UnsignedInt(0),
             DataType::Timestamp => Datum::Int(0),
+            DataType::Decimal { scale, .. } => Datum::Decimal {
+                value: 0,
+                scale: *scale,
+            },
         }
     }
 
@@ -68,6 +74,7 @@ impl Datum {
             Datum::Bytes(_) => 5,
             Datum::Timestamp(_) => 6,
             Datum::Bit { .. } => 7,
+            Datum::Decimal { .. } => 3, // same as Float for cross-type ordering
         }
     }
 
@@ -83,6 +90,18 @@ impl Datum {
             Datum::Bytes(_) => Some(DataType::Blob),
             Datum::Bit { width, .. } => Some(DataType::Bit(*width)),
             Datum::Timestamp(_) => Some(DataType::Timestamp),
+            Datum::Decimal { value, scale } => {
+                let digits = if *value == 0 {
+                    1
+                } else {
+                    value.unsigned_abs().ilog10() as u8 + 1
+                };
+                let precision = digits.max(*scale);
+                Some(DataType::Decimal {
+                    precision,
+                    scale: *scale,
+                })
+            }
         }
     }
 
@@ -93,6 +112,7 @@ impl Datum {
             Datum::Int(i) => Some(*i != 0),
             Datum::UnsignedInt(u) => Some(*u != 0),
             Datum::Bit { value, .. } => Some(*value != 0),
+            Datum::Decimal { value, .. } => Some(*value != 0),
             Datum::Null => None,
             _ => None,
         }
@@ -106,6 +126,10 @@ impl Datum {
             Datum::Float(f) => Some(*f as i64),
             Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
             Datum::Bit { value, .. } => Some(*value as i64),
+            Datum::Decimal { value, scale } => {
+                let divisor = 10i128.pow(*scale as u32);
+                Some((value / divisor) as i64)
+            }
             Datum::Null => None,
             _ => None,
         }
@@ -118,6 +142,7 @@ impl Datum {
             Datum::Int(i) => Some(*i as f64),
             Datum::UnsignedInt(u) => Some(*u as f64),
             Datum::Bit { value, .. } => Some(*value as f64),
+            Datum::Decimal { value, scale } => Some(*value as f64 / 10f64.powi(*scale as i32)),
             Datum::Null => None,
             _ => None,
         }
@@ -183,6 +208,7 @@ impl Datum {
                 s
             }
             Datum::Timestamp(t) => t.to_string(),
+            Datum::Decimal { value, scale } => format_decimal(*value, *scale),
         }
     }
 
@@ -211,6 +237,7 @@ impl Datum {
             }
             Datum::Bit { value, .. } => value.to_string(),
             Datum::Timestamp(t) => t.to_string(),
+            Datum::Decimal { value, scale } => format_decimal(*value, *scale),
         }
     }
 
@@ -224,6 +251,10 @@ impl Datum {
             Literal::Float(f) => Datum::Float(*f),
             Literal::String(s) => Datum::String(s.clone()),
             Literal::Blob(b) => Datum::Bytes(b.clone()),
+            Literal::Decimal(value, scale) => Datum::Decimal {
+                value: *value,
+                scale: *scale,
+            },
             Literal::Placeholder(i) => {
                 panic!("Unsubstituted placeholder ?{} in plan execution", i)
             }
@@ -239,6 +270,10 @@ impl Datum {
                 // -UnsignedInt: converts to signed via two's complement
                 Some(Datum::Int(-(*u as i64)))
             }
+            Datum::Decimal { value, scale } => Some(Datum::Decimal {
+                value: -value,
+                scale: *scale,
+            }),
             Datum::Null => Some(Datum::Null),
             Datum::Bit { .. } => None,
             _ => None,
@@ -253,6 +288,7 @@ impl Datum {
             Datum::UnsignedInt(u) => Some(Datum::Bool(*u == 0)),
             Datum::Float(f) => Some(Datum::Bool(*f == 0.0)),
             Datum::Bit { value, .. } => Some(Datum::Bool(*value == 0)),
+            Datum::Decimal { value, .. } => Some(Datum::Bool(*value == 0)),
             Datum::Null => Some(Datum::Null),
             _ => None,
         }
@@ -274,6 +310,46 @@ impl Datum {
                 Some(Datum::Bool(like_match(&s, &p)))
             }
         }
+    }
+}
+
+/// Reduce a decimal to canonical form by stripping trailing fractional zeros.
+/// e.g., (12300, 2) → (123, 0), (12345, 2) → (12345, 2)
+fn canonical_decimal(value: i128, scale: u8) -> (i128, u8) {
+    let mut v = value;
+    let mut s = scale;
+    while s > 0 && v % 10 == 0 {
+        v /= 10;
+        s -= 1;
+    }
+    (v, s)
+}
+
+/// Format a decimal value with the given scale as a string.
+/// e.g., value=12345, scale=2 → "123.45"
+pub fn format_decimal(value: i128, scale: u8) -> String {
+    if scale == 0 {
+        return value.to_string();
+    }
+    let negative = value < 0;
+    let abs_val = value.unsigned_abs();
+    let divisor = 10u128.pow(scale as u32);
+    let integer_part = abs_val / divisor;
+    let frac_part = abs_val % divisor;
+    if negative {
+        format!(
+            "-{}.{:0>width$}",
+            integer_part,
+            frac_part,
+            width = scale as usize
+        )
+    } else {
+        format!(
+            "{}.{:0>width$}",
+            integer_part,
+            frac_part,
+            width = scale as usize
+        )
     }
 }
 
@@ -344,6 +420,53 @@ impl PartialEq for Datum {
             (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
                 (*a as f64).to_bits() == b.to_bits()
             }
+            // Decimal comparisons
+            (
+                Datum::Decimal {
+                    value: a,
+                    scale: sa,
+                },
+                Datum::Decimal {
+                    value: b,
+                    scale: sb,
+                },
+            ) => {
+                if sa == sb {
+                    a == b
+                } else if sa < sb {
+                    let factor = 10i128.pow((*sb - *sa) as u32);
+                    a.checked_mul(factor) == Some(*b)
+                } else {
+                    let factor = 10i128.pow((*sa - *sb) as u32);
+                    b.checked_mul(factor) == Some(*a)
+                }
+            }
+            // Decimal vs Int/UnsignedInt: canonicalize decimal, then compare exactly
+            (Datum::Decimal { value, scale }, Datum::Int(i))
+            | (Datum::Int(i), Datum::Decimal { value, scale }) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    cv == *i as i128
+                } else {
+                    false // non-zero fractional part can't equal an integer
+                }
+            }
+            (Datum::Decimal { value, scale }, Datum::UnsignedInt(u))
+            | (Datum::UnsignedInt(u), Datum::Decimal { value, scale }) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    cv == *u as i128
+                } else {
+                    false
+                }
+            }
+            // Decimal vs Float: compare via f64 (same as Int vs Float)
+            (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+                match (self.as_float(), other.as_float()) {
+                    (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -397,6 +520,92 @@ impl Ord for Datum {
             (Datum::Int(a), Datum::Float(b)) => (*a as f64).total_cmp(b),
             (Datum::Float(a), Datum::Int(b)) => a.total_cmp(&(*b as f64)),
 
+            // Decimal ordering
+            (
+                Datum::Decimal {
+                    value: a,
+                    scale: sa,
+                },
+                Datum::Decimal {
+                    value: b,
+                    scale: sb,
+                },
+            ) => {
+                if sa == sb {
+                    a.cmp(b)
+                } else if sa < sb {
+                    let factor = 10i128.pow((*sb - *sa) as u32);
+                    match a.checked_mul(factor) {
+                        Some(a_scaled) => a_scaled.cmp(b),
+                        None => {
+                            // Overflow means |a| is huge; use sign to determine order
+                            if *a >= 0 {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                    }
+                } else {
+                    let factor = 10i128.pow((*sa - *sb) as u32);
+                    match b.checked_mul(factor) {
+                        Some(b_scaled) => a.cmp(&b_scaled),
+                        None => {
+                            if *b >= 0 {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
+                        }
+                    }
+                }
+            }
+            // Decimal vs Int: canonicalize, compare via i128
+            (Datum::Decimal { value, scale }, Datum::Int(i)) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    cv.cmp(&(*i as i128))
+                } else {
+                    // Has fractional part: compare with exact scaling
+                    let i_scaled = (*i as i128).wrapping_mul(10i128.pow(cs as u32));
+                    cv.cmp(&i_scaled)
+                }
+            }
+            (Datum::Int(i), Datum::Decimal { value, scale }) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    (*i as i128).cmp(&cv)
+                } else {
+                    let i_scaled = (*i as i128).wrapping_mul(10i128.pow(cs as u32));
+                    i_scaled.cmp(&cv)
+                }
+            }
+            (Datum::Decimal { value, scale }, Datum::UnsignedInt(u)) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    cv.cmp(&(*u as i128))
+                } else {
+                    let u_scaled = (*u as i128).wrapping_mul(10i128.pow(cs as u32));
+                    cv.cmp(&u_scaled)
+                }
+            }
+            (Datum::UnsignedInt(u), Datum::Decimal { value, scale }) => {
+                let (cv, cs) = canonical_decimal(*value, *scale);
+                if cs == 0 {
+                    (*u as i128).cmp(&cv)
+                } else {
+                    let u_scaled = (*u as i128).wrapping_mul(10i128.pow(cs as u32));
+                    u_scaled.cmp(&cv)
+                }
+            }
+            // Decimal vs Float: compare via f64
+            (Datum::Decimal { .. }, Datum::Float(_)) | (Datum::Float(_), Datum::Decimal { .. }) => {
+                match (self.as_float(), other.as_float()) {
+                    (Some(a), Some(b)) => a.total_cmp(&b),
+                    _ => self.type_tag().cmp(&other.type_tag()),
+                }
+            }
+
             // Different types: use type tag for stable ordering
             _ => self.type_tag().cmp(&other.type_tag()),
         }
@@ -435,6 +644,29 @@ impl Hash for Datum {
                 0u8.hash(state);
                 (*value as i64 as f64).to_bits().hash(state);
             }
+            Datum::Decimal { value, scale } => {
+                // Reduce to canonical form: strip trailing fractional zeros so that
+                // Decimal(12300, 2) and Decimal(123, 0) hash identically (both equal 123).
+                // This matches PartialEq which uses exact integer normalization.
+                let mut v = *value;
+                let mut s = *scale;
+                while s > 0 && v % 10 == 0 {
+                    v /= 10;
+                    s -= 1;
+                }
+                if s == 0 {
+                    // Integer-valued decimal: hash same as Int/Float for cross-type consistency
+                    // (Int uses 0u8 + (i as f64).to_bits(), and PartialEq for Decimal==Int
+                    // compares canonicalized value exactly)
+                    0u8.hash(state);
+                    (v as f64).to_bits().hash(state);
+                } else {
+                    // Fractional decimal: can't equal Int/UnsignedInt, use distinct tag
+                    11u8.hash(state);
+                    v.hash(state);
+                    s.hash(state);
+                }
+            }
             other => {
                 std::mem::discriminant(other).hash(state);
                 match other {
@@ -443,7 +675,11 @@ impl Hash for Datum {
                     Datum::String(s) => s.hash(state),
                     Datum::Bytes(b) => b.hash(state),
                     Datum::Timestamp(t) => t.hash(state),
-                    Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_) | Datum::Bit { .. } => {
+                    Datum::Int(_)
+                    | Datum::UnsignedInt(_)
+                    | Datum::Float(_)
+                    | Datum::Bit { .. }
+                    | Datum::Decimal { .. } => {
                         unreachable!()
                     }
                 }
@@ -709,6 +945,127 @@ mod tests {
         map2.insert(vec![Datum::Int(7)], "found");
         assert_eq!(
             map2.get(&vec![Datum::Bit { value: 7, width: 8 }]),
+            Some(&"found")
+        );
+    }
+
+    #[test]
+    fn test_format_decimal() {
+        assert_eq!(format_decimal(0, 0), "0");
+        assert_eq!(format_decimal(123, 0), "123");
+        assert_eq!(format_decimal(-5, 0), "-5");
+        assert_eq!(format_decimal(12345, 2), "123.45");
+        assert_eq!(format_decimal(-12345, 2), "-123.45");
+        assert_eq!(format_decimal(0, 3), "0.000");
+        assert_eq!(format_decimal(1, 3), "0.001");
+        assert_eq!(format_decimal(-1, 3), "-0.001");
+        assert_eq!(format_decimal(1, 10), "0.0000000001");
+    }
+
+    #[test]
+    fn test_datum_decimal_equality() {
+        // Same scale
+        assert_eq!(
+            Datum::Decimal {
+                value: 100,
+                scale: 2
+            },
+            Datum::Decimal {
+                value: 100,
+                scale: 2
+            }
+        );
+        // Different scale, same value: 1.00 == 1.0
+        assert_eq!(
+            Datum::Decimal {
+                value: 100,
+                scale: 2
+            },
+            Datum::Decimal {
+                value: 10,
+                scale: 1
+            }
+        );
+        // Decimal == Int: 5.0 == 5
+        assert_eq!(
+            Datum::Decimal {
+                value: 50,
+                scale: 1
+            },
+            Datum::Int(5)
+        );
+        // Decimal != Int when fractional
+        assert_ne!(
+            Datum::Decimal {
+                value: 51,
+                scale: 1
+            },
+            Datum::Int(5)
+        );
+    }
+
+    #[test]
+    fn test_datum_decimal_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn compute_hash(d: &Datum) -> u64 {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        }
+
+        // Decimal(100, 2) == Decimal(10, 1) must hash identically
+        let a = Datum::Decimal {
+            value: 100,
+            scale: 2,
+        };
+        let b = Datum::Decimal {
+            value: 10,
+            scale: 1,
+        };
+        assert_eq!(a, b);
+        assert_eq!(compute_hash(&a), compute_hash(&b));
+
+        // Decimal(50, 1) == Int(5): both hash consistently
+        let dec = Datum::Decimal {
+            value: 50,
+            scale: 1,
+        };
+        let int = Datum::Int(5);
+        assert_eq!(dec, int);
+        assert_eq!(compute_hash(&dec), compute_hash(&int));
+    }
+
+    #[test]
+    fn test_datum_decimal_hashmap_lookup() {
+        use std::collections::HashMap;
+
+        // Build with Decimal, probe with Int
+        let mut map: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map.insert(
+            vec![Datum::Decimal {
+                value: 420,
+                scale: 1,
+            }],
+            "found",
+        );
+        assert_eq!(map.get(&vec![Datum::Int(42)]), Some(&"found"));
+
+        // Build with Decimal at one scale, probe with another
+        let mut map2: HashMap<Vec<Datum>, &str> = HashMap::new();
+        map2.insert(
+            vec![Datum::Decimal {
+                value: 1000,
+                scale: 3,
+            }],
+            "found",
+        );
+        assert_eq!(
+            map2.get(&vec![Datum::Decimal {
+                value: 10,
+                scale: 1
+            }]),
             Some(&"found")
         );
     }

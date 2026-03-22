@@ -275,6 +275,10 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
         Datum::Bytes(b) => val(Value::HexStringLiteral(hex::encode(b))),
         Datum::Bit { value, .. } => val(Value::Number(value.to_string(), false)),
         Datum::Timestamp(ts) => val(Value::Number(ts.to_string(), false)),
+        Datum::Decimal { value, scale } => {
+            let s = crate::executor::datum::format_decimal(*value, *scale);
+            val(Value::Number(s, false))
+        }
     }
 }
 

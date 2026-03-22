@@ -127,6 +127,7 @@ const TAG_BYTES: u8 = 5;
 const TAG_TIMESTAMP: u8 = 6;
 const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
+const TAG_DECIMAL: u8 = 9;
 
 /// Encode a row value
 ///
@@ -189,6 +190,11 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
         Datum::Timestamp(t) => {
             buf.push(TAG_TIMESTAMP);
             buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Datum::Decimal { value, scale } => {
+            buf.push(TAG_DECIMAL);
+            buf.push(*scale);
+            buf.extend_from_slice(&value.to_le_bytes());
         }
     }
 }
@@ -335,6 +341,21 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             Ok((Datum::Timestamp(t), 9))
         }
 
+        TAG_DECIMAL => {
+            if data.len() < 18 {
+                return Err(ExecutorError::Encoding(
+                    "decimal data too short".to_string(),
+                ));
+            }
+            let scale = data[1];
+            let value = i128::from_le_bytes(
+                data[2..18]
+                    .try_into()
+                    .expect("length checked: slice is 16 bytes"),
+            );
+            Ok((Datum::Decimal { value, scale }, 18))
+        }
+
         _ => Err(ExecutorError::Encoding(format!(
             "unknown datum tag: {}",
             tag
@@ -451,6 +472,52 @@ mod tests {
                     assert_eq!(ow, rw, "width mismatch");
                 }
                 _ => panic!("expected Bit, got {:?}", result),
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_decimal() {
+        let test_cases = vec![
+            Datum::Decimal { value: 0, scale: 0 },
+            Datum::Decimal {
+                value: 12345,
+                scale: 2,
+            },
+            Datum::Decimal {
+                value: -99999,
+                scale: 3,
+            },
+            Datum::Decimal {
+                value: i128::MAX,
+                scale: 0,
+            },
+            Datum::Decimal {
+                value: i128::MIN,
+                scale: 10,
+            },
+        ];
+
+        for original in &test_cases {
+            let row = Row::new(vec![original.clone()]);
+            let encoded = encode_row(&row);
+            let decoded = decode_row(&encoded).unwrap();
+            let result = decoded.get(0).unwrap();
+            match (original, result) {
+                (
+                    Datum::Decimal {
+                        value: ov,
+                        scale: os,
+                    },
+                    Datum::Decimal {
+                        value: rv,
+                        scale: rs,
+                    },
+                ) => {
+                    assert_eq!(ov, rv, "value mismatch");
+                    assert_eq!(os, rs, "scale mismatch");
+                }
+                _ => panic!("expected Decimal, got {:?}", result),
             }
         }
     }

@@ -101,6 +101,15 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             // Encode as MySQL binary datetime: length-prefixed fields
             encode_binary_timestamp(*ts)
         }
+
+        Datum::Decimal { value, scale } => {
+            // Encode as length-encoded string (MySQL sends DECIMAL as string in binary protocol)
+            let s = crate::executor::datum::format_decimal(*value, *scale);
+            let bytes = s.as_bytes();
+            let mut out = encode_length_encoded_int(bytes.len() as u64);
+            out.extend_from_slice(bytes);
+            out
+        }
     }
 }
 
