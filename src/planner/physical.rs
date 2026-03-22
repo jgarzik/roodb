@@ -162,6 +162,19 @@ pub enum PhysicalPlan {
     /// DROP TABLE t1, t2, t3 (multiple tables)
     DropMultipleTables { names: Vec<String>, if_exists: bool },
 
+    /// Materialized derived table (subquery in FROM)
+    Materialize { input: Box<PhysicalPlan> },
+
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
+
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -302,6 +315,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { input, .. } => input.output_columns(),
             PhysicalPlan::Limit { input, .. } => input.output_columns(),
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
+            PhysicalPlan::Materialize { input } => input.output_columns(),
             PhysicalPlan::SingleRow => vec![],
 
             // DML/DDL operations don't produce query output
@@ -310,6 +324,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::CreateTableAs { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
@@ -525,9 +541,14 @@ impl PhysicalPlan {
             PhysicalPlan::CreateTableAs { source, .. } => {
                 source.substitute_params(params)?;
             }
+            PhysicalPlan::Materialize { input } => {
+                input.substitute_params(params)?;
+            }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
             | PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
@@ -1182,6 +1203,27 @@ impl PhysicalPlanner {
                     if_not_exists,
                     source: Box::new(source_plan),
                 })
+            }
+
+            LogicalPlan::DerivedTable { input, .. } => {
+                let inner = Self::plan_node(*input, catalog)?;
+                Ok(PhysicalPlan::Materialize {
+                    input: Box::new(inner),
+                })
+            }
+
+            LogicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            } => Ok(PhysicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            }),
+
+            LogicalPlan::DropView { name, if_exists } => {
+                Ok(PhysicalPlan::DropView { name, if_exists })
             }
 
             LogicalPlan::DropTable { name, if_exists } => {

@@ -66,6 +66,18 @@ impl<'a> Resolver<'a> {
             sp::Statement::Delete(delete) => self.resolve_delete(&delete),
             sp::Statement::Query(query) => self.resolve_query(&query),
 
+            // CREATE VIEW
+            sp::Statement::CreateView(cv) => {
+                let name = cv.name.to_string();
+                let or_replace = cv.or_replace;
+                let query_sql = cv.query.to_string();
+                Ok(ResolvedStatement::CreateView {
+                    name,
+                    query_sql,
+                    or_replace,
+                })
+            }
+
             // Auth statements
             sp::Statement::CreateRole(create_role) => self.resolve_create_user(
                 &create_role.names,
@@ -214,7 +226,8 @@ impl<'a> Resolver<'a> {
         let name = names[0].to_string();
 
         match object_type {
-            sp::ObjectType::Table | sp::ObjectType::View => {
+            sp::ObjectType::View => Ok(ResolvedStatement::DropView { name, if_exists }),
+            sp::ObjectType::Table => {
                 if names.len() > 1 {
                     // Multi-table DROP: DROP TABLE t1, t2, t3
                     let table_names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
@@ -579,21 +592,25 @@ impl<'a> Resolver<'a> {
             // Need to create scope from the resolved tables
             let mut scope = Scope::new();
             for table_ref in &result.from {
-                if let Some(table_def) = self.catalog.get_table(&table_ref.name) {
-                    let alias = table_ref
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| table_ref.name.clone());
+                let alias = table_ref
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| table_ref.name.clone());
+                if table_ref.inner_query.is_some() {
+                    scope.add_derived_table(&alias, &table_ref.columns);
+                } else if let Some(table_def) = self.catalog.get_table(&table_ref.name) {
                     scope.add_table(&alias, &table_ref.name, table_def);
                 }
             }
             for join in &result.joins {
-                if let Some(table_def) = self.catalog.get_table(&join.table.name) {
-                    let alias = join
-                        .table
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| join.table.name.clone());
+                let alias = join
+                    .table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| join.table.name.clone());
+                if join.table.inner_query.is_some() {
+                    scope.add_derived_table(&alias, &join.table.columns);
+                } else if let Some(table_def) = self.catalog.get_table(&join.table.name) {
                     scope.add_table(&alias, &join.table.name, table_def);
                 }
             }
@@ -663,16 +680,21 @@ impl<'a> Resolver<'a> {
 
                 for table in &select.from {
                     let table_ref = self.resolve_table_factor(&table.relation)?;
-                    let table_def = self
-                        .catalog
-                        .get_table(&table_ref.name)
-                        .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
-
                     let alias = table_ref
                         .alias
                         .clone()
                         .unwrap_or_else(|| table_ref.name.clone());
-                    scope.add_table(&alias, &table_ref.name, table_def);
+
+                    if table_ref.inner_query.is_some() {
+                        // Derived table or view — add columns directly to scope
+                        scope.add_derived_table(&alias, &table_ref.columns);
+                    } else {
+                        let table_def = self
+                            .catalog
+                            .get_table(&table_ref.name)
+                            .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+                        scope.add_table(&alias, &table_ref.name, table_def);
+                    }
                 }
 
                 // Build resolved from list first
@@ -799,19 +821,97 @@ impl<'a> Resolver<'a> {
         match table {
             sp::TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
-                let table_def = self
-                    .catalog
-                    .get_table(&table_name)
-                    .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
+                // Check physical table first
+                if let Some(table_def) = self.catalog.get_table(&table_name) {
+                    return Ok(ResolvedTableRef {
+                        name: table_name,
+                        alias: alias.as_ref().map(|a| a.name.value.clone()),
+                        columns: table_def
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                            .collect(),
+                        inner_query: None,
+                    });
+                }
+
+                // Fall back to view — expand view query as a derived table
+                if let Some(view_def) = self.catalog.get_view(&table_name) {
+                    let view_sql = view_def.query_sql.clone();
+                    let view_stmt = crate::sql::Parser::parse_one(&view_sql).map_err(|e| {
+                        SqlError::Parse(format!("Invalid view '{}': {}", table_name, e))
+                    })?;
+                    if let sp::Statement::Query(query) = view_stmt {
+                        let inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        let columns: Vec<(String, DataType, bool)> = inner_select
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(idx, item)| match item {
+                                ResolvedSelectItem::Columns(cols) => cols
+                                    .iter()
+                                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                                    .collect::<Vec<_>>(),
+                                ResolvedSelectItem::Expr { expr, alias: a } => {
+                                    let name = a.clone().unwrap_or_else(|| {
+                                        crate::planner::logical::builder::LogicalPlanBuilder::expr_name(expr, idx)
+                                    });
+                                    vec![(name, expr.data_type(), expr.is_nullable())]
+                                }
+                            })
+                            .collect();
+                        let effective_alias = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| table_name.clone());
+                        return Ok(ResolvedTableRef {
+                            name: table_name,
+                            alias: Some(effective_alias),
+                            columns,
+                            inner_query: Some(Box::new(inner_select)),
+                        });
+                    }
+                }
+
+                Err(SqlError::TableNotFound(table_name))
+            }
+            // Derived table (subquery in FROM clause)
+            sp::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let alias_name = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .ok_or_else(|| {
+                        SqlError::Parse("Derived table must have an alias".to_string())
+                    })?;
+                let inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                // Derive columns from the inner query's SELECT list
+                let columns: Vec<(String, DataType, bool)> = inner_select
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(idx, item)| match item {
+                        ResolvedSelectItem::Columns(cols) => cols
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                            .collect::<Vec<_>>(),
+                        ResolvedSelectItem::Expr { expr, alias } => {
+                            let name = alias.clone().unwrap_or_else(|| {
+                                crate::planner::logical::builder::LogicalPlanBuilder::expr_name(
+                                    expr, idx,
+                                )
+                            });
+                            vec![(name, expr.data_type(), expr.is_nullable())]
+                        }
+                    })
+                    .collect();
                 Ok(ResolvedTableRef {
-                    name: table_name,
-                    alias: alias.as_ref().map(|a| a.name.value.clone()),
-                    columns: table_def
-                        .columns
-                        .iter()
-                        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-                        .collect(),
+                    name: alias_name.clone(),
+                    alias: Some(alias_name),
+                    columns,
+                    inner_query: Some(Box::new(inner_select)),
                 })
             }
             _ => Err(SqlError::Unsupported("Complex table reference".to_string())),
@@ -1607,6 +1707,23 @@ impl Scope {
                     .iter()
                     .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
                     .collect(),
+                column_offset,
+            },
+        );
+
+        self.table_order.push((alias.to_lowercase(), column_offset));
+        self.total_columns += num_columns;
+    }
+
+    /// Add a derived table (subquery or view) to scope using pre-computed columns
+    fn add_derived_table(&mut self, alias: &str, columns: &[(String, DataType, bool)]) {
+        let column_offset = self.total_columns;
+        let num_columns = columns.len();
+
+        self.tables.insert(
+            alias.to_lowercase(),
+            TableInfo {
+                columns: columns.to_vec(),
                 column_offset,
             },
         );

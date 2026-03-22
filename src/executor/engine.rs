@@ -17,8 +17,8 @@ use super::analyze::AnalyzeTable;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
 use super::ddl::{
-    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, DropDatabase,
-    DropIndex, DropTable,
+    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, CreateView,
+    DropDatabase, DropIndex, DropTable, DropView, Materialize,
 };
 use super::delete::Delete;
 use super::distinct::HashDistinct;
@@ -334,6 +334,28 @@ impl ExecutorEngine {
                     txn_context: self.txn_context.clone(),
                 })))
             }
+
+            PhysicalPlan::Materialize { input } => {
+                let inner = self.build_node(*input)?;
+                Ok(Box::new(Materialize::new(inner)))
+            }
+
+            PhysicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            } => Ok(Box::new(CreateView::new(
+                name,
+                query_sql,
+                or_replace,
+                self.catalog.clone(),
+            ))),
+
+            PhysicalPlan::DropView { name, if_exists } => Ok(Box::new(DropView::new(
+                name,
+                if_exists,
+                self.catalog.clone(),
+            ))),
 
             PhysicalPlan::DropTable { name, if_exists } => {
                 if let Some(ref raft_node) = self.raft_node {

@@ -1272,8 +1272,13 @@ where
             ResolvedStatement::Delete { table, .. } => {
                 vec![RequiredPrivilege::delete(db, table)]
             }
-            ResolvedStatement::CreateTable { .. } | ResolvedStatement::CreateTableAs { .. } => {
+            ResolvedStatement::CreateTable { .. }
+            | ResolvedStatement::CreateTableAs { .. }
+            | ResolvedStatement::CreateView { .. } => {
                 vec![RequiredPrivilege::create_table(db)]
+            }
+            ResolvedStatement::DropView { .. } => {
+                vec![] // Views don't need special privileges
             }
             ResolvedStatement::DropTable { name, .. } => {
                 vec![RequiredPrivilege::drop_table(db, name)]

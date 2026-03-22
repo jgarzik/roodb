@@ -78,6 +78,18 @@ impl LogicalPlanBuilder {
             ResolvedStatement::DropTable { name, if_exists } => {
                 Ok(LogicalPlan::DropTable { name, if_exists })
             }
+            ResolvedStatement::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            } => Ok(LogicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            }),
+            ResolvedStatement::DropView { name, if_exists } => {
+                Ok(LogicalPlan::DropView { name, if_exists })
+            }
             // Multi-table DROP: plan as first table, remaining handled by executor
             ResolvedStatement::DropMultipleTables { names, if_exists } => {
                 // Build first drop; executor will handle all of them
@@ -287,12 +299,10 @@ impl LogicalPlanBuilder {
             return Ok(LogicalPlan::SingleRow);
         }
 
-        // Create scan for first table
-        let mut plan = Self::table_scan(&tables[0]);
+        let mut plan = Self::build_table_source(&tables[0])?;
 
-        // Cross join with remaining tables
         for table in &tables[1..] {
-            let right = Self::table_scan(table);
+            let right = Self::build_table_source(table)?;
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -302,6 +312,20 @@ impl LogicalPlanBuilder {
         }
 
         Ok(plan)
+    }
+
+    /// Build a plan node for a single table source (physical table or derived table)
+    fn build_table_source(table: &ResolvedTableRef) -> PlannerResult<LogicalPlan> {
+        if let Some(inner_query) = &table.inner_query {
+            let alias = table.alias.clone().unwrap_or_else(|| table.name.clone());
+            let inner_plan = Self::build_select(*inner_query.clone())?;
+            Ok(LogicalPlan::DerivedTable {
+                input: Box::new(inner_plan),
+                alias,
+            })
+        } else {
+            Ok(Self::table_scan(table))
+        }
     }
 
     /// Create a table scan node

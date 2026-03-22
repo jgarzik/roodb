@@ -247,6 +247,13 @@ pub struct ProcedureDef {
     pub body_sql: String,
 }
 
+/// View definition
+#[derive(Debug, Clone)]
+pub struct ViewDef {
+    pub name: String,
+    pub query_sql: String,
+}
+
 /// Catalog error
 #[derive(Debug, Clone)]
 pub enum CatalogError {
@@ -268,6 +275,10 @@ pub enum CatalogError {
     ProcedureExists(String),
     /// Procedure not found
     ProcedureNotFound(String),
+    /// View already exists
+    ViewExists(String),
+    /// View not found
+    ViewNotFound(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -287,6 +298,12 @@ impl std::fmt::Display for CatalogError {
             }
             CatalogError::ProcedureNotFound(name) => {
                 write!(f, "Procedure '{}' not found", name)
+            }
+            CatalogError::ViewExists(name) => {
+                write!(f, "View '{}' already exists", name)
+            }
+            CatalogError::ViewNotFound(name) => {
+                write!(f, "View '{}' not found", name)
             }
         }
     }
@@ -334,6 +351,8 @@ pub struct Catalog {
     databases: HashSet<String>,
     /// Stored procedures by name
     procedures: HashMap<String, ProcedureDef>,
+    /// Views by name
+    views: HashMap<String, ViewDef>,
 }
 
 impl Catalog {
@@ -347,6 +366,7 @@ impl Catalog {
             schema_version: 0,
             databases,
             procedures: HashMap::new(),
+            views: HashMap::new(),
         }
     }
 
@@ -615,6 +635,43 @@ impl Catalog {
     /// Clear all procedures (for re-initialization)
     pub fn clear_procedures(&mut self) {
         self.procedures.clear();
+    }
+
+    // ============ View operations ============
+
+    /// Create a view
+    pub fn create_view(&mut self, def: ViewDef) -> CatalogResult<()> {
+        if self.views.contains_key(&def.name) {
+            return Err(CatalogError::ViewExists(def.name.clone()));
+        }
+        self.views.insert(def.name.clone(), def);
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Create or replace a view
+    pub fn replace_view(&mut self, def: ViewDef) {
+        self.views.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// Drop a view
+    pub fn drop_view(&mut self, name: &str, if_exists: bool) -> CatalogResult<()> {
+        if self.views.remove(name).is_none() && !if_exists {
+            return Err(CatalogError::ViewNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get a view definition
+    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(name)
+    }
+
+    /// Check if a view exists
+    pub fn view_exists(&self, name: &str) -> bool {
+        self.views.contains_key(name)
     }
 }
 

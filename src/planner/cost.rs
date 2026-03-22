@@ -184,6 +184,9 @@ impl CostEstimator {
 
             PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::CreateTableAs { .. }
+            | PhysicalPlan::Materialize { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }

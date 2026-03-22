@@ -245,6 +245,9 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
         // DDL, Auth, Analyze — no EXPLAIN rows
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::CreateTableAs { .. }
+        | PhysicalPlan::Materialize { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::DropMultipleTables { .. }
         | PhysicalPlan::CreateIndex { .. }

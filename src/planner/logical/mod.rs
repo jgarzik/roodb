@@ -255,6 +255,8 @@ pub struct ResolvedTableRef {
     pub name: String,
     pub alias: Option<String>,
     pub columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
+    /// Set for derived tables (subquery in FROM) and view expansions
+    pub inner_query: Option<Box<ResolvedSelect>>,
 }
 
 /// Resolved ORDER BY item
@@ -401,6 +403,14 @@ pub enum ResolvedStatement {
     AnalyzeTable { table: String },
     /// EXPLAIN statement
     Explain { inner: Box<ResolvedStatement> },
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
 }
 
 /// Logical plan node
@@ -462,6 +472,12 @@ pub enum LogicalPlan {
 
     /// Single empty row (TABLE_DEE - for expression-only queries)
     SingleRow,
+
+    /// Derived table (subquery in FROM) — materializes inner plan
+    DerivedTable {
+        input: Box<LogicalPlan>,
+        alias: String,
+    },
 
     // ============ DML Operations ============
     /// INSERT rows into a table
@@ -525,6 +541,16 @@ pub enum LogicalPlan {
 
     /// DROP DATABASE
     DropDatabase { name: String, if_exists: bool },
+
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
 
     // ============ Auth Operations ============
     /// CREATE USER
@@ -645,6 +671,7 @@ impl LogicalPlan {
             LogicalPlan::Limit { input, .. } => input.output_columns(),
             LogicalPlan::Distinct { input } => input.output_columns(),
             LogicalPlan::SingleRow => vec![],
+            LogicalPlan::DerivedTable { input, .. } => input.output_columns(),
 
             // DML operations don't produce output columns for query purposes
             LogicalPlan::Insert { .. }
@@ -659,7 +686,9 @@ impl LogicalPlan {
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateDatabase { .. }
-            | LogicalPlan::DropDatabase { .. } => vec![],
+            | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::CreateView { .. }
+            | LogicalPlan::DropView { .. } => vec![],
 
             // Auth operations don't produce output columns (except ShowGrants which returns rows)
             LogicalPlan::CreateUser { .. }

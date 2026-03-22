@@ -34,6 +34,7 @@ impl TypeChecker {
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
             ResolvedStatement::CreateTableAs { select, .. } => Self::check_select(select),
+            ResolvedStatement::CreateView { .. } | ResolvedStatement::DropView { .. } => Ok(()),
 
             // Database DDL doesn't need type checking
             ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {

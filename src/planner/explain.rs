@@ -234,6 +234,16 @@ impl ExplainOutput {
             PhysicalPlan::DropIndex { name } => {
                 writeln!(out, "{}DropIndex: {}", prefix, name).unwrap();
             }
+            PhysicalPlan::Materialize { input } => {
+                writeln!(out, "{}Materialize", prefix).unwrap();
+                Self::format_node(input, indent + 1, out);
+            }
+            PhysicalPlan::CreateView { name, .. } => {
+                writeln!(out, "{}CreateView: {}", prefix, name).unwrap();
+            }
+            PhysicalPlan::DropView { name, .. } => {
+                writeln!(out, "{}DropView: {}", prefix, name).unwrap();
+            }
 
             PhysicalPlan::CreateUser { username, host, .. } => {
                 writeln!(out, "{}CreateUser: {}@{}", prefix, username, host.as_str()).unwrap();

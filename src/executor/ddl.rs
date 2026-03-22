@@ -1166,6 +1166,159 @@ impl Executor for CreateTableAs {
     }
 }
 
+// ============ Materialize (derived table) ============
+
+/// Materialize executor — eagerly materializes all rows from input on open(),
+/// then streams them from memory on subsequent next() calls.
+/// Used for derived tables (subquery in FROM clause).
+pub struct Materialize {
+    input: Box<dyn Executor>,
+    rows: Vec<Row>,
+    position: usize,
+}
+
+impl Materialize {
+    pub fn new(input: Box<dyn Executor>) -> Self {
+        Materialize {
+            input,
+            rows: Vec::new(),
+            position: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for Materialize {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.rows.clear();
+        self.position = 0;
+        self.input.open().await?;
+        while let Some(row) = self.input.next().await? {
+            self.rows.push(row);
+        }
+        self.input.close().await?;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.position >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.position].clone();
+        self.position += 1;
+        Ok(Some(row))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        self.rows.clear();
+        self.position = 0;
+        Ok(())
+    }
+}
+
+// ============ CREATE VIEW / DROP VIEW ============
+
+/// CREATE VIEW executor
+pub struct CreateView {
+    name: String,
+    query_sql: String,
+    or_replace: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    done: bool,
+}
+
+impl CreateView {
+    pub fn new(
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+        catalog: Arc<RwLock<Catalog>>,
+    ) -> Self {
+        CreateView {
+            name,
+            query_sql,
+            or_replace,
+            catalog,
+            done: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for CreateView {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        let view_def = crate::catalog::ViewDef {
+            name: self.name.clone(),
+            query_sql: self.query_sql.clone(),
+        };
+        let mut catalog = self.catalog.write();
+        if self.or_replace {
+            catalog.replace_view(view_def);
+        } else {
+            catalog
+                .create_view(view_def)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+}
+
+/// DROP VIEW executor
+pub struct DropView {
+    name: String,
+    if_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    done: bool,
+}
+
+impl DropView {
+    pub fn new(name: String, if_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        DropView {
+            name,
+            if_exists,
+            catalog,
+            done: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for DropView {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut catalog = self.catalog.write();
+        catalog
+            .drop_view(&self.name, self.if_exists)
+            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
