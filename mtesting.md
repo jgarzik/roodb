@@ -44,27 +44,52 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 ### Tier 1 — 3/6 pass
 
-| Test | Status | Blocking Feature |
-|------|--------|-----------------|
-| func_op | **PASS** | — |
-| bool | **PASS** | — |
-| type_uint | **PASS** | — |
-| compare | FAIL | Correlated scalar subqueries (line 72) |
-| comments | FAIL | SQL-level PREPARE stmt + unclosed comment validation |
-| func_equal | FAIL | CREATE TRIGGER (line 56) |
+| Test | Status | Fail Line | Blocking Feature |
+|------|--------|-----------|-----------------|
+| func_op | **PASS** | — | — |
+| bool | **PASS** | — | — |
+| type_uint | **PASS** | — | — |
+| compare | FAIL | 72 | Correlated scalar subqueries |
+| comments | FAIL | 51 | PREPARE should reject unclosed comments |
+| func_equal | FAIL | 56 | CREATE TRIGGER |
 
-### Tier 2 — 0/8 pass (no recorded baselines yet)
+### Tier 2 — 0/8 pass
 
-| Test | Status | Blocking Feature | Lines Passed |
-|------|--------|-----------------|-------------|
-| bigint | FAIL | mysqltest WHILE loop control flow | ~350/500 |
-| null | FAIL | NOT NULL constraint on expr results | ~70/324 |
-| limit | FAIL | Parenthesized query expressions | ~15/448 |
-| case | FAIL | Charset introducers (_latin1), COLLATE | ~74/396 |
-| type_varchar | FAIL | PAD SPACE collation, ALTER TABLE | ~20/176 |
-| type_ranges | FAIL | ENUM, SET, display widths, many types | ~58/173 |
-| func_isnull | FAIL | ISNULL(), GET_LOCK(), subqueries | ~25/170 |
-| type_binary | FAIL | --replace_result mysqltest directive | ~23/198 |
+| Test | Status | Fail Line / Total | Blocking Feature |
+|------|--------|-------------------|-----------------|
+| bigint | FAIL | 361/502 (72%) | mysqltest WHILE loop / HEX() edge case |
+| null | FAIL | 113/324 (35%) | INSERT ... SELECT (INSERT-SELECT) |
+| limit | FAIL | 42/448 (9%) | UNION queries |
+| case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
+| type_varchar | FAIL | 21/176 (12%) | Duplicate key check on ALTER TABLE ADD PK |
+| type_ranges | FAIL | 59/173 (34%) | ENUM, SET types in INSERT |
+| func_isnull | FAIL | 26/170 (15%) | GET_LOCK() function, subqueries |
+| type_binary | FAIL | 42/198 (21%) | Duplicate key check on INSERT |
+
+### Tier 3 — 0/10 pass
+
+| Test | Status | Fail Line / Total | Blocking Feature |
+|------|--------|-------------------|-----------------|
+| type_float | FAIL | 130/504 (26%) | CREATE TABLE AS SELECT + UNION |
+| type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
+| func_math | FAIL | 327/1271 (26%) | DIV overflow check (error 1690) |
+| delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
+| func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
+| func_test | FAIL | 28/483 (6%) | Large unsigned integer literal parsing |
+| cast | FAIL | 63/1148 (5%) | Charset introducers (_latin1), CAST with charset |
+| type_year | FAIL | 21/~200 (11%) | NOW() in INSERT with non-timestamp column |
+| type_enum | FAIL | 13/~400 (3%) | ENUM type DDL: CREATE TABLE with ENUM |
+| type_decimal | ERROR | — | Test infrastructure error |
+
+### Tier 4 — 0/5 pass
+
+| Test | Status | Fail Line / Total | Blocking Feature |
+|------|--------|-------------------|-----------------|
+| func_if | FAIL | 61/301 (20%) | IF() with mixed aggregate/non-aggregate |
+| insert | FAIL | 29/1077 (3%) | INSERT expression referencing same table cols |
+| update | FAIL | 45/780 (6%) | INSERT with many columns |
+| func_str | FAIL | 18/2630 (1%) | BIT_LENGTH() function |
+| func_concat | FAIL | 16/153 (10%) | CONCAT_WS with mixed types |
 
 ### Custom Tests — 22/22 pass
 
@@ -72,9 +97,15 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Feature | Description |
 |---------|-------------|
+| Full ALTER TABLE | ADD/DROP/MODIFY/CHANGE COLUMN, ADD/DROP PK/FK/INDEX, RENAME, Raft persistence |
+| Lazy row padding | TableScan pads rows with defaults after ALTER TABLE ADD COLUMN |
+| NOT NULL enforcement | Error 1048 for NULL into NOT NULL; multi-row converts to default |
+| Parenthesized queries | `(SELECT ... LIMIT n) ORDER BY ... LIMIT m` |
+| ORDER BY aliases | SELECT aliases usable in ORDER BY clause |
+| DDL type validation | FLOAT precision, CHAR/VARCHAR length limits, TEXT promotion |
 | Conditional comments | `/*!NNNNN code*/` pre-processing with version check |
 | Post-aggregate arithmetic | `max(x)-1` rewrites aggregate refs in expression trees |
-| System variable prefixes | `@@global.var`, `@@session.var` parsed; added default_storage_engine |
+| System variable prefixes | `@@global.var`, `@@session.var` parsed |
 | Infix MOD operator | `expr MOD expr` works for any expression type |
 | Native DECIMAL | `DECIMAL(M,D)` with i128 exact arithmetic (38-digit precision) |
 | Shift operators | `<<`, `>>` bitwise shifts |
@@ -83,31 +114,34 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | String→number coercion | Implicit conversion in arithmetic contexts |
 | BIGINT UNSIGNED | Full u64 range support |
 
-## Gap Analysis
+## Gap Analysis — Next Steps
 
-### Quick Fixes
-- NOT NULL constraint enforcement on expression results
-- ISNULL() function (alias for expr IS NULL)
+### Quick Wins (unblocks most test progress)
+- UNION queries (blocks limit, type_float)
+- INSERT ... SELECT (blocks null at line 113)
+- Duplicate key enforcement (blocks type_varchar, type_binary)
+- BIT_LENGTH() function (blocks func_str)
+- CONCAT_WS with mixed types (blocks func_concat)
 
 ### Medium Features
-- PAD SPACE comparison for varchar
-- Parenthesized query expressions `(SELECT ...) ORDER BY`
-- SQL-level PREPARE/EXECUTE/DEALLOCATE
-- ALTER TABLE (ADD COLUMN, MODIFY, ADD KEY, ADD PRIMARY KEY)
+- CREATE TABLE AS SELECT (blocks type_float)
+- Multi-table DELETE syntax (blocks delete)
+- PREPARE validation of SQL syntax (blocks comments)
+- GET_LOCK()/RELEASE_LOCK() stub functions (blocks func_isnull)
+- Large unsigned integer literal parsing (blocks func_test)
 
-### Large Features
-- Scalar/correlated subqueries
-- CREATE TRIGGER / trigger execution
-- Charset introducers (`_latin1'...'`) and COLLATE
-- ENUM and SET types
-- REGEXP operator
+### Large Features (complex implementation)
+- Scalar/correlated subqueries (blocks compare)
+- CREATE TRIGGER / trigger execution (blocks func_equal)
+- Charset introducers (`_latin1'...'`) and COLLATE (blocks case, cast)
+- ENUM and SET types (blocks type_ranges, type_enum)
 
 ## Architecture
 
 1. `run_mtr_tests.py` generates self-signed TLS certs in a temp directory
 2. Initializes a fresh RooDB database with `roodb_init`
 3. Starts `roodb` server on port 13309
-4. For each test: resets the `test` database, runs `mysqltest` with the `.test` file
+4. For each test: resets the `test` database, runs `mysqltest` via `--test-file`
 5. `mysqltest` compares output against recorded `.result` file (or records with `--record`)
 6. Server is stopped after all tests complete
 
