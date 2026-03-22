@@ -2526,9 +2526,8 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
                 Ok(t1)
             }
         }
-        "CONCAT" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "SUBSTRING" | "SUBSTR" => {
-            Ok(DataType::Text)
-        }
+        "CONCAT" | "CONCAT_WS" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "SUBSTRING"
+        | "SUBSTR" => Ok(DataType::Text),
         "LENGTH" | "CHAR_LENGTH" => Ok(DataType::BigInt),
         "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" => {
             if args.is_empty() {

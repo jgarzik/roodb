@@ -1561,6 +1561,26 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
         }
 
+        "CONCAT_WS" => {
+            // CONCAT_WS(separator, str1, str2, ...)
+            // NULL separator → NULL; NULL arguments are skipped
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "CONCAT_WS requires at least 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let sep = args[0].to_display_string();
+            let parts: Vec<String> = args[1..]
+                .iter()
+                .filter(|a| !a.is_null())
+                .map(|a| a.to_display_string())
+                .collect();
+            Ok(Datum::String(parts.join(&sep)))
+        }
+
         "COALESCE" => {
             for arg in args {
                 if !arg.is_null() {
@@ -2235,6 +2255,34 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 "{:o}",
                 args[0].as_int().unwrap_or(0)
             )))
+        }
+
+        "BIT_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "BIT_LENGTH requires 1 argument".to_string(),
+                ));
+            }
+            match &args[0] {
+                Datum::Null => Ok(Datum::Null),
+                Datum::String(s) => Ok(Datum::Int(s.len() as i64 * 8)),
+                Datum::Bytes(b) => Ok(Datum::Int(b.len() as i64 * 8)),
+                other => Ok(Datum::Int(other.to_display_string().len() as i64 * 8)),
+            }
+        }
+
+        "OCTET_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "OCTET_LENGTH requires 1 argument".to_string(),
+                ));
+            }
+            match &args[0] {
+                Datum::Null => Ok(Datum::Null),
+                Datum::String(s) => Ok(Datum::Int(s.len() as i64)),
+                Datum::Bytes(b) => Ok(Datum::Int(b.len() as i64)),
+                other => Ok(Datum::Int(other.to_display_string().len() as i64)),
+            }
         }
 
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
