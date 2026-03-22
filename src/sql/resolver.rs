@@ -294,7 +294,18 @@ impl<'a> Resolver<'a> {
         }
 
         // Build column list (explicit or all columns)
-        let specified_columns: Vec<String> = if insert.columns.is_empty() {
+        // Check for INSERT INTO t1 () VALUES () — empty column list means use all defaults
+        let values_rows_ref = match insert.source.as_ref().map(|s| s.body.as_ref()) {
+            Some(sp::SetExpr::Values(sp::Values { rows, .. })) => rows,
+            _ => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
+        };
+        let is_empty_insert =
+            insert.columns.is_empty() && values_rows_ref.first().is_some_and(|row| row.is_empty());
+
+        let specified_columns: Vec<String> = if is_empty_insert {
+            // INSERT INTO t1 () VALUES () — no columns specified, use defaults
+            Vec::new()
+        } else if insert.columns.is_empty() {
             table_def.columns.iter().map(|c| c.name.clone()).collect()
         } else {
             insert.columns.iter().map(|c| c.value.clone()).collect()
@@ -333,15 +344,9 @@ impl<'a> Resolver<'a> {
             });
         }
 
-        // Parse values
-        let values_rows = match insert.source.as_ref().map(|s| s.body.as_ref()) {
-            Some(sp::SetExpr::Values(sp::Values { rows, .. })) => rows,
-            _ => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
-        };
-
         // Resolve values - expand to full rows
         let mut resolved_values = Vec::new();
-        for row in values_rows {
+        for row in values_rows_ref {
             if row.len() != specified_columns.len() {
                 return Err(SqlError::InvalidOperation(format!(
                     "INSERT has {} columns but {} values",
@@ -358,7 +363,7 @@ impl<'a> Resolver<'a> {
                 .collect();
 
             // Fill in the specified values at their correct positions
-            let is_multi_row = values_rows.len() > 1;
+            let is_multi_row = values_rows_ref.len() > 1;
             for (value_idx, expr) in row.iter().enumerate() {
                 let (col_idx, nullable, col_name) = &column_indices[value_idx];
                 let resolved_expr = self.resolve_expr(expr, &scope)?;
