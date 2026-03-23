@@ -108,7 +108,7 @@ async fn test_select_expression() {
         .expect("INSERT failed");
 
     // Select with arithmetic expressions
-    // Note: MySQL-style division (int/int) returns float, so a/b = 2.0
+    // MySQL-style division (int/int) returns float; wire format drops ".0" for integer-valued floats
     let rows: Vec<(i32, i32, i32, String)> = conn
         .query("SELECT a + b, a - b, a * b, a / b FROM select_expr_tbl")
         .await
