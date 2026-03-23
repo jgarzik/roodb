@@ -70,7 +70,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Test | Status | Fail Line / Total | Blocking Feature |
 |------|--------|-------------------|-----------------|
-| type_float | FAIL | 242/504 (48%) | Scientific notation in expressions (f1 + 0e0) |
+| type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
 | func_math | FAIL | 637/1271 (50%) | weight_string(_eucjpms) charset function |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |

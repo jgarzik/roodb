@@ -388,4 +388,13 @@ mod tests {
         .unwrap();
         assert!(matches!(stmt, sp::Statement::Query(_)));
     }
+
+    #[test]
+    fn test_parse_scientific_notation() {
+        // 0e0, 1e199, etc. should parse as valid SQL
+        let result = Parser::parse_one("SELECT 0e0, 1e10, 1.5e2");
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let result = Parser::parse_one("SELECT 1e199 + 0e0");
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+    }
 }

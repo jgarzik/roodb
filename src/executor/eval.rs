@@ -355,17 +355,15 @@ fn eval_binary_op_ex(
     }
 }
 
-/// Check if a float result overflows. MySQL raises ER_DATA_OUT_OF_RANGE for:
-/// - Infinity (true float overflow)
-/// - Values exceeding BIGINT UNSIGNED range (> 1.8446744073709552e19)
+/// Check if a float result overflows in integer-promoted context.
+/// For Int+Float, UnsignedInt+Float etc., values beyond BIGINT UNSIGNED
+/// max (~1.8e19) are rejected (MySQL semantics).
 fn check_float_overflow(v: f64) -> ExecutorResult<Datum> {
     if v.is_infinite() {
         Err(ExecutorError::DataOutOfRange(
             "DOUBLE value is out of range".to_string(),
         ))
     } else if v.abs() > 1.844_674_407_370_955e19 {
-        // Exceeds BIGINT UNSIGNED max (18446744073709551615 ≈ 1.8446744073709552e19)
-        // Use a slightly lower threshold to catch edge cases lost to float precision
         Err(ExecutorError::DataOutOfRange(
             "BIGINT UNSIGNED value is out of range".to_string(),
         ))
