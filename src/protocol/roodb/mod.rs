@@ -4862,6 +4862,8 @@ where
                     (codes::ER_TOO_BIG_FIELDLENGTH, states::SYNTAX_ERROR)
                 } else if msg.contains("Display width out of range") {
                     (codes::ER_TOO_BIG_DISPLAYWIDTH, states::SYNTAX_ERROR)
+                } else if msg.contains("Too big scale") {
+                    (codes::ER_TOO_BIG_SCALE, states::SYNTAX_ERROR)
                 } else {
                     (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR)
                 }

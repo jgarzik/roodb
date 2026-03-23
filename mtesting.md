@@ -70,7 +70,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Test | Status | Fail Line / Total | Blocking Feature |
 |------|--------|-------------------|-----------------|
-| type_float | FAIL | 182/504 (36%) | HAVING + ORDER BY combined with aggregate alias |
+| type_float | FAIL | 242/504 (48%) | Scientific notation in expressions (f1 + 0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
 | func_math | FAIL | 637/1271 (50%) | weight_string(_eucjpms) charset function |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
@@ -127,6 +127,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | GET_FORMAT resolver | GET_FORMAT type inference + keyword-as-argument fallback |
 | HAVING alias resolution | HAVING clause resolves SELECT aliases (e.g., `HAVING s <> 0`) |
 | DO statement | `DO expr` evaluates expression and discards result |
+| ORDER BY aggregate alias | ORDER BY resolves aggregate aliases via transform_to_output_columns |
+| FLOAT/DOUBLE scale validation | ER_TOO_BIG_SCALE (1427) for D>M; scale max 30; display width max 255 |
 
 ## Gap Analysis — Next Steps
 

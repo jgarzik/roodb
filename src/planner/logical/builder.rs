@@ -1001,6 +1001,30 @@ impl LogicalPlanBuilder {
         expr: &ResolvedExpr,
         columns: &[ResolvedSelectItem],
     ) -> ResolvedExpr {
+        // First check if the whole expression matches a SELECT item (handles
+        // aggregate functions like sum(b) referenced by alias in ORDER BY/HAVING)
+        if Self::expr_has_aggregate(expr) {
+            let mut output_idx = 0usize;
+            for item in columns {
+                if let ResolvedSelectItem::Expr {
+                    expr: sel_expr,
+                    alias,
+                } = item
+                {
+                    if Self::aggregates_match(expr, sel_expr) {
+                        let name = alias.clone().unwrap_or_default();
+                        return ResolvedExpr::Column(ResolvedColumn {
+                            table: String::new(),
+                            name,
+                            index: output_idx,
+                            data_type: expr.data_type(),
+                            nullable: true,
+                        });
+                    }
+                    output_idx += 1;
+                }
+            }
+        }
         match expr {
             ResolvedExpr::Column(col) => {
                 // Find this column in the SELECT list

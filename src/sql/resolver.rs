@@ -2164,9 +2164,22 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                         return Ok(DataType::Double);
                     }
                 }
-                sp::ExactNumberInfo::PrecisionAndScale(p, _) => {
-                    if *p > 53 {
-                        // FLOAT(p,s) with p>53 → error 1425
+                sp::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    // MySQL: FLOAT/DOUBLE(M,D) — D (scale) max is 30
+                    if *s > 30 {
+                        return Err(SqlError::InvalidOperation(
+                            "Display width out of range for column (max = 255)".to_string(),
+                        ));
+                    }
+                    if *s as u64 > *p {
+                        // FLOAT(M,D) with D>M → error 1427
+                        return Err(SqlError::InvalidOperation(format!(
+                            "Too big scale {} specified for column. Maximum is {}.",
+                            s, p
+                        )));
+                    }
+                    // FLOAT(M,D): M is display width (max 255)
+                    if *p > 255 {
                         return Err(SqlError::InvalidOperation(
                             "Display width out of range for column (max = 255)".to_string(),
                         ));
@@ -2182,8 +2195,22 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         | sp::DataType::RealUnsigned => Ok(DataType::Float),
         // Double — validate precision
         sp::DataType::Double(info) | sp::DataType::DoubleUnsigned(info) => {
-            if let sp::ExactNumberInfo::PrecisionAndScale(p, _) = info {
-                if *p > 53 {
+            if let sp::ExactNumberInfo::PrecisionAndScale(p, s) = info {
+                // MySQL: DOUBLE(M,D) — D (scale) max is 30
+                if *s > 30 {
+                    return Err(SqlError::InvalidOperation(format!(
+                        "Too big scale {} specified for column. Maximum is 30.",
+                        s
+                    )));
+                }
+                if *s as u64 > *p {
+                    return Err(SqlError::InvalidOperation(format!(
+                        "Too big scale {} specified for column. Maximum is {}.",
+                        s, p
+                    )));
+                }
+                // DOUBLE(M,D): M is display width (max 255)
+                if *p > 255 {
                     return Err(SqlError::InvalidOperation(
                         "Display width out of range for column (max = 255)".to_string(),
                     ));
