@@ -79,23 +79,9 @@ impl Executor for InsertSelect {
             return Ok(None);
         }
 
-        // Read all rows from source and insert them
-        // First, collect all rows to know the count for batch allocation
-        let mut source_rows = Vec::new();
-        while let Some(row) = self.source.next().await? {
-            source_rows.push(row);
-        }
-
-        // Pre-allocate row IDs
-        let row_count = source_rows.len() as u64;
-        let (start_local, node_id) = if row_count > 0 {
-            allocate_row_id_batch(row_count)
-        } else {
-            (0, 0)
-        };
-        let mut next_local_id = start_local;
-
-        for source_row in &source_rows {
+        // Stream rows from source — insert each row as it arrives to avoid
+        // buffering the entire result set in memory.
+        while let Some(source_row) = self.source.next().await? {
             // Coerce source row values to match target column types
             let mut datums: Vec<Datum> = Vec::with_capacity(self.columns.len());
             for (col_idx, col) in self.columns.iter().enumerate() {
@@ -108,9 +94,9 @@ impl Executor for InsertSelect {
                 datums.push(datum);
             }
 
-            // Get next row ID
-            let row_id = encode_row_id(next_local_id, node_id);
-            next_local_id += 1;
+            // Allocate row ID per-row
+            let (local_id, node_id) = allocate_row_id_batch(1);
+            let row_id = encode_row_id(local_id, node_id);
 
             // Replace NULL values in auto_increment columns with generated ID
             let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
@@ -127,7 +113,7 @@ impl Executor for InsertSelect {
                     && !self.columns[col_idx].nullable
                     && datum.is_null()
                 {
-                    if self.ignore || source_rows.len() > 1 {
+                    if self.ignore {
                         *datum = Datum::default_for_type(&self.columns[col_idx].data_type);
                     } else {
                         return Err(super::error::ExecutorError::NullValue(format!(
