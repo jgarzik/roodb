@@ -2525,7 +2525,7 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             }
         }
 
-        "YEAR" | "MONTH" | "DAYOFMONTH" => {
+        "YEAR" | "MONTH" | "DAYOFMONTH" | "DAY" => {
             if args.len() != 1 {
                 return Err(ExecutorError::InvalidOperation(format!(
                     "{} requires 1 argument",
@@ -2536,14 +2536,18 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let parts: Vec<&str> = s.split(['-', ' ', ':']).collect();
-            let val = match name_upper.as_str() {
-                "YEAR" => parts.first().and_then(|p| p.parse::<i64>().ok()),
-                "MONTH" => parts.get(1).and_then(|p| p.parse::<i64>().ok()),
-                "DAYOFMONTH" => parts.get(2).and_then(|p| p.parse::<i64>().ok()),
-                _ => None,
-            };
-            Ok(val.map(Datum::Int).unwrap_or(Datum::Null))
+            match parse_to_parts(&s) {
+                Some(p) => {
+                    let val = match name_upper.as_str() {
+                        "YEAR" => p.year,
+                        "MONTH" => p.month as i64,
+                        "DAYOFMONTH" | "DAY" => p.day as i64,
+                        _ => unreachable!(),
+                    };
+                    Ok(Datum::Int(val))
+                }
+                None => Ok(Datum::Null),
+            }
         }
 
         "FIELD" => {
@@ -2667,37 +2671,522 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             Ok(Datum::Null)
         }
 
-        "CURDATE" | "CURRENT_DATE" => Ok(Datum::String("2024-01-01".to_string())),
+        "CURDATE" | "CURRENT_DATE" => {
+            let p = system_now_parts();
+            Ok(Datum::String(p.format_date()))
+        }
         "NOW" | "CURRENT_TIMESTAMP" | "SYSDATE" | "LOCALTIME" | "LOCALTIMESTAMP" => {
-            // Return current timestamp as formatted string
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let secs = now as i64;
-            let days = secs / 86400;
-            let tod = (secs % 86400) as u64;
-            let (year, month, day) = {
-                // Days since epoch to YMD (Hinnant algorithm)
-                let z = days + 719468;
-                let era = if z >= 0 { z } else { z - 146096 } / 146097;
-                let doe = (z - era * 146097) as u32;
-                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-                let y = yoe as i64 + era * 400;
-                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-                let mp = (5 * doy + 2) / 153;
-                let d = doy - (153 * mp + 2) / 5 + 1;
-                let m = if mp < 10 { mp + 3 } else { mp - 9 };
-                let y = if m <= 2 { y + 1 } else { y };
-                (y, m, d)
+            let p = system_now_parts();
+            Ok(Datum::String(p.format_datetime()))
+        }
+        "CURTIME" | "CURRENT_TIME" => {
+            let p = system_now_parts();
+            Ok(Datum::String(p.format_time()))
+        }
+
+        // ── Date/time format-string functions ──
+        "DATE_FORMAT" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DATE_FORMAT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let fmt = args[1].to_display_string();
+            match parse_to_parts(&s) {
+                Some(p) => Ok(Datum::String(format_datetime_fmt(&p, &fmt))),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "TIME_FORMAT" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIME_FORMAT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let fmt = args[1].to_display_string();
+            // TIME_FORMAT: parse as time, date parts stay zero
+            match parse_to_parts(&s) {
+                Some(p) => {
+                    let time_only = DateTimeParts {
+                        year: 0,
+                        month: 0,
+                        day: 0,
+                        hour: p.hour,
+                        minute: p.minute,
+                        second: p.second,
+                        microsecond: p.microsecond,
+                        negative: p.negative,
+                    };
+                    Ok(Datum::String(format_datetime_fmt(&time_only, &fmt)))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "STR_TO_DATE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "STR_TO_DATE requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let input = args[0].to_display_string();
+            let fmt = args[1].to_display_string();
+            match parse_datetime_fmt(&input, &fmt) {
+                Some(p) => {
+                    let has_date = p.year != 0 || p.month != 0 || p.day != 0;
+                    let has_time =
+                        p.hour != 0 || p.minute != 0 || p.second != 0 || p.microsecond != 0;
+                    if has_date && has_time {
+                        Ok(Datum::String(p.format_datetime()))
+                    } else if has_date {
+                        Ok(Datum::String(p.format_date()))
+                    } else {
+                        Ok(Datum::String(p.format_time()))
+                    }
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "GET_FORMAT" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "GET_FORMAT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let type_name = args[0].to_display_string().to_uppercase();
+            let standard = args[1].to_display_string().to_uppercase();
+            match get_format_string(&type_name, &standard) {
+                Some(fmt) => Ok(Datum::String(fmt.to_string())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "FROM_UNIXTIME" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "FROM_UNIXTIME requires 1 or 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let ts = args[0].as_int().unwrap_or(0);
+            let p = DateTimeParts::from_unix_seconds(ts);
+            if args.len() == 2 {
+                if args[1].is_null() {
+                    return Ok(Datum::Null);
+                }
+                let fmt = args[1].to_display_string();
+                Ok(Datum::String(format_datetime_fmt(&p, &fmt)))
+            } else {
+                Ok(Datum::String(p.format_datetime()))
+            }
+        }
+
+        // ── Date/time extraction functions ──
+        "HOUR" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "HOUR requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.hour as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "MINUTE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MINUTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.minute as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "SECOND" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SECOND requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.second as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "MICROSECOND" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MICROSECOND requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.microsecond as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DAYOFWEEK" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DAYOFWEEK requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.day_of_week() as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DAYOFYEAR" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DAYOFYEAR requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.day_of_year() as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "WEEKDAY" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEEKDAY requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.weekday() as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DAYNAME" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DAYNAME requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => {
+                    if p.month == 0 || p.day == 0 {
+                        return Ok(Datum::Null);
+                    }
+                    let dow = p.day_of_week_zero() as usize;
+                    Ok(Datum::String(WEEKDAY_NAMES[dow % 7].to_string()))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "MONTHNAME" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MONTHNAME requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => {
+                    if p.month == 0 || p.month > 12 {
+                        return Ok(Datum::Null);
+                    }
+                    Ok(Datum::String(MONTH_NAMES[p.month as usize].to_string()))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "WEEK" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEEK requires 1 or 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let mode = if args.len() == 2 {
+                args[1].as_int().unwrap_or(0) as u32
+            } else {
+                0
             };
-            let hour = tod / 3600;
-            let min = (tod % 3600) / 60;
-            let sec = tod % 60;
-            Ok(Datum::String(format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                year, month, day, hour, min, sec
-            )))
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.week_number(mode) as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "QUARTER" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "QUARTER requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => {
+                    let q = p.quarter();
+                    if q == 0 {
+                        Ok(Datum::Null)
+                    } else {
+                        Ok(Datum::Int(q as i64))
+                    }
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "YEARWEEK" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "YEARWEEK requires 1 or 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let mode = if args.len() == 2 {
+                args[1].as_int().unwrap_or(0) as u32
+            } else {
+                0
+            };
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => {
+                    let wk = p.week_number(mode);
+                    // If early January falls in the last week of the prior year,
+                    // YEARWEEK must report the prior year
+                    let display_year = if wk > 51 && p.month == 1 {
+                        p.year - 1
+                    } else {
+                        p.year
+                    };
+                    Ok(Datum::Int(display_year * 100 + wk as i64))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        // ── Conversion/constructor functions ──
+        "UNIX_TIMESTAMP" => {
+            if args.is_empty() {
+                // 0-arg: current Unix timestamp
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                return Ok(Datum::Int(now as i64));
+            }
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNIX_TIMESTAMP requires 0 or 1 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.to_unix_seconds())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "LAST_DAY" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "LAST_DAY requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => {
+                    if p.month == 0 || p.month > 12 {
+                        return Ok(Datum::Null);
+                    }
+                    let last = days_in_month(p.year, p.month);
+                    Ok(Datum::String(format!(
+                        "{:04}-{:02}-{:02}",
+                        p.year, p.month, last
+                    )))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "MAKEDATE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MAKEDATE requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let year = args[0].as_int().unwrap_or(0);
+            let doy = args[1].as_int().unwrap_or(0);
+            if doy < 1 {
+                return Ok(Datum::Null);
+            }
+            // Jan 1 of year + (doy - 1) days
+            let epoch_days = ymd_to_days_from_epoch(year, 1, 1) + doy - 1;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            Ok(Datum::String(format!("{:04}-{:02}-{:02}", y, m, d)))
+        }
+
+        "MAKETIME" => {
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MAKETIME requires 3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let h = args[0].as_int().unwrap_or(0);
+            let m = args[1].as_int().unwrap_or(0);
+            let s = args[2].as_int().unwrap_or(0);
+            Ok(Datum::String(format!("{:02}:{:02}:{:02}", h, m, s)))
+        }
+
+        "SEC_TO_TIME" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SEC_TO_TIME requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let total = args[0].as_int().unwrap_or(0);
+            Ok(Datum::String(secs_to_time_string(total)))
+        }
+
+        "TIME_TO_SEC" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIME_TO_SEC requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::Int(parse_time_to_secs(&s)))
+        }
+
+        "PERIOD_ADD" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "PERIOD_ADD requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let period = args[0].as_int().unwrap_or(0);
+            let n = args[1].as_int().unwrap_or(0);
+            let total = period_to_months(period) + n;
+            Ok(Datum::Int(months_to_period(total)))
+        }
+
+        "PERIOD_DIFF" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "PERIOD_DIFF requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let p1 = args[0].as_int().unwrap_or(0);
+            let p2 = args[1].as_int().unwrap_or(0);
+            let diff = period_to_months(p1) - period_to_months(p2);
+            Ok(Datum::Int(diff))
+        }
+
+        "DATE" => {
+            // DATE(expr) — extract date part from datetime
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "DATE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::String(p.format_date())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "TIME" => {
+            // TIME(expr) — extract time part from datetime
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIME requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::String(p.format_time())),
+                None => Ok(Datum::Null),
+            }
         }
 
         "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "STD" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
@@ -2762,11 +3251,766 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
     }
 }
 
-/// Convert integer to string in given radix (2-36)
-/// Parse a date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) to days since year 0.
-/// MySQL's TO_DAYS algorithm.
-/// Parse a time/datetime string to total seconds from midnight (or epoch for datetimes).
-/// Handles "HH:MM:SS", "YYYY-MM-DD HH:MM:SS", and integer 0.
+// ── Date/Time infrastructure ──────────────────────────────────────────
+
+const MONTH_NAMES: [&str; 13] = [
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const MONTH_ABBREVS: [&str; 13] = [
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const WEEKDAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const WEEKDAY_ABBREVS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// Hinnant civil_from_days: convert days since Unix epoch to (year, month, day)
+fn days_from_epoch_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Inverse Hinnant: (year, month, day) to days since Unix epoch
+fn ymd_to_days_from_epoch(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+struct DateTimeParts {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    microsecond: u32,
+    negative: bool,
+}
+
+impl DateTimeParts {
+    fn day_of_year(&self) -> u32 {
+        let mut doy = self.day;
+        for m in 1..self.month {
+            doy += days_in_month(self.year, m);
+        }
+        doy
+    }
+
+    /// 0=Sunday..6=Saturday (internal), MySQL DAYOFWEEK = 1=Sun..7=Sat
+    fn day_of_week_zero(&self) -> u32 {
+        let d = ymd_to_days_from_epoch(self.year, self.month, self.day);
+        // Unix epoch (1970-01-01) was Thursday (4)
+        ((d % 7 + 4 + 7) % 7) as u32
+    }
+
+    /// MySQL DAYOFWEEK: 1=Sunday..7=Saturday
+    fn day_of_week(&self) -> u32 {
+        self.day_of_week_zero() + 1
+    }
+
+    /// MySQL WEEKDAY: 0=Monday..6=Sunday
+    fn weekday(&self) -> u32 {
+        let dow0 = self.day_of_week_zero(); // 0=Sun
+        if dow0 == 0 {
+            6
+        } else {
+            dow0 - 1
+        }
+    }
+
+    fn quarter(&self) -> u32 {
+        if self.month == 0 {
+            return 0;
+        }
+        (self.month - 1) / 3 + 1
+    }
+
+    /// MySQL WEEK function with 8 modes (0-7)
+    ///
+    /// | Mode | 1st day | Range | Week 1 is the first week...      |
+    /// |------|---------|-------|----------------------------------|
+    /// |  0   | Sunday  | 0-53  | with a Sunday in this year       |
+    /// |  1   | Monday  | 0-53  | with 4 or more days this year    |
+    /// |  2   | Sunday  | 1-53  | with a Sunday in this year       |
+    /// |  3   | Monday  | 1-53  | with 4 or more days this year    |
+    /// |  4   | Sunday  | 0-53  | with 4 or more days this year    |
+    /// |  5   | Monday  | 0-53  | with a Monday in this year       |
+    /// |  6   | Sunday  | 1-53  | with 4 or more days this year    |
+    /// |  7   | Monday  | 1-53  | with a Monday in this year       |
+    fn week_number(&self, mode: u32) -> u32 {
+        let mode = mode % 8;
+        let first_day: u32 = match mode {
+            0 | 2 | 4 | 6 => 0, // Sunday
+            _ => 1,             // Monday
+        };
+        let range_1_53 = matches!(mode, 2 | 3 | 6 | 7);
+        // "4+ days" rule: week 1 needs >=4 days in this year (threshold=3)
+        // "first [day]" rule: week 1 starts on first occurrence of first_day (threshold=0)
+        let four_day_rule = matches!(mode, 1 | 3 | 4 | 6);
+        let threshold: i32 = if four_day_rule { 3 } else { 0 };
+
+        let jan1_dow = {
+            let d = ymd_to_days_from_epoch(self.year, 1, 1);
+            ((d % 7 + 4 + 7) % 7) as u32 // 0=Sun
+        };
+        let doy = self.day_of_year() as i32;
+
+        // days_offset: how many days Jan 1 is past the "first day of week"
+        let days_offset = if jan1_dow >= first_day {
+            (jan1_dow - first_day) as i32
+        } else {
+            (7 - (first_day - jan1_dow)) as i32
+        };
+
+        if days_offset <= threshold {
+            // Jan 1 is in week 1 of this year
+            let week = (doy + days_offset - 1) / 7 + 1;
+            if !range_1_53 {
+                return week as u32;
+            }
+            week as u32
+        } else {
+            // Jan 1 is in the last week of the previous year (or week 0)
+            let adjusted = doy - (7 - days_offset);
+            if adjusted <= 0 {
+                if !range_1_53 {
+                    return 0;
+                }
+                // Belongs to last year's last week — compute recursively
+                let prev = DateTimeParts {
+                    year: self.year - 1,
+                    month: 12,
+                    day: 31,
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                    microsecond: 0,
+                    negative: false,
+                };
+                return prev.week_number(mode);
+            }
+            let week = (adjusted - 1) / 7 + 1;
+            if !range_1_53 {
+                return week as u32;
+            }
+            week as u32
+        }
+    }
+
+    fn to_unix_seconds(&self) -> i64 {
+        let days = ymd_to_days_from_epoch(self.year, self.month, self.day);
+        days * 86400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64
+    }
+
+    fn from_unix_seconds(secs: i64) -> Self {
+        let neg = secs < 0;
+        let abs = secs.unsigned_abs();
+        let day_secs = if neg {
+            let rem = abs % 86400;
+            if rem == 0 {
+                0
+            } else {
+                86400 - rem
+            }
+        } else {
+            abs % 86400
+        };
+        let days = if neg {
+            -(abs as i64 + 86399) / 86400
+        } else {
+            secs / 86400
+        };
+        let (y, m, d) = days_from_epoch_to_ymd(days);
+        DateTimeParts {
+            year: y,
+            month: m,
+            day: d,
+            hour: (day_secs / 3600) as u32,
+            minute: ((day_secs % 3600) / 60) as u32,
+            second: (day_secs % 60) as u32,
+            microsecond: 0,
+            negative: false,
+        }
+    }
+
+    fn format_date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    fn format_time(&self) -> String {
+        format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+
+    fn format_datetime(&self) -> String {
+        format!("{} {}", self.format_date(), self.format_time())
+    }
+}
+
+/// Parse MySQL date/time/datetime input string into parts
+fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Try "YYYY-MM-DD HH:MM:SS[.ffffff]"
+    if s.len() >= 19 && s.as_bytes()[4] == b'-' && s.as_bytes()[10] == b' ' {
+        let year: i64 = s[0..4].parse().ok()?;
+        let month: u32 = s[5..7].parse().ok()?;
+        let day: u32 = s[8..10].parse().ok()?;
+        let hour: u32 = s[11..13].parse().ok()?;
+        let minute: u32 = s[14..16].parse().ok()?;
+        let second: u32 = s[17..19].parse().ok()?;
+        let microsecond = if s.len() > 20 && s.as_bytes()[19] == b'.' {
+            let frac = &s[20..];
+            let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
+            padded.parse().unwrap_or(0)
+        } else {
+            0
+        };
+        return Some(DateTimeParts {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
+            negative: false,
+        });
+    }
+
+    // Try "YYYY-MM-DD"
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        let year: i64 = s[0..4].parse().ok()?;
+        let month: u32 = s[5..7].parse().ok()?;
+        let day: u32 = s[8..10].parse().ok()?;
+        return Some(DateTimeParts {
+            year,
+            month,
+            day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+            negative: false,
+        });
+    }
+
+    // Try negative time "-HH:MM:SS"
+    if let Some(rest) = s.strip_prefix('-') {
+        if let Some(p) = parse_time_parts(rest) {
+            return Some(DateTimeParts {
+                negative: true,
+                ..p
+            });
+        }
+    }
+
+    // Try "HH:MM:SS[.ffffff]"
+    if let Some(p) = parse_time_parts(s) {
+        return Some(p);
+    }
+
+    // Try compact "YYYYMMDDHHMMSS" (14 digits) or "YYYYMMDD" (8 digits)
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        if s.len() == 14 {
+            let year: i64 = s[0..4].parse().ok()?;
+            let month: u32 = s[4..6].parse().ok()?;
+            let day: u32 = s[6..8].parse().ok()?;
+            let hour: u32 = s[8..10].parse().ok()?;
+            let minute: u32 = s[10..12].parse().ok()?;
+            let second: u32 = s[12..14].parse().ok()?;
+            return Some(DateTimeParts {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                microsecond: 0,
+                negative: false,
+            });
+        } else if s.len() == 8 {
+            let year: i64 = s[0..4].parse().ok()?;
+            let month: u32 = s[4..6].parse().ok()?;
+            let day: u32 = s[6..8].parse().ok()?;
+            return Some(DateTimeParts {
+                year,
+                month,
+                day,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                microsecond: 0,
+                negative: false,
+            });
+        }
+    }
+
+    // Try integer coercion (e.g., Datum would have produced "0")
+    if s == "0" {
+        return Some(DateTimeParts {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+            negative: false,
+        });
+    }
+
+    None
+}
+
+/// Parse a time-only string "HH:MM:SS[.ffffff]" or "H:MM:SS"
+fn parse_time_parts(s: &str) -> Option<DateTimeParts> {
+    let colon1 = s.find(':')?;
+    let rest = &s[colon1 + 1..];
+    let colon2 = rest.find(':')?;
+    let hour: u32 = s[..colon1].parse().ok()?;
+    let minute: u32 = rest[..colon2].parse().ok()?;
+    let sec_part = &rest[colon2 + 1..];
+    let (sec_str, micro) = if let Some(dot) = sec_part.find('.') {
+        let frac = &sec_part[dot + 1..];
+        let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
+        (&sec_part[..dot], padded.parse::<u32>().unwrap_or(0))
+    } else {
+        (sec_part, 0)
+    };
+    let second: u32 = sec_str.parse().ok()?;
+    Some(DateTimeParts {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour,
+        minute,
+        second,
+        microsecond: micro,
+        negative: false,
+    })
+}
+
+/// Get system time as DateTimeParts
+fn system_now_parts() -> DateTimeParts {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let micros = now.subsec_micros();
+    let mut p = DateTimeParts::from_unix_seconds(secs);
+    p.microsecond = micros;
+    p
+}
+
+/// MySQL DATE_FORMAT / TIME_FORMAT format engine
+fn format_datetime_fmt(parts: &DateTimeParts, fmt: &str) -> String {
+    let mut out = String::with_capacity(fmt.len() * 2);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            i += 1;
+            match bytes[i] {
+                b'Y' => out.push_str(&format!("{:04}", parts.year)),
+                b'y' => out.push_str(&format!("{:02}", (parts.year % 100).unsigned_abs())),
+                b'm' => out.push_str(&format!("{:02}", parts.month)),
+                b'c' => out.push_str(&format!("{}", parts.month)),
+                b'M' => {
+                    let idx = (parts.month as usize).min(12);
+                    out.push_str(MONTH_NAMES[idx]);
+                }
+                b'b' => {
+                    let idx = (parts.month as usize).min(12);
+                    out.push_str(MONTH_ABBREVS[idx]);
+                }
+                b'd' => out.push_str(&format!("{:02}", parts.day)),
+                b'e' => out.push_str(&format!("{}", parts.day)),
+                b'D' => {
+                    let d = parts.day;
+                    let suffix = match d % 10 {
+                        1 if d != 11 => "st",
+                        2 if d != 12 => "nd",
+                        3 if d != 13 => "rd",
+                        _ => "th",
+                    };
+                    out.push_str(&format!("{}{}", d, suffix));
+                }
+                b'j' => out.push_str(&format!("{:03}", parts.day_of_year())),
+                b'H' => out.push_str(&format!("{:02}", parts.hour)),
+                b'k' => out.push_str(&format!("{}", parts.hour)),
+                b'h' | b'I' => {
+                    let h12 = match parts.hour % 12 {
+                        0 => 12,
+                        h => h,
+                    };
+                    out.push_str(&format!("{:02}", h12));
+                }
+                b'l' => {
+                    let h12 = match parts.hour % 12 {
+                        0 => 12,
+                        h => h,
+                    };
+                    out.push_str(&format!("{}", h12));
+                }
+                b'i' => out.push_str(&format!("{:02}", parts.minute)),
+                b's' | b'S' => out.push_str(&format!("{:02}", parts.second)),
+                b'p' => out.push_str(if parts.hour < 12 { "AM" } else { "PM" }),
+                b'f' => out.push_str(&format!("{:06}", parts.microsecond)),
+                b'W' => {
+                    let dow = parts.day_of_week_zero() as usize;
+                    out.push_str(WEEKDAY_NAMES[dow % 7]);
+                }
+                b'a' => {
+                    let dow = parts.day_of_week_zero() as usize;
+                    out.push_str(WEEKDAY_ABBREVS[dow % 7]);
+                }
+                b'w' => out.push_str(&format!("{}", parts.day_of_week_zero())),
+                b'U' => out.push_str(&format!("{:02}", parts.week_number(0))),
+                b'u' => out.push_str(&format!("{:02}", parts.week_number(1))),
+                b'V' => out.push_str(&format!("{:02}", parts.week_number(2))),
+                b'v' => out.push_str(&format!("{:02}", parts.week_number(3))),
+                b'r' => {
+                    let h12 = match parts.hour % 12 {
+                        0 => 12,
+                        h => h,
+                    };
+                    let ampm = if parts.hour < 12 { "AM" } else { "PM" };
+                    out.push_str(&format!(
+                        "{:02}:{:02}:{:02} {}",
+                        h12, parts.minute, parts.second, ampm
+                    ));
+                }
+                b'T' => out.push_str(&format!(
+                    "{:02}:{:02}:{:02}",
+                    parts.hour, parts.minute, parts.second
+                )),
+                b'%' => out.push('%'),
+                _ => {
+                    out.push('%');
+                    out.push(bytes[i] as char);
+                }
+            }
+        } else {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// STR_TO_DATE: parse input using a MySQL format string
+fn parse_datetime_fmt(input: &str, fmt: &str) -> Option<DateTimeParts> {
+    let mut parts = DateTimeParts {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        microsecond: 0,
+        negative: false,
+    };
+    let ibytes = input.as_bytes();
+    let fbytes = fmt.as_bytes();
+    let mut ii = 0; // index into input
+    let mut fi = 0; // index into fmt
+    let mut ampm: Option<bool> = None; // true = PM
+
+    while fi < fbytes.len() {
+        if fbytes[fi] == b'%' && fi + 1 < fbytes.len() {
+            fi += 1;
+            match fbytes[fi] {
+                b'Y' => {
+                    let (v, n) = consume_digits(ibytes, ii, 4)?;
+                    parts.year = v as i64;
+                    ii += n;
+                }
+                b'y' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.year = if v <= 69 {
+                        2000 + v as i64
+                    } else {
+                        1900 + v as i64
+                    };
+                    ii += n;
+                }
+                b'm' | b'c' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.month = v;
+                    ii += n;
+                }
+                b'M' => {
+                    let (v, n) = match_name(ibytes, ii, &MONTH_NAMES[1..])?;
+                    parts.month = v as u32 + 1;
+                    ii += n;
+                }
+                b'b' => {
+                    let (v, n) = match_name(ibytes, ii, &MONTH_ABBREVS[1..])?;
+                    parts.month = v as u32 + 1;
+                    ii += n;
+                }
+                b'd' | b'e' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.day = v;
+                    ii += n;
+                }
+                b'H' | b'k' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.hour = v;
+                    ii += n;
+                }
+                b'h' | b'I' | b'l' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.hour = v;
+                    ii += n;
+                }
+                b'i' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.minute = v;
+                    ii += n;
+                }
+                b's' | b'S' => {
+                    let (v, n) = consume_digits(ibytes, ii, 2)?;
+                    parts.second = v;
+                    ii += n;
+                }
+                b'f' => {
+                    let (v, n) = consume_digits(ibytes, ii, 6)?;
+                    // Pad right if fewer than 6 digits consumed
+                    let scale = 10u32.pow(6u32.saturating_sub(n as u32));
+                    parts.microsecond = v * scale;
+                    ii += n;
+                }
+                b'p' => {
+                    if ii + 2 > ibytes.len() {
+                        return None;
+                    }
+                    let s = std::str::from_utf8(&ibytes[ii..ii + 2]).ok()?;
+                    if s.eq_ignore_ascii_case("AM") {
+                        ampm = Some(false);
+                    } else if s.eq_ignore_ascii_case("PM") {
+                        ampm = Some(true);
+                    } else {
+                        return None;
+                    }
+                    ii += 2;
+                }
+                b'%' => {
+                    if ii >= ibytes.len() || ibytes[ii] != b'%' {
+                        return None;
+                    }
+                    ii += 1;
+                }
+                b'j' => {
+                    let (v, n) = consume_digits(ibytes, ii, 3)?;
+                    // Day of year — set month/day later
+                    parts.day = v; // temporarily store doy
+                    parts.month = 0; // flag
+                    ii += n;
+                }
+                _ => {
+                    // Unknown specifier, try to skip
+                }
+            }
+        } else {
+            // Literal character — must match
+            if ii >= ibytes.len() {
+                return None;
+            }
+            if fbytes[fi] == ibytes[ii] {
+                ii += 1;
+            } else if fbytes[fi] == b' ' {
+                // Allow optional space
+            } else {
+                return None;
+            }
+        }
+        fi += 1;
+    }
+
+    // Convert day-of-year back to month/day if %j was parsed
+    if parts.month == 0 && parts.day != 0 {
+        let mut remaining = parts.day;
+        let mut m = 1u32;
+        while m <= 12 {
+            let dim = days_in_month(parts.year, m);
+            if remaining <= dim {
+                break;
+            }
+            remaining -= dim;
+            m += 1;
+        }
+        if m <= 12 {
+            parts.month = m;
+            parts.day = remaining;
+        } else {
+            return None;
+        }
+    }
+
+    // Apply AM/PM
+    if let Some(is_pm) = ampm {
+        if is_pm {
+            if parts.hour != 12 {
+                parts.hour += 12;
+            }
+        } else if parts.hour == 12 {
+            parts.hour = 0;
+        }
+    }
+
+    Some(parts)
+}
+
+/// Consume up to `max` ASCII digits from input starting at pos, return (value, count)
+fn consume_digits(input: &[u8], pos: usize, max: usize) -> Option<(u32, usize)> {
+    let mut val: u32 = 0;
+    let mut count = 0;
+    while count < max && pos + count < input.len() && input[pos + count].is_ascii_digit() {
+        val = val * 10 + (input[pos + count] - b'0') as u32;
+        count += 1;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some((val, count))
+    }
+}
+
+/// Match input at pos against a list of names (case-insensitive), return (index, consumed_len)
+fn match_name(input: &[u8], pos: usize, names: &[&str]) -> Option<(usize, usize)> {
+    let remaining = &input[pos..];
+    let remaining_str = std::str::from_utf8(remaining).ok()?;
+    // Try longest match first
+    let mut best: Option<(usize, usize)> = None;
+    for (i, name) in names.iter().enumerate() {
+        if remaining_str.len() >= name.len()
+            && remaining_str[..name.len()].eq_ignore_ascii_case(name)
+            && (best.is_none() || name.len() > best.unwrap().1)
+        {
+            best = Some((i, name.len()));
+        }
+    }
+    best
+}
+
+/// GET_FORMAT lookup table
+fn get_format_string(type_name: &str, standard: &str) -> Option<&'static str> {
+    match (type_name, standard) {
+        ("DATE", "USA") => Some("%m.%d.%Y"),
+        ("DATE", "JIS") | ("DATE", "ISO") => Some("%Y-%m-%d"),
+        ("DATE", "EUR") => Some("%d.%m.%Y"),
+        ("DATE", "INTERNAL") => Some("%Y%m%d"),
+        ("DATETIME", "USA") => Some("%Y-%m-%d %H.%i.%s"),
+        ("DATETIME", "JIS") | ("DATETIME", "ISO") => Some("%Y-%m-%d %H:%i:%s"),
+        ("DATETIME", "EUR") => Some("%Y-%m-%d %H.%i.%s"),
+        ("DATETIME", "INTERNAL") => Some("%Y%m%d%H%i%s"),
+        ("TIME", "USA") => Some("%h:%i:%s %p"),
+        ("TIME", "JIS") | ("TIME", "ISO") => Some("%H:%i:%s"),
+        ("TIME", "EUR") => Some("%H.%i.%s"),
+        ("TIME", "INTERNAL") => Some("%H%i%s"),
+        ("TIMESTAMP", "USA") => Some("%Y-%m-%d %H.%i.%s"),
+        ("TIMESTAMP", "JIS") | ("TIMESTAMP", "ISO") => Some("%Y-%m-%d %H:%i:%s"),
+        ("TIMESTAMP", "EUR") => Some("%Y-%m-%d %H.%i.%s"),
+        ("TIMESTAMP", "INTERNAL") => Some("%Y%m%d%H%i%s"),
+        _ => None,
+    }
+}
+
+/// Convert total seconds to a MySQL TIME string "[−]HH:MM:SS"
+fn secs_to_time_string(total_secs: i64) -> String {
+    let sign = if total_secs < 0 { "-" } else { "" };
+    let abs = total_secs.unsigned_abs();
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    let s = abs % 60;
+    format!("{}{:02}:{:02}:{:02}", sign, h, m, s)
+}
+
+/// PERIOD_ADD/PERIOD_DIFF helper: normalize YYMM/YYYYMM to total months
+fn period_to_months(p: i64) -> i64 {
+    if p == 0 {
+        return 0;
+    }
+    let (y, m) = if p > 0 && p <= 9999 {
+        // Could be YYMM or YYYYMM
+        if p <= 1299 {
+            // YYMM
+            let yy = p / 100;
+            let mm = p % 100;
+            let yyyy = if yy <= 69 { 2000 + yy } else { 1900 + yy };
+            (yyyy, mm)
+        } else {
+            (p / 100, p % 100)
+        }
+    } else {
+        (p / 100, p % 100)
+    };
+    y * 12 + m
+}
+
+fn months_to_period(months: i64) -> i64 {
+    let y = (months - 1) / 12;
+    let m = (months - 1) % 12 + 1;
+    y * 100 + m
+}
+
+// ── End date/time infrastructure ──────────────────────────────────────
+
 /// Return Datum::Float for finite values, Datum::Null for NaN/Infinity.
 /// MySQL returns NULL for mathematically undefined results (log of negative, etc.)
 fn float_or_null(v: f64) -> Datum {
@@ -3305,6 +4549,599 @@ mod tests {
             result_type: DataType::BigInt,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(3));
+    }
+
+    // ── Date/time infrastructure tests ──
+
+    #[test]
+    fn test_hinnant_roundtrip() {
+        // Verify days_from_epoch_to_ymd and ymd_to_days_from_epoch are inverses
+        let cases: &[(i64, u32, u32)] = &[
+            (1970, 1, 1),
+            (2000, 1, 1),
+            (2000, 2, 29),
+            (1969, 12, 31),
+            (2024, 3, 23),
+            (1, 1, 1),
+            (9999, 12, 31),
+        ];
+        for &(y, m, d) in cases {
+            let days = ymd_to_days_from_epoch(y, m, d);
+            let (y2, m2, d2) = days_from_epoch_to_ymd(days);
+            assert_eq!(
+                (y, m, d),
+                (y2, m2, d2),
+                "roundtrip failed for {}-{}-{}",
+                y,
+                m,
+                d
+            );
+        }
+        // Unix epoch should be day 0
+        assert_eq!(ymd_to_days_from_epoch(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn test_is_leap_year() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2023));
+        assert!(is_leap_year(2400));
+    }
+
+    #[test]
+    fn test_days_in_month() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(2024, 1), 31);
+        assert_eq!(days_in_month(2024, 4), 30);
+    }
+
+    #[test]
+    fn test_parse_to_parts_datetime() {
+        let p = parse_to_parts("2024-03-23 14:30:45").unwrap();
+        assert_eq!(p.year, 2024);
+        assert_eq!(p.month, 3);
+        assert_eq!(p.day, 23);
+        assert_eq!(p.hour, 14);
+        assert_eq!(p.minute, 30);
+        assert_eq!(p.second, 45);
+        assert!(!p.negative);
+    }
+
+    #[test]
+    fn test_parse_to_parts_date_only() {
+        let p = parse_to_parts("2024-03-23").unwrap();
+        assert_eq!(p.year, 2024);
+        assert_eq!(p.month, 3);
+        assert_eq!(p.day, 23);
+        assert_eq!(p.hour, 0);
+    }
+
+    #[test]
+    fn test_parse_to_parts_time_only() {
+        let p = parse_to_parts("14:30:45").unwrap();
+        assert_eq!(p.hour, 14);
+        assert_eq!(p.minute, 30);
+        assert_eq!(p.second, 45);
+        assert_eq!(p.year, 0);
+    }
+
+    #[test]
+    fn test_parse_to_parts_negative_time() {
+        let p = parse_to_parts("-01:30:00").unwrap();
+        assert!(p.negative);
+        assert_eq!(p.hour, 1);
+        assert_eq!(p.minute, 30);
+    }
+
+    #[test]
+    fn test_parse_to_parts_compact() {
+        let p = parse_to_parts("20240323").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 3, 23));
+        let p = parse_to_parts("20240323143045").unwrap();
+        assert_eq!(
+            (p.year, p.month, p.day, p.hour, p.minute, p.second),
+            (2024, 3, 23, 14, 30, 45)
+        );
+    }
+
+    #[test]
+    fn test_parse_to_parts_microseconds() {
+        let p = parse_to_parts("2024-03-23 14:30:45.123456").unwrap();
+        assert_eq!(p.microsecond, 123456);
+        let p = parse_to_parts("14:30:45.5").unwrap();
+        assert_eq!(p.microsecond, 500000);
+    }
+
+    #[test]
+    fn test_parse_to_parts_zero() {
+        let p = parse_to_parts("0").unwrap();
+        assert_eq!((p.year, p.month, p.day), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_parse_to_parts_empty() {
+        assert!(parse_to_parts("").is_none());
+        assert!(parse_to_parts("garbage").is_none());
+    }
+
+    #[test]
+    fn test_day_of_week() {
+        // 2024-01-07 was Sunday
+        let p = parse_to_parts("2024-01-07").unwrap();
+        assert_eq!(p.day_of_week_zero(), 0); // 0=Sunday
+        assert_eq!(p.day_of_week(), 1); // MySQL DAYOFWEEK 1=Sun
+        assert_eq!(p.weekday(), 6); // MySQL WEEKDAY 6=Sun
+
+        // 2024-01-08 was Monday
+        let p = parse_to_parts("2024-01-08").unwrap();
+        assert_eq!(p.day_of_week_zero(), 1); // 1=Monday
+        assert_eq!(p.day_of_week(), 2); // MySQL DAYOFWEEK 2=Mon
+        assert_eq!(p.weekday(), 0); // MySQL WEEKDAY 0=Mon
+
+        // 1970-01-01 was Thursday
+        let p = parse_to_parts("1970-01-01").unwrap();
+        assert_eq!(p.day_of_week_zero(), 4); // 4=Thursday
+    }
+
+    #[test]
+    fn test_day_of_year() {
+        let p = parse_to_parts("2024-01-01").unwrap();
+        assert_eq!(p.day_of_year(), 1);
+        let p = parse_to_parts("2024-12-31").unwrap();
+        assert_eq!(p.day_of_year(), 366); // 2024 is leap
+        let p = parse_to_parts("2023-12-31").unwrap();
+        assert_eq!(p.day_of_year(), 365);
+    }
+
+    #[test]
+    fn test_quarter() {
+        let p = parse_to_parts("2024-01-15").unwrap();
+        assert_eq!(p.quarter(), 1);
+        let p = parse_to_parts("2024-06-15").unwrap();
+        assert_eq!(p.quarter(), 2);
+        let p = parse_to_parts("2024-09-15").unwrap();
+        assert_eq!(p.quarter(), 3);
+        let p = parse_to_parts("2024-12-15").unwrap();
+        assert_eq!(p.quarter(), 4);
+        // month=0 should return 0 (caller maps to NULL)
+        let p = parse_to_parts("0").unwrap();
+        assert_eq!(p.quarter(), 0);
+    }
+
+    #[test]
+    fn test_unix_seconds_roundtrip() {
+        // 2024-01-01 00:00:00 UTC
+        let p = parse_to_parts("2024-01-01 00:00:00").unwrap();
+        let secs = p.to_unix_seconds();
+        let p2 = DateTimeParts::from_unix_seconds(secs);
+        assert_eq!((p2.year, p2.month, p2.day), (2024, 1, 1));
+        assert_eq!((p2.hour, p2.minute, p2.second), (0, 0, 0));
+        assert!(!p2.negative);
+    }
+
+    #[test]
+    fn test_from_unix_seconds_negative() {
+        // -1 should be 1969-12-31 23:59:59
+        let p = DateTimeParts::from_unix_seconds(-1);
+        assert_eq!((p.year, p.month, p.day), (1969, 12, 31));
+        assert_eq!((p.hour, p.minute, p.second), (23, 59, 59));
+        assert!(!p.negative); // datetimes should never be negative
+    }
+
+    #[test]
+    fn test_from_unix_seconds_zero() {
+        let p = DateTimeParts::from_unix_seconds(0);
+        assert_eq!((p.year, p.month, p.day), (1970, 1, 1));
+        assert_eq!((p.hour, p.minute, p.second), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_format_datetime_fmt_basic() {
+        let p = parse_to_parts("2024-03-23 14:30:45").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%Y-%m-%d"), "2024-03-23");
+        assert_eq!(format_datetime_fmt(&p, "%H:%i:%s"), "14:30:45");
+        assert_eq!(
+            format_datetime_fmt(&p, "%Y-%m-%d %H:%i:%s"),
+            "2024-03-23 14:30:45"
+        );
+    }
+
+    #[test]
+    fn test_format_datetime_fmt_specifiers() {
+        let p = parse_to_parts("2024-03-05 09:05:07").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%y"), "24");
+        assert_eq!(format_datetime_fmt(&p, "%c"), "3");
+        assert_eq!(format_datetime_fmt(&p, "%e"), "5");
+        assert_eq!(format_datetime_fmt(&p, "%k"), "9");
+        assert_eq!(format_datetime_fmt(&p, "%M"), "March");
+        assert_eq!(format_datetime_fmt(&p, "%b"), "Mar");
+    }
+
+    #[test]
+    fn test_format_datetime_12h() {
+        let p = parse_to_parts("2024-01-01 00:30:00").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%h"), "12");
+        assert_eq!(format_datetime_fmt(&p, "%p"), "AM");
+        let p = parse_to_parts("2024-01-01 13:30:00").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%h"), "01");
+        assert_eq!(format_datetime_fmt(&p, "%l"), "1");
+        assert_eq!(format_datetime_fmt(&p, "%p"), "PM");
+    }
+
+    #[test]
+    fn test_format_day_suffix() {
+        let p = |d: u32| DateTimeParts {
+            year: 2024,
+            month: 1,
+            day: d,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+            negative: false,
+        };
+        assert_eq!(format_datetime_fmt(&p(1), "%D"), "1st");
+        assert_eq!(format_datetime_fmt(&p(2), "%D"), "2nd");
+        assert_eq!(format_datetime_fmt(&p(3), "%D"), "3rd");
+        assert_eq!(format_datetime_fmt(&p(4), "%D"), "4th");
+        assert_eq!(format_datetime_fmt(&p(11), "%D"), "11th");
+        assert_eq!(format_datetime_fmt(&p(12), "%D"), "12th");
+        assert_eq!(format_datetime_fmt(&p(13), "%D"), "13th");
+        assert_eq!(format_datetime_fmt(&p(21), "%D"), "21st");
+        assert_eq!(format_datetime_fmt(&p(22), "%D"), "22nd");
+        assert_eq!(format_datetime_fmt(&p(23), "%D"), "23rd");
+    }
+
+    #[test]
+    fn test_format_r_and_t() {
+        let p = parse_to_parts("2024-01-01 14:30:45").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%r"), "02:30:45 PM");
+        assert_eq!(format_datetime_fmt(&p, "%T"), "14:30:45");
+    }
+
+    #[test]
+    fn test_format_literal_percent() {
+        let p = parse_to_parts("2024-01-01").unwrap();
+        assert_eq!(format_datetime_fmt(&p, "%%"), "%");
+        assert_eq!(format_datetime_fmt(&p, "100%%"), "100%");
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_basic() {
+        let p = parse_datetime_fmt("2024-03-23", "%Y-%m-%d").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 3, 23));
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_month_name() {
+        let p = parse_datetime_fmt("March 23, 2024", "%M %d, %Y").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 3, 23));
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_abbrev_month() {
+        let p = parse_datetime_fmt("Mar 23, 2024", "%b %d, %Y").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 3, 23));
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_12h_ampm() {
+        let p = parse_datetime_fmt("02:30:00 PM", "%h:%i:%s %p").unwrap();
+        assert_eq!((p.hour, p.minute, p.second), (14, 30, 0));
+        let p = parse_datetime_fmt("12:00:00 AM", "%h:%i:%s %p").unwrap();
+        assert_eq!(p.hour, 0);
+        let p = parse_datetime_fmt("12:00:00 PM", "%h:%i:%s %p").unwrap();
+        assert_eq!(p.hour, 12);
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_2digit_year() {
+        let p = parse_datetime_fmt("69-03-23", "%y-%m-%d").unwrap();
+        assert_eq!(p.year, 2069);
+        let p = parse_datetime_fmt("70-03-23", "%y-%m-%d").unwrap();
+        assert_eq!(p.year, 1970);
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_day_of_year() {
+        // Day 60 of 2024 (leap year): should be Feb 29
+        let p = parse_datetime_fmt("2024 060", "%Y %j").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 2, 29));
+        // Day 1 of 2024: should be Jan 1
+        let p = parse_datetime_fmt("2024 001", "%Y %j").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 1, 1));
+        // Day 366 of 2024: should be Dec 31
+        let p = parse_datetime_fmt("2024 366", "%Y %j").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2024, 12, 31));
+    }
+
+    #[test]
+    fn test_parse_datetime_fmt_microseconds() {
+        let p = parse_datetime_fmt("123", "%f").unwrap();
+        assert_eq!(p.microsecond, 123000);
+        let p = parse_datetime_fmt("123456", "%f").unwrap();
+        assert_eq!(p.microsecond, 123456);
+    }
+
+    #[test]
+    fn test_week_number_mode0() {
+        // Mode 0: Sunday-start, 0-53, first Sunday
+        // 2024-01-01 is Monday → first Sunday is Jan 7 → Jan 1-6 are week 0
+        let p = parse_to_parts("2024-01-01").unwrap();
+        assert_eq!(p.week_number(0), 0);
+        let p = parse_to_parts("2024-01-07").unwrap(); // first Sunday
+        assert_eq!(p.week_number(0), 1);
+    }
+
+    #[test]
+    fn test_week_number_mode1() {
+        // Mode 1: Monday-start, 0-53, 4+ days
+        // 2024-01-01 is Monday → Mon-Sun = 7 days in year → week 1
+        let p = parse_to_parts("2024-01-01").unwrap();
+        assert_eq!(p.week_number(1), 1);
+    }
+
+    #[test]
+    fn test_week_number_mode3_iso() {
+        // Mode 3: Monday-start, 1-53, 4+ days (ISO-like)
+        // 2024-01-01 is Monday → ISO week 1
+        let p = parse_to_parts("2024-01-01").unwrap();
+        assert_eq!(p.week_number(3), 1);
+        // 2023-01-01 is Sunday → ISO: belongs to week 52 of 2022
+        let p = parse_to_parts("2023-01-01").unwrap();
+        assert_eq!(p.week_number(3), 52);
+    }
+
+    #[test]
+    fn test_get_format() {
+        assert_eq!(get_format_string("DATE", "USA"), Some("%m.%d.%Y"));
+        assert_eq!(
+            get_format_string("DATETIME", "ISO"),
+            Some("%Y-%m-%d %H:%i:%s")
+        );
+        assert_eq!(get_format_string("DATE", "UNKNOWN"), None);
+    }
+
+    #[test]
+    fn test_secs_to_time_string() {
+        assert_eq!(secs_to_time_string(3661), "01:01:01");
+        assert_eq!(secs_to_time_string(0), "00:00:00");
+        assert_eq!(secs_to_time_string(-3661), "-01:01:01");
+    }
+
+    #[test]
+    fn test_period_to_months_and_back() {
+        // YYYYMM format
+        assert_eq!(period_to_months(202403), 2024 * 12 + 3);
+        // Round-trip
+        let m = period_to_months(202403);
+        assert_eq!(months_to_period(m), 202403);
+    }
+
+    #[test]
+    fn test_period_add_via_helpers() {
+        // PERIOD_ADD(202401, 5) → 202406
+        let total = period_to_months(202401) + 5;
+        assert_eq!(months_to_period(total), 202406);
+        // Cross year boundary: 202411 + 3 → 202502
+        let total = period_to_months(202411) + 3;
+        assert_eq!(months_to_period(total), 202502);
+    }
+
+    #[test]
+    fn test_monthname_zero_date() {
+        // MONTHNAME('0000-00-00') should return NULL
+        let result = eval_function("MONTHNAME", &[Datum::String("0000-00-00".to_string())]);
+        assert_eq!(result.unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_dayname_zero_date() {
+        // DAYNAME('0000-00-00') should return NULL
+        let result = eval_function("DAYNAME", &[Datum::String("0000-00-00".to_string())]);
+        assert_eq!(result.unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_quarter_zero_date() {
+        // QUARTER('0000-00-00') should return NULL
+        let result = eval_function("QUARTER", &[Datum::String("0000-00-00".to_string())]);
+        assert_eq!(result.unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_date_format_function() {
+        let result = eval_function(
+            "DATE_FORMAT",
+            &[
+                Datum::String("2024-03-23".to_string()),
+                Datum::String("%W, %M %D, %Y".to_string()),
+            ],
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("Saturday, March 23rd, 2024".to_string())
+        );
+    }
+
+    #[test]
+    fn test_str_to_date_function() {
+        let result = eval_function(
+            "STR_TO_DATE",
+            &[
+                Datum::String("March 23, 2024".to_string()),
+                Datum::String("%M %d, %Y".to_string()),
+            ],
+        );
+        assert_eq!(result.unwrap(), Datum::String("2024-03-23".to_string()));
+    }
+
+    #[test]
+    fn test_extraction_functions() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        assert_eq!(
+            eval_function("HOUR", &[dt.clone()]).unwrap(),
+            Datum::Int(14)
+        );
+        assert_eq!(
+            eval_function("MINUTE", &[dt.clone()]).unwrap(),
+            Datum::Int(30)
+        );
+        assert_eq!(
+            eval_function("SECOND", &[dt.clone()]).unwrap(),
+            Datum::Int(45)
+        );
+        assert_eq!(
+            eval_function("YEAR", &[dt.clone()]).unwrap(),
+            Datum::Int(2024)
+        );
+        assert_eq!(
+            eval_function("MONTH", &[dt.clone()]).unwrap(),
+            Datum::Int(3)
+        );
+        assert_eq!(eval_function("DAY", &[dt.clone()]).unwrap(), Datum::Int(23));
+        assert_eq!(
+            eval_function("DAYOFMONTH", &[dt.clone()]).unwrap(),
+            Datum::Int(23)
+        );
+        // 2024-03-23 is Saturday
+        assert_eq!(
+            eval_function("DAYOFWEEK", &[dt.clone()]).unwrap(),
+            Datum::Int(7)
+        ); // 7=Sat
+        assert_eq!(
+            eval_function("WEEKDAY", &[dt.clone()]).unwrap(),
+            Datum::Int(5)
+        ); // 5=Sat
+        assert_eq!(
+            eval_function("DAYNAME", &[dt.clone()]).unwrap(),
+            Datum::String("Saturday".to_string())
+        );
+        assert_eq!(
+            eval_function("MONTHNAME", &[dt.clone()]).unwrap(),
+            Datum::String("March".to_string())
+        );
+        // Day 83 of 2024 (leap year)
+        assert_eq!(
+            eval_function("DAYOFYEAR", &[dt.clone()]).unwrap(),
+            Datum::Int(83)
+        );
+        assert_eq!(eval_function("QUARTER", &[dt]).unwrap(), Datum::Int(1));
+    }
+
+    #[test]
+    fn test_maketime() {
+        let result = eval_function(
+            "MAKETIME",
+            &[Datum::Int(14), Datum::Int(30), Datum::Int(45)],
+        );
+        assert_eq!(result.unwrap(), Datum::String("14:30:45".to_string()));
+    }
+
+    #[test]
+    fn test_makedate() {
+        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(1)]);
+        assert_eq!(result.unwrap(), Datum::String("2024-01-01".to_string()));
+        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(60)]);
+        assert_eq!(result.unwrap(), Datum::String("2024-02-29".to_string())); // leap year
+    }
+
+    #[test]
+    fn test_last_day() {
+        let result = eval_function("LAST_DAY", &[Datum::String("2024-02-15".to_string())]);
+        assert_eq!(result.unwrap(), Datum::String("2024-02-29".to_string()));
+        let result = eval_function("LAST_DAY", &[Datum::String("2023-02-15".to_string())]);
+        assert_eq!(result.unwrap(), Datum::String("2023-02-28".to_string()));
+    }
+
+    #[test]
+    fn test_sec_to_time() {
+        assert_eq!(
+            eval_function("SEC_TO_TIME", &[Datum::Int(3661)]).unwrap(),
+            Datum::String("01:01:01".to_string())
+        );
+        assert_eq!(
+            eval_function("SEC_TO_TIME", &[Datum::Int(-3661)]).unwrap(),
+            Datum::String("-01:01:01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_time_to_sec() {
+        assert_eq!(
+            eval_function("TIME_TO_SEC", &[Datum::String("01:01:01".to_string())]).unwrap(),
+            Datum::Int(3661)
+        );
+    }
+
+    #[test]
+    fn test_period_add() {
+        assert_eq!(
+            eval_function("PERIOD_ADD", &[Datum::Int(202401), Datum::Int(5)]).unwrap(),
+            Datum::Int(202406)
+        );
+        // Cross year boundary
+        assert_eq!(
+            eval_function("PERIOD_ADD", &[Datum::Int(202411), Datum::Int(3)]).unwrap(),
+            Datum::Int(202502)
+        );
+    }
+
+    #[test]
+    fn test_period_diff() {
+        assert_eq!(
+            eval_function("PERIOD_DIFF", &[Datum::Int(202403), Datum::Int(202401)]).unwrap(),
+            Datum::Int(2)
+        );
+    }
+
+    #[test]
+    fn test_date_and_time_extract() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        assert_eq!(
+            eval_function("DATE", &[dt.clone()]).unwrap(),
+            Datum::String("2024-03-23".to_string())
+        );
+        assert_eq!(
+            eval_function("TIME", &[dt]).unwrap(),
+            Datum::String("14:30:45".to_string())
+        );
+    }
+
+    #[test]
+    fn test_null_propagation_datetime_funcs() {
+        assert_eq!(eval_function("HOUR", &[Datum::Null]).unwrap(), Datum::Null);
+        assert_eq!(
+            eval_function("MINUTE", &[Datum::Null]).unwrap(),
+            Datum::Null
+        );
+        assert_eq!(
+            eval_function("DAYNAME", &[Datum::Null]).unwrap(),
+            Datum::Null
+        );
+        assert_eq!(
+            eval_function("MONTHNAME", &[Datum::Null]).unwrap(),
+            Datum::Null
+        );
+        assert_eq!(
+            eval_function(
+                "DATE_FORMAT",
+                &[Datum::Null, Datum::String("%Y".to_string())]
+            )
+            .unwrap(),
+            Datum::Null
+        );
+        assert_eq!(
+            eval_function(
+                "DATE_FORMAT",
+                &[Datum::String("2024-01-01".to_string()), Datum::Null]
+            )
+            .unwrap(),
+            Datum::Null
+        );
     }
 
     #[test]
