@@ -180,8 +180,10 @@ impl TypeChecker {
         source: &DataType,
         expr: &ResolvedExpr,
     ) -> SqlResult<()> {
-        // NULL is compatible with any type — at runtime, the NOT NULL check handles rejection
-        if Self::is_definitely_null(expr) || Self::could_be_null(expr) {
+        // A literal NULL is compatible with any type — the NOT NULL constraint
+        // handles rejection at runtime. Expressions that merely *contain* a NULL
+        // (e.g. COALESCE('x', NULL)) still need type checking on their result type.
+        if Self::is_definitely_null(expr) {
             return Ok(());
         }
 
@@ -197,19 +199,6 @@ impl TypeChecker {
                 expected: target.clone(),
                 found: source.clone(),
             })
-        }
-    }
-
-    /// Check if expression could evaluate to NULL at runtime (e.g. 1/null, a+null)
-    fn could_be_null(expr: &ResolvedExpr) -> bool {
-        match expr {
-            ResolvedExpr::Literal(Literal::Null) => true,
-            ResolvedExpr::BinaryOp { left, right, .. } => {
-                Self::could_be_null(left) || Self::could_be_null(right)
-            }
-            ResolvedExpr::UnaryOp { expr, .. } => Self::could_be_null(expr),
-            ResolvedExpr::Function { args, .. } => args.iter().any(Self::could_be_null),
-            _ => false,
         }
     }
 
