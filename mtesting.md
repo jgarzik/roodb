@@ -70,7 +70,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Test | Status | Fail Line / Total | Blocking Feature |
 |------|--------|-------------------|-----------------|
-| type_float | FAIL | 130/504 (26%) | CREATE TABLE AS SELECT + UNION |
+| type_float | FAIL | 182/504 (36%) | HAVING + ORDER BY combined with aggregate alias |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
 | func_math | FAIL | 637/1271 (50%) | weight_string(_eucjpms) charset function |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
@@ -125,6 +125,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Negation overflow | checked_neg for Int; UnsignedInt overflow returns error not Decimal |
 | Log function sql_mode | ER_INVALID_ARGUMENT_FOR_LOGARITHM (3020) in DML with ERROR_FOR_DIVISION_BY_ZERO |
 | GET_FORMAT resolver | GET_FORMAT type inference + keyword-as-argument fallback |
+| HAVING alias resolution | HAVING clause resolves SELECT aliases (e.g., `HAVING s <> 0`) |
+| DO statement | `DO expr` evaluates expression and discards result |
 
 ## Gap Analysis — Next Steps
 

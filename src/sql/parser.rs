@@ -121,6 +121,11 @@ impl Parser {
         // Process conditional comments first, before any other normalization
         let sql = Self::normalize_conditional_comments(sql);
 
+        // DO expr → SELECT expr (evaluate and discard result)
+        let re_do = Regex::new(r"(?i)^\s*DO\s+").unwrap();
+        let sql = re_do.replace(&sql, "SELECT ");
+        let sql = sql.to_string();
+
         // MOD is a keyword in sqlparser. Handle both MOD(x,y) function and x MOD y infix.
         // Replace MOD( with _ROODB_MOD( for function call form.
         let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();

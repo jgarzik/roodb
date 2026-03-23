@@ -952,12 +952,12 @@ impl<'a> Resolver<'a> {
                     }
                 }
 
-                // Resolve HAVING
-                let resolved_having = select
-                    .having
-                    .as_ref()
-                    .map(|h| self.resolve_expr(h, &scope))
-                    .transpose()?;
+                // Resolve HAVING — aliases from SELECT list are valid here
+                let resolved_having = if let Some(h) = &select.having {
+                    Some(self.resolve_expr_with_aliases(h, &scope, &resolved_columns)?)
+                } else {
+                    None
+                };
 
                 Ok(ResolvedSelect {
                     distinct: select.distinct.is_some(),
@@ -1160,6 +1160,62 @@ impl<'a> Resolver<'a> {
 
                 Ok(ResolvedSelectItem::Columns(columns))
             }
+        }
+    }
+
+    /// Resolve expression with SELECT alias fallback (for HAVING/ORDER BY).
+    /// Resolve expression with SELECT alias fallback (for HAVING).
+    /// Identifiers that match SELECT aliases are replaced with the aliased expression.
+    /// Recurses into BinaryOp/UnaryOp to handle `HAVING s <> 0` where `s` is an alias.
+    fn resolve_expr_with_aliases(
+        &self,
+        expr: &sp::Expr,
+        scope: &Scope,
+        select_columns: &[ResolvedSelectItem],
+    ) -> SqlResult<ResolvedExpr> {
+        // First check if this is a plain identifier matching a SELECT alias
+        if let sp::Expr::Identifier(ident) = expr {
+            if !ident.value.starts_with('@') {
+                let alias_name = &ident.value;
+                for col_item in select_columns {
+                    if let ResolvedSelectItem::Expr {
+                        expr: resolved_expr,
+                        alias: Some(a),
+                    } = col_item
+                    {
+                        if a.eq_ignore_ascii_case(alias_name) {
+                            return Ok(resolved_expr.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // For compound expressions, recurse to resolve sub-expressions with aliases
+        match expr {
+            sp::Expr::BinaryOp { left, op, right } => {
+                let l = self.resolve_expr_with_aliases(left, scope, select_columns)?;
+                let r = self.resolve_expr_with_aliases(right, scope, select_columns)?;
+                let binary_op = convert_binary_op(op)?;
+                let result_type = infer_binary_result_type(binary_op, &l, &r)?;
+                Ok(ResolvedExpr::BinaryOp {
+                    left: Box::new(l),
+                    op: binary_op,
+                    right: Box::new(r),
+                    result_type,
+                })
+            }
+            sp::Expr::UnaryOp { op, expr: inner } => {
+                let resolved = self.resolve_expr_with_aliases(inner, scope, select_columns)?;
+                let unary_op = convert_unary_op(op)?;
+                let result_type = infer_unary_result_type(unary_op, &resolved)?;
+                Ok(ResolvedExpr::UnaryOp {
+                    op: unary_op,
+                    expr: Box::new(resolved),
+                    result_type,
+                })
+            }
+            // All other expression types: normal resolution
+            _ => self.resolve_expr(expr, scope),
         }
     }
 
