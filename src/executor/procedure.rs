@@ -91,11 +91,19 @@ pub fn eval_sp_expr(
 
         Expr::Identifier(ident) => {
             let name = ident.value.to_lowercase();
-            // Check locals first, then user variables
+            // User variables (@var): strip leading @ for lookup (session
+            // store keys are stored without the prefix)
+            if let Some(var_name) = name.strip_prefix('@') {
+                if !var_name.starts_with('@') {
+                    // Single @: user variable
+                    let vars = user_vars.read();
+                    return Ok(vars.get(var_name).cloned().unwrap_or(Datum::Null));
+                }
+            }
+            // Check locals first, then user variables by bare name
             if let Some(val) = ctx.locals.get(&name) {
                 return Ok(val.clone());
             }
-            // Check as user variable without @
             let vars = user_vars.read();
             if let Some(val) = vars.get(&name) {
                 return Ok(val.clone());
