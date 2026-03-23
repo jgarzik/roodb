@@ -55,6 +55,22 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
     ))
 }
 
+/// Extract row data from a value that may be MVCC-wrapped or raw.
+/// Returns None if the row is deleted. Handles both MVCC-wrapped rows
+/// (from normal operations) and raw rows (from roodb_init).
+fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
+    if value.len() > MVCC_HEADER_SIZE {
+        // MVCC-wrapped: check deleted flag
+        if value[16] == 1 {
+            return None; // deleted
+        }
+        Some(&value[MVCC_HEADER_SIZE..])
+    } else {
+        // Raw row (from roodb_init, no MVCC header)
+        Some(value)
+    }
+}
+
 // Key prefixes for Raft state in LSM
 const VOTE_KEY: &[u8] = b"_raft:vote";
 const PURGED_KEY: &[u8] = b"_raft:log_state:purged";
@@ -261,18 +277,9 @@ impl LsmRaftStorage {
 
         let mut catalog = self.catalog.write();
         for (_key, value) in rows {
-            // Try MVCC-wrapped row first (17-byte header)
-            let row_data = if value.len() > MVCC_HEADER_SIZE {
-                // Check deleted flag
-                if value[16] == 1 {
-                    continue;
-                }
-                &value[MVCC_HEADER_SIZE..]
-            } else {
-                // Raw row (from roodb_init, no MVCC header)
-                &value
+            let Some(row_data) = extract_row_data(&value) else {
+                continue;
             };
-
             if let Ok(row) = decode_row(row_data) {
                 if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
                     catalog.register_database(db_name.clone());
@@ -316,18 +323,12 @@ impl LsmRaftStorage {
                 .await
                 .map_err(read_err)?;
 
-            // Collect column rows for this table (skip MVCC header)
+            // Collect column rows for this table
             let mut column_rows = Vec::new();
             for (_key, value) in rows {
-                // Skip MVCC header (17 bytes: 8 + 8 + 1)
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                // Check if deleted
-                if value[16] == 1 {
-                    continue;
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     // Check if this row belongs to the table we're rebuilding
                     if let Some(crate::executor::Datum::String(tbl)) = row.values().first() {
@@ -352,13 +353,9 @@ impl LsmRaftStorage {
 
                     let mut constraint_rows = Vec::new();
                     for (_key, value) in constraint_data {
-                        if value.len() <= MVCC_HEADER_SIZE {
+                        let Some(row_data) = extract_row_data(&value) else {
                             continue;
-                        }
-                        if value[16] == 1 {
-                            continue;
-                        }
-                        let row_data = &value[MVCC_HEADER_SIZE..];
+                        };
                         if let Ok(row) = decode_row(row_data) {
                             if let Some(crate::executor::Datum::String(tbl)) = row.values().first()
                             {
@@ -431,13 +428,9 @@ impl LsmRaftStorage {
                 .map_err(read_err)?;
 
             for (_key, value) in rows {
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                if value[16] == 1 {
-                    continue;
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     if let Some(crate::executor::Datum::String(idx_name)) = row.values().first() {
                         if idx_name == index_name {
@@ -492,13 +485,9 @@ impl LsmRaftStorage {
         > = std::collections::HashMap::new();
 
         for (_key, value) in column_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
                     if !is_system_table(table_name) {
@@ -527,13 +516,9 @@ impl LsmRaftStorage {
         > = std::collections::HashMap::new();
 
         for (_key, value) in constraint_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
                     if !is_system_table(table_name) {
@@ -570,13 +555,9 @@ impl LsmRaftStorage {
             .map_err(read_err)?;
 
         for (_key, value) in index_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(index_def) = row_to_index_def(&row) {
                     index_defs.push(index_def);
@@ -596,13 +577,9 @@ impl LsmRaftStorage {
                 .map_err(read_err)?;
 
             for (_key, value) in db_rows {
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                if value[16] == 1 {
-                    continue; // Skip deleted
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
                         database_names.push(db_name.clone());
@@ -623,13 +600,9 @@ impl LsmRaftStorage {
                 .map_err(read_err)?;
 
             for (_key, value) in proc_rows {
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                if value[16] == 1 {
-                    continue; // Skip deleted
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     if let Some(proc_def) = row_to_procedure_def(&row) {
                         procedure_defs.push(proc_def);
