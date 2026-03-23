@@ -19,7 +19,7 @@ Key paths:
 ## Running Tests
 
 ```bash
-# Custom compatibility tests (22 tests, all pass)
+# Custom compatibility tests (23 tests, all pass)
 python3 tests/mysql_compat/run_mysql_tests.py
 
 # Official MySQL tests (curated, tiered)
@@ -58,7 +58,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Test | Status | Fail Line / Total | Blocking Feature |
 |------|--------|-------------------|-----------------|
 | bigint | FAIL | 361/502 (72%) | mysqltest WHILE loop / HEX() edge case |
-| null | FAIL | 113/324 (35%) | INSERT ... SELECT (INSERT-SELECT) |
+| null | FAIL | 113/324 (35%) | INSERT ... SELECT now supported, needs retest |
 | limit | FAIL | 237/448 (53%) | ORDER BY aggregate alias (count(*) c ... ORDER BY c) |
 | case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
 | type_varchar | FAIL | 21/176 (12%) | Duplicate key check on ALTER TABLE ADD PK |
@@ -72,7 +72,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 130/504 (26%) | CREATE TABLE AS SELECT + UNION |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | FAIL | 447/1271 (35%) | SQL_MODE NO_UNSIGNED_SUBTRACTION |
+| func_math | FAIL | 637/1271 (50%) | weight_string(_eucjpms) charset function |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
 | func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
@@ -91,7 +91,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | func_str | FAIL | 25/2630 (1%) | BINARY keyword in POSITION function |
 | func_concat | FAIL | 16/153 (10%) | Non-aggregated column in GROUP BY |
 
-### Custom Tests — 22/22 pass
+### Custom Tests — 23/23 pass
 
 ## Features Added for MySQL Compat
 
@@ -119,6 +119,12 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Expression headers | Column names reconstructed from expression trees |
 | String→number coercion | Implicit conversion in arithmetic contexts |
 | BIGINT UNSIGNED | Full u64 range support |
+| INSERT IGNORE | Suppress errors during INSERT, skip bad rows |
+| INSERT ... SELECT | Insert rows from a source query into a table |
+| ABS overflow detection | ABS(i64::MIN) returns ER_DATA_OUT_OF_RANGE; Decimal + UnsignedInt arms |
+| Negation overflow | checked_neg for Int; UnsignedInt overflow returns error not Decimal |
+| Log function sql_mode | ER_INVALID_ARGUMENT_FOR_LOGARITHM (3020) in DML with ERROR_FOR_DIVISION_BY_ZERO |
+| GET_FORMAT resolver | GET_FORMAT type inference + keyword-as-argument fallback |
 
 ## Gap Analysis — Next Steps
 

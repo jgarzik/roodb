@@ -12,6 +12,12 @@ use super::row::Row;
 /// Internal variable name for NO_UNSIGNED_SUBTRACTION flag (stored in UserVariables)
 const NO_UNSIGNED_SUB_VAR: &str = "__sys_no_unsigned_sub";
 
+/// Internal variable name for ERROR_FOR_DIVISION_BY_ZERO flag (stored in UserVariables)
+const ERROR_DIV_ZERO_VAR: &str = "__sys_error_div_zero";
+
+/// Internal variable name for strict-DML context flag (set during INSERT/UPDATE evaluation)
+const STRICT_DML_CONTEXT_VAR: &str = "__sys_strict_dml";
+
 /// Set the NO_UNSIGNED_SUBTRACTION flag for a session (stored in UserVariables)
 pub fn set_no_unsigned_subtraction(vars: &UserVariables, val: bool) {
     let mut w = vars.write();
@@ -26,6 +32,48 @@ pub fn set_no_unsigned_subtraction(vars: &UserVariables, val: bool) {
 fn no_unsigned_subtraction(vars: &UserVariables) -> bool {
     let r = vars.read();
     matches!(r.get(NO_UNSIGNED_SUB_VAR), Some(Datum::Bool(true)))
+}
+
+/// Set the ERROR_FOR_DIVISION_BY_ZERO flag for a session (stored in UserVariables)
+pub fn set_error_for_division_by_zero(vars: &UserVariables, val: bool) {
+    let mut w = vars.write();
+    if val {
+        w.insert(ERROR_DIV_ZERO_VAR.to_string(), Datum::Bool(true));
+    } else {
+        w.remove(ERROR_DIV_ZERO_VAR);
+    }
+}
+
+/// Get the ERROR_FOR_DIVISION_BY_ZERO flag from UserVariables
+fn error_for_division_by_zero(vars: Option<&UserVariables>) -> bool {
+    match vars {
+        Some(v) => {
+            let r = v.read();
+            matches!(r.get(ERROR_DIV_ZERO_VAR), Some(Datum::Bool(true)))
+        }
+        None => false,
+    }
+}
+
+/// Set/clear the strict DML context flag (called by Insert/Update executors)
+pub fn set_strict_dml_context(vars: &UserVariables, val: bool) {
+    let mut w = vars.write();
+    if val {
+        w.insert(STRICT_DML_CONTEXT_VAR.to_string(), Datum::Bool(true));
+    } else {
+        w.remove(STRICT_DML_CONTEXT_VAR);
+    }
+}
+
+/// Check if we're in a strict DML context (INSERT/UPDATE with strict mode)
+fn in_strict_dml_context(vars: Option<&UserVariables>) -> bool {
+    match vars {
+        Some(v) => {
+            let r = v.read();
+            matches!(r.get(STRICT_DML_CONTEXT_VAR), Some(Datum::Bool(true)))
+        }
+        None => false,
+    }
 }
 
 /// Evaluate an expression against a row, with access to user variables
@@ -74,7 +122,7 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
                 .iter()
                 .map(|a| evaluate(a, row, vars))
                 .collect::<Result<_, _>>()?;
-            eval_function(name, &arg_vals)
+            eval_function(name, &arg_vals, Some(vars))
         }
 
         ResolvedExpr::IsNull { expr, negated } => {
@@ -1466,7 +1514,11 @@ pub fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
 }
 
 /// Evaluate a scalar function
-pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
+pub fn eval_function(
+    name: &str,
+    args: &[Datum],
+    vars: Option<&UserVariables>,
+) -> ExecutorResult<Datum> {
     let name_upper = name.to_uppercase();
     match name_upper.as_str() {
         // String functions
@@ -2090,17 +2142,19 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                     "LOG requires 1-2 arguments".to_string(),
                 ));
             }
-            if args[0].is_null() {
+            if args[0].is_null() || (args.len() == 2 && args[1].is_null()) {
                 return Ok(Datum::Null);
             }
             let result = if args.len() == 1 {
-                args[0].as_float().unwrap_or(0.0).ln()
+                let v = args[0].as_float().unwrap_or(0.0);
+                check_log_arg(v, "log", vars)?;
+                v.ln()
             } else {
                 let base = args[0].as_float().unwrap_or(0.0);
                 let val = args[1].as_float().unwrap_or(0.0);
+                check_log_arg(val, "log", vars)?;
                 val.log(base)
             };
-            // MySQL returns NULL for NaN/Inf results (log of negative, etc.)
             Ok(float_or_null(result))
         }
 
@@ -2113,7 +2167,9 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).log2()))
+            let v = args[0].as_float().unwrap_or(0.0);
+            check_log_arg(v, "log2", vars)?;
+            Ok(float_or_null(v.log2()))
         }
 
         "LOG10" => {
@@ -2125,7 +2181,9 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).log10()))
+            let v = args[0].as_float().unwrap_or(0.0);
+            check_log_arg(v, "log10", vars)?;
+            Ok(float_or_null(v.log10()))
         }
 
         "LN" => {
@@ -2137,7 +2195,9 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
-            Ok(float_or_null(args[0].as_float().unwrap_or(0.0).ln()))
+            let v = args[0].as_float().unwrap_or(0.0);
+            check_log_arg(v, "ln", vars)?;
+            Ok(float_or_null(v.ln()))
         }
 
         "EXP" => {
@@ -4037,6 +4097,19 @@ fn float_or_null(v: f64) -> Datum {
     }
 }
 
+/// Check if a logarithm argument is valid (> 0). In DML context with
+/// ERROR_FOR_DIVISION_BY_ZERO sql_mode, returns ER_INVALID_ARGUMENT_FOR_LOGARITHM.
+/// In SELECT context, the caller returns NULL via float_or_null.
+fn check_log_arg(v: f64, func_name: &str, vars: Option<&UserVariables>) -> ExecutorResult<()> {
+    if v <= 0.0 && error_for_division_by_zero(vars) && in_strict_dml_context(vars) {
+        return Err(ExecutorError::InvalidArgumentForLogarithm(format!(
+            "Invalid argument for logarithm in function {}",
+            func_name
+        )));
+    }
+    Ok(())
+}
+
 fn parse_time_to_secs(s: &str) -> i64 {
     let s = s.trim();
     // Integer 0 means "00:00:00"
@@ -4950,21 +5023,25 @@ mod tests {
     #[test]
     fn test_monthname_zero_date() {
         // MONTHNAME('0000-00-00') should return NULL
-        let result = eval_function("MONTHNAME", &[Datum::String("0000-00-00".to_string())]);
+        let result = eval_function(
+            "MONTHNAME",
+            &[Datum::String("0000-00-00".to_string())],
+            None,
+        );
         assert_eq!(result.unwrap(), Datum::Null);
     }
 
     #[test]
     fn test_dayname_zero_date() {
         // DAYNAME('0000-00-00') should return NULL
-        let result = eval_function("DAYNAME", &[Datum::String("0000-00-00".to_string())]);
+        let result = eval_function("DAYNAME", &[Datum::String("0000-00-00".to_string())], None);
         assert_eq!(result.unwrap(), Datum::Null);
     }
 
     #[test]
     fn test_quarter_zero_date() {
         // QUARTER('0000-00-00') should return NULL
-        let result = eval_function("QUARTER", &[Datum::String("0000-00-00".to_string())]);
+        let result = eval_function("QUARTER", &[Datum::String("0000-00-00".to_string())], None);
         assert_eq!(result.unwrap(), Datum::Null);
     }
 
@@ -4976,6 +5053,7 @@ mod tests {
                 Datum::String("2024-03-23".to_string()),
                 Datum::String("%W, %M %D, %Y".to_string()),
             ],
+            None,
         );
         assert_eq!(
             result.unwrap(),
@@ -4991,6 +5069,7 @@ mod tests {
                 Datum::String("March 23, 2024".to_string()),
                 Datum::String("%M %d, %Y".to_string()),
             ],
+            None,
         );
         assert_eq!(result.unwrap(), Datum::String("2024-03-23".to_string()));
     }
@@ -4999,53 +5078,59 @@ mod tests {
     fn test_extraction_functions() {
         let dt = Datum::String("2024-03-23 14:30:45".to_string());
         assert_eq!(
-            eval_function("HOUR", &[dt.clone()]).unwrap(),
+            eval_function("HOUR", &[dt.clone()], None).unwrap(),
             Datum::Int(14)
         );
         assert_eq!(
-            eval_function("MINUTE", &[dt.clone()]).unwrap(),
+            eval_function("MINUTE", &[dt.clone()], None).unwrap(),
             Datum::Int(30)
         );
         assert_eq!(
-            eval_function("SECOND", &[dt.clone()]).unwrap(),
+            eval_function("SECOND", &[dt.clone()], None).unwrap(),
             Datum::Int(45)
         );
         assert_eq!(
-            eval_function("YEAR", &[dt.clone()]).unwrap(),
+            eval_function("YEAR", &[dt.clone()], None).unwrap(),
             Datum::Int(2024)
         );
         assert_eq!(
-            eval_function("MONTH", &[dt.clone()]).unwrap(),
+            eval_function("MONTH", &[dt.clone()], None).unwrap(),
             Datum::Int(3)
         );
-        assert_eq!(eval_function("DAY", &[dt.clone()]).unwrap(), Datum::Int(23));
         assert_eq!(
-            eval_function("DAYOFMONTH", &[dt.clone()]).unwrap(),
+            eval_function("DAY", &[dt.clone()], None).unwrap(),
+            Datum::Int(23)
+        );
+        assert_eq!(
+            eval_function("DAYOFMONTH", &[dt.clone()], None).unwrap(),
             Datum::Int(23)
         );
         // 2024-03-23 is Saturday
         assert_eq!(
-            eval_function("DAYOFWEEK", &[dt.clone()]).unwrap(),
+            eval_function("DAYOFWEEK", &[dt.clone()], None).unwrap(),
             Datum::Int(7)
         ); // 7=Sat
         assert_eq!(
-            eval_function("WEEKDAY", &[dt.clone()]).unwrap(),
+            eval_function("WEEKDAY", &[dt.clone()], None).unwrap(),
             Datum::Int(5)
         ); // 5=Sat
         assert_eq!(
-            eval_function("DAYNAME", &[dt.clone()]).unwrap(),
+            eval_function("DAYNAME", &[dt.clone()], None).unwrap(),
             Datum::String("Saturday".to_string())
         );
         assert_eq!(
-            eval_function("MONTHNAME", &[dt.clone()]).unwrap(),
+            eval_function("MONTHNAME", &[dt.clone()], None).unwrap(),
             Datum::String("March".to_string())
         );
         // Day 83 of 2024 (leap year)
         assert_eq!(
-            eval_function("DAYOFYEAR", &[dt.clone()]).unwrap(),
+            eval_function("DAYOFYEAR", &[dt.clone()], None).unwrap(),
             Datum::Int(83)
         );
-        assert_eq!(eval_function("QUARTER", &[dt]).unwrap(), Datum::Int(1));
+        assert_eq!(
+            eval_function("QUARTER", &[dt], None).unwrap(),
+            Datum::Int(1)
+        );
     }
 
     #[test]
@@ -5053,34 +5138,35 @@ mod tests {
         let result = eval_function(
             "MAKETIME",
             &[Datum::Int(14), Datum::Int(30), Datum::Int(45)],
+            None,
         );
         assert_eq!(result.unwrap(), Datum::String("14:30:45".to_string()));
     }
 
     #[test]
     fn test_makedate() {
-        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(1)]);
+        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(1)], None);
         assert_eq!(result.unwrap(), Datum::String("2024-01-01".to_string()));
-        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(60)]);
+        let result = eval_function("MAKEDATE", &[Datum::Int(2024), Datum::Int(60)], None);
         assert_eq!(result.unwrap(), Datum::String("2024-02-29".to_string())); // leap year
     }
 
     #[test]
     fn test_last_day() {
-        let result = eval_function("LAST_DAY", &[Datum::String("2024-02-15".to_string())]);
+        let result = eval_function("LAST_DAY", &[Datum::String("2024-02-15".to_string())], None);
         assert_eq!(result.unwrap(), Datum::String("2024-02-29".to_string()));
-        let result = eval_function("LAST_DAY", &[Datum::String("2023-02-15".to_string())]);
+        let result = eval_function("LAST_DAY", &[Datum::String("2023-02-15".to_string())], None);
         assert_eq!(result.unwrap(), Datum::String("2023-02-28".to_string()));
     }
 
     #[test]
     fn test_sec_to_time() {
         assert_eq!(
-            eval_function("SEC_TO_TIME", &[Datum::Int(3661)]).unwrap(),
+            eval_function("SEC_TO_TIME", &[Datum::Int(3661)], None).unwrap(),
             Datum::String("01:01:01".to_string())
         );
         assert_eq!(
-            eval_function("SEC_TO_TIME", &[Datum::Int(-3661)]).unwrap(),
+            eval_function("SEC_TO_TIME", &[Datum::Int(-3661)], None).unwrap(),
             Datum::String("-01:01:01".to_string())
         );
     }
@@ -5088,7 +5174,12 @@ mod tests {
     #[test]
     fn test_time_to_sec() {
         assert_eq!(
-            eval_function("TIME_TO_SEC", &[Datum::String("01:01:01".to_string())]).unwrap(),
+            eval_function(
+                "TIME_TO_SEC",
+                &[Datum::String("01:01:01".to_string())],
+                None
+            )
+            .unwrap(),
             Datum::Int(3661)
         );
     }
@@ -5096,12 +5187,12 @@ mod tests {
     #[test]
     fn test_period_add() {
         assert_eq!(
-            eval_function("PERIOD_ADD", &[Datum::Int(202401), Datum::Int(5)]).unwrap(),
+            eval_function("PERIOD_ADD", &[Datum::Int(202401), Datum::Int(5)], None).unwrap(),
             Datum::Int(202406)
         );
         // Cross year boundary
         assert_eq!(
-            eval_function("PERIOD_ADD", &[Datum::Int(202411), Datum::Int(3)]).unwrap(),
+            eval_function("PERIOD_ADD", &[Datum::Int(202411), Datum::Int(3)], None).unwrap(),
             Datum::Int(202502)
         );
     }
@@ -5109,7 +5200,12 @@ mod tests {
     #[test]
     fn test_period_diff() {
         assert_eq!(
-            eval_function("PERIOD_DIFF", &[Datum::Int(202403), Datum::Int(202401)]).unwrap(),
+            eval_function(
+                "PERIOD_DIFF",
+                &[Datum::Int(202403), Datum::Int(202401)],
+                None
+            )
+            .unwrap(),
             Datum::Int(2)
         );
     }
@@ -5118,34 +5214,38 @@ mod tests {
     fn test_date_and_time_extract() {
         let dt = Datum::String("2024-03-23 14:30:45".to_string());
         assert_eq!(
-            eval_function("DATE", &[dt.clone()]).unwrap(),
+            eval_function("DATE", &[dt.clone()], None).unwrap(),
             Datum::String("2024-03-23".to_string())
         );
         assert_eq!(
-            eval_function("TIME", &[dt]).unwrap(),
+            eval_function("TIME", &[dt], None).unwrap(),
             Datum::String("14:30:45".to_string())
         );
     }
 
     #[test]
     fn test_null_propagation_datetime_funcs() {
-        assert_eq!(eval_function("HOUR", &[Datum::Null]).unwrap(), Datum::Null);
         assert_eq!(
-            eval_function("MINUTE", &[Datum::Null]).unwrap(),
+            eval_function("HOUR", &[Datum::Null], None).unwrap(),
             Datum::Null
         );
         assert_eq!(
-            eval_function("DAYNAME", &[Datum::Null]).unwrap(),
+            eval_function("MINUTE", &[Datum::Null], None).unwrap(),
             Datum::Null
         );
         assert_eq!(
-            eval_function("MONTHNAME", &[Datum::Null]).unwrap(),
+            eval_function("DAYNAME", &[Datum::Null], None).unwrap(),
+            Datum::Null
+        );
+        assert_eq!(
+            eval_function("MONTHNAME", &[Datum::Null], None).unwrap(),
             Datum::Null
         );
         assert_eq!(
             eval_function(
                 "DATE_FORMAT",
-                &[Datum::Null, Datum::String("%Y".to_string())]
+                &[Datum::Null, Datum::String("%Y".to_string())],
+                None,
             )
             .unwrap(),
             Datum::Null
@@ -5153,7 +5253,8 @@ mod tests {
         assert_eq!(
             eval_function(
                 "DATE_FORMAT",
-                &[Datum::String("2024-01-01".to_string()), Datum::Null]
+                &[Datum::String("2024-01-01".to_string()), Datum::Null],
+                None,
             )
             .unwrap(),
             Datum::Null
@@ -5191,15 +5292,15 @@ mod tests {
     #[test]
     fn test_abs_int() {
         assert_eq!(
-            eval_function("ABS", &[Datum::Int(-42)]).unwrap(),
+            eval_function("ABS", &[Datum::Int(-42)], None).unwrap(),
             Datum::Int(42)
         );
         assert_eq!(
-            eval_function("ABS", &[Datum::Int(42)]).unwrap(),
+            eval_function("ABS", &[Datum::Int(42)], None).unwrap(),
             Datum::Int(42)
         );
         assert_eq!(
-            eval_function("ABS", &[Datum::Int(0)]).unwrap(),
+            eval_function("ABS", &[Datum::Int(0)], None).unwrap(),
             Datum::Int(0)
         );
     }
@@ -5207,7 +5308,7 @@ mod tests {
     #[test]
     fn test_abs_int_min_overflow() {
         // ABS(i64::MIN) should error — |i64::MIN| > i64::MAX
-        let result = eval_function("ABS", &[Datum::Int(i64::MIN)]);
+        let result = eval_function("ABS", &[Datum::Int(i64::MIN)], None);
         assert!(result.is_err(), "ABS(i64::MIN) should overflow");
     }
 
@@ -5219,7 +5320,8 @@ mod tests {
                 &[Datum::Decimal {
                     value: -100,
                     scale: 2
-                }]
+                }],
+                None,
             )
             .unwrap(),
             Datum::Decimal {
@@ -5233,7 +5335,8 @@ mod tests {
                 &[Datum::Decimal {
                     value: 100,
                     scale: 2
-                }]
+                }],
+                None,
             )
             .unwrap(),
             Datum::Decimal {
@@ -5246,14 +5349,17 @@ mod tests {
     #[test]
     fn test_abs_unsigned() {
         assert_eq!(
-            eval_function("ABS", &[Datum::UnsignedInt(42)]).unwrap(),
+            eval_function("ABS", &[Datum::UnsignedInt(42)], None).unwrap(),
             Datum::UnsignedInt(42)
         );
     }
 
     #[test]
     fn test_abs_null() {
-        assert_eq!(eval_function("ABS", &[Datum::Null]).unwrap(), Datum::Null);
+        assert_eq!(
+            eval_function("ABS", &[Datum::Null], None).unwrap(),
+            Datum::Null
+        );
     }
 
     #[test]

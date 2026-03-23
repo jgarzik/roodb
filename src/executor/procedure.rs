@@ -203,7 +203,7 @@ pub fn eval_sp_expr(
                     return Err("Subquery function args not supported in procedures".to_string());
                 }
             };
-            eval_function(&name, &args).map_err(|e| e.to_string())
+            eval_function(&name, &args, None).map_err(|e| e.to_string())
         }
 
         // Nested expression

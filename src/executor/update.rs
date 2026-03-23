@@ -183,11 +183,17 @@ impl Executor for Update {
             return Ok(None);
         }
 
-        if self.key_value.is_some() {
-            self.next_point_get().await?;
+        // Set strict DML context so log functions error instead of returning NULL
+        super::eval::set_strict_dml_context(&self.user_variables, true);
+
+        let result = if self.key_value.is_some() {
+            self.next_point_get().await
         } else {
-            self.next_full_scan().await?;
-        }
+            self.next_full_scan().await
+        };
+
+        super::eval::set_strict_dml_context(&self.user_variables, false);
+        result?;
 
         self.done = true;
 

@@ -116,7 +116,7 @@ where
         let (read_half, write_half) = tokio::io::split(stream);
 
         let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
-        RooDbConnection {
+        let conn = RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
             connection_id,
@@ -132,7 +132,13 @@ where
             raft_node,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
-        }
+        };
+        // Initialize eval flags from default sql_mode
+        crate::executor::eval::set_error_for_division_by_zero(
+            &conn.session.user_variables(),
+            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
+        );
+        conn
     }
 
     /// Create a new RooDB connection with pre-established scramble (for STARTTLS)
@@ -153,7 +159,7 @@ where
         let (read_half, write_half) = tokio::io::split(stream);
 
         let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
-        RooDbConnection {
+        let conn = RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
             connection_id,
@@ -169,7 +175,12 @@ where
             raft_node,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
-        }
+        };
+        crate::executor::eval::set_error_for_division_by_zero(
+            &conn.session.user_variables(),
+            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
+        );
+        conn
     }
 
     /// Complete handshake after STARTTLS upgrade
@@ -1052,6 +1063,10 @@ where
             crate::executor::eval::set_no_unsigned_subtraction(
                 &self.session.user_variables(),
                 self.session.has_sql_mode("NO_UNSIGNED_SUBTRACTION"),
+            );
+            crate::executor::eval::set_error_for_division_by_zero(
+                &self.session.user_variables(),
+                self.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
             );
             return self.send_ok(0, 0).await;
         }
@@ -4890,6 +4905,14 @@ where
                     (codes::ER_BAD_NULL_ERROR, "23000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::DataOutOfRange(_) = exec_err {
                     (codes::ER_DATA_OUT_OF_RANGE, "22003", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::InvalidArgumentForLogarithm(_) =
+                    exec_err
+                {
+                    (
+                        codes::ER_INVALID_ARGUMENT_FOR_LOGARITHM,
+                        "2201E",
+                        exec_err.to_string(),
+                    )
                 } else {
                     (
                         codes::ER_UNKNOWN_ERROR,
