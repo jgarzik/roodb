@@ -110,7 +110,22 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
 
         ResolvedExpr::UnaryOp { op, expr, .. } => {
             let val = evaluate(expr, row, vars)?;
-            eval_unary_op(op, &val)
+            let result = eval_unary_op(op, &val);
+            // For unary Neg on UnsignedInt that overflows BIGINT:
+            // - Column values → keep the DataOutOfRange error (MySQL semantics)
+            // - Literal/expression values → promote to Decimal
+            if result.is_err() && matches!(op, UnaryOp::Neg) {
+                if let Datum::UnsignedInt(u) = &val {
+                    let is_column = matches!(expr.as_ref(), ResolvedExpr::Column(_));
+                    if !is_column {
+                        return Ok(Datum::Decimal {
+                            value: -(*u as i128),
+                            scale: 0,
+                        });
+                    }
+                }
+            }
+            result
         }
 
         ResolvedExpr::Function { name, args, .. } => {

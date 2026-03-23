@@ -57,7 +57,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Test | Status | Fail Line / Total | Blocking Feature |
 |------|--------|-------------------|-----------------|
-| bigint | FAIL | 361/502 (72%) | mysqltest WHILE loop / HEX() edge case |
+| bigint | FAIL | 327/502 (65%) | Double-negation with --enable_metadata |
 | null | FAIL | 113/324 (35%) | INSERT ... SELECT now supported, needs retest |
 | limit | FAIL | 237/448 (53%) | ORDER BY aggregate alias (count(*) c ... ORDER BY c) |
 | case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
