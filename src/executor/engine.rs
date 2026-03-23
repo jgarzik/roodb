@@ -9,18 +9,25 @@ use parking_lot::RwLock;
 use crate::catalog::Catalog;
 use crate::planner::PhysicalPlan;
 use crate::raft::RaftNode;
+use crate::server::session::UserVariables;
 use crate::txn::MvccStorage;
 
 use super::aggregate::HashAggregate;
+use super::analyze::AnalyzeTable;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
-use super::ddl::{CreateIndex, CreateTable, DropIndex, DropTable};
+use super::ddl::{
+    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, CreateView,
+    DropDatabase, DropIndex, DropTable, DropView, Materialize,
+};
 use super::delete::Delete;
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
+use super::explain_exec::ExplainExecutor;
 use super::filter::Filter;
 use super::hash_join::HashJoin;
 use super::insert::Insert;
+use super::insert_select::InsertSelect;
 use super::join::NestedLoopJoin;
 use super::limit::Limit;
 use super::point_get::PointGet;
@@ -29,6 +36,7 @@ use super::range_scan::RangeScan;
 use super::scan::TableScan;
 use super::single_row::SingleRow;
 use super::sort::Sort;
+use super::union::Union;
 use super::update::Update;
 use super::Executor;
 
@@ -42,6 +50,8 @@ pub struct ExecutorEngine {
     txn_context: Option<TransactionContext>,
     /// Optional Raft node for replication (DDL goes through Raft)
     raft_node: Option<Arc<RaftNode>>,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl ExecutorEngine {
@@ -50,12 +60,14 @@ impl ExecutorEngine {
         mvcc: Arc<MvccStorage>,
         catalog: Arc<RwLock<Catalog>>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         ExecutorEngine {
             mvcc,
             catalog,
             txn_context,
             raft_node: None,
+            user_variables,
         }
     }
 
@@ -65,12 +77,14 @@ impl ExecutorEngine {
         catalog: Arc<RwLock<Catalog>>,
         txn_context: Option<TransactionContext>,
         raft_node: Arc<RaftNode>,
+        user_variables: UserVariables,
     ) -> Self {
         ExecutorEngine {
             mvcc,
             catalog,
             txn_context,
             raft_node: Some(raft_node),
+            user_variables,
         }
     }
 
@@ -85,14 +99,19 @@ impl ExecutorEngine {
 
             PhysicalPlan::TableScan {
                 table,
-                columns: _,
+                columns,
                 filter,
-            } => Ok(Box::new(TableScan::new(
-                table,
-                filter,
-                self.mvcc.clone(),
-                self.txn_context.clone(),
-            ))),
+            } => {
+                let schema_types: Vec<_> = columns.iter().map(|c| c.data_type.clone()).collect();
+                Ok(Box::new(TableScan::with_schema_types(
+                    table,
+                    filter,
+                    self.mvcc.clone(),
+                    self.txn_context.clone(),
+                    self.user_variables.clone(),
+                    schema_types,
+                )))
+            }
 
             PhysicalPlan::PointGet {
                 table,
@@ -103,6 +122,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::RangeScan {
@@ -124,16 +144,25 @@ impl ExecutorEngine {
                 },
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::Filter { input, predicate } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Filter::new(input_exec, predicate)))
+                Ok(Box::new(Filter::new(
+                    input_exec,
+                    predicate,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::Project { input, expressions } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Project::new(input_exec, expressions)))
+                Ok(Box::new(Project::new(
+                    input_exec,
+                    expressions,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::NestedLoopJoin {
@@ -155,6 +184,7 @@ impl ExecutorEngine {
                     condition,
                     left_width,
                     right_width,
+                    self.user_variables.clone(),
                 )))
             }
 
@@ -180,6 +210,7 @@ impl ExecutorEngine {
                     condition,
                     left_width,
                     right_width,
+                    self.user_variables.clone(),
                 )))
             }
 
@@ -190,13 +221,20 @@ impl ExecutorEngine {
             } => {
                 let input_exec = self.build_node(*input)?;
                 Ok(Box::new(HashAggregate::new(
-                    input_exec, group_by, aggregates,
+                    input_exec,
+                    group_by,
+                    aggregates,
+                    self.user_variables.clone(),
                 )))
             }
 
             PhysicalPlan::Sort { input, order_by } => {
                 let input_exec = self.build_node(*input)?;
-                Ok(Box::new(Sort::new(input_exec, order_by)))
+                Ok(Box::new(Sort::new(
+                    input_exec,
+                    order_by,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::Limit {
@@ -213,12 +251,19 @@ impl ExecutorEngine {
                 Ok(Box::new(HashDistinct::new(input_exec)))
             }
 
+            PhysicalPlan::Union { left, right, all } => {
+                let left_exec = self.build_node(*left)?;
+                let right_exec = self.build_node(*right)?;
+                Ok(Box::new(Union::new(left_exec, right_exec, all)))
+            }
+
             PhysicalPlan::Insert {
                 table,
                 columns,
                 values,
                 auto_increment_indices,
                 pk_column_indices,
+                ignore,
             } => Ok(Box::new(Insert::new(
                 table,
                 columns,
@@ -226,7 +271,29 @@ impl ExecutorEngine {
                 self.txn_context.clone(),
                 auto_increment_indices,
                 pk_column_indices,
+                self.user_variables.clone(),
+                ignore,
             ))),
+
+            PhysicalPlan::InsertSelect {
+                table,
+                columns,
+                source,
+                auto_increment_indices,
+                pk_column_indices,
+                ignore,
+            } => {
+                let source_exec = self.build_node(*source)?;
+                Ok(Box::new(InsertSelect::new(
+                    table,
+                    columns,
+                    source_exec,
+                    self.txn_context.clone(),
+                    auto_increment_indices,
+                    pk_column_indices,
+                    ignore,
+                )))
+            }
 
             PhysicalPlan::Update {
                 table,
@@ -240,6 +307,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::Delete {
@@ -252,6 +320,7 @@ impl ExecutorEngine {
                 key_value,
                 self.mvcc.clone(),
                 self.txn_context.clone(),
+                self.user_variables.clone(),
             ))),
 
             PhysicalPlan::CreateTable {
@@ -280,6 +349,48 @@ impl ExecutorEngine {
                 }
             }
 
+            PhysicalPlan::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                source,
+            } => {
+                let source_exec = self.build_node(*source)?;
+                Ok(Box::new(CreateTableAs::new(CreateTableAsParams {
+                    name,
+                    columns,
+                    constraints,
+                    if_not_exists,
+                    catalog: self.catalog.clone(),
+                    raft_node: self.raft_node.clone(),
+                    source: source_exec,
+                    txn_context: self.txn_context.clone(),
+                })))
+            }
+
+            PhysicalPlan::Materialize { input } => {
+                let inner = self.build_node(*input)?;
+                Ok(Box::new(Materialize::new(inner)))
+            }
+
+            PhysicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            } => Ok(Box::new(CreateView::new(
+                name,
+                query_sql,
+                or_replace,
+                self.catalog.clone(),
+            ))),
+
+            PhysicalPlan::DropView { name, if_exists } => Ok(Box::new(DropView::new(
+                name,
+                if_exists,
+                self.catalog.clone(),
+            ))),
+
             PhysicalPlan::DropTable { name, if_exists } => {
                 if let Some(ref raft_node) = self.raft_node {
                     Ok(Box::new(DropTable::with_raft(
@@ -296,6 +407,28 @@ impl ExecutorEngine {
                         self.catalog.clone(),
                     )))
                 }
+            }
+
+            PhysicalPlan::DropMultipleTables { names, if_exists } => {
+                let mut executors: Vec<Box<dyn Executor>> = Vec::new();
+                for name in names {
+                    if let Some(ref raft_node) = self.raft_node {
+                        executors.push(Box::new(DropTable::with_raft(
+                            name,
+                            if_exists,
+                            self.catalog.clone(),
+                            raft_node.clone(),
+                            self.mvcc.clone(),
+                        )));
+                    } else {
+                        executors.push(Box::new(DropTable::new(
+                            name,
+                            if_exists,
+                            self.catalog.clone(),
+                        )));
+                    }
+                }
+                Ok(Box::new(super::multi_exec::MultiExecutor::new(executors)))
             }
 
             PhysicalPlan::CreateIndex {
@@ -334,6 +467,44 @@ impl ExecutorEngine {
                     )))
                 } else {
                     Ok(Box::new(DropIndex::new(name, self.catalog.clone())))
+                }
+            }
+
+            PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(CreateDatabase::with_raft(
+                        name,
+                        if_not_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(CreateDatabase::new(
+                        name,
+                        if_not_exists,
+                        self.catalog.clone(),
+                    )))
+                }
+            }
+
+            PhysicalPlan::DropDatabase { name, if_exists } => {
+                if let Some(ref raft_node) = self.raft_node {
+                    Ok(Box::new(DropDatabase::with_raft(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                        raft_node.clone(),
+                        self.mvcc.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(DropDatabase::new(
+                        name,
+                        if_exists,
+                        self.catalog.clone(),
+                    )))
                 }
             }
 
@@ -451,6 +622,20 @@ impl ExecutorEngine {
                     self.mvcc.inner().clone(),
                 )))
             }
+
+            PhysicalPlan::AnalyzeTable { table } => {
+                let raft_node = self.raft_node.clone().ok_or_else(|| {
+                    ExecutorError::Internal("ANALYZE TABLE requires Raft".to_string())
+                })?;
+                Ok(Box::new(AnalyzeTable::new(
+                    table,
+                    self.mvcc.clone(),
+                    self.catalog.clone(),
+                    raft_node,
+                )))
+            }
+
+            PhysicalPlan::Explain { inner } => Ok(Box::new(ExplainExecutor::new(*inner))),
         }
     }
 }
@@ -562,7 +747,8 @@ mod tests {
         }
 
         // No transaction context for simple tests (legacy behavior)
-        let engine = ExecutorEngine::new(mvcc.clone(), catalog, None);
+        let user_variables = UserVariables::default();
+        let engine = ExecutorEngine::new(mvcc.clone(), catalog, None, user_variables);
         (engine, mvcc)
     }
 

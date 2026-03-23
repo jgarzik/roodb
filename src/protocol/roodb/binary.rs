@@ -68,6 +68,8 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             _ => i.to_le_bytes().to_vec(),
         },
 
+        Datum::UnsignedInt(u) => u.to_le_bytes().to_vec(),
+
         Datum::Float(f) => match data_type {
             DataType::Float => (*f as f32).to_le_bytes().to_vec(),
             _ => f.to_le_bytes().to_vec(),
@@ -86,9 +88,27 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             out
         }
 
+        Datum::Bit { value, width } => {
+            let byte_len = (*width as usize).div_ceil(8);
+            let be_bytes = value.to_be_bytes();
+            let bytes = &be_bytes[8 - byte_len..];
+            let mut out = encode_length_encoded_int(bytes.len() as u64);
+            out.extend_from_slice(bytes);
+            out
+        }
+
         Datum::Timestamp(ts) => {
             // Encode as MySQL binary datetime: length-prefixed fields
             encode_binary_timestamp(*ts)
+        }
+
+        Datum::Decimal { value, scale } => {
+            // Encode as length-encoded string (MySQL sends DECIMAL as string in binary protocol)
+            let s = crate::executor::datum::format_decimal(*value, *scale);
+            let bytes = s.as_bytes();
+            let mut out = encode_length_encoded_int(bytes.len() as u64);
+            out.extend_from_slice(bytes);
+            out
         }
     }
 }

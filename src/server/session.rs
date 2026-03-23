@@ -1,8 +1,31 @@
 //! Session state for RooDB connections
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// MySQL 8.0 default sql_mode values
+const DEFAULT_SQL_MODES: &[&str] = &[
+    "ONLY_FULL_GROUP_BY",
+    "STRICT_TRANS_TABLES",
+    "NO_ZERO_IN_DATE",
+    "NO_ZERO_DATE",
+    "ERROR_FOR_DIVISION_BY_ZERO",
+    "NO_ENGINE_SUBSTITUTION",
+];
+
+fn default_sql_modes() -> HashSet<String> {
+    DEFAULT_SQL_MODES.iter().map(|s| s.to_string()).collect()
+}
+
+use parking_lot::RwLock;
+
+use crate::executor::Datum;
 use crate::raft::RowChange;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 use crate::txn::{IsolationLevel, TimeoutConfig};
+
+/// Thread-safe per-session user variable storage (@var)
+pub type UserVariables = Arc<RwLock<HashMap<String, Datum>>>;
 
 /// Default batch size for row ID allocation
 const ROW_ID_BATCH_SIZE: u64 = 1000;
@@ -58,6 +81,17 @@ impl IdBatch {
     }
 }
 
+/// A warning generated during query execution
+#[derive(Debug, Clone)]
+pub struct Warning {
+    /// Warning level (Note, Warning, Error)
+    pub level: String,
+    /// MySQL-compatible warning code
+    pub code: u16,
+    /// Human-readable message
+    pub message: String,
+}
+
 /// Per-connection session state
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -85,6 +119,23 @@ pub struct Session {
     // ID batching for reduced atomic contention
     /// Pre-allocated batch of row IDs for this session
     row_id_batch: IdBatch,
+
+    // Warning tracking
+    /// Warnings accumulated during the current statement
+    warnings: Vec<Warning>,
+
+    // User variables (@var)
+    /// Per-session user variable storage
+    user_variables: UserVariables,
+
+    /// SQL-level prepared statements (PREPARE stmt FROM 'sql')
+    pub sql_prepared_stmts: std::collections::HashMap<String, String>,
+
+    /// Active SQL modes (e.g., NO_UNSIGNED_SUBTRACTION, STRICT_TRANS_TABLES)
+    sql_modes: HashSet<String>,
+
+    /// Temporary table names owned by this session (cleaned up on disconnect)
+    temp_table_names: Vec<String>,
 }
 
 impl Session {
@@ -103,6 +154,16 @@ impl Session {
             pending_changes: Vec::new(),
             // ID batching
             row_id_batch: IdBatch::empty(),
+            // Warnings
+            warnings: Vec::new(),
+            // User variables
+            user_variables: Arc::new(RwLock::new(HashMap::new())),
+            // SQL prepared statements
+            sql_prepared_stmts: std::collections::HashMap::new(),
+            // SQL modes — MySQL 8.0 defaults
+            sql_modes: default_sql_modes(),
+            // Temporary tables
+            temp_table_names: Vec::new(),
         }
     }
 
@@ -206,5 +267,97 @@ impl Session {
         self.row_id_batch
             .next_id()
             .expect("freshly refilled batch should have IDs")
+    }
+
+    // ============ Warning tracking ============
+
+    /// Add a warning to the current statement's warning list
+    pub fn add_warning(&mut self, level: &str, code: u16, message: String) {
+        self.warnings.push(Warning {
+            level: level.to_string(),
+            code,
+            message,
+        });
+    }
+
+    /// Clear warnings (called at start of each statement)
+    pub fn clear_warnings(&mut self) {
+        self.warnings.clear();
+    }
+
+    /// Get the current warning count
+    pub fn warning_count(&self) -> u16 {
+        self.warnings.len() as u16
+    }
+
+    /// Get a reference to accumulated warnings
+    pub fn warnings(&self) -> &[Warning] {
+        &self.warnings
+    }
+
+    // ============ User variables (@var) ============
+
+    /// Get a clone of the user variables handle (Arc-cloned, cheap)
+    pub fn user_variables(&self) -> UserVariables {
+        self.user_variables.clone()
+    }
+
+    /// Get a user variable value, returns Datum::Null if not set
+    pub fn get_user_variable(&self, name: &str) -> Datum {
+        let vars = self.user_variables.read();
+        vars.get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or(Datum::Null)
+    }
+
+    /// Set a user variable
+    pub fn set_user_variable(&self, name: &str, value: Datum) {
+        let mut vars = self.user_variables.write();
+        vars.insert(name.to_lowercase(), value);
+    }
+
+    // ============ SQL Mode ============
+
+    /// Set sql_mode from a comma-separated string. Empty string clears all modes.
+    pub fn set_sql_mode(&mut self, mode_str: &str) {
+        self.sql_modes.clear();
+        let trimmed = mode_str.trim().trim_matches('\'').trim_matches('"');
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.eq_ignore_ascii_case("DEFAULT") {
+            self.sql_modes = default_sql_modes();
+            return;
+        }
+        for mode in trimmed.split(',') {
+            let m = mode.trim().to_uppercase();
+            if !m.is_empty() {
+                self.sql_modes.insert(m);
+            }
+        }
+    }
+
+    /// Check if a specific sql_mode is active
+    pub fn has_sql_mode(&self, mode: &str) -> bool {
+        self.sql_modes.contains(&mode.to_uppercase())
+    }
+
+    /// Get the current sql_mode as a comma-separated string
+    pub fn sql_mode_string(&self) -> String {
+        let mut modes: Vec<&str> = self.sql_modes.iter().map(|s| s.as_str()).collect();
+        modes.sort();
+        modes.join(",")
+    }
+
+    // ============ Temporary Tables ============
+
+    /// Register a temporary table name for cleanup on disconnect
+    pub fn register_temp_table(&mut self, name: String) {
+        self.temp_table_names.push(name);
+    }
+
+    /// Take all temporary table names (called on disconnect for cleanup)
+    pub fn take_temp_tables(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.temp_table_names)
     }
 }

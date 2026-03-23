@@ -40,6 +40,7 @@ RooDB is a distributed SQL database in Rust with these key design decisions:
 - `ExecutorEngine` (`src/executor/engine.rs`) - Query execution
 - `LsmEngine` (`src/storage/lsm/engine.rs`) - LSM storage backend
 - `Catalog` (`src/catalog/mod.rs`) - Schema metadata
+- `DataType::Bit(u8)` — BIT(M) with M=1..64, stored as u64
 
 ### Query Execution Flow
 
@@ -88,6 +89,19 @@ Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`,
 - Command: `bench/run.sh --table-size=100000 --duration=30`
 - After benchmarks complete, show a comparison table of ALL workload results (before vs after, RooDB vs MySQL).
 - Use `bench/compare.sh` to compare against baseline when available.
+
+## Code Quality Gates
+
+**All of the following MUST pass with ZERO warnings before committing:**
+
+```bash
+cargo build --release    # must compile clean, zero warnings
+cargo clippy             # must pass with zero warnings
+cargo fmt --check        # must be formatted
+cargo test --release     # all tests must pass
+```
+
+These are non-negotiable. Do not commit code with warnings.
 
 ## Code Policies
 

@@ -1,0 +1,100 @@
+# Test: Iteration 5 features
+# DROP VIEW IF EXISTS (no-op)
+DROP VIEW IF EXISTS nonexistent_v1;
+SELECT 1;
+1
+1
+# DROP PROCEDURE IF EXISTS (no-op)
+DROP PROCEDURE IF EXISTS nonexistent_p1;
+SELECT 2;
+2
+2
+# DROP FUNCTION IF EXISTS (no-op)
+DROP FUNCTION IF EXISTS nonexistent_f1;
+SELECT 3;
+3
+3
+# LOCK/UNLOCK TABLES (no-op)
+CREATE TABLE lock_t (id INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO lock_t VALUES (1);
+LOCK TABLES lock_t WRITE;
+SELECT * FROM lock_t;
+id
+1
+UNLOCK TABLES;
+DROP TABLE lock_t;
+# FLUSH (no-op)
+FLUSH STATUS;
+SELECT 4;
+4
+4
+# SET NAMES / SET sql_mode
+SET NAMES utf8;
+SET NAMES utf8mb4;
+SET NAMES default;
+SET sql_mode = '';
+SET @myvar = 42;
+SELECT 5;
+5
+5
+# CREATE TABLE with charset
+CREATE TABLE charset_t (a CHAR(10) NOT NULL) DEFAULT CHARSET=utf8;
+INSERT INTO charset_t VALUES ('hello');
+SELECT * FROM charset_t;
+a
+hello
+DROP TABLE charset_t;
+# CREATE TABLE with charset shorthand (MySQL syntax normalization)
+CREATE TABLE charset_t2 (a CHAR(10) NOT NULL) charset latin1;
+INSERT INTO charset_t2 VALUES ('hello');
+SELECT * FROM charset_t2;
+a
+hello
+DROP TABLE charset_t2;
+# UNSIGNED types
+CREATE TABLE uint_t (a INT UNSIGNED, b BIGINT UNSIGNED, c MEDIUMINT, PRIMARY KEY (a));
+INSERT INTO uint_t VALUES (1, 2, 3);
+SELECT * FROM uint_t;
+a	b	c
+1	2	3
+DROP TABLE uint_t;
+# ENUM and SET types
+CREATE TABLE enum_t (id INT NOT NULL, status ENUM('active','inactive'), PRIMARY KEY (id));
+INSERT INTO enum_t VALUES (1, 'active');
+SELECT * FROM enum_t;
+id	status
+1	active
+DROP TABLE enum_t;
+# DECIMAL type
+CREATE TABLE dec_t (id INT NOT NULL, price DECIMAL(10,2), PRIMARY KEY (id));
+INSERT INTO dec_t VALUES (1, 19.99);
+SELECT * FROM dec_t;
+id	price
+1	19.99
+DROP TABLE dec_t;
+# CAST AS UNSIGNED
+SELECT CAST(1-2 AS UNSIGNED);
+CAST(1 - 2 AS BigIntUnsigned)
+18446744073709551615
+SELECT CAST(-1 AS SIGNED);
+CAST(-1 AS BigInt)
+-1
+SELECT CAST('123' AS SIGNED);
+CAST('123' AS BigInt)
+123
+# Multi-table DROP
+CREATE TABLE mt_a (id INT NOT NULL, PRIMARY KEY (id));
+CREATE TABLE mt_b (id INT NOT NULL, PRIMARY KEY (id));
+CREATE TABLE mt_c (id INT NOT NULL, PRIMARY KEY (id));
+DROP TABLE IF EXISTS mt_a, mt_b, mt_c;
+SELECT 6;
+6
+6
+# SHOW COLLATION
+SHOW COLLATION LIKE 'utf8mb4%';
+Collation	Charset	Id	Default	Compiled	Sortlen	Pad_attribute
+utf8mb4_general_ci	utf8mb4	45	Yes	Yes	1	PAD SPACE
+# SHOW CHARACTER SET
+SHOW CHARACTER SET LIKE 'utf8mb4%';
+Charset	Description	Default collation	Maxlen
+utf8mb4	UTF-8 Unicode	utf8mb4_general_ci	4

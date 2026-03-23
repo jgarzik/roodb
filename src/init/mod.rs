@@ -14,11 +14,12 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
+use crate::catalog::system_tables::{SYSTEM_DATABASES, SYSTEM_GRANTS, SYSTEM_USERS};
 use crate::executor::encoding::{encode_row, encode_row_key};
 use crate::executor::{Datum, Row};
 use crate::protocol::roodb::auth::compute_password_hash;
 use crate::sql::Privilege;
+use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 use crate::storage::schema_version::{write_schema_version, CURRENT_SCHEMA_VERSION};
 use crate::storage::StorageEngine;
 
@@ -141,10 +142,11 @@ pub async fn initialize_database(
         Datum::Null,                                        // granted_at
     ]);
 
-    // Use fixed row IDs for init (1 for user, 2 for grant)
-    // These are safe since this is first-time init on empty storage
-    let user_row_id: u64 = 1;
-    let grant_row_id: u64 = 2;
+    // Allocate row IDs via the generator so it stays in sync
+    let (user_local, user_node) = allocate_row_id_batch(1);
+    let user_row_id = encode_row_id(user_local, user_node);
+    let (grant_local, grant_node) = allocate_row_id_batch(1);
+    let grant_row_id = encode_row_id(grant_local, grant_node);
 
     // Encode rows for storage
     let user_key = encode_row_key(SYSTEM_USERS, user_row_id);
@@ -162,6 +164,25 @@ pub async fn initialize_database(
     // Write grant row
     storage
         .put(&grant_key, &grant_value)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
+    // Bootstrap default databases: "default" and "test"
+    let default_db_row = Row::new(vec![Datum::String("default".to_string())]);
+    let (db1_local, db1_node) = allocate_row_id_batch(1);
+    let default_db_key = encode_row_key(SYSTEM_DATABASES, encode_row_id(db1_local, db1_node));
+    let default_db_value = encode_row(&default_db_row);
+    storage
+        .put(&default_db_key, &default_db_value)
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
+    let test_db_row = Row::new(vec![Datum::String("test".to_string())]);
+    let (db2_local, db2_node) = allocate_row_id_batch(1);
+    let test_db_key = encode_row_key(SYSTEM_DATABASES, encode_row_id(db2_local, db2_node));
+    let test_db_value = encode_row(&test_db_row);
+    storage
+        .put(&test_db_key, &test_db_value)
         .await
         .map_err(|e| InitError::Storage(e.to_string()))?;
 

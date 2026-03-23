@@ -26,6 +26,7 @@ impl TypeChecker {
             ResolvedStatement::Insert {
                 columns, values, ..
             } => Self::check_insert(columns, values),
+            ResolvedStatement::InsertSelect { source, .. } => Self::check(source),
             ResolvedStatement::Update {
                 assignments,
                 filter,
@@ -33,6 +34,13 @@ impl TypeChecker {
             } => Self::check_update(assignments, filter),
             ResolvedStatement::Delete { filter, .. } => Self::check_delete(filter),
             ResolvedStatement::Select(select) => Self::check_select(select),
+            ResolvedStatement::CreateTableAs { source, .. } => Self::check(source),
+            ResolvedStatement::CreateView { .. } | ResolvedStatement::DropView { .. } => Ok(()),
+
+            // Database DDL doesn't need type checking
+            ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
+                Ok(())
+            }
 
             // Auth statements don't need type checking
             ResolvedStatement::CreateUser { .. }
@@ -42,17 +50,35 @@ impl TypeChecker {
             | ResolvedStatement::Grant { .. }
             | ResolvedStatement::Revoke { .. }
             | ResolvedStatement::ShowGrants { .. } => Ok(()),
+
+            // ANALYZE TABLE doesn't need type checking
+            ResolvedStatement::AnalyzeTable { .. } => Ok(()),
+
+            // Multi-table DROP doesn't need type checking
+            ResolvedStatement::DropMultipleTables { .. } => Ok(()),
+
+            // UNION - type check both sides
+            ResolvedStatement::Union { left, right, .. } => {
+                Self::check_select(left)?;
+                Self::check_select(right)
+            }
+
+            // EXPLAIN - type check the inner statement
+            ResolvedStatement::Explain { inner } => Self::check(inner),
         }
     }
 
     /// Check INSERT statement
     fn check_insert(columns: &[ResolvedColumn], values: &[Vec<ResolvedExpr>]) -> SqlResult<()> {
+        // MySQL behavior: single-row INSERT with explicit NULL into NOT NULL → error 1048.
+        // Multi-row INSERT in non-strict mode → silently convert NULL to column default.
+        let is_multi_row = values.len() > 1;
         for row in values {
             for (col, expr) in columns.iter().zip(row.iter()) {
                 Self::check_type_compatible(&col.data_type, &expr.data_type(), expr)?;
 
-                // Check NOT NULL constraints
-                if !col.nullable && Self::is_definitely_null(expr) {
+                // Check NOT NULL constraints (skip for multi-row — executor handles conversion)
+                if !is_multi_row && !col.nullable && Self::is_definitely_null(expr) {
                     return Err(SqlError::InvalidOperation(format!(
                         "Column '{}' cannot be NULL",
                         col.name
@@ -75,13 +101,8 @@ impl TypeChecker {
                 &assign.value,
             )?;
 
-            // Check NOT NULL constraints
-            if !assign.column.nullable && Self::is_definitely_null(&assign.value) {
-                return Err(SqlError::InvalidOperation(format!(
-                    "Column '{}' cannot be NULL",
-                    assign.column.name
-                )));
-            }
+            // MySQL: UPDATE SET col=NULL on NOT NULL column silently sets to default.
+            // Don't reject at typecheck time — let the executor handle coercion.
         }
 
         // Check filter is boolean
@@ -135,13 +156,16 @@ impl TypeChecker {
     }
 
     /// Check if expression evaluates to boolean
+    /// MySQL treats non-zero numeric values as true, so accept numeric types too
     fn check_is_boolean(expr: &ResolvedExpr) -> SqlResult<()> {
-        match expr.data_type() {
-            DataType::Boolean => Ok(()),
-            other => Err(SqlError::TypeMismatch {
+        let dt = expr.data_type();
+        if dt == DataType::Boolean || dt.is_numeric() {
+            Ok(())
+        } else {
+            Err(SqlError::TypeMismatch {
                 expected: DataType::Boolean,
-                found: other,
-            }),
+                found: dt,
+            })
         }
     }
 
@@ -156,7 +180,9 @@ impl TypeChecker {
         source: &DataType,
         expr: &ResolvedExpr,
     ) -> SqlResult<()> {
-        // NULL is compatible with any nullable type
+        // A literal NULL is compatible with any type — the NOT NULL constraint
+        // handles rejection at runtime. Expressions that merely *contain* a NULL
+        // (e.g. COALESCE('x', NULL)) still need type checking on their result type.
         if Self::is_definitely_null(expr) {
             return Ok(());
         }
@@ -190,7 +216,7 @@ impl TypeChecker {
             ResolvedExpr::Function { name, args, .. } => {
                 let is_agg = matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
                 );
                 is_agg || args.iter().any(Self::expr_has_aggregate)
             }
@@ -218,7 +244,7 @@ impl TypeChecker {
                 // Inside an aggregate function, column references are OK
                 let is_agg = matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
                 );
                 if is_agg {
                     false
@@ -231,6 +257,7 @@ impl TypeChecker {
                     || Self::expr_has_non_aggregate_column(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_non_aggregate_column(expr),
+            ResolvedExpr::UserVariable { .. } => false,
             _ => false,
         }
     }
@@ -261,6 +288,23 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         | (DataType::Boolean, DataType::SmallInt)
         | (DataType::Boolean, DataType::Int)
         | (DataType::Boolean, DataType::BigInt) => true,
+
+        // Bit is numeric-compatible and accepts Blob (hex literals)
+        (DataType::Bit(_), b) if b.is_numeric() => true,
+        (a, DataType::Bit(_)) if a.is_numeric() => true,
+        (DataType::Bit(_), DataType::Blob) | (DataType::Blob, DataType::Bit(_)) => true,
+
+        // Blob (hex literals like 0x01) can be inserted into string columns
+        (DataType::Varchar(_), DataType::Blob) | (DataType::Text, DataType::Blob) => true,
+        (DataType::Blob, DataType::Varchar(_)) | (DataType::Blob, DataType::Text) => true,
+
+        // MySQL implicitly converts strings/blobs to numbers and vice versa
+        (a, DataType::Text) | (a, DataType::Varchar(_)) | (a, DataType::Blob) if a.is_numeric() => {
+            true
+        }
+        (DataType::Text, b) | (DataType::Varchar(_), b) | (DataType::Blob, b) if b.is_numeric() => {
+            true
+        }
 
         _ => false,
     }
@@ -353,8 +397,12 @@ mod tests {
         // String types are compatible
         assert!(types_compatible(&DataType::Text, &DataType::Varchar(100)));
 
-        // Incompatible types
-        assert!(!types_compatible(&DataType::Int, &DataType::Text));
-        assert!(!types_compatible(&DataType::Blob, &DataType::Int));
+        // MySQL implicit conversion: strings/blobs ↔ numbers
+        assert!(types_compatible(&DataType::Int, &DataType::Text));
+        assert!(types_compatible(&DataType::Blob, &DataType::Int));
+
+        // Truly incompatible types
+        assert!(!types_compatible(&DataType::Timestamp, &DataType::Int));
+        assert!(!types_compatible(&DataType::Boolean, &DataType::Text));
     }
 }

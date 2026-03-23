@@ -4,6 +4,7 @@
 //! iterator model: each operator implements open/next/close methods.
 
 pub mod aggregate;
+pub mod analyze;
 pub mod auth;
 pub mod context;
 pub mod datum;
@@ -14,18 +15,23 @@ pub mod encoding;
 pub mod engine;
 pub mod error;
 pub mod eval;
+pub mod explain_exec;
 pub mod filter;
 pub mod hash_join;
 pub mod insert;
+pub mod insert_select;
 pub mod join;
 pub mod limit;
+pub mod multi_exec;
 pub mod point_get;
+pub mod procedure;
 pub mod project;
 pub mod range_scan;
 pub mod row;
 pub mod scan;
 pub mod single_row;
 pub mod sort;
+pub mod union;
 pub mod update;
 
 pub use context::TransactionContext;

@@ -12,6 +12,7 @@ use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
 use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
 use roodb::planner::PhysicalPlan;
+use roodb::server::session::UserVariables;
 use roodb::storage::traits::KeyValue;
 use roodb::storage::{StorageEngine, StorageResult};
 use roodb::txn::{MvccStorage, ReadView, TransactionManager};
@@ -129,7 +130,7 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
 
     // Provide transaction context (required for Raft-as-WAL)
     let txn_context = TransactionContext::new(1, ReadView::default());
-    let engine = ExecutorEngine::new(mvcc, catalog, Some(txn_context));
+    let engine = ExecutorEngine::new(mvcc, catalog, Some(txn_context), UserVariables::default());
     (engine, storage)
 }
 
@@ -415,6 +416,7 @@ async fn test_insert() {
         ]],
         auto_increment_indices: vec![],
         pk_column_indices: vec![0], // id is PK
+        ignore: false,
     };
 
     let mut exec = engine.build(plan).unwrap();
@@ -482,7 +484,7 @@ async fn test_create_and_drop_table() {
         txn_manager,
     ));
     let catalog = Arc::new(RwLock::new(Catalog::new()));
-    let engine = ExecutorEngine::new(mvcc, catalog.clone(), None);
+    let engine = ExecutorEngine::new(mvcc, catalog.clone(), None, UserVariables::default());
 
     // CREATE TABLE test (id INT)
     let create_plan = PhysicalPlan::CreateTable {
@@ -549,7 +551,7 @@ async fn test_distinct() {
             .unwrap();
     }
 
-    let engine = ExecutorEngine::new(mvcc, catalog, None);
+    let engine = ExecutorEngine::new(mvcc, catalog, None, UserVariables::default());
 
     let scan = PhysicalPlan::TableScan {
         table: "nums".to_string(),

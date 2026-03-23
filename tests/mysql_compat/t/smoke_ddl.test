@@ -1,0 +1,13 @@
+--echo # Smoke test: DDL and basic DML
+
+CREATE TABLE smoke_t1 (id INT NOT NULL, name VARCHAR(50), PRIMARY KEY (id));
+INSERT INTO smoke_t1 (id, name) VALUES (1, 'Alice');
+INSERT INTO smoke_t1 (id, name) VALUES (2, 'Bob');
+INSERT INTO smoke_t1 (id, name) VALUES (3, 'Charlie');
+SELECT * FROM smoke_t1;
+SELECT id, name FROM smoke_t1 WHERE id = 2;
+UPDATE smoke_t1 SET name = 'Robert' WHERE id = 2;
+SELECT name FROM smoke_t1 WHERE id = 2;
+DELETE FROM smoke_t1 WHERE id = 3;
+SELECT COUNT(*) FROM smoke_t1;
+DROP TABLE smoke_t1;

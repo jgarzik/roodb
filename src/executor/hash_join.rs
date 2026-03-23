@@ -9,9 +9,11 @@ use async_trait::async_trait;
 
 use crate::planner::logical::{JoinType, ResolvedExpr};
 
+use crate::server::session::UserVariables;
+
 use super::datum::Datum;
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -54,6 +56,8 @@ pub struct HashJoin {
     main_loop_done: bool,
     /// Position for emitting unmatched right rows (right/full outer)
     unmatched_right_pos: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl HashJoin {
@@ -67,6 +71,7 @@ impl HashJoin {
         condition: Option<ResolvedExpr>,
         left_width: usize,
         right_width: usize,
+        user_variables: UserVariables,
     ) -> Self {
         HashJoin {
             left,
@@ -86,6 +91,7 @@ impl HashJoin {
             left_matched: false,
             main_loop_done: false,
             unmatched_right_pos: 0,
+            user_variables,
         }
     }
 
@@ -111,7 +117,7 @@ impl HashJoin {
     fn check_condition(&self, combined: &Row) -> ExecutorResult<bool> {
         match &self.condition {
             Some(cond) => {
-                let result = eval(cond, combined)?;
+                let result = evaluate(cond, combined, &self.user_variables)?;
                 Ok(result.as_bool().unwrap_or(false))
             }
             None => Ok(true),
@@ -258,6 +264,14 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::{BinaryOp, ResolvedColumn};
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -311,6 +325,7 @@ mod tests {
             None,
             2,
             2,
+            empty_vars(),
         );
         join.open().await.unwrap();
 
@@ -336,7 +351,17 @@ mod tests {
             Row::new(vec![Datum::Int(2), Datum::String("b".into())]),
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Left, vec![0], vec![0], None, 1, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Left,
+            vec![0],
+            vec![0],
+            None,
+            1,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -366,7 +391,17 @@ mod tests {
             Row::new(vec![Datum::Int(3), Datum::String("c".into())]), // no match
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Right, vec![0], vec![0], None, 1, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Right,
+            vec![0],
+            vec![0],
+            None,
+            1,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -389,7 +424,17 @@ mod tests {
             Row::new(vec![Datum::Int(2), Datum::String("b".into())]), // no match on left
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Full, vec![0], vec![0], None, 1, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Full,
+            vec![0],
+            vec![0],
+            None,
+            1,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -441,6 +486,7 @@ mod tests {
             Some(remaining),
             2,
             2,
+            empty_vars(),
         );
         join.open().await.unwrap();
 
@@ -461,7 +507,17 @@ mod tests {
         let left = mock(vec![Row::new(vec![Datum::Int(1)])]);
         let right = mock(vec![]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 1, 1);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Inner,
+            vec![0],
+            vec![0],
+            None,
+            1,
+            1,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -477,7 +533,17 @@ mod tests {
         let left = mock(vec![]);
         let right = mock(vec![Row::new(vec![Datum::Int(1)])]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 1, 1);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Inner,
+            vec![0],
+            vec![0],
+            None,
+            1,
+            1,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut count = 0;
@@ -517,6 +583,7 @@ mod tests {
             None,
             2,
             3,
+            empty_vars(),
         );
         join.open().await.unwrap();
 
@@ -547,7 +614,17 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Inner, vec![0], vec![0], None, 2, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Inner,
+            vec![0],
+            vec![0],
+            None,
+            2,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -573,7 +650,17 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Left, vec![0], vec![0], None, 2, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Left,
+            vec![0],
+            vec![0],
+            None,
+            2,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();
@@ -607,7 +694,17 @@ mod tests {
             Row::new(vec![Datum::Int(1), Datum::String("right_one".into())]),
         ]);
 
-        let mut join = HashJoin::new(left, right, JoinType::Full, vec![0], vec![0], None, 2, 2);
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinType::Full,
+            vec![0],
+            vec![0],
+            None,
+            2,
+            2,
+            empty_vars(),
+        );
         join.open().await.unwrap();
 
         let mut results = Vec::new();

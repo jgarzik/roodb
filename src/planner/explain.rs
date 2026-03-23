@@ -189,12 +189,26 @@ impl ExplainOutput {
                 Self::format_node(input, indent + 1, out);
             }
 
+            PhysicalPlan::Union {
+                left, right, all, ..
+            } => {
+                let op = if *all { "UNION ALL" } else { "UNION" };
+                writeln!(out, "{}{}", prefix, op).unwrap();
+                Self::format_node(left, indent + 1, out);
+                Self::format_node(right, indent + 1, out);
+            }
+
             PhysicalPlan::SingleRow => {
                 writeln!(out, "{}SingleRow (TABLE_DEE)", prefix).unwrap();
             }
 
             PhysicalPlan::Insert { table, values, .. } => {
                 writeln!(out, "{}Insert: {} ({} rows)", prefix, table, values.len()).unwrap();
+            }
+
+            PhysicalPlan::InsertSelect { table, source, .. } => {
+                writeln!(out, "{}InsertSelect: {}", prefix, table).unwrap();
+                Self::format_node(source, indent + 1, out);
             }
 
             PhysicalPlan::Update { table, filter, .. } => {
@@ -214,9 +228,17 @@ impl ExplainOutput {
             PhysicalPlan::CreateTable { name, .. } => {
                 writeln!(out, "{}CreateTable: {}", prefix, name).unwrap();
             }
+            PhysicalPlan::CreateTableAs { name, source, .. } => {
+                writeln!(out, "{}CreateTableAs: {}", prefix, name).unwrap();
+                Self::format_node(source, indent + 1, out);
+            }
 
             PhysicalPlan::DropTable { name, .. } => {
                 writeln!(out, "{}DropTable: {}", prefix, name).unwrap();
+            }
+
+            PhysicalPlan::DropMultipleTables { names, .. } => {
+                writeln!(out, "{}DropMultipleTables: {}", prefix, names.join(", ")).unwrap();
             }
 
             PhysicalPlan::CreateIndex { name, table, .. } => {
@@ -225,6 +247,16 @@ impl ExplainOutput {
 
             PhysicalPlan::DropIndex { name } => {
                 writeln!(out, "{}DropIndex: {}", prefix, name).unwrap();
+            }
+            PhysicalPlan::Materialize { input } => {
+                writeln!(out, "{}Materialize", prefix).unwrap();
+                Self::format_node(input, indent + 1, out);
+            }
+            PhysicalPlan::CreateView { name, .. } => {
+                writeln!(out, "{}CreateView: {}", prefix, name).unwrap();
+            }
+            PhysicalPlan::DropView { name, .. } => {
+                writeln!(out, "{}DropView: {}", prefix, name).unwrap();
             }
 
             PhysicalPlan::CreateUser { username, host, .. } => {
@@ -279,6 +311,36 @@ impl ExplainOutput {
                 } else {
                     writeln!(out, "{}ShowGrants: for current user", prefix).unwrap();
                 }
+            }
+
+            PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
+                writeln!(
+                    out,
+                    "{}CreateDatabase: {} (if_not_exists={})",
+                    prefix, name, if_not_exists
+                )
+                .unwrap();
+            }
+
+            PhysicalPlan::DropDatabase { name, if_exists } => {
+                writeln!(
+                    out,
+                    "{}DropDatabase: {} (if_exists={})",
+                    prefix, name, if_exists
+                )
+                .unwrap();
+            }
+
+            PhysicalPlan::AnalyzeTable { table } => {
+                writeln!(out, "{}AnalyzeTable: {}", prefix, table).unwrap();
+            }
+
+            PhysicalPlan::Explain { inner } => {
+                writeln!(out, "{}Explain:", prefix).unwrap();
+                Self::format_node(inner, indent + 1, out);
             }
         }
     }

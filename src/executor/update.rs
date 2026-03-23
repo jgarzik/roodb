@@ -10,10 +10,12 @@ use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::txn::MvccStorage;
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -35,6 +37,8 @@ pub struct Update {
     rows_updated: u64,
     /// Whether execution is complete
     done: bool,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Update {
@@ -46,6 +50,7 @@ impl Update {
         key_value: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         Update {
             table,
@@ -56,6 +61,7 @@ impl Update {
             txn_context,
             rows_updated: 0,
             done: false,
+            user_variables,
         }
     }
 }
@@ -64,7 +70,7 @@ impl Update {
     /// PointGet fast path: O(1) single-key lookup + update
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
-        let key_datum = eval(key_expr, &Row::empty())?;
+        let key_datum = evaluate(key_expr, &Row::empty(), &self.user_variables)?;
         let storage_key = encode_pk_key(&self.table, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
@@ -82,13 +88,16 @@ impl Update {
         if let Some((data, row_version)) = result {
             let mut row = decode_row(&data)?;
             if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     return Ok(());
                 }
             }
             for (col, expr) in &self.assignments {
-                let new_value = eval(expr, &row)?;
+                let mut new_value = evaluate(expr, &row, &self.user_variables)?;
+                if new_value.is_null() && !col.nullable {
+                    new_value = super::datum::Datum::default_for_type(&col.data_type);
+                }
                 row.set(col.index, new_value)?;
             }
             let new_value = encode_row(&row);
@@ -128,13 +137,17 @@ impl Update {
         for (key, value, row_version) in kv_pairs {
             let mut row = decode_row(&value)?;
             if let Some(filter) = &self.filter {
-                let result = eval(filter, &row)?;
+                let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }
             }
             for (col, expr) in &self.assignments {
-                let new_value = eval(expr, &row)?;
+                let mut new_value = evaluate(expr, &row, &self.user_variables)?;
+                // MySQL: SET col=NULL on NOT NULL column → use default value
+                if new_value.is_null() && !col.nullable {
+                    new_value = super::datum::Datum::default_for_type(&col.data_type);
+                }
                 row.set(col.index, new_value)?;
             }
             let new_value = encode_row(&row);
@@ -170,6 +183,9 @@ impl Executor for Update {
             return Ok(None);
         }
 
+        // RAII guard: strict DML context cleared on drop (even on early return/error)
+        let _strict_guard = super::eval::StrictDmlGuard::new(&self.user_variables);
+
         if self.key_value.is_some() {
             self.next_point_get().await?;
         } else {
@@ -202,10 +218,17 @@ mod tests {
     use crate::executor::datum::Datum;
     use crate::executor::encoding::encode_pk_key;
     use crate::planner::logical::{BinaryOp, Literal};
+    use crate::server::session::UserVariables;
     use crate::storage::traits::KeyValue;
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
-    use std::sync::Mutex;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockStorage {
         data: Mutex<Vec<KeyValue>>,
@@ -341,6 +364,7 @@ mod tests {
             None,
             mvcc,
             Some(txn_context),
+            empty_vars(),
         );
         update.open().await.unwrap();
 

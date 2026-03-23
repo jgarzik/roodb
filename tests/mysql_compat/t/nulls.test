@@ -1,0 +1,20 @@
+--echo # Test: NULL handling
+
+CREATE TABLE null_t (id INT NOT NULL, val INT, name VARCHAR(50), PRIMARY KEY (id));
+INSERT INTO null_t VALUES (1, 10, 'hello');
+INSERT INTO null_t VALUES (2, NULL, NULL);
+INSERT INTO null_t VALUES (3, 0, '');
+
+--echo # NULL comparisons
+SELECT id FROM null_t WHERE val IS NULL;
+SELECT id FROM null_t WHERE val IS NOT NULL;
+SELECT id FROM null_t WHERE name IS NULL;
+
+--echo # NULL in expressions
+SELECT id, val + 1 FROM null_t;
+
+--echo # COUNT with NULLs
+SELECT COUNT(*) FROM null_t;
+SELECT COUNT(val) FROM null_t;
+
+DROP TABLE null_t;

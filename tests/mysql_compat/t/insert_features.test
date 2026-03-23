@@ -1,0 +1,65 @@
+--echo # Test: INSERT IGNORE, INSERT...SELECT, numeric overflow
+
+--echo # Setup
+CREATE TABLE t1 (id INT NOT NULL, val INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO t1 VALUES (1, 100);
+INSERT INTO t1 VALUES (2, 200);
+
+--echo # INSERT ... SELECT (all columns)
+CREATE TABLE t2 (id INT NOT NULL, val INT NOT NULL, PRIMARY KEY (id));
+INSERT INTO t2 SELECT * FROM t1;
+SELECT * FROM t2 ORDER BY id;
+DROP TABLE t2;
+
+--echo # INSERT ... SELECT with explicit columns
+CREATE TABLE t3 (a INT NOT NULL, b INT NOT NULL DEFAULT 0, PRIMARY KEY (a));
+INSERT INTO t3 (a) SELECT id FROM t1;
+SELECT * FROM t3 ORDER BY a;
+DROP TABLE t3;
+
+--echo # INSERT ... SELECT from expression (no FROM)
+CREATE TABLE t4 (a VARCHAR(100));
+INSERT INTO t4 SELECT 'hello';
+SELECT * FROM t4;
+DROP TABLE t4;
+
+--echo # INSERT IGNORE suppresses errors
+CREATE TABLE t5 (a INT NOT NULL);
+INSERT IGNORE INTO t5 VALUES (1);
+SELECT * FROM t5;
+DROP TABLE t5;
+
+--echo # INSERT IGNORE with subquery
+CREATE TABLE t6 (a CHAR(1));
+INSERT IGNORE INTO t6 (SELECT 'hello world');
+SELECT * FROM t6;
+DROP TABLE t6;
+
+--echo # ABS on various types
+SELECT ABS(-42);
+SELECT ABS(42);
+SELECT ABS(0);
+SELECT ABS(-3.14);
+SELECT ABS(NULL);
+
+--echo # ABS overflow on i64::MIN
+--error 1690
+SELECT ABS(-9223372036854775808);
+
+--echo # Double negation promotes to Decimal (literal context)
+SELECT -(-9223372036854775808);
+
+--echo # UnsignedInt negation boundary: -(2^63) = i64::MIN (fits)
+CREATE TABLE t7 (a BIGINT, b BIGINT UNSIGNED);
+INSERT INTO t7 VALUES (-9223372036854775808, 9223372036854775809);
+--error 1690
+SELECT -a FROM t7;
+--error 1690
+SELECT -b FROM t7;
+DROP TABLE t7;
+
+--echo # MOD edge case: i64::MIN % -1 = 0
+SELECT -9223372036854775808 MOD -1;
+
+--echo # Cleanup
+DROP TABLE t1;

@@ -8,7 +8,8 @@
 
 pub mod system_tables;
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// SQL data types supported by the database
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub enum DataType {
     Int,
     /// 64-bit signed integer
     BigInt,
+    /// 64-bit unsigned integer
+    BigIntUnsigned,
     /// 32-bit floating point
     Float,
     /// 64-bit floating point
@@ -33,8 +36,12 @@ pub enum DataType {
     Text,
     /// Binary data
     Blob,
+    /// Bit string with width 1..64
+    Bit(u8),
     /// Timestamp (date and time)
     Timestamp,
+    /// Fixed-point decimal with precision and scale
+    Decimal { precision: u8, scale: u8 },
 }
 
 impl DataType {
@@ -46,8 +53,11 @@ impl DataType {
                 | DataType::SmallInt
                 | DataType::Int
                 | DataType::BigInt
+                | DataType::BigIntUnsigned
                 | DataType::Float
                 | DataType::Double
+                | DataType::Bit(_)
+                | DataType::Decimal { .. }
         )
     }
 
@@ -55,7 +65,11 @@ impl DataType {
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
-            DataType::TinyInt | DataType::SmallInt | DataType::Int | DataType::BigInt
+            DataType::TinyInt
+                | DataType::SmallInt
+                | DataType::Int
+                | DataType::BigInt
+                | DataType::BigIntUnsigned
         )
     }
 
@@ -140,6 +154,8 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     /// Table constraints
     pub constraints: Vec<Constraint>,
+    /// Whether this is a temporary table (session-scoped, not persisted)
+    pub is_temporary: bool,
 }
 
 impl TableDef {
@@ -149,6 +165,7 @@ impl TableDef {
             name: name.into(),
             columns: Vec::new(),
             constraints: Vec::new(),
+            is_temporary: false,
         }
     }
 
@@ -219,6 +236,37 @@ impl IndexDef {
     }
 }
 
+/// Parameter mode for stored procedure parameters
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParamMode {
+    In,
+    Out,
+    InOut,
+}
+
+/// Stored procedure parameter
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcedureParam {
+    pub name: String,
+    pub data_type: String,
+    pub mode: ParamMode,
+}
+
+/// Stored procedure definition
+#[derive(Debug, Clone)]
+pub struct ProcedureDef {
+    pub name: String,
+    pub params: Vec<ProcedureParam>,
+    pub body_sql: String,
+}
+
+/// View definition
+#[derive(Debug, Clone)]
+pub struct ViewDef {
+    pub name: String,
+    pub query_sql: String,
+}
+
 /// Catalog error
 #[derive(Debug, Clone)]
 pub enum CatalogError {
@@ -236,6 +284,14 @@ pub enum CatalogError {
     InvalidName(String),
     /// Invalid constraint definition
     InvalidConstraint(String),
+    /// Procedure already exists
+    ProcedureExists(String),
+    /// Procedure not found
+    ProcedureNotFound(String),
+    /// View already exists
+    ViewExists(String),
+    /// View not found
+    ViewNotFound(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -250,6 +306,18 @@ impl std::fmt::Display for CatalogError {
             }
             CatalogError::InvalidName(msg) => write!(f, "Invalid name: {}", msg),
             CatalogError::InvalidConstraint(msg) => write!(f, "Invalid constraint: {}", msg),
+            CatalogError::ProcedureExists(name) => {
+                write!(f, "Procedure '{}' already exists", name)
+            }
+            CatalogError::ProcedureNotFound(name) => {
+                write!(f, "Procedure '{}' not found", name)
+            }
+            CatalogError::ViewExists(name) => {
+                write!(f, "View '{}' already exists", name)
+            }
+            CatalogError::ViewNotFound(name) => {
+                write!(f, "View '{}' not found", name)
+            }
         }
     }
 }
@@ -258,6 +326,30 @@ impl std::error::Error for CatalogError {}
 
 /// Result type for catalog operations
 pub type CatalogResult<T> = Result<T, CatalogError>;
+
+/// Catalog error for database operations
+#[derive(Debug, Clone)]
+pub enum DatabaseError {
+    /// Database already exists
+    DatabaseExists(String),
+    /// Database not found
+    DatabaseNotFound(String),
+}
+
+impl std::fmt::Display for DatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseError::DatabaseExists(name) => {
+                write!(f, "Can't create database '{}'; database exists", name)
+            }
+            DatabaseError::DatabaseNotFound(name) => {
+                write!(f, "Unknown database '{}'", name)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatabaseError {}
 
 /// Database catalog - stores schema metadata
 #[derive(Debug, Default)]
@@ -268,15 +360,26 @@ pub struct Catalog {
     indexes: HashMap<String, IndexDef>,
     /// Schema version counter (incremented on DDL operations)
     schema_version: u64,
+    /// Known databases
+    databases: HashSet<String>,
+    /// Stored procedures by name
+    procedures: HashMap<String, ProcedureDef>,
+    /// Views by name
+    views: HashMap<String, ViewDef>,
 }
 
 impl Catalog {
     /// Create a new empty catalog
     pub fn new() -> Self {
+        let mut databases = HashSet::new();
+        databases.insert("default".to_string());
         Self {
             tables: HashMap::new(),
             indexes: HashMap::new(),
             schema_version: 0,
+            databases,
+            procedures: HashMap::new(),
+            views: HashMap::new(),
         }
     }
 
@@ -320,6 +423,67 @@ impl Catalog {
         self.indexes.clear();
     }
 
+    // ============ Database operations ============
+
+    /// Create a database
+    pub fn create_database(&mut self, name: &str) -> Result<(), DatabaseError> {
+        if self.databases.contains(name) {
+            return Err(DatabaseError::DatabaseExists(name.to_string()));
+        }
+        self.databases.insert(name.to_string());
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Drop a database
+    pub fn drop_database(&mut self, name: &str) -> Result<(), DatabaseError> {
+        if !self.databases.remove(name) {
+            return Err(DatabaseError::DatabaseNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Check if a database exists
+    pub fn database_exists(&self, name: &str) -> bool {
+        self.databases.contains(name)
+    }
+
+    /// List all databases (sorted)
+    pub fn list_databases(&self) -> Vec<String> {
+        let mut dbs: Vec<String> = self.databases.iter().cloned().collect();
+        dbs.sort();
+        dbs
+    }
+
+    /// Get tables that belong to a specific database
+    ///
+    /// Currently returns all non-system user tables (since tables don't have
+    /// database prefixes yet). When qualified names are added, this will filter
+    /// by database prefix.
+    pub fn get_tables_in_database(&self, _db: &str) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|name| !system_tables::is_system_table(name))
+            .cloned()
+            .collect();
+        tables.sort();
+        tables
+    }
+
+    /// Register a database directly (for rebuilding from storage)
+    pub fn register_database(&mut self, name: String) {
+        self.databases.insert(name);
+    }
+
+    /// Clear all non-default databases (for re-initialization)
+    pub fn clear_user_databases(&mut self) {
+        self.databases.retain(|name| name == "default");
+    }
+
+    // ============ Table operations ============
+
     /// Create a table
     pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {
         // Validate table name
@@ -354,6 +518,19 @@ impl Catalog {
         self.tables.insert(def.name.clone(), def);
         self.schema_version += 1;
         Ok(())
+    }
+
+    /// Replace a table definition atomically (used by ALTER TABLE)
+    ///
+    /// Swaps the entire table definition after applying ALTER operations.
+    /// The old definition is replaced with the new one. If the table name
+    /// changed (RENAME), the old entry is removed and the new one inserted.
+    pub fn replace_table(&mut self, old_name: &str, def: TableDef) {
+        if old_name != def.name {
+            self.tables.remove(old_name);
+        }
+        self.tables.insert(def.name.clone(), def);
+        self.schema_version += 1;
     }
 
     /// Drop a table
@@ -438,6 +615,89 @@ impl Catalog {
             .values()
             .filter(|idx| idx.table == table)
             .collect()
+    }
+
+    // ============ Procedure operations ============
+
+    /// Create a stored procedure
+    pub fn create_procedure(&mut self, def: ProcedureDef) -> CatalogResult<()> {
+        if def.name.is_empty() {
+            return Err(CatalogError::InvalidName(
+                "Procedure name cannot be empty".into(),
+            ));
+        }
+        if self.procedures.contains_key(&def.name) {
+            return Err(CatalogError::ProcedureExists(def.name.clone()));
+        }
+        self.procedures.insert(def.name.clone(), def);
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Drop a stored procedure
+    pub fn drop_procedure(&mut self, name: &str) -> CatalogResult<()> {
+        if self.procedures.remove(name).is_none() {
+            return Err(CatalogError::ProcedureNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get a stored procedure definition
+    pub fn get_procedure(&self, name: &str) -> Option<&ProcedureDef> {
+        self.procedures.get(name)
+    }
+
+    /// Register a procedure directly (for rebuilding from storage)
+    pub fn register_procedure(&mut self, def: ProcedureDef) {
+        self.procedures.insert(def.name.clone(), def);
+    }
+
+    /// Check if a procedure exists
+    pub fn procedure_exists(&self, name: &str) -> bool {
+        self.procedures.contains_key(name)
+    }
+
+    /// Clear all procedures (for re-initialization)
+    pub fn clear_procedures(&mut self) {
+        self.procedures.clear();
+    }
+
+    // ============ View operations ============
+
+    /// Create a view
+    pub fn create_view(&mut self, def: ViewDef) -> CatalogResult<()> {
+        if self.views.contains_key(&def.name) {
+            return Err(CatalogError::ViewExists(def.name.clone()));
+        }
+        self.views.insert(def.name.clone(), def);
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Create or replace a view
+    pub fn replace_view(&mut self, def: ViewDef) {
+        self.views.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// Drop a view
+    pub fn drop_view(&mut self, name: &str, if_exists: bool) -> CatalogResult<()> {
+        if self.views.remove(name).is_none() && !if_exists {
+            return Err(CatalogError::ViewNotFound(name.to_string()));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get a view definition
+    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(name)
+    }
+
+    /// Check if a view exists
+    pub fn view_exists(&self, name: &str) -> bool {
+        self.views.contains_key(name)
     }
 }
 

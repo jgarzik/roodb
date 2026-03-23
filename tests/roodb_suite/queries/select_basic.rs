@@ -108,12 +108,16 @@ async fn test_select_expression() {
         .expect("INSERT failed");
 
     // Select with arithmetic expressions
-    let rows: Vec<(i32, i32, i32, i32)> = conn
+    // MySQL-style division (int/int) returns float; wire format drops ".0" for integer-valued floats
+    let rows: Vec<(i32, i32, i32, String)> = conn
         .query("SELECT a + b, a - b, a * b, a / b FROM select_expr_tbl")
         .await
         .expect("SELECT with expression failed");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0], (15, 5, 50, 2)); // 10+5, 10-5, 10*5, 10/5
+    assert_eq!(rows[0].0, 15); // 10+5
+    assert_eq!(rows[0].1, 5); // 10-5
+    assert_eq!(rows[0].2, 50); // 10*5
+    assert_eq!(rows[0].3, "2"); // 10/5 returns float (integer-valued)
 
     conn.query_drop("DROP TABLE select_expr_tbl")
         .await

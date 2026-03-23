@@ -1,0 +1,24 @@
+--echo # Test: JOIN operations
+
+CREATE TABLE j_users (id INT NOT NULL, name VARCHAR(50), PRIMARY KEY (id));
+CREATE TABLE j_orders (id INT NOT NULL, user_id INT, amount DOUBLE, PRIMARY KEY (id));
+
+INSERT INTO j_users VALUES (1, 'Alice');
+INSERT INTO j_users VALUES (2, 'Bob');
+INSERT INTO j_users VALUES (3, 'Charlie');
+
+INSERT INTO j_orders VALUES (10, 1, 100.50);
+INSERT INTO j_orders VALUES (11, 1, 200.00);
+INSERT INTO j_orders VALUES (12, 2, 50.75);
+
+--echo # INNER JOIN
+SELECT j_users.name, j_orders.amount FROM j_users INNER JOIN j_orders ON j_users.id = j_orders.user_id;
+
+--echo # LEFT JOIN
+SELECT j_users.name, j_orders.amount FROM j_users LEFT JOIN j_orders ON j_users.id = j_orders.user_id;
+
+--echo # Cross join
+SELECT j_users.name, j_orders.id FROM j_users CROSS JOIN j_orders;
+
+DROP TABLE j_orders;
+DROP TABLE j_users;

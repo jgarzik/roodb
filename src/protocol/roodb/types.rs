@@ -68,12 +68,15 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
         DataType::SmallInt => ColumnType::Short,
         DataType::Int => ColumnType::Long,
         DataType::BigInt => ColumnType::LongLong,
+        DataType::BigIntUnsigned => ColumnType::LongLong,
         DataType::Float => ColumnType::Float,
         DataType::Double => ColumnType::Double,
         DataType::Varchar(_) => ColumnType::Varchar,
         DataType::Text => ColumnType::Blob,
         DataType::Blob => ColumnType::Blob,
+        DataType::Bit(_) => ColumnType::Bit,
         DataType::Timestamp => ColumnType::Datetime,
+        DataType::Decimal { .. } => ColumnType::NewDecimal,
     }
 }
 
@@ -81,16 +84,19 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
 pub fn datatype_column_length(dt: &DataType) -> u32 {
     match dt {
         DataType::Boolean => 1,
-        DataType::TinyInt => 4,  // -128 to 127
-        DataType::SmallInt => 6, // -32768 to 32767
-        DataType::Int => 11,     // -2147483648 to 2147483647
-        DataType::BigInt => 20,  // Full i64 range
+        DataType::TinyInt => 4,         // -128 to 127
+        DataType::SmallInt => 6,        // -32768 to 32767
+        DataType::Int => 11,            // -2147483648 to 2147483647
+        DataType::BigInt => 20,         // Full i64 range
+        DataType::BigIntUnsigned => 20, // Full u64 range
         DataType::Float => 12,
         DataType::Double => 22,
         DataType::Varchar(n) => *n,
         DataType::Text => 65535,
         DataType::Blob => 65535,
+        DataType::Bit(n) => *n as u32,
         DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
+        DataType::Decimal { precision, .. } => *precision as u32 + 2, // sign + decimal point
     }
 }
 
@@ -116,6 +122,15 @@ pub fn datatype_flags(dt: &DataType, nullable: bool) -> u16 {
         DataType::Blob | DataType::Text => {
             flags |= column_flags::BLOB;
         }
+        DataType::BigIntUnsigned => {
+            flags |= column_flags::UNSIGNED | column_flags::NUM;
+        }
+        DataType::Bit(_) => {
+            flags |= column_flags::UNSIGNED | column_flags::NUM;
+        }
+        DataType::Decimal { .. } => {
+            flags |= column_flags::NUM;
+        }
         _ => {}
     }
 
@@ -133,20 +148,40 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         }
         Datum::Bool(b) => encode_length_encoded_string(if *b { "1" } else { "0" }),
         Datum::Int(i) => encode_length_encoded_string(&i.to_string()),
+        Datum::UnsignedInt(u) => encode_length_encoded_string(&u.to_string()),
         Datum::Float(f) => {
-            // Use enough precision for round-trip
-            encode_length_encoded_string(
-                format!("{:.15}", f)
+            // Format floats for MySQL wire protocol:
+            // - Very small/large values: scientific notation
+            // - Integer-valued floats (60.0, -3.0): display without decimal ("60", "-3")
+            // - Non-integer floats (1.6, 2.5): show needed decimal places
+            let abs = f.abs();
+            let result = if abs != 0.0 && !(1e-15..=1e15).contains(&abs) {
+                format!("{:e}", f)
+            } else {
+                let formatted = format!("{:.15}", f);
+                formatted
                     .trim_end_matches('0')
-                    .trim_end_matches('.'),
-            )
+                    .trim_end_matches('.')
+                    .to_string()
+            };
+            encode_length_encoded_string(&result)
         }
         Datum::String(s) => encode_length_encoded_string(s),
         Datum::Bytes(b) => super::packet::encode_length_encoded_bytes(b),
+        Datum::Bit { value, width } => {
+            // MySQL text protocol: send BIT as binary bytes (width+7)/8
+            let byte_len = (*width as usize).div_ceil(8);
+            let bytes = &value.to_be_bytes()[8 - byte_len..];
+            super::packet::encode_length_encoded_bytes(bytes)
+        }
         Datum::Timestamp(ts) => {
             // Convert unix millis to datetime format
             let datetime = format_timestamp(*ts);
             encode_length_encoded_string(&datetime)
+        }
+        Datum::Decimal { value, scale } => {
+            let s = crate::executor::datum::format_decimal(*value, *scale);
+            encode_length_encoded_string(&s)
         }
     }
 }

@@ -15,8 +15,9 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS,
-    SYSTEM_CONSTRAINTS, SYSTEM_INDEXES, SYSTEM_TABLES,
+    is_system_table, row_to_index_def, row_to_procedure_def, rows_to_constraints,
+    rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES,
+    SYSTEM_PROCEDURES, SYSTEM_TABLES,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -52,6 +53,22 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(
         encoded[0..8].try_into().expect("slice is exactly 8 bytes"),
     ))
+}
+
+/// Extract row data from a value that may be MVCC-wrapped or raw.
+/// Returns None if the row is deleted. Handles both MVCC-wrapped rows
+/// (from normal operations) and raw rows (from roodb_init).
+fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
+    if value.len() > MVCC_HEADER_SIZE {
+        // MVCC-wrapped: check deleted flag
+        if value[16] == 1 {
+            return None; // deleted
+        }
+        Some(&value[MVCC_HEADER_SIZE..])
+    } else {
+        // Raw row (from roodb_init, no MVCC header)
+        Some(value)
+    }
 }
 
 // Key prefixes for Raft state in LSM
@@ -237,6 +254,39 @@ impl LsmRaftStorage {
             "Loaded Raft state from LSM"
         );
 
+        // Load databases from system.databases into catalog
+        // These may have been written by roodb_init (without MVCC headers)
+        // or via Raft apply (with MVCC headers). Handle both.
+        self.load_databases_into_catalog().await?;
+
+        Ok(())
+    }
+
+    /// Load database names from system.databases into the catalog
+    ///
+    /// Handles both raw rows (from roodb_init) and MVCC-wrapped rows (from Raft apply).
+    async fn load_databases_into_catalog(&self) -> Result<(), StorageError> {
+        let prefix = table_key_prefix(SYSTEM_DATABASES);
+        let end = table_key_end(SYSTEM_DATABASES);
+
+        let rows = self
+            .storage
+            .scan(Some(&prefix), Some(&end))
+            .await
+            .map_err(read_err)?;
+
+        let mut catalog = self.catalog.write();
+        for (_key, value) in rows {
+            let Some(row_data) = extract_row_data(&value) else {
+                continue;
+            };
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                    catalog.register_database(db_name.clone());
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -273,18 +323,12 @@ impl LsmRaftStorage {
                 .await
                 .map_err(read_err)?;
 
-            // Collect column rows for this table (skip MVCC header)
+            // Collect column rows for this table
             let mut column_rows = Vec::new();
             for (_key, value) in rows {
-                // Skip MVCC header (17 bytes: 8 + 8 + 1)
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                // Check if deleted
-                if value[16] == 1 {
-                    continue;
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     // Check if this row belongs to the table we're rebuilding
                     if let Some(crate::executor::Datum::String(tbl)) = row.values().first() {
@@ -309,13 +353,9 @@ impl LsmRaftStorage {
 
                     let mut constraint_rows = Vec::new();
                     for (_key, value) in constraint_data {
-                        if value.len() <= MVCC_HEADER_SIZE {
+                        let Some(row_data) = extract_row_data(&value) else {
                             continue;
-                        }
-                        if value[16] == 1 {
-                            continue;
-                        }
-                        let row_data = &value[MVCC_HEADER_SIZE..];
+                        };
                         if let Ok(row) = decode_row(row_data) {
                             if let Some(crate::executor::Datum::String(tbl)) = row.values().first()
                             {
@@ -388,13 +428,9 @@ impl LsmRaftStorage {
                 .map_err(read_err)?;
 
             for (_key, value) in rows {
-                if value.len() <= MVCC_HEADER_SIZE {
+                let Some(row_data) = extract_row_data(&value) else {
                     continue;
-                }
-                if value[16] == 1 {
-                    continue;
-                }
-                let row_data = &value[MVCC_HEADER_SIZE..];
+                };
                 if let Ok(row) = decode_row(row_data) {
                     if let Some(crate::executor::Datum::String(idx_name)) = row.values().first() {
                         if idx_name == index_name {
@@ -449,13 +485,9 @@ impl LsmRaftStorage {
         > = std::collections::HashMap::new();
 
         for (_key, value) in column_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
                     if !is_system_table(table_name) {
@@ -484,13 +516,9 @@ impl LsmRaftStorage {
         > = std::collections::HashMap::new();
 
         for (_key, value) in constraint_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
                     if !is_system_table(table_name) {
@@ -527,16 +555,58 @@ impl LsmRaftStorage {
             .map_err(read_err)?;
 
         for (_key, value) in index_rows {
-            if value.len() <= MVCC_HEADER_SIZE {
+            let Some(row_data) = extract_row_data(&value) else {
                 continue;
-            }
-            if value[16] == 1 {
-                continue; // Skip deleted
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
+            };
             if let Ok(row) = decode_row(row_data) {
                 if let Some(index_def) = row_to_index_def(&row) {
                     index_defs.push(index_def);
+                }
+            }
+        }
+
+        // Scan system.databases to rebuild database list
+        let mut database_names: Vec<String> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_DATABASES);
+            let end = table_key_end(SYSTEM_DATABASES);
+            let db_rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+
+            for (_key, value) in db_rows {
+                let Some(row_data) = extract_row_data(&value) else {
+                    continue;
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                        database_names.push(db_name.clone());
+                    }
+                }
+            }
+        }
+
+        // Scan system.procedures to rebuild stored procedures
+        let mut procedure_defs: Vec<crate::catalog::ProcedureDef> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_PROCEDURES);
+            let end = table_key_end(SYSTEM_PROCEDURES);
+            let proc_rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+
+            for (_key, value) in proc_rows {
+                let Some(row_data) = extract_row_data(&value) else {
+                    continue;
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(proc_def) = row_to_procedure_def(&row) {
+                        procedure_defs.push(proc_def);
+                    }
                 }
             }
         }
@@ -565,6 +635,19 @@ impl LsmRaftStorage {
         for index_def in index_defs {
             tracing::debug!(index = %index_def.name, "Rebuilding index from snapshot");
             let _ = catalog.create_index(index_def);
+        }
+
+        // Rebuild databases
+        catalog.clear_user_databases();
+        for db_name in database_names {
+            catalog.register_database(db_name);
+        }
+
+        // Rebuild procedures
+        catalog.clear_procedures();
+        for proc_def in procedure_defs {
+            tracing::debug!(procedure = %proc_def.name, "Rebuilding procedure from snapshot");
+            catalog.register_procedure(proc_def);
         }
 
         tracing::info!("Rebuilt catalog from system tables after snapshot install");
@@ -614,6 +697,30 @@ impl LsmRaftStorage {
                         dropped_indexes.insert(index_name.clone());
                     } else {
                         affected_indexes.insert(index_name.clone());
+                    }
+                }
+            }
+        } else if table == SYSTEM_DATABASES {
+            // Database name changes — update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
+                    let mut catalog = self.catalog.write();
+                    if is_delete {
+                        let _ = catalog.drop_database(db_name);
+                    } else {
+                        catalog.register_database(db_name.clone());
+                    }
+                }
+            }
+        } else if table == SYSTEM_PROCEDURES {
+            // Procedure changes — update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if let Some(proc_def) = row_to_procedure_def(&row) {
+                    let mut catalog = self.catalog.write();
+                    if is_delete {
+                        let _ = catalog.drop_procedure(&proc_def.name);
+                    } else {
+                        catalog.register_procedure(proc_def);
                     }
                 }
             }

@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use crate::planner::logical::expr::AggregateFunc;
 use crate::planner::logical::{Literal, ResolvedExpr};
 
+use crate::server::session::UserVariables;
+
 use super::datum::Datum;
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -23,6 +25,9 @@ enum Accumulator {
     Avg { sum: f64, count: i64 },
     Min(Option<Datum>),
     Max(Option<Datum>),
+    BitAnd(Option<u64>),
+    BitOr(u64),
+    BitXor(u64),
 }
 
 impl Accumulator {
@@ -33,6 +38,9 @@ impl Accumulator {
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
+            "BIT_AND" => Accumulator::BitAnd(None),
+            "BIT_OR" => Accumulator::BitOr(0),
+            "BIT_XOR" => Accumulator::BitXor(0),
             _ => Accumulator::Count(0), // fallback
         }
     }
@@ -78,6 +86,35 @@ impl Accumulator {
                     }
                 }
             }
+            Accumulator::BitAnd(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc = Some(acc.map_or(v, |a| a & v));
+                }
+            }
+            Accumulator::BitOr(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc |= v;
+                }
+            }
+            Accumulator::BitXor(acc) => {
+                if let Some(v) = Self::as_bitwise_u64(value) {
+                    *acc ^= v;
+                }
+            }
+        }
+    }
+
+    /// Extract u64 from a Datum for bitwise aggregate operations.
+    /// BIT values are used directly; integers are reinterpreted as u64 bit patterns.
+    fn as_bitwise_u64(value: &Datum) -> Option<u64> {
+        match value {
+            Datum::Bit { value, .. } => Some(*value),
+            Datum::Int(i) => Some(*i as u64),
+            Datum::UnsignedInt(u) => Some(*u),
+            Datum::Float(f) => Some(*f as u64),
+            Datum::Bool(b) => Some(if *b { 1 } else { 0 }),
+            Datum::Null => None,
+            _ => None,
         }
     }
 
@@ -97,6 +134,9 @@ impl Accumulator {
             }
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
+            Accumulator::BitAnd(acc) => acc.map_or(Datum::Null, |v| Datum::Int(v as i64)),
+            Accumulator::BitOr(v) => Datum::Int(*v as i64),
+            Accumulator::BitXor(v) => Datum::Int(*v as i64),
         }
     }
 }
@@ -156,6 +196,8 @@ pub struct HashAggregate {
     output: Vec<Row>,
     /// Current position in output
     position: usize,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl HashAggregate {
@@ -164,6 +206,7 @@ impl HashAggregate {
         input: Box<dyn Executor>,
         group_by: Vec<ResolvedExpr>,
         aggregates: Vec<(AggregateFunc, String)>,
+        user_variables: UserVariables,
     ) -> Self {
         HashAggregate {
             input,
@@ -172,6 +215,7 @@ impl HashAggregate {
             groups: HashMap::new(),
             output: Vec::new(),
             position: 0,
+            user_variables,
         }
     }
 
@@ -210,7 +254,7 @@ impl Executor for HashAggregate {
             // Evaluate group by expressions
             let mut group_values = Vec::with_capacity(self.group_by.len());
             for expr in &self.group_by {
-                group_values.push(eval(expr, &row)?);
+                group_values.push(evaluate(expr, &row, &self.user_variables)?);
             }
 
             let group_key = Self::make_group_key(&group_values);
@@ -232,7 +276,7 @@ impl Executor for HashAggregate {
                     // COUNT(*) case - count every row
                     Datum::Int(1)
                 } else {
-                    eval(&agg.args[0], &row)?
+                    evaluate(&agg.args[0], &row, &self.user_variables)?
                 };
                 accumulators[i].accumulate(&value);
             }
@@ -282,6 +326,14 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::ResolvedColumn;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -328,7 +380,7 @@ mod tests {
             "count".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -363,7 +415,7 @@ mod tests {
             "sum".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -406,7 +458,7 @@ mod tests {
             "sum".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, group_by, aggregates);
+        let mut agg = HashAggregate::new(input, group_by, aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let mut results: HashMap<String, f64> = HashMap::new();
@@ -451,7 +503,7 @@ mod tests {
             "count_distinct".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();
@@ -488,7 +540,7 @@ mod tests {
             "sum_distinct".to_string(),
         )];
 
-        let mut agg = HashAggregate::new(input, vec![], aggregates);
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
         agg.open().await.unwrap();
 
         let result = agg.next().await.unwrap().unwrap();

@@ -3,7 +3,7 @@
 //! Schema metadata is stored in system tables that are replicated via Raft
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
-use super::{ColumnDef, Constraint, DataType, IndexDef, TableDef};
+use super::{ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef};
 use crate::executor::{Datum, Row};
 
 /// System table names
@@ -17,6 +17,15 @@ pub const SYSTEM_USERS: &str = "system.users";
 pub const SYSTEM_GRANTS: &str = "system.grants";
 pub const SYSTEM_ROLES: &str = "system.roles";
 pub const SYSTEM_ROLE_GRANTS: &str = "system.role_grants";
+
+// Database registry
+pub const SYSTEM_DATABASES: &str = "system.databases";
+
+// Table statistics
+pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
+
+// Stored procedures
+pub const SYSTEM_PROCEDURES: &str = "system.procedures";
 
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
@@ -137,6 +146,32 @@ pub fn role_grants_table_def() -> TableDef {
         ]))
 }
 
+/// Create the TableDef for system.table_statistics
+pub fn table_statistics_table_def() -> TableDef {
+    TableDef::new(SYSTEM_TABLE_STATISTICS)
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("row_count", DataType::BigInt).nullable(false))
+        .column(ColumnDef::new("data_size", DataType::BigInt).nullable(false))
+        .column(ColumnDef::new("last_analyzed", DataType::Timestamp).nullable(true))
+        .constraint(Constraint::PrimaryKey(vec!["table_name".to_string()]))
+}
+
+/// Create the TableDef for system.databases
+pub fn databases_table_def() -> TableDef {
+    TableDef::new(SYSTEM_DATABASES)
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["database_name".to_string()]))
+}
+
+/// Create the TableDef for system.procedures
+pub fn procedures_table_def() -> TableDef {
+    TableDef::new(SYSTEM_PROCEDURES)
+        .column(ColumnDef::new("procedure_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("params_json", DataType::Text).nullable(false))
+        .column(ColumnDef::new("body_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
+}
+
 /// Get all system table definitions for bootstrapping
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
     vec![
@@ -148,6 +183,9 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         grants_table_def(),
         roles_table_def(),
         role_grants_table_def(),
+        databases_table_def(),
+        table_statistics_table_def(),
+        procedures_table_def(),
     ]
 }
 
@@ -186,12 +224,15 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::SmallInt => "SMALLINT".to_string(),
         DataType::Int => "INT".to_string(),
         DataType::BigInt => "BIGINT".to_string(),
+        DataType::BigIntUnsigned => "BIGINT UNSIGNED".to_string(),
         DataType::Float => "FLOAT".to_string(),
         DataType::Double => "DOUBLE".to_string(),
         DataType::Varchar(n) => format!("VARCHAR({})", n),
         DataType::Text => "TEXT".to_string(),
         DataType::Blob => "BLOB".to_string(),
+        DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
     }
 }
 
@@ -200,14 +241,34 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
     let s = s.to_uppercase();
     if s.starts_with("VARCHAR(") && s.ends_with(')') {
         let len_str = &s[8..s.len() - 1];
-        len_str.parse().ok().map(DataType::Varchar)
-    } else {
+        return len_str.parse().ok().map(DataType::Varchar);
+    }
+    if s.starts_with("BIT(") && s.ends_with(')') {
+        let n_str = &s[4..s.len() - 1];
+        return n_str
+            .parse::<u8>()
+            .ok()
+            .map(|n| DataType::Bit(n.clamp(1, 64)));
+    }
+    if s.starts_with("DECIMAL(") && s.ends_with(')') {
+        let inner = &s[8..s.len() - 1];
+        if let Some((p_str, s_str)) = inner.split_once(',') {
+            if let (Ok(p), Ok(sc)) = (p_str.parse::<u8>(), s_str.parse::<u8>()) {
+                return Some(DataType::Decimal {
+                    precision: p,
+                    scale: sc,
+                });
+            }
+        }
+    }
+    {
         match s.as_str() {
             "BOOLEAN" => Some(DataType::Boolean),
             "TINYINT" => Some(DataType::TinyInt),
             "SMALLINT" => Some(DataType::SmallInt),
             "INT" => Some(DataType::Int),
             "BIGINT" => Some(DataType::BigInt),
+            "BIGINT UNSIGNED" => Some(DataType::BigIntUnsigned),
             "FLOAT" => Some(DataType::Float),
             "DOUBLE" => Some(DataType::Double),
             "TEXT" => Some(DataType::Text),
@@ -389,6 +450,38 @@ pub fn rows_to_table_def(table_name: &str, column_rows: &[Row]) -> Option<TableD
     Some(def)
 }
 
+/// Convert a ProcedureDef to a row for system.procedures
+pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
+    let params_json = serde_json::to_string(&def.params).unwrap_or_else(|_| "[]".to_string());
+    Row::new(vec![
+        Datum::String(def.name.clone()),
+        Datum::String(params_json),
+        Datum::String(def.body_sql.clone()),
+    ])
+}
+
+/// Reconstruct a ProcedureDef from a system.procedures row
+pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
+    let name = match &row.values()[0] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let params_json = match &row.values()[1] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let body_sql = match &row.values()[2] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let params: Vec<ProcedureParam> = serde_json::from_str(&params_json).ok()?;
+    Some(ProcedureDef {
+        name,
+        params,
+        body_sql,
+    })
+}
+
 /// Reconstruct an IndexDef from a system.indexes row
 pub fn row_to_index_def(row: &Row) -> Option<IndexDef> {
     let index_name = match &row.values()[0] {
@@ -439,6 +532,9 @@ mod tests {
             DataType::Varchar(100),
             DataType::Text,
             DataType::Blob,
+            DataType::Bit(1),
+            DataType::Bit(8),
+            DataType::Bit(64),
             DataType::Timestamp,
         ];
 
@@ -508,7 +604,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 8);
+        assert_eq!(tables.len(), 11);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -519,6 +615,9 @@ mod tests {
         assert!(names.contains(&SYSTEM_GRANTS));
         assert!(names.contains(&SYSTEM_ROLES));
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
+        assert!(names.contains(&SYSTEM_DATABASES));
+        assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
+        assert!(names.contains(&SYSTEM_PROCEDURES));
     }
 
     #[test]

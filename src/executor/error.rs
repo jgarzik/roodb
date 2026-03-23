@@ -28,6 +28,9 @@ pub enum ExecutorError {
     /// Invalid operation (e.g., division by zero)
     InvalidOperation(String),
 
+    /// Data out of range (e.g., float overflow)
+    DataOutOfRange(String),
+
     /// Column not found during evaluation
     ColumnNotFound { table: String, column: String },
 
@@ -42,6 +45,9 @@ pub enum ExecutorError {
 
     /// Encoding/decoding error
     Encoding(String),
+
+    /// Invalid argument for logarithm (MySQL error 3020)
+    InvalidArgumentForLogarithm(String),
 
     /// Internal executor error
     Internal(String),
@@ -64,6 +70,7 @@ impl fmt::Display for ExecutorError {
                 )
             }
             ExecutorError::InvalidOperation(msg) => write!(f, "invalid operation: {}", msg),
+            ExecutorError::DataOutOfRange(msg) => write!(f, "{}", msg),
             ExecutorError::ColumnNotFound { table, column } => {
                 write!(f, "column not found: {}.{}", table, column)
             }
@@ -77,6 +84,7 @@ impl fmt::Display for ExecutorError {
             ExecutorError::NullValue(context) => write!(f, "null value in {}", context),
             ExecutorError::TableNotFound(name) => write!(f, "table not found: {}", name),
             ExecutorError::Encoding(msg) => write!(f, "encoding error: {}", msg),
+            ExecutorError::InvalidArgumentForLogarithm(msg) => write!(f, "{}", msg),
             ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }

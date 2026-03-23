@@ -1,0 +1,15 @@
+# Test: Multi-row INSERT
+CREATE TABLE mri_t (id INT NOT NULL, name VARCHAR(50), PRIMARY KEY (id));
+# Multi-row VALUES
+INSERT INTO mri_t (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+SELECT * FROM mri_t;
+id	name
+1	Alice
+2	Bob
+3	Charlie
+# Partial column list
+INSERT INTO mri_t (id) VALUES (4);
+SELECT * FROM mri_t WHERE id = 4;
+id	name
+4	NULL
+DROP TABLE mri_t;

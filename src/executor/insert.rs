@@ -8,10 +8,12 @@ use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{encode_pk_key, encode_row, encode_row_key};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -24,7 +26,7 @@ pub struct Insert {
     /// Table name
     table: String,
     /// Target columns
-    _columns: Vec<ResolvedColumn>,
+    columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
     values: Vec<Vec<ResolvedExpr>>,
     /// Transaction context (for MVCC versioning)
@@ -43,10 +45,15 @@ pub struct Insert {
     last_insert_id: u64,
     /// Primary key column indices (for PK-based storage keys)
     pk_column_indices: Vec<usize>,
+    /// User variables
+    user_variables: UserVariables,
+    /// IGNORE modifier — suppress errors, skip bad rows
+    ignore: bool,
 }
 
 impl Insert {
     /// Create a new insert executor
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: String,
         columns: Vec<ResolvedColumn>,
@@ -54,10 +61,12 @@ impl Insert {
         txn_context: Option<TransactionContext>,
         auto_increment_indices: Vec<usize>,
         pk_column_indices: Vec<usize>,
+        user_variables: UserVariables,
+        ignore: bool,
     ) -> Self {
         Insert {
             table,
-            _columns: columns,
+            columns,
             values,
             txn_context,
             rows_inserted: 0,
@@ -67,6 +76,8 @@ impl Insert {
             auto_increment_indices,
             last_insert_id: 0,
             pk_column_indices,
+            user_variables,
+            ignore,
         }
     }
 
@@ -106,12 +117,33 @@ impl Executor for Insert {
         // Insert all rows
         let empty_row = Row::empty();
 
-        for value_row in &self.values {
+        // RAII guard: strict DML context cleared on drop (even on early return/error)
+        let _strict_guard = super::eval::StrictDmlGuard::new(&self.user_variables);
+
+        'row_loop: for value_row in &self.values {
             // Evaluate expressions to get datum values
             let mut datums = Vec::with_capacity(value_row.len());
-            for expr in value_row {
-                let datum = eval(expr, &empty_row)?;
+            let mut skip_row = false;
+            for (col_idx, expr) in value_row.iter().enumerate() {
+                let datum = match evaluate(expr, &empty_row, &self.user_variables) {
+                    Ok(d) => d,
+                    Err(_) if self.ignore => {
+                        skip_row = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                // Coerce value to match column type (e.g. Bytes → Bit)
+                let datum = if col_idx < self.columns.len() {
+                    super::eval::coerce_to_column_type(datum, &self.columns[col_idx].data_type)
+                } else {
+                    datum
+                };
                 datums.push(datum);
+            }
+            if skip_row {
+                self.next_local_id += 1;
+                continue 'row_loop;
             }
 
             // Get next row ID from pre-allocated batch
@@ -125,6 +157,29 @@ impl Executor for Insert {
                 if idx < datums.len() && datums[idx].is_null() {
                     datums[idx] = super::datum::Datum::Int(auto_id as i64);
                     self.last_insert_id = auto_id;
+                }
+            }
+
+            // Validate NOT NULL constraints (after auto_increment so generated values pass).
+            // MySQL behavior: single-row INSERT with explicit NULL → error 1048.
+            // Multi-row INSERT in non-strict mode → convert NULL to column default.
+            // INSERT IGNORE: convert NULL to column default instead of erroring.
+            let is_multi_row = self.values.len() > 1;
+            for (col_idx, datum) in datums.iter_mut().enumerate() {
+                if col_idx < self.columns.len()
+                    && !self.columns[col_idx].nullable
+                    && datum.is_null()
+                {
+                    if is_multi_row || self.ignore {
+                        // Non-strict mode / IGNORE: replace NULL with type default
+                        *datum =
+                            super::datum::Datum::default_for_type(&self.columns[col_idx].data_type);
+                    } else {
+                        return Err(super::error::ExecutorError::NullValue(format!(
+                            "Column '{}' cannot be null",
+                            self.columns[col_idx].name
+                        )));
+                    }
                 }
             }
 
@@ -183,6 +238,14 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::planner::logical::Literal;
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     #[tokio::test]
     async fn test_insert() {
@@ -220,6 +283,8 @@ mod tests {
             Some(txn_context),
             vec![],
             vec![0], // id is PK at index 0
+            empty_vars(),
+            false,
         );
         insert.open().await.unwrap();
 

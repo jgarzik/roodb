@@ -1,0 +1,16 @@
+--echo # Test: Built-in functions
+
+--echo # String functions
+SELECT UPPER('hello');
+SELECT LOWER('HELLO');
+SELECT LENGTH('hello');
+SELECT CONCAT('hello', ' ', 'world');
+
+--echo # Numeric functions
+SELECT ABS(-5);
+SELECT ABS(5);
+
+--echo # NULL functions
+SELECT COALESCE(NULL, 'fallback');
+SELECT COALESCE('first', 'second');
+SELECT COALESCE(NULL, NULL, 'third');

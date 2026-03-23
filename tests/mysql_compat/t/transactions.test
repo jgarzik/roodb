@@ -1,0 +1,22 @@
+--echo # Test: Transactions
+
+CREATE TABLE txn_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
+
+--echo # Autocommit INSERT (implicit commit)
+INSERT INTO txn_t VALUES (1, 100);
+SELECT * FROM txn_t;
+
+--echo # Explicit transaction with COMMIT
+BEGIN;
+INSERT INTO txn_t VALUES (2, 200);
+INSERT INTO txn_t VALUES (3, 300);
+COMMIT;
+SELECT * FROM txn_t;
+
+--echo # Explicit transaction with ROLLBACK
+BEGIN;
+INSERT INTO txn_t VALUES (4, 400);
+ROLLBACK;
+SELECT * FROM txn_t;
+
+DROP TABLE txn_t;

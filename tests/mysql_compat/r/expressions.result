@@ -1,0 +1,77 @@
+# Test: Expressions and operators
+CREATE TABLE expr_t (id INT NOT NULL, val INT, name VARCHAR(50), PRIMARY KEY (id));
+INSERT INTO expr_t VALUES (1, 10, 'apple');
+INSERT INTO expr_t VALUES (2, 20, 'banana');
+INSERT INTO expr_t VALUES (3, 30, 'cherry');
+INSERT INTO expr_t VALUES (4, NULL, NULL);
+# Arithmetic
+SELECT 2 + 3;
+2 + 3
+5
+SELECT 10 - 4;
+10 - 4
+6
+SELECT 3 * 7;
+3 * 7
+21
+SELECT 15 / 3;
+15 / 3
+5
+# Comparison
+SELECT id, val FROM expr_t WHERE val > 15;
+id	val
+2	20
+3	30
+SELECT id, val FROM expr_t WHERE val >= 20;
+id	val
+2	20
+3	30
+SELECT id, val FROM expr_t WHERE val < 25;
+id	val
+1	10
+2	20
+SELECT id, val FROM expr_t WHERE val <= 10;
+id	val
+1	10
+SELECT id, val FROM expr_t WHERE val != 20;
+id	val
+1	10
+3	30
+# IN list
+SELECT id, name FROM expr_t WHERE name IN ('apple', 'cherry');
+id	name
+1	apple
+3	cherry
+# BETWEEN
+SELECT id, val FROM expr_t WHERE val BETWEEN 15 AND 35;
+id	val
+2	20
+3	30
+# LIKE
+SELECT id, name FROM expr_t WHERE name LIKE 'a%';
+id	name
+1	apple
+# IS NULL / IS NOT NULL
+SELECT id, val FROM expr_t WHERE val IS NULL;
+id	val
+4	NULL
+SELECT id, val FROM expr_t WHERE val IS NOT NULL;
+id	val
+1	10
+2	20
+3	30
+# AND / OR
+SELECT id FROM expr_t WHERE val > 15 AND val < 35;
+id
+2
+3
+SELECT id FROM expr_t WHERE val < 15 OR val > 25;
+id
+1
+3
+# Negation
+SELECT id FROM expr_t WHERE NOT val > 20;
+id
+1
+2
+DROP TABLE expr_t;

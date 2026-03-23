@@ -703,6 +703,622 @@ impl Executor for DropIndex {
     }
 }
 
+/// CREATE DATABASE executor
+pub struct CreateDatabase {
+    name: String,
+    if_not_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    raft_node: Option<Arc<RaftNode>>,
+    done: bool,
+    changes: Vec<RowChange>,
+}
+
+impl CreateDatabase {
+    pub fn new(name: String, if_not_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        CreateDatabase {
+            name,
+            if_not_exists,
+            catalog,
+            raft_node: None,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn with_raft(
+        name: String,
+        if_not_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+    ) -> Self {
+        CreateDatabase {
+            name,
+            if_not_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for CreateDatabase {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Check if database already exists
+        {
+            let catalog = self.catalog.read();
+            if catalog.database_exists(&self.name) {
+                if self.if_not_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "Can't create database '{}'; database exists",
+                    self.name
+                )));
+            }
+        }
+
+        if let Some(ref raft_node) = self.raft_node {
+            use crate::catalog::system_tables::SYSTEM_DATABASES;
+
+            // Write to system.databases via Raft
+            let (start, node_id) = allocate_row_id_batch(1);
+            let row_id = encode_row_id(start, node_id);
+
+            let row = Row::new(vec![Datum::String(self.name.clone())]);
+            let key = encode_row_key(SYSTEM_DATABASES, row_id);
+            let value = encode_row(&row);
+
+            let change = RowChange::insert(SYSTEM_DATABASES.to_string(), key, value);
+            let changeset = ChangeSet::new_with_changes(0, vec![change]);
+
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        } else {
+            // Direct catalog update (no Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .create_database(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+/// DROP DATABASE executor
+pub struct DropDatabase {
+    name: String,
+    if_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    raft_node: Option<Arc<RaftNode>>,
+    mvcc: Option<Arc<crate::txn::MvccStorage>>,
+    done: bool,
+    changes: Vec<RowChange>,
+}
+
+impl DropDatabase {
+    pub fn new(name: String, if_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        DropDatabase {
+            name,
+            if_exists,
+            catalog,
+            raft_node: None,
+            mvcc: None,
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn with_raft(
+        name: String,
+        if_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+        raft_node: Arc<RaftNode>,
+        mvcc: Arc<crate::txn::MvccStorage>,
+    ) -> Self {
+        DropDatabase {
+            name,
+            if_exists,
+            catalog,
+            raft_node: Some(raft_node),
+            mvcc: Some(mvcc),
+            done: false,
+            changes: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for DropDatabase {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.changes.clear();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Prevent dropping the "default" database
+        if self.name == "default" {
+            return Err(ExecutorError::Internal(
+                "Cannot drop the 'default' database".to_string(),
+            ));
+        }
+
+        // Check if database exists
+        {
+            let catalog = self.catalog.read();
+            if !catalog.database_exists(&self.name) {
+                if self.if_exists {
+                    self.done = true;
+                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "Can't drop database '{}'; database doesn't exist",
+                    self.name
+                )));
+            }
+        }
+
+        if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
+            use crate::catalog::system_tables::SYSTEM_DATABASES;
+
+            // Scan system.databases to find the row to delete
+            let prefix = format!("t:{SYSTEM_DATABASES}:");
+            let end = format!("t:{SYSTEM_DATABASES};\x00");
+
+            let rows = mvcc
+                .scan_raw(prefix.as_bytes(), end.as_bytes())
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+
+            let mut changeset = ChangeSet::new(0);
+            for (key, value) in rows {
+                let row_data = if value.len() > 17 {
+                    &value[17..]
+                } else {
+                    &value
+                };
+                if let Ok(row) = super::encoding::decode_row(row_data) {
+                    if let Some(Datum::String(db_name)) = row.get_opt(0) {
+                        if db_name == &self.name {
+                            changeset.push(RowChange::delete_with_value(
+                                SYSTEM_DATABASES,
+                                key.clone(),
+                                row_data.to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if !changeset.changes.is_empty() {
+                raft_node
+                    .propose_changes(changeset)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            }
+        } else {
+            // Direct catalog update (no Raft)
+            let mut catalog = self.catalog.write();
+            catalog
+                .drop_database(&self.name)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+// ============ CREATE TABLE ... SELECT ============
+
+use super::context::TransactionContext;
+use super::encoding::encode_pk_key;
+
+/// CREATE TABLE ... SELECT executor
+///
+/// Combines DDL (table creation) and DML (row insertion from a SELECT source).
+/// The table is created via Raft first, then rows from the source SELECT are
+/// streamed into storage.
+pub struct CreateTableAs {
+    name: String,
+    columns: Vec<ColumnDef>,
+    constraints: Vec<Constraint>,
+    if_not_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    raft_node: Option<Arc<RaftNode>>,
+    source: Box<dyn Executor>,
+    txn_context: Option<TransactionContext>,
+    done: bool,
+    rows_inserted: u64,
+}
+
+/// Parameters for creating a CreateTableAs executor.
+pub struct CreateTableAsParams {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    pub constraints: Vec<Constraint>,
+    pub if_not_exists: bool,
+    pub catalog: Arc<RwLock<Catalog>>,
+    pub raft_node: Option<Arc<RaftNode>>,
+    pub source: Box<dyn Executor>,
+    pub txn_context: Option<TransactionContext>,
+}
+
+impl CreateTableAs {
+    pub fn new(params: CreateTableAsParams) -> Self {
+        CreateTableAs {
+            name: params.name,
+            columns: params.columns,
+            constraints: params.constraints,
+            if_not_exists: params.if_not_exists,
+            catalog: params.catalog,
+            raft_node: params.raft_node,
+            source: params.source,
+            txn_context: params.txn_context,
+            done: false,
+            rows_inserted: 0,
+        }
+    }
+
+    /// Create the table definition and register it (DDL phase).
+    /// Returns the PK column indices for row storage.
+    async fn create_table_ddl(&mut self) -> ExecutorResult<Vec<usize>> {
+        if is_system_table(&self.name) {
+            return Err(ExecutorError::Internal(format!(
+                "cannot create system table '{}'",
+                self.name
+            )));
+        }
+
+        // Check if table exists
+        {
+            let catalog = self.catalog.read();
+            if catalog.get_table(&self.name).is_some() {
+                if self.if_not_exists {
+                    return Ok(vec![]);
+                }
+                return Err(ExecutorError::Internal(format!(
+                    "table '{}' already exists",
+                    self.name
+                )));
+            }
+        }
+
+        // Build table definition
+        let mut table_def = TableDef::new(&self.name);
+        for col in &self.columns {
+            table_def = table_def.column(col.clone());
+        }
+        for constraint in &self.constraints {
+            table_def = table_def.constraint(constraint.clone());
+        }
+
+        // Determine PK column indices for row storage
+        let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
+            pk_cols
+                .iter()
+                .filter_map(|pk_name| table_def.get_column_index(pk_name))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        if let Some(ref raft_node) = self.raft_node {
+            // Raft path: propose DDL changes to system tables
+            let mut changeset = ChangeSet::new(0);
+            let column_rows = table_def_to_columns_rows(&table_def);
+            let constraint_rows = table_def_to_constraints_rows(&table_def);
+            let total_ids = 1 + column_rows.len() as u64 + constraint_rows.len() as u64;
+            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+
+            let table_row = table_def_to_tables_row(&table_def);
+            let row_id = encode_row_id(next_local, node_id);
+            next_local += 1;
+            let key = encode_row_key(SYSTEM_TABLES, row_id);
+            let value = encode_row(&table_row);
+            changeset.push(RowChange::insert(SYSTEM_TABLES, key, value));
+
+            for col_row in column_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_COLUMNS, row_id);
+                let value = encode_row(&col_row);
+                changeset.push(RowChange::insert(SYSTEM_COLUMNS, key, value));
+            }
+
+            for constraint_row in constraint_rows {
+                let row_id = encode_row_id(next_local, node_id);
+                next_local += 1;
+                let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
+                let value = encode_row(&constraint_row);
+                changeset.push(RowChange::insert(SYSTEM_CONSTRAINTS, key, value));
+            }
+
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+        } else {
+            // No Raft: update catalog directly
+            let mut catalog = self.catalog.write();
+            catalog
+                .create_table(table_def)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+
+        Ok(pk_indices)
+    }
+}
+
+#[async_trait]
+impl Executor for CreateTableAs {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        self.rows_inserted = 0;
+        self.source.open().await
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Phase 1: Create the table (DDL)
+        let pk_indices = self.create_table_ddl().await?;
+
+        // If table already existed (IF NOT EXISTS), return 0 rows affected
+        {
+            let catalog = self.catalog.read();
+            if catalog.get_table(&self.name).is_none() && self.if_not_exists {
+                self.done = true;
+                return Ok(Some(Row::new(vec![Datum::Int(0)])));
+            }
+        }
+
+        // Phase 2: Stream rows from source SELECT into the new table
+        // Allocate row IDs in batches for performance
+        let batch_size = 1000u64;
+        let (mut next_local, node_id) = allocate_row_id_batch(batch_size);
+        let mut batch_remaining = batch_size;
+
+        while let Some(row) = self.source.next().await? {
+            if batch_remaining == 0 {
+                let (new_local, new_node) = allocate_row_id_batch(batch_size);
+                next_local = new_local;
+                let _ = new_node; // Same node
+                batch_remaining = batch_size;
+            }
+
+            let row_id = encode_row_id(next_local, node_id);
+            next_local += 1;
+            batch_remaining -= 1;
+
+            // Encode storage key (PK-based or row-ID-based)
+            let key = if !pk_indices.is_empty() {
+                let pk_values: Vec<_> = pk_indices
+                    .iter()
+                    .filter_map(|&idx| row.get(idx).ok().cloned())
+                    .collect();
+                encode_pk_key(&self.name, &pk_values)
+            } else {
+                encode_row_key(&self.name, row_id)
+            };
+            let value = encode_row(&row);
+
+            // Buffer the row change for Raft replication
+            if let Some(ref mut ctx) = self.txn_context {
+                ctx.add_change(RowChange::insert(&self.name, key.clone(), value.clone()));
+                ctx.buffer_write(key, value);
+            }
+            self.rows_inserted += 1;
+        }
+
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(self.rows_inserted as i64)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        self.source.close().await
+    }
+
+    fn take_changes(&mut self) -> Vec<RowChange> {
+        self.txn_context
+            .as_mut()
+            .map(|ctx| ctx.take_changes())
+            .unwrap_or_default()
+    }
+}
+
+// ============ Materialize (derived table) ============
+
+/// Materialize executor — eagerly materializes all rows from input on open(),
+/// then streams them from memory on subsequent next() calls.
+/// Used for derived tables (subquery in FROM clause).
+pub struct Materialize {
+    input: Box<dyn Executor>,
+    rows: Vec<Row>,
+    position: usize,
+}
+
+impl Materialize {
+    pub fn new(input: Box<dyn Executor>) -> Self {
+        Materialize {
+            input,
+            rows: Vec::new(),
+            position: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for Materialize {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.rows.clear();
+        self.position = 0;
+        self.input.open().await?;
+        while let Some(row) = self.input.next().await? {
+            self.rows.push(row);
+        }
+        self.input.close().await?;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.position >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.position].clone();
+        self.position += 1;
+        Ok(Some(row))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        self.rows.clear();
+        self.position = 0;
+        Ok(())
+    }
+}
+
+// ============ CREATE VIEW / DROP VIEW ============
+
+/// CREATE VIEW executor
+pub struct CreateView {
+    name: String,
+    query_sql: String,
+    or_replace: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    done: bool,
+}
+
+impl CreateView {
+    pub fn new(
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+        catalog: Arc<RwLock<Catalog>>,
+    ) -> Self {
+        CreateView {
+            name,
+            query_sql,
+            or_replace,
+            catalog,
+            done: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for CreateView {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        let view_def = crate::catalog::ViewDef {
+            name: self.name.clone(),
+            query_sql: self.query_sql.clone(),
+        };
+        let mut catalog = self.catalog.write();
+        if self.or_replace {
+            catalog.replace_view(view_def);
+        } else {
+            catalog
+                .create_view(view_def)
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        }
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+}
+
+/// DROP VIEW executor
+pub struct DropView {
+    name: String,
+    if_exists: bool,
+    catalog: Arc<RwLock<Catalog>>,
+    done: bool,
+}
+
+impl DropView {
+    pub fn new(name: String, if_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+        DropView {
+            name,
+            if_exists,
+            catalog,
+            done: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Executor for DropView {
+    async fn open(&mut self) -> ExecutorResult<()> {
+        self.done = false;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ExecutorResult<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut catalog = self.catalog.write();
+        catalog
+            .drop_view(&self.name, self.if_exists)
+            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        self.done = true;
+        Ok(Some(Row::new(vec![Datum::Int(0)])))
+    }
+
+    async fn close(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

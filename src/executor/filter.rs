@@ -6,8 +6,10 @@ use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedExpr;
 
+use crate::server::session::UserVariables;
+
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -17,12 +19,22 @@ pub struct Filter {
     input: Box<dyn Executor>,
     /// Filter predicate
     predicate: ResolvedExpr,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl Filter {
     /// Create a new filter executor
-    pub fn new(input: Box<dyn Executor>, predicate: ResolvedExpr) -> Self {
-        Filter { input, predicate }
+    pub fn new(
+        input: Box<dyn Executor>,
+        predicate: ResolvedExpr,
+        user_variables: UserVariables,
+    ) -> Self {
+        Filter {
+            input,
+            predicate,
+            user_variables,
+        }
     }
 }
 
@@ -36,7 +48,7 @@ impl Executor for Filter {
         loop {
             match self.input.next().await? {
                 Some(row) => {
-                    let result = eval(&self.predicate, &row)?;
+                    let result = evaluate(&self.predicate, &row, &self.user_variables)?;
                     if result.as_bool().unwrap_or(false) {
                         return Ok(Some(row));
                     }
@@ -58,6 +70,14 @@ mod tests {
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
+    use crate::server::session::UserVariables;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_vars() -> UserVariables {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     struct MockExecutor {
         rows: Vec<Row>,
@@ -109,7 +129,7 @@ mod tests {
             result_type: DataType::Boolean,
         };
 
-        let mut filter = Filter::new(input, predicate);
+        let mut filter = Filter::new(input, predicate, empty_vars());
         filter.open().await.unwrap();
 
         // Should get 2 and 3 only

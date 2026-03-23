@@ -147,12 +147,31 @@ impl CostEstimator {
                 }
             }
 
+            PhysicalPlan::Union { left, right, .. } => {
+                let left_cost = Self::estimate_node(left);
+                let right_cost = Self::estimate_node(right);
+                Cost {
+                    rows: left_cost.rows + right_cost.rows,
+                    cpu: left_cost.cpu + right_cost.cpu,
+                    io: left_cost.io + right_cost.io,
+                }
+            }
+
             // DML/DDL have minimal query cost
             PhysicalPlan::Insert { values, .. } => Cost {
                 rows: values.len() as f64,
                 cpu: values.len() as f64,
                 io: 1.0,
             },
+
+            PhysicalPlan::InsertSelect { source, .. } => {
+                let source_cost = Self::estimate_node(source);
+                Cost {
+                    rows: source_cost.rows,
+                    cpu: source_cost.cpu + source_cost.rows,
+                    io: source_cost.io + 1.0,
+                }
+            }
 
             PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. } => Cost {
                 rows: Self::DEFAULT_TABLE_ROWS * Self::DEFAULT_SELECTIVITY,
@@ -183,16 +202,25 @@ impl CostEstimator {
             }
 
             PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateTableAs { .. }
+            | PhysicalPlan::Materialize { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. }
             | PhysicalPlan::CreateUser { .. }
             | PhysicalPlan::DropUser { .. }
             | PhysicalPlan::AlterUser { .. }
             | PhysicalPlan::SetPassword { .. }
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
-            | PhysicalPlan::ShowGrants { .. } => Cost::zero(),
+            | PhysicalPlan::ShowGrants { .. }
+            | PhysicalPlan::AnalyzeTable { .. }
+            | PhysicalPlan::Explain { .. }
+            | PhysicalPlan::DropMultipleTables { .. } => Cost::zero(),
         }
     }
 }

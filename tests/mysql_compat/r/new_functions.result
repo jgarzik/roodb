@@ -1,0 +1,59 @@
+# Test: IF(), ISNULL(), IFNULL(), division by zero, DATE type
+# Division by zero returns NULL
+SELECT 1 / 0;
+1 / 0
+NULL
+SELECT 10 / 0;
+10 / 0
+NULL
+SELECT 5 % 0;
+5 % 0
+NULL
+# IF() function
+SELECT IF(1, 'yes', 'no');
+IF(1,'yes','no')
+yes
+SELECT IF(0, 'yes', 'no');
+IF(0,'yes','no')
+no
+SELECT IF(NULL, 'yes', 'no');
+IF(NULL,'yes','no')
+no
+# IF() with expressions
+CREATE TABLE if_t (id INT NOT NULL, val INT, PRIMARY KEY (id));
+INSERT INTO if_t VALUES (1, 10);
+INSERT INTO if_t VALUES (2, NULL);
+INSERT INTO if_t VALUES (3, 0);
+SELECT id, IF(val, 'truthy', 'falsy') FROM if_t;
+id	IF(val,'truthy','falsy')
+1	truthy
+2	falsy
+3	falsy
+DROP TABLE if_t;
+# ISNULL() function
+SELECT ISNULL(1);
+ISNULL(1)
+0
+SELECT ISNULL(NULL);
+ISNULL(NULL)
+1
+SELECT ISNULL('hello');
+ISNULL('hello')
+0
+# IFNULL() function
+SELECT IFNULL(1, 2);
+IFNULL(1,2)
+1
+SELECT IFNULL(NULL, 2);
+IFNULL(NULL,2)
+2
+SELECT IFNULL(NULL, 'default');
+IFNULL(NULL,'default')
+default
+# DATE column type
+CREATE TABLE date_t (id INT NOT NULL, d DATE, PRIMARY KEY (id));
+INSERT INTO date_t VALUES (1, '2024-01-15');
+SELECT id, d FROM date_t;
+id	d
+1	2024-01-15
+DROP TABLE date_t;

@@ -36,6 +36,20 @@ pub enum BinaryOp {
     // String
     Like,
     NotLike,
+    // Bitwise
+    BitwiseOr,
+    BitwiseAnd,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+    // Integer division
+    IntDiv,
+    // Logical
+    Xor,
+    // NULL-safe comparison
+    Spaceship,
+    // Assignment (:=)
+    Assign,
 }
 
 /// Unary operators
@@ -43,6 +57,8 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Not,
     Neg,
+    Plus,
+    BitwiseNot,
 }
 
 /// JOIN type
@@ -55,15 +71,29 @@ pub enum JoinType {
     Cross,
 }
 
+/// Boolean test type for IS TRUE / IS FALSE / IS UNKNOWN predicates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanTestType {
+    IsTrue,
+    IsNotTrue,
+    IsFalse,
+    IsNotFalse,
+    IsUnknown,
+    IsNotUnknown,
+}
+
 /// Literal value
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     Boolean(bool),
     Integer(i64),
+    UnsignedInteger(u64),
     Float(f64),
     String(String),
     Blob(Vec<u8>),
+    /// Fixed-point decimal (unscaled value, scale)
+    Decimal(i128, u8),
     /// Parameter placeholder (index into params array) for prepared statement plan caching
     Placeholder(usize),
 }
@@ -125,6 +155,31 @@ pub enum ResolvedExpr {
         high: Box<ResolvedExpr>,
         negated: bool,
     },
+    /// IS TRUE / IS FALSE / IS UNKNOWN predicates
+    BooleanTest {
+        expr: Box<ResolvedExpr>,
+        test: BooleanTestType,
+    },
+    /// CAST(expr AS type)
+    Cast {
+        expr: Box<ResolvedExpr>,
+        target_type: DataType,
+    },
+    /// User variable reference (@var)
+    UserVariable { name: String },
+    /// CASE expression (simple and searched)
+    Case {
+        /// Simple CASE: the operand to compare against; None for searched CASE
+        operand: Option<Box<ResolvedExpr>>,
+        /// WHEN conditions
+        conditions: Vec<ResolvedExpr>,
+        /// THEN results (parallel to conditions)
+        results: Vec<ResolvedExpr>,
+        /// Optional ELSE result
+        else_result: Option<Box<ResolvedExpr>>,
+        /// Inferred result type
+        result_type: DataType,
+    },
 }
 
 impl ResolvedExpr {
@@ -136,9 +191,21 @@ impl ResolvedExpr {
                 Literal::Null => DataType::Int, // NULL is polymorphic, default to Int
                 Literal::Boolean(_) => DataType::Boolean,
                 Literal::Integer(_) => DataType::BigInt,
+                Literal::UnsignedInteger(_) => DataType::BigIntUnsigned,
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::Text,
                 Literal::Blob(_) => DataType::Blob,
+                Literal::Decimal(value, scale) => {
+                    let digits = if *value == 0 {
+                        1
+                    } else {
+                        value.unsigned_abs().ilog10() as u8 + 1
+                    };
+                    DataType::Decimal {
+                        precision: digits.max(*scale),
+                        scale: *scale,
+                    }
+                }
                 Literal::Placeholder(_) => DataType::BigInt, // Placeholder type determined at substitution
             },
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
@@ -147,6 +214,10 @@ impl ResolvedExpr {
             ResolvedExpr::IsNull { .. } => DataType::Boolean,
             ResolvedExpr::InList { .. } => DataType::Boolean,
             ResolvedExpr::Between { .. } => DataType::Boolean,
+            ResolvedExpr::BooleanTest { .. } => DataType::Boolean,
+            ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
+            ResolvedExpr::UserVariable { .. } => DataType::Text,
+            ResolvedExpr::Case { result_type, .. } => result_type.clone(),
         }
     }
 
@@ -166,6 +237,17 @@ impl ResolvedExpr {
             ResolvedExpr::Between {
                 expr, low, high, ..
             } => expr.is_nullable() || low.is_nullable() || high.is_nullable(),
+            ResolvedExpr::BooleanTest { .. } => false, // Always returns true/false, never NULL
+            ResolvedExpr::Cast { expr, .. } => expr.is_nullable(),
+            ResolvedExpr::UserVariable { .. } => true,
+            ResolvedExpr::Case {
+                results,
+                else_result,
+                ..
+            } => {
+                // Case is nullable if any result is nullable or there's no ELSE
+                else_result.is_none() || results.iter().any(|r| r.is_nullable())
+            }
         }
     }
 }
@@ -188,6 +270,8 @@ pub struct ResolvedTableRef {
     pub name: String,
     pub alias: Option<String>,
     pub columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
+    /// Set for derived tables (subquery in FROM) and view expansions
+    pub inner_query: Option<Box<ResolvedSelect>>,
 }
 
 /// Resolved ORDER BY item
@@ -239,6 +323,8 @@ pub enum ResolvedStatement {
     },
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
     /// CREATE INDEX
     CreateIndex {
         name: String,
@@ -248,11 +334,23 @@ pub enum ResolvedStatement {
     },
     /// DROP INDEX
     DropIndex { name: String },
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
     /// INSERT with resolved columns
     Insert {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
+        ignore: bool,
+    },
+    /// INSERT ... SELECT with resolved source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<ResolvedStatement>,
+        ignore: bool,
     },
     /// UPDATE with resolved assignments
     Update {
@@ -269,6 +367,20 @@ pub enum ResolvedStatement {
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
+    /// UNION of two SELECTs
+    Union {
+        left: Box<ResolvedSelect>,
+        right: Box<ResolvedSelect>,
+        all: bool,
+    },
+    /// CREATE TABLE ... SELECT (CTAS) — source can be Select or Union
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        source: Box<ResolvedStatement>,
+    },
 
     // ============ Auth/User Management ============
     /// CREATE USER 'name'@'host' IDENTIFIED BY 'password'
@@ -316,6 +428,18 @@ pub enum ResolvedStatement {
         /// If None, show grants for current user
         for_user: Option<(String, HostPattern)>,
     },
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
+    /// EXPLAIN statement
+    Explain { inner: Box<ResolvedStatement> },
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
 }
 
 /// Logical plan node
@@ -375,8 +499,21 @@ pub enum LogicalPlan {
     /// Remove duplicate rows
     Distinct { input: Box<LogicalPlan> },
 
+    /// UNION of two query plans
+    Union {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        all: bool,
+    },
+
     /// Single empty row (TABLE_DEE - for expression-only queries)
     SingleRow,
+
+    /// Derived table (subquery in FROM) — materializes inner plan
+    DerivedTable {
+        input: Box<LogicalPlan>,
+        alias: String,
+    },
 
     // ============ DML Operations ============
     /// INSERT rows into a table
@@ -384,6 +521,15 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
+        ignore: bool,
+    },
+
+    /// INSERT ... SELECT — insert rows from a source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<LogicalPlan>,
+        ignore: bool,
     },
 
     /// UPDATE rows in a table
@@ -409,8 +555,20 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// CREATE TABLE ... SELECT
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        source: Box<LogicalPlan>,
+    },
+
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
+
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
@@ -422,6 +580,22 @@ pub enum LogicalPlan {
 
     /// DROP INDEX
     DropIndex { name: String },
+
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
+
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
 
     // ============ Auth Operations ============
     /// CREATE USER
@@ -474,6 +648,12 @@ pub enum LogicalPlan {
     ShowGrants {
         for_user: Option<(String, HostPattern)>,
     },
+
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
+
+    /// EXPLAIN — wraps the inner plan for EXPLAIN output
+    Explain { inner: Box<LogicalPlan> },
 }
 
 impl LogicalPlan {
@@ -536,17 +716,25 @@ impl LogicalPlan {
             LogicalPlan::Limit { input, .. } => input.output_columns(),
             LogicalPlan::Distinct { input } => input.output_columns(),
             LogicalPlan::SingleRow => vec![],
+            LogicalPlan::DerivedTable { input, .. } => input.output_columns(),
 
             // DML operations don't produce output columns for query purposes
             LogicalPlan::Insert { .. }
+            | LogicalPlan::InsertSelect { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. } => vec![],
 
             // DDL operations don't produce output columns
             LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateTableAs { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::DropMultipleTables { .. }
             | LogicalPlan::CreateIndex { .. }
-            | LogicalPlan::DropIndex { .. } => vec![],
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::CreateDatabase { .. }
+            | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::CreateView { .. }
+            | LogicalPlan::DropView { .. } => vec![],
 
             // Auth operations don't produce output columns (except ShowGrants which returns rows)
             LogicalPlan::CreateUser { .. }
@@ -556,6 +744,15 @@ impl LogicalPlan {
             | LogicalPlan::Grant { .. }
             | LogicalPlan::Revoke { .. }
             | LogicalPlan::ShowGrants { .. } => vec![],
+
+            // ANALYZE TABLE returns a result set (handled by executor)
+            LogicalPlan::AnalyzeTable { .. } => vec![],
+
+            // UNION: output columns from left side
+            LogicalPlan::Union { left, .. } => left.output_columns(),
+
+            // EXPLAIN returns MySQL-format result set (handled by executor)
+            LogicalPlan::Explain { .. } => vec![],
         }
     }
 
@@ -565,8 +762,11 @@ impl LogicalPlan {
             self,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::DropTable { .. }
+                | LogicalPlan::DropMultipleTables { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::DropIndex { .. }
+                | LogicalPlan::CreateDatabase { .. }
+                | LogicalPlan::DropDatabase { .. }
         )
     }
 
@@ -574,7 +774,10 @@ impl LogicalPlan {
     pub fn is_dml(&self) -> bool {
         matches!(
             self,
-            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
+            LogicalPlan::Insert { .. }
+                | LogicalPlan::InsertSelect { .. }
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
         )
     }
 }

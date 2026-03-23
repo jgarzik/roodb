@@ -325,7 +325,7 @@ fn test_parse_error_invalid_sql() {
 #[test]
 fn test_parse_error_empty() {
     let result = Parser::parse_one("");
-    assert!(matches!(result, Err(SqlError::Parse(_))));
+    assert!(matches!(result, Err(SqlError::EmptyQuery)));
 }
 
 #[test]

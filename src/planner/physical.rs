@@ -105,6 +105,13 @@ pub enum PhysicalPlan {
     /// Hash-based distinct
     HashDistinct { input: Box<PhysicalPlan> },
 
+    /// UNION of two query plans
+    Union {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        all: bool,
+    },
+
     /// Single empty row (TABLE_DEE)
     SingleRow,
 
@@ -118,6 +125,21 @@ pub enum PhysicalPlan {
         auto_increment_indices: Vec<usize>,
         /// Primary key column indices for PK-based storage keys
         pk_column_indices: Vec<usize>,
+        /// IGNORE modifier — suppress errors, convert to warnings
+        ignore: bool,
+    },
+
+    /// INSERT ... SELECT — insert rows from a source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<PhysicalPlan>,
+        /// Column indices that are auto_increment (value generated if NULL)
+        auto_increment_indices: Vec<usize>,
+        /// Primary key column indices for PK-based storage keys
+        pk_column_indices: Vec<usize>,
+        /// IGNORE modifier — suppress errors, convert to warnings
+        ignore: bool,
     },
 
     /// UPDATE rows in a table
@@ -147,8 +169,33 @@ pub enum PhysicalPlan {
         if_not_exists: bool,
     },
 
+    /// CREATE TABLE ... SELECT
+    CreateTableAs {
+        name: String,
+        columns: Vec<ColumnDef>,
+        constraints: Vec<Constraint>,
+        if_not_exists: bool,
+        source: Box<PhysicalPlan>,
+    },
+
     /// DROP TABLE
     DropTable { name: String, if_exists: bool },
+
+    /// DROP TABLE t1, t2, t3 (multiple tables)
+    DropMultipleTables { names: Vec<String>, if_exists: bool },
+
+    /// Materialized derived table (subquery in FROM)
+    Materialize { input: Box<PhysicalPlan> },
+
+    /// CREATE VIEW
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+
+    /// DROP VIEW
+    DropView { name: String, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
@@ -160,6 +207,12 @@ pub enum PhysicalPlan {
 
     /// DROP INDEX
     DropIndex { name: String },
+
+    /// CREATE DATABASE
+    CreateDatabase { name: String, if_not_exists: bool },
+
+    /// DROP DATABASE
+    DropDatabase { name: String, if_exists: bool },
 
     // ============ Auth Operations ============
     /// CREATE USER
@@ -212,6 +265,12 @@ pub enum PhysicalPlan {
     ShowGrants {
         for_user: Option<(String, HostPattern)>,
     },
+
+    /// ANALYZE TABLE
+    AnalyzeTable { table: String },
+
+    /// EXPLAIN — wraps the inner plan for MySQL-format EXPLAIN output
+    Explain { inner: Box<PhysicalPlan> },
 }
 
 impl PhysicalPlan {
@@ -278,16 +337,25 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { input, .. } => input.output_columns(),
             PhysicalPlan::Limit { input, .. } => input.output_columns(),
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
+            PhysicalPlan::Union { left, .. } => left.output_columns(),
+            PhysicalPlan::Materialize { input } => input.output_columns(),
             PhysicalPlan::SingleRow => vec![],
 
             // DML/DDL operations don't produce query output
             PhysicalPlan::Insert { .. }
+            | PhysicalPlan::InsertSelect { .. }
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateTableAs { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
-            | PhysicalPlan::DropIndex { .. } => vec![],
+            | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. } => vec![],
 
             // Auth operations don't produce query output columns
             PhysicalPlan::CreateUser { .. }
@@ -297,6 +365,62 @@ impl PhysicalPlan {
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
             | PhysicalPlan::ShowGrants { .. } => vec![],
+
+            // EXPLAIN returns MySQL-format 12-column result set
+            PhysicalPlan::Explain { .. } => {
+                let col_names = [
+                    "id",
+                    "select_type",
+                    "table",
+                    "partitions",
+                    "type",
+                    "possible_keys",
+                    "key",
+                    "key_len",
+                    "ref",
+                    "rows",
+                    "filtered",
+                    "Extra",
+                ];
+                col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| OutputColumn {
+                        id: i,
+                        name: name.to_string(),
+                        data_type: DataType::Varchar(255),
+                        nullable: true,
+                    })
+                    .collect()
+            }
+
+            // ANALYZE TABLE returns a result set (columns handled by executor)
+            PhysicalPlan::AnalyzeTable { .. } => vec![
+                OutputColumn {
+                    id: 0,
+                    name: "Table".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 1,
+                    name: "Op".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 2,
+                    name: "Msg_type".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+                OutputColumn {
+                    id: 3,
+                    name: "Msg_text".to_string(),
+                    data_type: DataType::Varchar(255),
+                    nullable: false,
+                },
+            ],
         }
     }
 
@@ -306,8 +430,11 @@ impl PhysicalPlan {
             self,
             PhysicalPlan::CreateTable { .. }
                 | PhysicalPlan::DropTable { .. }
+                | PhysicalPlan::DropMultipleTables { .. }
                 | PhysicalPlan::CreateIndex { .. }
                 | PhysicalPlan::DropIndex { .. }
+                | PhysicalPlan::CreateDatabase { .. }
+                | PhysicalPlan::DropDatabase { .. }
         )
     }
 
@@ -315,7 +442,10 @@ impl PhysicalPlan {
     pub fn is_dml(&self) -> bool {
         matches!(
             self,
-            PhysicalPlan::Insert { .. } | PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. }
+            PhysicalPlan::Insert { .. }
+                | PhysicalPlan::InsertSelect { .. }
+                | PhysicalPlan::Update { .. }
+                | PhysicalPlan::Delete { .. }
         )
     }
 
@@ -399,12 +529,19 @@ impl PhysicalPlan {
             PhysicalPlan::HashDistinct { input } => {
                 input.substitute_params(params)?;
             }
+            PhysicalPlan::Union { left, right, .. } => {
+                left.substitute_params(params)?;
+                right.substitute_params(params)?;
+            }
             PhysicalPlan::Insert { values, .. } => {
                 for row in values {
                     for expr in row {
                         substitute_expr(expr, params)?;
                     }
                 }
+            }
+            PhysicalPlan::InsertSelect { source, .. } => {
+                source.substitute_params(params)?;
             }
             PhysicalPlan::Update {
                 assignments,
@@ -432,19 +569,34 @@ impl PhysicalPlan {
                     substitute_expr(kv, params)?;
                 }
             }
+            PhysicalPlan::Explain { inner } => {
+                inner.substitute_params(params)?;
+            }
+            PhysicalPlan::CreateTableAs { source, .. } => {
+                source.substitute_params(params)?;
+            }
+            PhysicalPlan::Materialize { input } => {
+                input.substitute_params(params)?;
+            }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
             | PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
             | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::DropMultipleTables { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateDatabase { .. }
+            | PhysicalPlan::DropDatabase { .. }
             | PhysicalPlan::CreateUser { .. }
             | PhysicalPlan::DropUser { .. }
             | PhysicalPlan::AlterUser { .. }
             | PhysicalPlan::SetPassword { .. }
             | PhysicalPlan::Grant { .. }
             | PhysicalPlan::Revoke { .. }
-            | PhysicalPlan::ShowGrants { .. } => {}
+            | PhysicalPlan::ShowGrants { .. }
+            | PhysicalPlan::AnalyzeTable { .. } => {}
         }
         Ok(())
     }
@@ -494,6 +646,33 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
             substitute_expr(high, params)?;
         }
         ResolvedExpr::Column(_) => {}
+        ResolvedExpr::UserVariable { .. } => {}
+        ResolvedExpr::BooleanTest { expr: inner, .. } => {
+            substitute_expr(inner, params)?;
+        }
+        ResolvedExpr::Cast { expr: inner, .. } => {
+            substitute_expr(inner, params)?;
+        }
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                substitute_expr(op, params)?;
+            }
+            for cond in conditions {
+                substitute_expr(cond, params)?;
+            }
+            for result in results {
+                substitute_expr(result, params)?;
+            }
+            if let Some(e) = else_result {
+                substitute_expr(e, params)?;
+            }
+        }
     }
     Ok(())
 }
@@ -504,10 +683,13 @@ fn datum_to_literal(datum: &Datum) -> Literal {
         Datum::Null => Literal::Null,
         Datum::Bool(b) => Literal::Boolean(*b),
         Datum::Int(i) => Literal::Integer(*i),
+        Datum::UnsignedInt(u) => Literal::Integer(*u as i64),
         Datum::Float(f) => Literal::Float(*f),
         Datum::String(s) => Literal::String(s.clone()),
         Datum::Bytes(b) => Literal::Blob(b.clone()),
+        Datum::Bit { value, .. } => Literal::Integer(*value as i64),
         Datum::Timestamp(t) => Literal::Integer(*t),
+        Datum::Decimal { value, scale } => Literal::Decimal(*value, *scale),
     }
 }
 
@@ -610,6 +792,37 @@ enum BoundType {
 pub struct PhysicalPlanner;
 
 impl PhysicalPlanner {
+    /// Look up auto_increment and primary key column indices from the catalog.
+    fn lookup_insert_metadata(
+        table: &str,
+        columns: &[ResolvedColumn],
+        catalog: &Catalog,
+    ) -> (Vec<usize>, Vec<usize>) {
+        if let Some(table_def) = catalog.get_table(table) {
+            let auto_inc: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| {
+                    table_def
+                        .get_column(&col.name)
+                        .is_some_and(|cd| cd.auto_increment)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
+                pk_cols
+                    .iter()
+                    .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
+                    .collect()
+            } else {
+                vec![]
+            };
+            (auto_inc, pk_indices)
+        } else {
+            (vec![], vec![])
+        }
+    }
+
     /// Convert a logical plan to a physical plan
     pub fn plan(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
         Self::plan_node(logical, catalog)
@@ -959,6 +1172,12 @@ impl PhysicalPlanner {
                 input: Box::new(Self::plan_node(*input, catalog)?),
             }),
 
+            LogicalPlan::Union { left, right, all } => Ok(PhysicalPlan::Union {
+                left: Box::new(Self::plan_node(*left, catalog)?),
+                right: Box::new(Self::plan_node(*right, catalog)?),
+                all,
+            }),
+
             LogicalPlan::SingleRow => Ok(PhysicalPlan::SingleRow),
 
             // DML passthrough
@@ -966,39 +1185,36 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 values,
+                ignore,
             } => {
-                // Look up auto_increment and PK columns from catalog
-                let (auto_increment_indices, pk_column_indices) = if let Some(table_def) =
-                    catalog.get_table(&table)
-                {
-                    let auto_inc: Vec<usize> = columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, col)| {
-                            table_def
-                                .get_column(&col.name)
-                                .is_some_and(|cd| cd.auto_increment)
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
-                        pk_cols
-                            .iter()
-                            .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-                    (auto_inc, pk_indices)
-                } else {
-                    (vec![], vec![])
-                };
+                let (auto_increment_indices, pk_column_indices) =
+                    Self::lookup_insert_metadata(&table, &columns, catalog);
                 Ok(PhysicalPlan::Insert {
                     table,
                     columns,
                     values,
                     auto_increment_indices,
                     pk_column_indices,
+                    ignore,
+                })
+            }
+
+            LogicalPlan::InsertSelect {
+                table,
+                columns,
+                source,
+                ignore,
+            } => {
+                let source_plan = Self::plan_node(*source, catalog)?;
+                let (auto_increment_indices, pk_column_indices) =
+                    Self::lookup_insert_metadata(&table, &columns, catalog);
+                Ok(PhysicalPlan::InsertSelect {
+                    table,
+                    columns,
+                    source: Box::new(source_plan),
+                    auto_increment_indices,
+                    pk_column_indices,
+                    ignore,
                 })
             }
 
@@ -1042,8 +1258,50 @@ impl PhysicalPlanner {
                 if_not_exists,
             }),
 
+            LogicalPlan::CreateTableAs {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                source,
+            } => {
+                let source_plan = Self::plan_node(*source, catalog)?;
+                Ok(PhysicalPlan::CreateTableAs {
+                    name,
+                    columns,
+                    constraints,
+                    if_not_exists,
+                    source: Box::new(source_plan),
+                })
+            }
+
+            LogicalPlan::DerivedTable { input, .. } => {
+                let inner = Self::plan_node(*input, catalog)?;
+                Ok(PhysicalPlan::Materialize {
+                    input: Box::new(inner),
+                })
+            }
+
+            LogicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            } => Ok(PhysicalPlan::CreateView {
+                name,
+                query_sql,
+                or_replace,
+            }),
+
+            LogicalPlan::DropView { name, if_exists } => {
+                Ok(PhysicalPlan::DropView { name, if_exists })
+            }
+
             LogicalPlan::DropTable { name, if_exists } => {
                 Ok(PhysicalPlan::DropTable { name, if_exists })
+            }
+
+            LogicalPlan::DropMultipleTables { names, if_exists } => {
+                Ok(PhysicalPlan::DropMultipleTables { names, if_exists })
             }
 
             LogicalPlan::CreateIndex {
@@ -1059,6 +1317,19 @@ impl PhysicalPlanner {
             }),
 
             LogicalPlan::DropIndex { name } => Ok(PhysicalPlan::DropIndex { name }),
+
+            // Database DDL passthrough
+            LogicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            } => Ok(PhysicalPlan::CreateDatabase {
+                name,
+                if_not_exists,
+            }),
+
+            LogicalPlan::DropDatabase { name, if_exists } => {
+                Ok(PhysicalPlan::DropDatabase { name, if_exists })
+            }
 
             // Auth operations - passthrough
             LogicalPlan::CreateUser {
@@ -1124,6 +1395,15 @@ impl PhysicalPlanner {
                 grantee_host,
             }),
             LogicalPlan::ShowGrants { for_user } => Ok(PhysicalPlan::ShowGrants { for_user }),
+
+            LogicalPlan::AnalyzeTable { table } => Ok(PhysicalPlan::AnalyzeTable { table }),
+
+            LogicalPlan::Explain { inner } => {
+                let inner_plan = Self::plan_node(*inner, catalog)?;
+                Ok(PhysicalPlan::Explain {
+                    inner: Box::new(inner_plan),
+                })
+            }
         }
     }
 }

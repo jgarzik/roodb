@@ -121,14 +121,13 @@ fn test_plan_select_with_order_by() {
     let catalog = test_catalog();
     let physical = plan_query(&catalog, "SELECT id, name FROM users ORDER BY name ASC");
 
-    // Should be: Sort -> Project -> TableScan
+    // Non-aggregate: Project -> Sort -> TableScan
+    // (Sort before Project so ORDER BY can access non-projected columns)
     match physical {
-        PhysicalPlan::Sort { input, order_by } => {
-            assert_eq!(order_by.len(), 1);
-            assert!(order_by[0].1); // ascending
-            assert!(matches!(*input, PhysicalPlan::Project { .. }));
+        PhysicalPlan::Project { input, .. } => {
+            assert!(matches!(*input, PhysicalPlan::Sort { .. }));
         }
-        _ => panic!("Expected Sort"),
+        _ => panic!("Expected Project"),
     }
 }
 

@@ -125,6 +125,9 @@ const TAG_FLOAT: u8 = 3;
 const TAG_STRING: u8 = 4;
 const TAG_BYTES: u8 = 5;
 const TAG_TIMESTAMP: u8 = 6;
+const TAG_BIT: u8 = 7;
+const TAG_UINT: u8 = 8;
+const TAG_DECIMAL: u8 = 9;
 
 /// Encode a row value
 ///
@@ -175,9 +178,23 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Datum::UnsignedInt(u) => {
+            buf.push(TAG_UINT);
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+        Datum::Bit { value, width } => {
+            buf.push(TAG_BIT);
+            buf.push(*width);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
         Datum::Timestamp(t) => {
             buf.push(TAG_TIMESTAMP);
             buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Datum::Decimal { value, scale } => {
+            buf.push(TAG_DECIMAL);
+            buf.push(*scale);
+            buf.extend_from_slice(&value.to_le_bytes());
         }
     }
 }
@@ -284,6 +301,31 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
             Ok((Datum::Bytes(data[5..5 + len].to_vec()), 5 + len))
         }
 
+        TAG_UINT => {
+            if data.len() < 9 {
+                return Err(ExecutorError::Encoding("uint data too short".to_string()));
+            }
+            let u = u64::from_le_bytes(
+                data[1..9]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
+            Ok((Datum::UnsignedInt(u), 9))
+        }
+
+        TAG_BIT => {
+            if data.len() < 10 {
+                return Err(ExecutorError::Encoding("bit data too short".to_string()));
+            }
+            let width = data[1];
+            let value = u64::from_le_bytes(
+                data[2..10]
+                    .try_into()
+                    .expect("length checked: slice is 8 bytes"),
+            );
+            Ok((Datum::Bit { value, width }, 10))
+        }
+
         TAG_TIMESTAMP => {
             if data.len() < 9 {
                 return Err(ExecutorError::Encoding(
@@ -297,6 +339,21 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     .expect("length checked: slice is 8 bytes"),
             );
             Ok((Datum::Timestamp(t), 9))
+        }
+
+        TAG_DECIMAL => {
+            if data.len() < 18 {
+                return Err(ExecutorError::Encoding(
+                    "decimal data too short".to_string(),
+                ));
+            }
+            let scale = data[1];
+            let value = i128::from_le_bytes(
+                data[2..18]
+                    .try_into()
+                    .expect("length checked: slice is 16 bytes"),
+            );
+            Ok((Datum::Decimal { value, scale }, 18))
         }
 
         _ => Err(ExecutorError::Encoding(format!(
@@ -365,5 +422,103 @@ mod tests {
         let encoded = encode_row(&row);
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.get(0).unwrap().as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_encode_decode_bit() {
+        // Test various BIT widths and values
+        let test_cases = vec![
+            Datum::Bit { value: 0, width: 1 },
+            Datum::Bit { value: 1, width: 1 },
+            Datum::Bit {
+                value: 255,
+                width: 8,
+            },
+            Datum::Bit {
+                value: 42,
+                width: 8,
+            },
+            Datum::Bit {
+                value: 0,
+                width: 64,
+            },
+            Datum::Bit {
+                value: u64::MAX,
+                width: 64,
+            },
+            Datum::Bit {
+                value: 9999,
+                width: 64,
+            },
+        ];
+
+        for original in &test_cases {
+            let row = Row::new(vec![original.clone()]);
+            let encoded = encode_row(&row);
+            let decoded = decode_row(&encoded).unwrap();
+            let result = decoded.get(0).unwrap();
+            match (original, result) {
+                (
+                    Datum::Bit {
+                        value: ov,
+                        width: ow,
+                    },
+                    Datum::Bit {
+                        value: rv,
+                        width: rw,
+                    },
+                ) => {
+                    assert_eq!(ov, rv, "value mismatch for width={ow}");
+                    assert_eq!(ow, rw, "width mismatch");
+                }
+                _ => panic!("expected Bit, got {:?}", result),
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_decimal() {
+        let test_cases = vec![
+            Datum::Decimal { value: 0, scale: 0 },
+            Datum::Decimal {
+                value: 12345,
+                scale: 2,
+            },
+            Datum::Decimal {
+                value: -99999,
+                scale: 3,
+            },
+            Datum::Decimal {
+                value: i128::MAX,
+                scale: 0,
+            },
+            Datum::Decimal {
+                value: i128::MIN,
+                scale: 10,
+            },
+        ];
+
+        for original in &test_cases {
+            let row = Row::new(vec![original.clone()]);
+            let encoded = encode_row(&row);
+            let decoded = decode_row(&encoded).unwrap();
+            let result = decoded.get(0).unwrap();
+            match (original, result) {
+                (
+                    Datum::Decimal {
+                        value: ov,
+                        scale: os,
+                    },
+                    Datum::Decimal {
+                        value: rv,
+                        scale: rs,
+                    },
+                ) => {
+                    assert_eq!(ov, rv, "value mismatch");
+                    assert_eq!(os, rs, "scale mismatch");
+                }
+                _ => panic!("expected Decimal, got {:?}", result),
+            }
+        }
     }
 }

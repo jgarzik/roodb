@@ -9,10 +9,12 @@ use async_trait::async_trait;
 use crate::planner::logical::ResolvedExpr;
 use crate::txn::MvccStorage;
 
+use crate::server::session::UserVariables;
+
 use super::context::TransactionContext;
 use super::encoding::{decode_row, encode_pk_key};
 use super::error::ExecutorResult;
-use super::eval::eval;
+use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
@@ -30,6 +32,8 @@ pub struct PointGet {
     result: Option<Row>,
     /// Whether we've already returned the result
     returned: bool,
+    /// User variables
+    user_variables: UserVariables,
 }
 
 impl PointGet {
@@ -38,6 +42,7 @@ impl PointGet {
         key_expr: ResolvedExpr,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
     ) -> Self {
         PointGet {
             table,
@@ -46,6 +51,7 @@ impl PointGet {
             txn_context,
             result: None,
             returned: false,
+            user_variables,
         }
     }
 }
@@ -56,7 +62,7 @@ impl Executor for PointGet {
         // Evaluate the key expression to get the PK value
         // Use an empty row since the key expression is a literal
         let empty_row = Row::empty();
-        let key_datum = eval(&self.key_expr, &empty_row)?;
+        let key_datum = evaluate(&self.key_expr, &empty_row, &self.user_variables)?;
 
         // Encode the storage key using PK-based encoding
         let storage_key = encode_pk_key(&self.table, &[key_datum]);
