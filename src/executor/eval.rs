@@ -65,6 +65,25 @@ pub fn set_strict_dml_context(vars: &UserVariables, val: bool) {
     }
 }
 
+/// RAII guard that sets strict DML context on creation and clears on drop.
+/// Ensures the flag is always cleared, even on early returns or errors.
+pub struct StrictDmlGuard {
+    vars: UserVariables,
+}
+
+impl StrictDmlGuard {
+    pub fn new(vars: &UserVariables) -> Self {
+        set_strict_dml_context(vars, true);
+        StrictDmlGuard { vars: vars.clone() }
+    }
+}
+
+impl Drop for StrictDmlGuard {
+    fn drop(&mut self) {
+        set_strict_dml_context(&self.vars, false);
+    }
+}
+
 /// Check if we're in a strict DML context (INSERT/UPDATE with strict mode)
 fn in_strict_dml_context(vars: Option<&UserVariables>) -> bool {
     match vars {

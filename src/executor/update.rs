@@ -183,17 +183,14 @@ impl Executor for Update {
             return Ok(None);
         }
 
-        // Set strict DML context so log functions error instead of returning NULL
-        super::eval::set_strict_dml_context(&self.user_variables, true);
+        // RAII guard: strict DML context cleared on drop (even on early return/error)
+        let _strict_guard = super::eval::StrictDmlGuard::new(&self.user_variables);
 
-        let result = if self.key_value.is_some() {
-            self.next_point_get().await
+        if self.key_value.is_some() {
+            self.next_point_get().await?;
         } else {
-            self.next_full_scan().await
-        };
-
-        super::eval::set_strict_dml_context(&self.user_variables, false);
-        result?;
+            self.next_full_scan().await?;
+        }
 
         self.done = true;
 

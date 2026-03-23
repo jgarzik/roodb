@@ -117,8 +117,8 @@ impl Executor for Insert {
         // Insert all rows
         let empty_row = Row::empty();
 
-        // Set strict DML context so log functions error instead of returning NULL
-        super::eval::set_strict_dml_context(&self.user_variables, true);
+        // RAII guard: strict DML context cleared on drop (even on early return/error)
+        let _strict_guard = super::eval::StrictDmlGuard::new(&self.user_variables);
 
         'row_loop: for value_row in &self.values {
             // Evaluate expressions to get datum values
@@ -211,9 +211,6 @@ impl Executor for Insert {
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
         }
-
-        // Clear strict DML context
-        super::eval::set_strict_dml_context(&self.user_variables, false);
 
         self.done = true;
 
