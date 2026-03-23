@@ -230,6 +230,7 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
         }
 
         PhysicalPlan::Insert { table, .. }
+        | PhysicalPlan::InsertSelect { table, .. }
         | PhysicalPlan::Update { table, .. }
         | PhysicalPlan::Delete { table, .. } => {
             rows.push(make_explain_row([

@@ -19,6 +19,7 @@ pub mod explain_exec;
 pub mod filter;
 pub mod hash_join;
 pub mod insert;
+pub mod insert_select;
 pub mod join;
 pub mod limit;
 pub mod multi_exec;

@@ -206,6 +206,11 @@ impl ExplainOutput {
                 writeln!(out, "{}Insert: {} ({} rows)", prefix, table, values.len()).unwrap();
             }
 
+            PhysicalPlan::InsertSelect { table, source, .. } => {
+                writeln!(out, "{}InsertSelect: {}", prefix, table).unwrap();
+                Self::format_node(source, indent + 1, out);
+            }
+
             PhysicalPlan::Update { table, filter, .. } => {
                 writeln!(out, "{}Update: {}", prefix, table).unwrap();
                 if let Some(f) = filter {

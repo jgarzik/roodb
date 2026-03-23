@@ -26,6 +26,7 @@ impl TypeChecker {
             ResolvedStatement::Insert {
                 columns, values, ..
             } => Self::check_insert(columns, values),
+            ResolvedStatement::InsertSelect { source, .. } => Self::check(source),
             ResolvedStatement::Update {
                 assignments,
                 filter,

@@ -264,18 +264,16 @@ impl Datum {
     /// Negate this datum (for unary minus)
     pub fn negate(&self) -> Option<Datum> {
         match self {
-            Datum::Int(i) => Some(Datum::Int(-i)),
+            Datum::Int(i) => i.checked_neg().map(Datum::Int),
             Datum::Float(f) => Some(Datum::Float(-f)),
             Datum::UnsignedInt(u) => {
-                // -UnsignedInt: convert to signed, checking for overflow
-                if *u <= i64::MAX as u64 {
-                    Some(Datum::Int(-(*u as i64)))
+                // -UnsignedInt: convert to signed if result fits in BIGINT
+                // e.g. -(2^63) == i64::MIN, which fits; larger values overflow
+                let neg = -(*u as i128);
+                if neg >= i64::MIN as i128 {
+                    Some(Datum::Int(neg as i64))
                 } else {
-                    // Value too large for i64 negation — use Decimal (i128)
-                    Some(Datum::Decimal {
-                        value: -(*u as i128),
-                        scale: 0,
-                    })
+                    None // overflow — result doesn't fit in BIGINT
                 }
             }
             Datum::Decimal { value, scale } => Some(Datum::Decimal {
@@ -766,7 +764,37 @@ mod tests {
     #[test]
     fn test_datum_negate() {
         assert_eq!(Datum::Int(5).negate(), Some(Datum::Int(-5)));
+        assert_eq!(Datum::Int(-5).negate(), Some(Datum::Int(5)));
+        assert_eq!(Datum::Int(0).negate(), Some(Datum::Int(0)));
         assert_eq!(Datum::Float(2.5).negate(), Some(Datum::Float(-2.5)));
+        assert_eq!(Datum::Null.negate(), Some(Datum::Null));
+    }
+
+    #[test]
+    fn test_datum_negate_int_min_overflow() {
+        // i64::MIN cannot be negated (|i64::MIN| > i64::MAX)
+        assert_eq!(Datum::Int(i64::MIN).negate(), None);
+        // i64::MAX can be negated
+        assert_eq!(Datum::Int(i64::MAX).negate(), Some(Datum::Int(-i64::MAX)));
+    }
+
+    #[test]
+    fn test_datum_negate_unsigned_fits_bigint() {
+        // -(2^63) == i64::MIN, which fits in BIGINT
+        let val = i64::MAX as u64 + 1; // 2^63
+        assert_eq!(Datum::UnsignedInt(val).negate(), Some(Datum::Int(i64::MIN)));
+        // Small unsigned values negate fine
+        assert_eq!(Datum::UnsignedInt(42).negate(), Some(Datum::Int(-42)));
+        assert_eq!(Datum::UnsignedInt(0).negate(), Some(Datum::Int(0)));
+    }
+
+    #[test]
+    fn test_datum_negate_unsigned_overflow() {
+        // 2^63 + 1 doesn't fit in BIGINT when negated
+        let val = i64::MAX as u64 + 2; // 2^63 + 1
+        assert_eq!(Datum::UnsignedInt(val).negate(), None);
+        // u64::MAX doesn't fit
+        assert_eq!(Datum::UnsignedInt(u64::MAX).negate(), None);
     }
 
     #[test]

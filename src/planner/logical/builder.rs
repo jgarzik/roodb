@@ -33,11 +33,27 @@ impl LogicalPlanBuilder {
                 table,
                 columns,
                 values,
+                ignore,
             } => Ok(LogicalPlan::Insert {
                 table,
                 columns,
                 values,
+                ignore,
             }),
+            ResolvedStatement::InsertSelect {
+                table,
+                columns,
+                source,
+                ignore,
+            } => {
+                let source_plan = Self::build(*source)?;
+                Ok(LogicalPlan::InsertSelect {
+                    table,
+                    columns,
+                    source: Box::new(source_plan),
+                    ignore,
+                })
+            }
             ResolvedStatement::Update {
                 table,
                 assignments,

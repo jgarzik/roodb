@@ -125,6 +125,21 @@ pub enum PhysicalPlan {
         auto_increment_indices: Vec<usize>,
         /// Primary key column indices for PK-based storage keys
         pk_column_indices: Vec<usize>,
+        /// IGNORE modifier — suppress errors, convert to warnings
+        ignore: bool,
+    },
+
+    /// INSERT ... SELECT — insert rows from a source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<PhysicalPlan>,
+        /// Column indices that are auto_increment (value generated if NULL)
+        auto_increment_indices: Vec<usize>,
+        /// Primary key column indices for PK-based storage keys
+        pk_column_indices: Vec<usize>,
+        /// IGNORE modifier — suppress errors, convert to warnings
+        ignore: bool,
     },
 
     /// UPDATE rows in a table
@@ -328,6 +343,7 @@ impl PhysicalPlan {
 
             // DML/DDL operations don't produce query output
             PhysicalPlan::Insert { .. }
+            | PhysicalPlan::InsertSelect { .. }
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }
             | PhysicalPlan::CreateTable { .. }
@@ -426,7 +442,10 @@ impl PhysicalPlan {
     pub fn is_dml(&self) -> bool {
         matches!(
             self,
-            PhysicalPlan::Insert { .. } | PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. }
+            PhysicalPlan::Insert { .. }
+                | PhysicalPlan::InsertSelect { .. }
+                | PhysicalPlan::Update { .. }
+                | PhysicalPlan::Delete { .. }
         )
     }
 
@@ -520,6 +539,9 @@ impl PhysicalPlan {
                         substitute_expr(expr, params)?;
                     }
                 }
+            }
+            PhysicalPlan::InsertSelect { source, .. } => {
+                source.substitute_params(params)?;
             }
             PhysicalPlan::Update {
                 assignments,
@@ -770,6 +792,37 @@ enum BoundType {
 pub struct PhysicalPlanner;
 
 impl PhysicalPlanner {
+    /// Look up auto_increment and primary key column indices from the catalog.
+    fn lookup_insert_metadata(
+        table: &str,
+        columns: &[ResolvedColumn],
+        catalog: &Catalog,
+    ) -> (Vec<usize>, Vec<usize>) {
+        if let Some(table_def) = catalog.get_table(table) {
+            let auto_inc: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| {
+                    table_def
+                        .get_column(&col.name)
+                        .is_some_and(|cd| cd.auto_increment)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
+                pk_cols
+                    .iter()
+                    .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
+                    .collect()
+            } else {
+                vec![]
+            };
+            (auto_inc, pk_indices)
+        } else {
+            (vec![], vec![])
+        }
+    }
+
     /// Convert a logical plan to a physical plan
     pub fn plan(logical: LogicalPlan, catalog: &Catalog) -> PlannerResult<PhysicalPlan> {
         Self::plan_node(logical, catalog)
@@ -1132,39 +1185,36 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 values,
+                ignore,
             } => {
-                // Look up auto_increment and PK columns from catalog
-                let (auto_increment_indices, pk_column_indices) = if let Some(table_def) =
-                    catalog.get_table(&table)
-                {
-                    let auto_inc: Vec<usize> = columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, col)| {
-                            table_def
-                                .get_column(&col.name)
-                                .is_some_and(|cd| cd.auto_increment)
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
-                        pk_cols
-                            .iter()
-                            .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-                    (auto_inc, pk_indices)
-                } else {
-                    (vec![], vec![])
-                };
+                let (auto_increment_indices, pk_column_indices) =
+                    Self::lookup_insert_metadata(&table, &columns, catalog);
                 Ok(PhysicalPlan::Insert {
                     table,
                     columns,
                     values,
                     auto_increment_indices,
                     pk_column_indices,
+                    ignore,
+                })
+            }
+
+            LogicalPlan::InsertSelect {
+                table,
+                columns,
+                source,
+                ignore,
+            } => {
+                let source_plan = Self::plan_node(*source, catalog)?;
+                let (auto_increment_indices, pk_column_indices) =
+                    Self::lookup_insert_metadata(&table, &columns, catalog);
+                Ok(PhysicalPlan::InsertSelect {
+                    table,
+                    columns,
+                    source: Box::new(source_plan),
+                    auto_increment_indices,
+                    pk_column_indices,
+                    ignore,
                 })
             }
 

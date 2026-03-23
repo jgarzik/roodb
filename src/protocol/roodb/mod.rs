@@ -1282,7 +1282,8 @@ where
                     .map(|table_ref| RequiredPrivilege::select(db, &table_ref.name))
                     .collect()
             }
-            ResolvedStatement::Insert { table, .. } => {
+            ResolvedStatement::Insert { table, .. }
+            | ResolvedStatement::InsertSelect { table, .. } => {
                 vec![RequiredPrivilege::insert(db, table)]
             }
             ResolvedStatement::Update { table, .. } => {

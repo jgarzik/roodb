@@ -164,6 +164,15 @@ impl CostEstimator {
                 io: 1.0,
             },
 
+            PhysicalPlan::InsertSelect { source, .. } => {
+                let source_cost = Self::estimate_node(source);
+                Cost {
+                    rows: source_cost.rows,
+                    cpu: source_cost.cpu + source_cost.rows,
+                    io: source_cost.io + 1.0,
+                }
+            }
+
             PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. } => Cost {
                 rows: Self::DEFAULT_TABLE_ROWS * Self::DEFAULT_SELECTIVITY,
                 cpu: Self::DEFAULT_TABLE_ROWS,

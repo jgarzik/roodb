@@ -343,6 +343,14 @@ pub enum ResolvedStatement {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
+        ignore: bool,
+    },
+    /// INSERT ... SELECT with resolved source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<ResolvedStatement>,
+        ignore: bool,
     },
     /// UPDATE with resolved assignments
     Update {
@@ -513,6 +521,15 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
+        ignore: bool,
+    },
+
+    /// INSERT ... SELECT — insert rows from a source query
+    InsertSelect {
+        table: String,
+        columns: Vec<ResolvedColumn>,
+        source: Box<LogicalPlan>,
+        ignore: bool,
     },
 
     /// UPDATE rows in a table
@@ -703,6 +720,7 @@ impl LogicalPlan {
 
             // DML operations don't produce output columns for query purposes
             LogicalPlan::Insert { .. }
+            | LogicalPlan::InsertSelect { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. } => vec![],
 
@@ -756,7 +774,10 @@ impl LogicalPlan {
     pub fn is_dml(&self) -> bool {
         matches!(
             self,
-            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
+            LogicalPlan::Insert { .. }
+                | LogicalPlan::InsertSelect { .. }
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
         )
     }
 }

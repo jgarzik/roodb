@@ -1441,9 +1441,15 @@ pub fn eval_unary_op(op: &UnaryOp, val: &Datum) -> ExecutorResult<Datum> {
         UnaryOp::Not => val
             .not()
             .ok_or_else(|| ExecutorError::InvalidOperation("NOT requires boolean".to_string())),
-        UnaryOp::Neg => val
-            .negate()
-            .ok_or_else(|| ExecutorError::InvalidOperation("negation requires number".to_string())),
+        UnaryOp::Neg => val.negate().ok_or_else(|| {
+            // If the value is numeric but negate() failed, it's an overflow (e.g. i64::MIN)
+            match val {
+                Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_) | Datum::Decimal { .. } => {
+                    ExecutorError::DataOutOfRange("BIGINT value is out of range".to_string())
+                }
+                _ => ExecutorError::InvalidOperation("negation requires number".to_string()),
+            }
+        }),
         UnaryOp::Plus => Ok(val.clone()),
         UnaryOp::BitwiseNot => {
             if val.is_null() {
@@ -1679,6 +1685,16 @@ pub fn eval_function(name: &str, args: &[Datum]) -> ExecutorResult<Datum> {
                 }),
                 Datum::Float(f) => Ok(Datum::Float(f.abs())),
                 Datum::Null => Ok(Datum::Null),
+                Datum::Decimal { value, scale } => {
+                    let abs_val = value.checked_abs().ok_or_else(|| {
+                        ExecutorError::DataOutOfRange("DECIMAL value is out of range".to_string())
+                    })?;
+                    Ok(Datum::Decimal {
+                        value: abs_val,
+                        scale: *scale,
+                    })
+                }
+                Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
                 Datum::String(s) => {
                     // MySQL: ABS coerces string to number
                     let trimmed = s.trim();
@@ -5170,5 +5186,101 @@ mod tests {
         let result = eval_sub(&Datum::UnsignedInt(1), &Datum::Int(2), Some(&vars));
         assert!(result.is_ok(), "With flag, 1 - 2 should succeed");
         assert_eq!(result.unwrap(), Datum::Int(-1));
+    }
+
+    #[test]
+    fn test_abs_int() {
+        assert_eq!(
+            eval_function("ABS", &[Datum::Int(-42)]).unwrap(),
+            Datum::Int(42)
+        );
+        assert_eq!(
+            eval_function("ABS", &[Datum::Int(42)]).unwrap(),
+            Datum::Int(42)
+        );
+        assert_eq!(
+            eval_function("ABS", &[Datum::Int(0)]).unwrap(),
+            Datum::Int(0)
+        );
+    }
+
+    #[test]
+    fn test_abs_int_min_overflow() {
+        // ABS(i64::MIN) should error — |i64::MIN| > i64::MAX
+        let result = eval_function("ABS", &[Datum::Int(i64::MIN)]);
+        assert!(result.is_err(), "ABS(i64::MIN) should overflow");
+    }
+
+    #[test]
+    fn test_abs_decimal() {
+        assert_eq!(
+            eval_function(
+                "ABS",
+                &[Datum::Decimal {
+                    value: -100,
+                    scale: 2
+                }]
+            )
+            .unwrap(),
+            Datum::Decimal {
+                value: 100,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            eval_function(
+                "ABS",
+                &[Datum::Decimal {
+                    value: 100,
+                    scale: 2
+                }]
+            )
+            .unwrap(),
+            Datum::Decimal {
+                value: 100,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_abs_unsigned() {
+        assert_eq!(
+            eval_function("ABS", &[Datum::UnsignedInt(42)]).unwrap(),
+            Datum::UnsignedInt(42)
+        );
+    }
+
+    #[test]
+    fn test_abs_null() {
+        assert_eq!(eval_function("ABS", &[Datum::Null]).unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_unary_neg_int_min_overflow() {
+        use crate::planner::logical::UnaryOp;
+        // Negating i64::MIN should produce DataOutOfRange, not InvalidOperation
+        let result = eval_unary_op(&UnaryOp::Neg, &Datum::Int(i64::MIN));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ExecutorError::DataOutOfRange(_)),
+            "Expected DataOutOfRange, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_unary_neg_non_numeric() {
+        use crate::planner::logical::UnaryOp;
+        // Negating a string should produce InvalidOperation
+        let result = eval_unary_op(&UnaryOp::Neg, &Datum::String("hello".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ExecutorError::InvalidOperation(_)),
+            "Expected InvalidOperation, got {:?}",
+            err
+        );
     }
 }

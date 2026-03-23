@@ -308,7 +308,56 @@ impl<'a> Resolver<'a> {
         // Check for INSERT INTO t1 () VALUES () — empty column list means use all defaults
         let values_rows_ref = match insert.source.as_ref().map(|s| s.body.as_ref()) {
             Some(sp::SetExpr::Values(sp::Values { rows, .. })) => rows,
-            _ => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
+            Some(_) => {
+                // INSERT ... SELECT — resolve source query and return InsertSelect
+                let source_query = insert.source.as_ref().unwrap();
+                let resolved_source = self.resolve_query(source_query)?;
+
+                // Build resolved columns — respect explicit column list if given
+                let resolved_columns = if insert.columns.is_empty() {
+                    // No explicit columns: use all table columns
+                    table_def
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, col_def)| ResolvedColumn {
+                            table: table.clone(),
+                            name: col_def.name.clone(),
+                            index: idx,
+                            data_type: col_def.data_type.clone(),
+                            nullable: col_def.nullable || col_def.auto_increment,
+                        })
+                        .collect()
+                } else {
+                    // Explicit column list: resolve only those columns
+                    let mut cols = Vec::new();
+                    for col_ident in &insert.columns {
+                        let col_name = &col_ident.value;
+                        let col_def = table_def
+                            .get_column(col_name)
+                            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+                        let idx = table_def
+                            .get_column_index(col_name)
+                            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+                        cols.push(ResolvedColumn {
+                            table: table.clone(),
+                            name: col_def.name.clone(),
+                            index: idx,
+                            data_type: col_def.data_type.clone(),
+                            nullable: col_def.nullable || col_def.auto_increment,
+                        });
+                    }
+                    cols
+                };
+
+                return Ok(ResolvedStatement::InsertSelect {
+                    table,
+                    columns: resolved_columns,
+                    source: Box::new(resolved_source),
+                    ignore: insert.ignore,
+                });
+            }
+            None => return Err(SqlError::Unsupported("INSERT without VALUES".to_string())),
         };
         let is_empty_insert =
             insert.columns.is_empty() && values_rows_ref.first().is_some_and(|row| row.is_empty());
@@ -427,6 +476,7 @@ impl<'a> Resolver<'a> {
             table,
             columns: resolved_columns,
             values: resolved_values,
+            ignore: insert.ignore,
         })
     }
 
@@ -490,6 +540,7 @@ impl<'a> Resolver<'a> {
             table: table.to_string(),
             columns: resolved_columns,
             values: vec![full_row],
+            ignore: insert.ignore,
         })
     }
 
@@ -1182,7 +1233,27 @@ impl<'a> Resolver<'a> {
                         for arg in &list.args {
                             match arg {
                                 sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
-                                    result.push(self.resolve_expr(e, scope)?);
+                                    // For functions that accept keyword arguments
+                                    // (GET_FORMAT, CONVERT, etc.), unresolvable
+                                    // identifiers are treated as string literals.
+                                    let accepts_keywords =
+                                        matches!(name.as_str(), "GET_FORMAT" | "CONVERT");
+                                    match self.resolve_expr(e, scope) {
+                                        Ok(resolved) => result.push(resolved),
+                                        Err(_)
+                                            if accepts_keywords
+                                                && matches!(e, sp::Expr::Identifier(_)) =>
+                                        {
+                                            let ident = match e {
+                                                sp::Expr::Identifier(id) => id.value.to_uppercase(),
+                                                _ => unreachable!(),
+                                            };
+                                            result.push(ResolvedExpr::Literal(Literal::String(
+                                                ident,
+                                            )));
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
                                 }
                                 sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
                                     // COUNT(*) - use a placeholder
@@ -2606,7 +2677,8 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             }
         }
         "CAST" | "CONVERT" => Ok(DataType::Text), // actual type resolved at Cast expr level
-        "TRUNCATE" => Ok(DataType::Double),       // TRUNCATE(number, decimals)
+        "GET_FORMAT" => Ok(DataType::Text),
+        "TRUNCATE" => Ok(DataType::Double), // TRUNCATE(number, decimals)
         "SIGN" => Ok(DataType::BigInt),
         "POW" | "POWER" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "PI" | "RADIANS"
         | "DEGREES" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "COT"

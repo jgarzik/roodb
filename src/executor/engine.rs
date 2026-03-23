@@ -27,6 +27,7 @@ use super::explain_exec::ExplainExecutor;
 use super::filter::Filter;
 use super::hash_join::HashJoin;
 use super::insert::Insert;
+use super::insert_select::InsertSelect;
 use super::join::NestedLoopJoin;
 use super::limit::Limit;
 use super::point_get::PointGet;
@@ -262,6 +263,7 @@ impl ExecutorEngine {
                 values,
                 auto_increment_indices,
                 pk_column_indices,
+                ignore,
             } => Ok(Box::new(Insert::new(
                 table,
                 columns,
@@ -270,7 +272,28 @@ impl ExecutorEngine {
                 auto_increment_indices,
                 pk_column_indices,
                 self.user_variables.clone(),
+                ignore,
             ))),
+
+            PhysicalPlan::InsertSelect {
+                table,
+                columns,
+                source,
+                auto_increment_indices,
+                pk_column_indices,
+                ignore,
+            } => {
+                let source_exec = self.build_node(*source)?;
+                Ok(Box::new(InsertSelect::new(
+                    table,
+                    columns,
+                    source_exec,
+                    self.txn_context.clone(),
+                    auto_increment_indices,
+                    pk_column_indices,
+                    ignore,
+                )))
+            }
 
             PhysicalPlan::Update {
                 table,
