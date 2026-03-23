@@ -59,9 +59,10 @@ NULL
 # ABS overflow on i64::MIN
 SELECT ABS(-9223372036854775808);
 ERROR 22003: BIGINT value is out of range
-# Negation overflow
+# Double negation promotes to Decimal (literal context)
 SELECT -(-9223372036854775808);
-ERROR 22003: BIGINT value is out of range
+--9223372036854775808
+9223372036854775808
 # UnsignedInt negation boundary: -(2^63) = i64::MIN (fits)
 CREATE TABLE t7 (a BIGINT, b BIGINT UNSIGNED);
 INSERT INTO t7 VALUES (-9223372036854775808, 9223372036854775809);

@@ -46,8 +46,7 @@ SELECT ABS(NULL);
 --error 1690
 SELECT ABS(-9223372036854775808);
 
---echo # Negation overflow
---error 1690
+--echo # Double negation promotes to Decimal (literal context)
 SELECT -(-9223372036854775808);
 
 --echo # UnsignedInt negation boundary: -(2^63) = i64::MIN (fits)

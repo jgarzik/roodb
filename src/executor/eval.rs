@@ -111,17 +111,27 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
         ResolvedExpr::UnaryOp { op, expr, .. } => {
             let val = evaluate(expr, row, vars)?;
             let result = eval_unary_op(op, &val);
-            // For unary Neg on UnsignedInt that overflows BIGINT:
-            // - Column values → keep the DataOutOfRange error (MySQL semantics)
-            // - Literal/expression values → promote to Decimal
+            // For unary Neg overflow in non-column contexts, promote to Decimal
+            // instead of erroring. MySQL promotes literals to DECIMAL when
+            // negation overflows BIGINT, but errors for column values.
             if result.is_err() && matches!(op, UnaryOp::Neg) {
-                if let Datum::UnsignedInt(u) = &val {
-                    let is_column = matches!(expr.as_ref(), ResolvedExpr::Column(_));
-                    if !is_column {
-                        return Ok(Datum::Decimal {
-                            value: -(*u as i128),
-                            scale: 0,
-                        });
+                let is_column = matches!(expr.as_ref(), ResolvedExpr::Column(_));
+                if !is_column {
+                    match &val {
+                        Datum::UnsignedInt(u) => {
+                            return Ok(Datum::Decimal {
+                                value: -(*u as i128),
+                                scale: 0,
+                            });
+                        }
+                        Datum::Int(i) => {
+                            // -(i64::MIN) overflows BIGINT; promote to Decimal
+                            return Ok(Datum::Decimal {
+                                value: -(*i as i128),
+                                scale: 0,
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
