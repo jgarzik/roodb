@@ -150,9 +150,18 @@ impl TypeChecker {
         Ok(())
     }
 
-    /// Check if expression is definitely NULL
+    /// Check if expression is definitely NULL or will evaluate to NULL at runtime
+    /// (e.g. `1/NULL`, `NULL + 5`, `COALESCE(NULL)`)
     fn is_definitely_null(expr: &ResolvedExpr) -> bool {
-        matches!(expr, ResolvedExpr::Literal(Literal::Null))
+        match expr {
+            ResolvedExpr::Literal(Literal::Null) => true,
+            ResolvedExpr::BinaryOp { left, right, .. } => {
+                // Arithmetic with any NULL operand evaluates to NULL
+                Self::is_definitely_null(left) || Self::is_definitely_null(right)
+            }
+            ResolvedExpr::UnaryOp { expr: inner, .. } => Self::is_definitely_null(inner),
+            _ => false,
+        }
     }
 
     /// Check if expression evaluates to boolean

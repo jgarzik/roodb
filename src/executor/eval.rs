@@ -24,12 +24,14 @@ fn mysql_rand_next(seed1: &mut u64, seed2: &mut u64) -> f64 {
     *seed1 as f64 / MAX_VALUE as f64
 }
 
-/// Seed MySQL RAND from integer — matches MySQL's seed_random()
+/// Seed MySQL RAND from integer — matches MySQL's seed_random() in item_func.cc
+/// MySQL uses `(uint32)` casts causing 32-bit wrapping, and only seed1 gets +55555555.
 fn mysql_rand_seed(seed: u64) -> (u64, u64) {
     const MAX_VALUE: u64 = 0x3FFFFFFF;
-    let s1 = seed.wrapping_mul(0x10001).wrapping_add(55555555);
-    let s2 = seed.wrapping_mul(0x10000001).wrapping_add(55555555);
-    (s1 % MAX_VALUE, s2 % MAX_VALUE)
+    let tmp = seed as u32;
+    let s1 = tmp.wrapping_mul(0x10001).wrapping_add(55555555);
+    let s2 = tmp.wrapping_mul(0x10000001); // No +55555555 on seed2
+    ((s1 as u64) % MAX_VALUE, (s2 as u64) % MAX_VALUE)
 }
 
 /// Internal variable name for NO_UNSIGNED_SUBTRACTION flag (stored in UserVariables)
@@ -1326,16 +1328,17 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 Ok(Datum::Int(*u as i64))
             }
             Datum::Float(f) => {
+                let rounded = f.round();
                 // 2^63 = 9223372036854775808.0 — exact threshold
                 const MAX_SIGNED: f64 = 9_223_372_036_854_775_808.0; // 2^63
                 const MIN_SIGNED: f64 = -9_223_372_036_854_775_808.0; // -2^63
-                if *f >= MAX_SIGNED || *f < MIN_SIGNED || f.is_nan() || f.is_infinite() {
+                if !(MIN_SIGNED..MAX_SIGNED).contains(&rounded) || f.is_nan() || f.is_infinite() {
                     return Err(ExecutorError::DataOutOfRange(format!(
                         "BIGINT value is out of range, casting {} to SIGNED",
                         f
                     )));
                 }
-                Ok(Datum::Int(*f as i64))
+                Ok(Datum::Int(rounded as i64))
             }
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
             Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
@@ -1352,7 +1355,7 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
         DataType::BigIntUnsigned => match val {
             Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
             Datum::Int(i) => Ok(Datum::UnsignedInt(*i as u64)),
-            Datum::Float(f) => Ok(Datum::UnsignedInt(*f as u64)),
+            Datum::Float(f) => Ok(Datum::UnsignedInt(f.round() as u64)),
             Datum::Bool(b) => Ok(Datum::UnsignedInt(if *b { 1 } else { 0 })),
             Datum::String(s) => {
                 let trimmed = s.trim();
@@ -2219,6 +2222,23 @@ pub fn eval_function(
                         Ok(Datum::Int(v as i64))
                     }
                 }
+                Datum::Decimal { value, scale } => {
+                    if *scale == 0 {
+                        // Already integer — fit into Int or UnsignedInt
+                        decimal_int_result(*value)
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        let truncated = *value / divisor;
+                        let remainder = *value % divisor;
+                        // Ceil: round toward +infinity
+                        let result = if remainder > 0 {
+                            truncated + 1
+                        } else {
+                            truncated
+                        };
+                        decimal_int_result(result)
+                    }
+                }
                 _ => Ok(Datum::Int(0)),
             }
         }
@@ -2239,6 +2259,22 @@ pub fn eval_function(
                         Ok(Datum::UnsignedInt(v as u64))
                     } else {
                         Ok(Datum::Int(v as i64))
+                    }
+                }
+                Datum::Decimal { value, scale } => {
+                    if *scale == 0 {
+                        decimal_int_result(*value)
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        let truncated = *value / divisor;
+                        let remainder = *value % divisor;
+                        // Floor: round toward -infinity
+                        let result = if remainder < 0 {
+                            truncated - 1
+                        } else {
+                            truncated
+                        };
+                        decimal_int_result(result)
                     }
                 }
                 _ => Ok(Datum::Int(0)),
@@ -4426,6 +4462,19 @@ fn months_to_period(months: i64) -> i64 {
 }
 
 // ── End date/time infrastructure ──────────────────────────────────────
+
+/// Convert an i128 decimal integer result to the best-fitting Datum type.
+/// Values in i64 range → Int, values in u64 range → UnsignedInt,
+/// otherwise stays as Decimal with scale 0.
+fn decimal_int_result(v: i128) -> ExecutorResult<Datum> {
+    if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
+        Ok(Datum::Int(v as i64))
+    } else if v >= 0 && v <= u64::MAX as i128 {
+        Ok(Datum::UnsignedInt(v as u64))
+    } else {
+        Ok(Datum::Decimal { value: v, scale: 0 })
+    }
+}
 
 /// Return Datum::Float for finite values, Datum::Null for NaN/Infinity.
 /// MySQL returns NULL for mathematically undefined results (log of negative, etc.)

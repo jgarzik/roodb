@@ -1013,7 +1013,11 @@ impl LogicalPlanBuilder {
             ResolvedExpr::Cast {
                 expr, target_type, ..
             } => {
-                format!("CAST({} AS {:?})", Self::expr_to_sql(expr), target_type)
+                format!(
+                    "CAST({} AS {})",
+                    Self::expr_to_sql(expr),
+                    target_type.sql_name()
+                )
             }
             ResolvedExpr::UserVariable { name } => format!("@{}", name),
             ResolvedExpr::Case { .. } => "CASE".to_string(),

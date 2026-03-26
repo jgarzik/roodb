@@ -79,6 +79,29 @@ impl DataType {
     pub fn is_string(&self) -> bool {
         matches!(self, DataType::Varchar(_) | DataType::Text)
     }
+
+    /// Return the MySQL-compatible SQL name for use in CAST column headers.
+    pub fn sql_name(&self) -> String {
+        match self {
+            DataType::Boolean => "BOOLEAN".to_string(),
+            DataType::TinyInt => "TINYINT".to_string(),
+            DataType::SmallInt => "SMALLINT".to_string(),
+            DataType::Int => "INT".to_string(),
+            DataType::BigInt => "BIGINT".to_string(),
+            DataType::BigIntUnsigned => "unsigned".to_string(),
+            DataType::Float => "FLOAT".to_string(),
+            DataType::Double => "DOUBLE".to_string(),
+            DataType::Varchar(n) => format!("CHAR({})", n),
+            DataType::Text => "CHAR".to_string(),
+            DataType::Blob => "BINARY".to_string(),
+            DataType::Bit(w) => format!("BIT({})", w),
+            DataType::Timestamp => "DATETIME".to_string(),
+            DataType::Decimal { precision, scale } => {
+                format!("DECIMAL({},{})", precision, scale)
+            }
+            DataType::Geometry => "GEOMETRY".to_string(),
+        }
+    }
 }
 
 /// Column definition
