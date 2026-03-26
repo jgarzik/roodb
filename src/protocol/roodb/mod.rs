@@ -1035,6 +1035,24 @@ where
             return Ok(result);
         }
 
+        // Handle DO statement — evaluate expression, discard result, send OK
+        // Errors are propagated (e.g., overflow), but successful results are discarded.
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("DO ") {
+                let expr_sql = sql.trim()[3..].trim().trim_end_matches(';');
+                let select_sql = format!("SELECT {}", expr_sql);
+                match self.execute_sql_silent(&select_sql).await {
+                    Ok(_) => return self.send_ok(0, 0).await,
+                    Err(e) => {
+                        return self
+                            .send_error(codes::ER_DATA_OUT_OF_RANGE, states::GENERAL_ERROR, &e)
+                            .await;
+                    }
+                }
+            }
+        }
+
         // Handle SQL-level PREPARE/EXECUTE/DEALLOCATE (text protocol prepared statements)
         if let Some(()) = self.try_handle_sql_prepare(sql).await? {
             return Ok(());

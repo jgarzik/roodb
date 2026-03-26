@@ -72,7 +72,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | **PASS** | 989/1271 (78%) | Trimmed; skips UDFs, ENUM/SET, JSON, CONTINUE HANDLER, LOAD DATA, multi-stmt procs |
+| func_math | **PASS** | 1050/1271 (83%) | Trimmed; skips UDFs, JSON, CONTINUE HANDLER, LOAD DATA, multi-stmt procs |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
 | func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
@@ -151,6 +151,10 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | SET timestamp | SET timestamp=UNIX\_TIMESTAMP(...) accepted; NOW()/TIMEDIFF()/engine=innodb work |
 | CREATE TABLE SELECT DIV | Type resolution for DIV with integer/decimal/string/CAST operands |
 | --TRUE double negation | `--TRUE` parsed as `-(-(TRUE))` = 1 (not as SQL comment) |
+| DO statement silent | DO evaluates expression but discards result; propagates errors |
+| CEIL/FLOOR BIGINT UNSIGNED | Returns UnsignedInt for values > i64::MAX; integer passthrough |
+| ENUM/SET columns | Stored as Text; CRC32 computes on string representation |
+| PREPARE/EXECUTE text protocol | Full cycle including parameter binding with USING @var |
 
 ## Gap Analysis — Next Steps
 

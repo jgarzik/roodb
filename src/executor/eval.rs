@@ -2210,7 +2210,15 @@ pub fn eval_function(
             match &args[0] {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Int(i) => Ok(Datum::Int(*i)),
-                Datum::Float(f) => Ok(Datum::Int(f.ceil() as i64)),
+                Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
+                Datum::Float(f) => {
+                    let v = f.ceil();
+                    if v >= 0.0 && v > i64::MAX as f64 {
+                        Ok(Datum::UnsignedInt(v as u64))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
                 _ => Ok(Datum::Int(0)),
             }
         }
@@ -2224,7 +2232,15 @@ pub fn eval_function(
             match &args[0] {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Int(i) => Ok(Datum::Int(*i)),
-                Datum::Float(f) => Ok(Datum::Int(f.floor() as i64)),
+                Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
+                Datum::Float(f) => {
+                    let v = f.floor();
+                    if v >= 0.0 && v > i64::MAX as f64 {
+                        Ok(Datum::UnsignedInt(v as u64))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
                 _ => Ok(Datum::Int(0)),
             }
         }

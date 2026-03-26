@@ -623,11 +623,11 @@ do sqrt(weight_string(_eucjpms "0E+"));
 
 --echo # Bug#25669580: regression: assertion failed: 0 in Item_num_func1::str_op
 
-# [RooDB-skip] Lines 698-698 skipped (unsupported feature)
+DO ROUND(0xe9b1, NULL);
 
 --echo # Bug#25688504: regression: scale >= 0 && precision >= 0 && ...
 
-# [RooDB-skip] Lines 702-702 skipped (unsupported feature)
+DO COUNT(DISTINCT ROUND(CAST(SLEEP(0) AS DECIMAL), NULL));
 
 
 --echo #
@@ -793,9 +793,14 @@ SELECT CRC32(ST_Area((poly))) FROM geom_data;
 SELECT CRC32(ST_Area((mpoly))) FROM geom_data;
 DROP TABLE geom_data;
 
+# Test cases for ENUM and SET data types
 DROP TABLE IF EXISTS t1;
-# [RooDB-skip] Lines 868-873 skipped (unsupported feature)
+CREATE TABLE t1 (e1 ENUM ('a','b'), s1 SET('a','b'));
+INSERT INTO t1 VALUES(2,'a,b'),('a','b,a');
+SELECT e1, CRC32(e1) FROM t1;
+SELECT s1, CRC32(s1) FROM t1;
 
+DROP TABLE IF EXISTS t1;
 # [RooDB-skip] Lines 875-884 skipped (unsupported feature)
 
 # Test case for views
@@ -825,7 +830,11 @@ DROP TABLE t1;
 # Test case for a user defined function
 # [RooDB-skip] Lines 916-926 skipped (unsupported feature)
 
-# [RooDB-skip] Lines 928-932 skipped (unsupported feature)
+# Test case for a prepared statement
+PREPARE stmt1 FROM 'SELECT CRC32(?)';
+SET @val = 'a';
+EXECUTE stmt1 USING @val;
+DEALLOCATE PREPARE stmt;
 
 # [RooDB-skip] Lines 934-940 skipped (unsupported feature)
 
@@ -899,7 +908,74 @@ select 2 * -9223372036854775808 as result;
 --echo #              ARGUMENTS
 --echo #
 
-# [RooDB-skip] Lines 1016-1083 skipped (unsupported feature)
+CREATE TABLE t1(a BIGINT UNSIGNED);
+SHOW CREATE TABLE t1;
+INSERT INTO t1 VALUES(18446744073709551615);
+CREATE TABLE t2 AS
+SELECT CEILING(a) AS c, FLOOR(a) AS f FROM t1;
+DESCRIBE t2;
+SELECT * FROM t2;
+DROP TABLE t1, t2;
+
+--echo # BIGINT should resolve to BIGINT.
+CREATE TABLE t AS
+SELECT CEILING(18446744073709551615) AS c,
+       FLOOR(18446744073709551615) AS f;
+DESCRIBE t;
+DROP TABLE t;
+
+--echo # DECIMAL should resolve to DECIMAL when too big for BIGINT.
+CREATE TABLE t AS
+SELECT CEILING(18446744073709551616) AS c,
+       FLOOR(18446744073709551616) AS f;
+DESCRIBE t;
+DROP TABLE t;
+
+--echo # CEILING/FLOOR has to always assume a signed DECIMAL, making this too
+--echo # big for BIGINT.
+CREATE TABLE t AS
+SELECT CEILING(CAST(1844674407370955161 AS DECIMAL(19, 0))) AS c,
+       FLOOR(CAST(1844674407370955161 AS DECIMAL(19, 0))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
+
+CREATE TABLE t AS
+SELECT CEILING(CAST(-9223372036854775808 AS DECIMAL(19, 0))) AS c,
+       FLOOR(CAST(-9223372036854775808 AS DECIMAL(19, 0))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
+
+--echo # DECIMAL should resolve to BIGINT when it fits.
+CREATE TABLE t AS
+SELECT CEILING(CAST(184467440737095516 AS DECIMAL(18, 0))) AS c,
+       FLOOR(CAST(184467440737095516 AS DECIMAL(18, 0))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
+
+CREATE TABLE t AS
+SELECT CEILING(CAST(-922337203685477580 AS DECIMAL(18, 0))) AS c,
+       FLOOR(CAST(-922337203685477580 AS DECIMAL(18, 0))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
+
+--echo # Account for possible increase of order of magnitude when rounding.
+CREATE TABLE t AS
+SELECT CEILING(CAST(99999999999999999.9 AS DECIMAL(18, 1))) AS c,
+       FLOOR(CAST(-99999999999999999.9 AS DECIMAL(18, 1))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
+
+CREATE TABLE t AS
+SELECT CEILING(CAST(999999999999999999.9 AS DECIMAL(19, 1))) AS c,
+       FLOOR(CAST(-999999999999999999.9 AS DECIMAL(19, 1))) AS f;
+DESCRIBE t;
+SELECT * FROM t;
+DROP TABLE t;
 
 --echo #
 --echo # Bug #29952066 CAST OF NEGATIVE FUNCTION RETURN VALUE TO
