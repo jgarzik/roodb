@@ -272,7 +272,7 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
         }
         Datum::UnsignedInt(u) => val(Value::Number(u.to_string(), false)),
         Datum::String(s) => val(Value::SingleQuotedString(s.clone())),
-        Datum::Bytes(b) => val(Value::HexStringLiteral(hex::encode(b))),
+        Datum::Bytes(b) | Datum::Geometry(b) => val(Value::HexStringLiteral(hex::encode(b))),
         Datum::Bit { value, .. } => val(Value::Number(value.to_string(), false)),
         Datum::Timestamp(ts) => val(Value::Number(ts.to_string(), false)),
         Datum::Decimal { value, scale } => {

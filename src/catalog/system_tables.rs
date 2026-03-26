@@ -244,6 +244,7 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::Varchar(n) => format!("VARCHAR({})", n),
         DataType::Text => "TEXT".to_string(),
         DataType::Blob => "BLOB".to_string(),
+        DataType::Geometry => "GEOMETRY".to_string(),
         DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
@@ -287,6 +288,7 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
             "DOUBLE" => Some(DataType::Double),
             "TEXT" => Some(DataType::Text),
             "BLOB" => Some(DataType::Blob),
+            "GEOMETRY" => Some(DataType::Geometry),
             "TIMESTAMP" => Some(DataType::Timestamp),
             _ => None,
         }

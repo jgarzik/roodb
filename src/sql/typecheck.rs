@@ -306,6 +306,10 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
             true
         }
 
+        // Geometry is compatible with Blob (WKB binary storage)
+        (DataType::Geometry, DataType::Blob) | (DataType::Blob, DataType::Geometry) => true,
+        (DataType::Geometry, DataType::Geometry) => true,
+
         _ => false,
     }
 }

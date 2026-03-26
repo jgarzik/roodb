@@ -42,6 +42,8 @@ pub enum DataType {
     Timestamp,
     /// Fixed-point decimal with precision and scale
     Decimal { precision: u8, scale: u8 },
+    /// Spatial geometry (stored as WKB binary)
+    Geometry,
 }
 
 impl DataType {

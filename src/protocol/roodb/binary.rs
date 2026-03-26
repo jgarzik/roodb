@@ -82,7 +82,7 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             out
         }
 
-        Datum::Bytes(b) => {
+        Datum::Bytes(b) | Datum::Geometry(b) => {
             let mut out = encode_length_encoded_int(b.len() as u64);
             out.extend_from_slice(b);
             out

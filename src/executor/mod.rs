@@ -17,6 +17,7 @@ pub mod error;
 pub mod eval;
 pub mod explain_exec;
 pub mod filter;
+pub mod geometry;
 pub mod hash_join;
 pub mod insert;
 pub mod insert_select;

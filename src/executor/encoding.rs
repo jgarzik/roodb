@@ -173,7 +173,7 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
-        Datum::Bytes(b) => {
+        Datum::Bytes(b) | Datum::Geometry(b) => {
             buf.push(TAG_BYTES);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);

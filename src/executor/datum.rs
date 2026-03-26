@@ -30,6 +30,8 @@ pub enum Datum {
     Timestamp(i64),
     /// Fixed-point decimal (unscaled value, scale)
     Decimal { value: i128, scale: u8 },
+    /// Spatial geometry (WKB binary)
+    Geometry(Vec<u8>),
 }
 
 impl Datum {
@@ -49,6 +51,7 @@ impl Datum {
             DataType::Float | DataType::Double => Datum::Float(0.0),
             DataType::Varchar(_) | DataType::Text => Datum::String(String::new()),
             DataType::Blob => Datum::Bytes(Vec::new()),
+            DataType::Geometry => Datum::Geometry(Vec::new()),
             DataType::Bit(w) => Datum::Bit {
                 value: 0,
                 width: *w,
@@ -72,6 +75,7 @@ impl Datum {
             Datum::Float(_) => 3,
             Datum::String(_) => 4,
             Datum::Bytes(_) => 5,
+            Datum::Geometry(_) => 5,
             Datum::Timestamp(_) => 6,
             Datum::Bit { .. } => 7,
             Datum::Decimal { .. } => 3, // same as Float for cross-type ordering
@@ -88,6 +92,7 @@ impl Datum {
             Datum::Float(_) => Some(DataType::Double),
             Datum::String(_) => Some(DataType::Text),
             Datum::Bytes(_) => Some(DataType::Blob),
+            Datum::Geometry(_) => Some(DataType::Geometry),
             Datum::Bit { width, .. } => Some(DataType::Bit(*width)),
             Datum::Timestamp(_) => Some(DataType::Timestamp),
             Datum::Decimal { value, scale } => {
@@ -188,7 +193,7 @@ impl Datum {
                 let escaped = s.replace('\'', "''");
                 format!("'{}'", escaped)
             }
-            Datum::Bytes(b) => {
+            Datum::Bytes(b) | Datum::Geometry(b) => {
                 let mut s = String::with_capacity(3 + b.len() * 2);
                 s.push_str("X'");
                 for byte in b {
@@ -227,7 +232,7 @@ impl Datum {
                 }
             }
             Datum::String(s) => s.clone(),
-            Datum::Bytes(b) => {
+            Datum::Bytes(b) | Datum::Geometry(b) => {
                 let mut s = String::with_capacity(2 + b.len() * 2);
                 s.push_str("0x");
                 for byte in b {
@@ -680,7 +685,7 @@ impl Hash for Datum {
                     Datum::Null => {}
                     Datum::Bool(b) => b.hash(state),
                     Datum::String(s) => s.hash(state),
-                    Datum::Bytes(b) => b.hash(state),
+                    Datum::Bytes(b) | Datum::Geometry(b) => b.hash(state),
                     Datum::Timestamp(t) => t.hash(state),
                     Datum::Int(_)
                     | Datum::UnsignedInt(_)

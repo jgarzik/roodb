@@ -72,7 +72,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | **PASS** | 936/1271 (74%) | Trimmed; skips UDFs, geometry, JSON, CONTINUE HANDLER, LOAD DATA |
+| func_math | **PASS** | 958/1271 (75%) | Trimmed; skips UDFs, ENUM/SET, JSON, CONTINUE HANDLER, LOAD DATA |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
 | func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
@@ -139,6 +139,12 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | CREATE VIEW / DROP VIEW | Raft-persisted views via system.views; survive restart; SHOW CREATE TABLE; SHOW TABLES includes views; JOIN with views; circular view guard (depth 32); query validation at CREATE time |
 | Boolean negation | `-(TRUE)` returns -1; `-(1 NOT IN (0))` works correctly |
 | CREATE TRIGGER / DROP TRIGGER | BEFORE/AFTER INSERT triggers; body stored as parsed AST; NEW.col substitution; fires via full SQL pipeline |
+| Geometry types | POINT, LINESTRING, POLYGON, MULTILINESTRING, MULTIPOLYGON column types; stored as WKB binary |
+| ST_GeomFromText | WKT parser (POINT, LINESTRING, POLYGON, MULTILINESTRING, MULTIPOLYGON) → WKB |
+| ST_X, ST_Y | Extract X/Y coordinates from POINT geometry |
+| ST_NumPoints | Count points in LINESTRING |
+| ST_Length | Compute Euclidean length of LINESTRING/MULTILINESTRING |
+| ST_Area | Compute area of POLYGON/MULTIPOLYGON via shoelace formula |
 
 ## Gap Analysis — Next Steps
 

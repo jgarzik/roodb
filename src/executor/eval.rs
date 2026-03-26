@@ -1486,6 +1486,13 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 _ => Ok(Datum::Decimal { value: 0, scale: s }),
             }
         }
+        DataType::Geometry => {
+            // Geometry values pass through — Bytes/Geometry are both valid WKB
+            match val {
+                Datum::Geometry(_) | Datum::Bytes(_) => Ok(val.clone()),
+                _ => Ok(Datum::String(val.to_display_string())),
+            }
+        }
         _ => Ok(Datum::String(val.to_display_string())),
     }
 }
@@ -3457,6 +3464,141 @@ pub fn eval_function(
             let s = args[0].to_display_string();
             let crc = crc32_compute(s.as_bytes());
             Ok(Datum::Int(crc as i64))
+        }
+
+        // ============ Geometry/Spatial Functions ============
+        "ST_GEOMFROMTEXT" | "ST_GEOMETRYFROMTEXT" => {
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_GeomFromText requires at least 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkt = args[0].to_display_string();
+            match crate::executor::geometry::wkt_to_wkb(&wkt) {
+                Ok(wkb) => Ok(Datum::Geometry(wkb)),
+                Err(e) => Err(ExecutorError::InvalidOperation(format!(
+                    "Invalid WKT: {}",
+                    e
+                ))),
+            }
+        }
+
+        "ST_X" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_X requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_X requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_x(wkb) {
+                Ok(x) => Ok(Datum::Float(x)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_Y" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Y requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Y requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_y(wkb) {
+                Ok(y) => Ok(Datum::Float(y)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_NUMPOINTS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_NumPoints requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_NumPoints requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_numpoints(wkb) {
+                Ok(n) => Ok(Datum::Int(n)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Length requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Length requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_length(wkb) {
+                Ok(l) => Ok(Datum::Float(l)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_AREA" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Area requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Area requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_area(wkb) {
+                Ok(a) => Ok(Datum::Float(a)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
         }
 
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled

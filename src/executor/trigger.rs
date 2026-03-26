@@ -186,7 +186,7 @@ pub fn datum_to_sp_value(datum: &crate::executor::datum::Datum) -> sp::Value {
                 )
             }
         }
-        Datum::Bytes(b) => {
+        Datum::Bytes(b) | Datum::Geometry(b) => {
             let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
             sp::Value::HexStringLiteral(hex)
         }

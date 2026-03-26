@@ -2321,6 +2321,8 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         sp::DataType::Time(_, _) => Ok(DataType::Text),
         // JSON
         sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Text),
+        // PostgreSQL-style geometry types
+        sp::DataType::GeometricType(_) => Ok(DataType::Geometry),
         // Custom type names (backward compat + types not in sqlparser enum)
         sp::DataType::Custom(name, _) => {
             let upper = name.to_string().to_uppercase();
@@ -2332,6 +2334,9 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => Ok(DataType::Text),
                 "MEDIUMBLOB" | "LONGBLOB" | "TINYBLOB" => Ok(DataType::Blob),
                 "FIXED" => Ok(DataType::Double),
+                // MySQL spatial/geometry types
+                "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
+                | "MULTIPOLYGON" | "GEOMETRY" | "GEOMETRYCOLLECTION" => Ok(DataType::Geometry),
                 _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
             }
         }
@@ -2762,13 +2767,21 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             Ok(DataType::Double)
         }
         // Spatial functions — not supported, but need type info for error path
-        "ST_LINESTRINGFROMWKB"
-        | "ST_POINTFROMWKB"
+        "ST_GEOMFROMTEXT"
+        | "ST_GEOMETRYFROMTEXT"
+        | "ST_GEOMFROMWKB"
         | "ST_GEOMETRYFROMWKB"
-        | "ST_GEOMFROMTEXT"
-        | "ST_GEOMFROMWKB" => Err(SqlError::InvalidOperation(
-            "Incorrect arguments to spatial function".to_string(),
-        )),
+        | "ST_POINTFROMWKB"
+        | "ST_LINESTRINGFROMWKB"
+        | "ST_POLYGONFROMWKB" => Ok(DataType::Geometry),
+        "ST_X" | "ST_Y" | "ST_LENGTH" | "ST_AREA" | "ST_DISTANCE" | "ST_PERIMETER" => {
+            Ok(DataType::Double)
+        }
+        "ST_NUMPOINTS"
+        | "ST_NUMGEOMETRIES"
+        | "ST_NUMINTERIORRINGS"
+        | "ST_SRID"
+        | "ST_DIMENSION" => Ok(DataType::BigInt),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "TO_DAYS" | "FROM_DAYS" | "DATEDIFF" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR"
         | "HOUR" | "MINUTE" | "SECOND" | "MONTH" | "YEAR" | "WEEK" | "QUARTER" | "WEEKDAY"
