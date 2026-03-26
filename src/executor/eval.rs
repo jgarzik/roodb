@@ -2243,9 +2243,50 @@ pub fn eval_function(
             } else {
                 0
             };
+            // For integer types with negative decimals, use integer arithmetic
+            // to avoid float precision loss on large values
+            if decimals < 0 {
+                match &args[0] {
+                    Datum::UnsignedInt(u) => {
+                        let d = (-decimals) as u32;
+                        if d >= 20 {
+                            return Ok(Datum::UnsignedInt(0));
+                        }
+                        let divisor = 10u64.pow(d);
+                        let rounded = (u + divisor / 2) / divisor * divisor;
+                        return Ok(Datum::UnsignedInt(rounded));
+                    }
+                    Datum::Int(i) => {
+                        let d = (-decimals) as u32;
+                        if d >= 19 {
+                            return Ok(Datum::Int(0));
+                        }
+                        let divisor = 10i64.pow(d);
+                        // Check for overflow: i64::MIN rounded can overflow
+                        if *i == i64::MIN && divisor > 1 {
+                            return Err(ExecutorError::DataOutOfRange(
+                                "BIGINT value is out of range".to_string(),
+                            ));
+                        }
+                        let rounded = if *i >= 0 {
+                            (i + divisor / 2) / divisor * divisor
+                        } else {
+                            (i - divisor / 2) / divisor * divisor
+                        };
+                        return Ok(Datum::Int(rounded));
+                    }
+                    _ => {} // fall through to float path
+                }
+            }
+
             let val = args[0].as_float().unwrap_or(0.0);
             let factor = 10_f64.powi(decimals as i32);
-            let rounded = (val * factor).round() / factor;
+            // Handle extreme decimals: when factor overflows, result rounds to 0
+            let rounded = if factor.is_infinite() || factor == 0.0 {
+                0.0
+            } else {
+                (val * factor).round() / factor
+            };
             if decimals <= 0 {
                 Ok(Datum::Int(rounded as i64))
             } else {

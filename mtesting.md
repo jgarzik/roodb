@@ -72,7 +72,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | **PASS** | 958/1271 (75%) | Trimmed; skips UDFs, ENUM/SET, JSON, CONTINUE HANDLER, LOAD DATA |
+| func_math | **PASS** | 989/1271 (78%) | Trimmed; skips UDFs, ENUM/SET, JSON, CONTINUE HANDLER, LOAD DATA, multi-stmt procs |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
 | func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
@@ -145,6 +145,12 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | ST_NumPoints | Count points in LINESTRING |
 | ST_Length | Compute Euclidean length of LINESTRING/MULTILINESTRING |
 | ST_Area | Compute area of POLYGON/MULTIPOLYGON via shoelace formula |
+| CASE with CONVERT | CASE/WHEN with CONVERT(val, CHAR) + CREATE TABLE SELECT |
+| COALESCE/IFNULL BIGINT UNSIGNED | CAST(COALESCE(nullable_col, -1) AS UNSIGNED) returns correct u64 |
+| ROUND integer arithmetic | ROUND with negative decimals uses integer division for BIGINT/UNSIGNED |
+| SET timestamp | SET timestamp=UNIX\_TIMESTAMP(...) accepted; NOW()/TIMEDIFF()/engine=innodb work |
+| CREATE TABLE SELECT DIV | Type resolution for DIV with integer/decimal/string/CAST operands |
+| --TRUE double negation | `--TRUE` parsed as `-(-(TRUE))` = 1 (not as SQL comment) |
 
 ## Gap Analysis — Next Steps
 

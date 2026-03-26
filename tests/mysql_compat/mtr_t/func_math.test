@@ -118,7 +118,14 @@ select abs(-2) * -2;
 #
 # InnoDB is required to reproduce the fault, but it is okay if we default to
 # MyISAM when testing.
-# [RooDB-skip] Lines 139-146 skipped (unsupported feature)
+SET timestamp=UNIX_TIMESTAMP('2001-01-01 00:00:00');
+--disable_warnings
+create table t1 (a varchar(90), ts datetime not null, index (a)) engine=innodb default charset=utf8;
+--enable_warnings
+insert into t1 values ('http://www.foo.com/', now());
+select a from t1 where a='http://www.foo.com/' order by abs(timediff(ts, 0));
+drop table t1;
+SET timestamp=DEFAULT;
 
 # End of 4.1 tests
 
@@ -319,7 +326,10 @@ select "123456789012345678901234567890.123456789012345678901234567890" div 1 as 
 --echo # Bug#57810 case/when/then : Assertion failed: length || !scale
 --echo #
 
-# [RooDB-skip] Lines 347-350 skipped (unsupported feature)
+SELECT CASE(('')) WHEN (CONVERT(1, CHAR(1))) THEN (('' / 1)) END;
+CREATE TABLE t1 SELECT CAST((CASE(('')) WHEN (CONVERT(1, CHAR(1))) THEN (('' / 1)) END) AS CHAR) as C;
+SHOW CREATE TABLE t1;
+DROP TABLE t1;
 
 --echo #
 # [RooDB-skip] Lines 353-360 skipped (unsupported feature)
@@ -896,7 +906,14 @@ select 2 * -9223372036854775808 as result;
 --echo #               UNSIGNED MALFUNCTIONS WITH BIGINT
 --echo #
 
-# [RooDB-skip] Lines 1090-1097 skipped (unsupported feature)
+CREATE TABLE t0(c0 BIGINT UNSIGNED);
+INSERT INTO t0(c0) VALUES(NULL);
+SELECT * FROM t0 WHERE CAST(COALESCE(t0.c0, -1) AS UNSIGNED);
+SELECT * FROM t0 WHERE CAST(IFNULL(t0.c0, -1) AS UNSIGNED);
+SELECT CAST(COALESCE(t0.c0, -1) AS UNSIGNED) IS TRUE FROM t0;
+SELECT CAST(COALESCE(t0.c0, -1) AS UNSIGNED) FROM t0;
+
+DROP TABLE t0;
 
 SELECT CAST(-1.1 AS UNSIGNED);
 
@@ -906,7 +923,8 @@ SELECT CAST(-1.1 AS UNSIGNED);
 --echo #               OF -9223372036854775808 IN ITEM_FUNC_ROUND::INT_OP()
 --echo #
 
-# [RooDB-skip] Lines 1107-1108 skipped (unsupported feature)
+--error ER_DATA_OUT_OF_RANGE
+select (round(-9223372036854775808, -4));
 
 # [RooDB-skip] Lines 1110-1154 skipped (unsupported feature)
 
@@ -929,7 +947,14 @@ SET sql_mode = DEFAULT;
 --echo #
 
 SELECT 5.0 + 96 DIV 1;
-# [RooDB-skip] Lines 1222-1229 skipped (unsupported feature)
+CREATE TABLE t1 SELECT
+  5.0 + 96 DIV 1,                     # Dividend is integer
+  5.0 + 96.1234 DIV 1,                # Dividend is decimal
+  5.0 + '96' DIV 1,                   # Dividend is string
+  5.0 + CAST('96' AS SIGNED) DIV 1,   # Dividend is function
+  5.0 + CAST('96' AS UNSIGNED) DIV 1;
+SHOW CREATE TABLE t1;
+DROP TABLE t1;
 
 --echo #
 --echo # Bug #32693863 MINUS BETWEEN CONST VALUE 0 AND FIELD WITH
@@ -950,7 +975,13 @@ SELECT a, 1-a FROM t1;
 
 DROP TABLE t1;
 
-# [RooDB-skip] Lines 1250-1265 skipped (unsupported feature)
+# [RooDB-skip] Lines 1250-1259 skipped (unsupported feature)
+
+--echo # Bug#32863037: Assertion `scale >= 0 && precision > 0 &&
+--echo #               scale <= precision' failed
+
+SELECT * FROM (SELECT -TRUE AS a, --TRUE AS b) AS dt;
+
 --echo # Bug#33142010: Failure on complex const argument to string functions
 
 CREATE VIEW v AS SELECT -(1 NOT IN (0)) AS c;

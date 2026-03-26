@@ -4610,7 +4610,9 @@ where
         // Pre-process: convert MySQL DECLARE variable statements to SET.
         // DECLARE var_name TYPE [DEFAULT expr]; → SET var_name = expr;
         // DECLARE var_name CURSOR FOR query; → kept as-is (sqlparser handles this)
-        let processed = Self::normalize_declare_stmts(inner);
+        // Normalize := to = for SET statements (MySQL supports both)
+        let inner = inner.replace(":=", "=");
+        let processed = Self::normalize_declare_stmts(&inner);
 
         // Wrap in BEGIN...END and CREATE PROCEDURE for parsing
         let wrapper = format!("CREATE PROCEDURE __body__() BEGIN {} END", processed);
