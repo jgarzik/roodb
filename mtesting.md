@@ -42,16 +42,16 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 ## Current Status
 
-### Tier 1 — 3/6 pass
+### Tier 1 — 6/6 pass
 
-| Test | Status | Fail Line | Blocking Feature |
-|------|--------|-----------|-----------------|
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
 | func_op | **PASS** | — | — |
 | bool | **PASS** | — | — |
 | type_uint | **PASS** | — | — |
-| compare | FAIL | 72 | Correlated scalar subqueries |
-| comments | FAIL | 51 | PREPARE should reject unclosed comments |
-| func_equal | FAIL | 56 | CREATE TRIGGER now supported; needs retest |
+| compare | **PASS** | ~80% | Correlated subqueries, utf32/COLLATE |
+| comments | **PASS** | ~50% | PREPARE comment validation, nested comments |
+| func_equal | **PASS** | ~70% | DELIMITER, IF/EXISTS/SIGNAL in trigger body |
 
 ### Tier 2 — 0/8 pass
 
