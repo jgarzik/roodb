@@ -3,7 +3,9 @@
 //! Schema metadata is stored in system tables that are replicated via Raft
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
-use super::{ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef};
+use super::{
+    ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef, ViewDef,
+};
 use crate::executor::{Datum, Row};
 
 /// System table names
@@ -26,6 +28,9 @@ pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
 
 // Stored procedures
 pub const SYSTEM_PROCEDURES: &str = "system.procedures";
+
+// Views
+pub const SYSTEM_VIEWS: &str = "system.views";
 
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
@@ -172,6 +177,14 @@ pub fn procedures_table_def() -> TableDef {
         .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
 }
 
+/// Create the TableDef for system.views
+pub fn views_table_def() -> TableDef {
+    TableDef::new(SYSTEM_VIEWS)
+        .column(ColumnDef::new("view_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("query_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["view_name".to_string()]))
+}
+
 /// Get all system table definitions for bootstrapping
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
     vec![
@@ -186,6 +199,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         databases_table_def(),
         table_statistics_table_def(),
         procedures_table_def(),
+        views_table_def(),
     ]
 }
 
@@ -482,6 +496,27 @@ pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
     })
 }
 
+/// Convert a ViewDef to a row for system.views
+pub fn view_def_to_row(def: &ViewDef) -> Row {
+    Row::new(vec![
+        Datum::String(def.name.clone()),
+        Datum::String(def.query_sql.clone()),
+    ])
+}
+
+/// Reconstruct a ViewDef from a system.views row
+pub fn row_to_view_def(row: &Row) -> Option<ViewDef> {
+    let name = match &row.values()[0] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let query_sql = match &row.values()[1] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    Some(ViewDef { name, query_sql })
+}
+
 /// Reconstruct an IndexDef from a system.indexes row
 pub fn row_to_index_def(row: &Row) -> Option<IndexDef> {
     let index_name = match &row.values()[0] {
@@ -604,7 +639,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 11);
+        assert_eq!(tables.len(), 12);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -617,6 +652,7 @@ mod tests {
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
         assert!(names.contains(&SYSTEM_DATABASES));
         assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
+        assert!(names.contains(&SYSTEM_VIEWS));
         assert!(names.contains(&SYSTEM_PROCEDURES));
     }
 

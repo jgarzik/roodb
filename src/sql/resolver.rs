@@ -27,6 +27,8 @@ pub struct Resolver<'a> {
     placeholder_mode: bool,
     /// Counter for assigning placeholder indices (used in placeholder_mode)
     placeholder_counter: Cell<usize>,
+    /// Track view expansion depth to prevent infinite recursion from circular views
+    view_depth: Cell<usize>,
 }
 
 impl<'a> Resolver<'a> {
@@ -36,6 +38,7 @@ impl<'a> Resolver<'a> {
             catalog,
             placeholder_mode: false,
             placeholder_counter: Cell::new(0),
+            view_depth: Cell::new(0),
         }
     }
 
@@ -45,6 +48,7 @@ impl<'a> Resolver<'a> {
             catalog,
             placeholder_mode: true,
             placeholder_counter: Cell::new(0),
+            view_depth: Cell::new(0),
         }
     }
 
@@ -871,16 +875,22 @@ impl<'a> Resolver<'a> {
                 for table_with_joins in &select.from {
                     for join in &table_with_joins.joins {
                         let table_ref = self.resolve_table_factor(&join.relation)?;
-                        let table_def = self
-                            .catalog
-                            .get_table(&table_ref.name)
-                            .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
 
                         let alias = table_ref
                             .alias
                             .clone()
                             .unwrap_or_else(|| table_ref.name.clone());
-                        scope.add_table(&alias, &table_ref.name, table_def);
+
+                        // For views (inner_query set), use derived table columns
+                        if table_ref.inner_query.is_some() {
+                            scope.add_derived_table(&alias, &table_ref.columns);
+                        } else {
+                            let table_def = self
+                                .catalog
+                                .get_table(&table_ref.name)
+                                .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+                            scope.add_table(&alias, &table_ref.name, table_def);
+                        }
 
                         let join_type = convert_join_type(&join.join_operator)?;
                         let condition = extract_join_condition(&join.join_operator)
@@ -1014,6 +1024,15 @@ impl<'a> Resolver<'a> {
 
                 // Fall back to view — expand view query as a derived table
                 if let Some(view_def) = self.catalog.get_view(&table_name) {
+                    let depth = self.view_depth.get();
+                    if depth >= 32 {
+                        return Err(SqlError::InvalidOperation(format!(
+                            "View recursion limit exceeded (depth {}), possible circular reference",
+                            depth
+                        )));
+                    }
+                    self.view_depth.set(depth + 1);
+
                     let view_sql = view_def.query_sql.clone();
                     let view_stmt = crate::sql::Parser::parse_one(&view_sql).map_err(|e| {
                         SqlError::Parse(format!("Invalid view '{}': {}", table_name, e))
@@ -1041,6 +1060,7 @@ impl<'a> Resolver<'a> {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| table_name.clone());
+                        self.view_depth.set(self.view_depth.get() - 1);
                         return Ok(ResolvedTableRef {
                             name: table_name,
                             alias: Some(effective_alias),
@@ -1048,6 +1068,7 @@ impl<'a> Resolver<'a> {
                             inner_query: Some(Box::new(inner_select)),
                         });
                     }
+                    self.view_depth.set(self.view_depth.get() - 1);
                 }
 
                 Err(SqlError::TableNotFound(table_name))

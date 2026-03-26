@@ -714,11 +714,14 @@ impl Catalog {
 
     /// Drop a view
     pub fn drop_view(&mut self, name: &str, if_exists: bool) -> CatalogResult<()> {
-        if self.views.remove(name).is_none() && !if_exists {
-            return Err(CatalogError::ViewNotFound(name.to_string()));
+        match self.views.remove(name) {
+            Some(_) => {
+                self.schema_version += 1;
+                Ok(())
+            }
+            None if if_exists => Ok(()),
+            None => Err(CatalogError::ViewNotFound(name.to_string())),
         }
-        self.schema_version += 1;
-        Ok(())
     }
 
     /// Get a view definition
@@ -729,6 +732,21 @@ impl Catalog {
     /// Check if a view exists
     pub fn view_exists(&self, name: &str) -> bool {
         self.views.contains_key(name)
+    }
+
+    /// Register a view directly (used during catalog rebuild from system tables)
+    pub fn register_view(&mut self, def: ViewDef) {
+        self.views.insert(def.name.clone(), def);
+    }
+
+    /// Clear all views (used before catalog rebuild)
+    pub fn clear_views(&mut self) {
+        self.views.clear();
+    }
+
+    /// Get all view names in current database
+    pub fn get_view_names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
     }
 
     // ============ Trigger operations ============

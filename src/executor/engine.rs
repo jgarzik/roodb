@@ -17,8 +17,8 @@ use super::analyze::AnalyzeTable;
 use super::auth::{AlterUser, CreateUser, DropUser, Grant, Revoke, SetPassword, ShowGrants};
 use super::context::TransactionContext;
 use super::ddl::{
-    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, CreateView,
-    DropDatabase, DropIndex, DropTable, DropView, Materialize,
+    CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, DropDatabase,
+    DropIndex, DropTable, Materialize,
 };
 use super::delete::Delete;
 use super::distinct::HashDistinct;
@@ -374,22 +374,13 @@ impl ExecutorEngine {
                 Ok(Box::new(Materialize::new(inner)))
             }
 
-            PhysicalPlan::CreateView {
-                name,
-                query_sql,
-                or_replace,
-            } => Ok(Box::new(CreateView::new(
-                name,
-                query_sql,
-                or_replace,
-                self.catalog.clone(),
-            ))),
-
-            PhysicalPlan::DropView { name, if_exists } => Ok(Box::new(DropView::new(
-                name,
-                if_exists,
-                self.catalog.clone(),
-            ))),
+            // CreateView and DropView are handled at the protocol level (Raft path),
+            // they should never reach the executor engine.
+            PhysicalPlan::CreateView { .. } | PhysicalPlan::DropView { .. } => {
+                Err(ExecutorError::Internal(
+                    "CreateView/DropView should be handled at protocol level".to_string(),
+                ))
+            }
 
             PhysicalPlan::DropTable { name, if_exists } => {
                 if let Some(ref raft_node) = self.raft_node {

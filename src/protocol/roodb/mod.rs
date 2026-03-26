@@ -1103,10 +1103,8 @@ where
             if upper.starts_with("FLUSH ") {
                 return self.send_ok(0, 0).await;
             }
-            // DROP FUNCTION/VIEW IF EXISTS — no-op (we don't have these yet)
-            if (upper.starts_with("DROP FUNCTION") || upper.starts_with("DROP VIEW"))
-                && upper.contains("IF EXISTS")
-            {
+            // DROP FUNCTION IF EXISTS — no-op (functions not yet implemented)
+            if upper.starts_with("DROP FUNCTION") && upper.contains("IF EXISTS") {
                 return self.send_ok(0, 0).await;
             }
             // CREATE TRIGGER — parsed and stored via normal pipeline
@@ -1167,6 +1165,15 @@ where
                 name: String,
                 if_exists: bool,
             },
+            CreateViewRaft {
+                name: String,
+                query_sql: String,
+                or_replace: bool,
+            },
+            DropViewRaft {
+                names: Vec<String>,
+                if_exists: bool,
+            },
             Call(sqlparser::ast::Function),
             Continue(Box<sqlparser::ast::Statement>),
         }
@@ -1192,6 +1199,23 @@ where
                         if_exists,
                     }
                 }
+                S::CreateView(cv) => Intercept::CreateViewRaft {
+                    name: cv.name.to_string(),
+                    query_sql: cv.query.to_string(),
+                    or_replace: cv.or_replace,
+                },
+                S::Drop {
+                    ref object_type,
+                    ref names,
+                    if_exists,
+                    ..
+                } if *object_type == sqlparser::ast::ObjectType::View => {
+                    let view_names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+                    Intercept::DropViewRaft {
+                        names: view_names,
+                        if_exists,
+                    }
+                }
                 S::Call(func) => Intercept::Call(func),
                 other => Intercept::Continue(Box::new(other)),
             }
@@ -1206,6 +1230,18 @@ where
             }
             Intercept::DropProc { name, if_exists } => {
                 return self.handle_drop_procedure(&name, if_exists).await;
+            }
+            Intercept::CreateViewRaft {
+                name,
+                query_sql,
+                or_replace,
+            } => {
+                return self
+                    .handle_create_view_raft(&name, &query_sql, or_replace)
+                    .await;
+            }
+            Intercept::DropViewRaft { names, if_exists } => {
+                return self.handle_drop_view_raft(&names, if_exists).await;
             }
             Intercept::Call(func) => {
                 let proc_name = func.name.to_string().to_lowercase();
@@ -3118,7 +3154,11 @@ where
                 .unwrap_or_else(|| "default".to_string());
             let tables = {
                 let catalog = self.catalog.read();
-                catalog.get_tables_in_database(&db)
+                let mut tables = catalog.get_tables_in_database(&db);
+                // Include views in SHOW TABLES output
+                tables.extend(catalog.get_view_names());
+                tables.sort();
+                tables
             };
             let col_name = format!("Tables_in_{}", db);
             let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
@@ -3865,6 +3905,176 @@ where
         );
 
         Ok(Some(()))
+    }
+
+    // ============ View Handlers (Raft-persisted) ============
+
+    /// Handle CREATE VIEW with Raft persistence.
+    /// Validates the view query at creation time, then persists to system.views via Raft.
+    async fn handle_create_view_raft(
+        &mut self,
+        view_name: &str,
+        query_sql: &str,
+        or_replace: bool,
+    ) -> ProtocolResult<()> {
+        use crate::catalog::system_tables::{view_def_to_row, SYSTEM_VIEWS};
+        use crate::catalog::ViewDef;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::raft::RowChange;
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let view_name = view_name.trim_matches('`').to_string();
+
+        // Validate the view query parses correctly
+        if let Err(e) = crate::sql::Parser::parse_one(query_sql) {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    &format!("Invalid view query: {}", e),
+                )
+                .await;
+        }
+
+        // Check if view already exists
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.view_exists(&view_name)
+        };
+
+        if exists && !or_replace {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("View '{}' already exists", view_name),
+                )
+                .await;
+        }
+
+        // If replacing, delete old row first
+        let mut changes = Vec::new();
+        if exists && or_replace {
+            if let Some(delete_change) = self.find_view_row_for_delete(&view_name).await? {
+                changes.push(delete_change);
+            }
+        }
+
+        // Insert new row into system.views
+        let view_def = ViewDef {
+            name: view_name.clone(),
+            query_sql: query_sql.to_string(),
+        };
+
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let row_id = encode_row_id(local_id, node_id);
+        let view_row = view_def_to_row(&view_def);
+        let key = encode_row_key(SYSTEM_VIEWS, row_id);
+        let value = encode_row(&view_row);
+        changes.push(RowChange::insert(SYSTEM_VIEWS, key, value));
+
+        let changeset = ChangeSet::new_with_changes(0, changes);
+        match self.raft_node.propose_changes(changeset).await {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Failed to create view: {}", e),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Handle DROP VIEW with Raft persistence.
+    async fn handle_drop_view_raft(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> ProtocolResult<()> {
+        let mut changeset = ChangeSet::new(0);
+
+        for raw_name in names {
+            let view_name = raw_name.trim_matches('`').to_string();
+
+            let exists = {
+                let catalog = self.catalog.read();
+                catalog.view_exists(&view_name)
+            };
+
+            if !exists {
+                if if_exists {
+                    continue;
+                }
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("View '{}' does not exist", view_name),
+                    )
+                    .await;
+            }
+
+            if let Some(delete_change) = self.find_view_row_for_delete(&view_name).await? {
+                changeset.push(delete_change);
+            }
+        }
+
+        if !changeset.changes.is_empty() {
+            match self.raft_node.propose_changes(changeset).await {
+                Ok(()) => self.send_ok(0, 0).await,
+                Err(e) => {
+                    self.send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Failed to drop view: {}", e),
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.send_ok(0, 0).await
+        }
+    }
+
+    /// Scan system.views for a row matching the given view name and return a delete RowChange.
+    async fn find_view_row_for_delete(
+        &self,
+        view_name: &str,
+    ) -> ProtocolResult<Option<crate::raft::RowChange>> {
+        use crate::catalog::system_tables::SYSTEM_VIEWS;
+        use crate::executor::encoding::decode_row;
+        use crate::raft::RowChange;
+
+        let prefix = format!("t:{SYSTEM_VIEWS}:");
+        let end = format!("t:{SYSTEM_VIEWS};\x00");
+
+        let rows = self
+            .mvcc
+            .scan_raw(prefix.as_bytes(), end.as_bytes())
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+
+        for (key, value) in rows {
+            let row_data = if value.len() > 17 {
+                &value[17..]
+            } else {
+                &value
+            };
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(Datum::String(name)) = row.values().first() {
+                    if name.eq_ignore_ascii_case(view_name) {
+                        return Ok(Some(RowChange::delete_with_value(
+                            SYSTEM_VIEWS,
+                            key,
+                            row_data.to_vec(),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     // ============ Trigger Handlers ============
