@@ -1,0 +1,106 @@
+create table t1 (s1 binary(3));
+insert into t1 values (0x61), (0x6120), (0x612020);
+select hex(s1) from t1;
+HEX(s1)
+61
+6120
+612020
+drop table t1;
+create table t1 (s1 binary(2), s2 varbinary(2));
+insert into t1 values (0x4100,0x4100);
+select length(concat('*',s1,'*',s2,'*')) from t1;
+LENGTH(CONCAT('*',s1,'*',s2,'*'))
+7
+delete from t1;
+insert into t1 values (0x4120,0x4120);
+select length(concat('*',s1,'*',s2,'*')) from t1;
+LENGTH(CONCAT('*',s1,'*',s2,'*'))
+7
+drop table t1;
+create table t1 (s1 varbinary(20), s2 varbinary(20));
+insert into t1 values (0x41,0x4100),(0x41,0x4120),(0x4100,0x4120);
+select hex(s1), hex(s2) from t1;
+HEX(s1)	HEX(s2)
+41	4100
+41	4120
+4100	4120
+select count(*) from t1 where s1 < s2;
+COUNT(NULL)
+3
+drop table t1;
+create table t1 (s1 varbinary(2), s2 varchar(1));
+insert into t1 values (0x41,'a'), (0x4100,'b'), (0x41,'c'), (0x4100,'d');
+select hex(s1),s2 from t1 order by s1,s2;
+HEX(s1)	s2
+41	a
+41	c
+4100	b
+4100	d
+drop table t1;
+create table t1 (s1 varbinary(2) primary key);
+insert into t1 values (0x01);
+insert into t1 values (0x0120);
+insert into t1 values (0x0100);
+select hex(s1) from t1 order by s1;
+HEX(s1)
+01
+0100
+0120
+select hex(s1) from t1 where s1=0x01;
+HEX(s1)
+01
+select hex(s1) from t1 where s1=0x0120;
+HEX(s1)
+0120
+select hex(s1) from t1 where s1=0x0100;
+HEX(s1)
+0100
+select count(distinct s1) from t1;
+COUNT(s1)
+3
+alter table t1 drop primary key;
+select hex(s1) from t1 where s1=0x01;
+HEX(s1)
+01
+select hex(s1) from t1 where s1=0x0120;
+HEX(s1)
+0120
+select hex(s1) from t1 where s1=0x0100;
+HEX(s1)
+0100
+select count(distinct s1) from t1;
+COUNT(s1)
+3
+drop table t1;
+select hex(cast(0x10 as binary(2)));
+HEX(CAST(blob AS BINARY))
+30783130
+create table t1 (b binary(2), vb varbinary(2));
+insert into t1 values(0x4120, 0x4120);
+drop table t1;
+create table t1(f1 int, f2 binary(2) not null, f3 char(2) not null);
+insert into t1 values (1, 0x0000, '');
+select hex(f2), hex(f3) from t1;
+HEX(f2)	HEX(f3)
+0000	
+drop table t1;
+End of 5.0 tests
+#
+# Bug#21922414 CAST OF TOO BIG HEX LITERAL TO BIGINT UNSIGNED: BAD RESULT AND NO WARNING
+#
+# Those casts overflow and must send a warning
+select convert(9999999999999999999999999999999999999999999,unsigned);
+CAST(10000000000000000000000000000000000000000000 AS unsigned)
+18446744073709551615
+select convert('9999999999999999999999999999999999999999999',unsigned);
+CAST('9999999999999999999999999999999999999999999' AS unsigned)
+0
+select convert(0x9999999999999999999999999999999999999999999,unsigned);
+CAST(blob AS unsigned)
+0
+#
+# Bug#22268110 VIEW USING HEXADECIMAL OR BIT LITERAL GIVES WRONG RESULTS
+#
+#
+# Bug#35507763: Assertion failed.
+#

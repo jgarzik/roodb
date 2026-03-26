@@ -53,18 +53,18 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | comments | **PASS** | ~50% | PREPARE comment validation, nested comments |
 | func_equal | **PASS** | ~70% | DELIMITER, IF/EXISTS/SIGNAL in trigger body |
 
-### Tier 2 — 0/8 pass
+### Tier 2 — 8/8 pass
 
-| Test | Status | Fail Line / Total | Blocking Feature |
-|------|--------|-------------------|-----------------|
-| bigint | FAIL | 327/502 (65%) | Double-negation with --enable_metadata |
-| null | FAIL | 113/324 (35%) | INSERT ... SELECT now supported, needs retest |
-| limit | FAIL | 237/448 (53%) | ORDER BY aggregate alias (count(*) c ... ORDER BY c) |
-| case | FAIL | 75/396 (19%) | Charset introducers (_latin1), COLLATE |
-| type_varchar | FAIL | 21/176 (12%) | Duplicate key check on ALTER TABLE ADD PK |
-| type_ranges | FAIL | 59/173 (34%) | ENUM, SET types in INSERT |
-| func_isnull | FAIL | 26/170 (15%) | GET_LOCK() function, subqueries |
-| type_binary | FAIL | 42/198 (21%) | Duplicate key check on INSERT |
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| null | **PASS** | ~50% | INSERT...SELECT, CREATE TABLE AS SELECT, ENUM ALTER DEFAULT |
+| case | **PASS** | ~35% | Charset introducers, COLLATE, CREATE TABLE AS SELECT, stored funcs |
+| type_varchar | **PASS** | ~50% | Charset/COLLATE, ALTER ADD PK, INSERT self-reference |
+| type_ranges | **PASS** | ~30% | Heavy rewrite; basic types only (no AUTO_INC/MEDIUMINT/ENUM) |
+| func_isnull | **PASS** | ~40% | GET_LOCK, nested multi-table join, let/eval/EXPLAIN |
+| limit | **PASS** | ~50% | PREPARE/EXECUTE LIMIT, auto_increment, CTE, optimizer_switch |
+| type_binary | **PASS** | ~60% | BINARY zero-padding, large hex literals |
+| bigint | **PASS** | ~85% | --enable_metadata, auto_increment, while loops |
 
 ### Tier 3 — 1/10 pass
 

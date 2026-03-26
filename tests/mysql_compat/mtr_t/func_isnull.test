@@ -1,0 +1,110 @@
+#
+# test of ISNULL()
+# Trimmed for RooDB compatibility
+#
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+create table t1 (id int auto_increment primary key not null, mydate date not null);
+insert into t1 values (0,"2002-05-01"),(0,"2002-05-01"),(0,"2002-05-01");
+# [RooDB-skip] flush tables;
+select * from t1 where isnull(to_days(mydate));
+drop table t1;
+
+# End of 4.1 tests
+
+--echo #
+--echo # Bug#53933 crash when using uncacheable subquery in the having clause of outer query
+--echo #
+
+# [RooDB-skip] GET_LOCK / RELEASE_LOCK section
+# [RooDB-skip] SELECT ISNULL((SELECT GET_LOCK('Bug#53933', 0) FROM t1 GROUP BY f1)) AS f2
+# [RooDB-skip] FROM t1 GROUP BY f1 HAVING f2 = f2;
+# [RooDB-skip] SELECT RELEASE_LOCK('Bug#53933');
+
+--echo End of 5.0 tests
+
+#
+# Bug #41371    Select returns 1 row with condition "col is not null and col is null"
+#
+
+CREATE TABLE t1 (id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id));
+INSERT INTO t1( id ) VALUES ( NULL );
+SELECT t1.id  FROM t1  WHERE (id  is not null and id is null );
+DROP TABLE t1;
+
+# End of 5.1 tests
+
+--echo #
+--echo # Bug#29027883 INCORRECT RESULT OF LEFT JOIN
+--echo #
+
+# test the special, documented behaviour of "not-nullable-DATE-column
+# IS NULL"
+
+CREATE TABLE t1 (
+pk int NOT NULL,
+col_int_key INT NOT NULL,
+col_date_key date NOT NULL,
+PRIMARY KEY (pk),
+KEY col_int_key (col_int_key),
+KEY col_date_key (col_date_key)
+);
+INSERT INTO t1 VALUES (14,4,'2000-01-01'), (15,2,'2003-01-13'),
+(16,5,'2006-07-07'), (17,3,'2000-01-01');
+CREATE TABLE t2 (
+pk INT NOT NULL,
+PRIMARY KEY (pk)
+);
+INSERT INTO t2 VALUES (1), (2), (3);
+
+CREATE TABLE t3(pk INT NOT NULL);
+
+INSERT INTO t3 VALUES(3),(3);
+
+# [RooDB-skip] Nested multi-table join syntax (t2 outr2 join t2 outr join t1)
+
+delete from t3;
+INSERT INTO t3 VALUES(3);
+
+# [RooDB-skip] let/eval directive sections with EXPLAIN
+# [RooDB-skip] let $query= select * from t3, t1 where t1.col_date_key is null;
+# [RooDB-skip] eval EXPLAIN $query;
+# [RooDB-skip] eval $query;
+# ... (all let/eval/EXPLAIN blocks skipped)
+
+# Basic IS NULL / IS NOT NULL queries without let/eval
+select * from t3, t1 where t1.col_date_key is null;
+select * from t3 join t1 on t1.col_date_key is null;
+select * from t3 left join t1 on t1.col_date_key is null;
+select * from t3 left join t1 on t1.col_date_key is null
+where t1.col_date_key is null;
+select * from t3, t1 where t1.col_date_key is not null;
+select * from t3, t1 where not (t1.col_date_key is null);
+
+DROP TABLE t1,t2,t3;
+
+--echo #
+--echo # Bug #32171239: HYPERGRAPH: ASSERTION FAILED.
+--echo #
+
+# [RooDB-skip] XOR with RAND() - too MySQL-specific
+
+--echo #
+--echo # Bug#32231698: SETUP_FIELDS: ASSERTION FAILED
+--echo #
+
+# [RooDB-skip] DO AVG(...) with POINT() - spatial + DO not supported
+# [RooDB-skip] --error ER_WRONG_ARGUMENTS
+# [RooDB-skip] DO AVG((SELECT POINT(@x, POINT(115, 219)) IS NULL));
+
+--echo #
+--echo # Bug#34808199: Assertion failed.
+--echo #
+
+CREATE TABLE t(x INT NOT NULL);
+INSERT INTO t VALUES (0), (1);
+SELECT t1.x IS NULL = t2.x AS col FROM t AS t1, t AS t2 ORDER BY col;
+DROP TABLE t;
