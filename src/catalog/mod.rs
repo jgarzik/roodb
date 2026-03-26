@@ -267,6 +267,34 @@ pub struct ViewDef {
     pub query_sql: String,
 }
 
+/// Trigger timing (BEFORE or AFTER)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// Trigger event (INSERT, UPDATE, DELETE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Trigger definition — stores the parsed body as an AST statement
+#[derive(Debug, Clone)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table_name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    /// The trigger body as a parsed sqlparser Statement
+    pub body: sqlparser::ast::Statement,
+    /// Original SQL for SHOW CREATE TRIGGER
+    pub create_sql: String,
+}
+
 /// Catalog error
 #[derive(Debug, Clone)]
 pub enum CatalogError {
@@ -366,6 +394,8 @@ pub struct Catalog {
     procedures: HashMap<String, ProcedureDef>,
     /// Views by name
     views: HashMap<String, ViewDef>,
+    /// Triggers by name
+    triggers: HashMap<String, TriggerDef>,
 }
 
 impl Catalog {
@@ -380,6 +410,7 @@ impl Catalog {
             databases,
             procedures: HashMap::new(),
             views: HashMap::new(),
+            triggers: HashMap::new(),
         }
     }
 
@@ -698,6 +729,39 @@ impl Catalog {
     /// Check if a view exists
     pub fn view_exists(&self, name: &str) -> bool {
         self.views.contains_key(name)
+    }
+
+    // ============ Trigger operations ============
+
+    /// Create a trigger
+    pub fn create_trigger(&mut self, def: TriggerDef) {
+        self.triggers.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// Drop a trigger
+    pub fn drop_trigger(&mut self, name: &str) -> CatalogResult<()> {
+        if self.triggers.remove(name).is_none() {
+            return Err(CatalogError::ViewNotFound(format!(
+                "Trigger '{}' not found",
+                name
+            )));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get triggers for a specific table, timing, and event
+    pub fn get_triggers(
+        &self,
+        table_name: &str,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+    ) -> Vec<&TriggerDef> {
+        self.triggers
+            .values()
+            .filter(|t| t.table_name == table_name && t.timing == timing && t.event == event)
+            .collect()
     }
 }
 

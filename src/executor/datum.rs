@@ -264,6 +264,7 @@ impl Datum {
     /// Negate this datum (for unary minus)
     pub fn negate(&self) -> Option<Datum> {
         match self {
+            Datum::Bool(b) => Some(Datum::Int(if *b { -1 } else { 0 })),
             Datum::Int(i) => i.checked_neg().map(Datum::Int),
             Datum::Float(f) => Some(Datum::Float(-f)),
             Datum::UnsignedInt(u) => {

@@ -51,7 +51,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | type_uint | **PASS** | — | — |
 | compare | FAIL | 72 | Correlated scalar subqueries |
 | comments | FAIL | 51 | PREPARE should reject unclosed comments |
-| func_equal | FAIL | 56 | CREATE TRIGGER |
+| func_equal | FAIL | 56 | CREATE TRIGGER now supported; needs retest |
 
 ### Tier 2 — 0/8 pass
 
@@ -72,7 +72,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 |------|--------|-------------------|-----------------|
 | type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
 | type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | **PASS** | 910/1271 (72%) | Trimmed test; skips triggers, UDFs, views, geometry, JSON, stored procs w/ CONTINUE HANDLER |
+| func_math | **PASS** | 936/1271 (74%) | Trimmed; skips UDFs, geometry, JSON, CONTINUE HANDLER, LOAD DATA |
 | delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
 | func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
 | func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
@@ -136,6 +136,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
 | Scalar-wrapping aggregates | `CRC32(SUM(a))`, `FUNC(AGG(...))` in SELECT, HAVING, ORDER BY |
 | HAVING with non-SELECT aggregates | HAVING clause can reference aggregates not in SELECT list |
+| CREATE VIEW / DROP VIEW | Views with SHOW CREATE TABLE support; view query expansion via derived tables |
+| Boolean negation | `-(TRUE)` returns -1; `-(1 NOT IN (0))` works correctly |
+| CREATE TRIGGER / DROP TRIGGER | BEFORE/AFTER INSERT triggers; body stored as parsed AST; NEW.col substitution; fires via full SQL pipeline |
 
 ## Gap Analysis — Next Steps
 

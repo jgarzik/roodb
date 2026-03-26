@@ -337,13 +337,13 @@ DROP TABLE t1;
 --echo # Bug#11764671  57533: UNINITIALISED VALUES IN COPY_AND_CONVERT (SQL_STRING.CC) WITH CERTAIN CHA
 --echo #
 
-# [RooDB-skip] Lines 375-375 skipped (unsupported feature)
+SELECT ROUND(LEAST(15, -4939092, 0.2704), STDDEV('a'));
 
 --echo #
 --echo # Bug#12392636  ASSERTION FAILED: SCALE >= 0 && PRECISION > 0 && SCALE <= PRECISION
 --echo #
 
-# [RooDB-skip] Lines 381-381 skipped (unsupported feature)
+SELECT SUM(DISTINCT (TRUNCATE((.1), NULL)));
 
 --echo End of 5.1 tests
 
@@ -486,7 +486,9 @@ as foo;
 --echo # Bug #58137 char(0) column cause:
 --echo #            my_gcvt: Assertion `width > 0 && to != ((void *)0)' failed
 --echo #
-# [RooDB-skip] Lines 524-526 skipped (unsupported feature)
+CREATE TABLE t1(a char(0));
+INSERT IGNORE INTO t1 (SELECT -pi());
+DROP TABLE t1;
 
 --echo #
 --echo # Bug #59241 invalid memory read
@@ -764,9 +766,27 @@ DROP TABLE IF EXISTS t1;
 
 # [RooDB-skip] Lines 875-884 skipped (unsupported feature)
 
-# [RooDB-skip] Lines 886-893 skipped (unsupported feature)
+# Test case for views
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES(10);
+CREATE VIEW v1 AS SELECT CRC32(a) AS my_crc FROM t1;
+SELECT * FROM v1;
+SELECT CRC32(CRC32(my_crc)) FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;
 
-# [RooDB-skip] Lines 895-906 skipped (unsupported feature)
+# Test case for triggers
+CREATE TABLE t1 (a CHAR);
+CREATE TABLE t2 (b BIGINT);
+CREATE TRIGGER trg1
+  BEFORE INSERT ON t1
+  FOR EACH ROW
+  INSERT INTO t2 VALUES(CRC32(NEW.a));
+INSERT INTO t1 VALUES('a');
+SELECT * FROM t2;
+DROP TRIGGER trg1;
+DROP TABLE t2;
+DROP TABLE t1;
 
 # [RooDB-skip] Lines 908-913 skipped (unsupported feature)
 
@@ -908,4 +928,10 @@ SELECT a, 1-a FROM t1;
 
 DROP TABLE t1;
 
-# [RooDB-skip] Lines 1250-1271 skipped (unsupported feature)
+# [RooDB-skip] Lines 1250-1265 skipped (unsupported feature)
+--echo # Bug#33142010: Failure on complex const argument to string functions
+
+CREATE VIEW v AS SELECT -(1 NOT IN (0)) AS c;
+SHOW CREATE TABLE v;
+SELECT * FROM v;
+DROP VIEW v;

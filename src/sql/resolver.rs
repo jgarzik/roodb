@@ -2649,7 +2649,15 @@ fn infer_binary_result_type(
 fn infer_unary_result_type(op: UnaryOp, expr: &ResolvedExpr) -> SqlResult<DataType> {
     match op {
         UnaryOp::Not => Ok(DataType::Boolean),
-        UnaryOp::Neg | UnaryOp::Plus => Ok(expr.data_type()),
+        UnaryOp::Neg | UnaryOp::Plus => {
+            let dt = expr.data_type();
+            // Negating a boolean produces an integer (-TRUE = -1)
+            if dt == DataType::Boolean {
+                Ok(DataType::BigInt)
+            } else {
+                Ok(dt)
+            }
+        }
         UnaryOp::BitwiseNot => Ok(DataType::BigInt),
     }
 }

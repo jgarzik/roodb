@@ -104,6 +104,7 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 /// Error codes
 pub mod codes {
     pub const ER_SYNTAX_ERROR: u16 = 1064;
+    pub const ER_PARSE_ERROR: u16 = 1064;
     pub const ER_NO_SUCH_TABLE: u16 = 1146;
     pub const ER_TABLE_EXISTS_ERROR: u16 = 1050;
     pub const ER_UNKNOWN_ERROR: u16 = 1105;

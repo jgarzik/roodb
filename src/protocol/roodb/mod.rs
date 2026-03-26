@@ -62,6 +62,13 @@ enum PlanError {
     Planner(crate::planner::PlannerError),
 }
 
+/// Info extracted from INSERT plans for trigger firing
+struct InsertTriggerInfo {
+    table_name: String,
+    column_names: Vec<String>,
+    values: Vec<Vec<crate::planner::logical::ResolvedExpr>>,
+}
+
 /// RooDB connection handler
 pub struct RooDbConnection<S>
 where
@@ -1102,6 +1109,14 @@ where
             {
                 return self.send_ok(0, 0).await;
             }
+            // CREATE TRIGGER — parsed and stored via normal pipeline
+            if upper.starts_with("CREATE TRIGGER ") {
+                return self.handle_create_trigger_sql(sql).await;
+            }
+            // DROP TRIGGER
+            if upper.starts_with("DROP TRIGGER ") {
+                return self.handle_drop_trigger_sql(sql).await;
+            }
         }
 
         // Handle INFORMATION_SCHEMA and performance_schema queries
@@ -1571,9 +1586,12 @@ where
 
             self.send_result_set(&columns, &mut *executor).await
         } else {
+            // Extract trigger info from INSERT plans before building executor
+            let insert_trigger_info = self.extract_insert_trigger_info(&plan);
+
             // DML/DDL - execute and count affected rows
             let engine = ExecutorEngine::with_raft(
-                mvcc,
+                mvcc.clone(),
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
@@ -1598,7 +1616,13 @@ where
             }
             executor.close().await?;
 
-            // Collect changes for Raft replication
+            // Fire triggers for INSERT operations
+            if let Some(ref trigger_info) = insert_trigger_info {
+                self.fire_insert_triggers(trigger_info).await?;
+            }
+
+            // Collect changes for Raft replication — includes both original INSERT
+            // and any trigger-generated changes
             let changes = executor.take_changes();
             if !changes.is_empty() {
                 if self.session.in_transaction() {
@@ -3123,14 +3147,31 @@ where
                         .await
                         .map(Some)
                 }
-                None => self
-                    .send_error(
-                        codes::ER_NO_SUCH_TABLE,
-                        states::NO_SUCH_TABLE,
-                        &format!("Table '{}' doesn't exist", table_name),
-                    )
-                    .await
-                    .map(|_| Some(())),
+                None => {
+                    // Check if it's a view
+                    let view_def = {
+                        let catalog = self.catalog.read();
+                        catalog.get_view(table_name).cloned()
+                    };
+                    if let Some(vd) = view_def {
+                        let create_view = format!(
+                            "CREATE ALGORITHM=UNDEFINED VIEW `{}` AS {}",
+                            vd.name, vd.query_sql
+                        );
+                        let rows = vec![vec![table_name.to_string(), create_view]];
+                        self.send_custom_result_set(&["View", "Create View"], &rows)
+                            .await
+                            .map(Some)
+                    } else {
+                        self.send_error(
+                            codes::ER_NO_SUCH_TABLE,
+                            states::NO_SUCH_TABLE,
+                            &format!("Table '{}' doesn't exist", table_name),
+                        )
+                        .await
+                        .map(|_| Some(()))
+                    }
+                }
             }
         }
         // SHOW KEYS FROM / SHOW INDEX FROM / SHOW INDEXES FROM
@@ -3824,6 +3865,281 @@ where
         );
 
         Ok(Some(()))
+    }
+
+    // ============ Trigger Handlers ============
+
+    /// Handle CREATE TRIGGER — parse the trigger definition and store in catalog.
+    ///
+    /// MySQL syntax: CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+    ///               ON table FOR EACH ROW body_statement
+    ///
+    /// The header is parsed by tokenizing, the body is parsed as a standalone
+    /// SQL statement via sqlparser. The body AST is stored in the catalog and
+    /// executed during DML with NEW/OLD column substitutions.
+    async fn handle_create_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
+        use crate::catalog::{TriggerDef, TriggerEvent, TriggerTiming};
+
+        let sql_clean = sql.trim().trim_end_matches(';');
+        let upper = sql_clean.to_uppercase();
+
+        // Find "FOR EACH ROW" to split header from body
+        let fer_pos = match upper.find("FOR EACH ROW") {
+            Some(p) => p,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        "CREATE TRIGGER requires FOR EACH ROW",
+                    )
+                    .await;
+            }
+        };
+
+        let header = sql_clean[..fer_pos].trim();
+        let body_sql = sql_clean[fer_pos + 12..].trim(); // 12 = "FOR EACH ROW".len()
+
+        // Parse header tokens: CREATE TRIGGER name BEFORE INSERT ON table
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        if tokens.len() < 7 {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    "Invalid CREATE TRIGGER syntax",
+                )
+                .await;
+        }
+
+        let name = tokens[2].trim_matches('`').to_string();
+        let timing_str = tokens[3].to_uppercase();
+        let event_str = tokens[4].to_uppercase();
+        let table_name = tokens[6].trim_matches('`').to_string();
+
+        let timing = match timing_str.as_str() {
+            "BEFORE" => TriggerTiming::Before,
+            "AFTER" => TriggerTiming::After,
+            _ => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Expected BEFORE or AFTER, got '{}'", timing_str),
+                    )
+                    .await;
+            }
+        };
+
+        let event = match event_str.as_str() {
+            "INSERT" => TriggerEvent::Insert,
+            "UPDATE" => TriggerEvent::Update,
+            "DELETE" => TriggerEvent::Delete,
+            _ => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Expected INSERT, UPDATE, or DELETE, got '{}'", event_str),
+                    )
+                    .await;
+            }
+        };
+
+        // Parse body as a standalone SQL statement through the full parser
+        let body = match crate::sql::Parser::parse_one(body_sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Parse error in trigger body: {}", e),
+                    )
+                    .await;
+            }
+        };
+
+        let def = TriggerDef {
+            name,
+            table_name,
+            timing,
+            event,
+            body,
+            create_sql: sql.to_string(),
+        };
+
+        {
+            let mut catalog = self.catalog.write();
+            catalog.create_trigger(def);
+        }
+
+        self.send_ok(0, 0).await
+    }
+
+    /// Handle DROP TRIGGER — parse and remove from catalog
+    async fn handle_drop_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
+        let upper = sql.to_uppercase();
+        let if_exists = upper.contains("IF EXISTS");
+
+        // Extract trigger name: DROP TRIGGER [IF EXISTS] name
+        let name_part = if if_exists {
+            sql.trim_end_matches(';')
+                .trim()
+                .rsplit("EXISTS")
+                .next()
+                .unwrap_or("")
+                .trim()
+        } else {
+            sql.trim_end_matches(';')
+                .trim()
+                .strip_prefix("DROP TRIGGER ")
+                .or_else(|| {
+                    sql.trim_end_matches(';')
+                        .trim()
+                        .strip_prefix("drop trigger ")
+                })
+                .unwrap_or("")
+                .trim()
+        };
+
+        let trigger_name = name_part.trim_matches('`').trim_matches('"');
+
+        if trigger_name.is_empty() {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    "Missing trigger name in DROP TRIGGER",
+                )
+                .await;
+        }
+
+        let result = {
+            let mut catalog = self.catalog.write();
+            catalog.drop_trigger(trigger_name)
+        };
+
+        match result {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(_) if if_exists => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_NO_SUCH_TABLE,
+                    states::NO_SUCH_TABLE,
+                    &format!("{}", e),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Extract trigger-relevant info from an INSERT physical plan.
+    /// Returns (table_name, column_names, row_values) if triggers exist.
+    fn extract_insert_trigger_info(&self, plan: &PhysicalPlan) -> Option<InsertTriggerInfo> {
+        if let PhysicalPlan::Insert {
+            table,
+            columns,
+            values,
+            ..
+        } = plan
+        {
+            // Check if any triggers exist for this table
+            let catalog = self.catalog.read();
+            let has_before = !catalog
+                .get_triggers(
+                    table,
+                    crate::catalog::TriggerTiming::Before,
+                    crate::catalog::TriggerEvent::Insert,
+                )
+                .is_empty();
+            let has_after = !catalog
+                .get_triggers(
+                    table,
+                    crate::catalog::TriggerTiming::After,
+                    crate::catalog::TriggerEvent::Insert,
+                )
+                .is_empty();
+
+            if has_before || has_after {
+                Some(InsertTriggerInfo {
+                    table_name: table.clone(),
+                    column_names: columns.iter().map(|c| c.name.clone()).collect(),
+                    values: values.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Fire INSERT triggers for each row that was inserted.
+    /// Resolves the trigger body with NEW bindings and executes through the full pipeline.
+    async fn fire_insert_triggers(&mut self, info: &InsertTriggerInfo) -> ProtocolResult<()> {
+        use crate::catalog::{TriggerEvent, TriggerTiming};
+        use crate::executor::eval::evaluate;
+        use crate::executor::row::Row;
+        use crate::executor::trigger::{datum_to_sp_value, substitute_new_refs};
+
+        // Get triggers (both BEFORE and AFTER — for now we fire both post-execution)
+        let triggers: Vec<crate::catalog::TriggerDef> = {
+            let catalog = self.catalog.read();
+            let mut trigs = Vec::new();
+            trigs.extend(
+                catalog
+                    .get_triggers(
+                        &info.table_name,
+                        TriggerTiming::Before,
+                        TriggerEvent::Insert,
+                    )
+                    .into_iter()
+                    .cloned(),
+            );
+            trigs.extend(
+                catalog
+                    .get_triggers(&info.table_name, TriggerTiming::After, TriggerEvent::Insert)
+                    .into_iter()
+                    .cloned(),
+            );
+            trigs
+        };
+
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        let empty_row = Row::empty();
+        let user_vars = self.session.user_variables();
+
+        // For each inserted row, fire all triggers
+        for value_row in &info.values {
+            // Evaluate the row expressions to get actual values
+            let mut new_values = std::collections::HashMap::new();
+            for (col_idx, expr) in value_row.iter().enumerate() {
+                if col_idx < info.column_names.len() {
+                    let datum = evaluate(expr, &empty_row, &user_vars)
+                        .unwrap_or(crate::executor::datum::Datum::Null);
+                    let sp_val = datum_to_sp_value(&datum);
+                    new_values.insert(info.column_names[col_idx].clone(), sp_val);
+                }
+            }
+
+            // Fire each trigger
+            for trigger in &triggers {
+                // Substitute NEW.col references in the trigger body
+                let substituted = substitute_new_refs(&trigger.body, &new_values);
+
+                // Execute the substituted statement through the full pipeline
+                let sql = substituted.to_string();
+                self.execute_sql_silent(&sql)
+                    .await
+                    .map_err(|e| ProtocolError::Sql(crate::sql::SqlError::InvalidOperation(e)))?;
+            }
+        }
+
+        Ok(())
     }
 
     // ============ Stored Procedure Handlers ============
