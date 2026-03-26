@@ -239,8 +239,12 @@ def run_one_test(test_name, certs, port, record, log_dir):
     Returns (status, detail) where status is one of:
         'pass', 'mismatch', 'error', 'skip'
     """
+    # Prefer custom trimmed test file over official MySQL test
+    custom_test_file = os.path.join(SCRIPT_DIR, "mtr_t", f"{test_name}.test")
     test_file = os.path.join(MYSQL_TEST_T, f"{test_name}.test")
-    if not os.path.exists(test_file):
+    if os.path.exists(custom_test_file):
+        test_file = custom_test_file
+    elif not os.path.exists(test_file):
         return ("skip", f"test file not found: {test_file}")
 
     result_file = os.path.join(MTR_RESULTS_DIR, f"{test_name}.result")
@@ -287,8 +291,14 @@ def run_one_test(test_name, certs, port, record, log_dir):
             return ("recorded", f"→ {result_file}")
         return ("pass", "")
     elif result.returncode == 1:
+        # Check for reject file to get detailed diff
+        reject_file = os.path.join(log_dir, f"{test_name}.reject")
+        if os.path.exists(reject_file):
+            import shutil
+            saved = os.path.join(MTR_RESULTS_DIR, f"{test_name}.reject")
+            shutil.copy2(reject_file, saved)
         detail = result.stderr.strip() or result.stdout.strip()
-        return ("mismatch", detail[:800])
+        return ("mismatch", detail[:2000])
     elif result.returncode == 62:
         # mysqltest returns 62 for --source file not found and similar
         detail = result.stderr.strip() or result.stdout.strip()

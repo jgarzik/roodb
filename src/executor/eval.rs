@@ -2,12 +2,35 @@
 //!
 //! Evaluates ResolvedExpr against a Row to produce a Datum.
 
+use std::cell::RefCell;
+
 use crate::planner::logical::{BinaryOp, BooleanTestType, ResolvedExpr, UnaryOp};
 use crate::server::session::UserVariables;
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
+
+// MySQL-compatible RAND() state: (seed1, seed2)
+thread_local! {
+    static RAND_STATE: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
+}
+
+/// MySQL's my_rnd() algorithm — advance state and return [0, 1) double
+fn mysql_rand_next(seed1: &mut u64, seed2: &mut u64) -> f64 {
+    const MAX_VALUE: u64 = 0x3FFFFFFF;
+    *seed1 = (*seed1 * 3 + *seed2) % MAX_VALUE;
+    *seed2 = (*seed1 + *seed2 + 33) % MAX_VALUE;
+    *seed1 as f64 / MAX_VALUE as f64
+}
+
+/// Seed MySQL RAND from integer — matches MySQL's seed_random()
+fn mysql_rand_seed(seed: u64) -> (u64, u64) {
+    const MAX_VALUE: u64 = 0x3FFFFFFF;
+    let s1 = seed.wrapping_mul(0x10001).wrapping_add(55555555);
+    let s2 = seed.wrapping_mul(0x10000001).wrapping_add(55555555);
+    (s1 % MAX_VALUE, s2 % MAX_VALUE)
+}
 
 /// Internal variable name for NO_UNSIGNED_SUBTRACTION flag (stored in UserVariables)
 const NO_UNSIGNED_SUB_VAR: &str = "__sys_no_unsigned_sub";
@@ -1293,8 +1316,27 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
     match target {
         DataType::BigInt | DataType::Int | DataType::SmallInt | DataType::TinyInt => match val {
             Datum::Int(i) => Ok(Datum::Int(*i)),
-            Datum::UnsignedInt(u) => Ok(Datum::Int(*u as i64)),
-            Datum::Float(f) => Ok(Datum::Int(*f as i64)),
+            Datum::UnsignedInt(u) => {
+                if *u > i64::MAX as u64 {
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "BIGINT value is out of range, casting {} to SIGNED",
+                        u
+                    )));
+                }
+                Ok(Datum::Int(*u as i64))
+            }
+            Datum::Float(f) => {
+                // 2^63 = 9223372036854775808.0 — exact threshold
+                const MAX_SIGNED: f64 = 9_223_372_036_854_775_808.0; // 2^63
+                const MIN_SIGNED: f64 = -9_223_372_036_854_775_808.0; // -2^63
+                if *f >= MAX_SIGNED || *f < MIN_SIGNED || f.is_nan() || f.is_infinite() {
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "BIGINT value is out of range, casting {} to SIGNED",
+                        f
+                    )));
+                }
+                Ok(Datum::Int(*f as i64))
+            }
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
             Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
             Datum::Bytes(b) => {
@@ -1672,6 +1714,32 @@ pub fn eval_function(
             }
         }
 
+        "LTRIM" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "LTRIM requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::String(s.trim_start().to_string()))
+        }
+
+        "RTRIM" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "RTRIM requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::String(s.trim_end().to_string()))
+        }
+
         "INSERT" | "_ROODB_INSERT" => {
             // INSERT(str, pos, len, newstr) — MySQL string INSERT function
             if args.len() != 4 {
@@ -1822,6 +1890,21 @@ pub fn eval_function(
             } else {
                 Ok(args[0].clone())
             }
+        }
+
+        "WEIGHT_STRING" => {
+            // WEIGHT_STRING(str) — returns binary sort key for string
+            // Stub: return the input bytes as-is for basic compatibility
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEIGHT_STRING requires at least 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::Bytes(s.into_bytes()))
         }
 
         "HEX" => {
@@ -2263,8 +2346,24 @@ pub fn eval_function(
         "PI" => Ok(Datum::Float(std::f64::consts::PI)),
 
         "RAND" => {
-            // RAND() or RAND(seed) — for determinism in tests, use simple approach
-            Ok(Datum::Float(0.0)) // TODO: actual random when not in test mode
+            // MySQL-compatible RAND([seed])
+            // RAND(NULL) seeds with 0 (same as MySQL behavior)
+            let seed_arg = if !args.is_empty() {
+                Some(args[0].as_int().unwrap_or(0) as u64)
+            } else {
+                None
+            };
+            RAND_STATE.with(|state| {
+                let mut st = state.borrow_mut();
+                if let Some(seed) = seed_arg {
+                    let (s1, s2) = mysql_rand_seed(seed);
+                    st.0 = s1;
+                    st.1 = s2;
+                }
+                let (ref mut s1, ref mut s2) = *st;
+                let result = mysql_rand_next(s1, s2);
+                Ok(Datum::Float(result))
+            })
         }
 
         "RADIANS" => {

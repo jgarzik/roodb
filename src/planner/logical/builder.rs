@@ -248,13 +248,21 @@ impl LogicalPlanBuilder {
         // 3. Apply GROUP BY / aggregates
         let has_aggregates = Self::has_aggregates(&select.columns);
         if !select.group_by.is_empty() || has_aggregates {
-            plan = Self::build_aggregate(plan, &select.group_by, &select.columns)?;
+            // Collect all aggregates from SELECT columns AND HAVING clause
+            let all_aggs = Self::collect_all_aggregates(&select.columns, select.having.as_ref());
+
+            plan = Self::build_aggregate(
+                plan,
+                &select.group_by,
+                &select.columns,
+                select.having.as_ref(),
+            )?;
 
             // After aggregation, apply HAVING (with transformed aggregates)
             if let Some(having) = select.having {
                 // Transform aggregate expressions in HAVING to column references
                 let transformed_having =
-                    Self::transform_aggregates_in_expr(&having, &select.columns, &select.group_by);
+                    Self::transform_having_expr(&having, &select.group_by, &all_aggs);
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: transformed_having,
@@ -385,17 +393,22 @@ impl LogicalPlanBuilder {
     /// Check if expression contains aggregate functions
     fn expr_has_aggregate(expr: &ResolvedExpr) -> bool {
         match expr {
-            ResolvedExpr::Function { name, .. } => {
+            ResolvedExpr::Function { name, args, .. } => {
                 let upper = name.to_uppercase();
-                matches!(
+                if matches!(
                     upper.as_str(),
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
-                )
+                ) {
+                    true
+                } else {
+                    args.iter().any(Self::expr_has_aggregate)
+                }
             }
             ResolvedExpr::BinaryOp { left, right, .. } => {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Cast { expr, .. } => Self::expr_has_aggregate(expr),
             _ => false,
         }
     }
@@ -405,6 +418,7 @@ impl LogicalPlanBuilder {
         input: LogicalPlan,
         group_by: &[ResolvedExpr],
         columns: &[ResolvedSelectItem],
+        having: Option<&ResolvedExpr>,
     ) -> PlannerResult<LogicalPlan> {
         let mut aggregates: Vec<(AggregateFunc, String)> = Vec::new();
 
@@ -414,6 +428,12 @@ impl LogicalPlanBuilder {
             if let ResolvedSelectItem::Expr { expr, alias } = item {
                 Self::collect_aggregates(expr, idx, alias.as_deref(), &mut aggregates);
             }
+        }
+
+        // Also collect aggregates from HAVING clause
+        if let Some(having_expr) = having {
+            let next_idx = columns.len();
+            Self::collect_aggregates(having_expr, next_idx, None, &mut aggregates);
         }
 
         Ok(LogicalPlan::Aggregate {
@@ -643,6 +663,20 @@ impl LogicalPlanBuilder {
                 expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
                 target_type: target_type.clone(),
             },
+            ResolvedExpr::Function {
+                name,
+                args,
+                distinct,
+                result_type,
+            } => ResolvedExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::rewrite_agg_refs(a, group_by_len, all_aggs))
+                    .collect(),
+                distinct: *distinct,
+                result_type: result_type.clone(),
+            },
             // For other expression types (Column, Literal, etc.), pass through
             other => other.clone(),
         }
@@ -765,53 +799,72 @@ impl LogicalPlanBuilder {
         }
     }
 
-    /// Transform aggregate expressions in an expression tree to column references
-    /// Used for HAVING clauses where aggregates need to reference aggregate output
-    fn transform_aggregates_in_expr(
-        expr: &ResolvedExpr,
+    /// Collect all aggregates from SELECT columns and HAVING clause
+    fn collect_all_aggregates(
         columns: &[ResolvedSelectItem],
-        group_by: &[ResolvedExpr],
-    ) -> ResolvedExpr {
-        match expr {
-            ResolvedExpr::Function { name, args, .. } => {
-                let upper = name.to_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
-                ) {
-                    // This is an aggregate function - find its index in the aggregate output
-                    if let Some(agg_idx) = Self::find_aggregate_index(expr, columns) {
-                        let col_idx = group_by.len() + agg_idx;
-                        let result_type = Self::get_aggregate_result_type(expr);
-                        return ResolvedExpr::Column(ResolvedColumn {
-                            table: String::new(),
-                            name: upper,
-                            index: col_idx,
-                            data_type: result_type,
-                            nullable: true,
-                        });
-                    }
-                }
-                // Non-aggregate function - transform arguments
-                ResolvedExpr::Function {
-                    name: name.clone(),
-                    args: args
-                        .iter()
-                        .map(|a| Self::transform_aggregates_in_expr(a, columns, group_by))
-                        .collect(),
-                    distinct: false,
-                    result_type: Self::get_expr_type(expr),
-                }
+        having: Option<&ResolvedExpr>,
+    ) -> Vec<(AggregateFunc, String)> {
+        let mut aggs = Vec::new();
+        for (idx, item) in columns.iter().enumerate() {
+            if let ResolvedSelectItem::Expr { expr, alias } = item {
+                Self::collect_aggregates(expr, idx, alias.as_deref(), &mut aggs);
             }
+        }
+        if let Some(having_expr) = having {
+            let next_idx = columns.len();
+            Self::collect_aggregates(having_expr, next_idx, None, &mut aggs);
+        }
+        aggs
+    }
+
+    /// Transform HAVING expression using the full aggregates list
+    fn transform_having_expr(
+        expr: &ResolvedExpr,
+        group_by: &[ResolvedExpr],
+        all_aggs: &[(AggregateFunc, String)],
+    ) -> ResolvedExpr {
+        // Check if this expression is a direct aggregate
+        if let Some(agg) = Self::extract_aggregate(expr) {
+            if let Some(pos) = all_aggs
+                .iter()
+                .position(|(a, _)| Self::aggregates_match_func(a, &agg))
+            {
+                let col_idx = group_by.len() + pos;
+                let result_type = Self::get_aggregate_result_type(expr);
+                return ResolvedExpr::Column(ResolvedColumn {
+                    table: String::new(),
+                    name: all_aggs[pos].1.clone(),
+                    index: col_idx,
+                    data_type: result_type,
+                    nullable: true,
+                });
+            }
+        }
+        // Recurse into sub-expressions
+        match expr {
+            ResolvedExpr::Function {
+                name,
+                args,
+                distinct,
+                result_type,
+            } => ResolvedExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::transform_having_expr(a, group_by, all_aggs))
+                    .collect(),
+                distinct: *distinct,
+                result_type: result_type.clone(),
+            },
             ResolvedExpr::BinaryOp {
                 left,
                 op,
                 right,
                 result_type,
             } => ResolvedExpr::BinaryOp {
-                left: Box::new(Self::transform_aggregates_in_expr(left, columns, group_by)),
+                left: Box::new(Self::transform_having_expr(left, group_by, all_aggs)),
                 op: *op,
-                right: Box::new(Self::transform_aggregates_in_expr(right, columns, group_by)),
+                right: Box::new(Self::transform_having_expr(right, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::UnaryOp {
@@ -820,11 +873,10 @@ impl LogicalPlanBuilder {
                 result_type,
             } => ResolvedExpr::UnaryOp {
                 op: *op,
-                expr: Box::new(Self::transform_aggregates_in_expr(inner, columns, group_by)),
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::Column(col) => {
-                // Check if this column is in the group-by list
                 if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
                     ResolvedExpr::Column(ResolvedColumn {
                         table: String::new(),
@@ -837,28 +889,8 @@ impl LogicalPlanBuilder {
                     expr.clone()
                 }
             }
-            // Other expressions pass through unchanged
-            _ => expr.clone(),
+            other => other.clone(),
         }
-    }
-
-    /// Find the index of an aggregate function in the SELECT list
-    fn find_aggregate_index(
-        target: &ResolvedExpr,
-        columns: &[ResolvedSelectItem],
-    ) -> Option<usize> {
-        let mut agg_idx = 0usize;
-        for item in columns {
-            if let ResolvedSelectItem::Expr { expr, .. } = item {
-                if Self::expr_has_aggregate(expr) {
-                    if Self::aggregates_match(target, expr) {
-                        return Some(agg_idx);
-                    }
-                    agg_idx += 1;
-                }
-            }
-        }
-        None
     }
 
     /// Check if two aggregate expressions match (same function and arguments)

@@ -2530,6 +2530,11 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
             let bytes = hex_decode(s).unwrap_or_default();
             Ok(Literal::Blob(bytes))
         }
+        sp::Value::SingleQuotedByteStringLiteral(s) => {
+            // B'10101' — binary bit string literal, convert to integer
+            let val = u64::from_str_radix(s, 2).unwrap_or(0);
+            Ok(Literal::UnsignedInteger(val))
+        }
         _ => Err(SqlError::Unsupported(format!("Value: {:?}", val))),
     }
 }
@@ -2715,6 +2720,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         }
         "FORMAT" => Ok(DataType::Text),
         "SHA" | "SHA1" | "SHA2" | "MD5" => Ok(DataType::Text),
+        "WEIGHT_STRING" => Ok(DataType::Blob),
         "CRC32" => Ok(DataType::BigInt),
         "CONNECTION_ID" | "LAST_INSERT_ID" => Ok(DataType::BigInt),
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" | "VERSION" | "DATABASE"
