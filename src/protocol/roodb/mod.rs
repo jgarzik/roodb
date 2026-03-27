@@ -5265,6 +5265,11 @@ where
     /// Uses execute_select_buffered to get rows, then manually sends the result set
     /// with SERVER_MORE_RESULTS_EXISTS flag (in_multi_result is set by handle_call).
     async fn execute_sp_select(&mut self, sql: &str) -> ProtocolResult<()> {
+        // First result set starts at sequence 1 (command was 0);
+        // subsequent result sets continue from where the previous left off
+        if !self.sp_sent_results {
+            self.writer.set_sequence(1);
+        }
         self.sp_sent_results = true;
         // Buffer all rows first
         let rows = self
@@ -5275,7 +5280,7 @@ where
         // Determine column info from first row or query
         let col_count = rows.first().map_or(0, |r| r.len());
 
-        // Send column count — DON'T reset sequence! Multi-result shares one continuous sequence
+        // Send column count
         let count_packet = encode_column_count(col_count as u64);
         self.writer.write_packet(&count_packet).await?;
 
