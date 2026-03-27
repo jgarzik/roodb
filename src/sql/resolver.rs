@@ -929,36 +929,41 @@ impl<'a> Resolver<'a> {
                     .transpose()?;
 
                 // Resolve GROUP BY — MySQL allows referencing SELECT aliases in GROUP BY
+                // When a name matches both a table column AND a SELECT alias,
+                // MySQL uses the alias and emits warning 1052 (ambiguous column).
                 let mut resolved_group_by = Vec::new();
                 match &select.group_by {
                     sp::GroupByExpr::Expressions(exprs, _) => {
                         for expr in exprs {
-                            // Try resolving against table scope first
+                            // For simple identifiers, check SELECT aliases first (MySQL behavior)
+                            if let sp::Expr::Identifier(ident) = expr {
+                                let name = &ident.value;
+                                let mut alias_match = None;
+                                for item in &resolved_columns {
+                                    if let ResolvedSelectItem::Expr {
+                                        expr: resolved_expr,
+                                        alias: Some(a),
+                                    } = item
+                                    {
+                                        if a.eq_ignore_ascii_case(name) {
+                                            alias_match = Some(resolved_expr.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(alias_expr) = alias_match {
+                                    resolved_group_by.push(alias_expr);
+                                    continue;
+                                }
+                            }
+                            // Fall back to table scope resolution
                             match self.resolve_expr(expr, &scope) {
                                 Ok(resolved) => resolved_group_by.push(resolved),
                                 Err(SqlError::ColumnNotFound(_)) => {
                                     // Column not in table scope — check SELECT aliases
                                     if let sp::Expr::Identifier(ident) = expr {
                                         let alias_name = &ident.value;
-                                        let mut found = false;
-                                        for item in &resolved_columns {
-                                            if let ResolvedSelectItem::Expr {
-                                                expr: resolved_expr,
-                                                alias: Some(a),
-                                            } = item
-                                            {
-                                                if a.eq_ignore_ascii_case(alias_name) {
-                                                    resolved_group_by.push(resolved_expr.clone());
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if !found {
-                                            return Err(SqlError::ColumnNotFound(
-                                                alias_name.clone(),
-                                            ));
-                                        }
+                                        return Err(SqlError::ColumnNotFound(alias_name.clone()));
                                     } else {
                                         return Err(SqlError::ColumnNotFound(expr.to_string()));
                                     }

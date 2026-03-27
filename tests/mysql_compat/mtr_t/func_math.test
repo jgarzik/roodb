@@ -1091,7 +1091,7 @@ SELECT a, 1-a FROM t1;
 
 DROP TABLE t1;
 
-# [RooDB-skip] Lines 1250-1259 skipped (DIV on float/GROUP BY alias issue)
+# [RooDB-skip] Lines 1250-1259 skipped (sqlparser: DIV has lower precedence than / — MySQL treats them equally)
 
 --echo # Bug#32863037: Assertion `scale >= 0 && precision > 0 &&
 --echo #               scale <= precision' failed
