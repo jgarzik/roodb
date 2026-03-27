@@ -100,6 +100,10 @@ where
     txn_manager: Arc<TransactionManager>,
     /// Raft node for consensus
     raft_node: Arc<RaftNode>,
+    /// Whether we're inside a stored procedure (multi-result-set mode)
+    in_multi_result: bool,
+    /// Whether any result sets were sent during current SP execution
+    sp_sent_results: bool,
     /// Prepared statement manager (per-connection)
     prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
@@ -137,6 +141,8 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            in_multi_result: false,
+            sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
@@ -176,6 +182,8 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            in_multi_result: false,
+            sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
@@ -1759,12 +1767,17 @@ where
             return Ok(());
         }
 
-        // Send final EOF/OK
+        // Send final EOF/OK — with SERVER_MORE_RESULTS_EXISTS if in multi-result-set
+        let status = if self.in_multi_result {
+            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
+        } else {
+            default_status()
+        };
         if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
+            let ok = encode_eof_ok_packet(status, 0);
             self.writer.write_packet(&ok).await?;
         } else {
-            let eof = encode_eof_packet(0, default_status());
+            let eof = encode_eof_packet(0, status);
             self.writer.write_packet(&eof).await?;
         }
 
@@ -4582,13 +4595,18 @@ where
                     .await;
             }
         };
-        // Execute the body
-        match self
+        // Execute the body with multi-result-set mode if client supports it
+        let client_multi =
+            self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
+        self.in_multi_result = client_multi;
+        let body_result = self
             .execute_procedure_body_with_handlers(&body_stmts, &mut ctx, &handlers)
-            .await
-        {
+            .await;
+
+        match body_result {
             Ok(_) => {}
             Err(e) => {
+                self.in_multi_result = false;
                 return self
                     .send_error(
                         codes::ER_UNKNOWN_ERROR,
@@ -4602,7 +4620,20 @@ where
         // Propagate OUT/INOUT params back to user variables
         propagate_out_params(&proc_def, call_args, &ctx, &user_vars);
 
-        self.send_ok(ctx.rows_affected, 0).await
+        // Send final OK
+        let sent_results = self.sp_sent_results;
+        self.in_multi_result = false;
+        self.sp_sent_results = false;
+        if sent_results {
+            // Multi-result: don't reset sequence — continue from result set
+            let packet = encode_ok_packet(ctx.rows_affected, 0, default_status(), 0);
+            self.writer.write_packet(&packet).await?;
+            self.writer.flush().await?;
+            Ok(())
+        } else {
+            // No result sets sent: standard OK with sequence reset
+            self.send_ok(ctx.rows_affected, 0).await
+        }
     }
 
     /// Parse procedure body SQL into Vec<Statement>.
@@ -5174,6 +5205,25 @@ where
                 }
 
                 let substituted = self.substitute_locals(&sql, ctx);
+
+                // SELECT and SHOW statements in SP body send results to client
+                // (only if client supports CLIENT_MULTI_RESULTS protocol flag)
+                let upper = substituted.trim().to_uppercase();
+                let client_multi =
+                    self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
+                if client_multi && (upper.starts_with("SELECT ") || upper.starts_with("SHOW ")) {
+                    if upper.starts_with("SHOW ") {
+                        if let Err(e) = self.handle_query(&substituted).await {
+                            return Err(format!("{}", e));
+                        }
+                    } else {
+                        self.execute_sp_select(&substituted)
+                            .await
+                            .map_err(|e| format!("{}", e))?;
+                    }
+                    return Ok(ProcControlFlow::Continue);
+                }
+
                 let affected = self.execute_sql_silent(&substituted).await?;
                 ctx.rows_affected += affected;
                 Ok(ProcControlFlow::Continue)
@@ -5215,6 +5265,102 @@ where
             result = result.replace(name, &val.to_sql_literal());
         }
         result
+    }
+
+    /// Execute a SELECT inside a stored procedure and send the result set to the client.
+    /// Uses execute_select_buffered to get rows, then manually sends the result set
+    /// with SERVER_MORE_RESULTS_EXISTS flag (in_multi_result is set by handle_call).
+    async fn execute_sp_select(&mut self, sql: &str) -> ProtocolResult<()> {
+        self.sp_sent_results = true;
+        // Buffer all rows first
+        let rows = self
+            .execute_select_buffered(sql)
+            .await
+            .map_err(|e| ProtocolError::Unsupported(format!("SP SELECT failed: {}", e)))?;
+
+        // Determine column info from first row or query
+        let col_count = rows.first().map_or(0, |r| r.len());
+
+        // Send column count
+        self.writer.set_sequence(1);
+        let count_packet = encode_column_count(col_count as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        // Send column definitions (minimal — name from SELECT expression)
+        let col_names = Self::extract_select_column_names(sql, col_count);
+        let schema = self.database.as_deref().unwrap_or("test");
+        for name in &col_names {
+            let def = ColumnDefinition41 {
+                catalog: "def".to_string(),
+                schema: schema.to_string(),
+                table: String::new(),
+                org_table: String::new(),
+                name: name.clone(),
+                org_name: name.clone(),
+                character_set: 63,
+                column_length: 255,
+                column_type: types::ColumnType::Varchar,
+                flags: 0,
+                decimals: 0,
+            };
+            let def_packet = def.encode();
+            self.writer.write_packet(&def_packet).await?;
+        }
+
+        // Send EOF after columns
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        // Send rows
+        for row in &rows {
+            let row_packet = encode_text_row(row);
+            self.writer.write_packet(&row_packet).await?;
+        }
+
+        // Send final EOF with SERVER_MORE_RESULTS_EXISTS
+        let status = if self.in_multi_result {
+            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
+        } else {
+            default_status()
+        };
+        if self.deprecate_eof {
+            let ok = encode_eof_ok_packet(status, 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, status);
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Extract column names from a SELECT statement (best-effort)
+    fn extract_select_column_names(sql: &str, count: usize) -> Vec<String> {
+        // Try parsing the SELECT to get column names
+        if let Ok(sqlparser::ast::Statement::Query(q)) =
+            crate::sql::parser::Parser::parse_one(sql).as_ref()
+        {
+            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                let mut names = Vec::new();
+                for item in &sel.projection {
+                    let name = match item {
+                        sqlparser::ast::SelectItem::UnnamedExpr(e) => e.to_string(),
+                        sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
+                            alias.value.clone()
+                        }
+                        _ => "?column?".to_string(),
+                    };
+                    names.push(name);
+                }
+                if names.len() == count {
+                    return names;
+                }
+            }
+        }
+        (0..count).map(|i| format!("col{}", i)).collect()
     }
 
     /// Handle `SELECT expr INTO var [FROM ...]` in a stored procedure context.
