@@ -1748,8 +1748,14 @@ where
 
         // If an error occurred during row streaming, send ERR packet instead of EOF
         if let Some(e) = row_error {
-            let err_packet =
-                encode_err_packet(codes::ER_DATA_OUT_OF_RANGE, "22003", &e.to_string());
+            let msg = e.to_string();
+            let (code, state) =
+                if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
+                    (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
+                } else {
+                    (codes::ER_DATA_OUT_OF_RANGE, "22003")
+                };
+            let err_packet = encode_err_packet(code, state, &msg);
             self.writer.write_packet(&err_packet).await?;
             self.writer.flush().await?;
             executor.close().await?;
@@ -5468,6 +5474,16 @@ where
                         "2201E",
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::InvalidOperation(ref msg) = exec_err {
+                    let code =
+                        if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
+                            codes::ER_WRONG_ARGUMENTS
+                        } else if msg.contains("cannot be NULL") {
+                            codes::ER_BAD_NULL_ERROR
+                        } else {
+                            codes::ER_UNKNOWN_ERROR
+                        };
+                    (code, states::GENERAL_ERROR, exec_err.to_string())
                 } else {
                     (
                         codes::ER_UNKNOWN_ERROR,

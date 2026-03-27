@@ -313,6 +313,32 @@ fn eval_binary_op_ex(
     vars: Option<&UserVariables>,
 ) -> ExecutorResult<Datum> {
     // Handle NULL propagation for most operations
+    // Geometry in arithmetic/DIV is always an error (MySQL: "Incorrect arguments to ...")
+    if matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::IntDiv
+    ) && (matches!(left, Datum::Geometry(_)) || matches!(right, Datum::Geometry(_)))
+    {
+        let op_name = match op {
+            BinaryOp::IntDiv => "DIV",
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "MOD",
+            _ => "operator",
+        };
+        return Err(ExecutorError::InvalidOperation(format!(
+            "Incorrect arguments to {}",
+            op_name
+        )));
+    }
+
     if matches!(
         op,
         BinaryOp::Add
@@ -3609,6 +3635,33 @@ pub fn eval_function(
                     "Invalid WKT: {}",
                     e
                 ))),
+            }
+        }
+
+        // WKB (Well-Known Binary) constructors — accept binary input, return Geometry
+        "ST_GEOMFROMWKB"
+        | "ST_GEOMETRYFROMWKB"
+        | "ST_LINESTRINGFROMWKB"
+        | "ST_POINTFROMWKB"
+        | "ST_POLYFROMWKB"
+        | "ST_POLYGONFROMWKB" => {
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires at least 1 argument",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match &args[0] {
+                Datum::Bytes(b) | Datum::Geometry(b) => Ok(Datum::Geometry(b.clone())),
+                // MySQL accepts non-binary args and returns a geometry (which then
+                // fails in arithmetic operators like DIV)
+                _ => {
+                    let bytes = args[0].to_display_string().into_bytes();
+                    Ok(Datum::Geometry(bytes))
+                }
             }
         }
 
