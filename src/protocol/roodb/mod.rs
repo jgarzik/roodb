@@ -1059,6 +1059,26 @@ where
             return Ok(());
         }
 
+        // Handle CREATE FUNCTION and DROP FUNCTION via text intercept
+        // (MySQL CREATE FUNCTION with BEGIN/END body doesn't parse cleanly in sqlparser)
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("DROP FUNCTION ") {
+                let rest = sql.trim()[14..].trim().trim_end_matches(';').trim();
+                let (if_exists, name) = if rest.to_uppercase().starts_with("IF EXISTS ") {
+                    (true, rest[10..].trim())
+                } else {
+                    (false, rest)
+                };
+                return self
+                    .handle_drop_procedure(&name.to_lowercase(), if_exists)
+                    .await;
+            }
+            if upper.starts_with("CREATE FUNCTION ") {
+                return self.handle_create_function_text(sql).await;
+            }
+        }
+
         // Handle CREATE TEMPORARY TABLE
         if let Some(()) = self.try_handle_create_temporary_table(sql).await? {
             return Ok(());
@@ -1197,6 +1217,7 @@ where
                 names: Vec<String>,
                 if_exists: bool,
             },
+            // CreateFunc handled via text intercept
             Call(sqlparser::ast::Function),
             Continue(Box<sqlparser::ast::Statement>),
         }
@@ -1239,6 +1260,7 @@ where
                         if_exists,
                     }
                 }
+                // CREATE FUNCTION handled via text intercept above
                 S::Call(func) => Intercept::Call(func),
                 other => Intercept::Continue(Box::new(other)),
             }
@@ -1254,6 +1276,7 @@ where
             Intercept::DropProc { name, if_exists } => {
                 return self.handle_drop_procedure(&name, if_exists).await;
             }
+            // CreateFunc handled via text intercept before parsing
             Intercept::CreateViewRaft {
                 name,
                 query_sql,
@@ -4436,6 +4459,7 @@ where
             name: proc_name.clone(),
             params: our_params,
             body_sql,
+            returns_type: None,
         };
 
         // Write to system.procedures via Raft
@@ -4466,7 +4490,97 @@ where
         }
     }
 
-    /// Handle DROP PROCEDURE statement
+    /// Handle CREATE FUNCTION via text parsing (MySQL syntax with BEGIN/END body)
+    async fn handle_create_function_text(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse: CREATE FUNCTION name(params) RETURNS type BEGIN ... END
+        let re = regex::Regex::new(
+            r"(?is)CREATE\s+FUNCTION\s+(\w+)\s*\(([^)]*)\)\s+RETURNS\s+(\w+)\s+(BEGIN\b.+\bEND)",
+        )
+        .unwrap();
+
+        let caps = match re.captures(sql) {
+            Some(c) => c,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        "Failed to parse CREATE FUNCTION",
+                    )
+                    .await;
+            }
+        };
+
+        let func_name = caps.get(1).unwrap().as_str().to_lowercase();
+        let params_str = caps.get(2).unwrap().as_str();
+        let returns_type = caps.get(3).unwrap().as_str().to_string();
+        let body_sql = caps.get(4).unwrap().as_str().to_string();
+
+        // Parse parameters: "inputvar CHAR, ..."
+        let our_params: Vec<ProcedureParam> = params_str
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let parts: Vec<&str> = s.trim().splitn(2, char::is_whitespace).collect();
+                ProcedureParam {
+                    name: parts.first().unwrap_or(&"").to_lowercase(),
+                    data_type: parts.get(1).unwrap_or(&"VARCHAR").to_string(),
+                    mode: ParamMode::In,
+                }
+            })
+            .collect();
+
+        let proc_def = ProcedureDef {
+            name: func_name.clone(),
+            params: our_params,
+            body_sql: body_sql.clone(),
+            returns_type: Some(returns_type),
+        };
+
+        // Store via Raft (reuse procedure storage)
+        use crate::catalog::system_tables::procedure_def_to_row;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::raft::RowChange;
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let row_id = encode_row_id(local_id, node_id);
+        let proc_row = procedure_def_to_row(&proc_def);
+        let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
+        let value = encode_row(&proc_row);
+
+        let change = RowChange::insert(SYSTEM_PROCEDURES, key, value);
+        let changeset = ChangeSet::new_with_changes(0, vec![change]);
+        self.raft_node
+            .propose_changes(changeset)
+            .await
+            .map_err(|e| ProtocolError::Unsupported(format!("Failed to create function: {}", e)))?;
+
+        // Register in catalog
+        let param_names: String = proc_def
+            .params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        {
+            let mut catalog = self.catalog.write();
+            catalog.register_procedure(proc_def);
+        }
+
+        // Register UDF in user_variables so eval_function can find it
+        {
+            let udf_key = format!("__udf_{}", func_name);
+            let params_key = format!("__udf_{}_params", func_name);
+            let vars = self.session.user_variables();
+            let mut w = vars.write();
+            w.insert(udf_key, Datum::String(body_sql));
+            w.insert(params_key, Datum::String(param_names));
+        }
+
+        self.send_ok(0, 0).await
+    }
+
     async fn handle_drop_procedure(
         &mut self,
         proc_name: &str,

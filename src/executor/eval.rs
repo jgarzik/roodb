@@ -3845,10 +3845,17 @@ pub fn eval_function(
 
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
-        _ => Err(ExecutorError::InvalidOperation(format!(
-            "unknown function: {}",
-            name
-        ))),
+
+        // Check for user-defined functions via __udf_NAME in user variables
+        _ => {
+            if let Some(udf_result) = try_eval_udf(&name_upper, args, vars) {
+                return udf_result;
+            }
+            Err(ExecutorError::InvalidOperation(format!(
+                "unknown function: {}",
+                name
+            )))
+        }
     }
 }
 
@@ -4611,6 +4618,171 @@ fn months_to_period(months: i64) -> i64 {
 }
 
 // ── End date/time infrastructure ──────────────────────────────────────
+
+/// Try to evaluate a user-defined function (UDF) stored in user variables.
+/// UDFs are registered as `__udf_NAME` = body_sql and `__udf_NAME_params` = param_names
+fn try_eval_udf(
+    name: &str,
+    args: &[Datum],
+    vars: Option<&UserVariables>,
+) -> Option<ExecutorResult<Datum>> {
+    let vars = vars?;
+    let udf_key = format!("__udf_{}", name.to_lowercase());
+
+    // Look up UDF body and params from user variables
+    let (body_sql, param_names) = {
+        let r = vars.read();
+        let body = match r.get(&udf_key) {
+            Some(Datum::String(s)) => s.clone(),
+            _ => return None,
+        };
+        let params_key = format!("{}_params", udf_key);
+        let params = match r.get(&params_key) {
+            Some(Datum::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        (body, params)
+    };
+
+    // Build a mini procedure context with args bound to param names
+    let param_list: Vec<&str> = if param_names.is_empty() {
+        vec![]
+    } else {
+        param_names.split(',').collect()
+    };
+
+    let mut ctx = crate::executor::procedure::ProcedureContext {
+        locals: std::collections::HashMap::new(),
+        cursors: std::collections::HashMap::new(),
+        found: false,
+        rows_affected: 0,
+    };
+
+    for (i, pname) in param_list.iter().enumerate() {
+        let val = args.get(i).cloned().unwrap_or(Datum::Null);
+        ctx.locals.insert(pname.trim().to_string(), val);
+    }
+
+    // Parse and execute the body statements
+    // Execute the body statements by splitting on ';' and processing each
+    let trimmed = body_sql.trim();
+    let upper = trimmed.to_uppercase();
+    let inner_body = if upper.starts_with("BEGIN") && upper.ends_with("END") {
+        trimmed[5..trimmed.len() - 3].trim()
+    } else {
+        trimmed
+    };
+
+    // Split body into statements and process each
+    let into_re = regex::Regex::new(r"(?i)\bINTO\s+(\w+)").ok()?;
+    for raw_stmt in inner_body.split(';') {
+        let stmt_text = raw_stmt.trim();
+        if stmt_text.is_empty() {
+            continue;
+        }
+        let stmt_upper = stmt_text.to_uppercase();
+
+        // DECLARE var TYPE → SET var = NULL
+        if stmt_upper.starts_with("DECLARE ") {
+            let parts: Vec<&str> = stmt_text.splitn(3, char::is_whitespace).collect();
+            if let Some(var_name) = parts.get(1) {
+                ctx.locals.insert(var_name.to_lowercase(), Datum::Null);
+            }
+            continue;
+        }
+
+        // SET var = expr
+        if stmt_upper.starts_with("SET ") {
+            let rest = stmt_text[4..].trim();
+            if let Some(eq_pos) = rest.find('=') {
+                let var_name = rest[..eq_pos].trim().to_lowercase();
+                let expr_text = rest[eq_pos + 1..].trim();
+                // Substitute locals in expression
+                let subst = substitute_locals_in_sql(expr_text, &ctx);
+                if let Some(val) = eval_sql_expr_in_sp_context(&subst, &ctx, vars) {
+                    ctx.locals.insert(var_name, val);
+                }
+            }
+            continue;
+        }
+
+        // RETURN expr
+        if stmt_upper.starts_with("RETURN ") {
+            let expr_text = stmt_text[7..].trim();
+            let subst = substitute_locals_in_sql(expr_text, &ctx);
+            if let Some(val) = eval_sql_expr_in_sp_context(&subst, &ctx, vars) {
+                return Some(Ok(val));
+            }
+            continue;
+        }
+
+        // SELECT ... INTO var
+        if stmt_upper.starts_with("SELECT ") {
+            if let Some(caps) = into_re.captures(stmt_text) {
+                let var_name = caps.get(1)?.as_str().to_lowercase();
+                let into_match = caps.get(0)?;
+                let select_sql = format!(
+                    "{}{}",
+                    &stmt_text[..into_match.start()],
+                    &stmt_text[into_match.end()..]
+                );
+                let subst = substitute_locals_in_sql(&select_sql, &ctx);
+                // The select_sql is already a full SELECT, no need to wrap
+                if let Ok(sqlparser::ast::Statement::Query(q)) =
+                    crate::sql::Parser::parse_one(&subst).as_ref()
+                {
+                    if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                        if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+                            sel.projection.first()
+                        {
+                            if let Ok(val) =
+                                crate::executor::procedure::eval_sp_expr(expr, &ctx, vars)
+                            {
+                                ctx.locals.insert(var_name, val);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    // If no explicit RETURN, return NULL
+    Some(Ok(Datum::Null))
+}
+
+/// Parse a SQL expression from "SELECT expr" and evaluate it in procedure context
+fn eval_sql_expr_in_sp_context(
+    expr_sql: &str,
+    ctx: &crate::executor::procedure::ProcedureContext,
+    vars: &UserVariables,
+) -> Option<Datum> {
+    if let Ok(sqlparser::ast::Statement::Query(q)) =
+        crate::sql::Parser::parse_one(&format!("SELECT {}", expr_sql)).as_ref()
+    {
+        if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) = sel.projection.first() {
+                return crate::executor::procedure::eval_sp_expr(expr, ctx, vars).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Substitute local variable names in SQL text with their values
+fn substitute_locals_in_sql(
+    sql: &str,
+    ctx: &crate::executor::procedure::ProcedureContext,
+) -> String {
+    let mut result = sql.to_string();
+    let mut vars: Vec<(&String, &Datum)> = ctx.locals.iter().collect();
+    vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (name, val) in vars {
+        result = result.replace(name.as_str(), &val.to_sql_literal());
+    }
+    result
+}
 
 /// Convert an i128 decimal integer result to the best-fitting Datum type.
 /// Values in i64 range → Int, values in u64 range → UnsignedInt,

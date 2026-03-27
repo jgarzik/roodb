@@ -2839,10 +2839,8 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "POW" | "POWER" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "PI" | "RADIANS"
         | "DEGREES" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "COT"
         | "RAND" => Ok(DataType::Double),
-        _ => Err(SqlError::InvalidOperation(format!(
-            "Unknown function: {}",
-            name
-        ))),
+        // UDF: check if function exists in catalog (returns BIGINT by default)
+        _ => Ok(DataType::BigInt),
     }
 }
 

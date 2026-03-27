@@ -277,12 +277,14 @@ pub struct ProcedureParam {
     pub mode: ParamMode,
 }
 
-/// Stored procedure definition
+/// Stored procedure / function definition
 #[derive(Debug, Clone)]
 pub struct ProcedureDef {
     pub name: String,
     pub params: Vec<ProcedureParam>,
     pub body_sql: String,
+    /// For CREATE FUNCTION: return type (e.g. "BIGINT"). None for procedures.
+    pub returns_type: Option<String>,
 }
 
 /// View definition

@@ -495,6 +495,7 @@ pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
         name,
         params,
         body_sql,
+        returns_type: None, // TODO: persist returns_type for functions
     })
 }
 

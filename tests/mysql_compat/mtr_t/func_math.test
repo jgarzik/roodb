@@ -906,7 +906,17 @@ SELECT @val;
 DROP PROCEDURE crc32_proc;
 
 # Test case for a user defined function
-# [RooDB-skip] Lines 916-926 skipped (unsupported feature)
+DELIMITER |;
+CREATE FUNCTION crc32_func(inputvar CHAR)
+RETURNS BIGINT
+BEGIN
+  DECLARE crcval BIGINT;
+  SELECT CRC32(inputvar) INTO crcval;
+  RETURN crcval;
+END|
+DELIMITER ;|
+SELECT crc32_func('a');
+DROP FUNCTION crc32_func;
 
 # Test case for a prepared statement
 PREPARE stmt1 FROM 'SELECT CRC32(?)';

@@ -1186,6 +1186,17 @@ SELECT @val;
 @val
 3904355907
 DROP PROCEDURE crc32_proc;
+CREATE FUNCTION crc32_func(inputvar CHAR)
+RETURNS BIGINT
+BEGIN
+DECLARE crcval BIGINT;
+SELECT CRC32(inputvar) INTO crcval;
+RETURN crcval;
+END|
+SELECT crc32_func('a');
+CRC32_FUNC('a')
+3904355907
+DROP FUNCTION crc32_func;
 PREPARE stmt1 FROM 'SELECT CRC32(?)';
 SET @val = 'a';
 EXECUTE stmt1 USING @val;
