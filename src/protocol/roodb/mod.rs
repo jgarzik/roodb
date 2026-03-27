@@ -4864,9 +4864,12 @@ where
         let mut ctx = match build_procedure_context(&proc_def, call_args, &user_vars) {
             Ok(c) => c,
             Err(e) => {
-                return self
-                    .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e)
-                    .await;
+                let code = if e.contains("Out of range value") {
+                    codes::ER_WARN_DATA_OUT_OF_RANGE
+                } else {
+                    codes::ER_UNKNOWN_ERROR
+                };
+                return self.send_error(code, "22003", &e).await;
             }
         };
 

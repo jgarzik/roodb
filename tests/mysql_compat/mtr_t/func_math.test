@@ -1133,7 +1133,8 @@ CALL test_round(-123456);
 CALL test_round(-9223372036854775807);
 CALL test_round(-9223372036854775808);
 CALL test_round(9223372036854775807);
-# [RooDB-skip] CALL test_round(9223372036854775808) — BIGINT param wraps instead of erroring
+--error ER_WARN_DATA_OUT_OF_RANGE
+CALL test_round(9223372036854775808);
 
 CALL test_round_unsigned(9223372036854775807);
 CALL test_round_unsigned(9223372036854775808);
@@ -1223,7 +1224,16 @@ SELECT a, 1-a FROM t1;
 
 DROP TABLE t1;
 
-# [RooDB-skip] Lines 1250-1259 skipped (sqlparser: DIV has lower precedence than / — MySQL treats them equally)
+--echo # Bug#31641064: Decimal returned function value overflow with GROUP BY
+
+CREATE TABLE t1(c1 INTEGER, c2 INTEGER);
+INSERT INTO t1 VALUES(97, 1);
+SET SQL_MODE='';
+SELECT 27 DIV (c2/c1) / 17 AS c1 FROM t1 GROUP BY c1;
+SELECT 27 DIV CAST(c2/c1 AS CHAR) / 17 AS c1 FROM t1 GROUP BY c1;
+SELECT 27 DIV CAST(c2/c1 AS DOUBLE) / 17 AS c1 FROM t1 GROUP BY c1;
+SET SQL_MODE=DEFAULT;
+DROP TABLE t1;
 
 --echo # Bug#32863037: Assertion `scale >= 0 && precision > 0 &&
 --echo #               scale <= precision' failed

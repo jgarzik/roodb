@@ -343,6 +343,30 @@ pub fn build_procedure_context(
         match param.mode {
             ParamMode::In | ParamMode::InOut => {
                 let val = eval_sp_expr(arg_expr, &eval_ctx, user_vars)?;
+                // Check BIGINT overflow: if param type is BIGINT and value is Float
+                // that exceeds i64 range, the literal overflowed during parsing
+                let param_type_upper = param.data_type.to_uppercase();
+                if param_type_upper.contains("BIGINT") && !param_type_upper.contains("UNSIGNED") {
+                    if let Datum::Float(f) = &val {
+                        // 2^63 exactly — values >= this overflow BIGINT
+                        const MAX_BIGINT_F64: f64 = 9_223_372_036_854_775_808.0;
+                        if *f >= MAX_BIGINT_F64 || *f < i64::MIN as f64 {
+                            return Err(format!(
+                                "Out of range value for column '{}' at row 1",
+                                param.name
+                            ));
+                        }
+                    }
+                    // Also check UnsignedInt values that exceed i64::MAX
+                    if let Datum::UnsignedInt(u) = &val {
+                        if *u > i64::MAX as u64 {
+                            return Err(format!(
+                                "Out of range value for column '{}' at row 1",
+                                param.name
+                            ));
+                        }
+                    }
+                }
                 ctx.locals.insert(param_name, val);
             }
             ParamMode::Out => {

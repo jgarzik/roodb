@@ -20,7 +20,14 @@ impl Parser {
         let dialect = MySqlDialect {};
         // Normalize MySQL-specific syntax that sqlparser doesn't handle
         let normalized = Self::normalize_mysql_syntax(sql);
-        let ast = SqlParser::parse_sql(&dialect, &normalized)?;
+        let mut ast = SqlParser::parse_sql(&dialect, &normalized)?;
+
+        // Fix DIV associativity: sqlparser's MySQL dialect makes DIV right-associative
+        // (parses `A DIV B / C` as `A DIV (B / C)` instead of `(A DIV B) / C`).
+        // Walk the AST and rotate DIV chains to be left-associative.
+        for stmt in &mut ast {
+            Self::fix_div_associativity_stmt(stmt);
+        }
 
         if ast.is_empty() {
             // Distinguish empty query from comment-only query.
@@ -325,6 +332,64 @@ impl Parser {
         // Copy remaining text
         result.push_str(&sql[last_end..]);
         result
+    }
+    /// Fix DIV associativity in a statement by walking expressions.
+    /// sqlparser's MySQL dialect parses `A DIV B / C` as `A DIV (B / C)`.
+    /// We need `(A DIV B) / C` (left-associative, same as MySQL).
+    fn fix_div_associativity_stmt(stmt: &mut Statement) {
+        let _ = sqlparser::ast::visit_expressions_mut(stmt, |expr| {
+            Self::fix_div_expr(expr);
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+    }
+
+    /// Fix a single expression: if it's `X DIV (Y op Z)` where op is *, /, %, DIV,
+    /// rotate to `(X DIV Y) op Z` (left-associative).
+    fn fix_div_expr(expr: &mut sqlparser::ast::Expr) {
+        use sqlparser::ast::BinaryOperator as BO;
+        use sqlparser::ast::Expr;
+
+        let needs_rotation = matches!(
+            expr,
+            Expr::BinaryOp {
+                op: BO::MyIntegerDivide,
+                right,
+                ..
+            } if matches!(
+                right.as_ref(),
+                Expr::BinaryOp {
+                    op: BO::Multiply | BO::Divide | BO::Modulo | BO::MyIntegerDivide,
+                    ..
+                }
+            )
+        );
+
+        if needs_rotation {
+            let old = std::mem::replace(expr, Expr::Value(sqlparser::ast::Value::Null.into()));
+            if let Expr::BinaryOp {
+                left: a,
+                op: BO::MyIntegerDivide,
+                right: bc_box,
+            } = old
+            {
+                if let Expr::BinaryOp {
+                    left: b,
+                    op: outer_op,
+                    right: c,
+                } = *bc_box
+                {
+                    *expr = Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: a,
+                            op: BO::MyIntegerDivide,
+                            right: b,
+                        }),
+                        op: outer_op,
+                        right: c,
+                    };
+                }
+            }
+        }
     }
 }
 
