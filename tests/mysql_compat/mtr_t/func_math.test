@@ -641,7 +641,7 @@ do sqrt(weight_string(_eucjpms "0E+"));
 --echo # Bug#21279005 - ROUND FUNCTION INCORRECT IN WHERE-CLAUSE
 --echo #                USING LOCAL VARIABLE
 
-# [RooDB-skip] Lines 643-684 skipped (unsupported feature)
+# [RooDB-skip] Lines 643-684 (SP multi-result-set: connection drops on next command after CALL)
 
 --echo #
 --echo # Bug#23013359 FUNCTION FLOOR(CEIL()) TRUNCATES BIGINT UNSIGNED

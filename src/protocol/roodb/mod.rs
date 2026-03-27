@@ -4625,7 +4625,7 @@ where
         self.in_multi_result = false;
         self.sp_sent_results = false;
         if sent_results {
-            // Multi-result: don't reset sequence — continue from result set
+            // Multi-result: continue sequence from result set, write final OK
             let packet = encode_ok_packet(ctx.rows_affected, 0, default_status(), 0);
             self.writer.write_packet(&packet).await?;
             self.writer.flush().await?;
@@ -5212,15 +5212,9 @@ where
                 let client_multi =
                     self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
                 if client_multi && (upper.starts_with("SELECT ") || upper.starts_with("SHOW ")) {
-                    if upper.starts_with("SHOW ") {
-                        if let Err(e) = self.handle_query(&substituted).await {
-                            return Err(format!("{}", e));
-                        }
-                    } else {
-                        self.execute_sp_select(&substituted)
-                            .await
-                            .map_err(|e| format!("{}", e))?;
-                    }
+                    self.execute_sp_select(&substituted)
+                        .await
+                        .map_err(|e| format!("{}", e))?;
                     return Ok(ProcControlFlow::Continue);
                 }
 
@@ -5281,8 +5275,7 @@ where
         // Determine column info from first row or query
         let col_count = rows.first().map_or(0, |r| r.len());
 
-        // Send column count
-        self.writer.set_sequence(1);
+        // Send column count — DON'T reset sequence! Multi-result shares one continuous sequence
         let count_packet = encode_column_count(col_count as u64);
         self.writer.write_packet(&count_packet).await?;
 
