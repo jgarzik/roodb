@@ -857,7 +857,12 @@ DROP TRIGGER trg1;
 DROP TABLE t2;
 DROP TABLE t1;
 
-# [RooDB-skip] Lines 908-913 skipped (unsupported feature)
+# Test case for a stored procedure
+CREATE PROCEDURE crc32_proc (IN a CHAR, OUT b BIGINT)
+  SELECT CRC32(a) INTO b;
+CALL crc32_proc('a',@val);
+SELECT @val;
+DROP PROCEDURE crc32_proc;
 
 # Test case for a user defined function
 # [RooDB-skip] Lines 916-926 skipped (unsupported feature)

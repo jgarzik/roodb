@@ -5169,6 +5169,13 @@ where
             // Everything else: fallback to string-based execution with local var substitution
             _ => {
                 let sql = stmt.to_string();
+
+                // Handle SELECT ... INTO var (MySQL stored procedure syntax)
+                // Must be checked BEFORE substitute_locals to preserve variable names
+                if let Some(result) = self.try_execute_select_into(&sql, ctx).await? {
+                    return Ok(result);
+                }
+
                 let substituted = self.substitute_locals(&sql, ctx);
                 let affected = self.execute_sql_silent(&substituted).await?;
                 ctx.rows_affected += affected;
@@ -5211,6 +5218,54 @@ where
             result = result.replace(name, &val.to_sql_literal());
         }
         result
+    }
+
+    /// Handle `SELECT expr INTO var [FROM ...]` in a stored procedure context.
+    /// Strips the INTO clause, executes the SELECT, stores the result in local/user var.
+    /// Returns Some(Continue) if handled, None if not a SELECT INTO.
+    async fn try_execute_select_into(
+        &mut self,
+        sql: &str,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+    ) -> Result<Option<crate::executor::procedure::ProcControlFlow>, String> {
+        let upper = sql.trim().to_uppercase();
+        if !upper.starts_with("SELECT ") {
+            return Ok(None);
+        }
+
+        // Find "INTO var" pattern — could be "SELECT expr INTO var" or
+        // "SELECT expr INTO var FROM ..."
+        // Use case-insensitive search for INTO followed by a variable name
+        let into_re = regex::Regex::new(r"(?i)\bINTO\s+(@?\w+(?:\s*,\s*@?\w+)*)")
+            .map_err(|e| e.to_string())?;
+
+        let caps = match into_re.captures(sql) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Extract variable names
+        let var_list = caps.get(1).unwrap().as_str();
+        let var_names: Vec<&str> = var_list.split(',').map(|s| s.trim()).collect();
+
+        // Remove the "INTO var1, var2, ..." from the SQL
+        let into_full = caps.get(0).unwrap();
+        let select_sql = format!("{}{}", &sql[..into_full.start()], &sql[into_full.end()..]);
+
+        // Substitute local variables in the SELECT part (not the INTO var names)
+        let substituted_select = self.substitute_locals(&select_sql, ctx);
+
+        // Execute the SELECT and get the first row
+        let rows = self.execute_select_buffered(&substituted_select).await?;
+        if let Some(row) = rows.first() {
+            for (i, var_name) in var_names.iter().enumerate() {
+                if let Some(val) = row.get_opt(i) {
+                    self.set_procedure_variable(ctx, var_name, val.clone());
+                }
+            }
+        }
+
+        Ok(Some(crate::executor::procedure::ProcControlFlow::Continue))
     }
 
     /// Execute a SELECT statement and buffer all result rows.

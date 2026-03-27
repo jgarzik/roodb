@@ -204,6 +204,21 @@ impl Parser {
         let re_proc = Regex::new(r"(?i)(CREATE\s+PROCEDURE\s+\w+\s*\([^)]*\))\s+BEGIN\b").unwrap();
         let result = re_proc.replace_all(&result, "$1 AS BEGIN");
 
+        // Normalize single-statement procedure bodies (no BEGIN/END):
+        // MySQL: CREATE PROCEDURE name(...) SELECT ...;
+        // → CREATE PROCEDURE name(...) AS BEGIN SELECT ...; END
+        let re_proc_single = Regex::new(
+            r"(?is)(CREATE\s+PROCEDURE\s+\w+\s*\([^)]*\))\s+((?:SELECT|INSERT|UPDATE|DELETE|SET)\b.+)"
+        ).unwrap();
+        let result =
+            if re_proc_single.is_match(&result) && !result.to_uppercase().contains(" AS BEGIN") {
+                re_proc_single
+                    .replace_all(&result, "$1 AS BEGIN $2; END")
+                    .to_string()
+            } else {
+                result.to_string()
+            };
+
         // Normalize DECLARE variable statements inside procedure bodies.
         // sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...,
         // not DECLARE var TYPE [DEFAULT expr]. Convert to SET statements.
