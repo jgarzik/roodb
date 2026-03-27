@@ -1,0 +1,65 @@
+#
+# Trimmed from MySQL having.test for RooDB compatibility testing.
+# Tests: basic HAVING with aggregate functions.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+#
+# Basic HAVING test
+#
+CREATE TABLE t1 (a int);
+SELECT count(a) AS b FROM t1 WHERE a=0 HAVING b > 0;
+INSERT INTO t1 VALUES (null);
+SELECT count(a) AS b FROM t1 WHERE a=0 HAVING b > 0;
+SELECT count(a) AS b FROM t1 WHERE a=0 HAVING b >=0;
+# [RooDB-skip] ANALYZE TABLE / EXPLAIN skipped
+DROP TABLE t1;
+
+# [RooDB-skip] Complex HAVING+AVG multi-table test skipped
+
+#
+# Test problem with having and MAX() IS NOT NULL
+#
+CREATE TABLE t1 (Fld1 int default NULL, Fld2 int default NULL);
+INSERT INTO t1 VALUES (1,10),(1,20),(2,NULL),(2,NULL),(3,50);
+# [RooDB-skip] HAVING with aggregate IS NOT NULL not supported
+DROP TABLE t1;
+
+#
+# Test problem with count(distinct) in having
+#
+CREATE TABLE t1 (id int NOT NULL, qty int NOT NULL);
+INSERT INTO t1 VALUES (1,2),(1,3),(2,4),(2,5);
+SELECT id, sum(qty) AS sqty FROM t1 GROUP BY id HAVING sqty>2 ORDER BY id;
+SELECT sum(qty) AS sqty FROM t1 GROUP BY id HAVING count(id) > 0 ORDER BY sqty;
+SELECT sum(qty) AS sqty FROM t1 GROUP BY id HAVING count(distinct id) > 0 ORDER BY sqty;
+DROP TABLE t1;
+
+#
+# Bug #14274: HAVING clause containing only set function
+#
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (3), (4), (1), (3), (1);
+SELECT SUM(a) FROM t1 GROUP BY a HAVING SUM(a)>0 ORDER BY SUM(a);
+SELECT SUM(a) FROM t1 GROUP BY a HAVING SUM(a) ORDER BY SUM(a);
+DROP TABLE t1;
+
+#
+# Bug #14927: HAVING clause containing constant false conjunct
+#
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1), (2), (1), (3), (2), (1);
+SELECT a FROM t1 GROUP BY a HAVING a > 1;
+SELECT a FROM t1 GROUP BY a HAVING 1 != 1 AND a > 1;
+SELECT 0 AS x, a FROM t1 GROUP BY x, a HAVING x=1 AND a > 1;
+# [RooDB-skip] EXPLAIN skipped
+DROP TABLE t1;
+
+# [RooDB-skip] Bug #29911 multi-table HAVING test skipped (complex joins)
+# [RooDB-skip] Subquery tests skipped
+# [RooDB-skip] --source include/turn_off_only_full_group_by.inc tests skipped
+# [RooDB-skip] CHARACTER SET / COLLATE tests skipped
+# [RooDB-skip] --disable_ps_protocol tests skipped

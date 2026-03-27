@@ -86,6 +86,14 @@ TIERS = {
         "func_concat",     # 153 lines — CONCAT (has includes)
         "func_if",         # 301 lines — IF function (has includes)
     ],
+    5: [
+        "alias",           # 220 lines — SELECT/table aliases
+        "truncate",        # 180 lines — TRUNCATE TABLE
+        "func_in_none",    # 216 lines — IN/NOT IN
+        "select_found",    # 239 lines — SELECT with LIMIT patterns
+        "distinct",        # 990 lines — SELECT DISTINCT
+        "having",          # 989 lines — HAVING clause
+    ],
 }
 
 

@@ -1,0 +1,157 @@
+DROP TABLE IF EXISTS t1, t2;
+SELECT 1 IN (1,2,3);
+expr
+1
+SELECT 10 IN (1,2,3);
+expr
+0
+SELECT NULL IN (1,2,3);
+expr
+NULL
+SELECT 1 IN (1,NULL,3);
+expr
+1
+SELECT 3 IN (1,NULL,3);
+expr
+1
+SELECT 10 IN (1,NULL,3);
+expr
+0
+SELECT 1.5 IN (1.5,2.5,3.5);
+expr
+1
+SELECT 10.5 IN (1.5,2.5,3.5);
+expr
+0
+SELECT NULL IN (1.5,2.5,3.5);
+expr
+NULL
+SELECT 1.5 IN (1.5,NULL,3.5);
+expr
+1
+SELECT 3.5 IN (1.5,NULL,3.5);
+expr
+1
+SELECT 10.5 IN (1.5,NULL,3.5);
+expr
+0
+CREATE TABLE t1 (a int, b int, c int);
+INSERT INTO t1 VALUES (1,2,3), (1,NULL,3);
+SELECT 1 IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 3 IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 10 IN (a,b,c) FROM t1;
+expr
+0
+0
+SELECT NULL IN (a,b,c) FROM t1;
+expr
+NULL
+NULL
+DROP TABLE t1;
+CREATE TABLE t1 (a float, b float, c float);
+INSERT INTO t1 VALUES (1.5,2.5,3.5), (1.5,NULL,3.5);
+SELECT 1.5 IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 3.5 IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 10.5 IN (a,b,c) FROM t1;
+expr
+0
+0
+DROP TABLE t1;
+CREATE TABLE t1 (a varchar(10), b varchar(10), c varchar(10));
+INSERT INTO t1 VALUES ('A','BC','EFD'), ('A',NULL,'EFD');
+SELECT 'A' IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 'EFD' IN (a,b,c) FROM t1;
+expr
+1
+1
+SELECT 'XSFGGHF' IN (a,b,c) FROM t1;
+expr
+0
+0
+DROP TABLE t1;
+CREATE TABLE t1 (field char(1));
+INSERT INTO t1 VALUES ('A'),(NULL);
+SELECT * FROM t1 WHERE field IN (NULL);
+field
+SELECT * FROM t1 WHERE field NOT IN (NULL);
+field
+A
+SELECT * FROM t1 WHERE field = field;
+field
+A
+SELECT * FROM t1 WHERE field <=> field;
+field
+A
+NULL
+DELETE FROM t1 WHERE field NOT IN (NULL);
+SELECT * FROM t1;
+field
+NULL
+DROP TABLE t1;
+CREATE TABLE t1 (id int primary key);
+INSERT INTO t1 VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9);
+SELECT * FROM t1 WHERE id IN (2,5,9);
+id
+2
+5
+9
+DROP TABLE t1;
+SELECT '1.0' IN (1,2);
+expr
+0
+SELECT 1 IN ('1.0',2);
+expr
+0
+SELECT 1 IN (1,'2.0');
+expr
+1
+SELECT 1 IN ('1.0',2.0);
+expr
+0
+SELECT 1 IN (1.0,'2.0');
+expr
+1
+SELECT 1 IN ('1.1',2);
+expr
+0
+SELECT 1 IN ('1.1',2.0);
+expr
+0
+CREATE TABLE t1 (id int, key(id));
+INSERT INTO t1 VALUES (1),(2),(3);
+SELECT count(*) FROM t1 WHERE id NOT IN (1);
+COUNT(NULL)
+2
+SELECT count(*) FROM t1 WHERE id NOT IN (1,2);
+COUNT(NULL)
+1
+DROP TABLE t1;
+CREATE TABLE t1 (a int PRIMARY KEY);
+INSERT INTO t1 VALUES (44), (45), (46);
+SELECT * FROM t1 WHERE a IN (45);
+a
+45
+SELECT * FROM t1 WHERE a NOT IN (0, 45);
+a
+44
+46
+SELECT * FROM t1 WHERE a NOT IN (45);
+a
+44
+46
+DROP TABLE t1;

@@ -39,6 +39,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 2 | null, case, type_varchar, type_ranges, func_isnull, limit, type_binary, bigint | NULL semantics, data types, LIMIT |
 | 3 | type_decimal, type_float, func_like, func_test, func_math, delete, cast, type_year, type_blob, type_enum | Functions, DML, type casting |
 | 4 | insert, update, func_str, func_concat, func_if | Complex DML, string functions |
+| 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
 
 ## Current Status
 
@@ -90,6 +91,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | update | **PASS** | ~10% | Multi-table UPDATE, ORDER BY LIMIT, subqueries |
 | func_str | **PASS** | ~5% | BINARY, charset, UNHEX, SUBSTRING_INDEX, TRIM extended |
 | func_concat | **PASS** | ~45% | GROUP BY issues, UNION, stored procedures |
+
+### Tier 5 — 6/6 pass
+
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| alias | **PASS** | ~35% | UPDATE ORDER BY LIMIT, INSERT...SELECT |
+| truncate | **PASS** | ~35% | LOCK/FLUSH, stored procs, TEMPORARY TABLE |
+| func_in_none | **PASS** | ~45% | EXPLAIN, subqueries |
+| select_found | **PASS** | ~40% | SQL_CALC_FOUND_ROWS, PREPARE, UNION |
+| distinct | **PASS** | ~12% | Complex joins, EXPLAIN, INSERT...SELECT |
+| having | **PASS** | ~10% | Aggregate alias HAVING, IS NOT NULL, subqueries |
 
 ### Custom Tests — 23/23 pass
 

@@ -1,0 +1,74 @@
+#
+# Trimmed from MySQL alias.test for RooDB compatibility testing.
+# Tests: SELECT with aliases, GROUP BY with aliases, ORDER BY with aliases.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+# [RooDB-skip] UPDATE with ORDER BY LIMIT
+
+#
+# Bug#27249 table_wild with alias: select t1.* as something
+#
+
+CREATE TABLE t1 (a int, b int, c int);
+CREATE TABLE t2 (d int);
+CREATE TABLE t3 (a1 int, b1 int, c1 int);
+INSERT INTO t1 VALUES(1,2,3);
+INSERT INTO t1 VALUES(11,22,33);
+INSERT INTO t2 VALUES(99);
+
+# Invalid queries with alias on wild
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias' FROM t1;
+--error ER_PARSE_ERROR
+SELECT t2.* AS 'with_alias' FROM t2;
+--error ER_PARSE_ERROR
+SELECT t1.*, t1.* AS 'with_alias' FROM t1;
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias', t1.* FROM t1;
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias', t1.* AS 'alias2' FROM t1;
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias', a, t1.* AS 'alias2' FROM t1;
+
+# other fields without alias
+--error ER_PARSE_ERROR
+SELECT a, t1.* AS 'with_alias' FROM t1;
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias', a FROM t1;
+--error ER_PARSE_ERROR
+SELECT a, t1.* AS 'with_alias', b FROM t1;
+
+# other fields with alias
+--error ER_PARSE_ERROR
+SELECT a AS 'x', t1.* AS 'with_alias' FROM t1;
+--error ER_PARSE_ERROR
+SELECT t1.* AS 'with_alias', a AS 'x' FROM t1;
+--error ER_PARSE_ERROR
+SELECT a AS 'x', t1.* AS 'with_alias', b AS 'x' FROM t1;
+
+#
+# Valid queries without alias on wild
+#
+SELECT t1.* FROM t1;
+SELECT t2.* FROM t2;
+SELECT t1.*, t1.* FROM t1;
+SELECT t1.*, a, t1.* FROM t1;
+
+# other fields without alias
+SELECT a, t1.* FROM t1;
+SELECT t1.*, a FROM t1;
+SELECT a, t1.*, b FROM t1;
+
+# other fields with alias
+SELECT a AS 'x', t1.* FROM t1;
+SELECT t1.*, a AS 'x' FROM t1;
+SELECT a AS 'x', t1.*, b AS 'x' FROM t1;
+
+# [RooDB-skip] INSERT...SELECT skipped
+# [RooDB-skip] CREATE TABLE AS SELECT skipped
+
+DROP TABLE t1, t2, t3;
