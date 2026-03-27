@@ -1280,10 +1280,13 @@ fn eval_spaceship(left: &Datum, right: &Datum) -> bool {
 /// Coerce a datum to match a target column type for implicit conversion (e.g. INSERT).
 /// Only performs conversion when the source type doesn't match the target and a safe
 /// conversion exists. Returns the datum unchanged for non-Bit types.
-pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) -> Datum {
+pub fn coerce_to_column_type(
+    datum: Datum,
+    target: &crate::catalog::DataType,
+) -> ExecutorResult<Datum> {
     use crate::catalog::DataType;
     if datum.is_null() {
-        return datum;
+        return Ok(datum);
     }
     // Check if type already matches
     let already_matches = matches!(
@@ -1301,9 +1304,21 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
             | (Datum::Decimal { .. }, DataType::Decimal { .. })
     );
     if !already_matches {
-        eval_cast(&datum, target).unwrap_or(datum)
+        match eval_cast(&datum, target) {
+            Ok(v) => Ok(v),
+            Err(ExecutorError::DataOutOfRange(ref msg))
+                if msg.starts_with("Out of range value for column") =>
+            {
+                // Propagate INSERT column overflow — real data integrity violation
+                Err(ExecutorError::DataOutOfRange(msg.clone()))
+            }
+            Err(_) => {
+                // Other cast failures (type mismatch, internal overflow, etc.) — fall back
+                Ok(datum)
+            }
+        }
     } else {
-        datum
+        Ok(datum)
     }
 }
 
@@ -1341,7 +1356,25 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 Ok(Datum::Int(rounded as i64))
             }
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
-            Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
+            Datum::String(s) => {
+                let trimmed = s.trim();
+                // Try direct i64 parse
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    return Ok(Datum::Int(v));
+                }
+                // Try f64 — check for overflow
+                if let Ok(v) = trimmed.parse::<f64>() {
+                    if v.is_finite() && v >= i64::MIN as f64 && v < 9_223_372_036_854_775_808.0 {
+                        return Ok(Datum::Int(v.round() as i64));
+                    }
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "Out of range value for column, value '{}'",
+                        &trimmed[..trimmed.len().min(64)]
+                    )));
+                }
+                // Extract leading digits
+                Ok(Datum::Int(parse_leading_int(trimmed)))
+            }
             Datum::Bytes(b) => {
                 // Interpret bytes as big-endian unsigned integer
                 let mut val = 0i64;

@@ -87,7 +87,7 @@ impl Executor for InsertSelect {
             for (col_idx, col) in self.columns.iter().enumerate() {
                 let datum = if col_idx < source_row.len() {
                     let d = source_row.get(col_idx).cloned().unwrap_or(Datum::Null);
-                    super::eval::coerce_to_column_type(d, &col.data_type)
+                    super::eval::coerce_to_column_type(d, &col.data_type)?
                 } else {
                     Datum::Null
                 };

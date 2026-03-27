@@ -5451,8 +5451,13 @@ where
                     )
                 } else if let crate::executor::ExecutorError::NullValue(_) = exec_err {
                     (codes::ER_BAD_NULL_ERROR, "23000", exec_err.to_string())
-                } else if let crate::executor::ExecutorError::DataOutOfRange(_) = exec_err {
-                    (codes::ER_DATA_OUT_OF_RANGE, "22003", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::DataOutOfRange(ref msg) = exec_err {
+                    let code = if msg.starts_with("Out of range value for column") {
+                        codes::ER_WARN_DATA_OUT_OF_RANGE
+                    } else {
+                        codes::ER_DATA_OUT_OF_RANGE
+                    };
+                    (code, "22003", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::InvalidArgumentForLogarithm(_) =
                     exec_err
                 {

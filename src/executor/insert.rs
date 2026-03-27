@@ -135,7 +135,7 @@ impl Executor for Insert {
                 };
                 // Coerce value to match column type (e.g. Bytes → Bit)
                 let datum = if col_idx < self.columns.len() {
-                    super::eval::coerce_to_column_type(datum, &self.columns[col_idx].data_type)
+                    super::eval::coerce_to_column_type(datum, &self.columns[col_idx].data_type)?
                 } else {
                     datum
                 };
