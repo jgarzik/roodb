@@ -124,6 +124,7 @@ pub mod codes {
     pub const ER_TOO_BIG_SCALE: u16 = 1427;
     pub const ER_WARN_DATA_OUT_OF_RANGE: u16 = 1264;
     pub const ER_DATA_OUT_OF_RANGE: u16 = 1690;
+    pub const ER_TRUNCATED_WRONG_VALUE: u16 = 1292;
     pub const ER_INVALID_ARGUMENT_FOR_LOGARITHM: u16 = 3020;
     pub const ER_WRONG_VALUE_COUNT_ON_ROW: u16 = 1136;
     pub const ER_CANT_CHANGE_TX_CHARACTERISTICS: u16 = 1568;

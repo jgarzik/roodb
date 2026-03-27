@@ -1783,6 +1783,8 @@ where
             let (code, state) =
                 if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
                     (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
+                } else if msg.contains("Truncated incorrect") {
+                    (codes::ER_TRUNCATED_WRONG_VALUE, "22007")
                 } else {
                     (codes::ER_DATA_OUT_OF_RANGE, "22003")
                 };
@@ -5971,6 +5973,12 @@ where
                     (
                         codes::ER_INVALID_ARGUMENT_FOR_LOGARITHM,
                         "2201E",
+                        exec_err.to_string(),
+                    )
+                } else if let crate::executor::ExecutorError::TruncatedWrongValue(_) = exec_err {
+                    (
+                        codes::ER_TRUNCATED_WRONG_VALUE,
+                        "22007",
                         exec_err.to_string(),
                     )
                 } else if let crate::executor::ExecutorError::InvalidOperation(ref msg) = exec_err {

@@ -384,6 +384,34 @@ fn eval_binary_op_ex(
         return Ok(Datum::Null);
     }
 
+    // In strict DML context (INSERT/UPDATE), non-numeric strings in arithmetic
+    // must raise ER_TRUNCATED_WRONG_VALUE (1292) instead of silently becoming 0
+    if matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::IntDiv
+    ) && in_strict_dml_context(vars)
+        && vars.is_some_and(is_strict_trans_tables)
+    {
+        for operand in [left, right] {
+            if let Datum::String(s) = operand {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
+                    // Leading digits might exist (e.g. "123abc" → 123) but MySQL
+                    // still raises TRUNCATED_WRONG_VALUE in strict mode
+                    return Err(ExecutorError::TruncatedWrongValue(format!(
+                        "Truncated incorrect DOUBLE value: '{}'",
+                        trimmed
+                    )));
+                }
+            }
+        }
+    }
+
     match op {
         // Arithmetic
         BinaryOp::Add => eval_add(left, right),
