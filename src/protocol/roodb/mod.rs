@@ -5024,7 +5024,7 @@ where
     /// Map SQLSTATE to MySQL error code
     fn sqlstate_to_error_code(sqlstate: &str) -> u16 {
         match sqlstate {
-            "22003" => 1264, // ER_WARN_DATA_OUT_OF_RANGE
+            "22003" => 1690, // ER_DATA_OUT_OF_RANGE (in procedure context)
             "23000" => 1062, // ER_DUP_ENTRY
             "22012" => 1365, // ER_DIVISION_BY_ZERO
             "22001" => 1265, // WARN_DATA_TRUNCATED
@@ -5140,10 +5140,15 @@ where
                 Ok(ProcControlFlow::Continue)
             }
 
-            // WHILE loop
+            // WHILE loop — extract nested handlers from WHILE body for error handling
             S::While(while_stmt) => {
                 let max_iterations = 100_000;
                 let mut iterations = 0;
+
+                // Extract handlers from the WHILE body SQL (handles nested BEGIN blocks)
+                let while_body_sql = while_stmt.while_block.to_string();
+                let nested_handlers = Self::extract_handlers(&while_body_sql);
+
                 loop {
                     if iterations >= max_iterations {
                         return Err(format!("WHILE loop exceeded {} iterations", max_iterations));
@@ -5159,9 +5164,13 @@ where
                         }
                     }
 
-                    // Execute body
+                    // Execute body with handlers (for CONTINUE HANDLER support)
                     match self
-                        .execute_procedure_body(while_stmt.while_block.statements(), ctx)
+                        .execute_procedure_body_with_handlers(
+                            while_stmt.while_block.statements(),
+                            ctx,
+                            &nested_handlers,
+                        )
                         .await?
                     {
                         ProcControlFlow::Return => return Ok(ProcControlFlow::Return),

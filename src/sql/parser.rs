@@ -243,8 +243,10 @@ impl Parser {
             sql = re_end_while.replace_all(&sql, "END").to_string();
 
             // Replace standalone DO keyword (after WHILE condition) with BEGIN
-            // Match: a word boundary + DO + whitespace/newline (not part of another word)
-            // Only safe in procedure body context where DO is only used in WHILE...DO
+            // But if DO is followed by BEGIN (compound statement), just remove DO
+            let re_do_begin = Regex::new(r"(?is)\bDO\s+BEGIN\b").unwrap();
+            sql = re_do_begin.replace_all(&sql, "BEGIN").to_string();
+            // For DO not followed by BEGIN, replace with BEGIN
             let re_do = Regex::new(r"(?i)\bDO\s").unwrap();
             sql = re_do.replace_all(&sql, "BEGIN ").to_string();
         }
@@ -273,6 +275,23 @@ impl Parser {
 
             // Skip cursor declarations: DECLARE name CURSOR ...
             if words.len() >= 3 && words[2].eq_ignore_ascii_case("CURSOR") {
+                continue;
+            }
+            // Remove handler declarations: DECLARE CONTINUE/EXIT HANDLER ...
+            // (These are processed separately by extract_handlers)
+            if words.len() >= 3
+                && (words[1].eq_ignore_ascii_case("CONTINUE")
+                    || words[1].eq_ignore_ascii_case("EXIT"))
+                && words[2].eq_ignore_ascii_case("HANDLER")
+            {
+                // Replace the entire DECLARE HANDLER statement + semicolon with empty
+                result.push_str(&sql[last_end..start]);
+                // Skip past the semicolon
+                last_end = if stmt_end < sql.len() && sql.as_bytes()[stmt_end] == b';' {
+                    stmt_end + 1
+                } else {
+                    stmt_end
+                };
                 continue;
             }
 
