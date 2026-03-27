@@ -397,7 +397,21 @@ impl LogicalPlanBuilder {
                 let upper = name.to_uppercase();
                 if matches!(
                     upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "BIT_AND"
+                        | "BIT_OR"
+                        | "BIT_XOR"
+                        | "STDDEV"
+                        | "STD"
+                        | "STDDEV_POP"
+                        | "STDDEV_SAMP"
+                        | "VARIANCE"
+                        | "VAR_POP"
+                        | "VAR_SAMP"
                 ) {
                     true
                 } else {
@@ -502,7 +516,21 @@ impl LogicalPlanBuilder {
                 let upper = name.to_uppercase();
                 if matches!(
                     upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "BIT_AND"
+                        | "BIT_OR"
+                        | "BIT_XOR"
+                        | "STDDEV"
+                        | "STD"
+                        | "STDDEV_POP"
+                        | "STDDEV_SAMP"
+                        | "VARIANCE"
+                        | "VAR_POP"
+                        | "VAR_SAMP"
                 ) {
                     Some(AggregateFunc::new(
                         upper,
@@ -693,6 +721,8 @@ impl LogicalPlanBuilder {
                     "COUNT" => DataType::BigInt,
                     "SUM" => DataType::Double,
                     "AVG" => DataType::Double,
+                    "STDDEV" | "STD" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
+                    | "VAR_SAMP" => DataType::Double,
                     _ => result_type.clone(),
                 }
             }

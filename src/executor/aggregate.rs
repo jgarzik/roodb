@@ -22,12 +22,30 @@ use super::Executor;
 enum Accumulator {
     Count(i64),
     Sum(Option<f64>),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Min(Option<Datum>),
     Max(Option<Datum>),
     BitAnd(Option<u64>),
     BitOr(u64),
     BitXor(u64),
+    /// Population variance/stddev: tracks sum, sum of squares, count
+    /// is_stddev: if true, finalize returns sqrt(variance)
+    VarPop {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+        is_stddev: bool,
+    },
+    /// Sample variance/stddev
+    VarSamp {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+        is_stddev: bool,
+    },
 }
 
 impl Accumulator {
@@ -41,6 +59,30 @@ impl Accumulator {
             "BIT_AND" => Accumulator::BitAnd(None),
             "BIT_OR" => Accumulator::BitOr(0),
             "BIT_XOR" => Accumulator::BitXor(0),
+            "VARIANCE" | "VAR_POP" => Accumulator::VarPop {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: false,
+            },
+            "VAR_SAMP" => Accumulator::VarSamp {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: false,
+            },
+            "STDDEV" | "STD" | "STDDEV_SAMP" => Accumulator::VarSamp {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: true,
+            },
+            "STDDEV_POP" => Accumulator::VarPop {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: true,
+            },
             _ => Accumulator::Count(0), // fallback
         }
     }
@@ -101,6 +143,23 @@ impl Accumulator {
                     *acc ^= v;
                 }
             }
+            Accumulator::VarPop {
+                sum, sum_sq, count, ..
+            }
+            | Accumulator::VarSamp {
+                sum, sum_sq, count, ..
+            } => {
+                let v = if let Some(f) = value.as_float() {
+                    Some(f)
+                } else {
+                    value.as_int().map(|i| i as f64)
+                };
+                if let Some(v) = v {
+                    *sum += v;
+                    *sum_sq += v * v;
+                    *count += 1;
+                }
+            }
         }
     }
 
@@ -137,6 +196,46 @@ impl Accumulator {
             Accumulator::BitAnd(acc) => acc.map_or(Datum::Null, |v| Datum::Int(v as i64)),
             Accumulator::BitOr(v) => Datum::Int(*v as i64),
             Accumulator::BitXor(v) => Datum::Int(*v as i64),
+            Accumulator::VarPop {
+                sum,
+                sum_sq,
+                count,
+                is_stddev,
+            } => {
+                if *count == 0 {
+                    Datum::Null
+                } else {
+                    let n = *count as f64;
+                    let variance = *sum_sq / n - (*sum / n).powi(2);
+                    let variance = variance.max(0.0); // avoid floating-point negative
+                    if *is_stddev {
+                        Datum::Float(variance.sqrt())
+                    } else {
+                        Datum::Float(variance)
+                    }
+                }
+            }
+            Accumulator::VarSamp {
+                sum,
+                sum_sq,
+                count,
+                is_stddev,
+            } => {
+                if *count < 2 {
+                    if *count == 0 {
+                        return Datum::Null;
+                    }
+                    return Datum::Float(0.0);
+                }
+                let n = *count as f64;
+                let variance = (*sum_sq - *sum * *sum / n) / (n - 1.0);
+                let variance = variance.max(0.0);
+                if *is_stddev {
+                    Datum::Float(variance.sqrt())
+                } else {
+                    Datum::Float(variance)
+                }
+            }
         }
     }
 }

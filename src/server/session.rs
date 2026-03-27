@@ -178,6 +178,14 @@ impl Session {
             &self.user_variables,
             self.has_sql_mode("STRICT_TRANS_TABLES"),
         );
+        // Store connection_id for advisory lock ownership
+        {
+            let mut w = self.user_variables.write();
+            w.insert(
+                "__sys_connection_id".to_string(),
+                crate::executor::datum::Datum::Int(self.connection_id as i64),
+            );
+        }
     }
 
     /// Create a new session for a replica (read-only)

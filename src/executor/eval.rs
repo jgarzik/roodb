@@ -1350,6 +1350,17 @@ fn eval_spaceship(left: &Datum, right: &Datum) -> bool {
     }
 }
 
+/// Get the connection ID from user variables (stored as __sys_connection_id).
+fn get_connection_id(vars: Option<&UserVariables>) -> u32 {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::Int(id)) = r.get("__sys_connection_id") {
+            return *id as u32;
+        }
+    }
+    0
+}
+
 /// Clamp an overflow value to the nearest type boundary (MAX or MIN).
 /// Used in non-strict INSERT mode when coercion overflows.
 pub fn clamp_to_type_boundary(datum: &Datum, target: &crate::catalog::DataType) -> Datum {
@@ -2053,8 +2064,9 @@ pub fn eval_function(
         }
 
         "WEIGHT_STRING" => {
-            // WEIGHT_STRING(str) — returns binary sort key for string
-            // Stub: return the input bytes as-is for basic compatibility
+            // WEIGHT_STRING(str) — returns binary collation sort key
+            // Implements utf8mb4_general_ci weights: case-fold to uppercase
+            // codepoint, pack as big-endian u16 per character.
             if args.is_empty() {
                 return Err(ExecutorError::InvalidOperation(
                     "WEIGHT_STRING requires at least 1 argument".to_string(),
@@ -2064,7 +2076,20 @@ pub fn eval_function(
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            Ok(Datum::Bytes(s.into_bytes()))
+            let mut weights = Vec::with_capacity(s.len() * 2);
+            for ch in s.chars() {
+                // utf8mb4_general_ci: uppercase the character, use codepoint as weight
+                let upper = ch.to_uppercase().next().unwrap_or(ch);
+                let cp = upper as u32;
+                // Pack as big-endian u16 (clamp BMP; supplementary chars use u32)
+                if cp <= 0xFFFF {
+                    weights.extend_from_slice(&(cp as u16).to_be_bytes());
+                } else {
+                    // Supplementary character: 4-byte weight
+                    weights.extend_from_slice(&cp.to_be_bytes());
+                }
+            }
+            Ok(Datum::Bytes(weights))
         }
 
         "HEX" => {
@@ -3096,13 +3121,36 @@ pub fn eval_function(
         }
 
         "GET_LOCK" => {
-            // GET_LOCK(name, timeout) — always return 1 (acquired)
-            Ok(Datum::Int(1))
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let conn_id = get_connection_id(vars);
+            let mgr = crate::server::locks::global_lock_manager();
+            Ok(Datum::Int(mgr.get_lock(&lock_name, conn_id)))
         }
 
-        "RELEASE_LOCK" => Ok(Datum::Int(1)),
+        "RELEASE_LOCK" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let conn_id = get_connection_id(vars);
+            let mgr = crate::server::locks::global_lock_manager();
+            match mgr.release_lock(&lock_name, conn_id) {
+                Some(v) => Ok(Datum::Int(v)),
+                None => Ok(Datum::Null),
+            }
+        }
 
-        "IS_FREE_LOCK" => Ok(Datum::Int(1)),
+        "IS_FREE_LOCK" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let mgr = crate::server::locks::global_lock_manager();
+            Ok(Datum::Int(mgr.is_free_lock(&lock_name)))
+        }
 
         "INET_NTOA" => {
             if args.is_empty() || args[0].is_null() {
@@ -3131,11 +3179,40 @@ pub fn eval_function(
             Ok(Datum::Int(val as i64))
         }
 
-        "INET6_NTOA" | "INET6_ATON" => {
+        "INET6_ATON" => {
             if args.is_empty() || args[0].is_null() {
                 return Ok(Datum::Null);
             }
+            let s = args[0].to_display_string();
+            let trimmed = s.trim();
+            // Try IPv6
+            if let Ok(addr) = trimmed.parse::<std::net::Ipv6Addr>() {
+                return Ok(Datum::Bytes(addr.octets().to_vec()));
+            }
+            // Try IPv4 (returns 4-byte binary)
+            if let Ok(addr) = trimmed.parse::<std::net::Ipv4Addr>() {
+                return Ok(Datum::Bytes(addr.octets().to_vec()));
+            }
             Ok(Datum::Null)
+        }
+
+        "INET6_NTOA" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match &args[0] {
+                Datum::Bytes(b) if b.len() == 16 => {
+                    let octets: [u8; 16] = b[..16].try_into().unwrap();
+                    let addr = std::net::Ipv6Addr::from(octets);
+                    Ok(Datum::String(addr.to_string()))
+                }
+                Datum::Bytes(b) if b.len() == 4 => {
+                    let octets: [u8; 4] = b[..4].try_into().unwrap();
+                    let addr = std::net::Ipv4Addr::from(octets);
+                    Ok(Datum::String(addr.to_string()))
+                }
+                _ => Ok(Datum::Null),
+            }
         }
 
         "CURDATE" | "CURRENT_DATE" => {
@@ -3656,12 +3733,13 @@ pub fn eval_function(
             }
         }
 
+        // STDDEV/VARIANCE family: handled as aggregate functions in aggregate.rs.
+        // If called as scalar (e.g. SELECT STDDEV(1)), treat as single-value aggregate.
         "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "STD" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
-            // Statistical aggregate functions — when called as scalar on a single value,
-            // return 0 (stddev of one value is 0)
             if args.is_empty() || args[0].is_null() {
                 return Ok(Datum::Null);
             }
+            // Single value: population stddev/variance is 0
             Ok(Datum::Float(0.0))
         }
 
