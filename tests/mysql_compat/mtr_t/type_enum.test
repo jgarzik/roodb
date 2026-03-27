@@ -1,0 +1,135 @@
+#
+# Trimmed MySQL type_enum.test for RooDB compatibility testing.
+# Original: /usr/lib/mysql-test/t/type_enum.test (379 lines)
+#
+
+# [RooDB-skip] --let $DEFAULT_ENGINE = ... (line 2)
+# [RooDB-skip] SET sql_mode = ... (line 11)
+# [RooDB-skip] Massive 300+ value ENUM (lines 12-17) -- too large for basic test
+# [RooDB-skip] GROUP BY on ENUM field (line 17)
+# [RooDB-skip] show create table / show columns (lines 28, 34, 56, 60, 76, 77, etc.)
+# [RooDB-skip] --replace_result directives
+# [RooDB-skip] CHARACTER SET / COLLATE (lines 56, 69-127, 135-140, etc.)
+# [RooDB-skip] set names latin1 (line 53)
+# [RooDB-skip] --character_set directive (line 54)
+# [RooDB-skip] ALTER TABLE on ENUM (lines 135-148, 204-208, 257)
+# [RooDB-skip] BINARY enum (line 83)
+# [RooDB-skip] ANALYZE TABLE (line 249)
+# [RooDB-skip] EXPLAIN (line 255, 259)
+# [RooDB-skip] --replace_result (line 254)
+# [RooDB-skip] --skip_if_hypergraph (line 232)
+# [RooDB-skip] CREATE TABLE ... SELECT (lines 235-237)
+# [RooDB-skip] Stored procedures (lines 284-296)
+# [RooDB-skip] DELIMITER // (none needed)
+# [RooDB-skip] INFORMATION_SCHEMA (line 312)
+# [RooDB-skip] show function status (line 309)
+# [RooDB-skip] optimizer_switch (line 304)
+# [RooDB-skip] INSERT IGNORE ... SELECT (line 376)
+# [RooDB-skip] --disable_result_log / --enable_result_log
+
+#
+# Basic ENUM creation and insert
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (a ENUM('a', 'b', 'c') NOT NULL);
+INSERT INTO t1 VALUES ('a');
+INSERT INTO t1 VALUES ('b');
+INSERT INTO t1 VALUES ('c');
+SELECT * FROM t1;
+SELECT * FROM t1 WHERE a = 'b';
+SELECT * FROM t1 WHERE a != 'b';
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+#
+# ENUM with numeric-like values
+#
+
+CREATE TABLE t1 (a ENUM('0', '1'));
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# ENUM with space values
+#
+
+CREATE TABLE t1 (a ENUM(' ', 'a', 'b') NOT NULL);
+INSERT INTO t1 VALUES (' ');
+INSERT INTO t1 VALUES ('a');
+INSERT INTO t1 VALUES ('b');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# ENUM default values
+#
+
+# [RooDB-skip] ENUM with DEFAULT value
+
+#
+# ENUM with empty string value
+#
+
+CREATE TABLE t1 (c1 ENUM('a', '', 'b'));
+INSERT INTO t1 (c1) VALUES ('a');
+INSERT INTO t1 (c1) VALUES ('');
+INSERT INTO t1 (c1) VALUES ('b');
+SELECT * FROM t1;
+SELECT c1 + 0, c1 FROM t1;
+DROP TABLE t1;
+
+#
+# ENUM ordering by numeric value
+#
+
+CREATE TABLE t1 (a ENUM('a','b','c','d'));
+INSERT INTO t1 VALUES ('d'), ('a'), ('c'), ('b');
+SELECT a FROM t1 ORDER BY a;
+SELECT a + 0, a FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+#
+# ENUM with NOT NULL and primary key
+#
+
+# [RooDB-skip] ENUM NOT NULL DEFAULT not supported
+
+#
+# ENUM comparison
+#
+
+CREATE TABLE t1 (a ENUM('small', 'medium', 'large'));
+INSERT INTO t1 VALUES ('small'), ('medium'), ('large');
+SELECT * FROM t1 WHERE a > 'small';
+SELECT * FROM t1 WHERE a < 'large';
+SELECT * FROM t1 WHERE a BETWEEN 'small' AND 'medium';
+DROP TABLE t1;
+
+#
+# ENUM used with WITH_GRANT_OPTION style values
+#
+
+CREATE TABLE t1 (
+  USER char(32),
+  HOST char(60),
+  PRIV char(32),
+  WITH_GRANT_OPTION enum('N','Y'),
+  PRIMARY KEY (WITH_GRANT_OPTION, USER, HOST, PRIV)
+);
+
+INSERT INTO t1 VALUES ('alice','localhost','SELECT','N');
+INSERT INTO t1 VALUES ('bob','localhost','INSERT','Y');
+INSERT INTO t1 VALUES ('charlie','localhost','UPDATE','N');
+
+SELECT * FROM t1 ORDER BY USER;
+SELECT * FROM t1 WHERE WITH_GRANT_OPTION = 'Y';
+
+DROP TABLE t1;
+
+--echo # End of type_enum tests

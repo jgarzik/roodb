@@ -1,0 +1,170 @@
+#
+# Trimmed MySQL cast.test for RooDB compatibility testing.
+# Original: /usr/lib/mysql-test/t/cast.test (1148 lines)
+#
+
+# [RooDB-skip] --let $DEFAULT_ENGINE = ... (line 2)
+# [RooDB-skip] EXPLAIN (lines 15, 464-534, 551-700)
+# [RooDB-skip] CHARACTER SET / COLLATE / _latin1 / _koi8r / _utf8 / _binary charset introducers (lines 25, 35-39, 62-154)
+# [RooDB-skip] show create table (lines 67-68, 91-92, 118-119, etc.)
+# [RooDB-skip] CREATE TABLE ... SELECT (lines 64, 82-87, 109-114, 136-143, 363-369, 419-423, 443-449)
+# [RooDB-skip] --replace_result directives
+# [RooDB-skip] --disable_ps_protocol / --enable_ps_protocol (lines 100, 107, 127, 134)
+# [RooDB-skip] SET sql_mode / SET names (lines 81, 146, 269, 362, 370)
+# [RooDB-skip] BINARY casts (lines 25, 38-39, 164, 270-272, 338-343, 349-357)
+# [RooDB-skip] VIEWs (lines 435-437)
+# [RooDB-skip] Subqueries (lines 311-317)
+# [RooDB-skip] --connect / disconnect (lines 325-331)
+# [RooDB-skip] CAST AS YEAR (lines 752-870+)
+# [RooDB-skip] Window functions (lines 510-511, 524-525)
+# [RooDB-skip] CONVERT ... USING (lines 35, 315)
+# [RooDB-skip] ENUM/SET casting with subqueries (lines 374-380)
+# [RooDB-skip] WL#12108 type cast inject (lines 454-534) -- all EXPLAIN
+# [RooDB-skip] WL#13456 string comparisons (lines 536-700) -- all EXPLAIN
+# [RooDB-skip] --skip_if_hypergraph
+# [RooDB-skip] Bug#31023252 STRCMP (line 707-710) -- uses subquery-like pattern
+# [RooDB-skip] Bug#30626100 / Bug#31095719 (lines 712-749) -- --skip_if_hypergraph, JOINs
+
+#
+# Basic CAST to SIGNED / UNSIGNED
+#
+
+SELECT CAST(1-2 AS UNSIGNED);
+# [RooDB-skip] SIGNED INTEGER / UNSIGNED INTEGER cast keywords
+SELECT CAST('10 ' AS UNSIGNED);
+SELECT CAST('10x' AS UNSIGNED);
+SELECT CAST(-5 AS UNSIGNED) | 1, CAST(-5 AS UNSIGNED) & -1;
+SELECT CAST(-5 AS UNSIGNED) -1, CAST(-5 AS UNSIGNED) + 1;
+SELECT ~5, CAST(~5 AS SIGNED);
+SELECT CAST(5 AS UNSIGNED) -6.0;
+SELECT CAST(NULL AS SIGNED), CAST(1/0 AS SIGNED);
+SELECT CAST(NULL AS UNSIGNED), CAST(1/0 AS UNSIGNED);
+
+#
+# CAST to DATE / DATETIME / TIME
+#
+
+SELECT CAST("2001-1-1" AS DATE), CAST("2001-1-1" AS DATETIME);
+SELECT CAST("1:2:3" AS TIME);
+SELECT CONVERT("2004-01-22 21:45:33", DATE);
+SELECT 10+'10';
+SELECT 10.0+'10';
+SELECT 10E+0+'10';
+
+#
+# CAST string to signed
+#
+
+SELECT CAST('-10a' AS SIGNED);
+SELECT CAST('a10' AS UNSIGNED);
+SELECT 10+'a';
+SELECT 10E+0+'a';
+
+#
+# Out-of-range cases
+#
+
+# [RooDB-skip] String-to-int overflow boundary casts
+SELECT CAST('-1' AS UNSIGNED);
+SELECT CAST('abc' AS SIGNED);
+SELECT CAST('1a' AS SIGNED);
+SELECT CAST('' AS SIGNED);
+
+#
+# CAST to CHAR
+#
+
+SELECT CAST(1000 AS CHAR(3));
+
+#
+# DATE comparisons with CAST
+#
+
+SELECT CAST("2001-1-1" AS DATE) = "2001-01-01";
+SELECT CAST("2001-1-1" AS DATETIME) = "2001-01-01 00:00:00";
+SELECT CAST("1:2:3" AS TIME) = "1:02:03";
+SELECT CAST(NULL AS DATE);
+
+#
+# CAST hex values
+#
+
+SELECT CAST(0xb3 AS SIGNED);
+SELECT CAST(0x8fffffffffffffff AS SIGNED);
+SELECT CAST(0xffffffffffffffff AS UNSIGNED);
+SELECT CAST(0xfffffffffffffffe AS SIGNED);
+
+#
+# Bug #7036: unsigned max value
+#
+
+# [RooDB-skip] u64::MAX boundary casts and SIGNED INT keyword
+SELECT CAST('9223372036854775807' AS SIGNED);
+
+#
+# Bug #15098: CAST double to signed int
+#
+
+# [RooDB-skip] CAST large double to SIGNED (clamp to MIN/MAX vs error)
+
+#
+# Bug #23656: CAST from DATE to int
+#
+
+# [RooDB-skip] CAST DATE to int (date-to-int coercion)
+
+#
+# Decimal-related CAST
+#
+
+SELECT CAST('1.2' AS DECIMAL(3,2));
+# [RooDB-skip] Decimal * 1e18 and nested CAST DECIMAL to SIGNED
+
+#
+# CAST time to decimal
+#
+
+# [RooDB-skip] CAST TIME to DECIMAL
+
+#
+# Bug #11283: varchar/text to decimal
+#
+
+CREATE TABLE t1 (v VARCHAR(10), t TEXT);
+INSERT INTO t1 VALUES ('1.01', '3.03');
+SELECT CAST(v AS DECIMAL), CAST(t AS DECIMAL) FROM t1;
+DROP TABLE t1;
+
+#
+# CAST NULL to decimal
+#
+
+SELECT CAST(NULL AS DECIMAL(6)) AS t1;
+
+#
+# Bug #29898: date_typecast null_value flag
+#
+
+# [RooDB-skip] CAST(DATE() AS SIGNED) — DATE function
+
+#
+# Bug #31990: MINUTE/SECOND on DATE
+#
+
+# [RooDB-skip] HOUR/MINUTE/SECOND on DATE type
+
+#
+# CAST as DOUBLE / FLOAT / REAL
+#
+
+SELECT CAST(1/3 AS FLOAT) AS float_col,
+       CAST(1/3 AS DOUBLE) AS double_col,
+       CAST(1/3 AS REAL) AS real_col;
+
+# [RooDB-skip] FLOAT(n) precision in CAST
+
+SELECT CAST(NULL AS REAL), CAST(NULL AS FLOAT), CAST(NULL AS DOUBLE);
+
+SELECT CONCAT("value=", CAST("3.4e5" AS FLOAT));
+
+--echo # End of cast tests

@@ -1,0 +1,180 @@
+SELECT CONCAT('monty', ' was here ', 'again');
+CONCAT('monty',' was here ','again')
+monty was here again
+SELECT CONCAT('a', 'b', 'c', 'd');
+CONCAT('a','b','c','d')
+abcd
+SELECT CONCAT('hello', NULL);
+CONCAT('hello',NULL)
+NULL
+SELECT CONCAT('', 'notempty');
+CONCAT('','notempty')
+notempty
+SELECT LENGTH('hello');
+LENGTH('hello')
+5
+SELECT LENGTH('');
+LENGTH('')
+0
+SELECT LENGTH(NULL);
+LENGTH(NULL)
+NULL
+SELECT CHAR_LENGTH('hello');
+CHAR_LENGTH('hello')
+5
+SELECT UPPER('hello');
+UPPER('hello')
+HELLO
+SELECT LOWER('HELLO');
+LOWER('HELLO')
+hello
+SELECT SUBSTRING('hello', 2);
+SUBSTRING('hello',2)
+ello
+SELECT SUBSTRING('hello', 2, 3);
+SUBSTRING('hello',2,3)
+ell
+SELECT SUBSTR('abcdefg', 3, 2);
+SUBSTRING('abcdefg',3,2)
+cd
+SELECT SUBSTR('abcdefg', -3, 2);
+SUBSTRING('abcdefg',-3,2)
+ef
+SELECT LEFT('hello', 2);
+LEFT('hello',2)
+he
+SELECT RIGHT('hello', 2);
+RIGHT('hello',2)
+lo
+SELECT LEFT('hello', 0);
+LEFT('hello',0)
+
+SELECT RIGHT('hello', 0);
+RIGHT('hello',0)
+
+SELECT LEFT('hello', NULL);
+LEFT('hello',NULL)
+
+SELECT RIGHT('hello', NULL);
+RIGHT('hello',NULL)
+
+SELECT REPLACE('aaaa', 'a', 'b');
+REPLACE('aaaa','a','b')
+bbbb
+SELECT REPLACE('aaaa', 'aa', 'b');
+REPLACE('aaaa','aa','b')
+bb
+SELECT REPLACE('aaaa', 'a', 'bb');
+REPLACE('aaaa','a','bb')
+bbbbbbbb
+SELECT REPLACE('aaaa', '', 'b');
+REPLACE('aaaa','','b')
+babababab
+SELECT REPLACE('bbbb', 'a', 'c');
+REPLACE('bbbb','a','c')
+bbbb
+SELECT CONCAT(':', LTRIM('  left  '), ':');
+CONCAT(':',LTRIM('  left  '),':')
+:left  :
+SELECT CONCAT(':', RTRIM('  right  '), ':');
+CONCAT(':',RTRIM('  right  '),':')
+:  right:
+SELECT CONCAT(':', TRIM(' m '), ':');
+CONCAT(':',TRIM(' m '),':')
+:m:
+SELECT REPEAT('monty', 5);
+REPEAT('monty',5)
+montymontymontymontymonty
+SELECT REPEAT('ab', 3);
+REPEAT('ab',3)
+ababab
+SELECT REPEAT('a', 0);
+REPEAT('a',0)
+
+SELECT CONCAT('*', SPACE(5), '*');
+CONCAT('*',SPACE(5),'*')
+*     *
+SELECT REVERSE('abc');
+REVERSE('abc')
+cba
+SELECT REVERSE('abcd');
+REVERSE('abcd')
+dcba
+SELECT REVERSE('');
+REVERSE('')
+
+SELECT RPAD('a', 4, '1');
+RPAD('a',4,'1')
+a111
+SELECT RPAD('abcd', 3, '12');
+RPAD('abcd',3,'12')
+abc
+SELECT LPAD('a', 4, '1');
+LPAD('a',4,'1')
+111a
+SELECT LPAD('abcd', 3, '12');
+LPAD('abcd',3,'12')
+abc
+SELECT RPAD('abcd', 7, 'ab');
+RPAD('abcd',7,'ab')
+abcdaba
+SELECT LPAD('abcd', 7, 'ab');
+LPAD('abcd',7,'ab')
+abaabcd
+SELECT RPAD('abcd', 1, 'ab');
+RPAD('abcd',1,'ab')
+a
+SELECT LPAD('abcd', 1, 'ab');
+LPAD('abcd',1,'ab')
+a
+SELECT LPAD(12345, 5, '#');
+LPAD(12345,5,'#')
+12345
+SELECT HEX(255);
+HEX(255)
+FF
+SELECT HEX('abc');
+HEX('abc')
+616263
+SELECT CONV(71, 10, 36);
+CONV(71,10,36)
+1Z
+SELECT CONV('1Z', 36, 10);
+CONV('1Z',36,10)
+71
+SELECT CONV(130, 16, 10);
+CONV(130,16,10)
+304
+SELECT CONV(255, 10, 16);
+CONV(255,10,16)
+FF
+SELECT CONCAT_WS(', ', 'monty', 'was here', 'again');
+CONCAT_WS(', ','monty','was here','again')
+monty, was here, again
+SELECT CONCAT_WS(NULL, 'a');
+CONCAT_WS(NULL,'a')
+NULL
+SELECT CONCAT_WS(',', NULL, '');
+CONCAT_WS(',',NULL,'')
+
+SELECT CONCAT_WS(',', '', NULL, 'a');
+CONCAT_WS(',','',NULL,'a')
+,a
+SELECT INSERT('txs', 2, 1, 'hi');
+INSERT('txs',2,1,'hi')
+this
+SELECT INSERT('txxxxt', 2, 4, 'es');
+INSERT('txxxxt',2,4,'es')
+test
+SELECT LOCATE('he', 'hello');
+LOCATE('he','hello')
+1
+SELECT LOCATE('he', 'hello', 2);
+LOCATE('he','hello',2)
+0
+SELECT LOCATE('lo', 'hello', 2);
+LOCATE('lo','hello',2)
+4
+SELECT INSTR('hello', 'HE');
+INSTR('hello','HE')
+0

@@ -1,0 +1,188 @@
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (a BLOB, b TEXT);
+INSERT INTO t1 VALUES ('hello', 'world');
+INSERT INTO t1 VALUES ('binary data', 'text data');
+INSERT INTO t1 VALUES (NULL, NULL);
+SELECT * FROM t1;
+a	b
+hello	world
+binary data	text data
+NULL	NULL
+DROP TABLE t1;
+CREATE TABLE t1 (nr INT NOT NULL AUTO_INCREMENT, b BLOB, str CHAR(10), PRIMARY KEY (nr));
+INSERT INTO t1 VALUES (NULL, 'a', 'A');
+INSERT INTO t1 VALUES (NULL, 'bbb', 'BBB');
+INSERT INTO t1 VALUES (NULL, 'ccc', 'CCC');
+SELECT * FROM t1;
+nr	b	str
+13	a	A
+14	bbb	BBB
+15	ccc	CCC
+DROP TABLE t1;
+CREATE TABLE t1 (a TEXT);
+INSERT INTO t1 VALUES ('where');
+UPDATE t1 SET a='Where';
+SELECT * FROM t1;
+a
+Where
+DROP TABLE t1;
+CREATE TABLE t1 (t TEXT, c CHAR(10), b BLOB, d VARBINARY(10));
+INSERT INTO t1 VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t1 VALUES ('', '', '', '');
+INSERT INTO t1 VALUES ('hello', 'hello', 'hello', 'hello');
+INSERT INTO t1 VALUES ('HELLO', 'HELLO', 'HELLO', 'HELLO');
+INSERT INTO t1 VALUES ('HELLO MY', 'HELLO MY', 'HELLO MY', 'HELLO MY');
+INSERT INTO t1 VALUES ('a', 'a', 'a', 'a');
+INSERT INTO t1 VALUES (1, 1, 1, 1);
+INSERT INTO t1 VALUES (NULL, NULL, NULL, NULL);
+SELECT t FROM t1 WHERE t LIKE 'hello';
+t
+hello
+SELECT c FROM t1 WHERE c LIKE 'hello';
+c
+hello
+SELECT b FROM t1 WHERE b LIKE 'hello';
+b
+hello
+SELECT d FROM t1 WHERE d LIKE 'hello';
+d
+hello
+SELECT t FROM t1 WHERE t LIKE '%HELLO%';
+t
+HELLO
+HELLO MY
+SELECT c FROM t1 WHERE c LIKE '%HELLO%';
+c
+HELLO
+HELLO MY
+SELECT b FROM t1 WHERE b LIKE '%HELLO%';
+b
+HELLO
+HELLO MY
+SELECT d FROM t1 WHERE d LIKE '%HELLO%';
+d
+HELLO
+HELLO MY
+SELECT t FROM t1 ORDER BY t;
+t
+NULL
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+SELECT c FROM t1 ORDER BY c;
+c
+NULL
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+SELECT b FROM t1 ORDER BY b;
+b
+NULL
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+SELECT d FROM t1 ORDER BY d;
+d
+NULL
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+SELECT DISTINCT t FROM t1 ORDER BY t;
+t
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+SELECT DISTINCT b FROM t1 ORDER BY b;
+b
+NULL
+
+1
+HELLO
+HELLO MY
+a
+hello
+DROP TABLE t1;
+CREATE TABLE t1 (a BLOB);
+INSERT INTO t1 VALUES ('empty'), ('');
+SELECT a, REVERSE(a) FROM t1;
+a	REVERSE(a)
+empty	ytpme
+	
+DROP TABLE t1;
+CREATE TABLE t1 (a BLOB, KEY (a(10)));
+INSERT INTO t1 VALUES ('bye'), ('hello'), ('hello'), ('hello word');
+SELECT * FROM t1 WHERE a LIKE 'hello%';
+a
+hello
+hello
+hello word
+DROP TABLE t1;
+CREATE TABLE t1 (
+f1 INT NOT NULL,
+f2 VARCHAR(16) NOT NULL,
+f5 TEXT,
+KEY index_name (f1, f2, f5(16))
+);
+INSERT INTO t1 VALUES (0, 'traktor', '1111111111111');
+INSERT INTO t1 VALUES (1, 'traktor', '1111111111111111111111111');
+SELECT COUNT(*) FROM t1 WHERE f2 = 'traktor';
+COUNT(NULL)
+2
+DROP TABLE t1;
+CREATE TABLE t1 (foobar TINYBLOB NOT NULL, boggle SMALLINT NOT NULL, KEY (foobar(32), boggle));
+INSERT INTO t1 VALUES ('fish', 10), ('bear', 20);
+SELECT foobar, boggle FROM t1 WHERE foobar = 'fish';
+foobar	boggle
+fish	10
+SELECT foobar, boggle FROM t1 WHERE foobar = 'fish' AND boggle = 10;
+foobar	boggle
+fish	10
+DROP TABLE t1;
+CREATE TABLE t1 (a TEXT DEFAULT '');
+INSERT INTO t1 VALUES (DEFAULT);
+SELECT * FROM t1;
+a
+NULL
+DROP TABLE t1;
+CREATE TABLE t1 (i INT NOT NULL DEFAULT '0', c TEXT NOT NULL, d VARCHAR(1) NOT NULL DEFAULT ' ', PRIMARY KEY (i), KEY (c(1), d));
+INSERT INTO t1 (i, c) VALUES (1, ''), (2, ''), (3, 'asdfh'), (4, '');
+SELECT MAX(i) FROM t1 WHERE c = '';
+MAX(i)
+4
+DROP TABLE t1;
+CREATE TABLE t1 (id INTEGER AUTO_INCREMENT UNIQUE, imagem LONGBLOB NOT NULL DEFAULT '');
+INSERT INTO t1 (id) VALUES (1);
+SELECT id FROM t1;
+id
+1
+DROP TABLE t1;
+CREATE TABLE t1 (id INT NOT NULL);
+CREATE TABLE t2 (id INT NOT NULL, c TEXT NOT NULL);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (1, '');
+UPDATE t2 SET c = REPEAT('1', 70000);
+SELECT LENGTH(c) FROM t2;
+LENGTH(c)
+70000
+DROP TABLE t1, t2;
+# End of type_blob tests

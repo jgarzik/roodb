@@ -1,0 +1,96 @@
+# Trimmed from MySQL type_decimal.test for RooDB compatibility testing.
+# Tests basic DECIMAL create/insert/select, arithmetic, and comparison.
+
+#
+# Basic DECIMAL table with inserts and range comparison
+#
+CREATE TABLE t1 (
+  id int NOT NULL,
+  min_value decimal(20,10) DEFAULT '0.0000000000' NOT NULL,
+  max_value decimal(20,10) DEFAULT '0.0000000000' NOT NULL,
+  PRIMARY KEY (id)
+);
+
+INSERT INTO t1 VALUES (1, '0.0000000000', '0.0000000000');
+INSERT INTO t1 VALUES (2, '1.0000000000', '1.0000000000');
+INSERT INTO t1 VALUES (3, '2.0000000000', '49.0000000000');
+INSERT INTO t1 VALUES (4, '-35.0000000000', '-5.0000000000');
+INSERT INTO t1 VALUES (5, '-4.9000000000', '-0.1000000000');
+
+SELECT * FROM t1 WHERE min_value <= 1 AND max_value >= -1;
+SELECT * FROM t1 WHERE min_value <= -1 AND max_value >= -1;
+DROP TABLE t1;
+
+#
+# DECIMAL with string input, signs, and leading zeros
+#
+CREATE TABLE t1 (a decimal(10,2));
+INSERT INTO t1 VALUES ("0.0"),("-0.0"),("+0.0"),("01.0"),("+01.0"),("-01.0");
+INSERT INTO t1 VALUES ("-.1"),("+.1"),(".1");
+INSERT INTO t1 VALUES ("00000000000001"),("+0000000000001"),("-0000000000001");
+INSERT INTO t1 VALUES ("+111111111.11"),("111111111.11"),("-11111111.11");
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# DECIMAL with numeric input
+#
+CREATE TABLE t1 (a decimal(10,2));
+INSERT INTO t1 VALUES (0.0),("-0.0"),(+0.0),(01.0),(+01.0),(-01.0);
+INSERT INTO t1 VALUES (-.1),(+.1),(.1);
+INSERT INTO t1 VALUES (00000000000001),(+0000000000001),(-0000000000001);
+INSERT INTO t1 VALUES (+111111111.11),(111111111.11),(-11111111.11);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# Overflow handling
+#
+CREATE TABLE t1 (a decimal);
+INSERT INTO t1 VALUES (-99999999999999),(-1),('+1'),('01'),('+00000000000001'),('+12345678901'),(99999999999999);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# Update from column with different precision
+#
+CREATE TABLE t1 (a decimal(10,5), b decimal(10,1));
+INSERT INTO t1 VALUES (123.12345, 123.12345);
+UPDATE t1 SET b = a;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# DECIMAL limits
+#
+CREATE TABLE t1 (d decimal(64,0));
+INSERT INTO t1 VALUES (1);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# Arithmetic with DECIMAL, GROUP BY, HAVING
+#
+CREATE TABLE t1 (i INT, d1 DECIMAL(9,2), d2 DECIMAL(9,2));
+INSERT INTO t1 VALUES (1, 101.40, 21.40), (1, -80.00, 0.00),
+(2, 0.00, 0.00), (2, -13.20, 0.00), (2, 59.60, 46.40),
+(2, 30.40, 30.40), (3, 37.00, 7.40), (3, -29.60, 0.00),
+(4, 60.00, 15.40), (4, -10.60, 0.00), (4, -34.00, 0.00),
+(5, 33.00, 0.00), (5, -25.80, 0.00), (5, 0.00, 7.20),
+(6, 0.00, 0.00), (6, -51.40, 0.00);
+
+SELECT i, SUM(d1) AS a, SUM(d2) AS b FROM t1 GROUP BY i HAVING a <> b;
+SELECT i, ROUND(SUM(d1), 2) AS a, ROUND(SUM(d2), 2) AS b FROM t1 GROUP BY i
+HAVING a <> b;
+DROP TABLE t1;
+
+#
+# DECIMAL comparison and arithmetic expressions
+#
+SELECT 1.5 + 2.5;
+SELECT 10.0 - 3.5;
+SELECT 2.5 * 4.0;
+SELECT 10.0 / 3.0;
+SELECT CAST(1.5 AS DECIMAL(10,2)) = CAST(1.50 AS DECIMAL(10,2));
+SELECT CAST(1.5 AS DECIMAL(10,2)) < CAST(2.50 AS DECIMAL(10,2));
+SELECT CAST(3.0 AS DECIMAL(10,2)) > CAST(2.50 AS DECIMAL(10,2));

@@ -5398,6 +5398,8 @@ where
                     (codes::ER_BAD_NULL_ERROR, "23000")
                 } else if msg.contains("already exists") {
                     (codes::ER_DUP_ENTRY, "23000")
+                } else if msg.contains("columns but") && msg.contains("values") {
+                    (codes::ER_WRONG_VALUE_COUNT_ON_ROW, "21S01")
                 } else if msg.contains("Incorrect arguments") {
                     (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
                 } else if msg.contains("can't have a default value") {

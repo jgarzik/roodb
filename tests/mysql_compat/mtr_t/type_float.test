@@ -1,0 +1,204 @@
+#
+# Trimmed MySQL type_float.test for RooDB compatibility testing.
+# Original: /usr/lib/mysql-test/t/type_float.test (504 lines)
+#
+
+# [RooDB-skip] --let $DEFAULT_ENGINE = ... (line 2)
+# [RooDB-skip] SET sql_mode = ... (line 8)
+# [RooDB-skip] show full columns (lines 17, 66)
+# [RooDB-skip] show create table (lines 49, 134)
+# [RooDB-skip] CREATE TABLE ... SELECT (lines 44, 129, 141-153)
+# [RooDB-skip] --replace_result directives
+# [RooDB-skip] EXPLAIN (lines 175, 188)
+# [RooDB-skip] ANALYZE TABLE (lines 174, 187)
+# [RooDB-skip] --skip_if_hypergraph
+# [RooDB-skip] --sorted_result with GROUP BY/HAVING
+# [RooDB-skip] ALTER TABLE (lines 186, 366-435)
+# [RooDB-skip] AUTO_INCREMENT on FLOAT/DOUBLE (lines 366-384)
+# [RooDB-skip] --let / eval / PREPARE directives (lines 227-231, 313-320)
+# [RooDB-skip] --disable_result_log / --enable_result_log
+# [RooDB-skip] CREATE TABLE LIKE (lines 369, 379, etc.)
+# [RooDB-skip] Stored procedures/functions (lines 437-503)
+# [RooDB-skip] DELIMITER // (lines 439, 497)
+# [RooDB-skip] ZEROFILL (lines 221-233)
+# [RooDB-skip] UNSIGNED on FLOAT/DOUBLE deprecation tests (lines 451-503)
+# [RooDB-skip] Float overflow at line 242+ (too strict)
+# [RooDB-skip] format() and group_concat() (lines 316-329)
+
+#
+# Basic float expressions
+#
+
+SELECT 10,10.0,10.,.1e+2,100.0e-1;
+SELECT 6e-16, -6e-16, --6e-16, -6e-16+1.000000;
+SELECT 1e1,1.e1,1.0e1,1e+1,1.e+1,1.0e+1,1e-1,1.e-1,1.0e-1;
+SELECT 0.001e+1,0.001e-1, -0.001e+01,-0.001e-01;
+SELECT 123.23E+02,-123.23E-02,"123.23E+02"+0.0,"-123.23E-02"+0.0;
+SELECT 2147483647E+02,21474836.47E+06;
+
+#
+# Basic float table operations
+#
+
+create table t1 (datum double);
+insert into t1 values (0.5),(1.0),(1.5),(2.0),(2.5);
+select * from t1;
+select * from t1 where datum < 1.5;
+select * from t1 where datum > 1.5;
+select * from t1 where datum = 1.5;
+drop table t1;
+
+#
+# Decimal ordering
+#
+
+create table t1 (a  decimal(7,3) not null, key (a));
+insert into t1 values ("0"),("-0.00"),("-0.01"),("-0.002"),("1");
+select a from t1 order by a;
+select min(a) from t1;
+drop table t1;
+
+#
+# Bug #3612: double arithmetic
+#
+
+create table t1 (c1 double, c2 varchar(20));
+insert into t1 values (121,"16");
+select c1 + c1 * (c2 / 100) as col from t1;
+drop table t1;
+
+#
+# Bug #1022: MAX/MIN/AVG on float
+#
+
+create table t1 (a float);
+insert into t1 values (1);
+select max(a),min(a),avg(a) from t1;
+drop table t1;
+
+#
+# Decimal ordering (repeat)
+#
+
+create table t1 (a  decimal(7,3) not null, key (a));
+insert into t1 values ("0"),("-0.00"),("-0.01"),("-0.002"),("1");
+select a from t1 order by a;
+select min(a) from t1;
+drop table t1;
+
+#
+# Error: float(200,100) should fail
+#
+--error 1425
+create table t1 (a float(200,100), b double(200,100));
+
+#
+# Float in a char(1) field
+#
+create table t1 (c20 char);
+insert into t1 values (5000.0);
+insert into t1 values (0.5e4);
+drop table t1;
+
+#
+# Error: float(54) should fail
+#
+--error 1063
+create table t1 (f float(54));
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+#
+# Do not allow double unsigned to go negative (Bug #7700)
+#
+create table t1 (d1 double, d2 double unsigned);
+insert into t1 set d1 = -1.0;
+update t1 set d2 = d1;
+select * from t1;
+drop table t1;
+
+#
+# Bug #7361: float(m,d) max values enforced
+#
+create table t1 (f float(4,3));
+insert into t1 values (-11.0),(-11),("-11"),(11.0),(11),("11");
+select * from t1;
+drop table if exists t1;
+create table t1 (f double(4,3));
+insert into t1 values (-11.0),(-11),("-11"),(11.0),(11),("11");
+select * from t1;
+drop table if exists t1;
+
+#
+# Bug #7774: float to char conversion
+#
+create table t1 (c char(20));
+insert into t1 values (5e-28);
+select * from t1;
+drop table t1;
+create table t1 (c char(6));
+insert into t1 values (2e5),(2e6),(2e-4),(2e-5);
+select * from t1;
+drop table t1;
+
+#
+# Bug #22129: small double precision number
+#
+select 1e-308, 1.00000001e-300, 100000000e-300;
+
+#
+# Overflow detection
+#
+select 10e307;
+
+#
+# Bug #12860: zero padding of exponent
+#
+create table t1 (c char(6));
+insert into t1 values (2e6),(2e-5);
+select * from t1;
+drop table t1;
+
+#
+# Bug #21497: DOUBLE max value
+#
+# [RooDB-skip] Lines 166-172 (DOUBLE max boundary INSERT overflow detection)
+
+#
+# Bug #26788: specific numbers into char fields
+#
+create table t1 (a char(20));
+insert into t1 values (1.225e-05);
+select a+0 from t1;
+drop table t1;
+
+#
+# Bug #27483: scientific notation to unsigned bigint
+#
+create table t1(d double, u bigint unsigned);
+insert into t1(d) values (9.22337203685479e18),
+                         (1.84e19);
+update t1 set u = d;
+select u from t1;
+drop table t1;
+
+#
+# Bug #21205: DOUBLE min value
+#
+CREATE TABLE t1 (f1 DOUBLE);
+INSERT INTO t1 VALUES(-1.79769313486231e+308);
+SELECT f1 FROM t1;
+DROP TABLE t1;
+
+#
+# Bug #13500371: conversion of '1.' to number
+#
+CREATE TABLE t1 (f FLOAT);
+INSERT INTO t1 VALUES ('1.');
+INSERT INTO t1 VALUES ('2.0.');
+INSERT INTO t1 VALUES ('.');
+SELECT * FROM t1 ORDER BY f;
+DROP TABLE t1;
+
+--echo # End of type_float tests

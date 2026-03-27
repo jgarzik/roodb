@@ -1,0 +1,86 @@
+create table t1 (a char(4), b double, c date, d tinyint(4));
+insert into t1 values ('AAAA', 105, '2003-03-01', 1);
+select * from t1 where concat(A,C,B,D) = 'AAAA2003-03-011051';
+a	b	c	d
+AAAA	105	2003-03-01	1
+drop table t1;
+CREATE TABLE t1 (c1 varchar(100), c2 varchar(100));
+INSERT INTO t1 VALUES ('',''), ('','First'), ('Random','Random');
+SELECT * FROM t1 WHERE CONCAT(c1,' ',c2) REGEXP 'First.*';
+c1	c2
+	First
+DROP TABLE t1;
+CREATE TABLE t1 (a varchar(10), b varchar(10));
+INSERT INTO t1 VALUES ('hello', 'world');
+INSERT INTO t1 VALUES ('foo', 'bar');
+INSERT INTO t1 VALUES (NULL, 'test');
+INSERT INTO t1 VALUES ('test', NULL);
+SELECT CONCAT(a, b) FROM t1;
+CONCAT(a,b)
+helloworld
+foobar
+NULL
+NULL
+SELECT CONCAT(a, ' ', b) FROM t1;
+CONCAT(a,' ',b)
+hello world
+foo bar
+NULL
+NULL
+SELECT CONCAT_WS(',', a, b) FROM t1;
+CONCAT_WS(',',a,b)
+hello,world
+foo,bar
+test
+test
+SELECT CONCAT_WS('-', a, b, 'extra') FROM t1;
+CONCAT_WS('-',a,b,'extra')
+hello-world-extra
+foo-bar-extra
+test-extra
+test-extra
+SELECT CONCAT_WS(',', NULL, a, b) FROM t1;
+CONCAT_WS(',',NULL,a,b)
+hello,world
+foo,bar
+test
+test
+# CONCAT with NULL returns NULL
+SELECT CONCAT(a, NULL) FROM t1;
+CONCAT(a,NULL)
+NULL
+NULL
+NULL
+NULL
+SELECT CONCAT(NULL, b) FROM t1;
+CONCAT(NULL,b)
+NULL
+NULL
+NULL
+NULL
+# CONCAT_WS with NULL separator
+SELECT CONCAT_WS(NULL, a, b) FROM t1;
+CONCAT_WS(NULL,a,b)
+NULL
+NULL
+NULL
+NULL
+# CONCAT_WS skips NULL arguments
+SELECT CONCAT_WS(',', a, NULL, b) FROM t1;
+CONCAT_WS(',',a,NULL,b)
+hello,world
+foo,bar
+test
+test
+DROP TABLE t1;
+# Numeric concat
+SELECT CONCAT(1, 2, 3);
+CONCAT(1,2,3)
+123
+SELECT CONCAT_WS('-', 1, 2, 3);
+CONCAT_WS('-',1,2,3)
+1-2-3
+SELECT CONCAT(1.5, 'x');
+CONCAT(1.5,'x')
+1.5x
+# End of func_concat tests
