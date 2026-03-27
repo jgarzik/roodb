@@ -851,6 +851,13 @@ impl<'a> Resolver<'a> {
                         .clone()
                         .unwrap_or_else(|| table_ref.name.clone());
 
+                    // MySQL DUAL pseudo-table: SELECT expr FROM DUAL is same as SELECT expr
+                    if table_ref.name.eq_ignore_ascii_case("dual")
+                        && table_ref.inner_query.is_none()
+                    {
+                        continue;
+                    }
+
                     if table_ref.inner_query.is_some() {
                         // Derived table or view — add columns directly to scope
                         scope.add_derived_table(&alias, &table_ref.columns);
@@ -863,12 +870,15 @@ impl<'a> Resolver<'a> {
                     }
                 }
 
-                // Build resolved from list first
+                // Build resolved from list first (skip DUAL pseudo-table)
                 let resolved_from: Vec<ResolvedTableRef> = select
                     .from
                     .iter()
                     .map(|t| self.resolve_table_factor(&t.relation))
-                    .collect::<SqlResult<Vec<_>>>()?;
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|t| !t.name.eq_ignore_ascii_case("dual") || t.inner_query.is_some())
+                    .collect();
 
                 // Add joined tables to scope
                 let mut resolved_joins = Vec::new();
@@ -1007,6 +1017,16 @@ impl<'a> Resolver<'a> {
         match table {
             sp::TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
+
+                // MySQL DUAL pseudo-table: FROM DUAL is equivalent to no FROM
+                if table_name.eq_ignore_ascii_case("dual") {
+                    return Ok(ResolvedTableRef {
+                        name: "dual".to_string(),
+                        alias: alias.as_ref().map(|a| a.name.value.clone()),
+                        columns: vec![],
+                        inner_query: None,
+                    });
+                }
 
                 // Check physical table first
                 if let Some(table_def) = self.catalog.get_table(&table_name) {

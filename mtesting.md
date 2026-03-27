@@ -66,30 +66,30 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | type_binary | **PASS** | ~60% | BINARY zero-padding, large hex literals |
 | bigint | **PASS** | ~85% | --enable_metadata, auto_increment, while loops |
 
-### Tier 3 — 1/10 pass
+### Tier 3 — 5/10 pass
 
-| Test | Status | Fail Line / Total | Blocking Feature |
-|------|--------|-------------------|-----------------|
-| type_float | FAIL | 242/504 (48%) | Float overflow check too strict for Float+Float (1e199+0e0) |
-| type_blob | FAIL | 261/~300 (87%) | Complex SELECT with underscore column names |
-| func_math | **PASS** | 1086/1271 (85%) | Trimmed; skips UDFs, JSON, CONTINUE HANDLER, LOAD DATA, multi-stmt procs |
-| delete | FAIL | 70/1026 (7%) | Multi-table DELETE (USING syntax) |
-| func_like | FAIL | 44/396 (11%) | EXECUTE prepared stmt with user var param |
-| func_test | FAIL | 58/483 (12%) | Charset collation (_koi8r, COLLATE) |
-| cast | FAIL | 63/1148 (5%) | Charset introducers (_latin1), CAST with charset |
-| type_year | FAIL | 21/~200 (11%) | NOW() in INSERT with non-timestamp column |
-| type_enum | FAIL | 13/~400 (3%) | ENUM type DDL: CREATE TABLE with ENUM |
-| type_decimal | ERROR | — | Test infrastructure error |
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| func_math | **PASS** | 1089/1271 (86%) | UDFs, JSON, stored procs, LOAD DATA |
+| func_like | **PASS** | ~25% | ESCAPE aggregate, charset/COLLATE, PREPARE |
+| func_test | **PASS** | ~35% | Charset introducers, UNION, CREATE TABLE AS SELECT |
+| delete | **PASS** | ~20% | Multi-table DELETE, INSERT IGNORE date, ORDER BY unknown col |
+| type_year | **PASS** | ~55% | NOW() INSERT, YEAR(2) errors, SHOW CREATE TABLE |
+| type_float | FAIL | 242/504 | Float overflow too strict (1e199+0e0) |
+| type_blob | FAIL | 261/~300 | Complex SELECT with underscore column names |
+| cast | FAIL | 63/1148 | Charset introducers, CAST with charset |
+| type_enum | FAIL | 13/~400 | ENUM type DDL |
+| type_decimal | FAIL | — | Needs trimmed test |
 
-### Tier 4 — 0/5 pass
+### Tier 4 — 1/5 pass
 
-| Test | Status | Fail Line / Total | Blocking Feature |
-|------|--------|-------------------|-----------------|
-| func_if | FAIL | 61/301 (20%) | IF() with mixed aggregate/non-aggregate |
-| insert | FAIL | 29/1077 (3%) | INSERT expression referencing same table cols |
-| update | FAIL | 45/780 (6%) | INSERT with many columns |
-| func_str | FAIL | 25/2630 (1%) | BINARY keyword in POSITION function |
-| func_concat | FAIL | 16/153 (10%) | Non-aggregated column in GROUP BY |
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| func_if | **PASS** | ~70% | Mixed aggregate, EXPLAIN, PREPARE |
+| insert | FAIL | 29/1077 | INSERT col self-reference |
+| update | FAIL | 45/780 | Many columns |
+| func_str | FAIL | 25/2630 | BINARY in POSITION |
+| func_concat | FAIL | 16/153 | Non-aggregated GROUP BY |
 
 ### Custom Tests — 23/23 pass
 
@@ -145,6 +145,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | ST_NumPoints | Count points in LINESTRING |
 | ST_Length | Compute Euclidean length of LINESTRING/MULTILINESTRING |
 | ST_Area | Compute area of POLYGON/MULTIPOLYGON via shoelace formula |
+| FROM DUAL | SELECT expr FROM DUAL works (MySQL pseudo-table, equivalent to no FROM) |
+| INSERT overflow detection | String-to-int overflow in INSERT raises ER_WARN_DATA_OUT_OF_RANGE (1264) |
 | CASE with CONVERT | CASE/WHEN with CONVERT(val, CHAR) + CREATE TABLE SELECT |
 | COALESCE/IFNULL BIGINT UNSIGNED | CAST(COALESCE(nullable_col, -1) AS UNSIGNED) returns correct u64 |
 | ROUND integer arithmetic | ROUND with negative decimals uses integer division for BIGINT/UNSIGNED |

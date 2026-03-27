@@ -1,0 +1,166 @@
+--disable_warnings
+drop table if exists t1,t2;
+--enable_warnings
+#
+# Testing of comparison functions (trimmed for RooDB)
+#
+select 0=0,1>0,1>=1,1<0,1<=0,1!=0,strcmp("abc","abcd"),strcmp("b","a"),strcmp("a","a") ;
+select "a"<"b","a"<="b","b">="a","b">"a","a"="A","a"<>"b";
+select "a "="A", "A "="a", "a  " <= "A b";
+select "abc" like "a%", "abc" not like "%d%", "a%" like "a\%","abc%" like "a%\%","abcde" like "a%_e","abc" like "abc%";
+select "a" like "%%b","a" like "%%ab","ab" like "a\%", "ab" like "_", "ab" like "ab_", "abc" like "%_d", "abc" like "abc%d";
+select '?' like '|%', '?' like '|%' ESCAPE '|', '%' like '|%', '%' like '|%' ESCAPE '|', '%' like '%';
+select 'abc' like '%c','abcabc' like '%c',  "ab" like "", "ab" like "a", "ab" like "ab";
+select "aba" regexp "^(a|b)*$";
+select "aba" regexp concat("^","a");
+select !0,NOT 0=1,!(0=0),1 AND 1,1 && 0,0 OR 1,1 || NULL, 1=1 or 1=1 and 1=0;
+select 2 between 1 and 3, "monty" between "max" and "my",2=2 and "monty" between "max" and "my" and 3=3;
+select 'b' between 'a' and 'c', 'B' between 'a' and 'c';
+select 2 in (3,2,5,9,5,1),"monty" in ("david","monty","allan"), 1.2 in (1.4,1.2,1.0);
+select -1.49 or -1.49,0.6 or 0.6;
+select 3 ^ 11, 1 ^ 1, 1 ^ 0, 1 ^ NULL, NULL ^ 1;
+# [RooDB-skip] EXPLAIN
+select 1 XOR 1, 1 XOR 0, 0 XOR 1, 0 XOR 0, NULL XOR 1, 1 XOR NULL, 0 XOR NULL;
+select 1 like 2 xor 2 like 1;
+select 10 % 7, 10 mod 7, 10 div 3;
+# [RooDB-skip] EXPLAIN
+select 18446744073709551615, 18446744073709551615 DIV 1, 18446744073709551615 DIV 2;
+# [RooDB-skip] EXPLAIN with bit shift
+
+create table t1 (a int);
+insert t1 values (1);
+# [RooDB-skip] ANALYZE TABLE
+select * from t1 where 1 xor 1;
+# [RooDB-skip] EXPLAIN
+select - a from t1;
+# [RooDB-skip] EXPLAIN
+drop table t1;
+
+#
+# Wrong usage of functions
+#
+
+select 5 between 0 and 10 between 0 and 1,(5 between 0 and 10) between 0 and 1;
+select 1 and 2 between 2 and 10, 2 between 2 and 10 and 1;
+select 1 and 0 or 2, 2 or 1 and 0;
+
+# [RooDB-skip] _koi8r charset introducer / COLLATE sections (lines 50-79)
+
+#
+# Test for LEAST() BUG in LEFT JOIN
+#
+CREATE TABLE t1 (d varchar(6), k int);
+INSERT INTO t1 VALUES (NULL, 2);
+SELECT GREATEST(d,d) FROM t1 WHERE k=2;
+DROP TABLE t1;
+
+#
+# Bug #6138: mod and doubles
+#
+
+select 1197.90 mod 50;
+select 5.1 mod 3, 5.1 mod -3, -5.1 mod 3, -5.1 mod -3;
+
+#
+# Test for mod and signed integers
+#
+
+select 5 mod 3, 5 mod -3, -5 mod 3, -5 mod -3;
+
+#
+# Bug#23411: MOD-ing zero returns strange result
+#
+select (12%0) <=> null      as '1';
+select (12%0) is null       as '1';
+select 12%0                 as 'NULL';
+select 12%2                 as '0';
+select 12%NULL              as 'NULL';
+select 12 % null            as 'NULL';
+select null % 12            as 'NULL';
+select null % 0             as 'NULL';
+select 0 % null             as 'NULL';
+select null % null          as 'NULL';
+
+select (12 mod 0) <=> null  as '1';
+select (12 mod 0) is null   as '1';
+select 12 mod 0             as 'NULL';
+select 12 mod 2             as '0';
+select 12 mod null          as 'NULL';
+select null mod 12          as 'NULL';
+select null mod 0           as 'NULL';
+select 0 mod null           as 'NULL';
+select null mod null        as 'NULL';
+
+select mod(12.0, 0)         as 'NULL';
+select mod(12, 0.0)         as 'NULL';
+select mod(12, NULL)        as 'NULL';
+select mod(12.0, NULL)      as 'NULL';
+select mod(NULL, 2)         as 'NULL';
+select mod(NULL, 2.0)       as 'NULL';
+
+
+#
+# Bug#6726: NOT BETWEEN parse failure
+#
+create table t1 (a int, b int);
+insert into t1 values (1,2), (2,3), (3,4), (4,5);
+select * from t1 where a not between 1 and 2;
+select * from t1 where a not between 1 and 2 and b not between 3 and 4;
+drop table t1;
+
+#
+# Test for bug #12791: one of the arguments of LEAST/GREATEST is NULL
+#
+
+SELECT GREATEST(1,NULL) FROM DUAL;
+SELECT LEAST('xxx','aaa',NULL,'yyy') FROM DUAL;
+SELECT LEAST(1.1,1.2,NULL,1.0) FROM DUAL;
+SELECT GREATEST(1.5E+2,1.3E+2,NULL) FROM DUAL;
+
+# End of 4.1 tests
+
+--echo #
+--echo # Bug#22523685 FUNCTION GREATEST AND LEAST WORKS INCORRECTLY
+--echo #              WITH BIGINT UNSIGNED VALUE
+--echo #
+
+SELECT greatest( 9223372036854775807 , 9223372036854775808 ) as g;
+SELECT least   ( 9223372036854775807 , 9223372036854775808 ) as l;
+
+SELECT greatest (9223372036854775808, -1, 18446744073709551615 ) as g;
+SELECT least    (9223372036854775808, -1, 18446744073709551615 ) as l;
+
+SELECT greatest (9223372036854775808, 18446744073709551615) as g;
+SELECT least    (9223372036854775808, 18446744073709551615) as l;
+
+# [RooDB-skip] CREATE TABLE AS SELECT
+
+# Strings only, strings and integers, and integers only
+SELECT GREATEST('11', '5', '2');
+SELECT GREATEST('11', 5, 2);
+SELECT GREATEST(11, 5, 2);
+SELECT LEAST('11', '5', '2');
+SELECT LEAST('11', 5, 2);
+SELECT LEAST(11, 5, 2);
+
+# [RooDB-skip] Bug#25123839 - CREATE TABLE AS SELECT with UNION, COALESCE, date/time literals
+# [RooDB-skip] Bug#22839888 - _utf16/_utf8 charset introducers
+# [RooDB-skip] Bug#26975864 - user variables with @a
+
+--echo #
+--echo # Bug #33624777 sum(least(a, NULL)) result error
+--echo #
+
+CREATE TABLE t1 (a DOUBLE, b DOUBLE);
+CREATE TABLE t2 (a INTEGER, b INTEGER);
+
+INSERT INTO t1 values(1, NULL), (1, 1);
+INSERT INTO t2 values(1, NULL), (1, 1);
+
+SELECT SUM(LEAST(a, b)) FROM t1;
+SELECT SUM(LEAST(a, b)) FROM t2;
+
+DROP TABLE t1, t2;
+
+# [RooDB-skip] Bug 33758255 - EXPLAIN with DESC index
+# [RooDB-skip] Bug #33996054 - TIMESTAMP type, complex date/time GREATEST

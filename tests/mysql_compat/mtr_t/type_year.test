@@ -1,0 +1,177 @@
+#
+# Test year (trimmed for RooDB)
+#
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+create table t1 (y year,y4 year(4));
+insert into t1 values (0,0),(1999,1999),(2000,2000),(2001,2001),(70,70),(69,69);
+select * from t1;
+select * from t1 order by y;
+select * from t1 order by y4;
+drop table t1;
+
+# [RooDB-skip] Bug 2335 - NOW() in INSERT with non-timestamp YEAR column
+
+#
+# Bug #27176: Assigning a string to an year column has unexpected results
+#
+create table t1(a year);
+insert ignore into t1 values (2000.5), ('2000.5'), ('2001a'), ('2.001E3');
+select * from t1;
+drop table t1;
+
+--echo End of 5.0 tests
+
+--echo #
+--echo # Bug #49480: WHERE using YEAR columns returns unexpected results
+--echo #
+
+CREATE TABLE t4(yyyy YEAR, c4 CHAR(4));
+
+INSERT INTO t4 (c4) VALUES (NULL),(1970),(1999),(2000),(2001),(2069);
+UPDATE t4 SET yyyy = c4;
+
+SELECT * FROM t4;
+
+--echo # Comparison of YEAR with YEAR
+
+SELECT * FROM t4 a, t4 b WHERE a.yyyy = b.yyyy;
+SELECT * FROM t4 a, t4 b WHERE a.yyyy <=> b.yyyy;
+
+--echo # Comparison with constants:
+
+SELECT * FROM t4 WHERE yyyy = NULL;
+SELECT * FROM t4 WHERE yyyy <=> NULL;
+
+# [RooDB-skip] NOW() comparison
+SELECT * FROM t4 WHERE yyyy = 99;
+SELECT * FROM t4 WHERE yyyy = 'test';
+SELECT * FROM t4 WHERE yyyy = '1999';
+SELECT * FROM t4 WHERE yyyy = 1999;
+SELECT * FROM t4 WHERE yyyy = 1999.1;
+SELECT * FROM t4 WHERE yyyy = 1998.9;
+
+--echo # Coverage tests for YEAR with zero/2000 constants:
+
+SELECT * FROM t4 WHERE yyyy = 0;
+SELECT * FROM t4 WHERE yyyy = '0';
+SELECT * FROM t4 WHERE yyyy = '0000';
+SELECT * FROM t4 WHERE yyyy = '2000';
+SELECT * FROM t4 WHERE yyyy = 2000;
+
+--echo # Comparison with constants those are out of YEAR range
+
+SELECT COUNT(yyyy) FROM t4;
+
+SELECT COUNT(*) FROM t4 WHERE yyyy > -1;
+SELECT COUNT(*) FROM t4 WHERE yyyy > -1000000000000000000;
+
+SELECT COUNT(*) FROM t4 WHERE yyyy < 2156;
+SELECT COUNT(*) FROM t4 WHERE yyyy < 1000000000000000000;
+
+SELECT * FROM t4 WHERE yyyy < 123;
+SELECT * FROM t4 WHERE yyyy > 123;
+
+DROP TABLE t4;
+
+--echo #
+--echo # Bug #49910: Behavioural change in SELECT/WHERE on YEAR(4) data type
+--echo #
+
+CREATE TABLE t1 (y YEAR NOT NULL, s VARCHAR(4));
+INSERT INTO t1 (y, s) VALUES (0, 0), (2000, 2000), (2001, 2001);
+
+SELECT * FROM t1 WHERE t1.y = 0;
+SELECT * FROM t1 WHERE t1.y = 2000;
+
+DROP TABLE t1;
+
+--echo #
+--echo # Bug #59211: Select Returns Different Value for min(year) Function
+--echo #
+
+CREATE TABLE t1(c1 YEAR);
+INSERT INTO t1 VALUES (1901),(2155),(0000);
+SELECT * FROM t1;
+SELECT COUNT(*) AS total_rows, MIN(c1) AS min_value, MAX(c1) FROM t1;
+DROP TABLE t1;
+
+--echo #
+--echo # WL#6263: Remove YEAR(2) type
+--echo #
+
+# [RooDB-skip] YEAR(2)/YEAR(0) error codes not implemented
+CREATE TABLE t1 (c1 YEAR(4));
+INSERT INTO t1 VALUES (55);
+UPDATE t1 SET c1=2016;
+# [RooDB-skip] CHECK TABLE, REPAIR TABLE
+DELETE FROM t1;
+DROP TABLE t1;
+
+--echo #
+
+--echo End of 5.1 tests
+
+# [RooDB-skip] Start of 5.6 tests - SET timestamp, TIME literals
+# [RooDB-skip] Bug#28172538 - float constants for YEAR
+
+--echo #
+--echo # Bug#28562930 AVG(YEAR(DATETIME_FIELD)) MAKES AN ERROR RESULT BEACUSE OF OVERFLOW
+--echo #
+CREATE TABLE t1(id INT,
+                name VARCHAR(10),
+                class CHAR(10),
+                date1 DATETIME);
+
+INSERT INTO t1 VALUES (1,'zhangsan','class1','2014-01-14 15:32:17'),
+                      (2,'lisi','class1','2013-12-14 10:21:27'),
+                      (3,'wangwu','class2','2003-05-21 08:25:14'),
+                      (4,'zhaoliu','class2','2001-07-19 09:35:18');
+
+SELECT COUNT(DISTINCT name), AVG(YEAR(date1)) AS aa, class
+  FROM t1 GROUP BY class ORDER BY aa;
+
+DROP TABLE t1;
+
+--echo #
+--echo # Bug#29668676 DATA TRUNCATION ERROR
+--echo #
+
+CREATE TABLE t(QC_DATE_KEY bigint, QC_DATE date, QC_TIMESTAMP datetime);
+INSERT INTO t VALUES
+(1, '1999-02-28', '1999-11-28 14:45:00'),
+(2, '1999-12-31', '2000-01-01 00:00:00');
+
+SELECT ((year(QC_DATE) - year(QC_TIMESTAMP))) FROM t
+  WHERE QC_DATE_KEY = 2;
+
+DROP TABLE t;
+
+# [RooDB-skip] WL#13537 - INFORMATION_SCHEMA, DESCRIBE, VIEW
+# [RooDB-skip] CREATE FUNCTION / CREATE PROCEDURE
+# [RooDB-skip] YEAR UNSIGNED
+
+--echo # Bug#31994744: Year should not be part of property functions
+
+CREATE TABLE t1
+(y YEAR,
+ d DATE,
+ i INTEGER,
+ v VARCHAR(10));
+INSERT INTO t1 VALUES(1901, DATE'1901-01-01', 1, 'one');
+SELECT LEAST(d, y) FROM t1;
+SELECT LEAST(y, d) FROM t1;
+SELECT LEAST(i, y, v) FROM t1;
+DROP TABLE t1;
+
+CREATE TABLE t1
+(pk INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ year_field YEAR
+);
+INSERT INTO t1 VALUES(NULL, 1901), (NULL, 1902), (NULL, 1903), (NULL, 1904);
+SELECT pk FROM t1 WHERE year_field IN (1901, 1903);
+SELECT pk FROM t1 WHERE year_field IN ('1901', '1903');
+SELECT pk FROM t1 WHERE year_field IN (1901, '1903');
+DROP TABLE t1;
