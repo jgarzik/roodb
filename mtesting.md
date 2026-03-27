@@ -71,7 +71,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 | Test | Status | Coverage | Trimmed |
 |------|--------|----------|---------|
-| func_math | **PASS** | 1089/1271 (86%) | UDFs, JSON, stored procs, LOAD DATA |
+| func_math | **PASS** | 1181/1271 (93%) | UDFs, JSON, CONTINUE HANDLER, LOAD DATA |
 | func_like | **PASS** | ~25% | ESCAPE aggregate, charset/COLLATE, PREPARE |
 | func_test | **PASS** | ~35% | Charset introducers, UNION, CREATE TABLE AS SELECT |
 | delete | **PASS** | ~20% | Multi-table DELETE, INSERT IGNORE date, ORDER BY errors |
