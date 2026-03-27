@@ -174,6 +174,7 @@ pub fn procedures_table_def() -> TableDef {
         .column(ColumnDef::new("procedure_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("params_json", DataType::Text).nullable(false))
         .column(ColumnDef::new("body_sql", DataType::Text).nullable(false))
+        .column(ColumnDef::new("returns_type", DataType::Varchar(255)).nullable(true))
         .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
 }
 
@@ -473,6 +474,7 @@ pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
         Datum::String(def.name.clone()),
         Datum::String(params_json),
         Datum::String(def.body_sql.clone()),
+        Datum::String(def.returns_type.clone().unwrap_or_default()),
     ])
 }
 
@@ -491,11 +493,19 @@ pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
         _ => return None,
     };
     let params: Vec<ProcedureParam> = serde_json::from_str(&params_json).ok()?;
+    let returns_type = if row.values().len() > 3 {
+        match &row.values()[3] {
+            Datum::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Some(ProcedureDef {
         name,
         params,
         body_sql,
-        returns_type: None, // TODO: persist returns_type for functions
+        returns_type,
     })
 }
 

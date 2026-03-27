@@ -1172,11 +1172,20 @@ where
         {
             let upper = sql.trim().to_uppercase();
             if upper.starts_with("CHECK TABLE") || upper.starts_with("CHECKSUM TABLE") {
+                let table_name = {
+                    let re = regex::Regex::new(r"(?i)(?:CHECK|CHECKSUM)\s+TABLE\s+(\w+)").unwrap();
+                    re.captures(sql.trim())
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                let db = self.database.as_deref().unwrap_or("test");
+                let qualified = format!("{}.{}", db, table_name);
                 return self
                     .send_custom_result_set(
                         &["Table", "Op", "Msg_type", "Msg_text"],
                         &[vec![
-                            "test.t1".to_string(),
+                            qualified,
                             "check".to_string(),
                             "status".to_string(),
                             "OK".to_string(),
@@ -5576,21 +5585,21 @@ where
             self.writer.set_sequence(1);
         }
         self.sp_sent_results = true;
-        // Buffer all rows first
+        // Extract column names first (works even when result is empty)
+        let col_names = Self::extract_select_column_names(sql, 100);
+        let col_count = col_names.len();
+
+        // Buffer all rows
         let rows = self
             .execute_select_buffered(sql)
             .await
             .map_err(|e| ProtocolError::Unsupported(format!("SP SELECT failed: {}", e)))?;
-
-        // Determine column info from first row or query
-        let col_count = rows.first().map_or(0, |r| r.len());
 
         // Send column count
         let count_packet = encode_column_count(col_count as u64);
         self.writer.write_packet(&count_packet).await?;
 
         // Send column definitions (minimal — name from SELECT expression)
-        let col_names = Self::extract_select_column_names(sql, col_count);
         let schema = self.database.as_deref().unwrap_or("test");
         for name in &col_names {
             let def = ColumnDefinition41 {
@@ -5657,8 +5666,11 @@ where
                         _ => "?column?".to_string(),
                     };
                     names.push(name);
+                    if names.len() >= count {
+                        break;
+                    }
                 }
-                if names.len() == count {
+                if !names.is_empty() {
                     return names;
                 }
             }

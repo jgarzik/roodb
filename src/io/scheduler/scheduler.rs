@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -253,121 +253,9 @@ impl<IO: AsyncIO + 'static> ScheduledHandle<IO> {
     }
 }
 
-// ============================================================================
-// Legacy FileHandle (kept for compatibility with existing code)
-// ============================================================================
-
-/// Handle to an open file managed by the scheduler
-///
-/// **Deprecated**: Use `ScheduledHandle` directly via `IoScheduler` as an
-/// `AsyncIOFactory`. This type is kept for backward compatibility.
-#[derive(Clone)]
-pub struct FileHandle {
-    /// Unique file ID
-    id: u64,
-    /// Path to the file
-    path: PathBuf,
-    /// Reference to scheduler inner state
-    scheduler: Arc<IoSchedulerInner>,
-}
-
-impl FileHandle {
-    /// Get the file ID
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Get the file path
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Read data at the specified offset
-    pub async fn read(
-        &self,
-        offset: u64,
-        size: usize,
-        priority: IoPriority,
-    ) -> IoResult<AlignedBuffer> {
-        self.scheduler.read(self.id, offset, size, priority).await
-    }
-
-    /// Write data at the specified offset
-    pub async fn write(
-        &self,
-        offset: u64,
-        data: AlignedBuffer,
-        priority: IoPriority,
-    ) -> IoResult<usize> {
-        self.scheduler.write(self.id, offset, data, priority).await
-    }
-
-    /// Sync the file to disk
-    pub async fn sync(&self, priority: IoPriority) -> IoResult<()> {
-        self.scheduler.sync(self.id, priority).await
-    }
-
-    /// Get the file size
-    pub async fn file_size(&self) -> IoResult<u64> {
-        self.scheduler.file_size(self.id).await
-    }
-
-    /// Truncate the file
-    pub async fn truncate(&self, size: u64) -> IoResult<()> {
-        self.scheduler.truncate(self.id, size).await
-    }
-}
-
 /// Open file entry
 struct OpenFile<IO: AsyncIO> {
     io: Arc<IO>,
-}
-
-/// Legacy stub - FileHandle operations return NotSupported errors
-struct IoSchedulerInner;
-
-impl IoSchedulerInner {
-    async fn read(
-        &self,
-        _file_id: u64,
-        _offset: u64,
-        _size: usize,
-        _priority: IoPriority,
-    ) -> IoResult<AlignedBuffer> {
-        Err(IoError::NotSupported(
-            "Legacy FileHandle: use IoScheduler as AsyncIOFactory".into(),
-        ))
-    }
-
-    async fn write(
-        &self,
-        _file_id: u64,
-        _offset: u64,
-        _data: AlignedBuffer,
-        _priority: IoPriority,
-    ) -> IoResult<usize> {
-        Err(IoError::NotSupported(
-            "Legacy FileHandle: use IoScheduler as AsyncIOFactory".into(),
-        ))
-    }
-
-    async fn sync(&self, _file_id: u64, _priority: IoPriority) -> IoResult<()> {
-        Err(IoError::NotSupported(
-            "Legacy FileHandle: use IoScheduler as AsyncIOFactory".into(),
-        ))
-    }
-
-    async fn file_size(&self, _file_id: u64) -> IoResult<u64> {
-        Err(IoError::NotSupported(
-            "Legacy FileHandle: use IoScheduler as AsyncIOFactory".into(),
-        ))
-    }
-
-    async fn truncate(&self, _file_id: u64, _size: u64) -> IoResult<()> {
-        Err(IoError::NotSupported(
-            "Legacy FileHandle: use IoScheduler as AsyncIOFactory".into(),
-        ))
-    }
 }
 
 /// I/O scheduler with typed factory
@@ -424,20 +312,13 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoScheduler<IO
     }
 
     /// Open a file
-    pub async fn open(self: &Arc<Self>, path: &Path, create: bool) -> IoResult<FileHandle> {
+    pub async fn open(self: &Arc<Self>, path: &Path, create: bool) -> IoResult<u64> {
         let io = self.factory.open(path, create).await?;
         let id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
 
         self.files.write().insert(id, OpenFile { io: Arc::new(io) });
 
-        // Create a simple inner reference for FileHandle (legacy stub)
-        let inner = Arc::new(IoSchedulerInner);
-
-        Ok(FileHandle {
-            id,
-            path: path.to_path_buf(),
-            scheduler: inner,
-        })
+        Ok(id)
     }
 
     /// Close a file
@@ -842,20 +723,17 @@ mod tests {
         let mut buf = AlignedBuffer::page().unwrap();
         buf.copy_from_slice(b"hello world").unwrap();
         let written = scheduler
-            .write(handle.id(), 0, buf, IoPriority::Flush)
+            .write(handle, 0, buf, IoPriority::Flush)
             .await
             .unwrap();
         assert!(written > 0);
 
         // Sync
-        scheduler
-            .sync(handle.id(), IoPriority::Flush)
-            .await
-            .unwrap();
+        scheduler.sync(handle, IoPriority::Flush).await.unwrap();
 
         // Read back
         let read_buf = scheduler
-            .read(handle.id(), 0, 4096, IoPriority::QueryRead)
+            .read(handle, 0, 4096, IoPriority::QueryRead)
             .await
             .unwrap();
         assert_eq!(&read_buf[..11], b"hello world");
