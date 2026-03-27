@@ -167,6 +167,19 @@ impl Session {
         }
     }
 
+    /// Initialize evaluator flags from the current sql_mode.
+    /// Call after creating a session to sync UserVariables with sql_modes.
+    pub fn init_eval_flags(&self) {
+        crate::executor::eval::set_error_for_division_by_zero(
+            &self.user_variables,
+            self.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
+        );
+        crate::executor::eval::set_strict_trans_tables(
+            &self.user_variables,
+            self.has_sql_mode("STRICT_TRANS_TABLES"),
+        );
+    }
+
     /// Create a new session for a replica (read-only)
     pub fn new_read_only(connection_id: u32) -> Self {
         let mut session = Self::new(connection_id);

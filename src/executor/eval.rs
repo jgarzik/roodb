@@ -43,6 +43,25 @@ const ERROR_DIV_ZERO_VAR: &str = "__sys_error_div_zero";
 /// Internal variable name for strict-DML context flag (set during INSERT/UPDATE evaluation)
 const STRICT_DML_CONTEXT_VAR: &str = "__sys_strict_dml";
 
+/// Internal variable name for STRICT_TRANS_TABLES sql_mode flag
+const STRICT_TRANS_VAR: &str = "__sys_strict_trans_tables";
+
+/// Set the STRICT_TRANS_TABLES flag for a session
+pub fn set_strict_trans_tables(vars: &UserVariables, val: bool) {
+    let mut w = vars.write();
+    if val {
+        w.insert(STRICT_TRANS_VAR.to_string(), Datum::Bool(true));
+    } else {
+        w.remove(STRICT_TRANS_VAR);
+    }
+}
+
+/// Check if STRICT_TRANS_TABLES is active
+pub fn is_strict_trans_tables(vars: &UserVariables) -> bool {
+    let r = vars.read();
+    matches!(r.get(STRICT_TRANS_VAR), Some(Datum::Bool(true)))
+}
+
 /// Set the NO_UNSIGNED_SUBTRACTION flag for a session (stored in UserVariables)
 pub fn set_no_unsigned_subtraction(vars: &UserVariables, val: bool) {
     let mut w = vars.write();
@@ -1303,6 +1322,35 @@ fn eval_spaceship(left: &Datum, right: &Datum) -> bool {
     }
 }
 
+/// Clamp an overflow value to the nearest type boundary (MAX or MIN).
+/// Used in non-strict INSERT mode when coercion overflows.
+pub fn clamp_to_type_boundary(datum: &Datum, target: &crate::catalog::DataType) -> Datum {
+    use crate::catalog::DataType;
+
+    // Determine the numeric value to clamp
+    let f_val = match datum {
+        Datum::Float(f) => Some(*f),
+        Datum::String(s) => s.trim().parse::<f64>().ok(),
+        Datum::Int(i) => Some(*i as f64),
+        Datum::UnsignedInt(u) => Some(*u as f64),
+        _ => None,
+    };
+
+    match target {
+        DataType::BigInt | DataType::Int | DataType::SmallInt | DataType::TinyInt => match f_val {
+            Some(f) if f >= 0.0 => Datum::Int(i64::MAX),
+            Some(_) => Datum::Int(i64::MIN),
+            None => Datum::Int(0),
+        },
+        DataType::BigIntUnsigned => match f_val {
+            Some(f) if f >= 0.0 => Datum::UnsignedInt(u64::MAX),
+            Some(_) => Datum::UnsignedInt(0), // negative → 0
+            None => Datum::UnsignedInt(0),
+        },
+        _ => Datum::default_for_type(target),
+    }
+}
+
 /// Coerce a datum to match a target column type for implicit conversion (e.g. INSERT).
 /// Only performs conversion when the source type doesn't match the target and a safe
 /// conversion exists. Returns the datum unchanged for non-Bit types.
@@ -1418,11 +1466,26 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
             Datum::Bool(b) => Ok(Datum::UnsignedInt(if *b { 1 } else { 0 })),
             Datum::String(s) => {
                 let trimmed = s.trim();
-                let v = trimmed.parse::<u64>().unwrap_or_else(|_| {
-                    // Try parsing as i64 first for negative strings
-                    trimmed.parse::<i64>().map(|i| i as u64).unwrap_or(0)
-                });
-                Ok(Datum::UnsignedInt(v))
+                // Try direct u64 parse
+                if let Ok(v) = trimmed.parse::<u64>() {
+                    return Ok(Datum::UnsignedInt(v));
+                }
+                // Try i64 for negative strings (wraps via two's complement)
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    return Ok(Datum::UnsignedInt(i as u64));
+                }
+                // Try f64
+                if let Ok(v) = trimmed.parse::<f64>() {
+                    if v.is_finite() && v >= 0.0 && v <= u64::MAX as f64 {
+                        return Ok(Datum::UnsignedInt(v.round() as u64));
+                    }
+                    if v.is_finite() && v < 0.0 {
+                        return Ok(Datum::UnsignedInt(v.round() as i64 as u64));
+                    }
+                    // Overflow: clamp to u64::MAX (MySQL behavior for SELECT CAST)
+                    return Ok(Datum::UnsignedInt(u64::MAX));
+                }
+                Ok(Datum::UnsignedInt(0))
             }
             Datum::Bit { value, .. } => Ok(Datum::UnsignedInt(*value)),
             Datum::Bytes(b) => {

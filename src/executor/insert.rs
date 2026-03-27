@@ -134,8 +134,20 @@ impl Executor for Insert {
                     Err(e) => return Err(e),
                 };
                 // Coerce value to match column type (e.g. Bytes → Bit)
+                // In non-strict mode (sql_mode lacks STRICT_TRANS_TABLES), clamp
+                // overflows to MIN/MAX with a warning instead of erroring.
                 let datum = if col_idx < self.columns.len() {
-                    super::eval::coerce_to_column_type(datum, &self.columns[col_idx].data_type)?
+                    let col_type = &self.columns[col_idx].data_type;
+                    match super::eval::coerce_to_column_type(datum.clone(), col_type) {
+                        Ok(d) => d,
+                        Err(super::error::ExecutorError::DataOutOfRange(_))
+                            if !super::eval::is_strict_trans_tables(&self.user_variables) =>
+                        {
+                            // Non-strict mode: clamp overflow to type boundary
+                            super::eval::clamp_to_type_boundary(&datum, col_type)
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     datum
                 };

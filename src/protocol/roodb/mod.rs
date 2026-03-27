@@ -140,11 +140,7 @@ where
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
-        // Initialize eval flags from default sql_mode
-        crate::executor::eval::set_error_for_division_by_zero(
-            &conn.session.user_variables(),
-            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
-        );
+        conn.session.init_eval_flags();
         conn
     }
 
@@ -183,10 +179,7 @@ where
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
-        crate::executor::eval::set_error_for_division_by_zero(
-            &conn.session.user_variables(),
-            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
-        );
+        conn.session.init_eval_flags();
         conn
     }
 
@@ -1092,6 +1085,10 @@ where
             crate::executor::eval::set_error_for_division_by_zero(
                 &self.session.user_variables(),
                 self.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
+            );
+            crate::executor::eval::set_strict_trans_tables(
+                &self.session.user_variables(),
+                self.session.has_sql_mode("STRICT_TRANS_TABLES"),
             );
             return self.send_ok(0, 0).await;
         }
