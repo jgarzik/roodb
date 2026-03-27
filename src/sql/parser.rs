@@ -242,13 +242,23 @@ impl Parser {
             let re_end_while = Regex::new(r"(?i)\bEND\s+WHILE\b").unwrap();
             sql = re_end_while.replace_all(&sql, "END").to_string();
 
-            // Replace standalone DO keyword (after WHILE condition) with BEGIN
-            // But if DO is followed by BEGIN (compound statement), just remove DO
+            // Replace DO with nothing when followed by BEGIN (compound block)
+            // and flatten: the inner BEGIN...END + remaining stmts merge into
+            // a single WHILE BEGIN ... END block
             let re_do_begin = Regex::new(r"(?is)\bDO\s+BEGIN\b").unwrap();
-            sql = re_do_begin.replace_all(&sql, "BEGIN").to_string();
-            // For DO not followed by BEGIN, replace with BEGIN
-            let re_do = Regex::new(r"(?i)\bDO\s").unwrap();
-            sql = re_do.replace_all(&sql, "BEGIN ").to_string();
+            if re_do_begin.is_match(&sql) {
+                sql = re_do_begin.replace_all(&sql, "BEGIN").to_string();
+                // Flatten: remove inner END; that precedes SET/SELECT etc.
+                // Replace "END;" followed by whitespace + a keyword with just ";"
+                let re_inner_end =
+                    Regex::new(r"(?is)\bEND\s*;\s*(SET|SELECT|INSERT|UPDATE|DELETE|IF|WHILE|CALL)")
+                        .unwrap();
+                sql = re_inner_end.replace_all(&sql, " $1").to_string();
+            } else {
+                // For DO not followed by BEGIN, replace with BEGIN
+                let re_do = Regex::new(r"(?i)\bDO\s").unwrap();
+                sql = re_do.replace_all(&sql, "BEGIN ").to_string();
+            }
         }
 
         // Only process DECLARE if it exists
@@ -346,6 +356,13 @@ mod tests {
     fn test_parse_select() {
         let stmt = Parser::parse_one("SELECT id, name FROM users WHERE id = 1").unwrap();
         assert!(matches!(stmt, sp::Statement::Query(_)));
+    }
+
+    #[test]
+    fn test_parse_while_with_handler() {
+        // WHILE with DO BEGIN compound block + DECLARE HANDLER + extra statement
+        let sql = "CREATE PROCEDURE test_round(in arg bigint)\nBEGIN\n  DECLARE i int;\n  SET i = 0;\n  WHILE (i >= -2) DO\n    BEGIN\n      DECLARE CONTINUE HANDLER FOR SQLSTATE '22003' SHOW ERRORS;\n      SELECT arg, i, round(arg, i);\n    END;\n    SET i = i - 1;\n  END WHILE;\nEND";
+        Parser::parse_one(sql).expect("Should parse WHILE with handler");
     }
 
     #[test]

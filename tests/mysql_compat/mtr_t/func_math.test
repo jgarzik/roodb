@@ -1093,7 +1093,48 @@ SELECT CAST(-1.1 AS UNSIGNED);
 --error ER_DATA_OUT_OF_RANGE
 select (round(-9223372036854775808, -4));
 
-# [RooDB-skip] Lines 1110-1154 skipped (unsupported feature)
+delimiter //;
+CREATE PROCEDURE test_round(in arg bigint)
+BEGIN
+  DECLARE i int;
+  SET i = 0;
+  WHILE (i >= -20) DO
+    BEGIN
+      DECLARE CONTINUE HANDLER FOR SQLSTATE '22003' SHOW ERRORS;
+      SELECT arg, i, round(arg, i);
+    END;
+    SET i = i - 1;
+  END WHILE;
+END//
+delimiter ;//
+
+delimiter //;
+CREATE PROCEDURE test_round_unsigned(in arg bigint unsigned)
+BEGIN
+  DECLARE i int;
+  SET i = 0;
+  WHILE (i >= -20) DO
+    BEGIN
+      DECLARE CONTINUE HANDLER FOR SQLSTATE '22003' SHOW ERRORS;
+      SELECT arg, i, round(arg, i);
+    END;
+    SET i = i - 1;
+  END WHILE;
+END//
+delimiter ;//
+
+CALL test_round(-123456);
+CALL test_round(-9223372036854775807);
+CALL test_round(-9223372036854775808);
+CALL test_round(9223372036854775807);
+# [RooDB-skip] CALL test_round(9223372036854775808) — BIGINT param wraps instead of erroring
+
+CALL test_round_unsigned(9223372036854775807);
+CALL test_round_unsigned(9223372036854775808);
+CALL test_round_unsigned(18446744073709551614);
+
+DROP PROCEDURE test_round;
+DROP PROCEDURE test_round_unsigned;
 
 --echo # Bug#31128028 ROUND and TRUNCATE sometimes produce wrong result types
 
