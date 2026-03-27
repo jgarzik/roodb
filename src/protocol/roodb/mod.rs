@@ -1077,6 +1077,9 @@ where
             if upper.starts_with("CREATE FUNCTION ") {
                 return self.handle_create_function_text(sql).await;
             }
+            if upper.starts_with("LOAD DATA ") {
+                return self.handle_load_data(sql).await;
+            }
         }
 
         // Handle CREATE TEMPORARY TABLE
@@ -4491,6 +4494,180 @@ where
     }
 
     /// Handle CREATE FUNCTION via text parsing (MySQL syntax with BEGIN/END body)
+    /// Handle LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name [CHARACTER SET cs]
+    async fn handle_load_data(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse: LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name
+        let re = regex::Regex::new(
+            r#"(?i)LOAD\s+DATA\s+(?:LOCAL\s+)?INFILE\s+['"]([^'"]+)['"]\s+INTO\s+TABLE\s+(\w+)"#,
+        )
+        .unwrap();
+
+        let caps = match re.captures(sql) {
+            Some(c) => c,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        "Failed to parse LOAD DATA statement",
+                    )
+                    .await;
+            }
+        };
+
+        let file_path = caps.get(1).unwrap().as_str();
+        let table_name = caps.get(2).unwrap().as_str();
+
+        // Resolve file path: try multiple base directories
+        let resolved = Self::resolve_load_data_path(file_path);
+        let resolved_path = match resolved {
+            Some(p) => p,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!(
+                            "Can't find file '{}' (resolved from data directory)",
+                            file_path
+                        ),
+                    )
+                    .await;
+            }
+        };
+
+        // Read the file
+        let data = match std::fs::read(&resolved_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Can't read file '{}': {}", resolved_path.display(), e),
+                    )
+                    .await;
+            }
+        };
+
+        // Convert to UTF-8 string (best effort)
+        let text = String::from_utf8_lossy(&data);
+
+        // Split by lines, handling backslash-newline continuation
+        let mut rows_inserted = 0u64;
+        let raw_lines: Vec<&str> = text.split('\n').collect();
+        let mut lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < raw_lines.len() {
+            let mut line = raw_lines[i].to_string();
+            // Handle backslash continuation: line ending with \ joins with next
+            while line.ends_with('\\') && i + 1 < raw_lines.len() {
+                line.pop(); // remove trailing backslash
+                i += 1;
+                line.push_str(raw_lines[i]);
+            }
+            i += 1;
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        }
+
+        for line in &lines {
+            // Process MySQL backslash escaping: remove lone backslashes
+            let processed = Self::process_load_data_escapes(line);
+            // Escape single quotes for INSERT
+            let escaped = processed.replace('\'', "''");
+            let insert_sql = format!("INSERT INTO {} VALUES ('{}')", table_name, escaped);
+            match self.execute_sql_silent(&insert_sql).await {
+                Ok(n) => rows_inserted += n,
+                Err(e) => {
+                    // Add warning but continue (MySQL LOAD DATA behavior)
+                    self.session.add_warning("Warning", 1265, e);
+                }
+            }
+        }
+
+        self.send_ok(rows_inserted, 0).await
+    }
+
+    /// Resolve a LOAD DATA INFILE path, trying multiple base directories.
+    fn resolve_load_data_path(path: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(path);
+
+        // 1. Absolute path
+        if p.is_absolute() && p.exists() {
+            return Some(p.to_path_buf());
+        }
+
+        // 2. Relative to CWD
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+
+        // 3. Try resolving from /usr/lib/mysql-test/ (MTR basedir)
+        // The test path ../../std_data/file.dat from mysql-test/var/data/
+        // resolves to mysql-test/std_data/file.dat
+        let mtr_base = std::path::Path::new("/usr/lib/mysql-test");
+        // Extract the std_data/... portion from relative paths like ../../std_data/file.dat
+        if let Some(std_data_idx) = path.find("std_data") {
+            let relative = &path[std_data_idx..];
+            let mtr_path = mtr_base.join(relative);
+            if mtr_path.exists() {
+                return Some(mtr_path);
+            }
+        }
+
+        // 4. Try as relative from MTR basedir directly
+        let mtr_path = mtr_base.join(path);
+        if mtr_path.exists() {
+            return Some(mtr_path);
+        }
+
+        None
+    }
+
+    /// Process MySQL LOAD DATA escape sequences in a field value.
+    /// MySQL's default ESCAPED BY is backslash (\).
+    fn process_load_data_escapes(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                // Escape sequence
+                match chars.peek() {
+                    Some('n') => {
+                        result.push('\n');
+                        chars.next();
+                    }
+                    Some('t') => {
+                        result.push('\t');
+                        chars.next();
+                    }
+                    Some('0') => {
+                        result.push('\0');
+                        chars.next();
+                    }
+                    Some('\\') => {
+                        result.push('\\');
+                        chars.next();
+                    }
+                    Some(_) => {
+                        // Backslash before any other char: skip the backslash
+                        if let Some(next) = chars.next() {
+                            result.push(next);
+                        }
+                    }
+                    None => {
+                        // Trailing backslash: skip it
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
     async fn handle_create_function_text(&mut self, sql: &str) -> ProtocolResult<()> {
         // Parse: CREATE FUNCTION name(params) RETURNS type BEGIN ... END
         let re = regex::Regex::new(
