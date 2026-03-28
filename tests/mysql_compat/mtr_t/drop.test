@@ -1,0 +1,71 @@
+#
+# Basic DROP TABLE tests for RooDB
+# Trimmed from MySQL drop.test
+#
+# [RooDB-skip] DROP DATABASE cascade, DROP VIEW, DROP TRIGGER
+# [RooDB-skip] --source includes, LOCK/UNLOCK, FLUSH TABLES
+# [RooDB-skip] TEMPORARY TABLE, INFORMATION_SCHEMA, SHOW CREATE TABLE
+# [RooDB-skip] connect/disconnect, --send/--reap, --enable_connect_log
+# [RooDB-skip] --write_file, --enable_info, --disable_result_log
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+#
+# Drop non-existent table should fail
+#
+--error 1051
+DROP TABLE t1;
+
+#
+# Basic create and drop
+#
+CREATE TABLE t1 (n INT);
+INSERT INTO t1 VALUES (1);
+SELECT * FROM t1 ORDER BY n;
+DROP TABLE t1;
+
+#
+# DROP TABLE IF EXISTS on non-existent table (no error)
+#
+DROP TABLE IF EXISTS t1;
+
+#
+# Multi-table DROP
+#
+CREATE TABLE t1 (a INT);
+CREATE TABLE t2 (b INT);
+CREATE TABLE t3 (c INT);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (2);
+INSERT INTO t3 VALUES (3);
+DROP TABLE t1, t2, t3;
+
+#
+# DROP TABLE IF EXISTS for multiple tables (some exist, some don't)
+#
+CREATE TABLE t1 (a INT);
+CREATE TABLE t2 (b INT);
+DROP TABLE IF EXISTS t1, t2, t3;
+
+#
+# Error on dropping non-existent table without IF EXISTS
+#
+--error 1051
+DROP TABLE table1;
+
+#
+# IF EXISTS on non-existent tables is not an error
+#
+DROP TABLE IF EXISTS table1;
+
+#
+# Create, drop, verify gone
+#
+CREATE TABLE t1 (x INT);
+INSERT INTO t1 VALUES (42);
+SELECT * FROM t1 ORDER BY x;
+DROP TABLE t1;
+--error 1146
+SELECT * FROM t1;

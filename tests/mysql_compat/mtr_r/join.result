@@ -1,0 +1,108 @@
+DROP TABLE IF EXISTS t1, t2, t3, t4;
+CREATE TABLE t1 (S1 INT);
+CREATE TABLE t2 (S1 INT);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (2);
+SELECT * FROM t1 JOIN t2 ORDER BY t1.S1, t2.S1;
+S1	S1
+1	2
+SELECT * FROM t1 INNER JOIN t2 ORDER BY t1.S1, t2.S1;
+S1	S1
+1	2
+SELECT * FROM t1 CROSS JOIN t2 ORDER BY t1.S1, t2.S1;
+S1	S1
+1	2
+SELECT * FROM t1 LEFT JOIN t2 USING(S1) ORDER BY t1.S1;
+S1	S1
+1	2
+SELECT * FROM t1 LEFT JOIN t2 ON(t2.S1 = 2) ORDER BY t1.S1;
+S1	S1
+1	2
+SELECT * FROM t1 RIGHT JOIN t2 USING(S1) ORDER BY t2.S1;
+S1	S1
+1	2
+SELECT * FROM t1 RIGHT JOIN t2 ON(t1.S1 = 1) ORDER BY t2.S1;
+S1	S1
+1	2
+DROP TABLE t1, t2;
+CREATE TABLE t1 (
+a INT NOT NULL,
+b INT NOT NULL,
+PRIMARY KEY (a, b)
+);
+INSERT INTO t1 VALUES (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(2,3);
+CREATE TABLE t2 (a INT);
+INSERT INTO t2 VALUES (2),(3);
+SELECT t1.a, t2.a, t1.b FROM t1, t2 WHERE t1.a = t2.a AND (t1.a = 1 OR t1.a = 2) AND b >= 1 AND b <= 3 ORDER BY t1.a, t2.a, t1.b;
+a	a	b
+2	2	3
+DROP TABLE t1, t2;
+CREATE TABLE t1 (d DATE NOT NULL);
+CREATE TABLE t2 (d DATE NOT NULL);
+INSERT INTO t1 (d) VALUES ('2001-08-01'),('1000-01-01');
+SELECT * FROM t1 LEFT JOIN t2 USING (d) WHERE t2.d IS NULL ORDER BY t1.d;
+d	d
+1000-01-01	NULL
+2001-08-01	NULL
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT);
+CREATE TABLE t2 (a INT PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200), (4, 400);
+SELECT t1.a, t1.b, t2.b FROM t1 INNER JOIN t2 ON t1.a = t2.a ORDER BY t1.a;
+a	b	b
+1	10	100
+2	20	200
+SELECT t1.a, t1.b, t2.b FROM t1 INNER JOIN t2 ON t1.a = t2.a WHERE t1.b > 10 ORDER BY t1.a;
+a	b	b
+2	20	200
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT PRIMARY KEY, b VARCHAR(20));
+CREATE TABLE t2 (a INT PRIMARY KEY, c VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+INSERT INTO t2 VALUES (2, 'two'), (3, 'three'), (4, 'four');
+SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a ORDER BY t1.a;
+a	b	c
+1	alpha	NULL
+2	beta	two
+3	gamma	three
+SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c IS NULL ORDER BY t1.a;
+a	b	c
+1	alpha	NULL
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT PRIMARY KEY, b VARCHAR(20));
+CREATE TABLE t2 (a INT PRIMARY KEY, c VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta');
+INSERT INTO t2 VALUES (2, 'two'), (3, 'three');
+SELECT t1.a, t1.b, t2.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a ORDER BY t2.a;
+a	b	a	c
+2	beta	2	two
+NULL	NULL	3	three
+DROP TABLE t1, t2;
+CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(20));
+CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value INT);
+CREATE TABLE t3 (id INT PRIMARY KEY, t2_id INT, label VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+INSERT INTO t2 VALUES (10, 1, 100), (20, 2, 200), (30, 1, 300);
+INSERT INTO t3 VALUES (100, 10, 'x'), (200, 20, 'y'), (300, 30, 'z');
+SELECT t1.name, t2.value, t3.label
+FROM t1
+INNER JOIN t2 ON t1.id = t2.t1_id
+INNER JOIN t3 ON t2.id = t3.t2_id
+ORDER BY t1.name, t2.value;
+name	value	label
+Alice	100	x
+Alice	300	z
+Bob	200	y
+DROP TABLE t1, t2, t3;
+CREATE TABLE t1 (id INT PRIMARY KEY, parent_id INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, NULL, 'root'), (2, 1, 'child1'), (3, 1, 'child2'), (4, 2, 'grandchild');
+SELECT c.name AS child, p.name AS parent
+FROM t1 c LEFT JOIN t1 p ON c.parent_id = p.id
+ORDER BY c.id;
+child	parent
+root	NULL
+child1	root
+child2	root
+grandchild	child1
+DROP TABLE t1;

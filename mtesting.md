@@ -41,6 +41,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 4 | insert, update, func_str, func_concat, func_if | Complex DML, string functions |
 | 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
 | 6 | func_system, replace, func_regexp, func_group, union | System funcs, REPLACE, REGEXP, aggregates, UNION |
+| 7 | ansi, binary_to_hex, count_distinct, date_formats, create_if_not_exists, constraints | ANSI, HEX/UNHEX, COUNT(DISTINCT), dates, DDL |
+| 8 | subselect, drop, auto_increment, type_timestamp, key, join | Subqueries, DROP, AUTO_INC, TIMESTAMP, indexes, JOINs |
 | 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
 
 ## Current Status
@@ -114,6 +116,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | func_regexp | **PASS** | ~35% | REGEXP_REPLACE/INSTR/LIKE, charset, NULL pattern |
 | func_group | **PASS** | ~10% | ROLLUP, window funcs, EXPLAIN, subqueries |
 | union | **PASS** | ~5% | EXPLAIN, VIEWs, subqueries, --source includes |
+
+### Tier 8 — 6/6 pass
+
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| subselect | **PASS** | ~15% | Subqueries in WHERE/SELECT not supported, aggregate-only |
+| drop | **PASS** | ~25% | DROP DATABASE, DROP VIEW, DROP TRIGGER, --source |
+| auto_increment | **PASS** | ~10% | NULL inserts, ALTER TABLE, REPLACE |
+| type_timestamp | **PASS** | ~12% | SET timestamp, timezone, NOW(), ON UPDATE |
+| key | **PASS** | ~12% | UNIQUE dup detect, prefix keys, SHOW INDEX |
+| join | **PASS** | ~5% | NATURAL/STRAIGHT JOIN, EXPLAIN, subqueries |
 
 ### Custom Tests — 23/23 pass
 

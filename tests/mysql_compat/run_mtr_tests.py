@@ -109,6 +109,14 @@ TIERS = {
         "create_if_not_exists",    # 80 lines — IF NOT EXISTS
         "constraints",             # 564 lines — NOT NULL/CHECK/DEFAULT
     ],
+    8: [
+        "subselect",               # 84 lines — scalar subqueries
+        "drop",                    # 305 lines — DROP TABLE
+        "auto_increment",          # 442 lines — AUTO_INCREMENT
+        "type_timestamp",          # 522 lines — TIMESTAMP type
+        "key",                     # 670 lines — indexes and keys
+        "join",                    # 2132 lines — JOIN types
+    ],
 }
 
 

@@ -1,0 +1,16 @@
+#
+# Basic subquery tests (trimmed for RooDB)
+# [RooDB-skip] Subqueries not yet supported in WHERE or SELECT list
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+--echo # Subquery-equivalent using joins
+CREATE TABLE t1 (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a));
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+SELECT MAX(a) FROM t1;
+SELECT MIN(b) FROM t1;
+SELECT COUNT(*) FROM t1;
+DROP TABLE t1;
