@@ -1,0 +1,73 @@
+#
+# Basic REGEXP / RLIKE tests - trimmed for RooDB
+#
+# [RooDB-skip] charset/collation, --source include/*, ANALYZE, EXPLAIN
+# [RooDB-skip] REGEXP_REPLACE, REGEXP_INSTR, REGEXP_LIKE, REGEXP_SUBSTR
+# [RooDB-skip] PREPARE/EXECUTE, stored procs/funcs, BINARY keyword
+#
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+#
+# Basic REGEXP on a table
+#
+create table t1 (xxx char(128));
+insert into t1 (xxx) values('this is a test of some long text to see what happens');
+select * from t1 where xxx regexp('is a test of some long text to');
+select * from t1 where xxx regexp('is a test of some long text to ');
+select * from t1 where xxx regexp('is a test of some long text to s');
+select * from t1 where xxx regexp('is a test of some long text to se');
+drop table t1;
+
+#
+# RLIKE with table data
+#
+create table t1 (a varchar(40));
+insert into t1 values ('C1'),('C2'),('R1'),('C3'),('R2'),('R3');
+select a from t1 where a rlike '^C.*' order by a;
+select a from t1 where a rlike '^R.*' order by a;
+drop table t1;
+
+--echo End of 4.1 tests
+
+#
+# REGEXP with NULL
+#
+# [RooDB-skip] REGEXP NULL (sqlparser can't parse NULL as REGEXP pattern)
+
+--echo End of 5.0 tests
+
+#
+# REGEXP with numeric data
+#
+CREATE TABLE t1(a INT, b CHAR(4));
+INSERT INTO t1 VALUES (1, '6.1'), (1, '7.0'), (1, '8.0');
+SELECT a FROM t1 WHERE a=1 AND '7.0' REGEXP b LIMIT 1;
+DROP TABLE t1;
+
+--echo End of 5.1 tests
+
+#
+# POSIX character classes
+#
+SELECT ' '  REGEXP '[[:blank:]]';
+SELECT ' '  REGEXP '[[:space:]]';
+
+#
+# Basic REGEXP patterns
+#
+SELECT 'abc' REGEXP 'abc';
+SELECT 'abc' REGEXP 'def';
+SELECT 'abc' REGEXP '^abc$';
+SELECT 'abc' REGEXP '^a';
+SELECT 'abc' REGEXP 'c$';
+SELECT 'abc' REGEXP 'b';
+SELECT 'abc' REGEXP '.b.';
+SELECT 'abc' REGEXP 'a.c';
+SELECT 'abc' REGEXP '[abc]';
+SELECT 'abc' REGEXP '[^xyz]';
+SELECT '123' REGEXP '[0-9]+';
+SELECT 'abc' REGEXP '[0-9]+';
+SELECT 'abc123' REGEXP '[a-z]+[0-9]+';

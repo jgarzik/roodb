@@ -1,0 +1,120 @@
+#
+# Test of UNION - trimmed for RooDB
+#
+
+--disable_warnings
+drop table if exists t1,t2;
+--enable_warnings
+
+CREATE TABLE t1 (a int not null, b char(10) not null);
+insert into t1 values(1,'a'),(2,'b'),(3,'c'),(3,'c');
+CREATE TABLE t2 (a int not null, b char(10) not null);
+insert into t2 values (3,'c'),(4,'d'),(5,'f'),(6,'e');
+
+# [RooDB-skip] analyze table
+
+#
+# Basic UNION DISTINCT and UNION ALL
+#
+select a,b from t1 union distinct select a,b from t2 order by a,b;
+select a,b from t1 union all select a,b from t2 order by a,b;
+select a,b from t1 union all select a,b from t2 order by b;
+
+#
+# UNION with constants
+#
+select a,b from t1 union select a,b from t1 order by a,b;
+
+#
+# UNION with GROUP BY
+#
+(select 't1',b,count(*) from t1 group by b) UNION (select 't2',b,count(*) from t2 group by b) order by 1,2;
+
+#
+# UNION with LIMIT
+#
+(select a,b from t1 limit 2) union all (select a,b from t2 order by a limit 1);
+
+#
+# Error: mismatched column counts
+#
+--error 1222
+select a,b from t1 union select a from t2;
+
+--error 1222
+select * from t1 union select a from t2;
+
+--error 1222
+select a from t1 union select * from t2;
+
+drop table t1,t2;
+
+#
+# UNION without tables
+#
+select 1 as a union select 2 as a order by a;
+select 1 as a union all select 1 as a order by a;
+(select 1 as a) union (select 2 as a) union (select 3 as a) order by a;
+
+#
+# UNION with tables and LIMIT
+#
+create table t1 (a int);
+create table t2 (a int);
+insert into t1 values (1),(2),(3),(4),(5);
+insert into t2 values (11),(12),(13),(14),(15);
+(select * from t1 limit 2) union (select * from t2 limit 3) order by a limit 4;
+(select * from t1 limit 2) union (select * from t2 limit 3) order by a;
+drop table t1,t2;
+
+# [RooDB-skip] SQL_CALC_FOUND_ROWS / found_rows()
+# [RooDB-skip] --source include/*
+# [RooDB-skip] --replace_column
+# [RooDB-skip] explain
+# [RooDB-skip] CREATE TABLE AS SELECT
+# [RooDB-skip] INSERT...SELECT
+# [RooDB-skip] TEMPORARY TABLE
+# [RooDB-skip] subqueries
+# [RooDB-skip] FOREIGN KEY
+# [RooDB-skip] AUTO_INCREMENT non-deterministic IDs
+
+#
+# UNION with ORDER BY
+#
+create table t1 (a int, b varchar(10));
+insert into t1 values (1,'one'),(2,'two'),(3,'three');
+create table t2 (a int, b varchar(10));
+insert into t2 values (4,'four'),(5,'five'),(6,'six');
+
+select a,b from t1 union select a,b from t2 order by a;
+select a,b from t1 union all select a,b from t2 order by a desc;
+select a,b from t1 union select a,b from t2 order by a limit 3;
+(select a,b from t1 order by a) union all (select a,b from t2 order by a);
+
+drop table t1,t2;
+
+#
+# UNION with WHERE
+#
+create table t1 (a int, b int);
+insert into t1 values (1,10),(2,20),(3,30);
+create table t2 (a int, b int);
+insert into t2 values (4,40),(5,50),(6,60);
+
+select * from t1 where a > 1 union select * from t2 where a < 6 order by a, b;
+select * from t1 where a = 1 union all select * from t2 where b = 50 order by a, b;
+
+drop table t1,t2;
+
+#
+# UNION with NULL
+#
+select 1 as a union select NULL;
+select NULL union select 1;
+select NULL union select NULL;
+
+#
+# UNION type coercion
+#
+select 1 union select 1.5;
+select 'abc' union select 123;

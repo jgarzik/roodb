@@ -1,0 +1,150 @@
+drop table if exists t1,t2;
+create table t1 (grp int, a bigint unsigned, c char(10) not null);
+insert into t1 values (1,1,'a');
+insert into t1 values (2,2,'b');
+insert into t1 values (2,3,'c');
+insert into t1 values (3,4,'E');
+insert into t1 values (3,5,'C');
+insert into t1 values (3,6,'D');
+select sum(a) from t1 where a > 10;
+SUM(a)
+NULL
+select count(distinct a),count(distinct grp) from t1;
+COUNT(a)	COUNT(grp)
+6	6
+insert into t1 values (null,null,'');
+select count(distinct a),count(distinct grp) from t1;
+COUNT(a)	COUNT(grp)
+6	6
+select sum(all a),count(all a),avg(all a),min(all a),max(all a),min(all c),max(all c) from t1;
+SUM(a)	COUNT(a)	AVG(a)	MIN(a)	MAX(a)	MIN(c)	MAX(c)
+21	6	3.5	1	6	1	6
+drop table t1;
+create table t1 (a int primary key, c char(10), b text);
+INSERT INTO t1 VALUES (1,'1','1');
+INSERT INTO t1 VALUES (2,'2','2');
+INSERT INTO t1 VALUES (4,'4','4');
+select count(*) from t1;
+COUNT(NULL)
+3
+select count(*) from t1 where a = 1;
+COUNT(NULL)
+1
+select count(*) from t1 where a = 100;
+COUNT(NULL)
+0
+select count(*) from t1 where a >= 10;
+COUNT(NULL)
+0
+select count(a) from t1 where a = 1;
+COUNT(a)
+1
+select count(a) from t1 where a = 100;
+COUNT(a)
+0
+select count(a) from t1 where a >= 10;
+COUNT(a)
+0
+drop table t1;
+CREATE TABLE t1 (d DATETIME, i INT);
+INSERT INTO t1 VALUES ('2024-01-01 00:00:00', 1);
+SELECT COUNT(i), i, COUNT(i)*i FROM t1 GROUP BY i ORDER BY i;
+COUNT(i)	i	COUNT(i) * i
+1	1	1
+SELECT COUNT(i), (i+0), COUNT(i)*(i+0) FROM t1 GROUP BY i ORDER BY i;
+COUNT(i)	i + 0	COUNT(i) * i + 0
+1	1	1
+DROP TABLE t1;
+create table t1 (
+num float(5,2),
+user char(20)
+);
+insert into t1 values (10.3,'nem'),(20.53,'monty'),(30.23,'sinisa');
+insert into t1 values (30.13,'nem'),(20.98,'monty'),(10.45,'sinisa');
+insert into t1 values (5.2,'nem'),(8.64,'monty'),(11.12,'sinisa');
+select sum(num) from t1;
+SUM(num)
+147.580000000000013
+drop table t1;
+CREATE TABLE t1 (a int, b int);
+select count(b), sum(b), avg(b), min(b), max(b) from t1;
+COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+0	NULL	NULL	NULL	NULL
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+a	COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+insert into t1 values (1,null);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+a	COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+1	0	NULL	NULL	NULL	NULL
+insert into t1 values (1,null);
+insert into t1 values (2,null);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+a	COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+1	0	NULL	NULL	NULL	NULL
+2	0	NULL	NULL	NULL	NULL
+insert into t1 values (2,1);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+a	COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+1	0	NULL	NULL	NULL	NULL
+2	1	1	1	1	1
+insert into t1 values (3,1);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+a	COUNT(b)	SUM(b)	AVG(b)	MIN(b)	MAX(b)
+1	0	NULL	NULL	NULL	NULL
+2	1	1	1	1	1
+3	1	1	1	1	1
+drop table t1;
+create table t1 (a int);
+select avg(2) from t1;
+AVG(2)
+NULL
+drop table t1;
+create table t1 (a int, b int);
+insert into t1 values (1,10),(2,20),(3,30),(1,40),(2,50);
+select min(a), max(a) from t1;
+MIN(a)	MAX(a)
+1	3
+select min(b), max(b) from t1;
+MIN(b)	MAX(b)
+10	50
+select a, min(b), max(b) from t1 group by a order by a;
+a	MIN(b)	MAX(b)
+1	10	40
+2	20	50
+3	30	30
+drop table t1;
+create table t1 (a int);
+insert into t1 values (1);
+select max(a) as b from t1 having b=1;
+b
+1
+select a from t1 having a=1;
+a
+1
+drop table t1;
+CREATE TABLE t1 (a int primary key);
+INSERT INTO t1 VALUES (1),(2),(3),(4);
+SELECT MAX(a) FROM t1 WHERE a > 5;
+MAX(a)
+NULL
+SELECT MIN(a) FROM t1 WHERE a < 0;
+MIN(a)
+NULL
+DROP TABLE t1;
+CREATE TABLE t1 (a int, b int, c varchar(10));
+INSERT INTO t1 VALUES (1,10,'x'),(1,20,'y'),(2,10,'z'),(2,30,'w');
+SELECT a, SUM(b) FROM t1 GROUP BY a ORDER BY a;
+a	SUM(b)
+1	30
+2	40
+SELECT a, COUNT(*), SUM(b), AVG(b), MIN(c), MAX(c) FROM t1 GROUP BY a ORDER BY a;
+a	COUNT(NULL)	SUM(b)	AVG(b)	MIN(c)	MAX(c)
+1	2	30	15	x	y
+2	2	40	20	w	z
+SELECT a, b, COUNT(*) FROM t1 GROUP BY a, b ORDER BY a, b;
+a	b	COUNT(NULL)
+1	10	1
+1	20	1
+2	10	1
+2	30	1
+DROP TABLE t1;

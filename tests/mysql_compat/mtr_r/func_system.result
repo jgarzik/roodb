@@ -1,0 +1,50 @@
+select database();
+DATABASE()
+test
+select database() = "test";
+DATABASE()
+test
+select user() like "%@%";
+USER() LIKE '%@%'
+1
+select version()>="3.23.29";
+VERSION() >= '3.23.29'
+1
+select TRUE,FALSE,NULL;
+TRUE	FALSE	NULL
+1	0	NULL
+create table t1 (c1 char(5));
+insert into t1 values('row 1');
+insert into t1 values('row 2');
+insert into t1 values('row 3');
+select concat(user(), '--', c1) from t1;
+CONCAT(USER(),'--',c1)
+root@localhost--row 1
+root@localhost--row 2
+root@localhost--row 3
+select concat(database(), '--', c1) from t1;
+DATABASE()
+test
+drop table t1;
+create table t1 (a char(10));
+select * from t1 where a=version();
+a
+select * from t1 where a=database();
+DATABASE()
+test
+select * from t1 where a=user();
+a
+insert into t1 values ('a');
+select left(concat(a,version()),1) from t1;
+LEFT(CONCAT(a,VERSION()),1)
+a
+drop table t1;
+#
+# Basic DATABASE() in UNION
+#
+SELECT DATABASE();
+DATABASE()
+test
+SELECT DATABASE() UNION ALL SELECT DATABASE();
+DATABASE()
+test

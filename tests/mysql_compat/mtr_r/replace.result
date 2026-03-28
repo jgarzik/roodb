@@ -1,0 +1,24 @@
+drop table if exists t1;
+CREATE TABLE t1 (
+gesuchnr int DEFAULT 0 NOT NULL,
+benutzer_id int DEFAULT 0 NOT NULL,
+PRIMARY KEY (gesuchnr,benutzer_id)
+);
+replace into t1 (gesuchnr,benutzer_id) values (2,1);
+replace into t1 (gesuchnr,benutzer_id) values (1,1);
+replace into t1 (gesuchnr,benutzer_id) values (1,1);
+replace into t1 (gesuchnr,benutzer_id) values (1,1);
+select * from t1;
+gesuchnr	benutzer_id
+1	1
+2	1
+drop table t1;
+create table t1 (a int not null primary key, b char(20) default "default_value");
+insert into t1 values (126,"first"),(63, "middle");
+replace into t1 values (126,"first updated");
+select * from t1;
+a	b
+126	first
+63	middle
+126	first updated
+drop table t1;

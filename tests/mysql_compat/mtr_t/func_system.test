@@ -1,0 +1,51 @@
+#
+# System functions - trimmed for RooDB
+#
+
+select database();
+select database() = "test";
+
+select user() like "%@%";
+
+select version()>="3.23.29";
+
+# [RooDB-skip] explain select database(), user();
+
+# [RooDB-skip] CREATE TABLE AS SELECT
+# [RooDB-skip] charset/collation functions
+# [RooDB-skip] _utf8/_latin1 charset introducers
+# [RooDB-skip] CHARACTER SET
+
+select TRUE,FALSE,NULL;
+
+#
+# Bug#12351: CONCAT with USER()/DATABASE()
+#
+create table t1 (c1 char(5));
+insert into t1 values('row 1');
+insert into t1 values('row 2');
+insert into t1 values('row 3');
+select concat(user(), '--', c1) from t1;
+select concat(database(), '--', c1) from t1;
+drop table t1;
+
+#
+# Basic system function in WHERE
+#
+create table t1 (a char(10));
+select * from t1 where a=version();
+select * from t1 where a=database();
+select * from t1 where a=user();
+insert into t1 values ('a');
+select left(concat(a,version()),1) from t1;
+drop table t1;
+
+# [RooDB-skip] PREPARE/EXECUTE
+# [RooDB-skip] IS_IPV4, IS_IPV6, IS_UUID
+
+--echo #
+--echo # Basic DATABASE() in UNION
+--echo #
+
+SELECT DATABASE();
+SELECT DATABASE() UNION ALL SELECT DATABASE();

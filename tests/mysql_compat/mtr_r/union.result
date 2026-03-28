@@ -1,0 +1,155 @@
+drop table if exists t1,t2;
+CREATE TABLE t1 (a int not null, b char(10) not null);
+insert into t1 values(1,'a'),(2,'b'),(3,'c'),(3,'c');
+CREATE TABLE t2 (a int not null, b char(10) not null);
+insert into t2 values (3,'c'),(4,'d'),(5,'f'),(6,'e');
+select a,b from t1 union distinct select a,b from t2 order by a,b;
+a	b
+1	a
+2	b
+3	c
+select a,b from t1 union all select a,b from t2 order by a,b;
+a	b
+1	a
+2	b
+3	c
+3	c
+3	c
+4	d
+5	f
+6	e
+select a,b from t1 union all select a,b from t2 order by b;
+a	b
+1	a
+2	b
+3	c
+3	c
+3	c
+4	d
+6	e
+5	f
+select a,b from t1 union select a,b from t1 order by a,b;
+a	b
+1	a
+2	b
+3	c
+(select 't1',b,count(*) from t1 group by b) UNION (select 't2',b,count(*) from t2 group by b) order by 1,2;
+'t1'	b	COUNT(NULL)
+t1	a	1
+t1	b	1
+t1	c	2
+t2	c	1
+t2	d	1
+t2	e	1
+t2	f	1
+(select a,b from t1 limit 2) union all (select a,b from t2 order by a limit 1);
+a	b
+1	a
+2	b
+3	c
+select a,b from t1 union select a from t2;
+ERROR 21000: The used SELECT statements have a different number of columns
+select * from t1 union select a from t2;
+ERROR 21000: The used SELECT statements have a different number of columns
+select a from t1 union select * from t2;
+ERROR 21000: The used SELECT statements have a different number of columns
+drop table t1,t2;
+select 1 as a union select 2 as a order by a;
+a
+1
+2
+select 1 as a union all select 1 as a order by a;
+a
+1
+1
+(select 1 as a) union (select 2 as a) union (select 3 as a) order by a;
+a
+1
+2
+3
+create table t1 (a int);
+create table t2 (a int);
+insert into t1 values (1),(2),(3),(4),(5);
+insert into t2 values (11),(12),(13),(14),(15);
+(select * from t1 limit 2) union (select * from t2 limit 3) order by a limit 4;
+a
+1
+2
+11
+12
+(select * from t1 limit 2) union (select * from t2 limit 3) order by a;
+a
+1
+2
+11
+12
+13
+drop table t1,t2;
+create table t1 (a int, b varchar(10));
+insert into t1 values (1,'one'),(2,'two'),(3,'three');
+create table t2 (a int, b varchar(10));
+insert into t2 values (4,'four'),(5,'five'),(6,'six');
+select a,b from t1 union select a,b from t2 order by a;
+a	b
+1	one
+2	two
+3	three
+4	four
+5	five
+6	six
+select a,b from t1 union all select a,b from t2 order by a desc;
+a	b
+6	six
+5	five
+4	four
+3	three
+2	two
+1	one
+select a,b from t1 union select a,b from t2 order by a limit 3;
+a	b
+1	one
+2	two
+3	three
+(select a,b from t1 order by a) union all (select a,b from t2 order by a);
+a	b
+1	one
+2	two
+3	three
+4	four
+5	five
+6	six
+drop table t1,t2;
+create table t1 (a int, b int);
+insert into t1 values (1,10),(2,20),(3,30);
+create table t2 (a int, b int);
+insert into t2 values (4,40),(5,50),(6,60);
+select * from t1 where a > 1 union select * from t2 where a < 6 order by a, b;
+a	b
+2	20
+3	30
+4	40
+5	50
+select * from t1 where a = 1 union all select * from t2 where b = 50 order by a, b;
+a	b
+1	10
+5	50
+drop table t1,t2;
+select 1 as a union select NULL;
+a
+1
+NULL
+select NULL union select 1;
+NULL
+NULL
+1
+select NULL union select NULL;
+NULL
+NULL
+select 1 union select 1.5;
+1
+1
+1.5
+select 'abc' union select 123;
+'abc'
+abc
+123

@@ -1,0 +1,83 @@
+drop table if exists t1;
+create table t1 (xxx char(128));
+insert into t1 (xxx) values('this is a test of some long text to see what happens');
+select * from t1 where xxx regexp('is a test of some long text to');
+xxx
+this is a test of some long text to see what happens
+select * from t1 where xxx regexp('is a test of some long text to ');
+xxx
+this is a test of some long text to see what happens
+select * from t1 where xxx regexp('is a test of some long text to s');
+xxx
+this is a test of some long text to see what happens
+select * from t1 where xxx regexp('is a test of some long text to se');
+xxx
+this is a test of some long text to see what happens
+drop table t1;
+create table t1 (a varchar(40));
+insert into t1 values ('C1'),('C2'),('R1'),('C3'),('R2'),('R3');
+select a from t1 where a rlike '^C.*' order by a;
+a
+C1
+C2
+C3
+select a from t1 where a rlike '^R.*' order by a;
+a
+R1
+R2
+R3
+drop table t1;
+End of 4.1 tests
+End of 5.0 tests
+CREATE TABLE t1(a INT, b CHAR(4));
+INSERT INTO t1 VALUES (1, '6.1'), (1, '7.0'), (1, '8.0');
+SELECT a FROM t1 WHERE a=1 AND '7.0' REGEXP b LIMIT 1;
+a
+1
+DROP TABLE t1;
+End of 5.1 tests
+SELECT ' '  REGEXP '[[:blank:]]';
+REGEXP(' ','[[:blank:]]')
+1
+SELECT ' '  REGEXP '[[:space:]]';
+REGEXP(' ','[[:space:]]')
+1
+SELECT 'abc' REGEXP 'abc';
+REGEXP('abc','abc')
+1
+SELECT 'abc' REGEXP 'def';
+REGEXP('abc','def')
+0
+SELECT 'abc' REGEXP '^abc$';
+REGEXP('abc','^abc$')
+1
+SELECT 'abc' REGEXP '^a';
+REGEXP('abc','^a')
+1
+SELECT 'abc' REGEXP 'c$';
+REGEXP('abc','c$')
+1
+SELECT 'abc' REGEXP 'b';
+REGEXP('abc','b')
+1
+SELECT 'abc' REGEXP '.b.';
+REGEXP('abc','.b.')
+1
+SELECT 'abc' REGEXP 'a.c';
+REGEXP('abc','a.c')
+1
+SELECT 'abc' REGEXP '[abc]';
+REGEXP('abc','[abc]')
+1
+SELECT 'abc' REGEXP '[^xyz]';
+REGEXP('abc','[^xyz]')
+1
+SELECT '123' REGEXP '[0-9]+';
+REGEXP('123','[0-9]+')
+1
+SELECT 'abc' REGEXP '[0-9]+';
+REGEXP('abc','[0-9]+')
+0
+SELECT 'abc123' REGEXP '[a-z]+[0-9]+';
+REGEXP('abc123','[a-z]+[0-9]+')
+1

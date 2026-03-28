@@ -94,6 +94,13 @@ TIERS = {
         "distinct",        # 990 lines — SELECT DISTINCT
         "having",          # 989 lines — HAVING clause
     ],
+    6: [
+        "func_system",     # 91 lines — system functions (DATABASE, USER, VERSION)
+        "replace",         # 47 lines — REPLACE INTO
+        "func_regexp",     # 205 lines — REGEXP/RLIKE
+        "func_group",      # 1506 lines — aggregate functions (COUNT/SUM/AVG/MIN/MAX)
+        "union",           # 2818 lines — UNION/UNION ALL
+    ],
 }
 
 

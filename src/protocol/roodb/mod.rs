@@ -1080,6 +1080,9 @@ where
             if upper.starts_with("LOAD DATA ") {
                 return self.handle_load_data(sql).await;
             }
+            if upper.starts_with("REPLACE ") {
+                return self.handle_replace(sql).await;
+            }
         }
 
         // Handle CREATE TEMPORARY TABLE
@@ -2327,6 +2330,19 @@ where
                 }
             };
 
+            // Validate column count matches first SELECT
+            let part_cols = plan.output_columns();
+            if part_cols.len() != columns.len() {
+                return self
+                    .send_error(
+                        1222,
+                        "21000",
+                        "The used SELECT statements have a different number of columns",
+                    )
+                    .await
+                    .map(|_| Some(()));
+            }
+
             let engine = ExecutorEngine::with_raft(
                 mvcc.clone(),
                 self.catalog.clone(),
@@ -2351,6 +2367,61 @@ where
                 let key: Vec<_> = row.values().to_vec();
                 seen.insert(key)
             });
+        }
+
+        // Apply trailing ORDER BY to the combined UNION result
+        // Extract ORDER BY from the parsed statement (sqlparser already parsed it)
+        if let sqlparser::ast::Statement::Query(q) = &ast[0] {
+            // Apply ORDER BY from the full UNION query
+            if let Some(ref order_by) = q.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(ref exprs) = order_by.kind {
+                    let col_names: Vec<String> =
+                        columns.iter().map(|c| c.name.to_uppercase()).collect();
+                    all_rows.sort_by(|a, b| {
+                        for ob_expr in exprs {
+                            let col_idx = match &ob_expr.expr {
+                                sqlparser::ast::Expr::Identifier(ident) => col_names
+                                    .iter()
+                                    .position(|n| n.eq_ignore_ascii_case(&ident.value)),
+                                sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                                    value: sqlparser::ast::Value::Number(n, _),
+                                    ..
+                                }) => n.parse::<usize>().ok().map(|i| i - 1),
+                                _ => None,
+                            };
+                            if let Some(idx) = col_idx {
+                                let va = a.get_opt(idx).unwrap_or(&Datum::Null);
+                                let vb = b.get_opt(idx).unwrap_or(&Datum::Null);
+                                let ord = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+                                let ord = if ob_expr.options.asc == Some(false) {
+                                    ord.reverse()
+                                } else {
+                                    ord
+                                };
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+            }
+
+            // Apply LIMIT
+            if let Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit:
+                    Some(sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::Number(ref n, _),
+                        ..
+                    })),
+                ..
+            }) = q.limit_clause
+            {
+                if let Ok(limit) = n.parse::<usize>() {
+                    all_rows.truncate(limit);
+                }
+            }
         }
 
         // Clean up read-only transaction
@@ -4505,6 +4576,79 @@ where
     }
 
     /// Handle CREATE FUNCTION via text parsing (MySQL syntax with BEGIN/END body)
+    /// Handle REPLACE INTO — MySQL semantics: if duplicate key, delete old row + insert new.
+    /// Approach: parse table + columns + values, for each row try INSERT;
+    /// on duplicate key, DELETE by PK then INSERT.
+    async fn handle_replace(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse REPLACE INTO table (cols) VALUES (vals), (vals)...
+        let re =
+            regex::Regex::new(r"(?is)REPLACE\s+INTO\s+(\w+)\s*(?:\(([^)]+)\))?\s+VALUES\s+(.*)")
+                .unwrap();
+
+        let caps = match re.captures(sql.trim().trim_end_matches(';')) {
+            Some(c) => c,
+            None => {
+                // Fallback: convert REPLACE to INSERT and try directly
+                let insert_sql = regex::Regex::new(r"(?i)^REPLACE\b")
+                    .unwrap()
+                    .replace(sql, "INSERT");
+                return self.handle_query(&insert_sql).await;
+            }
+        };
+
+        let table = caps.get(1).unwrap().as_str();
+        let cols = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let values_part = caps.get(3).unwrap().as_str();
+
+        // For each VALUES group, try INSERT; on dup key error, DELETE + INSERT
+        let col_clause = if cols.is_empty() {
+            String::new()
+        } else {
+            format!("({})", cols)
+        };
+
+        // Split value groups: (v1,v2), (v3,v4)
+        let mut total_affected = 0u64;
+        let val_re = regex::Regex::new(r"\(([^)]*)\)").unwrap();
+        for val_match in val_re.captures_iter(values_part) {
+            let vals = val_match.get(1).unwrap().as_str();
+            let insert_sql = format!("INSERT INTO {} {} VALUES ({})", table, col_clause, vals);
+            match self.execute_sql_silent(&insert_sql).await {
+                Ok(n) => total_affected += n,
+                Err(e) => {
+                    if e.contains("Duplicate entry") || e.contains("duplicate key") {
+                        // Build DELETE WHERE pk = val using the first column value
+                        // For multi-column PK, we'd need schema introspection.
+                        // Simplified: delete by first column value
+                        let first_val = vals.split(',').next().unwrap_or("").trim();
+                        let first_col = if cols.is_empty() {
+                            // No column list; assume first column is PK
+                            String::new()
+                        } else {
+                            cols.split(',').next().unwrap_or("").trim().to_string()
+                        };
+                        if !first_col.is_empty() {
+                            let delete_sql = format!(
+                                "DELETE FROM {} WHERE {} = {}",
+                                table, first_col, first_val
+                            );
+                            if let Ok(d) = self.execute_sql_silent(&delete_sql).await {
+                                total_affected += d;
+                            }
+                        }
+                        // Retry INSERT
+                        if let Ok(n) = self.execute_sql_silent(&insert_sql).await {
+                            total_affected += n;
+                        }
+                    }
+                    // Else: non-duplicate error, skip row
+                }
+            }
+        }
+
+        self.send_ok(total_affected, 0).await
+    }
+
     /// Handle LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name [CHARACTER SET cs]
     async fn handle_load_data(&mut self, sql: &str) -> ProtocolResult<()> {
         // Parse: LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name

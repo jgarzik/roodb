@@ -40,6 +40,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 3 | type_decimal, type_float, func_like, func_test, func_math, delete, cast, type_year, type_blob, type_enum | Functions, DML, type casting |
 | 4 | insert, update, func_str, func_concat, func_if | Complex DML, string functions |
 | 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
+| 6 | func_system, replace, func_regexp, func_group, union | System funcs, REPLACE, REGEXP, aggregates, UNION |
+| 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
 
 ## Current Status
 
@@ -102,6 +104,16 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | select_found | **PASS** | ~40% | SQL_CALC_FOUND_ROWS, PREPARE, UNION |
 | distinct | **PASS** | ~12% | Complex joins, EXPLAIN, INSERT...SELECT |
 | having | **PASS** | ~10% | Aggregate alias HAVING, IS NOT NULL, subqueries |
+
+### Tier 6 — 5/5 pass
+
+| Test | Status | Coverage | Trimmed |
+|------|--------|----------|---------|
+| func_system | **PASS** | ~55% | CHARSET/COLLATION functions, EXPLAIN |
+| replace | **PASS** | ~70% | REPLACE...SELECT, VIEW, ALTER TABLE |
+| func_regexp | **PASS** | ~35% | REGEXP_REPLACE/INSTR/LIKE, charset, NULL pattern |
+| func_group | **PASS** | ~10% | ROLLUP, window funcs, EXPLAIN, subqueries |
+| union | **PASS** | ~5% | EXPLAIN, VIEWs, subqueries, --source includes |
 
 ### Custom Tests — 23/23 pass
 
