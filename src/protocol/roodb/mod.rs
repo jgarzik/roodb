@@ -2760,14 +2760,17 @@ where
             }
 
             AlterTableOperation::DropForeignKey { name, .. } => {
-                // MySQL: DROP FOREIGN KEY fk_symbol — we don't track names,
-                // so try to match by removing the first FK constraint, or log warning
-                let _fk_name = name.value.clone();
+                let fk_name = name.value.clone();
                 let before = def.constraints.len();
-                def.constraints
-                    .retain(|c| !matches!(c, crate::catalog::Constraint::ForeignKey { .. }));
+                def.constraints.retain(|c| {
+                    if let crate::catalog::Constraint::ForeignKey { name: Some(n), .. } = c {
+                        !n.eq_ignore_ascii_case(&fk_name)
+                    } else {
+                        true
+                    }
+                });
                 if def.constraints.len() == before {
-                    warn!("DROP FOREIGN KEY '{}': no foreign key found", _fk_name);
+                    warn!("DROP FOREIGN KEY '{}': no foreign key found", fk_name);
                 }
             }
 
@@ -6141,6 +6144,8 @@ where
                         "22007",
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::DuplicateKey(_) = exec_err {
+                    (codes::ER_DUP_ENTRY, "23000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::InvalidOperation(ref msg) = exec_err {
                     let code =
                         if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
@@ -6208,6 +6213,7 @@ fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
                 parts.push(format!("UNIQUE KEY ({})", col_list.join(", ")));
             }
             Constraint::ForeignKey {
+                name,
                 columns,
                 ref_table,
                 ref_columns,
@@ -6215,12 +6221,22 @@ fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
                 let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c)).collect();
                 let ref_list: Vec<String> =
                     ref_columns.iter().map(|c| format!("`{}`", c)).collect();
-                parts.push(format!(
-                    "FOREIGN KEY ({}) REFERENCES `{}` ({})",
-                    col_list.join(", "),
-                    ref_table,
-                    ref_list.join(", ")
-                ));
+                if let Some(fk_name) = name {
+                    parts.push(format!(
+                        "CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                        fk_name,
+                        col_list.join(", "),
+                        ref_table,
+                        ref_list.join(", ")
+                    ));
+                } else {
+                    parts.push(format!(
+                        "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                        col_list.join(", "),
+                        ref_table,
+                        ref_list.join(", ")
+                    ));
+                }
             }
             Constraint::Check(expr) => {
                 parts.push(format!("CHECK ({})", expr));

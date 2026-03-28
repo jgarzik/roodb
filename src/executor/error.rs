@@ -52,6 +52,9 @@ pub enum ExecutorError {
     /// Truncated incorrect value (MySQL error 1292)
     TruncatedWrongValue(String),
 
+    /// Duplicate key violation (MySQL error 1062)
+    DuplicateKey(String),
+
     /// Internal executor error
     Internal(String),
 }
@@ -89,6 +92,7 @@ impl fmt::Display for ExecutorError {
             ExecutorError::Encoding(msg) => write!(f, "encoding error: {}", msg),
             ExecutorError::InvalidArgumentForLogarithm(msg) => write!(f, "{}", msg),
             ExecutorError::TruncatedWrongValue(msg) => write!(f, "{}", msg),
+            ExecutorError::DuplicateKey(msg) => write!(f, "{}", msg),
             ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }

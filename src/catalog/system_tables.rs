@@ -80,6 +80,7 @@ pub fn constraints_table_def() -> TableDef {
         .column(ColumnDef::new("ref_table", DataType::Varchar(255)).nullable(true)) // for FK
         .column(ColumnDef::new("ref_columns", DataType::Text).nullable(true)) // comma-separated, for FK
         .column(ColumnDef::new("check_expr", DataType::Text).nullable(true)) // for CHECK
+        .column(ColumnDef::new("constraint_name", DataType::Varchar(255)).nullable(true)) // FK name
         .constraint(Constraint::PrimaryKey(vec![
             "table_name".to_string(),
             "ordinal".to_string(),
@@ -312,24 +313,31 @@ pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
         .iter()
         .enumerate()
         .map(|(ordinal, constraint)| {
-            let (constraint_type, columns, ref_table, ref_columns, check_expr) = match constraint {
-                Constraint::PrimaryKey(cols) => {
-                    ("PRIMARY_KEY", Some(cols.join(",")), None, None, None)
-                }
-                Constraint::Unique(cols) => ("UNIQUE", Some(cols.join(",")), None, None, None),
-                Constraint::ForeignKey {
-                    columns,
-                    ref_table,
-                    ref_columns,
-                } => (
-                    "FOREIGN_KEY",
-                    Some(columns.join(",")),
-                    Some(ref_table.clone()),
-                    Some(ref_columns.join(",")),
-                    None,
-                ),
-                Constraint::Check(expr) => ("CHECK", None, None, None, Some(expr.clone())),
-            };
+            let (constraint_type, columns, ref_table, ref_columns, check_expr, constraint_name) =
+                match constraint {
+                    Constraint::PrimaryKey(cols) => {
+                        ("PRIMARY_KEY", Some(cols.join(",")), None, None, None, None)
+                    }
+                    Constraint::Unique(cols) => {
+                        ("UNIQUE", Some(cols.join(",")), None, None, None, None)
+                    }
+                    Constraint::ForeignKey {
+                        name,
+                        columns,
+                        ref_table,
+                        ref_columns,
+                    } => (
+                        "FOREIGN_KEY",
+                        Some(columns.join(",")),
+                        Some(ref_table.clone()),
+                        Some(ref_columns.join(",")),
+                        None,
+                        name.clone(),
+                    ),
+                    Constraint::Check(expr) => {
+                        ("CHECK", None, None, None, Some(expr.clone()), None)
+                    }
+                };
 
             Row::new(vec![
                 Datum::String(def.name.clone()),
@@ -339,6 +347,7 @@ pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
                 ref_table.map(Datum::String).unwrap_or(Datum::Null),
                 ref_columns.map(Datum::String).unwrap_or(Datum::Null),
                 check_expr.map(Datum::String).unwrap_or(Datum::Null),
+                constraint_name.map(Datum::String).unwrap_or(Datum::Null),
             ])
         })
         .collect()
@@ -395,7 +404,17 @@ pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
                     let cols = columns?;
                     let rt = ref_table?;
                     let rc = ref_columns?;
+                    // Backward compat: older rows may not have column 7 (constraint_name)
+                    let fk_name = if row.values().len() > 7 {
+                        match &row.values()[7] {
+                            Datum::String(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     Some(Constraint::ForeignKey {
+                        name: fk_name,
                         columns: cols,
                         ref_table: rt,
                         ref_columns: rc,
@@ -681,6 +700,7 @@ mod tests {
                 "status".to_string(),
             ]))
             .constraint(Constraint::ForeignKey {
+                name: Some("fk_user".to_string()),
                 columns: vec!["user_id".to_string()],
                 ref_table: "users".to_string(),
                 ref_columns: vec!["id".to_string()],

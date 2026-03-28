@@ -20,7 +20,7 @@ use super::ddl::{
     CreateDatabase, CreateIndex, CreateTable, CreateTableAs, CreateTableAsParams, DropDatabase,
     DropIndex, DropTable, Materialize,
 };
-use super::delete::Delete;
+use super::delete::{Delete, DeleteParams};
 use super::distinct::HashDistinct;
 use super::error::{ExecutorError, ExecutorResult};
 use super::explain_exec::ExplainExecutor;
@@ -302,6 +302,7 @@ impl ExecutorEngine {
                 key_value,
                 order_by,
                 limit,
+                pk_column_indices,
             } => Ok(Box::new(Update::new(UpdateParams {
                 table,
                 assignments,
@@ -309,6 +310,7 @@ impl ExecutorEngine {
                 key_value,
                 order_by,
                 limit,
+                pk_column_indices,
                 mvcc: self.mvcc.clone(),
                 txn_context: self.txn_context.clone(),
                 user_variables: self.user_variables.clone(),
@@ -318,14 +320,18 @@ impl ExecutorEngine {
                 table,
                 filter,
                 key_value,
-            } => Ok(Box::new(Delete::new(
+                order_by,
+                limit,
+            } => Ok(Box::new(Delete::new(DeleteParams {
                 table,
                 filter,
                 key_value,
-                self.mvcc.clone(),
-                self.txn_context.clone(),
-                self.user_variables.clone(),
-            ))),
+                order_by,
+                limit,
+                mvcc: self.mvcc.clone(),
+                txn_context: self.txn_context.clone(),
+                user_variables: self.user_variables.clone(),
+            }))),
 
             PhysicalPlan::CreateTable {
                 name,

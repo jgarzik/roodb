@@ -162,6 +162,7 @@ pub enum Constraint {
     Unique(Vec<String>),
     /// Foreign key constraint
     ForeignKey {
+        name: Option<String>,
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
@@ -570,6 +571,32 @@ impl Catalog {
             }
         }
 
+        // Validate FK ref_table and ref_columns exist
+        for constraint in &def.constraints {
+            if let Constraint::ForeignKey {
+                ref_table,
+                ref_columns,
+                ..
+            } = constraint
+            {
+                if let Some(ref_def) = self.tables.get(ref_table) {
+                    for rc in ref_columns {
+                        if ref_def.get_column(rc).is_none() {
+                            return Err(CatalogError::InvalidConstraint(format!(
+                                "Foreign key references non-existent column '{}' in table '{}'",
+                                rc, ref_table
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(CatalogError::InvalidConstraint(format!(
+                        "Foreign key references non-existent table '{}'",
+                        ref_table
+                    )));
+                }
+            }
+        }
+
         if self.tables.contains_key(&def.name) {
             return Err(CatalogError::TableExists(def.name.clone()));
         }
@@ -891,6 +918,7 @@ mod tests {
             .column(ColumnDef::new("status", DataType::Varchar(50)))
             .constraint(Constraint::PrimaryKey(vec!["id".to_string()]))
             .constraint(Constraint::ForeignKey {
+                name: Some("fk_user".to_string()),
                 columns: vec!["user_id".to_string()],
                 ref_table: "users".to_string(),
                 ref_columns: vec!["id".to_string()],

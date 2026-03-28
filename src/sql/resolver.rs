@@ -156,6 +156,8 @@ impl<'a> Resolver<'a> {
                         })
                         .unwrap_or_default(),
                     filter: None,
+                    order_by: Vec::new(),
+                    limit: None,
                 })
             }
 
@@ -197,13 +199,44 @@ impl<'a> Resolver<'a> {
             }
         }
 
+        // Check for multiple primary key definitions (MySQL error 1068)
+        let has_table_level_pk = constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::PrimaryKey(_)));
+        if !inline_pk_columns.is_empty() && has_table_level_pk {
+            return Err(SqlError::Unsupported(
+                "Multiple primary key defined".to_string(),
+            ));
+        }
+
+        // Check for multiple table-level PK constraints
+        let pk_count = constraints
+            .iter()
+            .filter(|c| matches!(c, Constraint::PrimaryKey(_)))
+            .count();
+        if pk_count > 1 {
+            return Err(SqlError::Unsupported(
+                "Multiple primary key defined".to_string(),
+            ));
+        }
+
         // Add PrimaryKey constraint for inline PK columns if not already present
-        if !inline_pk_columns.is_empty()
-            && !constraints
-                .iter()
-                .any(|c| matches!(c, Constraint::PrimaryKey(_)))
-        {
+        if !inline_pk_columns.is_empty() && !has_table_level_pk {
             constraints.push(Constraint::PrimaryKey(inline_pk_columns));
+        }
+
+        // Enforce NOT NULL on all PRIMARY KEY columns (MySQL behavior)
+        for constraint in &constraints {
+            if let Constraint::PrimaryKey(pk_cols) = constraint {
+                for pk_col in pk_cols {
+                    if let Some(col) = columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(pk_col))
+                    {
+                        col.nullable = false;
+                    }
+                }
+            }
         }
 
         // Handle CREATE TABLE ... SELECT (CTAS)
@@ -699,10 +732,36 @@ impl<'a> Resolver<'a> {
             .map(|f| self.resolve_expr(f, &scope))
             .transpose()?;
 
+        // Resolve ORDER BY
+        let mut resolved_order_by = Vec::new();
+        for ob in &delete.order_by {
+            let expr = self.resolve_expr(&ob.expr, &scope)?;
+            let asc = ob.options.asc.unwrap_or(true);
+            resolved_order_by.push((expr, asc));
+        }
+
+        // Resolve LIMIT
+        let resolved_limit = if let Some(ref limit_expr) = delete.limit {
+            match limit_expr {
+                sp::Expr::Value(v) => {
+                    if let sp::Value::Number(n, _) = &v.value {
+                        n.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(ResolvedStatement::Delete {
             table: table_name,
             table_columns,
             filter: resolved_filter,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
         })
     }
 
@@ -2473,6 +2532,7 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
                 .map(|c| c.value.clone())
                 .collect();
             Ok(Some(Constraint::ForeignKey {
+                name: fk.name.as_ref().map(|n| n.value.clone()),
                 columns: cols,
                 ref_table: fk.foreign_table.to_string(),
                 ref_columns: ref_cols,

@@ -366,6 +366,8 @@ pub enum ResolvedStatement {
         table: String,
         table_columns: Vec<(String, DataType, bool)>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        limit: Option<usize>,
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
@@ -548,6 +550,8 @@ pub enum LogicalPlan {
     Delete {
         table: String,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     // ============ DDL Operations (passthrough) ============

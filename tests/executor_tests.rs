@@ -458,6 +458,8 @@ async fn test_delete_with_filter() {
             result_type: DataType::Boolean,
         }),
         key_value: None,
+        order_by: vec![],
+        limit: None,
     };
 
     let mut exec = engine.build(plan).unwrap();

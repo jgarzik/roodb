@@ -35,6 +35,12 @@ fn encode_comparable_datum(buf: &mut Vec<u8>, datum: &Datum) {
             let v = (*i as u64) ^ (1u64 << 63);
             buf.extend_from_slice(&v.to_be_bytes());
         }
+        Datum::UnsignedInt(u) => {
+            // Big-endian for order-preserving comparison.
+            // Unsigned values are always >= 0, so no sign-bit flip needed —
+            // just straight BE gives correct byte ordering.
+            buf.extend_from_slice(&u.to_be_bytes());
+        }
         Datum::String(s) => {
             // Null-terminated encoding: escape 0x00 bytes
             for &b in s.as_bytes() {

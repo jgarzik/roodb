@@ -19,6 +19,18 @@ use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
+/// Parameters for creating a Delete executor.
+pub struct DeleteParams {
+    pub table: String,
+    pub filter: Option<ResolvedExpr>,
+    pub key_value: Option<ResolvedExpr>,
+    pub order_by: Vec<(ResolvedExpr, bool)>,
+    pub limit: Option<usize>,
+    pub mvcc: Arc<MvccStorage>,
+    pub txn_context: Option<TransactionContext>,
+    pub user_variables: UserVariables,
+}
+
 /// Delete executor
 pub struct Delete {
     /// Table name
@@ -27,6 +39,10 @@ pub struct Delete {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    /// ORDER BY expressions for DELETE ... ORDER BY ... LIMIT
+    order_by: Vec<(ResolvedExpr, bool)>,
+    /// Optional LIMIT
+    limit: Option<usize>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility and versioning)
@@ -41,23 +57,18 @@ pub struct Delete {
 
 impl Delete {
     /// Create a new delete executor
-    pub fn new(
-        table: String,
-        filter: Option<ResolvedExpr>,
-        key_value: Option<ResolvedExpr>,
-        mvcc: Arc<MvccStorage>,
-        txn_context: Option<TransactionContext>,
-        user_variables: UserVariables,
-    ) -> Self {
+    pub fn new(p: DeleteParams) -> Self {
         Delete {
-            table,
-            filter,
-            key_value,
-            mvcc,
-            txn_context,
+            table: p.table,
+            filter: p.filter,
+            key_value: p.key_value,
+            order_by: p.order_by,
+            limit: p.limit,
+            mvcc: p.mvcc,
+            txn_context: p.txn_context,
             rows_deleted: 0,
             done: false,
-            user_variables,
+            user_variables: p.user_variables,
         }
     }
 }
@@ -121,7 +132,7 @@ impl Delete {
                 .collect()
         };
 
-        let mut keys_to_delete = Vec::new();
+        let mut matching: Vec<(Vec<u8>, u64, Row)> = Vec::new();
 
         for (key, value, row_version) in kv_pairs {
             let row = decode_row(&value)?;
@@ -131,8 +142,33 @@ impl Delete {
                     continue;
                 }
             }
-            keys_to_delete.push((key, row_version));
+            matching.push((key, row_version, row));
         }
+
+        // Apply ORDER BY if present
+        if !self.order_by.is_empty() {
+            let order_by = &self.order_by;
+            let user_vars = &self.user_variables;
+            matching.sort_by(|a, b| {
+                for (expr, asc) in order_by {
+                    let va = evaluate(expr, &a.2, user_vars).unwrap_or(super::datum::Datum::Null);
+                    let vb = evaluate(expr, &b.2, user_vars).unwrap_or(super::datum::Datum::Null);
+                    let ord = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if *asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Apply LIMIT if specified
+        if let Some(limit) = self.limit {
+            matching.truncate(limit);
+        }
+
+        let keys_to_delete: Vec<_> = matching.into_iter().map(|(k, v, _)| (k, v)).collect();
 
         let ctx = self.txn_context.as_mut().ok_or_else(|| {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
@@ -327,14 +363,16 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut delete = Delete::new(
-            "users".to_string(),
-            Some(filter),
-            None,
+        let mut delete = Delete::new(DeleteParams {
+            table: "users".to_string(),
+            filter: Some(filter),
+            key_value: None,
+            order_by: vec![],
+            limit: None,
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -376,14 +414,16 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut delete = Delete::new(
-            "users".to_string(),
-            None,
-            None,
+        let mut delete = Delete::new(DeleteParams {
+            table: "users".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![],
+            limit: None,
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();

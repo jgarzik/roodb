@@ -222,6 +222,19 @@ impl Executor for Insert {
                     "INSERT requires transaction context".to_string(),
                 )
             })?;
+
+            // Intra-batch duplicate check: if this PK key was already inserted
+            // in this same INSERT statement, it's a duplicate.
+            if !self.pk_column_indices.is_empty() && ctx.has_buffered_key(&key) {
+                if self.ignore {
+                    continue 'row_loop;
+                }
+                return Err(super::error::ExecutorError::DuplicateKey(format!(
+                    "Duplicate entry for key 'PRIMARY' in table '{}'",
+                    self.table
+                )));
+            }
+
             ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
             // Buffer for read-your-writes within this transaction
             ctx.buffer_write(key, value);

@@ -152,6 +152,8 @@ pub enum PhysicalPlan {
         key_value: Option<ResolvedExpr>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
+        /// Primary key column indices (positions in the full table row)
+        pk_column_indices: Vec<usize>,
     },
 
     /// DELETE rows from a table
@@ -160,6 +162,8 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     // ============ DDL Operations ============
@@ -814,7 +818,11 @@ impl PhysicalPlanner {
             let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
                 pk_cols
                     .iter()
-                    .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
+                    .filter_map(|pk_name| {
+                        columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(pk_name))
+                    })
                     .collect()
             } else {
                 vec![]
@@ -1230,6 +1238,24 @@ impl PhysicalPlanner {
                 let key_value = filter
                     .as_ref()
                     .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                // Look up PK column indices so the executor can detect PK changes
+                let pk_column_indices = if let Some(table_def) = catalog.get_table(&table) {
+                    if let Some(pk_cols) = table_def.primary_key() {
+                        pk_cols
+                            .iter()
+                            .filter_map(|pk_name| {
+                                table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(pk_name))
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
                 Ok(PhysicalPlan::Update {
                     table,
                     assignments,
@@ -1237,10 +1263,16 @@ impl PhysicalPlanner {
                     key_value,
                     order_by,
                     limit,
+                    pk_column_indices,
                 })
             }
 
-            LogicalPlan::Delete { table, filter } => {
+            LogicalPlan::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+            } => {
                 let key_value = filter
                     .as_ref()
                     .and_then(|f| Self::extract_point_get(&table, f, catalog));
@@ -1248,6 +1280,8 @@ impl PhysicalPlanner {
                     table,
                     filter,
                     key_value,
+                    order_by,
+                    limit,
                 })
             }
 

@@ -74,9 +74,18 @@ impl LogicalPlanBuilder {
                     limit,
                 })
             }
-            ResolvedStatement::Delete { table, filter, .. } => {
-                Ok(LogicalPlan::Delete { table, filter })
-            }
+            ResolvedStatement::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+                ..
+            } => Ok(LogicalPlan::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+            }),
             ResolvedStatement::CreateTable {
                 name,
                 columns,
