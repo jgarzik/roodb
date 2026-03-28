@@ -58,6 +58,8 @@ impl LogicalPlanBuilder {
                 table,
                 assignments,
                 filter,
+                order_by,
+                limit,
                 ..
             } => {
                 let assigns = assignments
@@ -68,6 +70,8 @@ impl LogicalPlanBuilder {
                     table,
                     assignments: assigns,
                     filter,
+                    order_by,
+                    limit,
                 })
             }
             ResolvedStatement::Delete { table, filter, .. } => {

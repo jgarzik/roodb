@@ -358,6 +358,8 @@ pub enum ResolvedStatement {
         table_columns: Vec<(String, DataType, bool)>,
         assignments: Vec<ResolvedAssignment>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        limit: Option<usize>,
     },
     /// DELETE with resolved filter
     Delete {
@@ -538,6 +540,8 @@ pub enum LogicalPlan {
         /// (column, new value)
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     /// DELETE rows from a table

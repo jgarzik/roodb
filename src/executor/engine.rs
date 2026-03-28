@@ -37,7 +37,7 @@ use super::scan::TableScan;
 use super::single_row::SingleRow;
 use super::sort::Sort;
 use super::union::Union;
-use super::update::Update;
+use super::update::{Update, UpdateParams};
 use super::Executor;
 
 /// Executor engine - builds executors from physical plans
@@ -300,15 +300,19 @@ impl ExecutorEngine {
                 assignments,
                 filter,
                 key_value,
-            } => Ok(Box::new(Update::new(
+                order_by,
+                limit,
+            } => Ok(Box::new(Update::new(UpdateParams {
                 table,
                 assignments,
                 filter,
                 key_value,
-                self.mvcc.clone(),
-                self.txn_context.clone(),
-                self.user_variables.clone(),
-            ))),
+                order_by,
+                limit,
+                mvcc: self.mvcc.clone(),
+                txn_context: self.txn_context.clone(),
+                user_variables: self.user_variables.clone(),
+            }))),
 
             PhysicalPlan::Delete {
                 table,

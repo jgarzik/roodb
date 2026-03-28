@@ -258,6 +258,7 @@ fn test_plan_update() {
             assignments,
             filter,
             key_value,
+            ..
         } => {
             assert_eq!(table, "users");
             assert_eq!(assignments.len(), 1);

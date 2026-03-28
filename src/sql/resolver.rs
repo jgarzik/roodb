@@ -64,9 +64,13 @@ impl<'a> Resolver<'a> {
             } => self.resolve_drop(&object_type, &names, if_exists),
             sp::Statement::CreateIndex(create_index) => self.resolve_create_index(&create_index),
             sp::Statement::Insert(insert) => self.resolve_insert(&insert),
-            sp::Statement::Update(update) => {
-                self.resolve_update(&update.table, &update.assignments, &update.selection)
-            }
+            sp::Statement::Update(update) => self.resolve_update(
+                &update.table,
+                &update.assignments,
+                &update.selection,
+                &[], // ORDER BY not in sqlparser Update (only Delete)
+                &update.limit,
+            ),
             sp::Statement::Delete(delete) => self.resolve_delete(&delete),
             sp::Statement::Query(query) => self.resolve_query(&query),
 
@@ -554,6 +558,8 @@ impl<'a> Resolver<'a> {
         table: &sp::TableWithJoins,
         assignments: &[sp::Assignment],
         selection: &Option<sp::Expr>,
+        order_by: &[sp::OrderByExpr],
+        limit: &Option<sp::Expr>,
     ) -> SqlResult<ResolvedStatement> {
         let table_name = match &table.relation {
             sp::TableFactor::Table { name, .. } => name.to_string(),
@@ -603,11 +609,37 @@ impl<'a> Resolver<'a> {
             .map(|f| self.resolve_expr(f, &scope))
             .transpose()?;
 
+        // Resolve ORDER BY
+        let mut resolved_order_by = Vec::new();
+        for ob in order_by {
+            let expr = self.resolve_expr(&ob.expr, &scope)?;
+            let asc = ob.options.asc.unwrap_or(true);
+            resolved_order_by.push((expr, asc));
+        }
+
+        // Resolve LIMIT
+        let resolved_limit = if let Some(limit_expr) = limit {
+            match limit_expr {
+                sp::Expr::Value(v) => {
+                    if let sp::Value::Number(n, _) = &v.value {
+                        n.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(ResolvedStatement::Update {
             table: table_name,
             table_columns,
             assignments: resolved_assignments,
             filter: resolved_filter,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
         })
     }
 

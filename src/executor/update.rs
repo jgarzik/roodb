@@ -13,6 +13,7 @@ use crate::txn::MvccStorage;
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
+use super::datum::Datum;
 use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
@@ -29,6 +30,10 @@ pub struct Update {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    /// ORDER BY expressions for UPDATE ... ORDER BY ... LIMIT
+    order_by: Vec<(ResolvedExpr, bool)>,
+    /// LIMIT for UPDATE ... LIMIT n
+    limit: Option<usize>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility and versioning)
@@ -41,27 +46,34 @@ pub struct Update {
     user_variables: UserVariables,
 }
 
+/// Parameters for creating an Update executor.
+pub struct UpdateParams {
+    pub table: String,
+    pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
+    pub filter: Option<ResolvedExpr>,
+    pub key_value: Option<ResolvedExpr>,
+    pub order_by: Vec<(ResolvedExpr, bool)>,
+    pub limit: Option<usize>,
+    pub mvcc: Arc<MvccStorage>,
+    pub txn_context: Option<TransactionContext>,
+    pub user_variables: UserVariables,
+}
+
 impl Update {
     /// Create a new update executor
-    pub fn new(
-        table: String,
-        assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
-        filter: Option<ResolvedExpr>,
-        key_value: Option<ResolvedExpr>,
-        mvcc: Arc<MvccStorage>,
-        txn_context: Option<TransactionContext>,
-        user_variables: UserVariables,
-    ) -> Self {
+    pub fn new(p: UpdateParams) -> Self {
         Update {
-            table,
-            assignments,
-            filter,
-            key_value,
-            mvcc,
-            txn_context,
+            table: p.table,
+            assignments: p.assignments,
+            filter: p.filter,
+            key_value: p.key_value,
+            order_by: p.order_by,
+            limit: p.limit,
+            mvcc: p.mvcc,
+            txn_context: p.txn_context,
             rows_updated: 0,
             done: false,
-            user_variables,
+            user_variables: p.user_variables,
         }
     }
 }
@@ -134,17 +146,46 @@ impl Update {
                 .collect()
         };
 
+        // Collect matching rows (with keys for later update)
+        let mut matching: Vec<(Vec<u8>, Vec<u8>, u64, Row)> = Vec::new();
         for (key, value, row_version) in kv_pairs {
-            let mut row = decode_row(&value)?;
+            let row = decode_row(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }
             }
+            matching.push((key, value, row_version, row));
+        }
+
+        // Apply ORDER BY if present
+        if !self.order_by.is_empty() {
+            let order_by = &self.order_by;
+            let user_vars = &self.user_variables;
+            matching.sort_by(|a, b| {
+                for (expr, asc) in order_by {
+                    let va = evaluate(expr, &a.3, user_vars).unwrap_or(Datum::Null);
+                    let vb = evaluate(expr, &b.3, user_vars).unwrap_or(Datum::Null);
+                    let ord = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if *asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Apply LIMIT if present
+        if let Some(limit) = self.limit {
+            matching.truncate(limit);
+        }
+
+        // Perform the updates
+        for (key, _value, row_version, mut row) in matching {
             for (col, expr) in &self.assignments {
                 let mut new_value = evaluate(expr, &row, &self.user_variables)?;
-                // MySQL: SET col=NULL on NOT NULL column → use default value
                 if new_value.is_null() && !col.nullable {
                     new_value = super::datum::Datum::default_for_type(&col.data_type);
                 }
@@ -357,15 +398,17 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut update = Update::new(
-            "users".to_string(),
+        let mut update = Update::new(UpdateParams {
+            table: "users".to_string(),
             assignments,
-            Some(filter),
-            None,
+            filter: Some(filter),
+            key_value: None,
+            order_by: vec![],
+            limit: None,
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         update.open().await.unwrap();
 
         let result = update.next().await.unwrap().unwrap();

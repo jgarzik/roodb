@@ -150,6 +150,8 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     /// DELETE rows from a table
@@ -1222,6 +1224,8 @@ impl PhysicalPlanner {
                 table,
                 assignments,
                 filter,
+                order_by,
+                limit,
             } => {
                 let key_value = filter
                     .as_ref()
@@ -1231,6 +1235,8 @@ impl PhysicalPlanner {
                     assignments,
                     filter,
                     key_value,
+                    order_by,
+                    limit,
                 })
             }
 
