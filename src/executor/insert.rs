@@ -166,9 +166,14 @@ impl Executor for Insert {
             // Use the low 48 bits (local counter) as the auto_increment value
             let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() && datums[idx].is_null() {
-                    datums[idx] = super::datum::Datum::Int(auto_id as i64);
-                    self.last_insert_id = auto_id;
+                if idx < datums.len() {
+                    // MySQL: both NULL and 0 trigger auto_increment
+                    let should_generate =
+                        datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
+                    if should_generate {
+                        datums[idx] = super::datum::Datum::Int(auto_id as i64);
+                        self.last_insert_id = auto_id;
+                    }
                 }
             }
 
@@ -208,11 +213,10 @@ impl Executor for Insert {
             } else {
                 encode_row_key(&self.table, row_id)
             };
+
             let value = encode_row(&row);
 
             // Collect the change for Raft replication.
-            // Data is written to storage in apply() after Raft commit.
-            // This ensures Raft-as-WAL: no writes until consensus.
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
                 super::error::ExecutorError::Internal(
                     "INSERT requires transaction context".to_string(),

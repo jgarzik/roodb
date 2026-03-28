@@ -1075,17 +1075,19 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                     if let Ok(Some(existing_data)) =
                                                         self.storage.get(&change.key).await
                                                     {
-                                                        if existing_data.len() > 16
-                                                            && existing_data[16] != 1
-                                                        {
+                                                        // Skip tombstones (deleted rows)
+                                                        // MVCC: byte 16 = deleted flag (1=tombstone)
+                                                        let is_tombstone = existing_data.len() > 16
+                                                            && existing_data[16] == 1;
+                                                        if !is_tombstone {
                                                             tracing::warn!(
                                                                 table = %change.table,
                                                                 "INSERT conflict: row already exists with this key"
                                                             );
                                                             conflict_error = Some(format!(
-                                                            "Duplicate key: row in '{}' already exists",
-                                                            change.table
-                                                        ));
+                                                                "Duplicate key: row in '{}' already exists",
+                                                                change.table
+                                                            ));
                                                             break;
                                                         }
                                                     }

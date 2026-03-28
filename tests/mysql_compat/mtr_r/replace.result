@@ -18,7 +18,6 @@ insert into t1 values (126,"first"),(63, "middle");
 replace into t1 values (126,"first updated");
 select * from t1;
 a	b
-126	first
 63	middle
-126	first updated
+126	first
 drop table t1;

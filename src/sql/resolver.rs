@@ -178,8 +178,16 @@ impl<'a> Resolver<'a> {
 
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
+        let mut inline_pk_columns = Vec::new();
 
         for col in &create.columns {
+            // Check for inline PRIMARY KEY before converting
+            let col_name = col.name.value.clone();
+            for opt_def in &col.options {
+                if matches!(opt_def.option, sp::ColumnOption::PrimaryKey(_)) {
+                    inline_pk_columns.push(col_name.clone());
+                }
+            }
             columns.push(convert_column_def(col)?);
         }
 
@@ -187,6 +195,15 @@ impl<'a> Resolver<'a> {
             if let Some(c) = convert_table_constraint(constraint)? {
                 constraints.push(c);
             }
+        }
+
+        // Add PrimaryKey constraint for inline PK columns if not already present
+        if !inline_pk_columns.is_empty()
+            && !constraints
+                .iter()
+                .any(|c| matches!(c, Constraint::PrimaryKey(_)))
+        {
+            constraints.push(Constraint::PrimaryKey(inline_pk_columns));
         }
 
         // Handle CREATE TABLE ... SELECT (CTAS)

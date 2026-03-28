@@ -14,6 +14,7 @@ use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
 use parking_lot::RwLock;
 
+use crate::catalog::system_tables::is_system_table;
 use crate::raft::changes::ChangeOp;
 use crate::raft::types::{
     Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
@@ -215,12 +216,34 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                     let resp = match cmd {
                         Command::DataChange(changeset) => {
                             // Apply changes to storage with MVCC format
-                            // This matches the format used by MvccStorage::put/delete,
-                            // making Raft apply idempotent with direct MVCC writes.
+                            let mut conflict_error: Option<String> = None;
                             if let Some(ref storage) = storage {
                                 for change in &changeset.changes {
+                                    if conflict_error.is_some() {
+                                        break;
+                                    }
                                     let result = match change.op {
                                         ChangeOp::Insert | ChangeOp::Update => {
+                                            // Check for duplicate key on INSERT
+                                            if change.op == ChangeOp::Insert
+                                                && !is_system_table(&change.table)
+                                            {
+                                                if let Ok(Some(existing)) =
+                                                    storage.get(&change.key).await
+                                                {
+                                                    // Skip tombstones (deleted rows)
+                                                    // MVCC: byte 16 = deleted flag (1=tombstone)
+                                                    let is_tombstone =
+                                                        existing.len() > 16 && existing[16] == 1;
+                                                    if !is_tombstone {
+                                                        conflict_error = Some(format!(
+                                                            "Duplicate key: row in '{}' already exists",
+                                                            change.table
+                                                        ));
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             let data = change.value.as_deref().unwrap_or(&[]);
                                             let encoded =
                                                 encode_mvcc_row(changeset.txn_id, false, data);
@@ -244,7 +267,11 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                                     "No storage engine configured, changes not persisted"
                                 );
                             }
-                            CommandResponse::Ok(None)
+                            if let Some(err_msg) = conflict_error {
+                                CommandResponse::Error(err_msg)
+                            } else {
+                                CommandResponse::Ok(None)
+                            }
                         }
                         Command::Noop => CommandResponse::Ok(None),
                     };
