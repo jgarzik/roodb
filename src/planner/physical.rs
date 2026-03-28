@@ -553,6 +553,7 @@ impl PhysicalPlan {
                 assignments,
                 filter,
                 key_value,
+                order_by,
                 ..
             } => {
                 for (_, expr) in assignments {
@@ -564,15 +565,24 @@ impl PhysicalPlan {
                 if let Some(kv) = key_value {
                     substitute_expr(kv, params)?;
                 }
+                for (expr, _) in order_by {
+                    substitute_expr(expr, params)?;
+                }
             }
             PhysicalPlan::Delete {
-                filter, key_value, ..
+                filter,
+                key_value,
+                order_by,
+                ..
             } => {
                 if let Some(f) = filter {
                     substitute_expr(f, params)?;
                 }
                 if let Some(kv) = key_value {
                     substitute_expr(kv, params)?;
+                }
+                for (expr, _) in order_by {
+                    substitute_expr(expr, params)?;
                 }
             }
             PhysicalPlan::Explain { inner } => {
@@ -1235,9 +1245,15 @@ impl PhysicalPlanner {
                 order_by,
                 limit,
             } => {
-                let key_value = filter
-                    .as_ref()
-                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                // Suppress PointGet when ORDER BY or LIMIT is present:
+                // ORDER BY requires full-scan sorting; LIMIT 0 must update 0 rows.
+                let key_value = if order_by.is_empty() && limit.is_none() {
+                    filter
+                        .as_ref()
+                        .and_then(|f| Self::extract_point_get(&table, f, catalog))
+                } else {
+                    None
+                };
                 // Look up PK column indices so the executor can detect PK changes
                 let pk_column_indices = if let Some(table_def) = catalog.get_table(&table) {
                     if let Some(pk_cols) = table_def.primary_key() {
@@ -1273,9 +1289,13 @@ impl PhysicalPlanner {
                 order_by,
                 limit,
             } => {
-                let key_value = filter
-                    .as_ref()
-                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                let key_value = if order_by.is_empty() && limit.is_none() {
+                    filter
+                        .as_ref()
+                        .and_then(|f| Self::extract_point_get(&table, f, catalog))
+                } else {
+                    None
+                };
                 Ok(PhysicalPlan::Delete {
                     table,
                     filter,
