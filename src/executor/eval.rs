@@ -2116,6 +2116,33 @@ pub fn eval_function(
             }
         }
 
+        "UNHEX" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNHEX requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let hex_str = args[0].to_display_string();
+            let trimmed = hex_str.trim();
+            // Decode hex string to bytes; odd-length gets leading 0
+            let padded = if trimmed.len() % 2 == 1 {
+                format!("0{}", trimmed)
+            } else {
+                trimmed.to_string()
+            };
+            let bytes: Result<Vec<u8>, _> = (0..padded.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&padded[i..i + 2], 16))
+                .collect();
+            match bytes {
+                Ok(b) => Ok(Datum::String(String::from_utf8_lossy(&b).to_string())),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
         "LPAD" => {
             if args.len() < 2 {
                 return Err(ExecutorError::InvalidOperation(

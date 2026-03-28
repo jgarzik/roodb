@@ -6060,7 +6060,11 @@ where
                 if msg.contains("cannot be NULL") {
                     (codes::ER_BAD_NULL_ERROR, "23000")
                 } else if msg.contains("already exists") {
-                    (codes::ER_DUP_ENTRY, "23000")
+                    if msg.contains("Table") || msg.contains("table") {
+                        (1050, "42S01") // ER_TABLE_EXISTS_ERROR
+                    } else {
+                        (codes::ER_DUP_ENTRY, "23000")
+                    }
                 } else if msg.contains("columns but") && msg.contains("values") {
                     (codes::ER_WRONG_VALUE_COUNT_ON_ROW, "21S01")
                 } else if msg.contains("Incorrect arguments") {
@@ -6148,11 +6152,14 @@ where
                         };
                     (code, states::GENERAL_ERROR, exec_err.to_string())
                 } else {
-                    (
-                        codes::ER_UNKNOWN_ERROR,
-                        states::GENERAL_ERROR,
-                        exec_err.to_string(),
-                    )
+                    let msg = exec_err.to_string();
+                    if msg.contains("already exists") {
+                        (1050, "42S01", msg)
+                    } else if msg.contains("Duplicate key") || msg.contains("duplicate key") {
+                        (codes::ER_DUP_ENTRY, "23000", msg)
+                    } else {
+                        (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, msg)
+                    }
                 }
             }
             _ => {

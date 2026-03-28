@@ -101,6 +101,14 @@ TIERS = {
         "func_group",      # 1506 lines — aggregate functions (COUNT/SUM/AVG/MIN/MAX)
         "union",           # 2818 lines — UNION/UNION ALL
     ],
+    7: [
+        "ansi",                    # 28 lines — ANSI SQL mode basics
+        "binary_to_hex",           # 93 lines — HEX/UNHEX conversions
+        "count_distinct",          # 269 lines — COUNT(DISTINCT)
+        "date_formats",            # 332 lines — DATE_FORMAT/STR_TO_DATE
+        "create_if_not_exists",    # 80 lines — IF NOT EXISTS
+        "constraints",             # 564 lines — NOT NULL/CHECK/DEFAULT
+    ],
 }
 
 

@@ -1,0 +1,37 @@
+#
+# Testing of constraints (trimmed for RooDB)
+#
+# [RooDB-skip] CHECK constraint enforcement (not implemented)
+# [RooDB-skip] ALTER TABLE, SHOW CREATE TABLE, FOREIGN KEY, TEMPORARY TABLE
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+# NULL handling
+CREATE TABLE t1 (a INT NULL);
+INSERT INTO t1 VALUES (1),(NULL);
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+# NOT NULL constraint
+CREATE TABLE t1 (a INT NOT NULL);
+INSERT INTO t1 VALUES (1);
+--error ER_BAD_NULL_ERROR
+INSERT INTO t1 VALUES (NULL);
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+# DEFAULT constraint
+CREATE TABLE t1 (a INT DEFAULT 42, b VARCHAR(20) DEFAULT 'hello');
+INSERT INTO t1 (a) VALUES (1);
+INSERT INTO t1 VALUES (3, 'test');
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+# PRIMARY KEY constraint
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, 10);
+INSERT INTO t1 VALUES (2, 20);
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
