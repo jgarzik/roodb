@@ -134,6 +134,10 @@ pub struct ChangeSet {
     pub txn_id: u64,
     /// The row-level changes
     pub changes: Vec<RowChange>,
+    /// When true, duplicate-key errors are suppressed (INSERT IGNORE semantics).
+    /// Rows that conflict with existing keys are silently skipped.
+    #[serde(default)]
+    pub ignore_duplicates: bool,
 }
 
 impl ChangeSet {
@@ -142,12 +146,30 @@ impl ChangeSet {
         Self {
             txn_id,
             changes: Vec::new(),
+            ignore_duplicates: false,
         }
     }
 
     /// Create a change set with pre-populated changes
     pub fn new_with_changes(txn_id: u64, changes: Vec<RowChange>) -> Self {
-        Self { txn_id, changes }
+        Self {
+            txn_id,
+            changes,
+            ignore_duplicates: false,
+        }
+    }
+
+    /// Create a change set with pre-populated changes and IGNORE semantics
+    pub fn new_with_changes_ignore(
+        txn_id: u64,
+        changes: Vec<RowChange>,
+        ignore_duplicates: bool,
+    ) -> Self {
+        Self {
+            txn_id,
+            changes,
+            ignore_duplicates,
+        }
     }
 
     /// Add a change to the set

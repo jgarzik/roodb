@@ -292,6 +292,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Column(ResolvedColumn {
@@ -300,6 +301,7 @@ mod tests {
                 index: 2,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             result_type: DataType::Boolean,
         };
@@ -356,6 +358,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Column(ResolvedColumn {
@@ -364,6 +367,7 @@ mod tests {
                 index: 1,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             result_type: DataType::Boolean,
         };

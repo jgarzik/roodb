@@ -25,7 +25,7 @@ SELECT * FROM t1;
 a	b	c
 1	10	first
 2	20	second
-4	NULL	NULL
+4	0	none
 DROP TABLE t1;
 CREATE TABLE t1 (id int NOT NULL DEFAULT 8);
 INSERT INTO t1 VALUES(NULL);
@@ -68,9 +68,9 @@ INSERT INTO t1 (a, c) VALUES (2, 'world');
 INSERT INTO t1 (b, a) VALUES (77, 3);
 SELECT * FROM t1;
 a	b	c
-1	NULL	NULL
-2	NULL	world
-3	77	NULL
+1	99	hi
+2	99	world
+3	77	hi
 DROP TABLE t1;
 CREATE TABLE t1 (c1 INT NOT NULL);
 INSERT INTO t1 VALUES(4188), (0), (-100), (999999);

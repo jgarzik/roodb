@@ -507,6 +507,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
@@ -539,6 +540,7 @@ mod tests {
             index: 0,
             data_type: DataType::Text,
             nullable: false,
+            default_value: None,
         })];
 
         let aggregates = vec![(
@@ -550,6 +552,7 @@ mod tests {
                     index: 1,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
@@ -595,6 +598,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 })],
                 distinct: true, // COUNT(DISTINCT c)
                 result_type: DataType::BigInt,
@@ -632,6 +636,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 })],
                 distinct: true, // SUM(DISTINCT c)
                 result_type: DataType::Double,

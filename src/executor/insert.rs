@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
+use crate::sql::resolver::parse_default_value;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use crate::server::session::UserVariables;
@@ -188,9 +189,13 @@ impl Executor for Insert {
                     && datum.is_null()
                 {
                     if is_multi_row || self.ignore {
-                        // Non-strict mode / IGNORE: replace NULL with type default
-                        *datum =
-                            super::datum::Datum::default_for_type(&self.columns[col_idx].data_type);
+                        // Non-strict mode / IGNORE: prefer column DEFAULT, fall back to type default
+                        *datum = if let Some(ref default_expr) = self.columns[col_idx].default_value
+                        {
+                            super::datum::Datum::from_literal(&parse_default_value(default_expr))
+                        } else {
+                            super::datum::Datum::default_for_type(&self.columns[col_idx].data_type)
+                        };
                     } else {
                         return Err(super::error::ExecutorError::NullValue(format!(
                             "Column '{}' cannot be null",
@@ -260,6 +265,10 @@ impl Executor for Insert {
             .map(|ctx| ctx.take_changes())
             .unwrap_or_default()
     }
+
+    fn is_ignore_duplicates(&self) -> bool {
+        self.ignore
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +297,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             },
             ResolvedColumn {
                 table: "users".to_string(),
@@ -295,6 +305,7 @@ mod tests {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             },
         ];
 

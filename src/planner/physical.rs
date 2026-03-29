@@ -138,6 +138,9 @@ pub enum PhysicalPlan {
         auto_increment_indices: Vec<usize>,
         /// Primary key column indices for PK-based storage keys
         pk_column_indices: Vec<usize>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         /// IGNORE modifier — suppress errors, convert to warnings
         ignore: bool,
     },
@@ -1223,6 +1226,7 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 source,
+                column_map,
                 ignore,
             } => {
                 let source_plan = Self::plan_node(*source, catalog)?;
@@ -1234,6 +1238,7 @@ impl PhysicalPlanner {
                     source: Box::new(source_plan),
                     auto_increment_indices,
                     pk_column_indices,
+                    column_map,
                     ignore,
                 })
             }

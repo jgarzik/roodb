@@ -117,6 +117,20 @@ TIERS = {
         "key",                     # 670 lines — indexes and keys
         "join",                    # 2132 lines — JOIN types
     ],
+    9: [
+        "select_all",              # 11 lines — basic SELECT (adapted)
+        "overflow",                # 15 lines — identifier overflow
+        "type_uint",               # 18 lines — unsigned int types
+        "bool",                    # 62 lines — boolean expressions
+        "negation_elimination",    # 107 lines — NOT/negation in WHERE clauses
+        "func_sapdb",              # 180 lines — SAP DB compatible functions
+        "order_by_sortkey",        # 142 lines — ORDER BY with various sort keys
+    ],
+    10: [
+        "func_misc",              # misc functions (INET_ATON, FORMAT, COALESCE, etc.)
+        "single_delete_update",   # single-table DELETE/UPDATE with ORDER BY, LIMIT
+        "insert_select",          # INSERT ... SELECT
+    ],
 }
 
 

@@ -27,27 +27,27 @@ id	string	tiny	short	long_int	longlong	real_float	real_double	utiny	ushort	ulong
 10	hi	1	1	1	1	1	1	1	1	1	1	2024-01-01	10:10:10	2024-01-01 10:10:10	blob1
 20	NULL	2	2	2	2	2	2	2	2	2	2	NULL	NULL	NULL	NULL
 30	test	1	3	3	3	3	3	3	3	3	3	2024-03-03	10:10:10	2024-03-03 10:10:10	blob3
-40	NULL	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
+40	hello	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
 select * from t1 where tiny > 0;
 id	string	tiny	short	long_int	longlong	real_float	real_double	utiny	ushort	ulong	ulonglong	date_field	time_field	date_time	blob_col
 10	hi	1	1	1	1	1	1	1	1	1	1	2024-01-01	10:10:10	2024-01-01 10:10:10	blob1
 20	NULL	2	2	2	2	2	2	2	2	2	2	NULL	NULL	NULL	NULL
 30	test	1	3	3	3	3	3	3	3	3	3	2024-03-03	10:10:10	2024-03-03 10:10:10	blob3
-40	NULL	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
+40	hello	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
 select * from t1 where tiny between 1 and 2;
 id	string	tiny	short	long_int	longlong	real_float	real_double	utiny	ushort	ulong	ulonglong	date_field	time_field	date_time	blob_col
 10	hi	1	1	1	1	1	1	1	1	1	1	2024-01-01	10:10:10	2024-01-01 10:10:10	blob1
 20	NULL	2	2	2	2	2	2	2	2	2	2	NULL	NULL	NULL	NULL
 30	test	1	3	3	3	3	3	3	3	3	3	2024-03-03	10:10:10	2024-03-03 10:10:10	blob3
-40	NULL	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
+40	hello	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
 select * from t1 where string is null;
 id	string	tiny	short	long_int	longlong	real_float	real_double	utiny	ushort	ulong	ulonglong	date_field	time_field	date_time	blob_col
 20	NULL	2	2	2	2	2	2	2	2	2	2	NULL	NULL	NULL	NULL
-40	NULL	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
 select * from t1 where string is not null;
 id	string	tiny	short	long_int	longlong	real_float	real_double	utiny	ushort	ulong	ulonglong	date_field	time_field	date_time	blob_col
 10	hi	1	1	1	1	1	1	1	1	1	1	2024-01-01	10:10:10	2024-01-01 10:10:10	blob1
 30	test	1	3	3	3	3	3	3	3	3	3	2024-03-03	10:10:10	2024-03-03 10:10:10	blob3
+40	hello	1	1	0	0	0	NULL	0	0	0	0	NULL	NULL	NULL	NULL
 update t1 set string='updated' where id=10;
 select id,string from t1 where id=10;
 id	string

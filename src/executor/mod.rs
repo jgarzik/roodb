@@ -74,6 +74,14 @@ pub trait Executor: Send {
     fn take_changes(&mut self) -> Vec<RowChange> {
         Vec::new()
     }
+
+    /// Whether this executor uses IGNORE semantics (duplicate keys silently skipped).
+    ///
+    /// Used by the protocol layer to set `ignore_duplicates` on the ChangeSet
+    /// so the Raft apply skips duplicate-key conflicts instead of erroring.
+    fn is_ignore_duplicates(&self) -> bool {
+        false
+    }
 }
 
 /// Execution result for DML/DDL operations

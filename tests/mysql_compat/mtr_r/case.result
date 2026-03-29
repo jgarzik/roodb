@@ -77,6 +77,7 @@ select min(a), min(case when 1=1 then a else NULL end),
 min(case when 1!=1 then NULL else a end)
 from t1 where b=3 group by b;
 MIN(a)	MIN(CASE)	MIN(CASE)
+2	2	2
 drop table t1;
 CREATE TABLE t1 (EMPNUM INT);
 INSERT INTO t1 VALUES (0), (2);

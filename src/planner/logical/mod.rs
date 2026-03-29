@@ -108,6 +108,8 @@ pub struct ResolvedColumn {
     pub index: usize,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Column DEFAULT value expression (as string), from ColumnDef.default
+    pub default_value: Option<String>,
 }
 
 /// Resolved expression with type information
@@ -350,6 +352,9 @@ pub enum ResolvedStatement {
         table: String,
         columns: Vec<ResolvedColumn>,
         source: Box<ResolvedStatement>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         ignore: bool,
     },
     /// UPDATE with resolved assignments
@@ -533,6 +538,9 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<ResolvedColumn>,
         source: Box<LogicalPlan>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         ignore: bool,
     },
 

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedColumn;
 use crate::raft::RowChange;
+use crate::sql::resolver::parse_default_value;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use super::context::TransactionContext;
@@ -19,7 +20,7 @@ use super::Executor;
 pub struct InsertSelect {
     /// Table name
     table: String,
-    /// Target columns
+    /// Target columns (always ALL table columns)
     columns: Vec<ResolvedColumn>,
     /// Source query executor
     source: Box<dyn Executor>,
@@ -35,6 +36,9 @@ pub struct InsertSelect {
     last_insert_id: u64,
     /// Primary key column indices (for PK-based storage keys)
     pk_column_indices: Vec<usize>,
+    /// Maps source column index → target column index for partial column lists.
+    /// None when all columns are targeted (1:1 positional mapping).
+    column_map: Option<Vec<usize>>,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
 }
@@ -49,6 +53,7 @@ impl InsertSelect {
         txn_context: Option<TransactionContext>,
         auto_increment_indices: Vec<usize>,
         pk_column_indices: Vec<usize>,
+        column_map: Option<Vec<usize>>,
         ignore: bool,
     ) -> Self {
         InsertSelect {
@@ -61,6 +66,7 @@ impl InsertSelect {
             auto_increment_indices,
             last_insert_id: 0,
             pk_column_indices,
+            column_map,
             ignore,
         }
     }
@@ -82,16 +88,56 @@ impl Executor for InsertSelect {
         // Stream rows from source — insert each row as it arrives to avoid
         // buffering the entire result set in memory.
         while let Some(source_row) = self.source.next().await? {
-            // Coerce source row values to match target column types
-            let mut datums: Vec<Datum> = Vec::with_capacity(self.columns.len());
-            for (col_idx, col) in self.columns.iter().enumerate() {
-                let datum = if col_idx < source_row.len() {
-                    let d = source_row.get(col_idx).cloned().unwrap_or(Datum::Null);
-                    super::eval::coerce_to_column_type(d, &col.data_type)?
-                } else {
-                    Datum::Null
-                };
-                datums.push(datum);
+            // Build a full-width row with NULLs for all table columns
+            let mut datums: Vec<Datum> = vec![Datum::Null; self.columns.len()];
+
+            if let Some(ref col_map) = self.column_map {
+                // Partial column list: map source values to target positions
+                for (src_idx, &target_idx) in col_map.iter().enumerate() {
+                    let d = if src_idx < source_row.len() {
+                        source_row.get(src_idx).cloned().unwrap_or(Datum::Null)
+                    } else {
+                        Datum::Null
+                    };
+                    if target_idx < self.columns.len() {
+                        datums[target_idx] = super::eval::coerce_to_column_type(
+                            d,
+                            &self.columns[target_idx].data_type,
+                        )?;
+                    }
+                }
+            } else {
+                // All columns targeted: 1:1 positional mapping
+                for (col_idx, col) in self.columns.iter().enumerate() {
+                    let d = if col_idx < source_row.len() {
+                        source_row.get(col_idx).cloned().unwrap_or(Datum::Null)
+                    } else {
+                        Datum::Null
+                    };
+                    datums[col_idx] = super::eval::coerce_to_column_type(d, &col.data_type)?;
+                }
+            }
+
+            // Apply column DEFAULT values for unmapped columns that are still NULL.
+            // When column_map is present, only mapped columns get source values;
+            // the rest should get their DEFAULT value if one is defined.
+            if self.column_map.is_some() {
+                let mapped_targets: std::collections::HashSet<usize> = self
+                    .column_map
+                    .as_ref()
+                    .map(|m| m.iter().copied().collect())
+                    .unwrap_or_default();
+                for (col_idx, datum) in datums.iter_mut().enumerate() {
+                    if !mapped_targets.contains(&col_idx)
+                        && datum.is_null()
+                        && col_idx < self.columns.len()
+                    {
+                        if let Some(ref default_expr) = self.columns[col_idx].default_value {
+                            let lit = parse_default_value(default_expr);
+                            *datum = Datum::from_literal(&lit);
+                        }
+                    }
+                }
             }
 
             // Allocate row ID per-row
@@ -114,7 +160,13 @@ impl Executor for InsertSelect {
                     && datum.is_null()
                 {
                     if self.ignore {
-                        *datum = Datum::default_for_type(&self.columns[col_idx].data_type);
+                        // Prefer column DEFAULT, fall back to type default
+                        *datum = if let Some(ref default_expr) = self.columns[col_idx].default_value
+                        {
+                            Datum::from_literal(&parse_default_value(default_expr))
+                        } else {
+                            Datum::default_for_type(&self.columns[col_idx].data_type)
+                        };
                     } else {
                         return Err(super::error::ExecutorError::NullValue(format!(
                             "Column '{}' cannot be null",
@@ -144,6 +196,19 @@ impl Executor for InsertSelect {
                     "INSERT requires transaction context".to_string(),
                 )
             })?;
+
+            // Intra-batch duplicate check: if this PK key was already inserted
+            // in this same INSERT ... SELECT statement, it's a duplicate.
+            if !self.pk_column_indices.is_empty() && ctx.has_buffered_key(&key) {
+                if self.ignore {
+                    continue;
+                }
+                return Err(super::error::ExecutorError::DuplicateKey(format!(
+                    "Duplicate entry for key 'PRIMARY' in table '{}'",
+                    self.table
+                )));
+            }
+
             ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
@@ -166,5 +231,9 @@ impl Executor for InsertSelect {
             .as_mut()
             .map(|ctx| ctx.take_changes())
             .unwrap_or_default()
+    }
+
+    fn is_ignore_duplicates(&self) -> bool {
+        self.ignore
     }
 }

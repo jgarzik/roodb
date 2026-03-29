@@ -191,6 +191,7 @@ async fn test_table_scan_with_filter() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -245,6 +246,7 @@ async fn test_project_single_column() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             }),
             "name".to_string(),
         )],
@@ -290,6 +292,7 @@ async fn test_sort_descending() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             }),
             false, // descending
         )],
@@ -401,6 +404,7 @@ async fn test_insert() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             },
             ResolvedColumn {
                 table: "users".to_string(),
@@ -408,6 +412,7 @@ async fn test_insert() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             },
         ],
         values: vec![vec![
@@ -452,6 +457,7 @@ async fn test_delete_with_filter() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(2))),
@@ -612,6 +618,7 @@ async fn test_full_query_pipeline() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -628,6 +635,7 @@ async fn test_full_query_pipeline() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             }),
             "name".to_string(),
         )],
@@ -642,6 +650,7 @@ async fn test_full_query_pipeline() {
                 index: 0, // After projection, name is at index 0
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             }),
             false, // descending
         )],

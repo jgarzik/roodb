@@ -1,0 +1,65 @@
+#
+# SAP DB compatible functions — date, time, math
+# Adapted from MySQL func_sapdb.test for RooDB compatibility
+# Removed: EXTRACT(), SET @@SQL_MODE, CREATE TABLE ... SELECT, DESCRIBE,
+#          CAST(...AS TIME), Warnings, sec_to_time, str_to_date, addtime/subtime,
+#          timediff, date_add/date_sub, adddate/subdate, weekofyear, timestamp()
+#
+
+--disable_warnings
+drop table if exists t1, test;
+--enable_warnings
+
+# [RooDB-skip] EXTRACT functions — not supported
+# [RooDB-skip] date_format with %f — not supported
+# [RooDB-skip] date_add/date_sub — not supported
+# [RooDB-skip] adddate/subdate — not supported
+
+#
+# Date functions
+#
+select datediff("1997-12-31 23:59:59.000001","1997-12-30");
+select datediff("1997-11-30 23:59:59.000001","1997-12-31");
+select datediff("1997-11-30 23:59:59.000001",null);
+
+# [RooDB-skip] weekofyear — not supported
+
+select makedate(1997,1);
+select makedate(1997,0);
+select makedate(9999,365);
+select makedate(9999,366);
+select makedate(100,1);
+
+#
+# Time functions
+#
+select maketime(10,11,12);
+select maketime(25,11,12);
+
+#
+# Extraction functions
+#
+# [RooDB-skip] timestamp() function — not supported
+select day("1997-12-31 23:59:59.000001");
+select date("1997-12-31 23:59:59.000001");
+select time("1997-12-31 23:59:59.000001");
+select microsecond("1997-12-31 23:59:59.000001");
+
+# [RooDB-skip] CREATE TABLE ... SELECT (not supported)
+# [RooDB-skip] DESCRIBE
+# [RooDB-skip] addtime/subtime/timediff functions
+
+select microsecond("1997-12-31 23:59:59.01") as a;
+
+# [RooDB-skip] microsecond(numeric) — numeric arg
+# [RooDB-skip] date_add with SECOND_MICROSECOND interval
+# [RooDB-skip] str_to_date — not supported
+
+# End of 4.1 tests
+
+# [RooDB-skip] Bug#37553 — timediff comparisons
+# [RooDB-skip] Bug#42525 — TIMEDIFF=TIME comparisons
+# [RooDB-skip] Bug#42661 — sec_to_time signedness
+# [RooDB-skip] Bug#42662 — maketime signedness with CAST(...AS TIME)
+
+# End of 5.0 tests

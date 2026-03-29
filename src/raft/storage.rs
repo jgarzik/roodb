@@ -236,6 +236,10 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                                                     let is_tombstone =
                                                         existing.len() > 16 && existing[16] == 1;
                                                     if !is_tombstone {
+                                                        if changeset.ignore_duplicates {
+                                                            // IGNORE: silently skip this row
+                                                            continue;
+                                                        }
                                                         conflict_error = Some(format!(
                                                             "Duplicate key: row in '{}' already exists",
                                                             change.table

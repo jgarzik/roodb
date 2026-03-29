@@ -164,6 +164,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             }),
             true, // ascending
         )];
@@ -204,6 +205,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             }),
             false, // descending
         )];

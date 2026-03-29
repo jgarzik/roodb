@@ -3198,9 +3198,16 @@ pub fn eval_function(
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let parts: Vec<u32> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-            if parts.len() != 4 {
+            let raw_parts: Vec<&str> = s.split('.').collect();
+            if raw_parts.len() != 4 {
                 return Ok(Datum::Null);
+            }
+            let mut parts = [0u32; 4];
+            for (i, p) in raw_parts.iter().enumerate() {
+                match p.parse::<u32>() {
+                    Ok(v) if v <= 255 => parts[i] = v,
+                    _ => return Ok(Datum::Null),
+                }
             }
             let val = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
             Ok(Datum::Int(val as i64))
@@ -5100,6 +5107,7 @@ mod tests {
             index,
             data_type: DataType::Int,
             nullable: true,
+            default_value: None,
         })
     }
 

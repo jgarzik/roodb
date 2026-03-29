@@ -371,47 +371,47 @@ impl<'a> Resolver<'a> {
                 let source_query = insert.source.as_ref().unwrap();
                 let resolved_source = self.resolve_query(source_query)?;
 
-                // Build resolved columns — respect explicit column list if given
-                let resolved_columns = if insert.columns.is_empty() {
-                    // No explicit columns: use all table columns
-                    table_def
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, col_def)| ResolvedColumn {
-                            table: table.clone(),
-                            name: col_def.name.clone(),
-                            index: idx,
-                            data_type: col_def.data_type.clone(),
-                            nullable: col_def.nullable || col_def.auto_increment,
-                        })
-                        .collect()
+                // Always resolve ALL table columns for the target row
+                let all_columns: Vec<ResolvedColumn> = table_def
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col_def)| ResolvedColumn {
+                        table: table.clone(),
+                        name: col_def.name.clone(),
+                        index: idx,
+                        data_type: col_def.data_type.clone(),
+                        nullable: col_def.nullable || col_def.auto_increment,
+                        default_value: col_def.default.clone(),
+                    })
+                    .collect();
+
+                // Build column_map: maps source column index → target column index.
+                // When no explicit column list, source maps 1:1 to all table columns.
+                // When explicit, only the named columns are mapped.
+                let column_map = if insert.columns.is_empty() {
+                    None
                 } else {
-                    // Explicit column list: resolve only those columns
-                    let mut cols = Vec::new();
+                    let mut map = Vec::new();
                     for col_ident in &insert.columns {
                         let col_name = &col_ident.value;
-                        let col_def = table_def
+                        // Validate column exists
+                        let _ = table_def
                             .get_column(col_name)
                             .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
                         let idx = table_def
                             .get_column_index(col_name)
                             .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-                        cols.push(ResolvedColumn {
-                            table: table.clone(),
-                            name: col_def.name.clone(),
-                            index: idx,
-                            data_type: col_def.data_type.clone(),
-                            nullable: col_def.nullable || col_def.auto_increment,
-                        });
+                        map.push(idx);
                     }
-                    cols
+                    Some(map)
                 };
 
                 return Ok(ResolvedStatement::InsertSelect {
                     table,
-                    columns: resolved_columns,
+                    columns: all_columns,
                     source: Box::new(resolved_source),
+                    column_map,
                     ignore: insert.ignore,
                 });
             }
@@ -459,6 +459,7 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
+                default_value: col_def.default.clone(),
             });
         }
 
@@ -501,28 +502,28 @@ impl<'a> Resolver<'a> {
                 full_row[*col_idx] = resolved_expr;
             }
 
-            // Check NOT NULL constraints for omitted columns and apply defaults
-            // Build set of specified indices for O(1) lookup
+            // Apply DEFAULT values for omitted columns and check NOT NULL constraints.
+            // Build set of specified indices for O(1) lookup.
             let specified_indices: HashSet<usize> =
                 column_indices.iter().map(|(i, _, _)| *i).collect();
             for (idx, col_def) in table_def.columns.iter().enumerate() {
-                if !col_def.nullable
-                    && !col_def.auto_increment
-                    && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
-                {
-                    let was_specified = specified_indices.contains(&idx);
-                    if !was_specified {
-                        // Try to use the column's DEFAULT value
-                        if let Some(ref default_expr) = col_def.default {
-                            // Parse the default expression as a literal
-                            let default_literal = parse_default_value(default_expr);
-                            full_row[idx] = ResolvedExpr::Literal(default_literal);
-                        } else {
-                            return Err(SqlError::InvalidOperation(format!(
-                                "Column '{}' cannot be NULL and was not specified",
-                                col_def.name
-                            )));
-                        }
+                if col_def.auto_increment {
+                    continue;
+                }
+                if !matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null)) {
+                    continue;
+                }
+                let was_specified = specified_indices.contains(&idx);
+                if !was_specified {
+                    if let Some(ref default_expr) = col_def.default {
+                        // Apply column DEFAULT for unspecified columns
+                        let default_literal = parse_default_value(default_expr);
+                        full_row[idx] = ResolvedExpr::Literal(default_literal);
+                    } else if !col_def.nullable {
+                        return Err(SqlError::InvalidOperation(format!(
+                            "Column '{}' cannot be NULL and was not specified",
+                            col_def.name
+                        )));
                     }
                 }
             }
@@ -557,6 +558,7 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
+                default_value: col_def.default.clone(),
             });
         }
 
@@ -582,10 +584,9 @@ impl<'a> Resolver<'a> {
             full_row[idx] = resolved_expr;
         }
 
-        // Apply defaults for unspecified NOT NULL columns
+        // Apply defaults for unspecified columns (both nullable and non-nullable)
         for (idx, col_def) in table_def.columns.iter().enumerate() {
-            if !col_def.nullable
-                && !col_def.auto_increment
+            if !col_def.auto_increment
                 && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
             {
                 if let Some(ref default_expr) = col_def.default {
@@ -647,6 +648,7 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable,
+                default_value: None,
             };
             let value = self.resolve_expr(&assign.value, &scope)?;
 
@@ -1281,6 +1283,7 @@ impl<'a> Resolver<'a> {
                             index: global_idx,
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            default_value: None,
                         });
                     }
                 }
@@ -1308,6 +1311,7 @@ impl<'a> Resolver<'a> {
                             index: global_idx,
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            default_value: None,
                         }
                     })
                     .collect();
@@ -1781,6 +1785,7 @@ impl<'a> Resolver<'a> {
                 index: global_idx,
                 data_type: col_info.1.clone(),
                 nullable: col_info.2,
+                default_value: None,
             }))
         } else {
             // Unqualified column reference - search all tables
@@ -1814,6 +1819,7 @@ impl<'a> Resolver<'a> {
                         index,
                         data_type,
                         nullable,
+                        default_value: None,
                     }))
                 }
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
@@ -2587,7 +2593,7 @@ fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
 /// Dynamic expressions (CURRENT_TIMESTAMP, NOW(), etc.) are mapped to
 /// appropriate values where possible; unrecognized expressions fall back
 /// to Literal::Null to avoid silently inserting wrong string values.
-fn parse_default_value(expr: &str) -> Literal {
+pub fn parse_default_value(expr: &str) -> Literal {
     let trimmed = expr.trim();
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Literal::Null;

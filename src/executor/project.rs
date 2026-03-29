@@ -123,6 +123,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 }),
                 "a".to_string(),
             ),
@@ -134,6 +135,7 @@ mod tests {
                         index: 0,
                         data_type: DataType::Int,
                         nullable: false,
+                        default_value: None,
                     })),
                     op: BinaryOp::Add,
                     right: Box::new(ResolvedExpr::Column(ResolvedColumn {
@@ -142,6 +144,7 @@ mod tests {
                         index: 1,
                         data_type: DataType::Int,
                         nullable: false,
+                        default_value: None,
                     })),
                     result_type: DataType::BigInt,
                 },

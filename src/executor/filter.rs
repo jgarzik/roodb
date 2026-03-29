@@ -123,6 +123,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),

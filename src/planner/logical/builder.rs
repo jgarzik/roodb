@@ -44,6 +44,7 @@ impl LogicalPlanBuilder {
                 table,
                 columns,
                 source,
+                column_map,
                 ignore,
             } => {
                 let source_plan = Self::build(*source)?;
@@ -51,6 +52,7 @@ impl LogicalPlanBuilder {
                     table,
                     columns,
                     source: Box::new(source_plan),
+                    column_map,
                     ignore,
                 })
             }
@@ -627,6 +629,7 @@ impl LogicalPlanBuilder {
                                 index: gb_idx,
                                 data_type: result_type,
                                 nullable: true,
+                                default_value: None,
                             });
                             expressions.push((col_ref, name));
                         } else {
@@ -671,6 +674,7 @@ impl LogicalPlanBuilder {
                     index: col_idx,
                     data_type: result_type,
                     nullable: true,
+                    default_value: None,
                 });
             }
         }
@@ -880,6 +884,7 @@ impl LogicalPlanBuilder {
                     index: col_idx,
                     data_type: result_type,
                     nullable: true,
+                    default_value: None,
                 });
             }
         }
@@ -927,6 +932,7 @@ impl LogicalPlanBuilder {
                         index: gb_idx,
                         data_type: col.data_type.clone(),
                         nullable: col.nullable,
+                        default_value: None,
                     })
                 } else {
                     expr.clone()
@@ -1098,6 +1104,7 @@ impl LogicalPlanBuilder {
                             index: output_idx,
                             data_type: expr.data_type(),
                             nullable: true,
+                            default_value: None,
                         });
                     }
                     output_idx += 1;
@@ -1125,6 +1132,7 @@ impl LogicalPlanBuilder {
                                         index: output_idx,
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
+                                        default_value: None,
                                     });
                                 }
                             }
@@ -1144,6 +1152,7 @@ impl LogicalPlanBuilder {
                                         index: output_idx,
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
+                                        default_value: None,
                                     });
                                 }
                                 output_idx += 1;

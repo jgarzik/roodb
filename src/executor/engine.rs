@@ -281,6 +281,7 @@ impl ExecutorEngine {
                 source,
                 auto_increment_indices,
                 pk_column_indices,
+                column_map,
                 ignore,
             } => {
                 let source_exec = self.build_node(*source)?;
@@ -291,6 +292,7 @@ impl ExecutorEngine {
                     self.txn_context.clone(),
                     auto_increment_indices,
                     pk_column_indices,
+                    column_map,
                     ignore,
                 )))
             }
@@ -816,6 +818,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 })),
                 op: BinaryOp::Gt,
                 right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -832,6 +835,7 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
                 }),
                 "id".to_string(),
             )],

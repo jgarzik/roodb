@@ -920,13 +920,17 @@ where
             executor.close().await?;
             let exec_iter_ns = metrics::elapsed_ns(t_iter);
 
+            let ignore_dups = executor.is_ignore_duplicates();
             let changes = executor.take_changes();
             if !changes.is_empty() {
                 if self.session.in_transaction() {
                     self.session.add_pending_changes(changes);
                 } else {
-                    let changeset =
-                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    let changeset = ChangeSet::new_with_changes_ignore(
+                        implicit_txn_id.unwrap_or(0),
+                        changes,
+                        ignore_dups,
+                    );
                     self.raft_node
                         .propose_changes(changeset)
                         .await
@@ -1720,6 +1724,7 @@ where
 
             // Collect changes for Raft replication — includes both original INSERT
             // and any trigger-generated changes
+            let ignore_dups = executor.is_ignore_duplicates();
             let changes = executor.take_changes();
             if !changes.is_empty() {
                 if self.session.in_transaction() {
@@ -1727,8 +1732,11 @@ where
                     self.session.add_pending_changes(changes);
                 } else {
                     // Autocommit: propose immediately
-                    let changeset =
-                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    let changeset = ChangeSet::new_with_changes_ignore(
+                        implicit_txn_id.unwrap_or(0),
+                        changes,
+                        ignore_dups,
+                    );
                     self.raft_node
                         .propose_changes(changeset)
                         .await
@@ -6008,12 +6016,17 @@ where
         executor.close().await.map_err(|e| e.to_string())?;
 
         // Handle changes
+        let ignore_dups = executor.is_ignore_duplicates();
         let changes = executor.take_changes();
         if !changes.is_empty() {
             if self.session.in_transaction() {
                 self.session.add_pending_changes(changes);
             } else {
-                let changeset = ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                let changeset = ChangeSet::new_with_changes_ignore(
+                    implicit_txn_id.unwrap_or(0),
+                    changes,
+                    ignore_dups,
+                );
                 self.raft_node
                     .propose_changes(changeset)
                     .await

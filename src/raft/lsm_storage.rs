@@ -1080,6 +1080,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                         let is_tombstone = existing_data.len() > 16
                                                             && existing_data[16] == 1;
                                                         if !is_tombstone {
+                                                            if changeset.ignore_duplicates {
+                                                                // IGNORE: silently skip this row
+                                                                continue;
+                                                            }
                                                             tracing::warn!(
                                                                 table = %change.table,
                                                                 "INSERT conflict: row already exists with this key"

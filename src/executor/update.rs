@@ -419,6 +419,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -432,6 +433,7 @@ mod tests {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
             },
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
@@ -493,6 +495,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -506,6 +509,7 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
             },
             ResolvedExpr::Literal(Literal::Integer(10)),
         )];
