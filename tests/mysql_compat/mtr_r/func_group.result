@@ -11,14 +11,14 @@ SUM(a)
 NULL
 select count(distinct a),count(distinct grp) from t1;
 COUNT(a)	COUNT(grp)
-6	6
+6	3
 insert into t1 values (null,null,'');
 select count(distinct a),count(distinct grp) from t1;
 COUNT(a)	COUNT(grp)
-6	6
+6	3
 select sum(all a),count(all a),avg(all a),min(all a),max(all a),min(all c),max(all c) from t1;
 SUM(a)	COUNT(a)	AVG(a)	MIN(a)	MAX(a)	MIN(c)	MAX(c)
-21	6	3.5	1	6	1	6
+21	6	3.5	1	6		c
 drop table t1;
 create table t1 (a int primary key, c char(10), b text);
 INSERT INTO t1 VALUES (1,'1','1');

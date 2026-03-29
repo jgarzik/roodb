@@ -25,7 +25,7 @@ DROP TABLE t1;
 #
 CREATE TABLE t1 (Fld1 int default NULL, Fld2 int default NULL);
 INSERT INTO t1 VALUES (1,10),(1,20),(2,NULL),(2,NULL),(3,50);
-# [RooDB-skip] HAVING with aggregate IS NOT NULL not supported
+SELECT Fld1, MAX(Fld2) FROM t1 GROUP BY Fld1 HAVING MAX(Fld2) IS NOT NULL ORDER BY Fld1;
 DROP TABLE t1;
 
 #

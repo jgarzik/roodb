@@ -437,6 +437,7 @@ impl LogicalPlanBuilder {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::IsNull { expr, .. } => Self::expr_has_aggregate(expr),
             ResolvedExpr::Cast { expr, .. } => Self::expr_has_aggregate(expr),
             ResolvedExpr::Case {
                 operand,
@@ -526,6 +527,9 @@ impl LogicalPlanBuilder {
             ResolvedExpr::Cast { expr: inner, .. } => {
                 Self::collect_aggregates(inner, idx, None, out);
             }
+            ResolvedExpr::IsNull { expr: inner, .. } => {
+                Self::collect_aggregates(inner, idx, None, out);
+            }
             ResolvedExpr::Case {
                 operand,
                 conditions,
@@ -552,7 +556,13 @@ impl LogicalPlanBuilder {
 
     /// Check if two AggregateFunc instances represent the same aggregate.
     fn aggregates_match_func(a: &AggregateFunc, b: &AggregateFunc) -> bool {
-        a.name == b.name && a.distinct == b.distinct && a.args.len() == b.args.len()
+        a.name == b.name
+            && a.distinct == b.distinct
+            && a.args.len() == b.args.len()
+            && a.args
+                .iter()
+                .zip(b.args.iter())
+                .all(|(x, y)| Self::exprs_equal(x, y))
     }
 
     /// Extract aggregate function from expression
@@ -760,6 +770,13 @@ impl LogicalPlanBuilder {
             } => ResolvedExpr::Cast {
                 expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
                 target_type: target_type.clone(),
+            },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
+                negated: *negated,
             },
             ResolvedExpr::Function {
                 name,
@@ -999,6 +1016,13 @@ impl LogicalPlanBuilder {
                 op: *op,
                 expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
                 result_type: result_type.clone(),
+            },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
+                negated: *negated,
             },
             ResolvedExpr::Column(col) => {
                 if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {

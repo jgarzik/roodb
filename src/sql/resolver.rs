@@ -1457,6 +1457,20 @@ impl<'a> Resolver<'a> {
                     result_type,
                 })
             }
+            sp::Expr::IsNull(inner) => {
+                let resolved = self.resolve_expr_with_aliases(inner, scope, select_columns)?;
+                Ok(ResolvedExpr::IsNull {
+                    expr: Box::new(resolved),
+                    negated: false,
+                })
+            }
+            sp::Expr::IsNotNull(inner) => {
+                let resolved = self.resolve_expr_with_aliases(inner, scope, select_columns)?;
+                Ok(ResolvedExpr::IsNull {
+                    expr: Box::new(resolved),
+                    negated: true,
+                })
+            }
             // All other expression types: normal resolution
             _ => self.resolve_expr(expr, scope),
         }
