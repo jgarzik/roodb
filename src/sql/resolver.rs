@@ -1751,6 +1751,37 @@ impl<'a> Resolver<'a> {
                 }
             }
 
+            // INTERVAL expr — encode as string literal "value UNIT" for DATE_ADD/DATE_SUB
+            sp::Expr::Extract { field, expr, .. } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                let field_str = field.to_string();
+                Ok(ResolvedExpr::Function {
+                    name: "__EXTRACT".to_string(),
+                    args: vec![
+                        ResolvedExpr::Literal(Literal::String(field_str)),
+                        resolved_expr,
+                    ],
+                    distinct: false,
+                    result_type: DataType::BigInt,
+                })
+            }
+
+            sp::Expr::Interval(interval) => {
+                let value = self.resolve_expr(&interval.value, scope)?;
+                let unit = interval
+                    .leading_field
+                    .as_ref()
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "DAY".to_string());
+                // Encode as a function so we preserve both pieces
+                Ok(ResolvedExpr::Function {
+                    name: "__INTERVAL".to_string(),
+                    args: vec![value, ResolvedExpr::Literal(Literal::String(unit))],
+                    distinct: false,
+                    result_type: DataType::Text,
+                })
+            }
+
             _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }

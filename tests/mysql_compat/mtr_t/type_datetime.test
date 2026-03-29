@@ -17,7 +17,7 @@
 # [RooDB-skip] CURRENT_DATE / CURRENT_TIMESTAMP / NOW() (time-dependent)
 # [RooDB-skip] User variables with := assignment syntax
 # [RooDB-skip] 0000-00-00 dates
-# [RooDB-skip] DATE_ADD / DATE_SUB / INTERVAL arithmetic (not implemented)
+# [RooDB-skip] INTERVAL arithmetic (expr + INTERVAL x UNIT — binary op form)
 # [RooDB-skip] EXTRACT (not implemented)
 # [RooDB-skip] FORCE INDEX / IGNORE INDEX
 # [RooDB-skip] SLEEP()

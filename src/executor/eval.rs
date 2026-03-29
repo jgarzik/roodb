@@ -3644,6 +3644,58 @@ pub fn eval_function(
             }
         }
 
+        // Internal: __INTERVAL(value, unit) — encodes INTERVAL for DATE_ADD/DATE_SUB
+        "__INTERVAL" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "__INTERVAL requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let val = args[0].to_display_string();
+            let unit = args[1].to_display_string();
+            Ok(Datum::String(format!("{} {}", val, unit)))
+        }
+
+        // Internal: __EXTRACT(field, expr) — implements EXTRACT(field FROM expr)
+        "__EXTRACT" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "__EXTRACT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let field = args[0].to_display_string().to_uppercase();
+            let s = args[1].to_display_string();
+            match parse_to_parts(&s) {
+                Some(p) => Ok(Datum::Int(extract_field(&field, &p))),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let date_str = args[0].to_display_string();
+            let interval_str = args[1].to_display_string();
+            let is_sub = name_upper == "DATE_SUB" || name_upper == "SUBDATE";
+            match eval_date_add_sub(&date_str, &interval_str, is_sub) {
+                Some(result) => Ok(Datum::String(result)),
+                None => Ok(Datum::Null),
+            }
+        }
+
         "MAKEDATE" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
@@ -4242,6 +4294,67 @@ impl DateTimeParts {
 
     fn format_datetime(&self) -> String {
         format!("{} {}", self.format_date(), self.format_time())
+    }
+}
+
+/// Extract a field from DateTimeParts for the EXTRACT() SQL function.
+/// Returns an integer value corresponding to the requested field.
+/// Compound fields (e.g. YEAR_MONTH, DAY_HOUR) return concatenated numeric values
+/// matching MySQL behavior.
+fn extract_field(field: &str, p: &DateTimeParts) -> i64 {
+    match field {
+        "YEAR" | "YEARS" => p.year,
+        "MONTH" | "MONTHS" => p.month as i64,
+        "DAY" | "DAYS" => p.day as i64,
+        "HOUR" | "HOURS" => p.hour as i64,
+        "MINUTE" | "MINUTES" => p.minute as i64,
+        "SECOND" | "SECONDS" => p.second as i64,
+        "MICROSECOND" | "MICROSECONDS" => p.microsecond as i64,
+        "WEEK" | "WEEKS" => p.week_number(0) as i64,
+        "QUARTER" => p.quarter() as i64,
+        // Compound fields return concatenated numeric values per MySQL spec
+        // YEAR_MONTH: YYYYMM
+        "YEAR_MONTH" => p.year * 100 + p.month as i64,
+        // DAY_HOUR: DDHH
+        "DAY_HOUR" => p.day as i64 * 100 + p.hour as i64,
+        // DAY_MINUTE: DDHHMM
+        "DAY_MINUTE" => p.day as i64 * 10000 + p.hour as i64 * 100 + p.minute as i64,
+        // DAY_SECOND: DDHHMMSS
+        "DAY_SECOND" => {
+            p.day as i64 * 1_000_000
+                + p.hour as i64 * 10_000
+                + p.minute as i64 * 100
+                + p.second as i64
+        }
+        // HOUR_MINUTE: HHMM
+        "HOUR_MINUTE" => p.hour as i64 * 100 + p.minute as i64,
+        // HOUR_SECOND: HHMMSS
+        "HOUR_SECOND" => p.hour as i64 * 10_000 + p.minute as i64 * 100 + p.second as i64,
+        // MINUTE_SECOND: MMSS
+        "MINUTE_SECOND" => p.minute as i64 * 100 + p.second as i64,
+        // DAY_MICROSECOND: DDHHMMSSffffff
+        "DAY_MICROSECOND" => {
+            p.day as i64 * 1_000_000_000_000
+                + p.hour as i64 * 10_000_000_000
+                + p.minute as i64 * 100_000_000
+                + p.second as i64 * 1_000_000
+                + p.microsecond as i64
+        }
+        // HOUR_MICROSECOND: HHMMSSffffff
+        "HOUR_MICROSECOND" => {
+            p.hour as i64 * 10_000_000_000
+                + p.minute as i64 * 100_000_000
+                + p.second as i64 * 1_000_000
+                + p.microsecond as i64
+        }
+        // MINUTE_MICROSECOND: MMSSffffff
+        "MINUTE_MICROSECOND" => {
+            p.minute as i64 * 100_000_000 + p.second as i64 * 1_000_000 + p.microsecond as i64
+        }
+        // SECOND_MICROSECOND: SSffffff
+        "SECOND_MICROSECOND" => p.second as i64 * 1_000_000 + p.microsecond as i64,
+        // Unknown field returns 0
+        _ => 0,
     }
 }
 
@@ -5070,6 +5183,166 @@ fn eval_if_function(
         evaluate(&args[1], row, vars)
     } else {
         evaluate(&args[2], row, vars)
+    }
+}
+
+/// Evaluate DATE_ADD/DATE_SUB with an interval string like "1 DAY".
+/// Returns the resulting date/datetime string, or None for NULL.
+fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option<String> {
+    let parts = parse_to_parts(date_str)?;
+    let has_time = date_str.contains(' ') || date_str.contains(':');
+
+    // Parse interval: "N UNIT" e.g. "1 DAY", "3 MONTH", "-2 YEAR"
+    let interval_str = interval_str.trim();
+    let (amount_str, unit) = interval_str.rsplit_once(' ')?;
+    let amount: i64 = amount_str.trim().parse().ok()?;
+    let amount = if is_sub { -amount } else { amount };
+    let unit_upper = unit.to_uppercase();
+
+    match unit_upper.as_str() {
+        "SECOND" | "SECONDS" => {
+            let total_secs = parts.to_total_seconds() + amount;
+            let result = total_seconds_to_datetime(total_secs);
+            Some(format_datetime_parts(&result, true))
+        }
+        "MINUTE" | "MINUTES" => {
+            let total_secs = parts.to_total_seconds() + amount * 60;
+            let result = total_seconds_to_datetime(total_secs);
+            Some(format_datetime_parts(&result, true))
+        }
+        "HOUR" | "HOURS" => {
+            let total_secs = parts.to_total_seconds() + amount * 3600;
+            let result = total_seconds_to_datetime(total_secs);
+            Some(format_datetime_parts(&result, true))
+        }
+        "DAY" | "DAYS" => {
+            let epoch_days = ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            if has_time {
+                Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    y, m, d, parts.hour, parts.minute, parts.second
+                ))
+            } else {
+                Some(format!("{:04}-{:02}-{:02}", y, m, d))
+            }
+        }
+        "WEEK" | "WEEKS" => {
+            let epoch_days =
+                ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount * 7;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            if has_time {
+                Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    y, m, d, parts.hour, parts.minute, parts.second
+                ))
+            } else {
+                Some(format!("{:04}-{:02}-{:02}", y, m, d))
+            }
+        }
+        "MONTH" | "MONTHS" => {
+            let total_months = parts.year * 12 + parts.month as i64 - 1 + amount;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            // Clamp day to max days in new month
+            let max_day = days_in_month(new_year, new_month);
+            let new_day = parts.day.min(max_day);
+            if has_time {
+                Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    new_year, new_month, new_day, parts.hour, parts.minute, parts.second
+                ))
+            } else {
+                Some(format!("{:04}-{:02}-{:02}", new_year, new_month, new_day))
+            }
+        }
+        "QUARTER" => {
+            let total_months = parts.year * 12 + parts.month as i64 - 1 + amount * 3;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            let max_day = days_in_month(new_year, new_month);
+            let new_day = parts.day.min(max_day);
+            if has_time {
+                Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    new_year, new_month, new_day, parts.hour, parts.minute, parts.second
+                ))
+            } else {
+                Some(format!("{:04}-{:02}-{:02}", new_year, new_month, new_day))
+            }
+        }
+        "YEAR" | "YEARS" => {
+            let new_year = parts.year + amount;
+            // Clamp day for Feb leap year edge case
+            let max_day = days_in_month(new_year, parts.month);
+            let new_day = parts.day.min(max_day);
+            if has_time {
+                Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    new_year, parts.month, new_day, parts.hour, parts.minute, parts.second
+                ))
+            } else {
+                Some(format!("{:04}-{:02}-{:02}", new_year, parts.month, new_day))
+            }
+        }
+        "MICROSECOND" | "MICROSECONDS" => {
+            // For microsecond precision, add microseconds
+            let total_us = parts.microsecond as i64 + amount;
+            let extra_secs = total_us.div_euclid(1_000_000);
+            let new_us = total_us.rem_euclid(1_000_000) as u32;
+            let total_secs = parts.to_total_seconds() + extra_secs;
+            let mut result = total_seconds_to_datetime(total_secs);
+            result.microsecond = new_us;
+            Some(format_datetime_parts(&result, true))
+        }
+        _ => None,
+    }
+}
+
+/// Convert DateTimeParts to total seconds since epoch for arithmetic
+impl DateTimeParts {
+    fn to_total_seconds(&self) -> i64 {
+        let days = ymd_to_days_from_epoch(self.year, self.month, self.day);
+        days * 86400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64
+    }
+}
+
+/// Convert total seconds since epoch back to DateTimeParts
+fn total_seconds_to_datetime(total_secs: i64) -> DateTimeParts {
+    let days = total_secs.div_euclid(86400);
+    let remainder = total_secs.rem_euclid(86400);
+    let (y, m, d) = days_from_epoch_to_ymd(days);
+    let hour = (remainder / 3600) as u32;
+    let minute = ((remainder % 3600) / 60) as u32;
+    let second = (remainder % 60) as u32;
+    DateTimeParts {
+        year: y,
+        month: m,
+        day: d,
+        hour,
+        minute,
+        second,
+        microsecond: 0,
+        negative: false,
+    }
+}
+
+/// Format DateTimeParts as a date or datetime string
+fn format_datetime_parts(p: &DateTimeParts, include_time: bool) -> String {
+    if include_time {
+        if p.microsecond > 0 {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                p.year, p.month, p.day, p.hour, p.minute, p.second, p.microsecond
+            )
+        } else {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                p.year, p.month, p.day, p.hour, p.minute, p.second
+            )
+        }
+    } else {
+        format!("{:04}-{:02}-{:02}", p.year, p.month, p.day)
     }
 }
 
@@ -6238,6 +6511,436 @@ mod tests {
             matches!(err, ExecutorError::InvalidOperation(_)),
             "Expected InvalidOperation, got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn test_date_add_days() {
+        // DATE_ADD('2020-01-01', INTERVAL 1 DAY) → '2020-01-02'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("1 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-01-02".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_months() {
+        // DATE_ADD('2020-01-31', INTERVAL 1 MONTH) → '2020-02-29' (leap year, clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-31".to_string()),
+                Datum::String("1 MONTH".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-02-29".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_years() {
+        // DATE_ADD('2020-02-29', INTERVAL 1 YEAR) → '2021-02-28' (not leap, clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-02-29".to_string()),
+                Datum::String("1 YEAR".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2021-02-28".to_string()));
+    }
+
+    #[test]
+    fn test_date_sub_days() {
+        // DATE_SUB('2020-01-01', INTERVAL 1 DAY) → '2019-12-31'
+        let result = eval_function(
+            "DATE_SUB",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("1 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2019-12-31".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_datetime_hours() {
+        // DATE_ADD('2020-01-01 10:00:00', INTERVAL 3 HOUR) → '2020-01-01 13:00:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 10:00:00".to_string()),
+                Datum::String("3 HOUR".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-01 13:00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_adddate_alias() {
+        // ADDDATE is alias for DATE_ADD
+        let result = eval_function(
+            "ADDDATE",
+            &[
+                Datum::String("2020-06-15".to_string()),
+                Datum::String("10 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-06-25".to_string()));
+    }
+
+    #[test]
+    fn test_subdate_alias() {
+        // SUBDATE is alias for DATE_SUB
+        let result = eval_function(
+            "SUBDATE",
+            &[
+                Datum::String("2020-06-15".to_string()),
+                Datum::String("10 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-06-05".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_null() {
+        // NULL input → NULL output
+        let result = eval_function(
+            "DATE_ADD",
+            &[Datum::Null, Datum::String("1 DAY".to_string())],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::Null);
+
+        let result = eval_function(
+            "DATE_ADD",
+            &[Datum::String("2020-01-01".to_string()), Datum::Null],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_date_add_week() {
+        // DATE_ADD('2020-01-01', INTERVAL 2 WEEK) → '2020-01-15'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("2 WEEK".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-01-15".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_quarter() {
+        // DATE_ADD('2020-01-31', INTERVAL 1 QUARTER) → '2020-04-30' (clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-31".to_string()),
+                Datum::String("1 QUARTER".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-04-30".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_seconds() {
+        // DATE_ADD('2020-01-01 23:59:59', INTERVAL 1 SECOND) → '2020-01-02 00:00:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 23:59:59".to_string()),
+                Datum::String("1 SECOND".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-02 00:00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_date_add_minutes() {
+        // DATE_ADD('2020-01-01 10:30:00', INTERVAL 45 MINUTE) → '2020-01-01 11:15:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 10:30:00".to_string()),
+                Datum::String("45 MINUTE".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-01 11:15:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_basic_fields() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        // EXTRACT(YEAR FROM '2024-03-23 14:30:45') = 2024
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2024)
+        );
+        // EXTRACT(MONTH FROM ...) = 3
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MONTH".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(3)
+        );
+        // EXTRACT(DAY FROM ...) = 23
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(23)
+        );
+        // EXTRACT(HOUR FROM ...) = 14
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(14)
+        );
+        // EXTRACT(MINUTE FROM ...) = 30
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(30)
+        );
+        // EXTRACT(SECOND FROM ...) = 45
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(45)
+        );
+        // EXTRACT(MICROSECOND FROM ...) = 0 (no fractional seconds)
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(0)
+        );
+        // EXTRACT(QUARTER FROM ...) = 1 (March is Q1)
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("QUARTER".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(1)
+        );
+        // EXTRACT(WEEK FROM ...) — week number with mode 0
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("WEEK".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            eval_function("WEEK", &[dt], None).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_extract_compound_fields() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        // EXTRACT(YEAR_MONTH FROM '2024-03-23 14:30:45') = 202403
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR_MONTH".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(202403)
+        );
+        // EXTRACT(DAY_HOUR FROM ...) = 2314
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_HOUR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2314)
+        );
+        // EXTRACT(DAY_MINUTE FROM ...) = 231430
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(231430)
+        );
+        // EXTRACT(DAY_SECOND FROM ...) = 23143045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(23143045)
+        );
+        // EXTRACT(HOUR_MINUTE FROM ...) = 1430
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR_MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(1430)
+        );
+        // EXTRACT(HOUR_SECOND FROM ...) = 143045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(143045)
+        );
+        // EXTRACT(MINUTE_SECOND FROM ...) = 3045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MINUTE_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(3045)
+        );
+    }
+
+    #[test]
+    fn test_extract_with_microseconds() {
+        let dt = Datum::String("2024-03-23 14:30:45.123456".to_string());
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(123456)
+        );
+        // SECOND_MICROSECOND = SSffffff = 45123456
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("SECOND_MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(45123456)
+        );
+    }
+
+    #[test]
+    fn test_extract_date_only() {
+        let d = Datum::String("2024-12-25".to_string());
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2024)
+        );
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MONTH".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(12)
+        );
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(25)
+        );
+        // Time fields should be 0 for date-only input
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(0)
+        );
+    }
+
+    #[test]
+    fn test_extract_null_propagation() {
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), Datum::Null],
+                None
+            )
+            .unwrap(),
+            Datum::Null
         );
     }
 }

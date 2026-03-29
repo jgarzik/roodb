@@ -4,6 +4,7 @@
 //! aggregates, grouping, ordering, and JOINs.
 
 mod aggregates;
+mod date_functions;
 mod grouping;
 mod joins;
 mod ordering;
