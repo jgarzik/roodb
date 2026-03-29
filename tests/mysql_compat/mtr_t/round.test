@@ -1,0 +1,94 @@
+# Adapted from MySQL round.test for RooDB compatibility testing.
+# Tests type coercion: string-to-integer rounding during INSERT.
+#
+# [RooDB-skip] MEDIUMINT type — not supported
+# [RooDB-skip] SET sql_mode — only partial support
+# [RooDB-skip] Scientific notation in string INSERT (1844674407370955161.0e1)
+# [RooDB-skip] BIGINT UNSIGNED overflow edge cases with string scientific notation
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+# --- TINYINT signed: string-to-int rounding ---
+CREATE TABLE t1 (sint8 TINYINT NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('127');
+INSERT INTO t1 VALUES ('-1');
+INSERT INTO t1 VALUES ('-127');
+INSERT INTO t1 VALUES ('-128');
+SELECT * FROM t1 ORDER BY sint8;
+DROP TABLE t1;
+
+# --- TINYINT unsigned: string-to-int rounding ---
+CREATE TABLE t1 (uint8 TINYINT UNSIGNED NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('127');
+INSERT INTO t1 VALUES ('255');
+SELECT * FROM t1 ORDER BY uint8;
+DROP TABLE t1;
+
+# --- SMALLINT signed: string-to-int rounding ---
+CREATE TABLE t1 (sint16 SMALLINT NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('32767');
+INSERT INTO t1 VALUES ('-1');
+INSERT INTO t1 VALUES ('-32767');
+INSERT INTO t1 VALUES ('-32768');
+SELECT * FROM t1 ORDER BY sint16;
+DROP TABLE t1;
+
+# --- SMALLINT unsigned: string-to-int rounding ---
+CREATE TABLE t1 (uint16 SMALLINT UNSIGNED NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('32767');
+INSERT INTO t1 VALUES ('65535');
+SELECT * FROM t1 ORDER BY uint16;
+DROP TABLE t1;
+
+# --- INT signed: string-to-int rounding ---
+CREATE TABLE t1 (sint32 INT NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('2147483647');
+INSERT INTO t1 VALUES ('-1');
+INSERT INTO t1 VALUES ('-2147483647');
+INSERT INTO t1 VALUES ('-2147483648');
+SELECT * FROM t1 ORDER BY sint32;
+DROP TABLE t1;
+
+# --- BIGINT signed: string-to-int rounding ---
+CREATE TABLE t1 (sint64 BIGINT NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('9223372036854775807');
+INSERT INTO t1 VALUES ('-1');
+INSERT INTO t1 VALUES ('-9223372036854775807');
+INSERT INTO t1 VALUES ('-9223372036854775808');
+SELECT * FROM t1 ORDER BY sint64;
+DROP TABLE t1;
+
+# --- BIGINT unsigned: string-to-int rounding ---
+CREATE TABLE t1 (uint64 BIGINT UNSIGNED NOT NULL);
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+INSERT INTO t1 VALUES ('9223372036854775807');
+INSERT INTO t1 VALUES ('18446744073709551615');
+SELECT * FROM t1 ORDER BY uint64;
+DROP TABLE t1;
+
+# --- String column UPDATE to integer ---
+CREATE TABLE t1 (str VARCHAR(128), sint64 BIGINT NOT NULL DEFAULT 0);
+INSERT INTO t1 (str) VALUES ('2');
+INSERT INTO t1 (str) VALUES ('10');
+INSERT INTO t1 (str) VALUES ('100');
+UPDATE t1 SET sint64 = str;
+SELECT * FROM t1 ORDER BY sint64;
+DROP TABLE t1;
+
+# --- ROUND function ---
+SELECT ROUND(4054410556, -10);

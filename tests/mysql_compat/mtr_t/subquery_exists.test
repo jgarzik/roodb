@@ -1,0 +1,109 @@
+# Custom test for RooDB: Advanced JOIN patterns and aggregation.
+# Exercises INNER JOIN, LEFT JOIN, self-join, derived tables, multi-table queries.
+#
+# [RooDB-skip] Subqueries in WHERE/SELECT — not supported
+# [RooDB-skip] EXISTS/NOT EXISTS — not supported
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3, t4;
+--enable_warnings
+
+# --- Setup tables ---
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
+
+CREATE TABLE t2 (id INT PRIMARY KEY, ref_id INT, amount DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 1, 10.50), (2, 1, 20.75), (3, 2, 30.00),
+                      (4, 3, 40.25), (5, 5, 50.00);
+
+CREATE TABLE t3 (id INT PRIMARY KEY, category VARCHAR(10));
+INSERT INTO t3 VALUES (1, 'A'), (2, 'B'), (3, 'A'), (4, 'B'), (5, 'A');
+
+# --- Basic INNER JOIN ---
+SELECT t1.id, t1.val, t2.amount
+FROM t1 JOIN t2 ON t1.id = t2.ref_id
+ORDER BY t1.id, t2.id;
+
+# --- LEFT JOIN with NULLs ---
+SELECT t1.id, t1.val, t2.amount
+FROM t1 LEFT JOIN t2 ON t1.id = t2.ref_id
+ORDER BY t1.id, t2.id;
+
+# --- LEFT JOIN anti-join pattern (find unmatched rows) ---
+SELECT t1.id, t1.val
+FROM t1 LEFT JOIN t2 ON t1.id = t2.ref_id
+WHERE t2.id IS NULL
+ORDER BY t1.id;
+
+# --- RIGHT JOIN ---
+SELECT t1.id, t1.val, t2.id AS t2_id, t2.ref_id
+FROM t1 RIGHT JOIN t2 ON t1.id = t2.ref_id
+ORDER BY t2.id;
+
+# --- Multi-table JOIN with aggregation ---
+SELECT t1.id, t1.val, t3.category, SUM(t2.amount) AS total
+FROM t1
+JOIN t3 ON t1.id = t3.id
+LEFT JOIN t2 ON t1.id = t2.ref_id
+GROUP BY t1.id, t1.val, t3.category
+ORDER BY t1.id;
+
+# --- Self-join ---
+SELECT a.id AS id1, b.id AS id2, a.val AS val1, b.val AS val2
+FROM t1 a JOIN t1 b ON a.id < b.id
+WHERE a.id <= 3 AND b.id <= 3
+ORDER BY a.id, b.id;
+
+# --- Derived table (subquery in FROM) ---
+SELECT d.ref_id, d.total
+FROM (SELECT ref_id, SUM(amount) AS total FROM t2 GROUP BY ref_id) d
+WHERE d.total > 25
+ORDER BY d.ref_id;
+
+# --- JOIN with GROUP BY and HAVING ---
+SELECT t1.id, t1.val, COUNT(t2.id) AS order_count, SUM(t2.amount) AS total
+FROM t1
+LEFT JOIN t2 ON t1.id = t2.ref_id
+GROUP BY t1.id, t1.val
+HAVING COUNT(t2.id) > 0
+ORDER BY t1.id;
+
+# --- INSERT ... SELECT with JOIN ---
+CREATE TABLE t4 (id INT PRIMARY KEY, total_amount DECIMAL(10,2));
+INSERT INTO t4 SELECT t2.ref_id, SUM(t2.amount)
+FROM t2 GROUP BY t2.ref_id;
+SELECT * FROM t4 ORDER BY id;
+
+# --- UPDATE specific rows ---
+UPDATE t1 SET val = 'has_orders' WHERE id = 1;
+UPDATE t1 SET val = 'has_orders' WHERE id = 2;
+UPDATE t1 SET val = 'has_orders' WHERE id = 3;
+UPDATE t1 SET val = 'has_orders' WHERE id = 5;
+SELECT * FROM t1 ORDER BY id;
+
+# --- DELETE using JOIN condition ---
+# Delete rows from t3 where category is B
+DELETE FROM t3 WHERE category = 'B';
+SELECT * FROM t3 ORDER BY id;
+
+# --- Multi-column ORDER BY with JOIN ---
+SELECT t1.val, t3.category, t2.amount
+FROM t1
+JOIN t3 ON t1.id = t3.id
+LEFT JOIN t2 ON t1.id = t2.ref_id
+ORDER BY t3.category, t1.val, t2.amount;
+
+# --- CROSS JOIN (cartesian product) limited ---
+SELECT a.id AS a_id, b.id AS b_id
+FROM t3 a, t3 b
+WHERE a.id < b.id
+ORDER BY a.id, b.id;
+
+# --- JOIN with BETWEEN ---
+SELECT t1.id, t2.amount
+FROM t1 JOIN t2 ON t1.id = t2.ref_id
+WHERE t2.amount BETWEEN 15 AND 45
+ORDER BY t2.amount;
+
+# --- Cleanup ---
+DROP TABLE t1, t2, t3, t4;

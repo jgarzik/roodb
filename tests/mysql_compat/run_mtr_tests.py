@@ -195,6 +195,12 @@ TIERS = {
         "truth_value_transform",      # IS TRUE / IS FALSE / IS UNKNOWN
         "ctype_ascii",                # ASCII character comparisons and ordering
     ],
+    22: [
+        "round",                              # string-to-integer rounding during INSERT
+        "sum_distinct",                       # SUM(DISTINCT), AVG(DISTINCT) aggregate edge cases
+        "implicit_char_to_num_conversion",    # string comparison with numeric columns in WHERE
+        "subquery_exists",                    # INSERT/UPDATE/DELETE with subqueries and JOINs
+    ],
 }
 
 

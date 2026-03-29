@@ -179,6 +179,7 @@ impl Update {
                 if new_value.is_null() && !col.nullable {
                     new_value = super::datum::Datum::default_for_type(&col.data_type);
                 }
+                new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
             self.emit_row_change(storage_key, &row, row_version)?;
@@ -249,6 +250,7 @@ impl Update {
                 if new_value.is_null() && !col.nullable {
                     new_value = super::datum::Datum::default_for_type(&col.data_type);
                 }
+                new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
             self.emit_row_change(key, &row, row_version)?;

@@ -1,0 +1,77 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (
+id INTEGER NOT NULL PRIMARY KEY AUTO_INCREMENT,
+gender CHAR(1),
+name VARCHAR(20)
+);
+SELECT SUM(DISTINCT LENGTH(name)) s1 FROM t1;
+s1
+NULL
+INSERT INTO t1 (gender, name) VALUES (NULL, NULL);
+INSERT INTO t1 (gender, name) VALUES (NULL, NULL);
+INSERT INTO t1 (gender, name) VALUES (NULL, NULL);
+SELECT SUM(DISTINCT LENGTH(name)) s1 FROM t1;
+s1
+NULL
+INSERT INTO t1 (gender, name) VALUES ('F', 'Helen'), ('F', 'Anastasia'),
+('F', 'Katherine'), ('F', 'Margo'), ('F', 'Magdalene'), ('F', 'Mary');
+INSERT INTO t1 (gender, name) VALUES ('F', 'Eva'), ('F', 'Sofia'),
+('F', 'Sara'), ('F', 'Golda'), ('F', 'Toba'), ('F', 'Victory'),
+('F', 'Faina'), ('F', 'Miriam'), ('F', 'Beki'), ('F', 'America'),
+('F', 'Susan'), ('F', 'Glory'), ('F', 'Priscilla'), ('F', 'Rosmary'),
+('F', 'Rose'), ('F', 'Margareth'), ('F', 'Elizabeth'), ('F', 'Meredith'),
+('F', 'Julie'), ('F', 'Xenia'), ('F', 'Zena'), ('F', 'Olga'),
+('F', 'Brunhilda'), ('F', 'Nataly'), ('F', 'Lara'), ('F', 'Svetlana'),
+('F', 'Grethem'), ('F', 'Irene');
+SELECT
+SUM(DISTINCT LENGTH(name)) s1,
+SUM(DISTINCT LENGTH(SUBSTRING(name, 1, 4))) s3
+FROM t1;
+s1	s3
+42	7
+SELECT AVG(DISTINCT LENGTH(name)) FROM t1;
+AVG(LENGTH(name))
+6
+SELECT COUNT(DISTINCT gender) FROM t1;
+COUNT(gender)
+1
+SELECT COUNT(DISTINCT LENGTH(name)) FROM t1;
+COUNT(LENGTH(name))
+7
+SELECT gender, SUM(DISTINCT LENGTH(name)) s1
+FROM t1
+WHERE gender IS NOT NULL
+GROUP BY gender;
+gender	s1
+F	42
+SELECT
+COUNT(*) AS cnt,
+SUM(DISTINCT LENGTH(name)) AS s1,
+MIN(name) AS mn,
+MAX(name) AS mx
+FROM t1
+WHERE gender = 'F';
+cnt	s1	mn	mx
+34	42	America	Zena
+DROP TABLE t1;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (1), (2), (2), (3), (3), (NULL);
+SELECT SUM(DISTINCT a) FROM t1;
+SUM(a)
+6
+SELECT AVG(DISTINCT a) FROM t1;
+AVG(a)
+2
+SELECT COUNT(DISTINCT a) FROM t1;
+COUNT(a)
+3
+DROP TABLE t1;
+CREATE TABLE t1 (a DECIMAL(10,2));
+INSERT INTO t1 VALUES (1.50), (1.50), (2.75), (2.75), (3.25);
+SELECT SUM(DISTINCT a) FROM t1;
+SUM(a)
+7.5
+SELECT AVG(DISTINCT a) FROM t1;
+AVG(a)
+2.5
+DROP TABLE t1;

@@ -78,9 +78,9 @@ SELECT * FROM t4 WHERE yyyy = 'test';
 yyyy	c4
 SELECT * FROM t4 WHERE yyyy = '1999';
 yyyy	c4
-1999	1999
 SELECT * FROM t4 WHERE yyyy = 1999;
 yyyy	c4
+1999	1999
 SELECT * FROM t4 WHERE yyyy = 1999.1;
 yyyy	c4
 SELECT * FROM t4 WHERE yyyy = 1998.9;
@@ -94,9 +94,9 @@ SELECT * FROM t4 WHERE yyyy = '0000';
 yyyy	c4
 SELECT * FROM t4 WHERE yyyy = '2000';
 yyyy	c4
-2000	2000
 SELECT * FROM t4 WHERE yyyy = 2000;
 yyyy	c4
+2000	2000
 # Comparison with constants those are out of YEAR range
 SELECT COUNT(yyyy) FROM t4;
 COUNT(yyyy)
@@ -109,10 +109,10 @@ COUNT(NULL)
 5
 SELECT COUNT(*) FROM t4 WHERE yyyy < 2156;
 COUNT(NULL)
-0
+5
 SELECT COUNT(*) FROM t4 WHERE yyyy < 1000000000000000000;
 COUNT(NULL)
-0
+5
 SELECT * FROM t4 WHERE yyyy < 123;
 yyyy	c4
 SELECT * FROM t4 WHERE yyyy > 123;
