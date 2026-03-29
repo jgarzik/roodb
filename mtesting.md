@@ -43,9 +43,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 6 | func_system, replace, func_regexp, func_group, union | System funcs, REPLACE, REGEXP, aggregates, UNION |
 | 7 | ansi, binary_to_hex, count_distinct, date_formats, create_if_not_exists, constraints | ANSI, HEX/UNHEX, COUNT(DISTINCT), dates, DDL |
 | 8 | subselect, drop, auto_increment, type_timestamp, key, join | Subqueries, DROP, AUTO_INC, TIMESTAMP, indexes, JOINs |
-| 5 | alias, truncate, func_in_none, select_found, distinct, having | Aliases, DISTINCT, HAVING, IN() |
+| 9 | select_all, overflow, type_uint, bool, negation_elimination, func_sapdb, order_by_sortkey | SELECT, overflow, negation, SAP functions, sort keys |
+| 10 | func_misc, single_delete_update, insert_select | INET functions, DELETE/UPDATE LIMIT, INSERT...SELECT |
+| 11 | truncate_coverage, func_group_innodb, type_set, varbinary | TRUNCATE edge cases, bitwise aggregates, SET type, BINARY |
+| 12 | order_by_limit, insert_update, type_date, type_time | ORDER BY LIMIT, INSERT edge cases, DATE/TIME types |
+| 13 | multi_update, type_datetime, func_time, func_set | Multi-table UPDATE, DATETIME, time functions, FIND_IN_SET |
+| 14 | expressions, parser_precedence, select_where, group_by | Complex expressions, operator precedence, WHERE, GROUP BY |
 
 ## Current Status
+
+**78 MySQL compat tests across 14 tiers — all pass**
+**200+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 
@@ -203,25 +211,32 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 ## Gap Analysis — Next Steps
 
-### Quick Wins (unblocks most test progress)
-- ORDER BY aggregate alias (blocks limit at line 237)
-- INSERT ... SELECT (blocks null at line 113)
-- Duplicate key validation on ALTER TABLE ADD PK (blocks type_varchar)
-- BIT_LENGTH() function (blocks func_str)
-- CONCAT_WS with mixed types (blocks func_concat)
+### Recently Implemented
+- DATE_ADD/DATE_SUB/ADDDATE/SUBDATE with all interval units
+- EXTRACT(unit FROM expr) for standard date/time fields
+- GROUP BY and ORDER BY ordinal references (GROUP BY 1, ORDER BY 2)
+- INSERT...SELECT partial column list remapping
+- INSERT IGNORE...SELECT duplicate key suppression
+- DEFAULT values for unspecified columns in partial INSERT
+- Aggregates inside CASE WHEN expressions
+- BIT_AND empty-set identity (u64::MAX)
+- DELETE ORDER BY + LIMIT support
+- PointGet suppression when LIMIT or ORDER BY present
 
-### Medium Features
-- CREATE TABLE AS SELECT (blocks type_float)
-- Multi-table DELETE syntax (blocks delete)
-- PREPARE validation of SQL syntax (blocks comments)
-- GET_LOCK()/RELEASE_LOCK() stub functions (blocks func_isnull)
-- Large unsigned integer literal parsing (blocks func_test)
-
-### Large Features (complex implementation)
-- Scalar/correlated subqueries (blocks compare)
-- CREATE TRIGGER / trigger execution (blocks func_equal)
-- Charset introducers (`_latin1'...'`) and COLLATE (blocks case, cast)
-- ENUM and SET types (blocks type_ranges, type_enum)
+### Missing Features (discovered by testing)
+- Multi-table UPDATE/DELETE syntax (`UPDATE t1,t2 SET ...`, `DELETE t1 FROM ...`)
+- Subqueries in WHERE/SELECT (`IN (SELECT ...)`, `EXISTS (SELECT ...)`, scalar subqueries)
+- INSERT...ON DUPLICATE KEY UPDATE
+- INTERVAL arithmetic in expressions (`expr + INTERVAL 1 DAY`)
+- Hex literal implicit integer coercion (`0x41+0`)
+- `0b` prefix binary literals (`0b01000001`)
+- Bitwise operations on VARBINARY columns
+- GROUP_CONCAT(DISTINCT ...)
+- GROUP BY with expression (IF, CASE, etc.)
+- FROM_DAYS(), ADDTIME/SUBTIME, TIMESTAMPADD/TIMESTAMPDIFF
+- MAKE_SET()/EXPORT_SET()
+- Integer-to-SET member mapping
+- SET column defaults
 
 ## Architecture
 
