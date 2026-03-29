@@ -107,8 +107,6 @@ a
 1
 2
 3
-4
-5
 DROP TABLE t1;
 CREATE TABLE t1 (grp INT, val INT);
 INSERT INTO t1 VALUES (1,10),(1,20),(2,30),(2,40),(3,50);

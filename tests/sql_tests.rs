@@ -1,6 +1,6 @@
 //! SQL layer integration tests
 
-use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
+use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef, ViewDef};
 use roodb::planner::logical::ResolvedStatement;
 use roodb::sql::{Parser, Resolver, SqlError, TypeChecker};
 use sqlparser::ast::Statement as SpStatement;
@@ -332,4 +332,41 @@ fn test_parse_error_empty() {
 fn test_parse_error_multiple_statements() {
     let result = Parser::parse_one("SELECT * FROM users; SELECT * FROM orders");
     assert!(matches!(result, Err(SqlError::Parse(_))));
+}
+
+#[test]
+fn test_view_order_by_limit_preserved() {
+    let mut catalog = test_catalog();
+
+    // Create a view with ORDER BY and LIMIT
+    catalog
+        .create_view(ViewDef {
+            name: "v_top_users".to_string(),
+            query_sql: "SELECT id, name FROM users ORDER BY id DESC LIMIT 2".to_string(),
+        })
+        .unwrap();
+
+    // Resolve a SELECT from the view
+    let resolved = full_pipeline(&catalog, "SELECT * FROM v_top_users").unwrap();
+
+    // The resolved statement should be a Select with a derived table (the view)
+    if let ResolvedStatement::Select(select) = resolved {
+        assert_eq!(select.from.len(), 1);
+        let table_ref = &select.from[0];
+        // The view should have an inner_query
+        let inner = table_ref
+            .inner_query
+            .as_ref()
+            .expect("view should have inner_query");
+        // The inner query should preserve ORDER BY and LIMIT
+        assert!(
+            !inner.order_by.is_empty(),
+            "view ORDER BY should be preserved"
+        );
+        assert_eq!(inner.limit, Some(2), "view LIMIT should be preserved as 2");
+        // Verify ORDER BY is DESC
+        assert!(!inner.order_by[0].ascending, "ORDER BY should be DESC");
+    } else {
+        panic!("Expected ResolvedStatement::Select");
+    }
 }

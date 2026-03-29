@@ -800,6 +800,18 @@ impl<'a> Resolver<'a> {
 
         let mut result = select;
 
+        self.resolve_query_order_limit(&mut result, query)?;
+
+        Ok(ResolvedStatement::Select(result))
+    }
+
+    /// Apply ORDER BY and LIMIT/OFFSET from a parsed Query onto a ResolvedSelect.
+    /// This is shared between top-level SELECT resolution and view/subquery expansion.
+    fn resolve_query_order_limit(
+        &self,
+        result: &mut ResolvedSelect,
+        query: &sp::Query,
+    ) -> SqlResult<()> {
         // Handle ORDER BY
         if let Some(order_by) = &query.order_by {
             // Need to create scope from the resolved tables
@@ -860,7 +872,7 @@ impl<'a> Resolver<'a> {
                             if let sp::Expr::Identifier(ident) = &item.expr {
                                 let alias_name = &ident.value;
                                 let mut found = None;
-                                for col_item in &result.columns {
+                                for col_item in &*result.columns {
                                     if let ResolvedSelectItem::Expr {
                                         expr: resolved_expr,
                                         alias: Some(a),
@@ -930,7 +942,7 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        Ok(ResolvedStatement::Select(result))
+        Ok(())
     }
 
     /// Resolve a SetExpr into a ResolvedSelect (for UNION operands)
@@ -1258,7 +1270,9 @@ impl<'a> Resolver<'a> {
                         SqlError::Parse(format!("Invalid view '{}': {}", table_name, e))
                     })?;
                     if let sp::Statement::Query(query) = view_stmt {
-                        let inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        let mut inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        // Apply ORDER BY and LIMIT/OFFSET from the view's query
+                        self.resolve_query_order_limit(&mut inner_select, &query)?;
                         let columns: Vec<(String, DataType, bool)> = inner_select
                             .columns
                             .iter()
@@ -1303,7 +1317,9 @@ impl<'a> Resolver<'a> {
                     .ok_or_else(|| {
                         SqlError::Parse("Derived table must have an alias".to_string())
                     })?;
-                let inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                // Apply ORDER BY and LIMIT/OFFSET from the subquery
+                self.resolve_query_order_limit(&mut inner_select, subquery)?;
                 // Derive columns from the inner query's SELECT list
                 let columns: Vec<(String, DataType, bool)> = inner_select
                     .columns
