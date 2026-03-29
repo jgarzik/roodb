@@ -1,0 +1,39 @@
+# Adapted from MySQL type_nchar.test for RooDB compatibility testing.
+# Tests NCHAR / NVARCHAR type synonyms.
+#
+# [RooDB-skip] SHOW CREATE TABLE — output format differs
+# [RooDB-skip] --replace_result / --let directives
+# [RooDB-skip] NATIONAL CHAR / NATIONAL VARCHAR / NATIONAL CHARACTER VARYING
+#   — sqlparser does not parse multi-word NATIONAL form; only NCHAR / NVARCHAR
+# [RooDB-skip] NCHAR VARCHAR — nonstandard compound syntax
+
+# NCHAR basic create/drop
+create table t1 (c nchar(10));
+drop table t1;
+
+# NVARCHAR basic create/drop
+create table t1 (c nvarchar(10));
+drop table t1;
+
+# Verify NCHAR columns work with data
+create table t1 (c nchar(10));
+insert into t1 values ('hello');
+insert into t1 values ('world');
+select * from t1 order by c;
+select length(c) from t1 order by c;
+drop table t1;
+
+# Verify NVARCHAR columns work with data
+create table t1 (c nvarchar(20));
+insert into t1 values ('hello world');
+insert into t1 values ('test');
+select * from t1 order by c;
+select length(c) from t1 order by c;
+drop table t1;
+
+# Mixed column types with NCHAR/NVARCHAR
+create table t1 (id int, name nvarchar(50), code nchar(5));
+insert into t1 values (1, 'Alice', 'A001');
+insert into t1 values (2, 'Bob', 'B002');
+select * from t1 order by id;
+drop table t1;

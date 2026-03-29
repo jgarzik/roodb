@@ -1,0 +1,38 @@
+create table t1(id int, a int);
+insert into t1 values(1,1),(2,2),(3,null);
+select id, a=1 is false from t1;
+id	a = 1 IS IsFalse
+1	0
+2	1
+3	0
+select id, not (a=1 is true) from t1;
+id	NOT a = 1 IS IsTrue
+1	0
+2	1
+3	1
+select id, (not a=1) is true from t1;
+id	NOT a = 1 IS IsTrue
+1	0
+2	1
+3	0
+select id, not (a=1 is false) from t1;
+id	NOT a = 1 IS IsFalse
+1	1
+2	0
+3	1
+select id, not (a=1 is unknown) from t1;
+id	NOT a = 1 IS IsUnknown
+1	1
+2	1
+3	0
+select id, ((not a=1) is true) is false from t1;
+id	NOT a = 1 IS IsTrue IS IsFalse
+1	1
+2	0
+3	1
+select id, 3 + (not (a=1 is false)) from t1;
+id	3 + NOT a = 1 IS IsFalse
+1	4
+2	3
+3	4
+drop table t1;

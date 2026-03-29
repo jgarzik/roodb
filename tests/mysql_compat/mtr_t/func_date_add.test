@@ -1,0 +1,57 @@
+# Adapted from MySQL func_date_add.test for RooDB compatibility testing.
+# Tests DATE_ADD / DATE_SUB / ADDDATE functions.
+#
+# [RooDB-skip] sql_mode='traditional' — not implemented
+# [RooDB-skip] PREPARE/EXECUTE — not fully supported for date math
+# [RooDB-skip] REPEAT('1', 32) overflow test — MySQL-specific behavior
+# [RooDB-skip] TIME literal expressions (TIME'00:00:00' + INTERVAL) — not implemented
+# [RooDB-skip] ADDTIME — not implemented
+# [RooDB-skip] CURRENT_DATE in computed expressions
+# [RooDB-skip] CAST(...) + INTERVAL — operator form treats result as numeric
+# [RooDB-skip] 'string' + interval a day from table — operator form on varchar
+
+# Document resolver actions of various ADDDATE parameters
+SELECT ADDDATE(DATE'2021-01-01', INTERVAL 1 DAY);
+SELECT ADDDATE(DATE'2021-01-01', INTERVAL 1 HOUR);
+SELECT ADDDATE(TIMESTAMP'2021-01-01 00:00:00', INTERVAL 1 DAY);
+SELECT ADDDATE(TIMESTAMP'2021-01-01 00:00:00', INTERVAL 1 HOUR);
+SELECT ADDDATE('2021-01-01', INTERVAL 1 DAY);
+SELECT ADDDATE('2021-01-01', INTERVAL 1 HOUR);
+SELECT ADDDATE('2021-01-01 00:00:00', INTERVAL 1 DAY);
+SELECT ADDDATE('2021-01-01 00:00:00', INTERVAL 1 HOUR);
+
+# Basic DATE_ADD / DATE_SUB
+SELECT DATE_ADD('2000-01-01', INTERVAL 1 DAY);
+SELECT DATE_ADD('2000-01-01', INTERVAL 1 MONTH);
+SELECT DATE_ADD('2000-01-01', INTERVAL 1 YEAR);
+SELECT DATE_SUB('2000-01-01', INTERVAL 1 DAY);
+SELECT DATE_SUB('2000-01-01', INTERVAL 1 MONTH);
+SELECT DATE_SUB('2000-01-01', INTERVAL 1 YEAR);
+
+# DATE_ADD with WEEK interval
+SELECT DATE_ADD('2006-09-26', INTERVAL 1 WEEK);
+
+# DATE_ADD/SUB with multiple units
+SELECT DATE_ADD('2000-01-01', INTERVAL 10 DAY);
+SELECT DATE_ADD('2000-01-15', INTERVAL 3 MONTH);
+SELECT DATE_SUB('2000-06-15', INTERVAL 100 DAY);
+
+# NULL handling
+SELECT DATE_ADD(NULL, INTERVAL 1 DAY);
+SELECT DATE_ADD('2000-01-04', INTERVAL NULL DAY);
+
+# DATE_ADD with table data
+create table t1 (a int, b varchar(10));
+insert into t1 values (1, '2001-01-01'),(2, '2002-02-02');
+select DATE_ADD('2007-01-01', INTERVAL a DAY) from t1;
+select DATE_ADD(b, INTERVAL a DAY) from t1;
+drop table t1;
+
+# Leap year handling
+SELECT DATE_ADD('2000-02-28', INTERVAL 1 DAY);
+SELECT DATE_ADD('2001-02-28', INTERVAL 1 DAY);
+SELECT DATE_ADD('2000-02-29', INTERVAL 1 YEAR);
+
+# End-of-month handling
+SELECT DATE_ADD('2000-01-31', INTERVAL 1 MONTH);
+SELECT DATE_ADD('2000-03-31', INTERVAL 1 MONTH);

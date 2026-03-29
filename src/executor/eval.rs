@@ -538,6 +538,8 @@ fn bytes_to_u64(b: &[u8]) -> u64 {
 
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
+        // MySQL: TRUE=1, FALSE=0 in numeric context
+        Datum::Bool(b) => std::borrow::Cow::Owned(Datum::Int(if *b { 1 } else { 0 })),
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
         Datum::Decimal { .. } => std::borrow::Cow::Borrowed(d),
         // MySQL: hex literals (Bytes) become unsigned integers in numeric context

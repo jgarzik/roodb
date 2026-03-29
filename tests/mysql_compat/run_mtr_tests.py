@@ -189,6 +189,12 @@ TIERS = {
         "lpad",                   # LPAD() string padding function
         "rpad",                   # RPAD() string padding function
     ],
+    21: [
+        "func_date_add",              # DATE_ADD/DATE_SUB/ADDDATE functions
+        "type_nchar",                 # NCHAR/NVARCHAR type synonyms
+        "truth_value_transform",      # IS TRUE / IS FALSE / IS UNKNOWN
+        "ctype_ascii",                # ASCII character comparisons and ordering
+    ],
 }
 
 
