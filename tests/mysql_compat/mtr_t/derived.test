@@ -1,0 +1,129 @@
+#
+# Derived table / subquery-in-FROM tests for RooDB
+# Adapted from MySQL derived.test
+#
+# [RooDB-skip] --source includes, mysqltest scripting (let, while, eval)
+# [RooDB-skip] EXPLAIN, ANALYZE TABLE, ENGINE= directives
+# [RooDB-skip] connect/disconnect, mysqltest_1 user, DELIMITER
+# [RooDB-skip] CREATE TABLE ... LIKE, multi-table UPDATE/DELETE with derived
+# [RooDB-skip] STRAIGHT_JOIN, MEDIUMINT, optimizer hints
+# [RooDB-skip] --error for UPDATE/DELETE/INSERT on derived tables
+# [RooDB-skip] INSERT INTO (select ...) VALUES, UPDATE (select ...) AS t1
+# [RooDB-skip] --sorted_result (we use ORDER BY instead)
+# [RooDB-skip] UNION/INTERSECT/EXCEPT inside derived table (unsupported)
+# [RooDB-skip] Scalar subqueries in WHERE (unsupported)
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+# Simple derived table with literal
+SELECT * FROM (SELECT 2 FROM DUAL) b;
+
+# Basic derived table with data
+CREATE TABLE t1 (a INT NOT NULL, b CHAR(10) NOT NULL);
+INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c'),(3,'c');
+
+CREATE TABLE t2 (a INT NOT NULL, b CHAR(10) NOT NULL);
+INSERT INTO t2 VALUES (3,'c'),(4,'d'),(5,'f'),(6,'e');
+
+# Derived table with alias and column rename
+SELECT t1.a, t3.y FROM t1, (SELECT a AS y FROM t2 WHERE b='c') AS t3 WHERE t1.a = t3.y ORDER BY t1.a;
+
+# Derived table with SELECT *
+SELECT t1.a, t3.a FROM t1, (SELECT * FROM t2 WHERE b='c') AS t3 WHERE t1.a = t3.a ORDER BY t1.a;
+
+# Nested derived tables
+CREATE TABLE t3 (a INT NOT NULL, b CHAR(10) NOT NULL);
+INSERT INTO t3 VALUES (3,'f'),(4,'y'),(5,'z'),(6,'c');
+SELECT t1.a, t4.y FROM t1, (SELECT t2.a AS y FROM t2, (SELECT t3.b FROM t3 WHERE t3.a > 3) AS t5 WHERE t2.b = t5.b) AS t4 WHERE t1.a = t4.y ORDER BY t1.a;
+
+DROP TABLE IF EXISTS t2, t3;
+
+# Literal derived table
+SELECT * FROM (SELECT 1) AS a;
+
+# Named column in derived table
+SELECT a FROM (SELECT 1 AS a) AS b;
+
+# Constant from derived table
+SELECT 1 FROM (SELECT 1) AS a;
+
+DROP TABLE t1;
+
+# Derived table reference with alias and HAVING
+SELECT a.x FROM (SELECT 1 AS x) AS a HAVING a.x = 1;
+
+# Derived table in INNER JOIN
+CREATE TABLE t1 (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a));
+INSERT INTO t1 VALUES (1,1), (2,2);
+
+SELECT d.a, d.b FROM (SELECT a, b FROM t1) AS d ORDER BY d.a;
+
+DROP TABLE t1;
+
+# Derived table with GROUP BY and aggregate
+CREATE TABLE t1 (n INT NOT NULL, m INT NOT NULL);
+INSERT INTO t1 VALUES (1,0),(1,0),(1,0),(2,0),(2,0),(3,0);
+SELECT * FROM (SELECT n, COUNT(*) AS cnt FROM t1 GROUP BY n HAVING cnt > 1) AS derived ORDER BY n;
+DROP TABLE t1;
+
+# LEFT JOIN with derived table
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1,10),(2,20),(3,30);
+CREATE TABLE t2 (a INT, b INT);
+INSERT INTO t2 VALUES (1,100),(4,400);
+
+SELECT t1.a, t1.b, d.b AS d_b
+FROM t1 LEFT JOIN (SELECT a, b FROM t2) AS d ON t1.a = d.a
+ORDER BY t1.a;
+
+DROP TABLE t1, t2;
+
+# Multiple derived tables in FROM (cross join)
+SELECT a.v, b.v FROM (SELECT 1 AS v) AS a, (SELECT 2 AS v) AS b;
+
+# Derived table with WHERE filtering
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(20));
+INSERT INTO t1 VALUES (1,'alpha'),(2,'beta'),(3,'gamma');
+SELECT d.id, d.val FROM (SELECT * FROM t1 WHERE id > 1) AS d ORDER BY d.id;
+DROP TABLE t1;
+
+# Derived table with RIGHT JOIN and COUNT(DISTINCT)
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1,2),(3,4);
+CREATE TABLE t2 (a INT, b INT);
+INSERT INTO t2 VALUES (1,2),(4,5);
+SELECT * FROM (SELECT COUNT(DISTINCT t1.a) AS cnt, t1.b FROM t1 RIGHT JOIN t2 ON t1.a = t2.a GROUP BY t1.b) AS tt ORDER BY tt.b;
+DROP TABLE t1, t2;
+
+# Derived table with multiple columns and ORDER BY
+CREATE TABLE t1 (x INT, y INT, z VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma');
+SELECT d.x, d.total FROM (SELECT x, y + x AS total, z FROM t1) AS d ORDER BY d.total;
+DROP TABLE t1;
+
+# Derived table joined with regular table
+CREATE TABLE t1 (id INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+CREATE TABLE t2 (id INT, score INT);
+INSERT INTO t2 VALUES (1, 90), (2, 85), (3, 95);
+SELECT d.name, t2.score
+FROM (SELECT id, name FROM t1) AS d
+INNER JOIN t2 ON d.id = t2.id
+ORDER BY t2.score;
+DROP TABLE t1, t2;
+
+# Derived table with LIMIT
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (5),(3),(1),(4),(2);
+SELECT * FROM (SELECT a FROM t1 ORDER BY a LIMIT 3) AS d ORDER BY d.a;
+DROP TABLE t1;
+
+# Derived table with aggregate functions
+CREATE TABLE t1 (grp INT, val INT);
+INSERT INTO t1 VALUES (1,10),(1,20),(2,30),(2,40),(3,50);
+SELECT d.grp, d.s, d.c, d.mn, d.mx
+FROM (SELECT grp, SUM(val) AS s, COUNT(*) AS c, MIN(val) AS mn, MAX(val) AS mx FROM t1 GROUP BY grp) AS d
+ORDER BY d.grp;
+DROP TABLE t1;

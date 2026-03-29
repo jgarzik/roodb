@@ -161,6 +161,12 @@ TIERS = {
         "partition_not_windows",  # long identifiers (CREATE/DROP DATABASE)
         "olap",                   # GROUP BY WITH ROLLUP
     ],
+    16: [
+        "derived",                # derived tables / subqueries in FROM
+        "join_nested",            # nested JOINs (standard compliant forms)
+        "temp_table",             # basic SQL operations (from temp_table.test)
+        "lowercase_table2",       # case-insensitive table/column names (extended)
+    ],
 }
 
 

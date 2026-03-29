@@ -1834,9 +1834,7 @@ pub fn eval_function(
                 Datum::String(s) => Ok(Datum::Int(s.len() as i64)),
                 Datum::Bytes(b) => Ok(Datum::Int(b.len() as i64)),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation(
-                    "LENGTH requires string or bytes".to_string(),
-                )),
+                other => Ok(Datum::Int(other.to_display_string().len() as i64)),
             }
         }
 

@@ -1,0 +1,132 @@
+#
+# SQL operations from temp_table.test adapted for RooDB
+# Adapted from MySQL temp_table.test
+#
+# [RooDB-skip] CREATE TEMPORARY TABLE, DROP TEMPORARY TABLE
+# [RooDB-skip] LOCK TABLE, UNLOCK TABLES, connect/disconnect
+# [RooDB-skip] ALTER TABLE RENAME, ALTER TABLE ADD PRIMARY KEY on dup
+# [RooDB-skip] SHOW CREATE TABLE, SHOW CREATE VIEW
+# [RooDB-skip] CREATE VIEW, DROP VIEW, ELT() function
+# [RooDB-skip] DELIMITER, CREATE FUNCTION, stored procedures
+# [RooDB-skip] CREATE TABLE ... LIKE, CREATE DATABASE, DROP DATABASE
+# [RooDB-skip] ANALYZE TABLE, CHECK TABLE, CHECKSUM TABLE, OPTIMIZE TABLE, REPAIR TABLE
+# [RooDB-skip] SET default_tmp_storage_engine, CREATE TABLE REPLACE AS
+# [RooDB-skip] WITH RECURSIVE, performance_schema references
+# [RooDB-skip] FLOAT with precision (FLOAT(20,14)), FLOAT(30,18)
+# [RooDB-skip] CREATE TABLE ... SELECT
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# Test basic table operations
+#
+CREATE TABLE t1 (c INT NOT NULL, d CHAR(10) NOT NULL);
+INSERT INTO t1 VALUES (1,''),(2,'a'),(3,'b');
+SELECT * FROM t1 ORDER BY c;
+DROP TABLE t1;
+
+#
+# Test CONCAT_WS
+#
+CREATE TABLE t1 (pkCrash INT PRIMARY KEY, strCrash VARCHAR(255));
+INSERT INTO t1 (pkCrash, strCrash) VALUES (1, '1');
+SELECT CONCAT_WS(pkCrash, strCrash) FROM t1;
+DROP TABLE t1;
+
+#
+# Test basic INSERT and SELECT
+#
+CREATE TABLE t1 (x INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT * FROM t1 ORDER BY x;
+DROP TABLE t1;
+
+#
+# Test LEFT JOIN with ORDER BY
+#
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (3,1),(3,2);
+CREATE TABLE t2 (c INT PRIMARY KEY, d VARCHAR(255));
+INSERT INTO t2 VALUES (1, 'foo'), (2, 'bar');
+SELECT d, c FROM t1 LEFT JOIN t2 ON b = c WHERE a = 3 ORDER BY d;
+DROP TABLE t1, t2;
+
+#
+# Bug #24791: Union with AVG-groups
+#
+CREATE TABLE t1 (c INT);
+INSERT INTO t1 VALUES (12139);
+
+CREATE TABLE t2 (c INT);
+INSERT INTO t2 VALUES (123456);
+
+SELECT AVG(c) FROM t1 UNION SELECT 1;
+SELECT 1 UNION SELECT AVG(c) FROM t1;
+SELECT 1 UNION SELECT * FROM t2 UNION SELECT 1;
+SELECT c / 1 FROM t1 UNION SELECT 1;
+
+DROP TABLE t1, t2;
+
+#
+# Test truncate
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (4711);
+SELECT * FROM t1;
+TRUNCATE t1;
+INSERT INTO t1 VALUES (42);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# Test DELETE
+#
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'val1'), (2, 'val2'), (3, 'val3');
+DELETE FROM t1 WHERE a = 1;
+SELECT COUNT(*) FROM t1;
+DELETE FROM t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# COUNT DISTINCT in derived table
+#
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1,2),(3,4);
+CREATE TABLE t2 (a INT, b INT);
+INSERT INTO t2 VALUES (1,2);
+INSERT INTO t2 VALUES (4,5);
+SELECT * FROM (SELECT COUNT(DISTINCT t1.a) AS cnt, t1.b FROM t1 RIGHT JOIN t2 ON t1.a = t2.a GROUP BY t1.b) AS tt ORDER BY tt.b;
+DROP TABLE t1, t2;
+
+#
+# Basic table creation and selection
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT * FROM t1 ORDER BY a;
+
+# Basic aggregation
+SELECT COUNT(*) FROM t1;
+SELECT SUM(a) FROM t1;
+SELECT AVG(a) FROM t1;
+SELECT MIN(a) FROM t1;
+SELECT MAX(a) FROM t1;
+DROP TABLE t1;
+
+#
+# Multi-column primary key
+#
+CREATE TABLE t1 (
+  a VARCHAR(255) NOT NULL,
+  b VARCHAR(255) NOT NULL,
+  c VARCHAR(255),
+  d VARCHAR(255) NOT NULL,
+  PRIMARY KEY (a, b, d)
+);
+INSERT INTO t1 (a, b, c, d) VALUES ('1','4',NULL,'3'),('2','5',NULL,'4');
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
