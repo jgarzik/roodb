@@ -505,13 +505,10 @@ fn checked_float_to_int(v: f64) -> ExecutorResult<Datum> {
 /// MySQL interprets hex literals as big-endian unsigned integers in numeric contexts.
 /// Bytes beyond the first 8 are silently ignored (only the last 8 bytes matter for u64).
 fn bytes_to_u64(b: &[u8]) -> u64 {
-    // Take at most the last 8 bytes (big-endian: most-significant bytes first)
     let start = if b.len() > 8 { b.len() - 8 } else { 0 };
-    let mut result: u64 = 0;
-    for &byte in &b[start..] {
-        result = (result << 8) | byte as u64;
-    }
-    result
+    b[start..]
+        .iter()
+        .fold(0u64, |acc, &byte| (acc << 8) | byte as u64)
 }
 
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
@@ -4142,6 +4139,7 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+#[derive(Default)]
 struct DateTimeParts {
     year: i64,
     month: u32,
@@ -4247,11 +4245,7 @@ impl DateTimeParts {
                     year: self.year - 1,
                     month: 12,
                     day: 31,
-                    hour: 0,
-                    minute: 0,
-                    second: 0,
-                    microsecond: 0,
-                    negative: false,
+                    ..Default::default()
                 };
                 return prev.week_number(mode);
             }
@@ -4294,8 +4288,7 @@ impl DateTimeParts {
             hour: (day_secs / 3600) as u32,
             minute: ((day_secs % 3600) / 60) as u32,
             second: (day_secs % 60) as u32,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         }
     }
 
@@ -4309,6 +4302,30 @@ impl DateTimeParts {
 
     fn format_datetime(&self) -> String {
         format!("{} {}", self.format_date(), self.format_time())
+    }
+
+    fn format_with_time(&self, include_time: bool) -> String {
+        if include_time {
+            if self.microsecond > 0 {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                    self.year,
+                    self.month,
+                    self.day,
+                    self.hour,
+                    self.minute,
+                    self.second,
+                    self.microsecond
+                )
+            } else {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    self.year, self.month, self.day, self.hour, self.minute, self.second
+                )
+            }
+        } else {
+            format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+        }
     }
 }
 
@@ -4327,27 +4344,18 @@ fn extract_field(field: &str, p: &DateTimeParts) -> i64 {
         "MICROSECOND" | "MICROSECONDS" => p.microsecond as i64,
         "WEEK" | "WEEKS" => p.week_number(0) as i64,
         "QUARTER" => p.quarter() as i64,
-        // Compound fields return concatenated numeric values per MySQL spec
-        // YEAR_MONTH: YYYYMM
         "YEAR_MONTH" => p.year * 100 + p.month as i64,
-        // DAY_HOUR: DDHH
         "DAY_HOUR" => p.day as i64 * 100 + p.hour as i64,
-        // DAY_MINUTE: DDHHMM
         "DAY_MINUTE" => p.day as i64 * 10000 + p.hour as i64 * 100 + p.minute as i64,
-        // DAY_SECOND: DDHHMMSS
         "DAY_SECOND" => {
             p.day as i64 * 1_000_000
                 + p.hour as i64 * 10_000
                 + p.minute as i64 * 100
                 + p.second as i64
         }
-        // HOUR_MINUTE: HHMM
         "HOUR_MINUTE" => p.hour as i64 * 100 + p.minute as i64,
-        // HOUR_SECOND: HHMMSS
         "HOUR_SECOND" => p.hour as i64 * 10_000 + p.minute as i64 * 100 + p.second as i64,
-        // MINUTE_SECOND: MMSS
         "MINUTE_SECOND" => p.minute as i64 * 100 + p.second as i64,
-        // DAY_MICROSECOND: DDHHMMSSffffff
         "DAY_MICROSECOND" => {
             p.day as i64 * 1_000_000_000_000
                 + p.hour as i64 * 10_000_000_000
@@ -4355,22 +4363,23 @@ fn extract_field(field: &str, p: &DateTimeParts) -> i64 {
                 + p.second as i64 * 1_000_000
                 + p.microsecond as i64
         }
-        // HOUR_MICROSECOND: HHMMSSffffff
         "HOUR_MICROSECOND" => {
             p.hour as i64 * 10_000_000_000
                 + p.minute as i64 * 100_000_000
                 + p.second as i64 * 1_000_000
                 + p.microsecond as i64
         }
-        // MINUTE_MICROSECOND: MMSSffffff
         "MINUTE_MICROSECOND" => {
             p.minute as i64 * 100_000_000 + p.second as i64 * 1_000_000 + p.microsecond as i64
         }
-        // SECOND_MICROSECOND: SSffffff
         "SECOND_MICROSECOND" => p.second as i64 * 1_000_000 + p.microsecond as i64,
-        // Unknown field returns 0
         _ => 0,
     }
+}
+
+fn parse_microseconds(frac: &str) -> u32 {
+    let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
+    padded.parse().unwrap_or(0)
 }
 
 /// Parse MySQL date/time/datetime input string into parts
@@ -4389,9 +4398,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
         let minute: u32 = s[14..16].parse().ok()?;
         let second: u32 = s[17..19].parse().ok()?;
         let microsecond = if s.len() > 20 && s.as_bytes()[19] == b'.' {
-            let frac = &s[20..];
-            let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
-            padded.parse().unwrap_or(0)
+            parse_microseconds(&s[20..])
         } else {
             0
         };
@@ -4403,7 +4410,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
             minute,
             second,
             microsecond,
-            negative: false,
+            ..Default::default()
         });
     }
 
@@ -4416,11 +4423,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
             year,
             month,
             day,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         });
     }
 
@@ -4455,8 +4458,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
                 hour,
                 minute,
                 second,
-                microsecond: 0,
-                negative: false,
+                ..Default::default()
             });
         } else if s.len() == 8 {
             let year: i64 = s[0..4].parse().ok()?;
@@ -4466,27 +4468,14 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
                 year,
                 month,
                 day,
-                hour: 0,
-                minute: 0,
-                second: 0,
-                microsecond: 0,
-                negative: false,
+                ..Default::default()
             });
         }
     }
 
     // Try integer coercion (e.g., Datum would have produced "0")
     if s == "0" {
-        return Some(DateTimeParts {
-            year: 0,
-            month: 0,
-            day: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
-        });
+        return Some(DateTimeParts::default());
     }
 
     None
@@ -4501,22 +4490,17 @@ fn parse_time_parts(s: &str) -> Option<DateTimeParts> {
     let minute: u32 = rest[..colon2].parse().ok()?;
     let sec_part = &rest[colon2 + 1..];
     let (sec_str, micro) = if let Some(dot) = sec_part.find('.') {
-        let frac = &sec_part[dot + 1..];
-        let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
-        (&sec_part[..dot], padded.parse::<u32>().unwrap_or(0))
+        (&sec_part[..dot], parse_microseconds(&sec_part[dot + 1..]))
     } else {
         (sec_part, 0)
     };
     let second: u32 = sec_str.parse().ok()?;
     Some(DateTimeParts {
-        year: 0,
-        month: 0,
-        day: 0,
         hour,
         minute,
         second,
         microsecond: micro,
-        negative: false,
+        ..Default::default()
     })
 }
 
@@ -4630,16 +4614,7 @@ fn format_datetime_fmt(parts: &DateTimeParts, fmt: &str) -> String {
 
 /// STR_TO_DATE: parse input using a MySQL format string
 fn parse_datetime_fmt(input: &str, fmt: &str) -> Option<DateTimeParts> {
-    let mut parts = DateTimeParts {
-        year: 0,
-        month: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        microsecond: 0,
-        negative: false,
-    };
+    let mut parts = DateTimeParts::default();
     let ibytes = input.as_bytes();
     let fbytes = fmt.as_bytes();
     let mut ii = 0; // index into input
@@ -5201,12 +5176,16 @@ fn eval_if_function(
     }
 }
 
+fn add_seconds_preserving_micros(parts: &DateTimeParts, delta_secs: i64) -> DateTimeParts {
+    let mut r = total_seconds_to_datetime(parts.to_unix_seconds() + delta_secs);
+    r.microsecond = parts.microsecond;
+    r
+}
+
 /// Evaluate DATE_ADD/DATE_SUB with an interval string like "1 DAY".
 /// Returns the resulting date/datetime string, or None for NULL.
 fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option<String> {
     let parts = parse_to_parts(date_str)?;
-    // A datetime has both date and time parts (contains space between them).
-    // A bare time string (e.g., "14:30:45") should not be treated as datetime.
     let has_time = date_str.contains(' ') || (date_str.contains(':') && date_str.contains('-'));
 
     // Parse interval: "N UNIT" e.g. "1 DAY", "3 MONTH", "-2 YEAR"
@@ -5218,22 +5197,16 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
 
     match unit_upper.as_str() {
         "SECOND" | "SECONDS" => {
-            let total_secs = parts.to_total_seconds() + amount;
-            let mut result = total_seconds_to_datetime(total_secs);
-            result.microsecond = parts.microsecond; // preserve microseconds
-            Some(format_datetime_parts(&result, true))
+            let result = add_seconds_preserving_micros(&parts, amount);
+            Some(result.format_with_time(true))
         }
         "MINUTE" | "MINUTES" => {
-            let total_secs = parts.to_total_seconds() + amount * 60;
-            let mut result = total_seconds_to_datetime(total_secs);
-            result.microsecond = parts.microsecond;
-            Some(format_datetime_parts(&result, true))
+            let result = add_seconds_preserving_micros(&parts, amount * 60);
+            Some(result.format_with_time(true))
         }
         "HOUR" | "HOURS" => {
-            let total_secs = parts.to_total_seconds() + amount * 3600;
-            let mut result = total_seconds_to_datetime(total_secs);
-            result.microsecond = parts.microsecond;
-            Some(format_datetime_parts(&result, true))
+            let result = add_seconds_preserving_micros(&parts, amount * 3600);
+            Some(result.format_with_time(true))
         }
         "DAY" | "DAYS" => {
             let epoch_days = ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount;
@@ -5245,7 +5218,7 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
                 microsecond: parts.microsecond,
                 ..parts
             };
-            Some(format_datetime_parts(&result, has_time))
+            Some(result.format_with_time(has_time))
         }
         "WEEK" | "WEEKS" => {
             let epoch_days =
@@ -5258,7 +5231,7 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
                 microsecond: parts.microsecond,
                 ..parts
             };
-            Some(format_datetime_parts(&result, has_time))
+            Some(result.format_with_time(has_time))
         }
         "MONTH" | "MONTHS" => {
             let total_months = parts.year * 12 + parts.month as i64 - 1 + amount;
@@ -5273,7 +5246,7 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
                 microsecond: parts.microsecond,
                 ..parts
             };
-            Some(format_datetime_parts(&result, has_time))
+            Some(result.format_with_time(has_time))
         }
         "QUARTER" => {
             let total_months = parts.year * 12 + parts.month as i64 - 1 + amount * 3;
@@ -5288,7 +5261,7 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
                 microsecond: parts.microsecond,
                 ..parts
             };
-            Some(format_datetime_parts(&result, has_time))
+            Some(result.format_with_time(has_time))
         }
         "YEAR" | "YEARS" => {
             let new_year = parts.year + amount;
@@ -5300,27 +5273,17 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
                 microsecond: parts.microsecond,
                 ..parts
             };
-            Some(format_datetime_parts(&result, has_time))
+            Some(result.format_with_time(has_time))
         }
         "MICROSECOND" | "MICROSECONDS" => {
-            // For microsecond precision, add microseconds
             let total_us = parts.microsecond as i64 + amount;
             let extra_secs = total_us.div_euclid(1_000_000);
             let new_us = total_us.rem_euclid(1_000_000) as u32;
-            let total_secs = parts.to_total_seconds() + extra_secs;
-            let mut result = total_seconds_to_datetime(total_secs);
+            let mut result = add_seconds_preserving_micros(&parts, extra_secs);
             result.microsecond = new_us;
-            Some(format_datetime_parts(&result, true))
+            Some(result.format_with_time(true))
         }
         _ => None,
-    }
-}
-
-/// Convert DateTimeParts to total seconds since epoch for arithmetic
-impl DateTimeParts {
-    fn to_total_seconds(&self) -> i64 {
-        let days = ymd_to_days_from_epoch(self.year, self.month, self.day);
-        days * 86400 + self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64
     }
 }
 
@@ -5339,27 +5302,7 @@ fn total_seconds_to_datetime(total_secs: i64) -> DateTimeParts {
         hour,
         minute,
         second,
-        microsecond: 0,
-        negative: false,
-    }
-}
-
-/// Format DateTimeParts as a date or datetime string
-fn format_datetime_parts(p: &DateTimeParts, include_time: bool) -> String {
-    if include_time {
-        if p.microsecond > 0 {
-            format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
-                p.year, p.month, p.day, p.hour, p.minute, p.second, p.microsecond
-            )
-        } else {
-            format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                p.year, p.month, p.day, p.hour, p.minute, p.second
-            )
-        }
-    } else {
-        format!("{:04}-{:02}-{:02}", p.year, p.month, p.day)
+        ..Default::default()
     }
 }
 
@@ -6007,11 +5950,7 @@ mod tests {
             year: 2024,
             month: 1,
             day: d,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         };
         assert_eq!(format_datetime_fmt(&p(1), "%D"), "1st");
         assert_eq!(format_datetime_fmt(&p(2), "%D"), "2nd");

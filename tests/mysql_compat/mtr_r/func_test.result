@@ -30,13 +30,13 @@ select !0,NOT 0=1,!(0=0),1 AND 1,1 && 0,0 OR 1,1 || NULL, 1=1 or 1=1 and 1=0;
 NOT 0	NOT 0 = 1	NOT 0 = 0	1 AND 1	1 AND 0	0 OR 1	1 OR NULL	1 = 1 OR 1 = 1 AND 1 = 0
 1	1	0	1	0	1	1	1
 select 2 between 1 and 3, "monty" between "max" and "my",2=2 and "monty" between "max" and "my" and 3=3;
-expr	expr	2 = 2 AND expr AND 3 = 3
+2 BETWEEN 1 AND 3	'monty' BETWEEN 'max' AND 'my'	2 = 2 AND 'monty' BETWEEN 'max' AND 'my' AND 3 = 3
 1	1	1
 select 'b' between 'a' and 'c', 'B' between 'a' and 'c';
-expr	expr
+'b' BETWEEN 'a' AND 'c'	'B' BETWEEN 'a' AND 'c'
 1	0
 select 2 in (3,2,5,9,5,1),"monty" in ("david","monty","allan"), 1.2 in (1.4,1.2,1.0);
-expr	expr	expr
+2 IN (3, 2, 5, 9, 5, 1)	'monty' IN ('david', 'monty', 'allan')	1.2 IN (1.4, 1.2, 1)
 1	1	1
 select -1.49 or -1.49,0.6 or 0.6;
 -1.49 OR -1.49	0.6 OR 0.6
@@ -65,10 +65,10 @@ select - a from t1;
 -1
 drop table t1;
 select 5 between 0 and 10 between 0 and 1,(5 between 0 and 10) between 0 and 1;
-expr	expr
+5 BETWEEN 0 AND 10 BETWEEN 0 AND 1	5 BETWEEN 0 AND 10 BETWEEN 0 AND 1
 0	0
 select 1 and 2 between 2 and 10, 2 between 2 and 10 and 1;
-1 AND expr	expr AND 1
+1 AND 2 BETWEEN 2 AND 10	2 BETWEEN 2 AND 10 AND 1
 1	1
 select 1 and 0 or 2, 2 or 1 and 0;
 1 AND 0 OR 2	2 OR 1 AND 0

@@ -405,29 +405,34 @@ impl LogicalPlanBuilder {
         })
     }
 
+    /// Check if a function name is a known aggregate function
+    fn is_aggregate_name(name: &str) -> bool {
+        matches!(
+            name,
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "BIT_AND"
+                | "BIT_OR"
+                | "BIT_XOR"
+                | "STDDEV"
+                | "STD"
+                | "STDDEV_POP"
+                | "STDDEV_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
+                | "VAR_SAMP"
+        )
+    }
+
     /// Check if expression contains aggregate functions
     fn expr_has_aggregate(expr: &ResolvedExpr) -> bool {
         match expr {
             ResolvedExpr::Function { name, args, .. } => {
                 let upper = name.to_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "BIT_AND"
-                        | "BIT_OR"
-                        | "BIT_XOR"
-                        | "STDDEV"
-                        | "STD"
-                        | "STDDEV_POP"
-                        | "STDDEV_SAMP"
-                        | "VARIANCE"
-                        | "VAR_POP"
-                        | "VAR_SAMP"
-                ) {
+                if Self::is_aggregate_name(&upper) {
                     true
                 } else {
                     args.iter().any(Self::expr_has_aggregate)
@@ -602,24 +607,7 @@ impl LogicalPlanBuilder {
                 result_type,
             } => {
                 let upper = name.to_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "BIT_AND"
-                        | "BIT_OR"
-                        | "BIT_XOR"
-                        | "STDDEV"
-                        | "STD"
-                        | "STDDEV_POP"
-                        | "STDDEV_SAMP"
-                        | "VARIANCE"
-                        | "VAR_POP"
-                        | "VAR_SAMP"
-                ) {
+                if Self::is_aggregate_name(&upper) {
                     Some(AggregateFunc::new(
                         upper,
                         args.clone(),
@@ -936,12 +924,10 @@ impl LogicalPlanBuilder {
 
     /// Find if an expression matches one in the group-by list
     fn find_in_group_by(expr: &ResolvedExpr, group_by: &[ResolvedExpr]) -> Option<usize> {
-        for (idx, gb_expr) in group_by.iter().enumerate() {
-            if Self::exprs_equal(expr, gb_expr) {
-                return Some(idx);
-            }
-        }
-        None
+        group_by
+            .iter()
+            .enumerate()
+            .find_map(|(idx, gb_expr)| Self::exprs_equal(expr, gb_expr).then_some(idx))
     }
 
     /// Check if two expressions are structurally equal
@@ -1189,7 +1175,7 @@ impl LogicalPlanBuilder {
                 if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
                     ResolvedExpr::Column(ResolvedColumn {
                         table: String::new(),
-                        name: col.name.clone(),
+                        name: format!("gb_{}", gb_idx),
                         index: gb_idx,
                         data_type: col.data_type.clone(),
                         nullable: col.nullable,
@@ -1384,7 +1370,31 @@ impl LogicalPlanBuilder {
             ResolvedExpr::BooleanTest { expr, test } => {
                 format!("{} IS {:?}", Self::expr_to_sql(expr), test)
             }
-            _ => "expr".to_string(),
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let expr_sql = Self::expr_to_sql(expr);
+                let neg = if *negated { " NOT" } else { "" };
+                let items: Vec<String> = list.iter().map(Self::expr_to_sql).collect();
+                format!("{}{} IN ({})", expr_sql, neg, items.join(", "))
+            }
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!(
+                    "{}{} BETWEEN {} AND {}",
+                    Self::expr_to_sql(expr),
+                    neg,
+                    Self::expr_to_sql(low),
+                    Self::expr_to_sql(high)
+                )
+            }
         }
     }
 
@@ -1507,6 +1517,70 @@ impl LogicalPlanBuilder {
                     .collect(),
                 distinct: *distinct,
                 result_type: result_type.clone(),
+            },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                negated: *negated,
+            },
+            ResolvedExpr::Cast {
+                expr: inner,
+                target_type,
+            } => ResolvedExpr::Cast {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                target_type: target_type.clone(),
+            },
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_to_output_columns(e, columns))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::transform_to_output_columns(c, columns))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::transform_to_output_columns(r, columns))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_to_output_columns(e, columns))),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                list: list
+                    .iter()
+                    .map(|e| Self::transform_to_output_columns(e, columns))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                low: Box::new(Self::transform_to_output_columns(low, columns)),
+                high: Box::new(Self::transform_to_output_columns(high, columns)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr: inner, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                test: *test,
             },
             // Other expression types pass through unchanged
             _ => expr.clone(),

@@ -1,86 +1,86 @@
 DROP TABLE IF EXISTS t1, t2;
 SELECT 1 IN (1,2,3);
-expr
+1 IN (1, 2, 3)
 1
 SELECT 10 IN (1,2,3);
-expr
+10 IN (1, 2, 3)
 0
 SELECT NULL IN (1,2,3);
-expr
+NULL IN (1, 2, 3)
 NULL
 SELECT 1 IN (1,NULL,3);
-expr
+1 IN (1, NULL, 3)
 1
 SELECT 3 IN (1,NULL,3);
-expr
+3 IN (1, NULL, 3)
 1
 SELECT 10 IN (1,NULL,3);
-expr
+10 IN (1, NULL, 3)
 0
 SELECT 1.5 IN (1.5,2.5,3.5);
-expr
+1.5 IN (1.5, 2.5, 3.5)
 1
 SELECT 10.5 IN (1.5,2.5,3.5);
-expr
+10.5 IN (1.5, 2.5, 3.5)
 0
 SELECT NULL IN (1.5,2.5,3.5);
-expr
+NULL IN (1.5, 2.5, 3.5)
 NULL
 SELECT 1.5 IN (1.5,NULL,3.5);
-expr
+1.5 IN (1.5, NULL, 3.5)
 1
 SELECT 3.5 IN (1.5,NULL,3.5);
-expr
+3.5 IN (1.5, NULL, 3.5)
 1
 SELECT 10.5 IN (1.5,NULL,3.5);
-expr
+10.5 IN (1.5, NULL, 3.5)
 0
 CREATE TABLE t1 (a int, b int, c int);
 INSERT INTO t1 VALUES (1,2,3), (1,NULL,3);
 SELECT 1 IN (a,b,c) FROM t1;
-expr
+1 IN (a, b, c)
 1
 1
 SELECT 3 IN (a,b,c) FROM t1;
-expr
+3 IN (a, b, c)
 1
 1
 SELECT 10 IN (a,b,c) FROM t1;
-expr
+10 IN (a, b, c)
 0
 0
 SELECT NULL IN (a,b,c) FROM t1;
-expr
+NULL IN (a, b, c)
 NULL
 NULL
 DROP TABLE t1;
 CREATE TABLE t1 (a float, b float, c float);
 INSERT INTO t1 VALUES (1.5,2.5,3.5), (1.5,NULL,3.5);
 SELECT 1.5 IN (a,b,c) FROM t1;
-expr
+1.5 IN (a, b, c)
 1
 1
 SELECT 3.5 IN (a,b,c) FROM t1;
-expr
+3.5 IN (a, b, c)
 1
 1
 SELECT 10.5 IN (a,b,c) FROM t1;
-expr
+10.5 IN (a, b, c)
 0
 0
 DROP TABLE t1;
 CREATE TABLE t1 (a varchar(10), b varchar(10), c varchar(10));
 INSERT INTO t1 VALUES ('A','BC','EFD'), ('A',NULL,'EFD');
 SELECT 'A' IN (a,b,c) FROM t1;
-expr
+'A' IN (a, b, c)
 1
 1
 SELECT 'EFD' IN (a,b,c) FROM t1;
-expr
+'EFD' IN (a, b, c)
 1
 1
 SELECT 'XSFGGHF' IN (a,b,c) FROM t1;
-expr
+'XSFGGHF' IN (a, b, c)
 0
 0
 DROP TABLE t1;
@@ -112,25 +112,25 @@ id
 9
 DROP TABLE t1;
 SELECT '1.0' IN (1,2);
-expr
+'1.0' IN (1, 2)
 0
 SELECT 1 IN ('1.0',2);
-expr
+1 IN ('1.0', 2)
 0
 SELECT 1 IN (1,'2.0');
-expr
+1 IN (1, '2.0')
 1
 SELECT 1 IN ('1.0',2.0);
-expr
+1 IN ('1.0', 2)
 0
 SELECT 1 IN (1.0,'2.0');
-expr
+1 IN (1, '2.0')
 1
 SELECT 1 IN ('1.1',2);
-expr
+1 IN ('1.1', 2)
 0
 SELECT 1 IN ('1.1',2.0);
-expr
+1 IN ('1.1', 2)
 0
 CREATE TABLE t1 (id int, key(id));
 INSERT INTO t1 VALUES (1),(2),(3);
