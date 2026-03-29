@@ -291,3 +291,32 @@ SELECT a AS d,SUM(b) FROM t1 WHERE a=1 GROUP BY c HAVING d=1;
 SELECT SUM(a)*SUM(b) AS d FROM t1 WHERE a=1 GROUP BY c HAVING d > 0;
 
 DROP TABLE t1;
+
+#
+# GROUP BY ordinal (numeric position in SELECT list)
+#
+
+CREATE TABLE t1 (a INT, b VARCHAR(10), c INT);
+INSERT INTO t1 VALUES (1, 'x', 10), (1, 'y', 20), (2, 'x', 30), (2, 'y', 40), (1, 'x', 50);
+
+# GROUP BY 1 — group by first select column
+--sorted_result
+SELECT a, SUM(c) FROM t1 GROUP BY 1;
+
+# GROUP BY 2 ��� group by second select column (b)
+--sorted_result
+SELECT b, SUM(c) FROM t1 GROUP BY 1;
+
+# GROUP BY with multiple ordinals
+--sorted_result
+SELECT a, b, SUM(c) FROM t1 GROUP BY 1, 2;
+
+# GROUP BY ordinal reversed
+--sorted_result
+SELECT a, b, SUM(c) FROM t1 GROUP BY 2, 1;
+
+# GROUP BY mixing ordinal and column name
+--sorted_result
+SELECT a, b, COUNT(*) FROM t1 GROUP BY 1, b;
+
+DROP TABLE t1;

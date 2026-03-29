@@ -260,3 +260,32 @@ SELECT SUM(a)*SUM(b) AS d FROM t1 WHERE a=1 GROUP BY c HAVING d > 0;
 d
 4
 DROP TABLE t1;
+CREATE TABLE t1 (a INT, b VARCHAR(10), c INT);
+INSERT INTO t1 VALUES (1, 'x', 10), (1, 'y', 20), (2, 'x', 30), (2, 'y', 40), (1, 'x', 50);
+SELECT a, SUM(c) FROM t1 GROUP BY 1;
+a	SUM(c)
+1	80
+2	70
+SELECT b, SUM(c) FROM t1 GROUP BY 1;
+b	SUM(c)
+x	90
+y	60
+SELECT a, b, SUM(c) FROM t1 GROUP BY 1, 2;
+a	b	SUM(c)
+1	x	60
+1	y	20
+2	x	30
+2	y	40
+SELECT a, b, SUM(c) FROM t1 GROUP BY 2, 1;
+a	b	SUM(c)
+1	x	60
+1	y	20
+2	x	30
+2	y	40
+SELECT a, b, COUNT(*) FROM t1 GROUP BY 1, b;
+a	b	COUNT(NULL)
+1	x	2
+1	y	1
+2	x	1
+2	y	1
+DROP TABLE t1;

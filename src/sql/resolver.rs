@@ -828,8 +828,30 @@ impl<'a> Resolver<'a> {
                 }
             }
 
+            let order_col_count = Self::select_column_count(&result.columns);
             if let sp::OrderByKind::Expressions(exprs) = &order_by.kind {
                 for item in exprs {
+                    // Check for ordinal (numeric literal) — ORDER BY 1
+                    if let sp::Expr::Value(val_with_span) = &item.expr {
+                        if let sp::Value::Number(n, _) = &val_with_span.value {
+                            if let Ok(ordinal) = n.parse::<usize>() {
+                                if ordinal >= 1 && ordinal <= order_col_count {
+                                    result.order_by.push(ResolvedOrderByItem {
+                                        expr: Self::select_expr_at_ordinal(
+                                            &result.columns,
+                                            ordinal,
+                                        )?,
+                                        ascending: item.options.asc.unwrap_or(true),
+                                    });
+                                    continue;
+                                }
+                                return Err(SqlError::InvalidOperation(format!(
+                                    "Unknown column '{}' in 'order clause'",
+                                    ordinal
+                                )));
+                            }
+                        }
+                    }
                     // Try resolving against table scope first, then SELECT aliases
                     let resolved = match self.resolve_expr(&item.expr, &scope) {
                         Ok(expr) => expr,
@@ -947,6 +969,50 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Given a 1-based ordinal, return the corresponding expression from the
+    /// resolved SELECT list.  Wildcard items (`SELECT *`) are flattened so that
+    /// each expanded column occupies one position.
+    fn select_expr_at_ordinal(
+        columns: &[ResolvedSelectItem],
+        ordinal: usize,
+    ) -> SqlResult<ResolvedExpr> {
+        let mut pos = 1usize; // 1-based
+        for item in columns {
+            match item {
+                ResolvedSelectItem::Expr { expr, .. } => {
+                    if pos == ordinal {
+                        return Ok(expr.clone());
+                    }
+                    pos += 1;
+                }
+                ResolvedSelectItem::Columns(cols) => {
+                    for col in cols {
+                        if pos == ordinal {
+                            return Ok(ResolvedExpr::Column(col.clone()));
+                        }
+                        pos += 1;
+                    }
+                }
+            }
+        }
+        // pos - 1 is the total column count after the loop
+        Err(SqlError::InvalidOperation(format!(
+            "Unknown column '{}' in 'group statement'",
+            ordinal
+        )))
+    }
+
+    /// Count the total number of output columns in a resolved SELECT list.
+    fn select_column_count(columns: &[ResolvedSelectItem]) -> usize {
+        columns
+            .iter()
+            .map(|item| match item {
+                ResolvedSelectItem::Expr { .. } => 1,
+                ResolvedSelectItem::Columns(cols) => cols.len(),
+            })
+            .sum()
+    }
+
     /// Resolve SELECT body
     fn resolve_select_body(&self, body: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
         match body {
@@ -1042,9 +1108,28 @@ impl<'a> Resolver<'a> {
                 // When a name matches both a table column AND a SELECT alias,
                 // MySQL uses the alias and emits warning 1052 (ambiguous column).
                 let mut resolved_group_by = Vec::new();
+                let select_col_count = Self::select_column_count(&resolved_columns);
                 match &select.group_by {
                     sp::GroupByExpr::Expressions(exprs, _) => {
                         for expr in exprs {
+                            // Check for ordinal (numeric literal) — GROUP BY 1
+                            if let sp::Expr::Value(val_with_span) = expr {
+                                if let sp::Value::Number(n, _) = &val_with_span.value {
+                                    if let Ok(ordinal) = n.parse::<usize>() {
+                                        if ordinal >= 1 && ordinal <= select_col_count {
+                                            resolved_group_by.push(Self::select_expr_at_ordinal(
+                                                &resolved_columns,
+                                                ordinal,
+                                            )?);
+                                            continue;
+                                        }
+                                        return Err(SqlError::InvalidOperation(format!(
+                                            "Unknown column '{}' in 'group statement'",
+                                            ordinal
+                                        )));
+                                    }
+                                }
+                            }
                             // For simple identifiers, check SELECT aliases first (MySQL behavior)
                             if let sp::Expr::Identifier(ident) = expr {
                                 let name = &ident.value;
