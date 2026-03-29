@@ -1,0 +1,14 @@
+#
+# Adapted from MySQL empty_table.test for RooDB.
+# Tests edge cases with empty tables: COUNT(*), SELECT *, LIMIT 0
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+create table t1 (nr int not null auto_increment, b varchar(255), str char(10), primary key (nr));
+select count(*) from t1;
+select * from t1;
+select * from t1 limit 0;
+drop table t1;

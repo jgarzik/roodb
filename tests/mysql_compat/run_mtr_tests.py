@@ -207,6 +207,12 @@ TIERS = {
         "bug28940878",                        # DATE comparison edge cases and BETWEEN
         "func_default",                       # DEFAULT() keyword in INSERT VALUES
     ],
+    24: [
+        "empty_table",                        # empty table edge cases (COUNT, SELECT *, LIMIT 0)
+        "count_distinct2",                    # COUNT(DISTINCT) with NULLs and multiple columns
+        "multi_update_innodb",                # multi-table UPDATE edge cases
+        "filesort_merge",                     # INSERT...SELECT, complex WHERE with OR, COUNT
+    ],
 }
 
 

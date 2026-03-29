@@ -1,0 +1,58 @@
+#
+# Adapted from MySQL filesort_merge.test for RooDB.
+# Tests INSERT...SELECT to build data, complex WHERE with OR conditions,
+# and COUNT(*) queries on larger datasets.
+# Removed: EXPLAIN, ANALYZE TABLE, FORCE INDEX, set sort_buffer_size,
+#   optimizer_switch, let/while loops, stored procedure-like variables
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+--enable_warnings
+
+CREATE TABLE t1 (
+  id int NOT NULL auto_increment PRIMARY KEY,
+  b int NOT NULL,
+  c datetime NOT NULL
+);
+
+CREATE TABLE t2 (
+  b int NOT NULL auto_increment PRIMARY KEY,
+  c datetime NOT NULL
+);
+
+INSERT INTO t2(c) VALUES ('2007-01-01');
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+INSERT INTO t2(c) SELECT c FROM t2;
+
+# Build t1 with data from t2
+INSERT INTO t1(b,c) SELECT b,c FROM t2;
+UPDATE t2 SET c='2007-01-02';
+INSERT INTO t1(b,c) SELECT b,c FROM t2;
+UPDATE t2 SET c='2007-01-03';
+INSERT INTO t1(b,c) SELECT b,c FROM t2;
+
+SELECT COUNT(*) FROM t1;
+
+# Complex WHERE with OR across different columns
+SELECT COUNT(*) FROM t1
+  WHERE (c >= '2007-01-02' AND c <= '2007-01-03') OR b >= 1;
+
+# Subset queries with date range
+SELECT COUNT(*) FROM t1 WHERE c = '2007-01-01';
+SELECT COUNT(*) FROM t1 WHERE c = '2007-01-02';
+SELECT COUNT(*) FROM t1 WHERE c = '2007-01-03';
+SELECT COUNT(*) FROM t1 WHERE c >= '2007-01-02';
+SELECT COUNT(*) FROM t1 WHERE b <= 10;
+SELECT COUNT(*) FROM t1 WHERE b <= 10 AND c >= '2007-01-02';
+
+DROP TABLE t1, t2;
