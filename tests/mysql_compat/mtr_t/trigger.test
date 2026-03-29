@@ -1,0 +1,112 @@
+#
+# Test of triggers — adapted from MySQL trigger.test for RooDB
+#
+# [RooDB-skip] Connections, LOCK TABLES, BEFORE/AFTER UPDATE/DELETE triggers,
+#   delimiter/BEGIN..END blocks, REPLACE with triggers,
+#   INSERT ON DUPLICATE KEY with triggers, triggers calling functions,
+#   cascading triggers, SHOW TRIGGERS, INFORMATION_SCHEMA.TRIGGERS,
+#   error conditions (OLD in INSERT, NEW in DELETE, etc.)
+#   SET @var / SET NEW.col trigger bodies (only DML bodies work)
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+#
+# AFTER INSERT trigger: INSERT INTO another table using NEW.col
+#
+CREATE TABLE t1 (a int);
+CREATE TABLE t2 (b int);
+CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (NEW.a * 100);
+INSERT INTO t1 VALUES (3);
+SELECT * FROM t1;
+SELECT * FROM t2;
+INSERT INTO t1 VALUES (5);
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;
+
+#
+# BEFORE INSERT trigger: INSERT INTO log table using CONCAT
+#
+CREATE TABLE t1 (a int);
+CREATE TABLE t2 (msg varchar(50));
+CREATE TRIGGER trg BEFORE INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (CONCAT('inserted: ', NEW.a));
+INSERT INTO t1 VALUES (42);
+SELECT * FROM t1;
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;
+
+#
+# AFTER INSERT trigger: UPDATE a counter in another table
+#
+CREATE TABLE t1 (a int);
+CREATE TABLE t2 (counter int);
+INSERT INTO t2 VALUES (0);
+CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW UPDATE t2 SET counter = counter + 1;
+INSERT INTO t1 VALUES (1);
+INSERT INTO t1 VALUES (2);
+INSERT INTO t1 VALUES (3);
+SELECT * FROM t1;
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;
+
+#
+# Multiple triggers on one table (BEFORE + AFTER INSERT)
+#
+CREATE TABLE t1 (a int);
+CREATE TABLE t2 (msg varchar(50));
+CREATE TABLE t3 (msg varchar(50));
+CREATE TRIGGER trg1 BEFORE INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (CONCAT('before: ', NEW.a));
+CREATE TRIGGER trg2 AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t3 VALUES (CONCAT('after: ', NEW.a));
+INSERT INTO t1 VALUES (99);
+SELECT * FROM t1;
+SELECT * FROM t2;
+SELECT * FROM t3;
+DROP TRIGGER trg1;
+DROP TRIGGER trg2;
+DROP TABLE t1, t2, t3;
+
+#
+# DROP TRIGGER IF EXISTS — should not error
+#
+DROP TRIGGER IF EXISTS no_such_trigger;
+
+#
+# Multi-row INSERT with trigger
+#
+CREATE TABLE t1 (x int);
+CREATE TABLE t2 (y int);
+CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (NEW.x * 10);
+INSERT INTO t1 VALUES (1),(2),(3);
+SELECT * FROM t1;
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;
+
+#
+# Trigger that copies a column value to another table
+#
+CREATE TABLE t1 (id int, name varchar(20));
+CREATE TABLE t2 (last_inserted_name varchar(20));
+CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (NEW.name);
+INSERT INTO t1 VALUES (1, 'alice');
+INSERT INTO t1 VALUES (2, 'bob');
+SELECT * FROM t1;
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;
+
+#
+# Trigger with expression in INSERT
+#
+CREATE TABLE t1 (a int, b int);
+CREATE TABLE t2 (sum_val int);
+CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t2 VALUES (NEW.a + NEW.b);
+INSERT INTO t1 VALUES (10, 20);
+INSERT INTO t1 VALUES (100, 200);
+SELECT * FROM t2;
+DROP TRIGGER trg;
+DROP TABLE t1, t2;

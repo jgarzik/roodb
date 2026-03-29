@@ -179,6 +179,12 @@ TIERS = {
         "group_min_max",          # GROUP BY with MIN/MAX aggregates
         "func_bitwise",           # integer bitwise operations (&, |, ^, ~, <<, >>)
     ],
+    19: [
+        "alter_table",            # ALTER TABLE (ADD/DROP/MODIFY/CHANGE COLUMN, RENAME, etc.)
+        "view",                   # CREATE/ALTER/DROP VIEW, view-on-view, joins with views
+        "trigger",                # CREATE/DROP TRIGGER, BEFORE/AFTER INSERT triggers
+        "explain",                # EXPLAIN SELECT (table scan, join, subquery, union)
+    ],
 }
 
 
