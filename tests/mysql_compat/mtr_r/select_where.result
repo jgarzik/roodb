@@ -1,0 +1,399 @@
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(30),
+val INT,
+price DECIMAL(10,2),
+flag BOOLEAN
+);
+INSERT INTO t1 VALUES (1, 'alpha', 10, 1.50, TRUE);
+INSERT INTO t1 VALUES (2, 'beta', 20, 2.50, FALSE);
+INSERT INTO t1 VALUES (3, 'gamma', 30, 3.50, TRUE);
+INSERT INTO t1 VALUES (4, 'delta', NULL, 4.50, NULL);
+INSERT INTO t1 VALUES (5, 'epsilon', 50, NULL, FALSE);
+INSERT INTO t1 VALUES (6, 'zeta', 60, 6.50, TRUE);
+INSERT INTO t1 VALUES (7, 'eta', 70, 7.50, FALSE);
+INSERT INTO t1 VALUES (8, 'theta', 80, 8.50, TRUE);
+INSERT INTO t1 VALUES (9, 'iota', 90, 9.50, NULL);
+INSERT INTO t1 VALUES (10, 'kappa', 100, 10.50, FALSE);
+# Simple equality
+SELECT * FROM t1 WHERE id = 5;
+id	name	val	price	flag
+5	epsilon	50	NULL	0
+# Not equal
+SELECT id, name FROM t1 WHERE id != 5;
+id	name
+1	alpha
+2	beta
+3	gamma
+4	delta
+6	zeta
+7	eta
+8	theta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE id <> 5;
+id	name
+1	alpha
+2	beta
+3	gamma
+4	delta
+6	zeta
+7	eta
+8	theta
+9	iota
+10	kappa
+# Greater than / less than
+SELECT id, name FROM t1 WHERE id > 7;
+id	name
+8	theta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE id < 3;
+id	name
+1	alpha
+2	beta
+SELECT id, name FROM t1 WHERE id >= 8;
+id	name
+8	theta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE id <= 2;
+id	name
+1	alpha
+2	beta
+# WHERE with NULL comparisons
+SELECT id, name, val FROM t1 WHERE val IS NULL;
+id	name	val
+4	delta	NULL
+SELECT id, name, val FROM t1 WHERE val IS NOT NULL;
+id	name	val
+1	alpha	10
+2	beta	20
+3	gamma	30
+5	epsilon	50
+6	zeta	60
+7	eta	70
+8	theta	80
+9	iota	90
+10	kappa	100
+SELECT id, name, price FROM t1 WHERE price IS NULL;
+id	name	price
+5	epsilon	NULL
+# WHERE with boolean column
+SELECT id, name FROM t1 WHERE flag IS TRUE;
+id	name
+1	alpha
+3	gamma
+6	zeta
+8	theta
+SELECT id, name FROM t1 WHERE flag IS FALSE;
+id	name
+2	beta
+5	epsilon
+7	eta
+10	kappa
+SELECT id, name FROM t1 WHERE flag IS UNKNOWN;
+id	name
+4	delta
+9	iota
+SELECT id, name FROM t1 WHERE flag IS NOT TRUE;
+id	name
+2	beta
+4	delta
+5	epsilon
+7	eta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE flag IS NOT FALSE;
+id	name
+1	alpha
+3	gamma
+4	delta
+6	zeta
+8	theta
+9	iota
+# BETWEEN
+SELECT id, name FROM t1 WHERE id BETWEEN 3 AND 7;
+id	name
+3	gamma
+4	delta
+5	epsilon
+6	zeta
+7	eta
+SELECT id, name FROM t1 WHERE id NOT BETWEEN 3 AND 7;
+id	name
+1	alpha
+2	beta
+8	theta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE val BETWEEN 20 AND 60;
+id	name
+2	beta
+3	gamma
+5	epsilon
+6	zeta
+# IN
+SELECT id, name FROM t1 WHERE id IN (1, 3, 5, 7, 9);
+id	name
+1	alpha
+3	gamma
+5	epsilon
+7	eta
+9	iota
+SELECT id, name FROM t1 WHERE id NOT IN (1, 3, 5, 7, 9);
+id	name
+2	beta
+4	delta
+6	zeta
+8	theta
+10	kappa
+SELECT id, name FROM t1 WHERE name IN ('alpha', 'gamma', 'zeta');
+id	name
+1	alpha
+3	gamma
+6	zeta
+# LIKE
+SELECT id, name FROM t1 WHERE name LIKE 'a%';
+id	name
+1	alpha
+SELECT id, name FROM t1 WHERE name LIKE '%ta';
+id	name
+2	beta
+4	delta
+6	zeta
+7	eta
+8	theta
+9	iota
+SELECT id, name FROM t1 WHERE name LIKE '%psi%';
+id	name
+5	epsilon
+SELECT id, name FROM t1 WHERE name NOT LIKE '%a%';
+id	name
+5	epsilon
+# Compound AND
+SELECT id, name FROM t1 WHERE id > 3 AND id < 8;
+id	name
+4	delta
+5	epsilon
+6	zeta
+7	eta
+SELECT id, name FROM t1 WHERE val > 30 AND flag IS TRUE;
+id	name
+6	zeta
+8	theta
+# Compound OR
+SELECT id, name FROM t1 WHERE id = 1 OR id = 10;
+id	name
+1	alpha
+10	kappa
+SELECT id, name FROM t1 WHERE name = 'alpha' OR name = 'kappa';
+id	name
+1	alpha
+10	kappa
+# Mixed AND/OR with parentheses
+SELECT id, name FROM t1 WHERE (id < 3 OR id > 8) AND flag IS TRUE;
+id	name
+1	alpha
+SELECT id, name FROM t1 WHERE id < 3 OR (id > 8 AND flag IS TRUE);
+id	name
+1	alpha
+2	beta
+# NOT
+SELECT id, name FROM t1 WHERE NOT (id > 5);
+id	name
+1	alpha
+2	beta
+3	gamma
+4	delta
+5	epsilon
+SELECT id, name FROM t1 WHERE NOT (id BETWEEN 3 AND 7);
+id	name
+1	alpha
+2	beta
+8	theta
+9	iota
+10	kappa
+SELECT id, name FROM t1 WHERE NOT (name LIKE '%a%');
+id	name
+5	epsilon
+# WHERE with expressions
+SELECT id, name, val FROM t1 WHERE val + 10 > 50;
+id	name	val
+5	epsilon	50
+6	zeta	60
+7	eta	70
+8	theta	80
+9	iota	90
+10	kappa	100
+SELECT id, name, val FROM t1 WHERE val * 2 < 100;
+id	name	val
+1	alpha	10
+2	beta	20
+3	gamma	30
+SELECT id, name, val, price FROM t1 WHERE val > 0 AND price > 5.00;
+id	name	val	price
+6	zeta	60	6.50
+7	eta	70	7.50
+8	theta	80	8.50
+9	iota	90	9.50
+10	kappa	100	10.50
+# WHERE with NULL arithmetic (NULL propagation)
+SELECT id, name, val FROM t1 WHERE val + 1 > 10;
+id	name	val
+1	alpha	10
+2	beta	20
+3	gamma	30
+5	epsilon	50
+6	zeta	60
+7	eta	70
+8	theta	80
+9	iota	90
+10	kappa	100
+SELECT id, name, val FROM t1 WHERE val = NULL;
+id	name	val
+SELECT id, name, val FROM t1 WHERE val <=> NULL;
+id	name	val
+4	delta	NULL
+SELECT id, name, val FROM t1 WHERE NULL <=> NULL;
+id	name	val
+1	alpha	10
+2	beta	20
+3	gamma	30
+4	delta	NULL
+5	epsilon	50
+6	zeta	60
+7	eta	70
+8	theta	80
+9	iota	90
+10	kappa	100
+CREATE TABLE t2 (
+id INT NOT NULL PRIMARY KEY,
+t1_id INT,
+label VARCHAR(20)
+);
+INSERT INTO t2 VALUES (1, 1, 'x');
+INSERT INTO t2 VALUES (2, 1, 'y');
+INSERT INTO t2 VALUES (3, 3, 'z');
+INSERT INTO t2 VALUES (4, 5, 'w');
+INSERT INTO t2 VALUES (5, NULL, 'v');
+# WHERE on joined tables
+SELECT t1.id, t1.name, t2.label
+FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id
+WHERE t1.val > 10
+ORDER BY t1.id, t2.id;
+id	name	label
+3	gamma	z
+5	epsilon	w
+# WHERE with multiple conditions on join
+SELECT t1.id, t1.name, t2.label
+FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id
+WHERE t1.flag IS TRUE AND t2.label >= 'x'
+ORDER BY t1.id;
+id	name	label
+1	alpha	x
+1	alpha	y
+3	gamma	z
+# WHERE filtering NULL join keys
+SELECT t1.name, t2.label
+FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id
+WHERE t2.label IS NULL
+ORDER BY t1.id;
+name	label
+beta	NULL
+delta	NULL
+zeta	NULL
+eta	NULL
+theta	NULL
+iota	NULL
+kappa	NULL
+# WHERE before GROUP BY
+SELECT flag, COUNT(*) AS cnt FROM t1 WHERE val IS NOT NULL GROUP BY flag ORDER BY flag;
+flag	cnt
+NULL	1
+0	4
+1	4
+# WHERE with ORDER BY and LIMIT
+SELECT id, name FROM t1 WHERE val > 20 ORDER BY name LIMIT 3;
+id	name
+5	epsilon
+7	eta
+3	gamma
+SELECT id, name FROM t1 WHERE val > 20 ORDER BY val DESC LIMIT 3;
+id	name
+10	kappa
+9	iota
+8	theta
+# WHERE 1=1 (always true)
+SELECT COUNT(*) FROM t1 WHERE 1=1;
+COUNT(NULL)
+10
+# WHERE 1=0 (always false)
+SELECT COUNT(*) FROM t1 WHERE 1=0;
+COUNT(NULL)
+0
+# WHERE with string comparison
+SELECT id, name FROM t1 WHERE name > 'eta' ORDER BY name;
+id	name
+3	gamma
+9	iota
+10	kappa
+8	theta
+6	zeta
+SELECT id, name FROM t1 WHERE name < 'delta' ORDER BY name;
+id	name
+1	alpha
+2	beta
+# Nested NOT
+SELECT id, name FROM t1 WHERE NOT NOT (id = 5);
+id	name
+5	epsilon
+SELECT id, name FROM t1 WHERE NOT NOT NOT (id = 5);
+id	name
+1	alpha
+2	beta
+3	gamma
+4	delta
+6	zeta
+7	eta
+8	theta
+9	iota
+10	kappa
+# Multiple IN values
+SELECT id FROM t1 WHERE id IN (1);
+id
+1
+SELECT id FROM t1 WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+SELECT id FROM t1 WHERE id NOT IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+id
+# BETWEEN with strings
+SELECT id, name FROM t1 WHERE name BETWEEN 'alpha' AND 'delta' ORDER BY name;
+id	name
+1	alpha
+2	beta
+4	delta
+# Complex nested conditions
+SELECT id, name FROM t1
+WHERE (id > 2 AND id < 9)
+AND (name LIKE '%a%' OR val > 50)
+AND flag IS NOT NULL
+ORDER BY id;
+id	name
+3	gamma
+6	zeta
+7	eta
+8	theta
+DROP TABLE t2;
+DROP TABLE t1;

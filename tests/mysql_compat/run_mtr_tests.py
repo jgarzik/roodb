@@ -149,6 +149,12 @@ TIERS = {
         "func_time",              # time functions (DATE_ADD, EXTRACT, etc.)
         "func_set",               # SET operations (INTERVAL, FIND_IN_SET, etc.)
     ],
+    14: [
+        "expressions",            # complex expressions (CASE, COALESCE, IF, NULLIF, etc.)
+        "parser_precedence",      # operator precedence (boolean, bitwise, arithmetic)
+        "select_where",           # WHERE clause patterns (comparisons, IN, BETWEEN, LIKE)
+        "group_by",               # GROUP BY with aggregates, HAVING, ORDER BY
+    ],
 }
 
 
