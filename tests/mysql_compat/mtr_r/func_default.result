@@ -1,0 +1,30 @@
+drop table if exists t1,t2;
+create table t1(str varchar(10) default 'def',strnull varchar(10),intg int default '10',rel double default '3.14');
+insert into t1 values ('','',0,0.0);
+select * from t1;
+str	strnull	intg	rel
+		0	0
+insert into t1 values (DEFAULT, DEFAULT, DEFAULT, DEFAULT);
+select * from t1 order by intg;
+str	strnull	intg	rel
+		0	0
+def	NULL	10	3.14
+drop table t1;
+CREATE TABLE t1 (a INT DEFAULT 5, b VARCHAR(10) DEFAULT 'world', c INT);
+INSERT INTO t1 VALUES (DEFAULT, DEFAULT, 42);
+SELECT * FROM t1;
+a	b	c
+5	world	42
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL DEFAULT 99);
+INSERT INTO t1 VALUES (DEFAULT);
+SELECT * FROM t1;
+a
+99
+DROP TABLE t1;
+CREATE TABLE t1 (a INT DEFAULT 5, b VARCHAR(10));
+INSERT INTO t1 (b) VALUES ('hello');
+SELECT * FROM t1;
+a	b
+5	hello
+DROP TABLE t1;

@@ -150,15 +150,16 @@ impl Parser {
         let re_bang = Regex::new(r"!([^=])").unwrap();
         let result = re_bang.replace_all(&result, "NOT $1");
 
-        // MySQL `DEFAULT` keyword in VALUES context → NULL (auto-fill with default value)
+        // MySQL `DEFAULT` keyword in VALUES context → special marker for resolver
+        // to substitute with the column's actual default value.
         let re_default = Regex::new(r"(?i)\bVALUES\b[^;]*").unwrap();
         let result = {
             let s = result.to_string();
             re_default
                 .replace_all(&s, |caps: &regex::Captures| {
-                    caps[0]
-                        .replace("DEFAULT", "NULL")
-                        .replace("default", "NULL")
+                    // Replace whole-word DEFAULT (case-insensitive) with marker
+                    let re_kw = Regex::new(r"(?i)\bDEFAULT\b").unwrap();
+                    re_kw.replace_all(&caps[0], "__ROODB_DEFAULT__").to_string()
                 })
                 .to_string()
         };

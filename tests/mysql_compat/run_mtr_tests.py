@@ -201,6 +201,12 @@ TIERS = {
         "implicit_char_to_num_conversion",    # string comparison with numeric columns in WHERE
         "subquery_exists",                    # INSERT/UPDATE/DELETE with subqueries and JOINs
     ],
+    23: [
+        "key_primary",                        # primary key lookups with CHAR type
+        "temporal_literal",                   # DATE, TIME, TIMESTAMP literal syntax
+        "bug28940878",                        # DATE comparison edge cases and BETWEEN
+        "func_default",                       # DEFAULT() keyword in INSERT VALUES
+    ],
 }
 
 

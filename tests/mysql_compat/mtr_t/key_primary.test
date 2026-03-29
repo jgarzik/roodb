@@ -1,0 +1,20 @@
+# Adapted from MySQL key_primary.test for RooDB compatibility testing.
+# Tests primary key conversions and lookups with CHAR type.
+#
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+create table t1 (t1 char(3) primary key);
+insert into t1 values("ABC");
+insert into t1 values("ABA");
+insert into t1 values("AB%");
+select * from t1 where t1="ABC";
+select * from t1 where t1="ABCD";
+select * from t1 where t1 like "a_\%";
+# [RooDB-skip] DESCRIBE is alias for EXPLAIN, not guaranteed identical
+select * from t1 order by t1;
+drop table t1;
+
+# End of 4.1 tests

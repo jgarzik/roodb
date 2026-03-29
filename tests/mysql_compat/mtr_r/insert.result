@@ -14,8 +14,8 @@ SELECT * FROM t1;
 a	c	i
 1	test	10
 2	foo	20
-3	NULL	30
-4	NULL	NULL
+3	hello	30
+4	hello	NULL
 DROP TABLE t1;
 CREATE TABLE t1 (a int NOT NULL, b int DEFAULT 0, c varchar(20) DEFAULT 'none');
 INSERT INTO t1 SET a=1, b=10, c='first';
