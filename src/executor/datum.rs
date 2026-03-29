@@ -428,6 +428,9 @@ impl PartialEq for Datum {
             // Cross-type: Bit/Int — BIT is unsigned, compare as u64
             (Datum::Bit { value, .. }, Datum::Int(i))
             | (Datum::Int(i), Datum::Bit { value, .. }) => *value == *i as u64,
+            // Cross-type: Bit/UnsignedInt
+            (Datum::Bit { value, .. }, Datum::UnsignedInt(u))
+            | (Datum::UnsignedInt(u), Datum::Bit { value, .. }) => *value == *u,
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
                 (*a as f64).to_bits() == b.to_bits()
@@ -527,7 +530,9 @@ impl Ord for Datum {
             // Cross-type: Bit/Int — BIT is unsigned, compare as u64
             (Datum::Bit { value, .. }, Datum::Int(i)) => value.cmp(&(*i as u64)),
             (Datum::Int(i), Datum::Bit { value, .. }) => (*i as u64).cmp(value),
-
+            // Cross-type: Bit/UnsignedInt
+            (Datum::Bit { value, .. }, Datum::UnsignedInt(u)) => value.cmp(u),
+            (Datum::UnsignedInt(u), Datum::Bit { value, .. }) => u.cmp(value),
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) => (*a as f64).total_cmp(b),
             (Datum::Float(a), Datum::Int(b)) => a.total_cmp(&(*b as f64)),

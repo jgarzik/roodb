@@ -173,6 +173,12 @@ TIERS = {
         "join_outer",             # LEFT/RIGHT JOIN tests (IS NULL, multi-table, aggregates)
         "variables",              # SET/SELECT user variable tests (@var basics)
     ],
+    18: [
+        "type_bit",               # BIT column type (storage, queries, JOINs, GROUP BY)
+        "null_key",               # NULL key behavior (joins, <=> operator, IS NULL)
+        "group_min_max",          # GROUP BY with MIN/MAX aggregates
+        "func_bitwise",           # integer bitwise operations (&, |, ^, ~, <<, >>)
+    ],
 }
 
 

@@ -1,0 +1,181 @@
+#
+# Adapted from MySQL func_bitwise_ops.test for RooDB.
+# Tests integer bitwise operations: &, |, ^, ~, <<, >>, BIT_COUNT.
+#
+# [RooDB-skip] Varbinary/binary bitwise operations (not supported)
+# [RooDB-skip] INET6_ATON (not supported)
+# [RooDB-skip] JSON type (not supported)
+# [RooDB-skip] PREPARE/EXECUTE (not fully supported)
+# [RooDB-skip] Hex literal bitwise with _binary prefix
+# [RooDB-skip] CREATE TABLE ... SELECT
+# [RooDB-skip] SHOW CREATE TABLE
+# [RooDB-skip] --error ER_INVALID_BITWISE_OPERANDS_SIZE
+# [RooDB-skip] --disable_result_log / --enable_result_log
+# [RooDB-skip] Complex type coercion tests with many MySQL types
+
+#
+# Basic integer bitwise AND
+#
+
+SELECT 0 & 0;
+SELECT 0 & 1;
+SELECT 1 & 0;
+SELECT 1 & 1;
+SELECT 255 & 15;
+SELECT 0xFF & 0x0F;
+SELECT 12345 & 67890;
+
+#
+# Basic integer bitwise OR
+#
+
+SELECT 0 | 0;
+SELECT 0 | 1;
+SELECT 1 | 0;
+SELECT 1 | 1;
+SELECT 240 | 15;
+SELECT 0xF0 | 0x0F;
+SELECT 12345 | 67890;
+
+#
+# Basic integer bitwise XOR
+#
+
+SELECT 0 ^ 0;
+SELECT 0 ^ 1;
+SELECT 1 ^ 0;
+SELECT 1 ^ 1;
+SELECT 255 ^ 15;
+SELECT 0xFF ^ 0x0F;
+SELECT 12345 ^ 67890;
+
+#
+# Bitwise NOT (~)
+#
+
+SELECT ~0;
+SELECT ~1;
+SELECT ~255;
+SELECT ~0xFF;
+SELECT ~0xFFFFFFFF;
+
+#
+# Bitwise left shift (<<)
+#
+
+SELECT 1 << 0;
+SELECT 1 << 1;
+SELECT 1 << 8;
+SELECT 1 << 16;
+SELECT 1 << 31;
+SELECT 1 << 63;
+SELECT 255 << 4;
+
+#
+# Bitwise right shift (>>)
+#
+
+SELECT 256 >> 0;
+SELECT 256 >> 1;
+SELECT 256 >> 8;
+SELECT 65535 >> 4;
+SELECT 0xFFFFFFFF >> 16;
+
+#
+# BIT_COUNT function
+#
+
+SELECT BIT_COUNT(0);
+SELECT BIT_COUNT(1);
+SELECT BIT_COUNT(255);
+SELECT BIT_COUNT(0xFF);
+SELECT BIT_COUNT(0xFFFF);
+SELECT BIT_COUNT(0xFFFFFFFF);
+
+#
+# Bitwise operations with table columns
+#
+
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (0xFF, 0x0F), (0xF0, 0x0F), (123, 456), (0, 0), (0xFFFF, 0xFF00);
+
+SELECT a, b, a & b, a | b, a ^ b FROM t1;
+SELECT a, ~a FROM t1;
+SELECT a, a << 4, a >> 4 FROM t1;
+SELECT a, BIT_COUNT(a) FROM t1;
+
+DROP TABLE t1;
+
+#
+# Bitwise operations with BIGINT
+#
+
+SELECT 0xFFFFFFFFFFFFFFFF & 0x00000000FFFFFFFF;
+SELECT 0xFFFFFFFFFFFFFFFF | 0x0000000000000000;
+SELECT 0xFFFFFFFFFFFFFFFF ^ 0xFFFFFFFFFFFFFFFF;
+SELECT 0xFFFFFFFF00000000 >> 32;
+SELECT 0x00000000FFFFFFFF << 32;
+SELECT BIT_COUNT(0xFFFFFFFFFFFFFFFF);
+
+#
+# Bitwise operations with negative numbers
+#
+
+SELECT -1 & 0xFF;
+SELECT -1 | 0;
+SELECT -1 ^ -1;
+SELECT BIT_COUNT(-1);
+
+#
+# Combining bitwise operations
+#
+
+SELECT (0xFF & 0x0F) | 0xF0;
+SELECT (0xFF ^ 0x0F) & 0xF0;
+SELECT ~(0xFF & 0x0F);
+SELECT (1 << 8) - 1;
+SELECT (1 << 16) | (1 << 8) | 1;
+
+#
+# Bitwise operations in WHERE clause
+#
+
+CREATE TABLE t1 (id INT, flags INT);
+INSERT INTO t1 VALUES (1, 0x01), (2, 0x02), (3, 0x03), (4, 0x04), (5, 0x07), (6, 0x00);
+
+SELECT id, flags FROM t1 WHERE flags & 0x01;
+SELECT id, flags FROM t1 WHERE flags & 0x02;
+SELECT id, flags FROM t1 WHERE flags & 0x04;
+SELECT id, flags FROM t1 WHERE (flags & 0x03) = 0x03;
+SELECT id, flags FROM t1 WHERE flags | 0x01 = 0x01;
+
+DROP TABLE t1;
+
+#
+# Bitwise operations with BIT column type
+#
+
+CREATE TABLE t1 (a BIT(8), b BIT(8));
+INSERT INTO t1 VALUES (0xFF, 0x0F), (0xF0, 0x0F), (0xAA, 0x55);
+
+SELECT HEX(a), HEX(b), a+0 & b+0, a+0 | b+0, a+0 ^ b+0 FROM t1;
+SELECT HEX(a), BIT_COUNT(a+0) FROM t1;
+
+DROP TABLE t1;
+
+#
+# Bitwise operations with NULL
+#
+
+SELECT NULL & 1;
+SELECT NULL | 1;
+SELECT NULL ^ 1;
+SELECT ~NULL;
+SELECT NULL << 1;
+SELECT NULL >> 1;
+SELECT BIT_COUNT(NULL);
+SELECT 1 & NULL;
+SELECT 1 | NULL;
+SELECT 1 ^ NULL;
+
+--echo # End of func_bitwise tests

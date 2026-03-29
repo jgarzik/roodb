@@ -418,6 +418,25 @@ fn eval_binary_op_ex(
         }
     }
 
+    // Coerce Bool to Int when comparing with Bit (MySQL: TRUE=1, FALSE=0)
+    let coerced = match (left, right) {
+        (Datum::Bit { .. }, Datum::Bool(b)) => {
+            Some((None, Some(Datum::Int(if *b { 1 } else { 0 }))))
+        }
+        (Datum::Bool(b), Datum::Bit { .. }) => {
+            Some((Some(Datum::Int(if *b { 1 } else { 0 })), None))
+        }
+        _ => None,
+    };
+    let left = coerced
+        .as_ref()
+        .and_then(|(l, _)| l.as_ref())
+        .unwrap_or(left);
+    let right = coerced
+        .as_ref()
+        .and_then(|(_, r)| r.as_ref())
+        .unwrap_or(right);
+
     match op {
         // Arithmetic
         BinaryOp::Add => eval_add(left, right),
@@ -1570,6 +1589,10 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
             match val {
                 Datum::Int(i) => Ok(Datum::Bit {
                     value: (*i as u64) & mask,
+                    width: *w,
+                }),
+                Datum::UnsignedInt(u) => Ok(Datum::Bit {
+                    value: u & mask,
                     width: *w,
                 }),
                 Datum::Bit { value, .. } => Ok(Datum::Bit {
