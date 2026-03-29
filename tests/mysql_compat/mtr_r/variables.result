@@ -1,0 +1,137 @@
+DROP TABLE IF EXISTS t1, t2;
+SET @test = 1;
+SELECT @test;
+@test
+1
+SET @TEST = 2;
+SELECT @test;
+@test
+2
+SET @Test = 3;
+SELECT @test;
+@test
+3
+SET @a = 10, @b = 20, @c = 30;
+SELECT @a, @b, @c;
+@a	@b	@c
+10	NULL	NULL
+SELECT @a + @b + @c;
+@a + @b + @c
+NULL
+SET @int_var = 42;
+SET @float_var = 3.14;
+SET @str_var = 'hello world';
+SET @null_var = NULL;
+SELECT @int_var, @float_var, @str_var, @null_var;
+@int_var	@float_var	@str_var	@null_var
+42	3.14	hello world	NULL
+SET @s1 = 'abcdeghi';
+SET @s2 = 'abcdefghij';
+SELECT @s1, @s2;
+@s1	@s2
+abcdeghi	abcdefghij
+SET @s1 = 'hello';
+SET @s2 = 'hello';
+SELECT @s1, @s2;
+@s1	@s2
+hello	hello
+SET @s1 = 'hellohello';
+SET @s2 = 'hellohello';
+SELECT @s1, @s2;
+@s1	@s2
+hellohello	hellohello
+SET @v1 = NULL, @v2 = NULL, @v3 = NULL;
+SELECT @v1, @v2, @v3;
+@v1	@v2	@v3
+NULL	NULL	NULL
+SELECT @not_used_variable;
+@not_used_variable
+NULL
+SET @x = 5, @y = 10;
+SELECT @x + @y;
+@x + @y
+NULL
+SELECT @x * @y;
+@x * @y
+NULL
+SELECT @x - @y;
+@x - @y
+NULL
+CREATE TABLE t1 (c_id INT NOT NULL, c_name CHAR(20), c_country CHAR(3), PRIMARY KEY(c_id));
+INSERT INTO t1 VALUES (1,'Bozo','USA'),(2,'Ronald','USA'),(3,'Kinko','IRE'),(4,'Mr. Floppy','GB');
+SELECT * FROM t1 ORDER BY c_id;
+c_id	c_name	c_country
+1	Bozo	USA
+2	Ronald	USA
+3	Kinko	IRE
+4	Mr. Floppy	GB
+SELECT * FROM t1 WHERE c_id = 1 OR c_id = 4 ORDER BY c_id;
+c_id	c_name	c_country
+1	Bozo	USA
+4	Mr. Floppy	GB
+SELECT * FROM t1 WHERE c_id = 1 OR c_id = 4 OR c_id = 666 ORDER BY c_id;
+c_id	c_name	c_country
+1	Bozo	USA
+4	Mr. Floppy	GB
+DROP TABLE t1;
+SET @sum = 0;
+SELECT @sum;
+@sum
+0
+SET @sum = 1 + 2 + 3;
+SELECT @sum;
+@sum
+6
+SET @sum = 100 * 2;
+SELECT @sum;
+@sum
+200
+SET @a = NULL;
+SET @b = 42;
+SELECT COALESCE(@a, @b);
+COALESCE(@a,@b)
+42
+SELECT COALESCE(@a, NULL, @b);
+COALESCE(@a,NULL,@b)
+42
+SET @flag = 1;
+SELECT IF(@flag, 'yes', 'no');
+IF(@flag,'yes','no')
+yes
+SET @flag = 0;
+SELECT IF(@flag, 'yes', 'no');
+IF(@flag,'yes','no')
+no
+SET @flag = NULL;
+SELECT IF(@flag, 'yes', 'no');
+IF(@flag,'yes','no')
+no
+SET @val = 2;
+SELECT CASE @val WHEN 1 THEN 'one' WHEN 2 THEN 'two' WHEN 3 THEN 'three' ELSE 'other' END;
+CASE
+two
+SET @val = 99;
+SELECT CASE @val WHEN 1 THEN 'one' WHEN 2 THEN 'two' WHEN 3 THEN 'three' ELSE 'other' END;
+CASE
+other
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+SET @search = 2;
+SELECT * FROM t1 WHERE id = @search;
+id	val
+2	beta
+SET @search = 'beta';
+SELECT * FROM t1 WHERE val = @search;
+id	val
+2	beta
+DROP TABLE t1;
+CREATE TABLE t1 (id INT, name VARCHAR(20));
+SET @n = 'test_name';
+INSERT INTO t1 VALUES (1, @n);
+SET @n = 'another';
+INSERT INTO t1 VALUES (2, @n);
+SELECT * FROM t1 ORDER BY id;
+id	name
+1	test_name
+2	another
+DROP TABLE t1;

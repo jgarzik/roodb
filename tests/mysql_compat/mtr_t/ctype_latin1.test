@@ -1,0 +1,123 @@
+#
+# Character type tests adapted from MySQL ctype_latin1.test
+# Tests basic string operations, HEX, CHAR_LENGTH, CONCAT with character data
+#
+# [RooDB-skip] SET NAMES, character set conversions, collation directives
+# [RooDB-skip] --source includes, --character_set, user variables in expressions
+# [RooDB-skip] REGEXP with COLLATE, CONVERT, EXPORT_SET, --error
+# [RooDB-skip] WEIGHT_STRING, identifier charset tests, --echo
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+#
+# Basic character tests with a simple table
+#
+CREATE TABLE t1 (a CHAR(20));
+INSERT INTO t1 VALUES ('hello'), ('world'), ('foo'), ('bar');
+SELECT * FROM t1 ORDER BY a;
+SELECT CHAR_LENGTH(a) FROM t1 ORDER BY a;
+SELECT UPPER(a) FROM t1 ORDER BY a;
+SELECT LOWER(a) FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+#
+# HEX and UNHEX functions
+#
+SELECT HEX('A');
+SELECT HEX('AB');
+SELECT HEX('ABC');
+SELECT HEX(65);
+SELECT HEX(255);
+SELECT HEX(256);
+
+#
+# String functions with character data
+#
+SELECT CONCAT('hello', ' ', 'world');
+SELECT CONCAT('A', 'B', 'C', 'D');
+SELECT LENGTH('hello');
+SELECT LENGTH('');
+SELECT LENGTH(NULL);
+
+#
+# Character comparisons (case-insensitive by default)
+#
+SELECT 'a' = 'A';
+SELECT 'a' < 'b';
+SELECT 'z' > 'a';
+SELECT 'abc' = 'ABC';
+SELECT 'abc' < 'abd';
+
+#
+# LIKE with character data
+#
+SELECT 'hello' LIKE 'hello';
+SELECT 'hello' LIKE 'HELLO';
+SELECT 'hello' LIKE 'h%';
+SELECT 'hello' LIKE '%lo';
+SELECT 'hello' LIKE '%ell%';
+SELECT 'hello' LIKE 'h_llo';
+SELECT 'hello' LIKE '____o';
+
+#
+# LEFT, RIGHT, SUBSTRING
+#
+SELECT LEFT('hello', 3);
+SELECT RIGHT('hello', 3);
+SELECT SUBSTRING('hello', 2, 3);
+SELECT SUBSTRING('hello', 2);
+
+#
+# TRIM functions
+#
+SELECT TRIM('  hello  ');
+SELECT LTRIM('  hello  ');
+SELECT RTRIM('  hello  ');
+
+#
+# REPLACE and REPEAT
+#
+SELECT REPLACE('hello world', 'world', 'there');
+SELECT REPLACE('aaa', 'a', 'bb');
+SELECT REPEAT('ab', 3);
+SELECT REPEAT('x', 5);
+
+#
+# REVERSE and LPAD/RPAD
+#
+SELECT REVERSE('hello');
+SELECT REVERSE('abcdef');
+SELECT LPAD('hi', 5, '0');
+SELECT RPAD('hi', 5, '0');
+SELECT LPAD('hello', 3, '0');
+SELECT RPAD('hello', 3, '0');
+
+#
+# Character data in WHERE clauses
+#
+CREATE TABLE t1 (id INT, name CHAR(20));
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'Dave');
+SELECT * FROM t1 WHERE name = 'Alice';
+SELECT * FROM t1 WHERE name LIKE 'B%';
+SELECT * FROM t1 WHERE name > 'C' ORDER BY name;
+SELECT * FROM t1 WHERE name IN ('Alice', 'Charlie') ORDER BY id;
+SELECT * FROM t1 WHERE CHAR_LENGTH(name) > 4 ORDER BY name;
+DROP TABLE t1;
+
+#
+# CONCAT_WS
+#
+SELECT CONCAT_WS(',', 'a', 'b', 'c');
+SELECT CONCAT_WS('-', 'hello', 'world');
+SELECT CONCAT_WS(',', 'a', NULL, 'b');
+SELECT CONCAT_WS(NULL, 'a', 'b');
+
+#
+# LOCATE / INSTR
+#
+SELECT LOCATE('lo', 'hello');
+SELECT LOCATE('lo', 'hello world', 5);
+SELECT INSTR('hello', 'ell');

@@ -167,6 +167,12 @@ TIERS = {
         "temp_table",             # basic SQL operations (from temp_table.test)
         "lowercase_table2",       # case-insensitive table/column names (extended)
     ],
+    17: [
+        "ctype_latin1",           # character type tests with latin1 (string funcs, HEX, LIKE)
+        "type_newdecimal",        # DECIMAL precision/scale tests (IN, CASE, ROUND, MOD)
+        "join_outer",             # LEFT/RIGHT JOIN tests (IS NULL, multi-table, aggregates)
+        "variables",              # SET/SELECT user variable tests (@var basics)
+    ],
 }
 
 

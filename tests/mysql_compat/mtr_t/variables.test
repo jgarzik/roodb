@@ -1,0 +1,149 @@
+#
+# SET/SELECT variable tests adapted from MySQL variables.test (~first 200 lines)
+#
+# [RooDB-skip] --source includes, @@global.* system variables, SHOW VARIABLES
+# [RooDB-skip] SET GLOBAL, performance_schema, --replace_result, ALTER TABLE
+# [RooDB-skip] SET character set, SET collation, --echo, --disable_warnings blocks
+# [RooDB-skip] @@identity, @@version, last_insert_id, EXPLAIN, big_tables
+# [RooDB-skip] concurrent_insert, storage_engine, myisam, net_buffer_length
+# [RooDB-skip] --error, alloc system variables, @@rand_seed, @@timestamp
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# User variable basics - case insensitivity
+#
+SET @test = 1;
+SELECT @test;
+
+SET @TEST = 2;
+SELECT @test;
+
+SET @Test = 3;
+SELECT @test;
+
+#
+# Multiple user variables
+#
+SET @a = 10, @b = 20, @c = 30;
+SELECT @a, @b, @c;
+SELECT @a + @b + @c;
+
+#
+# Different data types in user variables
+#
+SET @int_var = 42;
+SET @float_var = 3.14;
+SET @str_var = 'hello world';
+SET @null_var = NULL;
+SELECT @int_var, @float_var, @str_var, @null_var;
+
+#
+# User variables with string values
+#
+SET @s1 = 'abcdeghi';
+SET @s2 = 'abcdefghij';
+SELECT @s1, @s2;
+
+SET @s1 = 'hello';
+SET @s2 = 'hello';
+SELECT @s1, @s2;
+
+SET @s1 = 'hellohello';
+SET @s2 = 'hellohello';
+SELECT @s1, @s2;
+
+#
+# NULL user variables
+#
+SET @v1 = NULL, @v2 = NULL, @v3 = NULL;
+SELECT @v1, @v2, @v3;
+
+#
+# Unset user variable returns NULL
+#
+SELECT @not_used_variable;
+
+#
+# User variables in expressions
+#
+SET @x = 5, @y = 10;
+SELECT @x + @y;
+SELECT @x * @y;
+SELECT @x - @y;
+
+#
+# User variables with table data
+#
+CREATE TABLE t1 (c_id INT NOT NULL, c_name CHAR(20), c_country CHAR(3), PRIMARY KEY(c_id));
+INSERT INTO t1 VALUES (1,'Bozo','USA'),(2,'Ronald','USA'),(3,'Kinko','IRE'),(4,'Mr. Floppy','GB');
+
+SELECT * FROM t1 ORDER BY c_id;
+SELECT * FROM t1 WHERE c_id = 1 OR c_id = 4 ORDER BY c_id;
+SELECT * FROM t1 WHERE c_id = 1 OR c_id = 4 OR c_id = 666 ORDER BY c_id;
+
+DROP TABLE t1;
+
+#
+# User variables with arithmetic results
+#
+SET @sum = 0;
+SELECT @sum;
+SET @sum = 1 + 2 + 3;
+SELECT @sum;
+SET @sum = 100 * 2;
+SELECT @sum;
+
+#
+# COALESCE with user variables
+#
+SET @a = NULL;
+SET @b = 42;
+SELECT COALESCE(@a, @b);
+SELECT COALESCE(@a, NULL, @b);
+
+#
+# IF with user variables
+#
+SET @flag = 1;
+SELECT IF(@flag, 'yes', 'no');
+SET @flag = 0;
+SELECT IF(@flag, 'yes', 'no');
+SET @flag = NULL;
+SELECT IF(@flag, 'yes', 'no');
+
+#
+# CASE with user variables
+#
+SET @val = 2;
+SELECT CASE @val WHEN 1 THEN 'one' WHEN 2 THEN 'two' WHEN 3 THEN 'three' ELSE 'other' END;
+SET @val = 99;
+SELECT CASE @val WHEN 1 THEN 'one' WHEN 2 THEN 'two' WHEN 3 THEN 'three' ELSE 'other' END;
+
+#
+# User variables in WHERE clause
+#
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+SET @search = 2;
+SELECT * FROM t1 WHERE id = @search;
+
+SET @search = 'beta';
+SELECT * FROM t1 WHERE val = @search;
+
+DROP TABLE t1;
+
+#
+# User variables in INSERT
+#
+CREATE TABLE t1 (id INT, name VARCHAR(20));
+SET @n = 'test_name';
+INSERT INTO t1 VALUES (1, @n);
+SET @n = 'another';
+INSERT INTO t1 VALUES (2, @n);
+SELECT * FROM t1 ORDER BY id;
+DROP TABLE t1;
