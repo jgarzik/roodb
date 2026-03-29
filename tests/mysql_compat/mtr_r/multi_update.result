@@ -1,0 +1,399 @@
+CREATE TABLE t1 (
+id int NOT NULL default 0,
+name varchar(10) default NULL,
+PRIMARY KEY (id)
+);
+INSERT INTO t1 VALUES (1,'aaa'),(2,'aaa'),(3,'aaa');
+CREATE TABLE t2 (
+id int NOT NULL default 0,
+name varchar(10) default NULL,
+PRIMARY KEY (id)
+);
+INSERT INTO t2 VALUES (2,'bbb'),(3,'bbb'),(4,'bbb');
+SELECT t1.id, t1.name, t2.name FROM t1 INNER JOIN t2 ON t1.id=t2.id ORDER BY t1.id;
+id	name	name
+2	aaa	bbb
+3	aaa	bbb
+UPDATE t1 SET name='updated' WHERE id = 2;
+UPDATE t1 SET name='updated' WHERE id = 3;
+SELECT * FROM t1 ORDER BY id;
+id	name
+1	aaa
+2	updated
+3	updated
+SELECT * FROM t2 ORDER BY id;
+id	name
+2	bbb
+3	bbb
+4	bbb
+DROP TABLE t1,t2;
+CREATE TABLE t1 (
+id int NOT NULL,
+tst text,
+tst1 text,
+PRIMARY KEY (id)
+);
+CREATE TABLE t2 (
+ID int NOT NULL,
+ParId int default NULL,
+tst text,
+tst1 text,
+PRIMARY KEY (ID)
+);
+INSERT INTO t1 VALUES(1, 'MySQL','MySQL AB'), (2, 'MSSQL','Microsoft'), (3, 'ORACLE','ORACLE');
+INSERT INTO t2 VALUES(1, 1, NULL, NULL), (2, 2, NULL, NULL), (3, 3, NULL, NULL);
+SELECT * FROM t2 ORDER BY ID;
+ID	ParId	tst	tst1
+1	1	NULL	NULL
+2	2	NULL	NULL
+3	3	NULL	NULL
+UPDATE t2 SET tst = 'MySQL', tst1 = 'MySQL AB' WHERE ParId = 1;
+UPDATE t2 SET tst = 'MSSQL', tst1 = 'Microsoft' WHERE ParId = 2;
+UPDATE t2 SET tst = 'ORACLE', tst1 = 'ORACLE' WHERE ParId = 3;
+SELECT * FROM t2 ORDER BY ID;
+ID	ParId	tst	tst1
+1	1	MySQL	MySQL AB
+2	2	MSSQL	Microsoft
+3	3	ORACLE	ORACLE
+SELECT t2.ID, t2.ParId, t2.tst, t2.tst1, t1.tst AS t1_tst, t1.tst1 AS t1_tst1
+FROM t2 INNER JOIN t1 ON t2.ParId = t1.id ORDER BY t2.ID;
+ID	ParId	tst	tst1	t1_tst	t1_tst1
+1	1	MySQL	MySQL AB	MySQL	MySQL AB
+2	2	MSSQL	Microsoft	MSSQL	Microsoft
+3	3	ORACLE	ORACLE	ORACLE	ORACLE
+DROP TABLE t2, t1;
+CREATE TABLE t1 (n numeric(10));
+CREATE TABLE t2 (n numeric(10));
+INSERT INTO t2 VALUES (1),(2),(4),(8),(16),(32);
+SELECT * FROM t2 LEFT OUTER JOIN t1 USING (n) ORDER BY t2.n;
+n	n
+1	NULL
+2	NULL
+4	NULL
+8	NULL
+16	NULL
+32	NULL
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int NOT NULL, b int NOT NULL);
+CREATE TABLE t2 (a int NOT NULL, b int NOT NULL);
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9);
+INSERT INTO t2 VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9);
+UPDATE t1 SET a=a+100;
+SELECT * FROM t1 ORDER BY a;
+a	b
+101	1
+102	2
+103	3
+104	4
+105	5
+106	6
+107	7
+108	8
+109	9
+UPDATE t1 SET a=a+100 WHERE a=101;
+SELECT * FROM t1 ORDER BY a;
+a	b
+102	2
+103	3
+104	4
+105	5
+106	6
+107	7
+108	8
+109	9
+201	1
+UPDATE t1 SET b=b+10 WHERE b=2;
+SELECT * FROM t1 ORDER BY a;
+a	b
+102	12
+103	3
+104	4
+105	5
+106	6
+107	7
+108	8
+109	9
+201	1
+DROP TABLE t1,t2;
+CREATE TABLE t1 (
+broj int NOT NULL default 0,
+naziv char(25) NOT NULL default 'NEPOZNAT',
+PRIMARY KEY (broj)
+);
+INSERT INTO t1 VALUES (1,'jedan'),(2,'dva'),(3,'tri'),(4,'xxxxxxxxxx'),(5,'a'),(10,''),(11,''),(12,''),(13,'');
+CREATE TABLE t2 (
+broj int NOT NULL default 0,
+naziv char(25) NOT NULL default 'NEPOZNAT',
+PRIMARY KEY (broj)
+);
+INSERT INTO t2 VALUES (1,'jedan'),(2,'dva'),(3,'tri'),(4,'xxxxxxxxxx'),(5,'a');
+CREATE TABLE t3 (
+broj int NOT NULL default 0,
+naziv char(25) NOT NULL default 'NEPOZNAT',
+PRIMARY KEY (broj)
+);
+INSERT INTO t3 VALUES (1,'jedan'),(2,'dva');
+UPDATE t1 SET naziv='aaaa' WHERE broj >= 1 AND broj <= 5;
+SELECT * FROM t1 ORDER BY broj;
+broj	naziv
+1	aaaa
+2	aaaa
+3	aaaa
+4	aaaa
+5	aaaa
+10	
+11	
+12	
+13	
+UPDATE t1 SET naziv='bbbb' WHERE broj >= 1 AND broj <= 2;
+UPDATE t2 SET naziv='aaaa' WHERE broj >= 1 AND broj <= 2;
+SELECT * FROM t1 ORDER BY broj;
+broj	naziv
+1	bbbb
+2	bbbb
+3	aaaa
+4	aaaa
+5	aaaa
+10	
+11	
+12	
+13	
+SELECT * FROM t2 ORDER BY broj;
+broj	naziv
+1	aaaa
+2	aaaa
+3	tri
+4	xxxxxxxxxx
+5	a
+DROP TABLE t1,t2,t3;
+CREATE TABLE t1 (p_id int NOT NULL, p_code varchar(20) NOT NULL default '', p_active tinyint NOT NULL default 1, PRIMARY KEY (p_id));
+CREATE TABLE t2 (c2_id int NOT NULL, c2_p_id int NOT NULL default 0, c2_note text NOT NULL, c2_active tinyint NOT NULL default 1, PRIMARY KEY (c2_id));
+INSERT INTO t1 VALUES (1,'A01-Comp',1);
+INSERT INTO t1 VALUES (2,'B01-Comp',1);
+INSERT INTO t2 VALUES (1,1,'A Note',1);
+UPDATE t2 SET c2_note = 'asdf-1' WHERE c2_p_id = 2;
+SELECT * FROM t1 ORDER BY p_id;
+p_id	p_code	p_active
+1	A01-Comp	1
+2	B01-Comp	1
+SELECT * FROM t2 ORDER BY c2_id;
+c2_id	c2_p_id	c2_note	c2_active
+1	1	A Note	1
+DROP TABLE t1, t2;
+CREATE TABLE t1 (id1 smallint, field char(5));
+CREATE TABLE t2 (id2 smallint, field char(5));
+INSERT INTO t1 VALUES (1, 'a'), (2, 'aa');
+INSERT INTO t2 VALUES (1, 'b'), (2, 'bb');
+SELECT * FROM t1 ORDER BY id1;
+id1	field
+1	a
+2	aa
+SELECT * FROM t2 ORDER BY id2;
+id2	field
+1	b
+2	bb
+UPDATE t2 SET field='x' WHERE 0=1;
+UPDATE t1 SET field='x' WHERE 0=1;
+SELECT * FROM t1 ORDER BY id1;
+id1	field
+1	a
+2	aa
+SELECT * FROM t2 ORDER BY id2;
+id2	field
+1	b
+2	bb
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int NOT NULL PRIMARY KEY, b int NOT NULL);
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3),(4,4);
+UPDATE t1 SET b=b+1;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	2
+2	3
+3	4
+4	5
+DROP TABLE t1;
+CREATE TABLE t1 (n int, d int);
+CREATE TABLE t2 (n int, d int);
+INSERT INTO t1 VALUES(1,1),(1,2);
+INSERT INTO t2 VALUES(1,10),(2,20);
+UPDATE t1 SET d=10 WHERE n=1;
+UPDATE t2 SET d=30 WHERE n=1;
+SELECT * FROM t1 ORDER BY d;
+n	d
+1	10
+1	10
+SELECT * FROM t2 ORDER BY n;
+n	d
+1	30
+2	20
+DROP TABLE t1,t2;
+CREATE TABLE t1 (n int NOT NULL PRIMARY KEY, d int);
+CREATE TABLE t2 (n int NOT NULL PRIMARY KEY, d int);
+INSERT INTO t1 VALUES(1,1), (3,3);
+INSERT INTO t2 VALUES(1,10),(2,20);
+UPDATE t1 SET d=10 WHERE n=1;
+SELECT * FROM t1 ORDER BY n;
+n	d
+1	10
+3	3
+SELECT * FROM t2 ORDER BY n;
+n	d
+1	10
+2	20
+SELECT t1.n, t1.d AS t1_d, t2.d AS t2_d FROM t1 LEFT JOIN t2 ON t1.n=t2.n ORDER BY t1.n;
+n	t1_d	t2_d
+1	10	10
+3	3	NULL
+DROP TABLE t1,t2;
+CREATE TABLE t1 (i1 int, i2 int, i3 int);
+CREATE TABLE t2 (id int, c1 varchar(20), c2 varchar(20));
+INSERT INTO t1 VALUES (1,5,10),(3,7,12),(4,5,2),(9,10,15),(2,2,2);
+INSERT INTO t2 VALUES (9,'abc','def'),(5,'opq','lmn'),(2,'test t','t test');
+SELECT * FROM t1 ORDER BY i1;
+i1	i2	i3
+1	5	10
+2	2	2
+3	7	12
+4	5	2
+9	10	15
+SELECT * FROM t2 ORDER BY id;
+id	c1	c2
+2	test t	t test
+5	opq	lmn
+9	abc	def
+UPDATE t1 SET i2=15 WHERE i1 = 2;
+UPDATE t1 SET i2=15 WHERE i1 = 9;
+UPDATE t2 SET c2='ppc' WHERE id = 2;
+UPDATE t2 SET c2='ppc' WHERE id = 9;
+SELECT * FROM t1 ORDER BY i1;
+i1	i2	i3
+1	5	10
+2	15	2
+3	7	12
+4	5	2
+9	15	15
+SELECT * FROM t2 ORDER BY id;
+id	c1	c2
+2	test t	ppc
+5	opq	lmn
+9	abc	ppc
+DROP TABLE t1, t2;
+CREATE TABLE t1 (i1 int NOT NULL, i2 int, i3 int, PRIMARY KEY (i1));
+CREATE TABLE t2 (id int NOT NULL, c1 varchar(20), c2 varchar(20), PRIMARY KEY(id));
+INSERT INTO t1 VALUES (1,5,10),(3,7,12),(4,5,2),(9,10,15),(2,2,2);
+INSERT INTO t2 VALUES (9,'abc','def'),(5,'opq','lmn'),(2,'test t','t test');
+SELECT * FROM t1 ORDER BY i1;
+i1	i2	i3
+1	5	10
+2	2	2
+3	7	12
+4	5	2
+9	10	15
+SELECT * FROM t2 ORDER BY id;
+id	c1	c2
+2	test t	t test
+5	opq	lmn
+9	abc	def
+UPDATE t1 SET i2=15 WHERE i1 = 2;
+UPDATE t1 SET i2=15 WHERE i1 = 9;
+UPDATE t2 SET c2='ppc' WHERE id = 2;
+UPDATE t2 SET c2='ppc' WHERE id = 9;
+SELECT * FROM t1 ORDER BY i1;
+i1	i2	i3
+1	5	10
+2	15	2
+3	7	12
+4	5	2
+9	15	15
+SELECT * FROM t2 ORDER BY id;
+id	c1	c2
+2	test t	ppc
+5	opq	lmn
+9	abc	ppc
+DROP TABLE t1, t2;
+CREATE TABLE t1 (c1 int, c2 int);
+CREATE TABLE t2 (c1 int, c2 int);
+CREATE TABLE t3 (c1 int, c2 int);
+INSERT INTO t1 VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+INSERT INTO t2 VALUES(11,1),(12,1),(13,1),(14,2),(15,6);
+INSERT INTO t3 VALUES(21,11),(22,11),(23,13),(24,14),(25,15);
+SELECT t1.c1, t1.c2, t2.c1 AS t2c1, t2.c2 AS t2c2, t3.c1 AS t3c1, t3.c2 AS t3c2
+FROM t1
+INNER JOIN t2 ON t1.c1 = t2.c2
+INNER JOIN t3 ON t2.c1 = t3.c2
+ORDER BY t1.c1, t2.c1, t3.c1;
+c1	c2	t2c1	t2c2	t3c1	t3c2
+1	1	11	1	21	11
+1	1	11	1	22	11
+1	1	13	1	23	13
+2	2	14	2	24	14
+UPDATE t1 SET c2 = 30 WHERE c1 = 1;
+UPDATE t1 SET c2 = 30 WHERE c1 = 2;
+UPDATE t2 SET c2 = 40 WHERE c1 = 11;
+UPDATE t2 SET c2 = 40 WHERE c1 = 13;
+UPDATE t2 SET c2 = 40 WHERE c1 = 14;
+UPDATE t3 SET c2 = 50 WHERE c1 = 21;
+UPDATE t3 SET c2 = 50 WHERE c1 = 22;
+UPDATE t3 SET c2 = 50 WHERE c1 = 23;
+UPDATE t3 SET c2 = 50 WHERE c1 = 24;
+SELECT * FROM t1 ORDER BY c1;
+c1	c2
+1	30
+2	30
+3	3
+4	4
+5	5
+SELECT * FROM t2 ORDER BY c1;
+c1	c2
+11	40
+12	1
+13	40
+14	40
+15	6
+SELECT * FROM t3 ORDER BY c1;
+c1	c2
+21	50
+22	50
+23	50
+24	50
+25	15
+DROP TABLE t1, t2, t3;
+CREATE TABLE t1 (a int NOT NULL PRIMARY KEY, b int NOT NULL);
+CREATE TABLE t2 (a int NOT NULL PRIMARY KEY, b int NOT NULL);
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+INSERT INTO t2 VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+UPDATE t1 SET b=100;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	100
+2	100
+3	100
+4	100
+5	100
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int, b int);
+CREATE TABLE t2 (a int, b int);
+INSERT INTO t1 VALUES (1,1),(2,1),(3,1);
+INSERT INTO t2 VALUES (1,1), (3,1);
+SELECT t1.a, t1.b, t2.a, t2.b FROM t1 LEFT JOIN t2 ON t1.a=t2.a ORDER BY t1.a;
+a	b	a	b
+1	1	1	1
+2	1	NULL	NULL
+3	1	3	1
+SELECT t1.a, t1.b, t2.a, t2.b FROM t1 INNER JOIN t2 ON t1.a=t2.a ORDER BY t1.a;
+a	b	a	b
+1	1	1	1
+3	1	3	1
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int);
+CREATE TABLE t2 (b int);
+INSERT INTO t1 VALUES (1),(2);
+INSERT INTO t2 VALUES (10),(20);
+SELECT t1.a, t2.b FROM t1, t2 ORDER BY t1.a, t2.b;
+a	b
+1	10
+1	20
+2	10
+2	20
+DROP TABLE t1, t2;

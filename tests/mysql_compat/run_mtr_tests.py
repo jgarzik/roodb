@@ -143,6 +143,12 @@ TIERS = {
         "type_date",              # DATE type operations
         "type_time",              # TIME type operations
     ],
+    13: [
+        "multi_update",           # UPDATE with multiple tables / JOINs
+        "type_datetime",          # DATETIME type operations
+        "func_time",              # time functions (DATE_ADD, EXTRACT, etc.)
+        "func_set",               # SET operations (INTERVAL, FIND_IN_SET, etc.)
+    ],
 }
 
 
