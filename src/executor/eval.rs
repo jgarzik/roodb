@@ -5205,7 +5205,9 @@ fn eval_if_function(
 /// Returns the resulting date/datetime string, or None for NULL.
 fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option<String> {
     let parts = parse_to_parts(date_str)?;
-    let has_time = date_str.contains(' ') || date_str.contains(':');
+    // A datetime has both date and time parts (contains space between them).
+    // A bare time string (e.g., "14:30:45") should not be treated as datetime.
+    let has_time = date_str.contains(' ') || (date_str.contains(':') && date_str.contains('-'));
 
     // Parse interval: "N UNIT" e.g. "1 DAY", "3 MONTH", "-2 YEAR"
     let interval_str = interval_str.trim();
@@ -5217,59 +5219,61 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
     match unit_upper.as_str() {
         "SECOND" | "SECONDS" => {
             let total_secs = parts.to_total_seconds() + amount;
-            let result = total_seconds_to_datetime(total_secs);
+            let mut result = total_seconds_to_datetime(total_secs);
+            result.microsecond = parts.microsecond; // preserve microseconds
             Some(format_datetime_parts(&result, true))
         }
         "MINUTE" | "MINUTES" => {
             let total_secs = parts.to_total_seconds() + amount * 60;
-            let result = total_seconds_to_datetime(total_secs);
+            let mut result = total_seconds_to_datetime(total_secs);
+            result.microsecond = parts.microsecond;
             Some(format_datetime_parts(&result, true))
         }
         "HOUR" | "HOURS" => {
             let total_secs = parts.to_total_seconds() + amount * 3600;
-            let result = total_seconds_to_datetime(total_secs);
+            let mut result = total_seconds_to_datetime(total_secs);
+            result.microsecond = parts.microsecond;
             Some(format_datetime_parts(&result, true))
         }
         "DAY" | "DAYS" => {
             let epoch_days = ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount;
             let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
-            if has_time {
-                Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    y, m, d, parts.hour, parts.minute, parts.second
-                ))
-            } else {
-                Some(format!("{:04}-{:02}-{:02}", y, m, d))
-            }
+            let result = DateTimeParts {
+                year: y,
+                month: m,
+                day: d,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(format_datetime_parts(&result, has_time))
         }
         "WEEK" | "WEEKS" => {
             let epoch_days =
                 ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount * 7;
             let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
-            if has_time {
-                Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    y, m, d, parts.hour, parts.minute, parts.second
-                ))
-            } else {
-                Some(format!("{:04}-{:02}-{:02}", y, m, d))
-            }
+            let result = DateTimeParts {
+                year: y,
+                month: m,
+                day: d,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(format_datetime_parts(&result, has_time))
         }
         "MONTH" | "MONTHS" => {
             let total_months = parts.year * 12 + parts.month as i64 - 1 + amount;
             let new_year = total_months.div_euclid(12);
             let new_month = (total_months.rem_euclid(12) + 1) as u32;
-            // Clamp day to max days in new month
             let max_day = days_in_month(new_year, new_month);
             let new_day = parts.day.min(max_day);
-            if has_time {
-                Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    new_year, new_month, new_day, parts.hour, parts.minute, parts.second
-                ))
-            } else {
-                Some(format!("{:04}-{:02}-{:02}", new_year, new_month, new_day))
-            }
+            let result = DateTimeParts {
+                year: new_year,
+                month: new_month,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(format_datetime_parts(&result, has_time))
         }
         "QUARTER" => {
             let total_months = parts.year * 12 + parts.month as i64 - 1 + amount * 3;
@@ -5277,28 +5281,26 @@ fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option
             let new_month = (total_months.rem_euclid(12) + 1) as u32;
             let max_day = days_in_month(new_year, new_month);
             let new_day = parts.day.min(max_day);
-            if has_time {
-                Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    new_year, new_month, new_day, parts.hour, parts.minute, parts.second
-                ))
-            } else {
-                Some(format!("{:04}-{:02}-{:02}", new_year, new_month, new_day))
-            }
+            let result = DateTimeParts {
+                year: new_year,
+                month: new_month,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(format_datetime_parts(&result, has_time))
         }
         "YEAR" | "YEARS" => {
             let new_year = parts.year + amount;
-            // Clamp day for Feb leap year edge case
             let max_day = days_in_month(new_year, parts.month);
             let new_day = parts.day.min(max_day);
-            if has_time {
-                Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    new_year, parts.month, new_day, parts.hour, parts.minute, parts.second
-                ))
-            } else {
-                Some(format!("{:04}-{:02}-{:02}", new_year, parts.month, new_day))
-            }
+            let result = DateTimeParts {
+                year: new_year,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(format_datetime_parts(&result, has_time))
         }
         "MICROSECOND" | "MICROSECONDS" => {
             // For microsecond precision, add microseconds

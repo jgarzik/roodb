@@ -455,6 +455,17 @@ impl LogicalPlanBuilder {
                         .as_ref()
                         .is_some_and(|e| Self::expr_has_aggregate(e))
             }
+            ResolvedExpr::InList { expr, list, .. } => {
+                Self::expr_has_aggregate(expr) || list.iter().any(Self::expr_has_aggregate)
+            }
+            ResolvedExpr::Between {
+                expr, low, high, ..
+            } => {
+                Self::expr_has_aggregate(expr)
+                    || Self::expr_has_aggregate(low)
+                    || Self::expr_has_aggregate(high)
+            }
+            ResolvedExpr::BooleanTest { expr, .. } => Self::expr_has_aggregate(expr),
             _ => false,
         }
     }
@@ -549,6 +560,22 @@ impl LogicalPlanBuilder {
                 if let Some(el) = else_result {
                     Self::collect_aggregates(el, idx, None, out);
                 }
+            }
+            ResolvedExpr::InList { expr, list, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
+                for item in list {
+                    Self::collect_aggregates(item, idx, None, out);
+                }
+            }
+            ResolvedExpr::Between {
+                expr, low, high, ..
+            } => {
+                Self::collect_aggregates(expr, idx, None, out);
+                Self::collect_aggregates(low, idx, None, out);
+                Self::collect_aggregates(high, idx, None, out);
+            }
+            ResolvedExpr::BooleanTest { expr, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
             }
             _ => {}
         }
@@ -824,6 +851,33 @@ impl LogicalPlanBuilder {
                     .map(|e| Box::new(Self::rewrite_agg_refs(e, group_by, all_aggs))),
                 result_type: result_type.clone(),
             },
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                list: list
+                    .iter()
+                    .map(|e| Self::rewrite_agg_refs(e, group_by, all_aggs))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                low: Box::new(Self::rewrite_agg_refs(low, group_by, all_aggs)),
+                high: Box::new(Self::rewrite_agg_refs(high, group_by, all_aggs)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                test: *test,
+            },
             // For other expression types (Column, Literal, etc.), pass through
             other => other.clone(),
         }
@@ -993,6 +1047,49 @@ impl LogicalPlanBuilder {
                     negated: nb,
                 },
             ) => na == nb && Self::exprs_equal(ea, eb),
+            (
+                ResolvedExpr::InList {
+                    expr: ea,
+                    list: la,
+                    negated: na,
+                },
+                ResolvedExpr::InList {
+                    expr: eb,
+                    list: lb,
+                    negated: nb,
+                },
+            ) => {
+                na == nb
+                    && Self::exprs_equal(ea, eb)
+                    && la.len() == lb.len()
+                    && la
+                        .iter()
+                        .zip(lb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+            }
+            (
+                ResolvedExpr::Between {
+                    expr: ea,
+                    low: la,
+                    high: ha,
+                    negated: na,
+                },
+                ResolvedExpr::Between {
+                    expr: eb,
+                    low: lb,
+                    high: hb,
+                    negated: nb,
+                },
+            ) => {
+                na == nb
+                    && Self::exprs_equal(ea, eb)
+                    && Self::exprs_equal(la, lb)
+                    && Self::exprs_equal(ha, hb)
+            }
+            (
+                ResolvedExpr::BooleanTest { expr: ea, test: ta },
+                ResolvedExpr::BooleanTest { expr: eb, test: tb },
+            ) => ta == tb && Self::exprs_equal(ea, eb),
             _ => false,
         }
     }
@@ -1124,6 +1221,33 @@ impl LogicalPlanBuilder {
                     .as_ref()
                     .map(|e| Box::new(Self::transform_having_expr(e, group_by, all_aggs))),
                 result_type: result_type.clone(),
+            },
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                list: list
+                    .iter()
+                    .map(|e| Self::transform_having_expr(e, group_by, all_aggs))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                low: Box::new(Self::transform_having_expr(low, group_by, all_aggs)),
+                high: Box::new(Self::transform_having_expr(high, group_by, all_aggs)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                test: *test,
             },
             other => other.clone(),
         }

@@ -113,7 +113,14 @@ impl Update {
         })?;
 
         if new_key != old_key {
-            // PK changed: delete old key, insert at new key
+            // PK changed: check for duplicate at the new key
+            if ctx.has_buffered_key(&new_key) {
+                return Err(super::error::ExecutorError::DuplicateKey(format!(
+                    "Duplicate entry for key 'PRIMARY' in table '{}'",
+                    self.table
+                )));
+            }
+            // Delete old key, insert at new key
             ctx.add_change(RowChange::delete_with_version(
                 &self.table,
                 old_key.clone(),
