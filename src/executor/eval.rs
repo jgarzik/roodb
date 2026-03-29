@@ -229,9 +229,11 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
                 return Ok(Datum::Null);
             }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = evaluate(item, row, vars)?;
                 if item_val.is_null() {
+                    has_null = true;
                     continue;
                 }
                 if val == item_val {
@@ -239,7 +241,11 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
                     break;
                 }
             }
-            Ok(Datum::Bool(if *negated { !found } else { found }))
+            if !found && has_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(if *negated { !found } else { found }))
+            }
         }
 
         ResolvedExpr::Between {

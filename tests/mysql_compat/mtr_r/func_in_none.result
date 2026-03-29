@@ -16,7 +16,7 @@ SELECT 3 IN (1,NULL,3);
 1
 SELECT 10 IN (1,NULL,3);
 10 IN (1, NULL, 3)
-0
+NULL
 SELECT 1.5 IN (1.5,2.5,3.5);
 1.5 IN (1.5, 2.5, 3.5)
 1
@@ -34,7 +34,7 @@ SELECT 3.5 IN (1.5,NULL,3.5);
 1
 SELECT 10.5 IN (1.5,NULL,3.5);
 10.5 IN (1.5, NULL, 3.5)
-0
+NULL
 CREATE TABLE t1 (a int, b int, c int);
 INSERT INTO t1 VALUES (1,2,3), (1,NULL,3);
 SELECT 1 IN (a,b,c) FROM t1;
@@ -48,7 +48,7 @@ SELECT 3 IN (a,b,c) FROM t1;
 SELECT 10 IN (a,b,c) FROM t1;
 10 IN (a, b, c)
 0
-0
+NULL
 SELECT NULL IN (a,b,c) FROM t1;
 NULL IN (a, b, c)
 NULL
@@ -67,7 +67,7 @@ SELECT 3.5 IN (a,b,c) FROM t1;
 SELECT 10.5 IN (a,b,c) FROM t1;
 10.5 IN (a, b, c)
 0
-0
+NULL
 DROP TABLE t1;
 CREATE TABLE t1 (a varchar(10), b varchar(10), c varchar(10));
 INSERT INTO t1 VALUES ('A','BC','EFD'), ('A',NULL,'EFD');
@@ -82,7 +82,7 @@ SELECT 'EFD' IN (a,b,c) FROM t1;
 SELECT 'XSFGGHF' IN (a,b,c) FROM t1;
 'XSFGGHF' IN (a, b, c)
 0
-0
+NULL
 DROP TABLE t1;
 CREATE TABLE t1 (field char(1));
 INSERT INTO t1 VALUES ('A'),(NULL);
@@ -90,7 +90,6 @@ SELECT * FROM t1 WHERE field IN (NULL);
 field
 SELECT * FROM t1 WHERE field NOT IN (NULL);
 field
-A
 SELECT * FROM t1 WHERE field = field;
 field
 A
@@ -101,6 +100,7 @@ NULL
 DELETE FROM t1 WHERE field NOT IN (NULL);
 SELECT * FROM t1;
 field
+A
 NULL
 DROP TABLE t1;
 CREATE TABLE t1 (id int primary key);

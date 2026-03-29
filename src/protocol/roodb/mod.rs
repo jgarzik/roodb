@@ -3840,10 +3840,11 @@ where
             .map(Some)
     }
 
-    /// Handle SET @var = expr (user variable assignment)
+    /// Handle SET @var = expr (user variable assignment).
+    /// Supports multiple assignments: SET @a = 1, @b = 2, @c = 3
     async fn handle_set_user_variable(&mut self, sql: &str) -> ProtocolResult<()> {
         let trimmed = sql.trim();
-        // Parse: after "SET @", extract var name and value
+        // Strip the SET keyword
         let rest = match trimmed
             .strip_prefix("SET ")
             .or_else(|| trimmed.strip_prefix("set "))
@@ -3851,47 +3852,107 @@ where
             Some(r) => r.trim(),
             None => return self.send_ok(0, 0).await,
         };
-        let rest = match rest.strip_prefix('@') {
-            Some(r) => r,
-            None => return self.send_ok(0, 0).await,
-        };
-        // Find = or :=
-        let (var_name, val_str) = if let Some(pos) = rest.find(":=") {
-            (&rest[..pos], rest[pos + 2..].trim())
-        } else if let Some(pos) = rest.find('=') {
-            (&rest[..pos], rest[pos + 1..].trim())
-        } else {
-            return self.send_ok(0, 0).await;
-        };
-        let var_name = var_name.trim().to_lowercase();
 
-        // Try to evaluate the value expression by wrapping in SELECT
-        let scope_expr = format!("SELECT {} AS v", val_str);
+        // Split into individual assignments at top-level commas
+        // (respecting parentheses and string literals)
+        let assignments = Self::split_set_assignments(rest);
 
-        // Resolve inside a block so the catalog guard is dropped before await
-        let datum = (|| -> Option<Datum> {
-            let val_stmt = Parser::parse_one(&scope_expr).ok()?;
-            let catalog = self.catalog.read();
-            let resolver = Resolver::new(&catalog);
-            let resolved = resolver.resolve(val_stmt).ok()?;
+        for assignment in &assignments {
+            let assignment = assignment.trim();
+            // Each assignment should be @var = expr or @var := expr
+            let assignment = match assignment.strip_prefix('@') {
+                Some(r) => r,
+                None => continue,
+            };
+            // Find = or :=
+            let (var_name, val_str) = if let Some(pos) = assignment.find(":=") {
+                (&assignment[..pos], assignment[pos + 2..].trim())
+            } else if let Some(pos) = assignment.find('=') {
+                (&assignment[..pos], assignment[pos + 1..].trim())
+            } else {
+                continue;
+            };
+            let var_name = var_name.trim().to_lowercase();
 
-            if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
-                if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
-                    expr: resolved_expr,
-                    ..
-                }) = sel.columns.first()
-                {
-                    let empty_row = crate::executor::row::Row::empty();
-                    let vars = self.session.user_variables();
-                    return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars).ok();
+            // Try to evaluate the value expression by wrapping in SELECT
+            let scope_expr = format!("SELECT {} AS v", val_str);
+
+            // Resolve inside a block so the catalog guard is dropped before await
+            let datum = (|| -> Option<Datum> {
+                let val_stmt = Parser::parse_one(&scope_expr).ok()?;
+                let catalog = self.catalog.read();
+                let resolver = Resolver::new(&catalog);
+                let resolved = resolver.resolve(val_stmt).ok()?;
+
+                if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
+                    if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
+                        expr: resolved_expr,
+                        ..
+                    }) = sel.columns.first()
+                    {
+                        let empty_row = crate::executor::row::Row::empty();
+                        let vars = self.session.user_variables();
+                        return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars)
+                            .ok();
+                    }
+                }
+                None
+            })();
+
+            let value = datum.unwrap_or(Datum::String(val_str.to_string()));
+            self.session.set_user_variable(&var_name, value);
+        }
+        self.send_ok(0, 0).await
+    }
+
+    /// Split a SET assignment list at top-level commas, respecting
+    /// parentheses and string literals.
+    fn split_set_assignments(s: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0u32;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut start = 0;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_single_quote {
+                if b == b'\'' {
+                    // Check for escaped quote ''
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+            } else if in_double_quote {
+                if b == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+            } else {
+                match b {
+                    b'\'' => in_single_quote = true,
+                    b'"' => in_double_quote = true,
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        parts.push(&s[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
                 }
             }
-            None
-        })();
-
-        let value = datum.unwrap_or(Datum::String(val_str.to_string()));
-        self.session.set_user_variable(&var_name, value);
-        self.send_ok(0, 0).await
+            i += 1;
+        }
+        if start < s.len() {
+            parts.push(&s[start..]);
+        }
+        parts
     }
 
     /// Extract the value from SET sql_mode / SET @@sql_mode / SET SESSION sql_mode.

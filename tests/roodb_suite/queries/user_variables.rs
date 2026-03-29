@@ -84,3 +84,26 @@ async fn test_user_variable_in_expression() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_set_multiple_user_variables() {
+    let server = TestServer::start("uvar_multi").await;
+    let mut conn = server.connect().await;
+
+    // SET multiple variables in a single statement
+    conn.query_drop("SET @a = 10, @b = 20, @c = 30")
+        .await
+        .expect("SET multi failed");
+
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = conn
+        .query("SELECT @a, @b, @c")
+        .await
+        .expect("SELECT multi vars failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, Some("10".to_string()), "@a should be 10");
+    assert_eq!(rows[0].1, Some("20".to_string()), "@b should be 20");
+    assert_eq!(rows[0].2, Some("30".to_string()), "@c should be 30");
+
+    drop(conn);
+    server.shutdown().await;
+}

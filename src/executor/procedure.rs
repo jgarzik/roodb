@@ -252,14 +252,23 @@ pub fn eval_sp_expr(
                 return Ok(Datum::Null);
             }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = eval_sp_expr(item, ctx, user_vars)?;
+                if item_val.is_null() {
+                    has_null = true;
+                    continue;
+                }
                 if let Ok(Datum::Bool(true)) = eval_binary_op(&BinaryOp::Eq, &val, &item_val) {
                     found = true;
                     break;
                 }
             }
-            Ok(Datum::Bool(if *negated { !found } else { found }))
+            if !found && has_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(if *negated { !found } else { found }))
+            }
         }
 
         // CASE expression

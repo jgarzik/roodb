@@ -14,10 +14,10 @@ SELECT @test;
 SET @a = 10, @b = 20, @c = 30;
 SELECT @a, @b, @c;
 @a	@b	@c
-10	NULL	NULL
+10	20	30
 SELECT @a + @b + @c;
 @a + @b + @c
-NULL
+60
 SET @int_var = 42;
 SET @float_var = 3.14;
 SET @str_var = 'hello world';
@@ -50,13 +50,13 @@ NULL
 SET @x = 5, @y = 10;
 SELECT @x + @y;
 @x + @y
-NULL
+15
 SELECT @x * @y;
 @x * @y
-NULL
+50
 SELECT @x - @y;
 @x - @y
-NULL
+-5
 CREATE TABLE t1 (c_id INT NOT NULL, c_name CHAR(20), c_country CHAR(3), PRIMARY KEY(c_id));
 INSERT INTO t1 VALUES (1,'Bozo','USA'),(2,'Ronald','USA'),(3,'Kinko','IRE'),(4,'Mr. Floppy','GB');
 SELECT * FROM t1 ORDER BY c_id;

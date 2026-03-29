@@ -134,7 +134,7 @@ field('str1', null, 'STR1') as c05,
 'string' in ('STRING', null) as c08,
 'string' in (null, 'STRING') as c09;
 c01	c02	c03	c04	c05	c08	c09
-NULL	NULL	0	0	0	0	0
+NULL	NULL	0	0	0	NULL	NULL
 # End of 4.1 tests
 #
 # Bug #31471: decimal_bin_size: Assertion `scale >= 0 &&

@@ -7,7 +7,7 @@ SELECT 1.1 IN (1.0, 1.2, 1.1, 1.4, 0.5);
 1
 SELECT 1.1 IN (1.0, 1.2, NULL, 1.4, 0.5);
 1.1 IN (1, 1.2, NULL, 1.4, 0.5)
-0
+NULL
 SELECT 0.5 IN (1.0, 1.2, NULL, 1.4, 0.5);
 0.5 IN (1, 1.2, NULL, 1.4, 0.5)
 1
@@ -16,7 +16,7 @@ SELECT 1 IN (1.11, 1.2, 1.1, 1.4, 1, 0.5);
 1
 SELECT 1 IN (1.11, 1.2, 1.1, 1.4, NULL, 0.5);
 1 IN (1.11, 1.2, 1.1, 1.4, NULL, 0.5)
-0
+NULL
 SELECT CASE 1.0 WHEN 0.1 THEN 'a' WHEN 1.0 THEN 'b' ELSE 'c' END;
 CASE
 b
@@ -42,7 +42,7 @@ NULL
 SELECT 0.1 IN (1.0, 1.2, 1.1, a, 1.4, 0.5) FROM t1;
 0.1 IN (1, 1.2, 1.1, a, 1.4, 0.5)
 0
-0
+NULL
 1
 DROP TABLE t1;
 CREATE TABLE wl1612 (col1 INT, col2 DECIMAL(38,10), col3 NUMERIC(38,10));
