@@ -55,10 +55,13 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 18 | type_bit, null_key, group_min_max, func_bitwise | BIT type, NULL key behavior, GROUP BY MIN/MAX, bitwise operations |
 | 19 | alter_table, view, trigger, explain | ALTER TABLE, CREATE/DROP VIEW, triggers, EXPLAIN output |
 | 20 | lpad, rpad | LPAD/RPAD string padding edge cases |
+| 21 | func_date_add, type_nchar, truth_value_transform, ctype_ascii | DATE_ADD intervals, NCHAR types, IS TRUE/FALSE, ASCII ordering |
+| 22 | round, sum_distinct, implicit_char_to_num_conversion, subquery_exists | String-to-int rounding, DISTINCT aggregates, type coercion, JOINs |
+| 23 | key_primary, temporal_literal, bug28940878, func_default | PK lookups, temporal literals, DATE comparisons, DEFAULT keyword |
 
 ## Current Status
 
-**100 MySQL compat tests across 20 tiers — all pass**
+**112 MySQL compat tests across 23 tiers — all pass**
 **210+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -195,6 +198,10 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | IN with NULL semantics | IN list returns NULL when value not found and NULL in list |
 | BIT type improvements | UnsignedInt cast to BIT, BIT/Bool comparison |
 | LPAD/RPAD edge cases | Negative length returns NULL, NULL padstr returns NULL |
+| VIEW ORDER BY LIMIT | Views and derived tables preserve ORDER BY + LIMIT from definition |
+| Bool arithmetic coercion | TRUE/FALSE convert to 1/0 in arithmetic contexts |
+| UPDATE type coercion | UPDATE calls coerce_to_column_type, matching INSERT behavior |
+| INSERT DEFAULT keyword | DEFAULT in VALUES clause uses column's actual default value |
 | MySQL RAND(seed) | Deterministic LCG matching MySQL's algorithm; thread-local state |
 | B'...' bit string literals | `B'10101'` parsed as unsigned integer from binary |
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
