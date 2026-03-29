@@ -120,7 +120,17 @@ INSERT INTO t1 VALUES ('sales', 'dave', 70000);
 INSERT INTO t1 VALUES ('sales', 'eve', 75000);
 INSERT INTO t1 VALUES ('hr', 'frank', 65000);
 
-# [RooDB-skip] SUM(CASE...) and IF(AVG(...)) — aggregate/CASE interaction needs fix
+--echo # Aggregate with CASE
+SELECT dept,
+  COUNT(*) AS cnt,
+  SUM(CASE WHEN salary > 80000 THEN 1 ELSE 0 END) AS high_earners
+FROM t1 GROUP BY dept ORDER BY dept;
+
+--echo # Aggregate with IF
+SELECT dept,
+  AVG(salary) AS avg_salary,
+  IF(AVG(salary) > 80000, 'high', 'normal') AS dept_level
+FROM t1 GROUP BY dept ORDER BY dept;
 
 --echo # COALESCE in aggregation
 SELECT dept, COALESCE(SUM(salary), 0) FROM t1 GROUP BY dept ORDER BY dept;

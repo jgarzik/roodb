@@ -783,15 +783,24 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
-            } => ResolvedExpr::Function {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| Self::rewrite_agg_refs(a, group_by, all_aggs))
-                    .collect(),
-                distinct: *distinct,
-                result_type: result_type.clone(),
-            },
+            } => {
+                // Guard: do not recurse into aggregate function args.
+                // Aggregate args are evaluated pre-aggregation, not post-.
+                // If we reach here, the aggregate was not found in all_aggs
+                // (should not happen with correct exprs_equal), return as-is.
+                if Self::extract_aggregate(expr).is_some() {
+                    return expr.clone();
+                }
+                ResolvedExpr::Function {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::rewrite_agg_refs(a, group_by, all_aggs))
+                        .collect(),
+                    distinct: *distinct,
+                    result_type: result_type.clone(),
+                }
+            }
             ResolvedExpr::Case {
                 operand,
                 conditions,
@@ -935,6 +944,55 @@ impl LogicalPlanBuilder {
                     target_type: tb,
                 },
             ) => ta == tb && Self::exprs_equal(ea, eb),
+            (
+                ResolvedExpr::Case {
+                    operand: oa,
+                    conditions: ca,
+                    results: ra,
+                    else_result: ea,
+                    ..
+                },
+                ResolvedExpr::Case {
+                    operand: ob,
+                    conditions: cb,
+                    results: rb,
+                    else_result: eb,
+                    ..
+                },
+            ) => {
+                let operands_eq = match (oa.as_ref(), ob.as_ref()) {
+                    (Some(a), Some(b)) => Self::exprs_equal(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let else_eq = match (ea.as_ref(), eb.as_ref()) {
+                    (Some(a), Some(b)) => Self::exprs_equal(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                operands_eq
+                    && ca.len() == cb.len()
+                    && ra.len() == rb.len()
+                    && ca
+                        .iter()
+                        .zip(cb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+                    && ra
+                        .iter()
+                        .zip(rb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+                    && else_eq
+            }
+            (
+                ResolvedExpr::IsNull {
+                    expr: ea,
+                    negated: na,
+                },
+                ResolvedExpr::IsNull {
+                    expr: eb,
+                    negated: nb,
+                },
+            ) => na == nb && Self::exprs_equal(ea, eb),
             _ => false,
         }
     }
@@ -988,15 +1046,21 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
-            } => ResolvedExpr::Function {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| Self::transform_having_expr(a, group_by, all_aggs))
-                    .collect(),
-                distinct: *distinct,
-                result_type: result_type.clone(),
-            },
+            } => {
+                // Guard: do not recurse into aggregate function args
+                if Self::extract_aggregate(expr).is_some() {
+                    return expr.clone();
+                }
+                ResolvedExpr::Function {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::transform_having_expr(a, group_by, all_aggs))
+                        .collect(),
+                    distinct: *distinct,
+                    result_type: result_type.clone(),
+                }
+            }
             ResolvedExpr::BinaryOp {
                 left,
                 op,
