@@ -501,10 +501,25 @@ fn checked_float_to_int(v: f64) -> ExecutorResult<Datum> {
 }
 
 /// Promote Bit and String to numeric types for arithmetic operations (MySQL implicit coercion).
+/// Convert a byte slice (big-endian) to a u64 for numeric context.
+/// MySQL interprets hex literals as big-endian unsigned integers in numeric contexts.
+/// Bytes beyond the first 8 are silently ignored (only the last 8 bytes matter for u64).
+fn bytes_to_u64(b: &[u8]) -> u64 {
+    // Take at most the last 8 bytes (big-endian: most-significant bytes first)
+    let start = if b.len() > 8 { b.len() - 8 } else { 0 };
+    let mut result: u64 = 0;
+    for &byte in &b[start..] {
+        result = (result << 8) | byte as u64;
+    }
+    result
+}
+
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
         Datum::Decimal { .. } => std::borrow::Cow::Borrowed(d),
+        // MySQL: hex literals (Bytes) become unsigned integers in numeric context
+        Datum::Bytes(b) => std::borrow::Cow::Owned(Datum::UnsignedInt(bytes_to_u64(b))),
         Datum::String(s) => {
             // MySQL coerces strings to numbers in arithmetic: "123.5" → 123.5, "abc" → 0
             let trimmed = s.trim();
@@ -1124,6 +1139,8 @@ fn to_bitwise_int(d: &Datum) -> Option<i64> {
             Some((value / divisor) as i64)
         }
         Datum::String(s) => Some(parse_leading_int(s)),
+        // MySQL: hex literals (Bytes) become unsigned integers in bitwise context
+        Datum::Bytes(b) => Some(bytes_to_u64(b) as i64),
         _ => None,
     }
 }
@@ -6942,5 +6959,62 @@ mod tests {
             .unwrap(),
             Datum::Null
         );
+    }
+
+    #[test]
+    fn test_bytes_to_u64_conversion() {
+        // Single byte: 0x41 = 65
+        assert_eq!(bytes_to_u64(&[0x41]), 65);
+        // Two bytes: 0xFF00 = 65280
+        assert_eq!(bytes_to_u64(&[0xFF, 0x00]), 65280);
+        // Empty bytes = 0
+        assert_eq!(bytes_to_u64(&[]), 0);
+        // Single byte 0xFF = 255
+        assert_eq!(bytes_to_u64(&[0xFF]), 255);
+        // 8 bytes: full u64
+        assert_eq!(
+            bytes_to_u64(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            1
+        );
+        assert_eq!(
+            bytes_to_u64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn test_hex_bytes_in_arithmetic() {
+        // 0x41 + 0 = 65 (MySQL: hex literal in numeric context becomes unsigned int)
+        let result = eval_add(&Datum::Bytes(vec![0x41]), &Datum::Int(0)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(65));
+
+        // 0x41 + 1 = 66
+        let result = eval_add(&Datum::Bytes(vec![0x41]), &Datum::Int(1)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(66));
+
+        // 0xFF * 2 = 510
+        let result = eval_mul(&Datum::Bytes(vec![0xFF]), &Datum::Int(2)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(510));
+    }
+
+    #[test]
+    fn test_hex_bytes_in_bitwise() {
+        // 0x41 | 0x0F = 0x4F = 79
+        let result = eval_bitwise_or(&Datum::Bytes(vec![0x41]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0x4F));
+
+        // 0x41 & 0x0F = 0x01 = 1
+        let result =
+            eval_bitwise_and(&Datum::Bytes(vec![0x41]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0x01));
+
+        // 0xFF ^ 0x0F = 0xF0 = 240
+        let result =
+            eval_bitwise_xor(&Datum::Bytes(vec![0xFF]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0xF0));
+
+        // 0xFF << 8 = 65280
+        let result = eval_shift_left(&Datum::Bytes(vec![0xFF]), &Datum::Int(8)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(65280));
     }
 }
