@@ -49,11 +49,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 12 | order_by_limit, insert_update, type_date, type_time | ORDER BY LIMIT, INSERT edge cases, DATE/TIME types |
 | 13 | multi_update, type_datetime, func_time, func_set | Multi-table UPDATE, DATETIME, time functions, FIND_IN_SET |
 | 14 | expressions, parser_precedence, select_where, group_by | Complex expressions, operator precedence, WHERE, GROUP BY |
+| 15 | ctype_utf8, lowercase_table, partition_not_windows, olap | UTF-8 string ops, case-insensitive refs, long identifiers, aggregates |
+| 16 | derived, join_nested, temp_table, lowercase_table2 | Derived tables, nested JOINs, CRUD patterns, case-insensitive refs |
+| 17 | ctype_latin1, type_newdecimal, join_outer, variables | String functions, DECIMAL precision, LEFT/RIGHT JOIN, user variables |
+| 18 | type_bit, null_key, group_min_max, func_bitwise | BIT type, NULL key behavior, GROUP BY MIN/MAX, bitwise operations |
+| 19 | alter_table, view, trigger, explain | ALTER TABLE, CREATE/DROP VIEW, triggers, EXPLAIN output |
+| 20 | lpad, rpad | LPAD/RPAD string padding edge cases |
 
 ## Current Status
 
-**78 MySQL compat tests across 14 tiers — all pass**
-**200+ Rust integration tests — all pass**
+**100 MySQL compat tests across 20 tiers — all pass**
+**210+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 
@@ -176,6 +182,19 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | FLOAT/DOUBLE scale validation | ER_TOO_BIG_SCALE (1427) for D>M; scale max 30; display width max 255 |
 | WEIGHT_STRING stub | Stub returns input bytes; sufficient for DO context |
 | LTRIM/RTRIM functions | Standalone LTRIM()/RTRIM() in eval.rs (resolver already had type inference) |
+| DATE_ADD/DATE_SUB | Full interval arithmetic: DAY, MONTH, YEAR, HOUR, MINUTE, SECOND, etc. |
+| EXTRACT() | EXTRACT(unit FROM expr) for all standard date/time fields |
+| GROUP BY ordinal | GROUP BY 1, ORDER BY 2 — numeric position references |
+| DELETE ORDER BY LIMIT | Full pipeline: resolver → planner → executor with sort + truncate |
+| INSERT...SELECT column_map | Partial column list mapping for INSERT...SELECT |
+| INSERT IGNORE...SELECT | ignore_duplicates propagated through Raft layer |
+| DEFAULT for partial INSERT | Column DEFAULT values applied for unspecified columns |
+| Hex literal coercion | 0xNN bytes auto-converted to u64 in arithmetic/bitwise contexts |
+| Trigger SET @var | SET @var = expr and SET @var = NEW.col in trigger bodies |
+| Multi-variable SET | SET @a=1, @b=2, @c=3 sets all variables |
+| IN with NULL semantics | IN list returns NULL when value not found and NULL in list |
+| BIT type improvements | UnsignedInt cast to BIT, BIT/Bool comparison |
+| LPAD/RPAD edge cases | Negative length returns NULL, NULL padstr returns NULL |
 | MySQL RAND(seed) | Deterministic LCG matching MySQL's algorithm; thread-local state |
 | B'...' bit string literals | `B'10101'` parsed as unsigned integer from binary |
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
