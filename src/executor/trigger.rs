@@ -42,6 +42,19 @@ fn substitute_stmt(stmt: &mut sp::Statement, new_values: &HashMap<String, sp::Va
                 substitute_expr(sel, new_values);
             }
         }
+        sp::Statement::Set(set) => match set {
+            sp::Set::SingleAssignment { values, .. } => {
+                for v in values {
+                    substitute_expr(v, new_values);
+                }
+            }
+            sp::Set::MultipleAssignments { assignments } => {
+                for a in assignments {
+                    substitute_expr(&mut a.value, new_values);
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
 }

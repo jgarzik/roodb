@@ -185,6 +185,10 @@ TIERS = {
         "trigger",                # CREATE/DROP TRIGGER, BEFORE/AFTER INSERT triggers
         "explain",                # EXPLAIN SELECT (table scan, join, subquery, union)
     ],
+    20: [
+        "lpad",                   # LPAD() string padding function
+        "rpad",                   # RPAD() string padding function
+    ],
 }
 
 

@@ -3905,6 +3905,62 @@ where
         self.send_ok(0, 0).await
     }
 
+    /// Handle SET @var = expr silently (no client response packets).
+    /// Used within trigger bodies and other internal execution paths.
+    fn execute_set_user_variable_silent(&self, sql: &str) {
+        let trimmed = sql.trim();
+        // Strip "SET " prefix case-insensitively
+        let rest = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("SET ") {
+            trimmed[4..].trim()
+        } else {
+            return;
+        };
+
+        let assignments = Self::split_set_assignments(rest);
+
+        for assignment in &assignments {
+            let assignment = assignment.trim();
+            let assignment = match assignment.strip_prefix('@') {
+                Some(r) => r,
+                None => continue,
+            };
+            let (var_name, val_str) = if let Some(pos) = assignment.find(":=") {
+                (&assignment[..pos], assignment[pos + 2..].trim())
+            } else if let Some(pos) = assignment.find('=') {
+                (&assignment[..pos], assignment[pos + 1..].trim())
+            } else {
+                continue;
+            };
+            let var_name = var_name.trim().to_lowercase();
+
+            let scope_expr = format!("SELECT {} AS v", val_str);
+
+            let datum = (|| -> Option<Datum> {
+                let val_stmt = Parser::parse_one(&scope_expr).ok()?;
+                let catalog = self.catalog.read();
+                let resolver = Resolver::new(&catalog);
+                let resolved = resolver.resolve(val_stmt).ok()?;
+
+                if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
+                    if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
+                        expr: resolved_expr,
+                        ..
+                    }) = sel.columns.first()
+                    {
+                        let empty_row = crate::executor::row::Row::empty();
+                        let vars = self.session.user_variables();
+                        return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars)
+                            .ok();
+                    }
+                }
+                None
+            })();
+
+            let value = datum.unwrap_or(Datum::String(val_str.to_string()));
+            self.session.set_user_variable(&var_name, value);
+        }
+    }
+
     /// Split a SET assignment list at top-level commas, respecting
     /// parentheses and string literals.
     fn split_set_assignments(s: &str) -> Vec<&str> {
@@ -5998,9 +6054,18 @@ where
     }
 
     /// Execute a SQL statement silently (no client response packets).
-    /// Used for executing DML/DDL within procedure bodies.
+    /// Used for executing DML/DDL within procedure bodies and trigger bodies.
     /// Returns the number of rows affected.
     async fn execute_sql_silent(&mut self, sql: &str) -> Result<u64, String> {
+        // Handle SET @var = expr (user variable assignment) — not handled by the planner
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("SET @") && !upper.starts_with("SET @@") {
+                self.execute_set_user_variable_silent(sql);
+                return Ok(0);
+            }
+        }
+
         // Parse and execute through the pipeline
         let stmt = match crate::sql::Parser::parse_one(sql) {
             Ok(s) => s,

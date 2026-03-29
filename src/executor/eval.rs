@@ -2190,17 +2190,23 @@ pub fn eval_function(
                     "LPAD requires 2-3 arguments".to_string(),
                 ));
             }
-            if args[0].is_null() || args[1].is_null() {
+            if args.iter().any(|a| a.is_null()) {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let len = args[1].as_int().unwrap_or(0) as usize;
+            let len_val = args[1].as_int().unwrap_or(0);
+            if len_val < 0 {
+                return Ok(Datum::Null);
+            }
+            let len = len_val as usize;
             let pad = if args.len() >= 3 {
                 args[2].to_display_string()
             } else {
                 " ".to_string()
             };
-            if pad.is_empty() || len <= s.len() {
+            if len == 0 {
+                Ok(Datum::String(String::new()))
+            } else if pad.is_empty() || len <= s.len() {
                 Ok(Datum::String(s.chars().take(len).collect()))
             } else {
                 let need = len - s.len();
@@ -2220,17 +2226,23 @@ pub fn eval_function(
                     "RPAD requires 2-3 arguments".to_string(),
                 ));
             }
-            if args[0].is_null() || args[1].is_null() {
+            if args.iter().any(|a| a.is_null()) {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let len = args[1].as_int().unwrap_or(0) as usize;
+            let len_val = args[1].as_int().unwrap_or(0);
+            if len_val < 0 {
+                return Ok(Datum::Null);
+            }
+            let len = len_val as usize;
             let pad = if args.len() >= 3 {
                 args[2].to_display_string()
             } else {
                 " ".to_string()
             };
-            if pad.is_empty() || len <= s.len() {
+            if len == 0 {
+                Ok(Datum::String(String::new()))
+            } else if pad.is_empty() || len <= s.len() {
                 Ok(Datum::String(s.chars().take(len).collect()))
             } else {
                 let need = len - s.len();
