@@ -28,7 +28,7 @@ enum Accumulator {
     },
     Min(Option<Datum>),
     Max(Option<Datum>),
-    BitAnd(Option<u64>),
+    BitAnd(u64),
     BitOr(u64),
     BitXor(u64),
     /// Population variance/stddev: tracks sum, sum of squares, count
@@ -56,7 +56,7 @@ impl Accumulator {
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
-            "BIT_AND" => Accumulator::BitAnd(None),
+            "BIT_AND" => Accumulator::BitAnd(u64::MAX),
             "BIT_OR" => Accumulator::BitOr(0),
             "BIT_XOR" => Accumulator::BitXor(0),
             "VARIANCE" | "VAR_POP" => Accumulator::VarPop {
@@ -130,7 +130,7 @@ impl Accumulator {
             }
             Accumulator::BitAnd(acc) => {
                 if let Some(v) = Self::as_bitwise_u64(value) {
-                    *acc = Some(acc.map_or(v, |a| a & v));
+                    *acc &= v;
                 }
             }
             Accumulator::BitOr(acc) => {
@@ -193,9 +193,9 @@ impl Accumulator {
             }
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
-            Accumulator::BitAnd(acc) => acc.map_or(Datum::Null, |v| Datum::Int(v as i64)),
-            Accumulator::BitOr(v) => Datum::Int(*v as i64),
-            Accumulator::BitXor(v) => Datum::Int(*v as i64),
+            Accumulator::BitAnd(v) => Datum::UnsignedInt(*v),
+            Accumulator::BitOr(v) => Datum::UnsignedInt(*v),
+            Accumulator::BitXor(v) => Datum::UnsignedInt(*v),
             Accumulator::VarPop {
                 sum,
                 sum_sq,
@@ -650,6 +650,69 @@ mod tests {
         let result = agg.next().await.unwrap().unwrap();
         // Without DISTINCT: 10+20+20+30=80, with DISTINCT: 10+20+30=60
         assert_eq!(result.get(0).unwrap().as_float(), Some(60.0));
+
+        agg.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bitwise_aggregates_empty_set() {
+        // MySQL behavior: BIT_AND() on empty set = 18446744073709551615 (u64::MAX)
+        // BIT_OR() on empty set = 0, BIT_XOR() on empty set = 0
+        let input = Box::new(MockExecutor {
+            rows: vec![],
+            position: 0,
+        });
+
+        let col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t".to_string(),
+            name: "c".to_string(),
+            index: 0,
+            data_type: DataType::Int,
+            nullable: false,
+            default_value: None,
+        });
+
+        let aggregates = vec![
+            (
+                AggregateFunc {
+                    name: "BIT_AND".to_string(),
+                    args: vec![col.clone()],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                },
+                "bit_and".to_string(),
+            ),
+            (
+                AggregateFunc {
+                    name: "BIT_OR".to_string(),
+                    args: vec![col.clone()],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                },
+                "bit_or".to_string(),
+            ),
+            (
+                AggregateFunc {
+                    name: "BIT_XOR".to_string(),
+                    args: vec![col],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                },
+                "bit_xor".to_string(),
+            ),
+        ];
+
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
+        agg.open().await.unwrap();
+
+        let result = agg.next().await.unwrap().unwrap();
+
+        // BIT_AND on empty set: u64::MAX (all ones)
+        assert_eq!(*result.get(0).unwrap(), Datum::UnsignedInt(u64::MAX));
+        // BIT_OR on empty set: 0
+        assert_eq!(*result.get(1).unwrap(), Datum::UnsignedInt(0));
+        // BIT_XOR on empty set: 0
+        assert_eq!(*result.get(2).unwrap(), Datum::UnsignedInt(0));
 
         agg.close().await.unwrap();
     }

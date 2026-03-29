@@ -233,6 +233,22 @@ impl TypeChecker {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_aggregate(e))
+                    || conditions.iter().any(Self::expr_has_aggregate)
+                    || results.iter().any(Self::expr_has_aggregate)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_aggregate(e))
+            }
             _ => false,
         }
     }
@@ -266,6 +282,22 @@ impl TypeChecker {
                     || Self::expr_has_non_aggregate_column(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_non_aggregate_column(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_non_aggregate_column(e))
+                    || conditions.iter().any(Self::expr_has_non_aggregate_column)
+                    || results.iter().any(Self::expr_has_non_aggregate_column)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_non_aggregate_column(e))
+            }
             ResolvedExpr::UserVariable { .. } => false,
             _ => false,
         }

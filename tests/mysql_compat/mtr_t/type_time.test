@@ -1,0 +1,162 @@
+# Adapted from MySQL type_time.test for RooDB compatibility testing.
+# Tests TIME type operations, comparisons, and time functions.
+
+# [RooDB-skip] SET sql_mode = 'NO_ENGINE_SUBSTITUTION'
+# [RooDB-skip] INSERT with invalid TIME values (error/warning behavior)
+# [RooDB-skip] Negative TIME values (-10, '-24:00:00', etc.)
+# [RooDB-skip] TIME values > 838:59:59 (out of range)
+# [RooDB-skip] INT display width (deprecated)
+# [RooDB-skip] SET TIMESTAMP
+# [RooDB-skip] ANALYZE TABLE / EXPLAIN
+# [RooDB-skip] ENGINE=InnoDB hints
+# [RooDB-skip] STRAIGHT_JOIN / FORCE INDEX / IGNORE INDEX
+# [RooDB-skip] --sorted_result / --disable_result_log
+# [RooDB-skip] MTR variable/loop constructs ($cnt, let, while, eval)
+# [RooDB-skip] prepared statements
+# [RooDB-skip] NAME_CONST function
+# [RooDB-skip] CURRENT_TIME / CURRENT_TIMESTAMP / CURRENT_DATE (time-dependent)
+# [RooDB-skip] <=> null-safe equal operator with TIME (tested in func_equal)
+# [RooDB-skip] TRUNCATE TABLE
+
+#
+# basic TIME column operations
+#
+CREATE TABLE t1 (t TIME);
+INSERT INTO t1 VALUES ('09:00:00'),('13:00:00'),('19:38:34'),('13:00:00'),('09:00:00'),('09:00:00'),('13:00:00'),('13:00:00'),('13:00:00'),('09:00:00');
+SELECT t, time_to_sec(t), sec_to_time(time_to_sec(t)) FROM t1;
+SELECT sec_to_time(time_to_sec(t)) FROM t1;
+DROP TABLE t1;
+
+#
+# TIME insertion with positive integer values
+#
+CREATE TABLE t1 (t TIME);
+INSERT INTO t1 VALUES ('10:22:33');
+INSERT INTO t1 VALUES ('12:34:56');
+INSERT INTO t1 VALUES ('01:23:00');
+INSERT INTO t1 VALUES ('01:23:45');
+INSERT INTO t1 VALUES ('12:30:00');
+INSERT INTO t1 VALUES ('12:30:35');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# CAST to TIME
+#
+SELECT CAST(235959.123456 AS TIME);
+SELECT CAST(0.235959123456e+6 AS TIME);
+SELECT CAST(235959123456e-6 AS TIME);
+
+# [RooDB-skip] TIME values >= 24:00:00 and scalar subquery comparison with CAST TIME
+
+# [RooDB-skip] Bug#29739: time comparison in BETWEEN - requires TIME > 24:00:00
+
+#
+# Bug#29729: date/time join condition
+#
+CREATE TABLE t1 (
+  f2 DATE NOT NULL,
+  f3 INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (f3, f2)
+);
+INSERT INTO t1 VALUES('2007-07-01', 1);
+INSERT INTO t1 VALUES('2007-07-01', 2);
+INSERT INTO t1 VALUES('2007-07-02', 1);
+INSERT INTO t1 VALUES('2007-07-02', 2);
+SELECT SUM(f3) FROM t1 WHERE f2='2007-07-01 00:00:00' GROUP BY f2;
+DROP TABLE t1;
+
+#
+# Bug#44792: casting from time to time
+#
+CREATE TABLE t1 (c TIME);
+INSERT INTO t1 VALUES ('0:00:00');
+SELECT CAST(c AS TIME) FROM t1;
+DROP TABLE t1;
+
+--echo End of 5.0 tests
+
+# [RooDB-skip] Bug#42664: Sign handling for TIME types - requires 24:00:00 TIME support
+
+--echo #
+--echo # Start of 5.6 tests
+--echo #
+
+#
+# Testing CASE with TIME type without a found item
+#
+SELECT CAST(CASE WHEN 0 THEN '01:01:01' END AS TIME);
+
+#
+# Testing COALESCE with TIME type without a found item
+#
+SELECT COALESCE(TIME(NULL));
+
+#
+# Testing TIME field with NULL value with NOT IN
+#
+CREATE TABLE t1 (a TIME);
+INSERT INTO t1 VALUES (NULL);
+SELECT * FROM t1 WHERE a NOT IN ('20:20:20','10:10:10');
+DROP TABLE t1;
+
+#
+# Testing Item_func_numhybrid with TIME type
+#
+CREATE TABLE t1 (a TIME);
+INSERT INTO t1 VALUES ('10:10:10');
+SELECT CAST(COALESCE(a,a) AS SIGNED) FROM t1;
+DROP TABLE t1;
+
+#
+# Testing CAST from TIME to DECIMAL
+#
+CREATE TABLE t1 (a TIME);
+INSERT INTO t1 VALUES ('10:10:10');
+SELECT CAST(COALESCE(a,a) AS DECIMAL(23,6)) FROM t1;
+DROP TABLE t1;
+
+#
+# Testing CAST COALESCE to TIME with non-temporal type
+#
+SELECT CAST(COALESCE(10,20) AS TIME);
+
+#
+# Testing LEAST with DATE NULL cast to TIME
+#
+SELECT CAST(LEAST(DATE(NULL), DATE(NULL)) AS TIME);
+
+#
+# Testing LEAST with non-temporal arguments cast to TIME
+#
+SELECT CAST(LEAST(111111,222222) AS TIME);
+
+#
+# Item::get_time_from_numeric
+#
+SELECT CAST(SUM(0) AS TIME);
+
+#
+# Item_cache_datetime::get_time
+#
+CREATE TABLE t1 (a DATE);
+INSERT INTO t1 VALUES ('2000-01-01');
+SELECT TIME(MIN(a)) FROM t1;
+DROP TABLE t1;
+
+--echo #
+--echo # Checking Item_func_if with TIME arguments
+--echo #
+SELECT CAST(IF(1, TIME'00:00:00', TIME'00:00:00') AS CHAR);
+
+--echo #
+--echo # Checking CASE with TIME arguments
+--echo #
+SELECT CAST(CASE WHEN 1 THEN TIME'00:00:00' ELSE TIME'00:00:00' END AS CHAR);
+
+--echo #
+--echo # TIME function with various inputs
+--echo #
+SELECT TIME('10:10:10');
+SELECT TIME('23:59:59');
+SELECT TIME('00:00:00');

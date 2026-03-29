@@ -309,3 +309,46 @@ async fn test_multiple_aggregates() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// Regression test: aggregate functions inside CASE WHEN expressions
+/// must be recognized and handled by the aggregate executor.
+#[tokio::test]
+async fn test_aggregate_inside_case_when() {
+    let server = TestServer::start("agg_case").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE agg_case_tbl (id INT, max_req INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO agg_case_tbl (id, max_req) VALUES (1, 3), (2, 3), (3, 3), (4, 2), (5, 2)",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // COUNT(*) inside CASE WHEN condition
+    let rows: Vec<(i64, i32)> = conn
+        .query("SELECT CASE WHEN COUNT(*) < max_req THEN 1 ELSE 0 END AS flag, max_req FROM agg_case_tbl GROUP BY max_req ORDER BY max_req")
+        .await
+        .expect("CASE WHEN COUNT(*) failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (0, 2)); // COUNT(*)=2, 2<2 is false -> 0
+    assert_eq!(rows[1], (0, 3)); // COUNT(*)=3, 3<3 is false -> 0
+
+    // SUM() inside CASE WHEN condition
+    let rows: Vec<(String, i32)> = conn
+        .query("SELECT CASE WHEN SUM(id) > max_req THEN 'yes' ELSE 'no' END AS result, max_req FROM agg_case_tbl GROUP BY max_req ORDER BY max_req")
+        .await
+        .expect("CASE WHEN SUM() failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "yes"); // SUM(id)=9, 9>2 -> yes
+    assert_eq!(rows[1].0, "yes"); // SUM(id)=6, 6>3 -> yes
+
+    conn.query_drop("DROP TABLE agg_case_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}

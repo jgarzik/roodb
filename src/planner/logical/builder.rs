@@ -438,6 +438,22 @@ impl LogicalPlanBuilder {
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
             ResolvedExpr::Cast { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_aggregate(e))
+                    || conditions.iter().any(Self::expr_has_aggregate)
+                    || results.iter().any(Self::expr_has_aggregate)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_aggregate(e))
+            }
             _ => false,
         }
     }
@@ -509,6 +525,26 @@ impl LogicalPlanBuilder {
             }
             ResolvedExpr::Cast { expr: inner, .. } => {
                 Self::collect_aggregates(inner, idx, None, out);
+            }
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_aggregates(op, idx, None, out);
+                }
+                for cond in conditions {
+                    Self::collect_aggregates(cond, idx, None, out);
+                }
+                for res in results {
+                    Self::collect_aggregates(res, idx, None, out);
+                }
+                if let Some(el) = else_result {
+                    Self::collect_aggregates(el, idx, None, out);
+                }
             }
             _ => {}
         }
@@ -617,7 +653,7 @@ impl LogicalPlanBuilder {
                     if Self::expr_has_aggregate(expr) {
                         // Rewrite the expression: replace aggregate sub-expressions
                         // with column references to the aggregate output
-                        let rewritten = Self::rewrite_agg_refs(expr, group_by.len(), &all_aggs);
+                        let rewritten = Self::rewrite_agg_refs(expr, group_by, &all_aggs);
                         expressions.push((rewritten, name));
                     } else {
                         // Non-aggregate expression - check if it's a group-by column
@@ -653,13 +689,16 @@ impl LogicalPlanBuilder {
     }
 
     /// Rewrite an expression by replacing aggregate function calls with
-    /// column references to the aggregate output. For example,
+    /// column references to the aggregate output, and group-by column
+    /// references with their output indices. For example,
     /// `max(big) - 1` becomes `Column(agg_idx) - 1`.
     fn rewrite_agg_refs(
         expr: &ResolvedExpr,
-        group_by_len: usize,
+        group_by: &[ResolvedExpr],
         all_aggs: &[(AggregateFunc, String)],
     ) -> ResolvedExpr {
+        let group_by_len = group_by.len();
+
         // If this expression itself is a direct aggregate, replace it
         if let Some(agg) = Self::extract_aggregate(expr) {
             if let Some(pos) = all_aggs
@@ -679,6 +718,20 @@ impl LogicalPlanBuilder {
             }
         }
 
+        // If this is a column reference that matches a group-by expression,
+        // rewrite it to point to the group-by output index.
+        if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
+            let result_type = Self::get_expr_type(expr);
+            return ResolvedExpr::Column(ResolvedColumn {
+                table: String::new(),
+                name: format!("gb_{}", gb_idx),
+                index: gb_idx,
+                data_type: result_type,
+                nullable: true,
+                default_value: None,
+            });
+        }
+
         // Recurse into sub-expressions
         match expr {
             ResolvedExpr::BinaryOp {
@@ -687,9 +740,9 @@ impl LogicalPlanBuilder {
                 right,
                 result_type,
             } => ResolvedExpr::BinaryOp {
-                left: Box::new(Self::rewrite_agg_refs(left, group_by_len, all_aggs)),
+                left: Box::new(Self::rewrite_agg_refs(left, group_by, all_aggs)),
                 op: *op,
-                right: Box::new(Self::rewrite_agg_refs(right, group_by_len, all_aggs)),
+                right: Box::new(Self::rewrite_agg_refs(right, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::UnaryOp {
@@ -698,14 +751,14 @@ impl LogicalPlanBuilder {
                 result_type,
             } => ResolvedExpr::UnaryOp {
                 op: *op,
-                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::Cast {
                 expr: inner,
                 target_type,
             } => ResolvedExpr::Cast {
-                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
                 target_type: target_type.clone(),
             },
             ResolvedExpr::Function {
@@ -717,9 +770,32 @@ impl LogicalPlanBuilder {
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|a| Self::rewrite_agg_refs(a, group_by_len, all_aggs))
+                    .map(|a| Self::rewrite_agg_refs(a, group_by, all_aggs))
                     .collect(),
                 distinct: *distinct,
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_agg_refs(e, group_by, all_aggs))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::rewrite_agg_refs(c, group_by, all_aggs))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::rewrite_agg_refs(r, group_by, all_aggs))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_agg_refs(e, group_by, all_aggs))),
                 result_type: result_type.clone(),
             },
             // For other expression types (Column, Literal, etc.), pass through
@@ -938,6 +1014,29 @@ impl LogicalPlanBuilder {
                     expr.clone()
                 }
             }
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_having_expr(e, group_by, all_aggs))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::transform_having_expr(c, group_by, all_aggs))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::transform_having_expr(r, group_by, all_aggs))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_having_expr(e, group_by, all_aggs))),
+                result_type: result_type.clone(),
+            },
             other => other.clone(),
         }
     }

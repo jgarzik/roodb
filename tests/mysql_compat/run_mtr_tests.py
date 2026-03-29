@@ -131,6 +131,18 @@ TIERS = {
         "single_delete_update",   # single-table DELETE/UPDATE with ORDER BY, LIMIT
         "insert_select",          # INSERT ... SELECT
     ],
+    11: [
+        "truncate_coverage",      # TRUNCATE TABLE edge cases
+        "func_group_innodb",      # GROUP BY aggregate functions (InnoDB)
+        "type_set",               # SET data type
+        "varbinary",              # VARBINARY/BINARY types
+    ],
+    12: [
+        "order_by_limit",         # ORDER BY with LIMIT edge cases
+        "insert_update",          # INSERT with UNIQUE constraints (ODKU skipped)
+        "type_date",              # DATE type operations
+        "type_time",              # TIME type operations
+    ],
 }
 
 
