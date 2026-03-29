@@ -1,0 +1,85 @@
+drop table if exists t1,t2,t3,t4;
+create table t1 (id int primary key, Word varchar(40) not null);
+create table t4 (id int primary key, Word varchar(40) not null);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO t4 VALUES(1,'match');
+SELECT * FROM t1;
+id	Word
+1	a
+2	b
+3	c
+SELECT t1.id from t1 LIMIT 1;
+id
+1
+SELECT T2.id from t1 as T2 LIMIT 1;
+id
+1
+SELECT * from t1 left join t4 on (t1.id= t4.id) where t1.id >= t4.id;
+id	Word	id	Word
+1	a	1	match
+SELECT T2.id from t1 as t2 LIMIT 1;
+id
+1
+drop table t1, t4;
+create table t1 (a int);
+select count(*) from t1;
+COUNT(NULL)
+0
+select count(bags.a) from t1 as Bags;
+COUNT(a)
+0
+drop table t1;
+create table t1 (MyCol int, AnotherCol varchar(20));
+INSERT INTO t1 VALUES (1, 'hello'), (2, 'world');
+SELECT mycol, anothercol FROM t1 ORDER BY mycol;
+mycol	anothercol
+1	hello
+2	world
+SELECT MYCOL, ANOTHERCOL FROM t1 ORDER BY mycol;
+MYCOL	ANOTHERCOL
+1	hello
+2	world
+SELECT MyCol, AnotherCol FROM t1 ORDER BY MyCol;
+MyCol	AnotherCol
+1	hello
+2	world
+drop table t1;
+create table t1 (a int, b int);
+create table t2 (a int, c int);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+SELECT X.a, Y.c FROM t1 AS X, t2 AS Y WHERE X.a = Y.a ORDER BY X.a;
+a	c
+1	100
+2	200
+SELECT x.a, y.c FROM t1 AS x, t2 AS y WHERE x.a = y.a ORDER BY x.a;
+a	c
+1	100
+2	200
+SELECT P.a, P.b, Q.c FROM t1 AS P LEFT JOIN t2 AS Q ON P.a = Q.a ORDER BY P.a;
+a	b	c
+1	10	100
+2	20	200
+3	30	NULL
+drop table t1, t2;
+create table t1 (Val1 int, Val2 int, Name varchar(20));
+INSERT INTO t1 VALUES (10, 20, 'alpha'), (30, 40, 'beta'), (50, 60, 'gamma');
+SELECT val1 + val2 AS total FROM t1 ORDER BY total;
+total
+30
+70
+110
+SELECT VAL1 * VAL2 AS product FROM t1 ORDER BY product;
+product
+200
+1200
+3000
+SELECT CONCAT(name, ':', CAST(val1 AS CHAR)) AS labeled FROM t1 ORDER BY val1;
+labeled
+alpha:10
+beta:30
+gamma:50
+SELECT name, val1 FROM t1 WHERE val1 > 10 AND val2 < 60 ORDER BY name;
+name	val1
+beta	30
+drop table t1;

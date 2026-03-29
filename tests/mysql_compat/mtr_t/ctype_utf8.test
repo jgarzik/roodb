@@ -1,0 +1,196 @@
+#
+# Pure string operations extracted from MySQL ctype_utf8.test (~200 lines)
+# Removed: --source, character_set directives, COLLATE, _utf8 hex literals,
+#          _koi8r/_latin1 conversions, SET NAMES, SET sql_mode, SET LC_TIME_NAMES,
+#          ALTER TABLE, CHECK TABLE, ENGINE=, --error, SHOW CREATE TABLE,
+#          CREATE TEMPORARY TABLE, key prefix tests, SOUNDEX with hex,
+#          collation-specific tests, regex tests
+#
+
+--disable_warnings
+drop table if exists t1, t2;
+--enable_warnings
+
+#
+# Basic string function tests
+#
+
+# LOCATE function
+select locate('he','hello');
+select locate('he','hello',2);
+select locate('lo','hello',2);
+select locate('HE','hello');
+select locate('HE','hello',2);
+select locate('LO','hello',2);
+
+# String comparisons
+SELECT 'a' = 'a ';
+SELECT 'a' like 'a';
+SELECT 'A' like 'a';
+
+#
+# INSERT() function (string insertion, not table INSERT)
+#
+select insert('txs',2,1,'hi'),insert('is ',4,0,'a'),insert('txxxxt',2,4,'es');
+select insert("aa",100,1,"b"),insert("aa",1,3,"b");
+
+#
+# String JOIN test
+#
+CREATE TABLE t1 ( a varchar(10) );
+INSERT INTO t1 VALUES ( 'test' );
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = b.a;
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = 'test' and b.a = 'test';
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = b.a and a.a = 'test';
+DROP TABLE t1;
+
+# String equality with repeated values
+create table t1 (a char(255));
+insert into t1 values('b'),('b');
+select * from t1 where a = 'b';
+select * from t1 where a = 'b' and a = 'b';
+select * from t1 where a = 'b' and a != 'b';
+drop table t1;
+
+#
+# LENGTH and CHAR_LENGTH
+#
+SELECT LENGTH('hello'), CHAR_LENGTH('hello');
+SELECT LENGTH(''), CHAR_LENGTH('');
+SELECT LENGTH('abc def'), CHAR_LENGTH('abc def');
+
+#
+# UPPER and LOWER
+#
+SELECT UPPER('hello'), LOWER('WORLD');
+SELECT UPPER(''), LOWER('');
+SELECT UPPER('aBcDeF'), LOWER('aBcDeF');
+
+#
+# CONCAT
+#
+SELECT CONCAT('hello', ' ', 'world');
+SELECT CONCAT('a', NULL, 'b');
+SELECT CONCAT('', 'test');
+
+#
+# SUBSTRING / SUBSTR
+#
+SELECT SUBSTRING('hello world', 1, 5);
+SELECT SUBSTRING('hello world', 7);
+SELECT SUBSTR('hello', 2, 3);
+SELECT SUBSTR('hello', -3);
+
+#
+# TRIM, LTRIM, RTRIM
+#
+SELECT TRIM('  hello  ');
+SELECT LTRIM('  hello');
+SELECT RTRIM('hello  ');
+SELECT TRIM(BOTH 'x' FROM 'xxxhelloxxx');
+# [RooDB-note] TRIM(LEADING/TRAILING x FROM y) not yet supported, only TRIM(BOTH x FROM y)
+
+#
+# REPLACE
+#
+SELECT REPLACE('hello world', 'world', 'there');
+SELECT REPLACE('aaa', 'a', 'bb');
+SELECT REPLACE('hello', 'xyz', 'abc');
+
+#
+# REPEAT and REVERSE
+#
+SELECT REPEAT('ab', 3);
+SELECT REPEAT('x', 0);
+SELECT REVERSE('hello');
+SELECT REVERSE('');
+
+#
+# LEFT and RIGHT
+#
+SELECT LEFT('hello', 3);
+SELECT RIGHT('hello', 3);
+SELECT LEFT('hello', 0);
+SELECT RIGHT('hello', 0);
+SELECT LEFT('hello', 10);
+
+#
+# LPAD and RPAD
+#
+SELECT LPAD('hi', 5, '0');
+SELECT RPAD('hi', 5, '0');
+SELECT LPAD('hello', 3, '0');
+SELECT RPAD('hello', 3, '0');
+
+#
+# String functions with table data
+#
+CREATE TABLE t1 (id int primary key, name varchar(50), description varchar(100));
+INSERT INTO t1 VALUES (1, 'Alice', 'First user');
+INSERT INTO t1 VALUES (2, 'Bob', 'Second user');
+INSERT INTO t1 VALUES (3, 'Charlie', 'Third user');
+INSERT INTO t1 VALUES (4, '', 'Empty name');
+INSERT INTO t1 VALUES (5, NULL, 'NULL name');
+
+SELECT id, LENGTH(name), CHAR_LENGTH(name) FROM t1 ORDER BY id;
+SELECT id, UPPER(name), LOWER(name) FROM t1 ORDER BY id;
+SELECT id, CONCAT(name, ' - ', description) FROM t1 WHERE name IS NOT NULL AND name != '' ORDER BY id;
+SELECT id, SUBSTRING(description, 1, 5) FROM t1 ORDER BY id;
+SELECT id, REPLACE(description, 'user', 'person') FROM t1 ORDER BY id;
+SELECT id, REVERSE(name) FROM t1 WHERE name IS NOT NULL ORDER BY id;
+SELECT id, LPAD(name, 10, '*'), RPAD(name, 10, '*') FROM t1 WHERE name IS NOT NULL ORDER BY id;
+
+DROP TABLE t1;
+
+#
+# LIKE with patterns
+#
+CREATE TABLE t1 (a char(10));
+insert into t1 values ("a"),("abc"),("abcd"),("hello"),("test");
+select * from t1 where a like "abc%";
+select * from t1 where a like concat("abc","%");
+select * from t1 where a like "ABC%";
+select * from t1 where a like "test%";
+select * from t1 where a like "te_t";
+select * from t1 where a like "%a%";
+select * from t1 where a like "%abcd%";
+drop table t1;
+
+# LIKE with underscores
+select 'c' like '\_' as want0;
+
+#
+# COALESCE with strings
+#
+SELECT COALESCE(NULL, 'hello');
+SELECT COALESCE('first', 'second');
+SELECT COALESCE(NULL, NULL, 'third');
+
+#
+# CONCAT_WS
+#
+SELECT CONCAT_WS(',', 'a', 'b', 'c');
+SELECT CONCAT_WS('-', 'hello', NULL, 'world');
+SELECT CONCAT_WS('', 'a', 'b');
+
+#
+# HEX / UNHEX
+#
+SELECT HEX('ABC');
+SELECT UNHEX('414243');
+
+#
+# CHAR function
+#
+create table t1 (a int);
+insert into t1 values (48),(49),(50);
+select distinct char(a) from t1;
+drop table t1;
+
+#
+# Mixed string operations
+#
+SELECT CONCAT(UPPER(LEFT('hello', 1)), LOWER(SUBSTRING('HELLO', 2)));
+SELECT REPLACE(CONCAT('foo', 'bar'), 'ob', 'OB');
+SELECT TRIM(CONCAT('  ', 'hello', '  '));
+SELECT LENGTH(REPEAT('abc', 5));

@@ -155,6 +155,12 @@ TIERS = {
         "select_where",           # WHERE clause patterns (comparisons, IN, BETWEEN, LIKE)
         "group_by",               # GROUP BY with aggregates, HAVING, ORDER BY
     ],
+    15: [
+        "ctype_utf8",             # UTF-8 string operations (LOCATE, INSERT, TRIM, etc.)
+        "lowercase_table",        # case-insensitive table/column names
+        "partition_not_windows",  # long identifiers (CREATE/DROP DATABASE)
+        "olap",                   # GROUP BY WITH ROLLUP
+    ],
 }
 
 

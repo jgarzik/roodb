@@ -1,0 +1,284 @@
+drop table if exists t1, t2;
+select locate('he','hello');
+LOCATE('he','hello')
+1
+select locate('he','hello',2);
+LOCATE('he','hello',2)
+0
+select locate('lo','hello',2);
+LOCATE('lo','hello',2)
+4
+select locate('HE','hello');
+LOCATE('HE','hello')
+0
+select locate('HE','hello',2);
+LOCATE('HE','hello',2)
+0
+select locate('LO','hello',2);
+LOCATE('LO','hello',2)
+0
+SELECT 'a' = 'a ';
+'a' = 'a '
+0
+SELECT 'a' like 'a';
+'a' LIKE 'a'
+1
+SELECT 'A' like 'a';
+'A' LIKE 'a'
+0
+select insert('txs',2,1,'hi'),insert('is ',4,0,'a'),insert('txxxxt',2,4,'es');
+INSERT('txs',2,1,'hi')	INSERT('is ',4,0,'a')	INSERT('txxxxt',2,4,'es')
+this	is 	test
+select insert("aa",100,1,"b"),insert("aa",1,3,"b");
+INSERT('aa',100,1,'b')	INSERT('aa',1,3,'b')
+aa	b
+CREATE TABLE t1 ( a varchar(10) );
+INSERT INTO t1 VALUES ( 'test' );
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = b.a;
+a	a
+test	test
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = 'test' and b.a = 'test';
+a	a
+test	test
+SELECT a.a, b.a FROM t1 a, t1 b WHERE a.a = b.a and a.a = 'test';
+a	a
+test	test
+DROP TABLE t1;
+create table t1 (a char(255));
+insert into t1 values('b'),('b');
+select * from t1 where a = 'b';
+a
+b
+b
+select * from t1 where a = 'b' and a = 'b';
+a
+b
+b
+select * from t1 where a = 'b' and a != 'b';
+a
+drop table t1;
+SELECT LENGTH('hello'), CHAR_LENGTH('hello');
+LENGTH('hello')	CHAR_LENGTH('hello')
+5	5
+SELECT LENGTH(''), CHAR_LENGTH('');
+LENGTH('')	CHAR_LENGTH('')
+0	0
+SELECT LENGTH('abc def'), CHAR_LENGTH('abc def');
+LENGTH('abc def')	CHAR_LENGTH('abc def')
+7	7
+SELECT UPPER('hello'), LOWER('WORLD');
+UPPER('hello')	LOWER('WORLD')
+HELLO	world
+SELECT UPPER(''), LOWER('');
+UPPER('')	LOWER('')
+	
+SELECT UPPER('aBcDeF'), LOWER('aBcDeF');
+UPPER('aBcDeF')	LOWER('aBcDeF')
+ABCDEF	abcdef
+SELECT CONCAT('hello', ' ', 'world');
+CONCAT('hello',' ','world')
+hello world
+SELECT CONCAT('a', NULL, 'b');
+CONCAT('a',NULL,'b')
+NULL
+SELECT CONCAT('', 'test');
+CONCAT('','test')
+test
+SELECT SUBSTRING('hello world', 1, 5);
+SUBSTRING('hello world',1,5)
+hello
+SELECT SUBSTRING('hello world', 7);
+SUBSTRING('hello world',7)
+world
+SELECT SUBSTR('hello', 2, 3);
+SUBSTRING('hello',2,3)
+ell
+SELECT SUBSTR('hello', -3);
+SUBSTRING('hello',-3)
+llo
+SELECT TRIM('  hello  ');
+TRIM('  hello  ')
+hello
+SELECT LTRIM('  hello');
+LTRIM('  hello')
+hello
+SELECT RTRIM('hello  ');
+RTRIM('hello  ')
+hello
+SELECT TRIM(BOTH 'x' FROM 'xxxhelloxxx');
+TRIM('xxxhelloxxx','x')
+hello
+SELECT REPLACE('hello world', 'world', 'there');
+REPLACE('hello world','world','there')
+hello there
+SELECT REPLACE('aaa', 'a', 'bb');
+REPLACE('aaa','a','bb')
+bbbbbb
+SELECT REPLACE('hello', 'xyz', 'abc');
+REPLACE('hello','xyz','abc')
+hello
+SELECT REPEAT('ab', 3);
+REPEAT('ab',3)
+ababab
+SELECT REPEAT('x', 0);
+REPEAT('x',0)
+
+SELECT REVERSE('hello');
+REVERSE('hello')
+olleh
+SELECT REVERSE('');
+REVERSE('')
+
+SELECT LEFT('hello', 3);
+LEFT('hello',3)
+hel
+SELECT RIGHT('hello', 3);
+RIGHT('hello',3)
+llo
+SELECT LEFT('hello', 0);
+LEFT('hello',0)
+
+SELECT RIGHT('hello', 0);
+RIGHT('hello',0)
+
+SELECT LEFT('hello', 10);
+LEFT('hello',10)
+hello
+SELECT LPAD('hi', 5, '0');
+LPAD('hi',5,'0')
+000hi
+SELECT RPAD('hi', 5, '0');
+RPAD('hi',5,'0')
+hi000
+SELECT LPAD('hello', 3, '0');
+LPAD('hello',3,'0')
+hel
+SELECT RPAD('hello', 3, '0');
+RPAD('hello',3,'0')
+hel
+CREATE TABLE t1 (id int primary key, name varchar(50), description varchar(100));
+INSERT INTO t1 VALUES (1, 'Alice', 'First user');
+INSERT INTO t1 VALUES (2, 'Bob', 'Second user');
+INSERT INTO t1 VALUES (3, 'Charlie', 'Third user');
+INSERT INTO t1 VALUES (4, '', 'Empty name');
+INSERT INTO t1 VALUES (5, NULL, 'NULL name');
+SELECT id, LENGTH(name), CHAR_LENGTH(name) FROM t1 ORDER BY id;
+id	LENGTH(name)	CHAR_LENGTH(name)
+1	5	5
+2	3	3
+3	7	7
+4	0	0
+5	NULL	NULL
+SELECT id, UPPER(name), LOWER(name) FROM t1 ORDER BY id;
+id	UPPER(name)	LOWER(name)
+1	ALICE	alice
+2	BOB	bob
+3	CHARLIE	charlie
+4		
+5	NULL	NULL
+SELECT id, CONCAT(name, ' - ', description) FROM t1 WHERE name IS NOT NULL AND name != '' ORDER BY id;
+id	CONCAT(name,' - ',description)
+1	Alice - First user
+2	Bob - Second user
+3	Charlie - Third user
+SELECT id, SUBSTRING(description, 1, 5) FROM t1 ORDER BY id;
+id	SUBSTRING(description,1,5)
+1	First
+2	Secon
+3	Third
+4	Empty
+5	NULL 
+SELECT id, REPLACE(description, 'user', 'person') FROM t1 ORDER BY id;
+id	REPLACE(description,'user','person')
+1	First person
+2	Second person
+3	Third person
+4	Empty name
+5	NULL name
+SELECT id, REVERSE(name) FROM t1 WHERE name IS NOT NULL ORDER BY id;
+id	REVERSE(name)
+1	ecilA
+2	boB
+3	eilrahC
+4	
+SELECT id, LPAD(name, 10, '*'), RPAD(name, 10, '*') FROM t1 WHERE name IS NOT NULL ORDER BY id;
+id	LPAD(name,10,'*')	RPAD(name,10,'*')
+1	*****Alice	Alice*****
+2	*******Bob	Bob*******
+3	***Charlie	Charlie***
+4	**********	**********
+DROP TABLE t1;
+CREATE TABLE t1 (a char(10));
+insert into t1 values ("a"),("abc"),("abcd"),("hello"),("test");
+select * from t1 where a like "abc%";
+a
+abc
+abcd
+select * from t1 where a like concat("abc","%");
+a
+abc
+abcd
+select * from t1 where a like "ABC%";
+a
+select * from t1 where a like "test%";
+a
+test
+select * from t1 where a like "te_t";
+a
+test
+select * from t1 where a like "%a%";
+a
+a
+abc
+abcd
+select * from t1 where a like "%abcd%";
+a
+abcd
+drop table t1;
+select 'c' like '\_' as want0;
+want0
+0
+SELECT COALESCE(NULL, 'hello');
+COALESCE(NULL,'hello')
+hello
+SELECT COALESCE('first', 'second');
+COALESCE('first','second')
+first
+SELECT COALESCE(NULL, NULL, 'third');
+COALESCE(NULL,NULL,'third')
+third
+SELECT CONCAT_WS(',', 'a', 'b', 'c');
+CONCAT_WS(',','a','b','c')
+a,b,c
+SELECT CONCAT_WS('-', 'hello', NULL, 'world');
+CONCAT_WS('-','hello',NULL,'world')
+hello-world
+SELECT CONCAT_WS('', 'a', 'b');
+CONCAT_WS('','a','b')
+ab
+SELECT HEX('ABC');
+HEX('ABC')
+414243
+SELECT UNHEX('414243');
+UNHEX('414243')
+ABC
+create table t1 (a int);
+insert into t1 values (48),(49),(50);
+select distinct char(a) from t1;
+CHAR(a)
+0
+1
+2
+drop table t1;
+SELECT CONCAT(UPPER(LEFT('hello', 1)), LOWER(SUBSTRING('HELLO', 2)));
+CONCAT(UPPER(LEFT('hello',1)),LOWER(SUBSTRING('HELLO',2)))
+Hello
+SELECT REPLACE(CONCAT('foo', 'bar'), 'ob', 'OB');
+REPLACE(CONCAT('foo','bar'),'ob','OB')
+foOBar
+SELECT TRIM(CONCAT('  ', 'hello', '  '));
+TRIM(CONCAT('  ','hello','  '))
+hello
+SELECT LENGTH(REPEAT('abc', 5));
+LENGTH(REPEAT('abc',5))
+15
