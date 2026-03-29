@@ -213,6 +213,12 @@ TIERS = {
         "multi_update_innodb",                # multi-table UPDATE edge cases
         "filesort_merge",                     # INSERT...SELECT, complex WHERE with OR, COUNT
     ],
+    25: [
+        "delete_where",                       # DELETE with complex WHERE (subquery, IS NULL, expressions)
+        "update_expr",                        # UPDATE with expressions (arithmetic, string, CASE, subquery)
+        "replace_into",                       # REPLACE INTO with key conflicts and defaults
+        "create_table_select",                # CREATE TABLE ... SELECT (CTAS)
+    ],
 }
 
 

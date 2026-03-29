@@ -1,0 +1,127 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE t2 AS SELECT * FROM t1;
+SELECT * FROM t2 ORDER BY a;
+a	b
+1	one
+2	two
+3	three
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+CREATE TABLE t2 AS SELECT * FROM t1 WHERE a > 2;
+SELECT * FROM t2 ORDER BY a;
+a	b
+3	30
+4	40
+5	50
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+CREATE TABLE t2 AS SELECT a, b, a + b AS total, a * b AS product FROM t1;
+SELECT * FROM t2 ORDER BY a;
+a	b	total	product
+1	10	11	10
+2	20	22	40
+3	30	33	90
+DROP TABLE t1, t2;
+CREATE TABLE t1 (category VARCHAR(10), amount INT);
+INSERT INTO t1 VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40), ('C', 50);
+CREATE TABLE t2 AS SELECT category, SUM(amount) AS total, COUNT(*) AS cnt
+FROM t1 GROUP BY category;
+SELECT * FROM t2 ORDER BY category;
+category	total	cnt
+A	30	2
+B	70	2
+C	50	1
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (5), (3), (1), (4), (2);
+CREATE TABLE t2 AS SELECT * FROM t1 ORDER BY a LIMIT 3;
+SELECT * FROM t2 ORDER BY a;
+a
+1
+2
+3
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT PRIMARY KEY, name VARCHAR(20));
+CREATE TABLE t2 (a INT, score INT);
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO t2 VALUES (1, 90), (2, 85), (1, 95), (3, 70);
+CREATE TABLE t3 AS SELECT t1.name, SUM(t2.score) AS total_score
+FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.name;
+SELECT * FROM t3 ORDER BY name;
+name	total_score
+Alice	185
+Bob	85
+Charlie	70
+DROP TABLE t1, t2, t3;
+CREATE TABLE t1 (name VARCHAR(50));
+INSERT INTO t1 VALUES ('alice'), ('BOB'), ('Charlie');
+CREATE TABLE t2 AS SELECT name, UPPER(name) AS upper_name, LENGTH(name) AS name_len FROM t1;
+SELECT * FROM t2 ORDER BY name;
+name	upper_name	name_len
+BOB	BOB	3
+Charlie	CHARLIE	7
+alice	ALICE	5
+DROP TABLE t1, t2;
+CREATE TABLE t1 AS SELECT 1 AS a, 'hello' AS b, 3.14 AS c;
+SELECT * FROM t1;
+a	b	c
+1	hello	3.14
+DROP TABLE t1;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (2), (2), (3), (3), (3);
+CREATE TABLE t2 AS SELECT DISTINCT a FROM t1;
+SELECT * FROM t2 ORDER BY a;
+a
+1
+2
+3
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+CREATE TABLE t2 (a INT);
+INSERT INTO t2 VALUES (3), (4), (5);
+CREATE TABLE t3 AS SELECT a FROM t1 UNION SELECT a FROM t2;
+SELECT * FROM t3 ORDER BY a;
+a
+1
+2
+3
+4
+5
+DROP TABLE t1, t2, t3;
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+CREATE TABLE t2 AS SELECT a, CASE WHEN b > 15 THEN 'high' ELSE 'low' END AS level FROM t1;
+SELECT * FROM t2 ORDER BY a;
+a	level
+1	low
+2	high
+3	high
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'x');
+CREATE TABLE t2 AS SELECT * FROM t1 WHERE 1 = 0;
+SELECT COUNT(*) FROM t2;
+COUNT(NULL)
+0
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b INT, c INT);
+INSERT INTO t1 VALUES (1, 2, 3);
+CREATE TABLE t2 AS SELECT a, c FROM t1;
+SELECT * FROM t2;
+a	c
+1	3
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, NULL), (2, 20), (NULL, 30);
+CREATE TABLE t2 AS SELECT COALESCE(a, 0) AS a, COALESCE(b, 0) AS b FROM t1;
+SELECT * FROM t2 ORDER BY a, b;
+a	b
+0	30
+1	0
+2	20
+DROP TABLE t1, t2;

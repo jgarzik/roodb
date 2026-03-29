@@ -1,0 +1,161 @@
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'original');
+SELECT * FROM t1;
+a	b
+1	original
+REPLACE INTO t1 VALUES (1, 'replaced');
+SELECT * FROM t1;
+a	b
+1	original
+REPLACE INTO t1 VALUES (2, 'new_row');
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	original
+2	new_row
+DROP TABLE t1;
+CREATE TABLE t1 (
+a INT NOT NULL,
+b INT NOT NULL,
+c VARCHAR(20),
+PRIMARY KEY (a, b)
+);
+INSERT INTO t1 VALUES (1, 1, 'first'), (1, 2, 'second'), (2, 1, 'third');
+SELECT * FROM t1 ORDER BY a, b;
+a	b	c
+1	1	first
+1	2	second
+2	1	third
+REPLACE INTO t1 (a, b, c) VALUES (1, 1, 'replaced_first');
+SELECT * FROM t1 ORDER BY a, b;
+a	b	c
+1	1	first
+1	2	second
+2	1	third
+REPLACE INTO t1 (a, b, c) VALUES (2, 2, 'brand_new');
+SELECT * FROM t1 ORDER BY a, b;
+a	b	c
+1	1	first
+1	2	second
+2	1	third
+2	2	brand_new
+DROP TABLE t1;
+CREATE TABLE t1 (
+id INT NOT NULL PRIMARY KEY,
+email VARCHAR(100) NOT NULL,
+name VARCHAR(50),
+UNIQUE KEY (email)
+);
+INSERT INTO t1 VALUES (1, 'alice@test.com', 'Alice');
+INSERT INTO t1 VALUES (2, 'bob@test.com', 'Bob');
+SELECT * FROM t1 ORDER BY id;
+id	email	name
+1	alice@test.com	Alice
+2	bob@test.com	Bob
+REPLACE INTO t1 (id, email, name) VALUES (1, 'alice@test.com', 'Alice Updated');
+SELECT * FROM t1 ORDER BY id;
+id	email	name
+1	alice@test.com	Alice
+2	bob@test.com	Bob
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+REPLACE INTO t1 VALUES (2, 200), (4, 400);
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+4	400
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(10));
+REPLACE INTO t1 VALUES (1, 'hello');
+REPLACE INTO t1 VALUES (2, 'world');
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	hello
+2	world
+DROP TABLE t1;
+CREATE TABLE t1 (
+a INT NOT NULL PRIMARY KEY,
+b VARCHAR(20) DEFAULT 'default_val',
+c INT DEFAULT 42
+);
+REPLACE INTO t1 (a) VALUES (1);
+SELECT * FROM t1;
+a	b	c
+1	default_val	42
+REPLACE INTO t1 VALUES (1, 'custom', 99);
+SELECT * FROM t1;
+a	b	c
+1	default_val	42
+REPLACE INTO t1 (a) VALUES (1);
+SELECT * FROM t1;
+a	b	c
+1	default_val	42
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b INT);
+REPLACE INTO t1 VALUES (1, NULL);
+SELECT * FROM t1;
+a	b
+1	NULL
+REPLACE INTO t1 VALUES (1, 42);
+SELECT * FROM t1;
+a	b
+1	NULL
+REPLACE INTO t1 VALUES (1, NULL);
+SELECT * FROM t1;
+a	b
+1	NULL
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b INT);
+REPLACE INTO t1 VALUES (1, 1);
+REPLACE INTO t1 VALUES (1, 2);
+REPLACE INTO t1 VALUES (1, 3);
+REPLACE INTO t1 VALUES (1, 4);
+SELECT * FROM t1;
+a	b
+1	1
+DROP TABLE t1;
+CREATE TABLE t1 (
+a INT NOT NULL PRIMARY KEY,
+b DECIMAL(10,2),
+c DATE,
+d VARCHAR(100)
+);
+REPLACE INTO t1 VALUES (1, 123.45, '2024-01-15', 'test string');
+SELECT * FROM t1;
+a	b	c	d
+1	123.45	2024-01-15	test string
+REPLACE INTO t1 VALUES (1, 999.99, '2025-12-31', 'updated');
+SELECT * FROM t1;
+a	b	c	d
+1	123.45	2024-01-15	test string
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b INT);
+REPLACE INTO t1 VALUES (1, 10);
+REPLACE INTO t1 VALUES (2, 20);
+REPLACE INTO t1 VALUES (3, 30);
+SELECT COUNT(*) FROM t1;
+COUNT(NULL)
+3
+REPLACE INTO t1 VALUES (2, 200);
+SELECT COUNT(*) FROM t1;
+COUNT(NULL)
+3
+REPLACE INTO t1 VALUES (4, 40);
+SELECT COUNT(*) FROM t1;
+COUNT(NULL)
+4
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+4	40
+DROP TABLE t1;
