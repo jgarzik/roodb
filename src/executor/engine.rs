@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 
 use crate::catalog::Catalog;
 use crate::planner::logical::builder::LogicalPlanBuilder;
-use crate::planner::logical::{ResolvedExpr, ResolvedStatement};
+use crate::planner::logical::{Literal, ResolvedExpr, ResolvedStatement};
 use crate::planner::physical::{datum_to_literal, PhysicalPlanner};
 use crate::planner::PhysicalPlan;
 use crate::raft::RaftNode;
@@ -283,6 +283,12 @@ impl ExecutorEngine {
                     };
                     Ok(())
                 }
+                ResolvedExpr::ExistsSubquery { query, negated } => {
+                    let exists = self.execute_exists_subquery(query).await?;
+                    let result = if *negated { !exists } else { exists };
+                    *expr = ResolvedExpr::Literal(Literal::Boolean(result));
+                    Ok(())
+                }
                 ResolvedExpr::BinaryOp { left, right, .. } => {
                     self.materialize_expr(left).await?;
                     self.materialize_expr(right).await
@@ -412,6 +418,23 @@ impl ExecutorEngine {
 
         executor.close().await?;
         Ok(values)
+    }
+
+    /// Execute an EXISTS subquery and return whether any rows exist.
+    async fn execute_exists_subquery(
+        &self,
+        query: &crate::planner::logical::ResolvedSelect,
+    ) -> ExecutorResult<bool> {
+        let mut physical = self.plan_subquery(query)?;
+        // Recursively materialize any subqueries nested inside this subquery's plan
+        self.materialize_subqueries_in_plan(&mut physical).await?;
+        let mut executor = self.build_node(physical)?;
+        executor.open().await?;
+
+        let has_rows = executor.next().await?.is_some();
+
+        executor.close().await?;
+        Ok(has_rows)
     }
 
     fn build_node(&self, plan: PhysicalPlan) -> ExecutorResult<Box<dyn Executor>> {

@@ -132,4 +132,54 @@ id	amount
 1	20.75
 2	30.00
 3	40.25
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2)
+ORDER BY t1.id;
+id	val
+1	has_orders
+2	has_orders
+3	has_orders
+4	four
+5	has_orders
+SELECT t1.id, t1.val
+FROM t1
+WHERE NOT EXISTS (SELECT 1 FROM t2)
+ORDER BY t1.id;
+id	val
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE ref_id = 1)
+ORDER BY t1.id;
+id	val
+1	has_orders
+2	has_orders
+3	has_orders
+4	four
+5	has_orders
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
+id	val
+SELECT t1.id, t1.val
+FROM t1
+WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
+id	val
+1	has_orders
+2	has_orders
+3	has_orders
+4	four
+5	has_orders
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT COUNT(*) FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
+id	val
+1	has_orders
+2	has_orders
+3	has_orders
+4	four
+5	has_orders
 DROP TABLE t1, t2, t3, t4;

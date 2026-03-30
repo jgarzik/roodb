@@ -697,6 +697,8 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
         ResolvedExpr::InSubquery { expr, .. } => {
             substitute_expr(expr, params)?;
         }
+        // EXISTS subqueries are self-contained, no placeholder substitution needed
+        ResolvedExpr::ExistsSubquery { .. } => {}
     }
     Ok(())
 }

@@ -193,6 +193,11 @@ pub enum ResolvedExpr {
         query: Box<ResolvedSelect>,
         negated: bool,
     },
+    /// EXISTS / NOT EXISTS subquery
+    ExistsSubquery {
+        query: Box<ResolvedSelect>,
+        negated: bool,
+    },
 }
 
 impl ResolvedExpr {
@@ -233,6 +238,7 @@ impl ResolvedExpr {
             ResolvedExpr::Case { result_type, .. } => result_type.clone(),
             ResolvedExpr::ScalarSubquery { result_type, .. } => result_type.clone(),
             ResolvedExpr::InSubquery { .. } => DataType::Boolean,
+            ResolvedExpr::ExistsSubquery { .. } => DataType::Boolean,
         }
     }
 
@@ -265,6 +271,7 @@ impl ResolvedExpr {
             }
             ResolvedExpr::ScalarSubquery { .. } => true, // Subquery may return NULL or no rows
             ResolvedExpr::InSubquery { .. } => true,     // IN subquery can return NULL
+            ResolvedExpr::ExistsSubquery { .. } => false, // EXISTS always returns true/false
         }
     }
 }

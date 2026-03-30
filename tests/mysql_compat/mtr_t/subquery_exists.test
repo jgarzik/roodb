@@ -1,7 +1,6 @@
-# Custom test for RooDB: Advanced JOIN patterns and aggregation.
-# Exercises INNER JOIN, LEFT JOIN, self-join, derived tables, multi-table queries.
-#
-# [RooDB-skip] EXISTS/NOT EXISTS — not supported
+# Custom test for RooDB: Advanced JOIN patterns, aggregation, and EXISTS subqueries.
+# Exercises INNER JOIN, LEFT JOIN, self-join, derived tables, multi-table queries,
+# and EXISTS/NOT EXISTS subqueries.
 
 --disable_warnings
 DROP TABLE IF EXISTS t1, t2, t3, t4;
@@ -103,6 +102,42 @@ SELECT t1.id, t2.amount
 FROM t1 JOIN t2 ON t1.id = t2.ref_id
 WHERE t2.amount BETWEEN 15 AND 45
 ORDER BY t2.amount;
+
+# --- EXISTS: uncorrelated, t2 has rows so all t1 rows returned ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2)
+ORDER BY t1.id;
+
+# --- NOT EXISTS: uncorrelated, t2 has rows so no t1 rows returned ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE NOT EXISTS (SELECT 1 FROM t2)
+ORDER BY t1.id;
+
+# --- EXISTS with filter: t2 has rows where ref_id = 1 ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE ref_id = 1)
+ORDER BY t1.id;
+
+# --- EXISTS with filter that matches nothing ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
+
+# --- NOT EXISTS with filter that matches nothing: all rows returned ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
+
+# --- EXISTS with aggregate subquery: COUNT(*) always returns a row ---
+SELECT t1.id, t1.val
+FROM t1
+WHERE EXISTS (SELECT COUNT(*) FROM t2 WHERE ref_id = 999)
+ORDER BY t1.id;
 
 # --- Cleanup ---
 DROP TABLE t1, t2, t3, t4;

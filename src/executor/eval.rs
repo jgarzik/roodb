@@ -330,6 +330,9 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
         ResolvedExpr::InSubquery { .. } => Err(ExecutorError::Internal(
             "InSubquery not materialized before evaluation".to_string(),
         )),
+        ResolvedExpr::ExistsSubquery { .. } => Err(ExecutorError::Internal(
+            "ExistsSubquery not materialized before evaluation".to_string(),
+        )),
     }
 }
 

@@ -474,6 +474,8 @@ impl LogicalPlanBuilder {
             // Scalar subqueries are self-contained; aggregates inside don't affect the outer query
             ResolvedExpr::ScalarSubquery { .. } => false,
             ResolvedExpr::InSubquery { expr, .. } => Self::expr_has_aggregate(expr),
+            // EXISTS subqueries are self-contained
+            ResolvedExpr::ExistsSubquery { .. } => false,
             _ => false,
         }
     }
@@ -589,7 +591,7 @@ impl LogicalPlanBuilder {
             ResolvedExpr::InSubquery { expr, .. } => {
                 Self::collect_aggregates(expr, idx, None, out);
             }
-            // ScalarSubquery is self-contained, no outer aggregates to collect
+            // ScalarSubquery and ExistsSubquery are self-contained, no outer aggregates to collect
             _ => {}
         }
     }
@@ -885,6 +887,7 @@ impl LogicalPlanBuilder {
                 query: query.clone(),
                 negated: *negated,
             },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
             // For other expression types (Column, Literal, etc.), pass through
             other => other.clone(),
         }
@@ -1095,6 +1098,11 @@ impl LogicalPlanBuilder {
                 ResolvedExpr::BooleanTest { expr: ea, test: ta },
                 ResolvedExpr::BooleanTest { expr: eb, test: tb },
             ) => ta == tb && Self::exprs_equal(ea, eb),
+            // ExistsSubquery: compare by negation (queries are opaque here)
+            (
+                ResolvedExpr::ExistsSubquery { negated: na, .. },
+                ResolvedExpr::ExistsSubquery { negated: nb, .. },
+            ) => na == nb,
             _ => false,
         }
     }
@@ -1265,6 +1273,7 @@ impl LogicalPlanBuilder {
                 query: query.clone(),
                 negated: *negated,
             },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
             other => other.clone(),
         }
     }
@@ -1429,6 +1438,13 @@ impl LogicalPlanBuilder {
             ResolvedExpr::InSubquery { expr, negated, .. } => {
                 let neg = if *negated { " NOT" } else { "" };
                 format!("{}{} IN (SELECT ...)", Self::expr_to_sql(expr), neg)
+            }
+            ResolvedExpr::ExistsSubquery { negated, .. } => {
+                if *negated {
+                    "NOT EXISTS (SELECT ...)".to_string()
+                } else {
+                    "EXISTS (SELECT ...)".to_string()
+                }
             }
         }
     }
@@ -1628,6 +1644,7 @@ impl LogicalPlanBuilder {
                 query: query.clone(),
                 negated: *negated,
             },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
             // Other expression types pass through unchanged
             _ => expr.clone(),
         }

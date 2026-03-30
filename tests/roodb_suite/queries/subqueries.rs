@@ -249,3 +249,153 @@ async fn test_nested_scalar_subquery() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_exists_subquery() {
+    let server = TestServer::start("subq_exists").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE exists_t1 (id INT PRIMARY KEY, val VARCHAR(20))")
+        .await
+        .expect("CREATE TABLE t1 failed");
+
+    conn.query_drop("CREATE TABLE exists_t2 (id INT PRIMARY KEY, ref_id INT)")
+        .await
+        .expect("CREATE TABLE t2 failed");
+
+    conn.query_drop("INSERT INTO exists_t1 (id, val) VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await
+        .expect("INSERT t1 failed");
+
+    conn.query_drop("INSERT INTO exists_t2 (id, ref_id) VALUES (1, 1), (2, 3)")
+        .await
+        .expect("INSERT t2 failed");
+
+    // Uncorrelated EXISTS: t2 has rows, so EXISTS is true — all rows returned
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, val FROM exists_t1 WHERE EXISTS (SELECT 1 FROM exists_t2) ORDER BY id")
+        .await
+        .expect("EXISTS subquery failed");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], (1, "one".to_string()));
+    assert_eq!(rows[1], (2, "two".to_string()));
+    assert_eq!(rows[2], (3, "three".to_string()));
+
+    // Uncorrelated NOT EXISTS: t2 has rows, so NOT EXISTS is false — no rows returned
+    let rows: Vec<(i32, String)> = conn
+        .query(
+            "SELECT id, val FROM exists_t1 WHERE NOT EXISTS (SELECT 1 FROM exists_t2) ORDER BY id",
+        )
+        .await
+        .expect("NOT EXISTS subquery failed");
+    assert_eq!(rows.len(), 0);
+
+    // EXISTS with a filter that matches some rows
+    let rows: Vec<(i32, String)> = conn
+        .query(
+            "SELECT id, val FROM exists_t1 WHERE EXISTS (SELECT 1 FROM exists_t2 WHERE ref_id = 1) ORDER BY id",
+        )
+        .await
+        .expect("EXISTS with filter subquery failed");
+    assert_eq!(rows.len(), 3);
+
+    // EXISTS with a filter that matches NO rows
+    let rows: Vec<(i32, String)> = conn
+        .query(
+            "SELECT id, val FROM exists_t1 WHERE EXISTS (SELECT 1 FROM exists_t2 WHERE ref_id = 999) ORDER BY id",
+        )
+        .await
+        .expect("EXISTS with no-match filter subquery failed");
+    assert_eq!(rows.len(), 0);
+
+    // NOT EXISTS with a filter that matches NO rows — should return all rows
+    let rows: Vec<(i32, String)> = conn
+        .query(
+            "SELECT id, val FROM exists_t1 WHERE NOT EXISTS (SELECT 1 FROM exists_t2 WHERE ref_id = 999) ORDER BY id",
+        )
+        .await
+        .expect("NOT EXISTS with no-match filter subquery failed");
+    assert_eq!(rows.len(), 3);
+
+    conn.query_drop("DROP TABLE exists_t1")
+        .await
+        .expect("DROP TABLE t1 failed");
+    conn.query_drop("DROP TABLE exists_t2")
+        .await
+        .expect("DROP TABLE t2 failed");
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_exists_empty_table() {
+    let server = TestServer::start("subq_exists_empty").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE exists_e1 (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE e1 failed");
+
+    conn.query_drop("CREATE TABLE exists_e2 (id INT PRIMARY KEY)")
+        .await
+        .expect("CREATE TABLE e2 failed");
+
+    conn.query_drop("INSERT INTO exists_e1 (id, val) VALUES (1, 10), (2, 20)")
+        .await
+        .expect("INSERT e1 failed");
+
+    // EXISTS against empty table: should return no rows
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM exists_e1 WHERE EXISTS (SELECT 1 FROM exists_e2)")
+        .await
+        .expect("EXISTS on empty table failed");
+    assert_eq!(rows.len(), 0);
+
+    // NOT EXISTS against empty table: should return all rows
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM exists_e1 WHERE NOT EXISTS (SELECT 1 FROM exists_e2) ORDER BY id")
+        .await
+        .expect("NOT EXISTS on empty table failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+
+    conn.query_drop("DROP TABLE exists_e1")
+        .await
+        .expect("DROP TABLE e1 failed");
+    conn.query_drop("DROP TABLE exists_e2")
+        .await
+        .expect("DROP TABLE e2 failed");
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_exists_with_aggregation() {
+    let server = TestServer::start("subq_exists_agg").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE exists_a1 (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE a1 failed");
+
+    conn.query_drop("INSERT INTO exists_a1 (id, val) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("INSERT a1 failed");
+
+    // EXISTS with aggregation in subquery — COUNT(*) always returns a row, so EXISTS is always true
+    let rows: Vec<(i32,)> = conn
+        .query(
+            "SELECT id FROM exists_a1 WHERE EXISTS (SELECT COUNT(*) FROM exists_a1 WHERE val > 100) ORDER BY id",
+        )
+        .await
+        .expect("EXISTS with aggregate subquery failed");
+    // COUNT(*) returns 0 even when no rows match, so EXISTS is true
+    assert_eq!(rows.len(), 3);
+
+    conn.query_drop("DROP TABLE exists_a1")
+        .await
+        .expect("DROP TABLE a1 failed");
+    drop(conn);
+    server.shutdown().await;
+}

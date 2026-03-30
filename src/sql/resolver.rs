@@ -1789,6 +1789,16 @@ impl<'a> Resolver<'a> {
                 })
             }
 
+            // EXISTS / NOT EXISTS subquery
+            sp::Expr::Exists { subquery, negated } => {
+                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                self.resolve_query_order_limit(&mut inner_select, subquery)?;
+                Ok(ResolvedExpr::ExistsSubquery {
+                    query: Box::new(inner_select),
+                    negated: *negated,
+                })
+            }
+
             // SUBSTRING(expr, from, for) — sqlparser parses as AST node
             sp::Expr::Substring {
                 expr,
