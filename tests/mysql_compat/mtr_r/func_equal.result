@@ -1,21 +1,21 @@
 drop table if exists t1,t2;
 select 0<=>0,0.0<=>0.0,0E0=0E0,"A"<=>"A",NULL<=>NULL;
-0 <=> 0	0 <=> 0	0 = 0	'A' <=> 'A'	NULL <=> NULL
+0 <=> 0	0.0 <=> 0.0	0 = 0	'A' <=> 'A'	NULL <=> NULL
 1	1	1	1	1
 select 1<=>0,0<=>NULL,NULL<=>0;
 1 <=> 0	0 <=> NULL	NULL <=> 0
 0	0	0
 select 1.0<=>0.0,0.0<=>NULL,NULL<=>0.0;
-1 <=> 0	0 <=> NULL	NULL <=> 0
+1.0 <=> 0.0	0.0 <=> NULL	NULL <=> 0.0
 0	0	0
 select "A"<=>"B","A"<=>NULL,NULL<=>"A";
 'A' <=> 'B'	'A' <=> NULL	NULL <=> 'A'
 0	0	0
 select 0<=>0.0, 0.0<=>0E0, 0E0<=>"0", 10.0<=>1E1, 10<=>10.0, 10<=>1E1;
-0 <=> 0	0 <=> 0	0 <=> '0'	10 <=> 10	10 <=> 10	10 <=> 10
+0 <=> 0.0	0.0 <=> 0	0 <=> '0'	10.0 <=> 10	10 <=> 10.0	10 <=> 10
 1	1	0	1	1	1
 select 1.0<=>0E1,10<=>NULL,NULL<=>0.0, NULL<=>0E0;
-1 <=> 0	10 <=> NULL	NULL <=> 0	NULL <=> 0
+1.0 <=> 0	10 <=> NULL	NULL <=> 0.0	NULL <=> 0
 0	0	0	0
 create table t1 (id int, value int);
 create table t2 (id int, value int);

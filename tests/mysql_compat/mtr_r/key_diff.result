@@ -1,0 +1,43 @@
+drop table if exists t1;
+CREATE TABLE t1 (
+a char(5) NOT NULL,
+b char(4) NOT NULL,
+KEY (a),
+KEY (b)
+) charset utf8mb4;
+INSERT INTO t1 VALUES ('A','B'),('b','A'),('C','c'),('D','E'),('a','a');
+select * from t1,t1 as t2;
+a	b	a	b
+A	B	A	B
+A	B	C	c
+A	B	D	E
+A	B	a	a
+A	B	b	A
+C	c	A	B
+C	c	C	c
+C	c	D	E
+C	c	a	a
+C	c	b	A
+D	E	A	B
+D	E	C	c
+D	E	D	E
+D	E	a	a
+D	E	b	A
+a	a	A	B
+a	a	C	c
+a	a	D	E
+a	a	a	a
+a	a	b	A
+b	A	A	B
+b	A	C	c
+b	A	D	E
+b	A	a	a
+b	A	b	A
+select t1.*,t2.* from t1,t1 as t2 where t1.A=t2.B order by t1.a, t2.a;
+a	b	a	b
+A	B	b	A
+a	a	a	a
+select * from t1 where a='a';
+a	b
+a	a
+drop table t1;

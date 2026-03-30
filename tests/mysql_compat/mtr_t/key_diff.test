@@ -1,0 +1,25 @@
+# Adapted from MySQL key_diff.test for RooDB compatibility testing.
+# Tests self-join conditions on different-length CHAR key columns.
+#
+# [RooDB-skip] ANALYZE TABLE (lines 19) — not supported
+# [RooDB-skip] EXPLAIN (line 20) — output format differs
+# [RooDB-skip] ORDER BY BINARY (line 22) — BINARY cast not supported
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+CREATE TABLE t1 (
+  a char(5) NOT NULL,
+  b char(4) NOT NULL,
+  KEY (a),
+  KEY (b)
+) charset utf8mb4;
+
+INSERT INTO t1 VALUES ('A','B'),('b','A'),('C','c'),('D','E'),('a','a');
+
+--sorted_result
+select * from t1,t1 as t2;
+select t1.*,t2.* from t1,t1 as t2 where t1.A=t2.B order by t1.a, t2.a;
+select * from t1 where a='a';
+drop table t1;

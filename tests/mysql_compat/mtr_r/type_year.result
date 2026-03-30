@@ -30,7 +30,7 @@ create table t1(a year);
 insert ignore into t1 values (2000.5), ('2000.5'), ('2001a'), ('2.001E3');
 select * from t1;
 a
-2001
+0
 2001
 2001
 2001

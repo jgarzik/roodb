@@ -36,11 +36,11 @@ select 'b' between 'a' and 'c', 'B' between 'a' and 'c';
 'b' BETWEEN 'a' AND 'c'	'B' BETWEEN 'a' AND 'c'
 1	0
 select 2 in (3,2,5,9,5,1),"monty" in ("david","monty","allan"), 1.2 in (1.4,1.2,1.0);
-2 IN (3, 2, 5, 9, 5, 1)	'monty' IN ('david', 'monty', 'allan')	1.2 IN (1.4, 1.2, 1)
+2 IN (3, 2, 5, 9, 5, 1)	'monty' IN ('david', 'monty', 'allan')	1.2 IN (1.4, 1.2, 1.0)
 1	1	1
 select -1.49 or -1.49,0.6 or 0.6;
 -1.49 OR -1.49	0.6 OR 0.6
-NULL	NULL
+1	1
 select 3 ^ 11, 1 ^ 1, 1 ^ 0, 1 ^ NULL, NULL ^ 1;
 3 ^ 11	1 ^ 1	1 ^ 0	1 ^ NULL	NULL ^ 1
 8	0	1	NULL	NULL
@@ -80,8 +80,8 @@ GREATEST(d,d)
 NULL
 DROP TABLE t1;
 select 1197.90 mod 50;
-1197.9 % 50
-47.900000000000091
+1197.90 % 50
+47.90
 select 5.1 mod 3, 5.1 mod -3, -5.1 mod 3, -5.1 mod -3;
 5.1 % 3	5.1 % -3	-5.1 % 3	-5.1 % -3
 2.1	2.1	-2.1	-2.1
@@ -180,7 +180,7 @@ SELECT LEAST('xxx','aaa',NULL,'yyy') FROM DUAL;
 LEAST('xxx','aaa',NULL,'yyy')
 NULL
 SELECT LEAST(1.1,1.2,NULL,1.0) FROM DUAL;
-LEAST(1.1,1.2,NULL,1)
+LEAST(1.1,1.2,NULL,1.0)
 NULL
 SELECT GREATEST(1.5E+2,1.3E+2,NULL) FROM DUAL;
 GREATEST(150,130,NULL)

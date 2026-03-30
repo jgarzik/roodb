@@ -219,6 +219,12 @@ TIERS = {
         "replace_into",                       # REPLACE INTO with key conflicts and defaults
         "create_table_select",                # CREATE TABLE ... SELECT (CTAS)
     ],
+    26: [
+        "decimal_arithmetic",                 # exact decimal literal arithmetic (0.7+0.1=0.8)
+        "key_diff",                           # self-join with different-length CHAR keys
+        "bulk_replace",                       # REPLACE INTO with unique constraints and bulk inserts
+        "join_outer_innodb",                  # LEFT JOIN with NULLs, aggregates, multi-table
+    ],
 }
 
 

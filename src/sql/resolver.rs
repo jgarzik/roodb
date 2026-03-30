@@ -2775,7 +2775,30 @@ pub fn parse_default_value(expr: &str) -> Literal {
     if let Ok(i) = trimmed.parse::<i64>() {
         return Literal::Integer(i);
     }
-    // Try float
+    // Try decimal (has decimal point but no scientific notation)
+    if trimmed.contains('.') && !trimmed.contains('E') && !trimmed.contains('e') {
+        if let Some(dot_pos) = trimmed.find('.') {
+            let scale = (trimmed.len() - dot_pos - 1) as u8;
+            let mut unscaled_str = String::with_capacity(trimmed.len() - 1);
+            unscaled_str.push_str(&trimmed[..dot_pos]);
+            unscaled_str.push_str(&trimmed[dot_pos + 1..]);
+            let negative = unscaled_str.starts_with('-');
+            let digits = if negative {
+                unscaled_str[1..].trim_start_matches('0')
+            } else {
+                unscaled_str.trim_start_matches('0')
+            };
+            let digits = if digits.is_empty() { "0" } else { digits };
+            if let Ok(unscaled) = if negative {
+                format!("-{}", digits).parse::<i128>()
+            } else {
+                digits.parse::<i128>()
+            } {
+                return Literal::Decimal(unscaled, scale);
+            }
+        }
+    }
+    // Try float (scientific notation)
     if let Ok(f) = trimmed.parse::<f64>() {
         return Literal::Float(f);
     }
@@ -2804,7 +2827,41 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::Null => Ok(Literal::Null),
         sp::Value::Boolean(b) => Ok(Literal::Boolean(*b)),
         sp::Value::Number(n, _) => {
-            if n.contains('.') || n.contains('E') || n.contains('e') {
+            if n.contains('.') && !n.contains('E') && !n.contains('e') {
+                // Decimal literal (e.g. 0.7, 3.14, 100.00) — exact DECIMAL, not float.
+                // MySQL treats numeric literals with a decimal point (but no scientific
+                // notation) as exact DECIMAL values.
+                let dot_pos = n.find('.').unwrap();
+                let scale = (n.len() - dot_pos - 1) as u8;
+                // Build the unscaled integer by removing the decimal point
+                let mut unscaled_str = String::with_capacity(n.len() - 1);
+                unscaled_str.push_str(&n[..dot_pos]);
+                unscaled_str.push_str(&n[dot_pos + 1..]);
+                // Strip leading zeros for parsing but preserve sign
+                let negative = unscaled_str.starts_with('-');
+                let digits = if negative {
+                    unscaled_str[1..].trim_start_matches('0')
+                } else {
+                    unscaled_str.trim_start_matches('0')
+                };
+                let digits = if digits.is_empty() { "0" } else { digits };
+                let parse_result: Result<i128, _> = if negative {
+                    format!("-{}", digits).parse()
+                } else {
+                    digits.parse()
+                };
+                match parse_result {
+                    Ok(unscaled) => Ok(Literal::Decimal(unscaled, scale)),
+                    Err(_) => {
+                        // Value too large for i128 — fall back to f64 (lossy)
+                        let val = n.parse().map_err(|_| {
+                            SqlError::InvalidOperation(format!("Invalid decimal literal: '{}'", n))
+                        })?;
+                        Ok(Literal::Float(val))
+                    }
+                }
+            } else if n.contains('E') || n.contains('e') {
+                // Scientific notation — true floating-point
                 let val = n.parse().map_err(|_| {
                     SqlError::InvalidOperation(format!("Invalid float literal: '{}'", n))
                 })?;

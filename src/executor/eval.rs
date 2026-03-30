@@ -1579,9 +1579,14 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
         },
         DataType::Double | DataType::Float => match val {
             Datum::Int(i) => Ok(Datum::Float(*i as f64)),
+            Datum::UnsignedInt(u) => Ok(Datum::Float(*u as f64)),
             Datum::Float(f) => Ok(Datum::Float(*f)),
             Datum::Bool(b) => Ok(Datum::Float(if *b { 1.0 } else { 0.0 })),
             Datum::String(s) => Ok(Datum::Float(s.parse::<f64>().unwrap_or(0.0))),
+            Datum::Decimal { value, scale } => {
+                let divisor = 10f64.powi(*scale as i32);
+                Ok(Datum::Float(*value as f64 / divisor))
+            }
             _ => Ok(Datum::Float(0.0)),
         },
         DataType::Varchar(_) | DataType::Text => Ok(Datum::String(val.to_display_string())),

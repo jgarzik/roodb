@@ -121,16 +121,16 @@ SELECT 1 IN (1,'2.0');
 1 IN (1, '2.0')
 1
 SELECT 1 IN ('1.0',2.0);
-1 IN ('1.0', 2)
+1 IN ('1.0', 2.0)
 0
 SELECT 1 IN (1.0,'2.0');
-1 IN (1, '2.0')
+1 IN (1.0, '2.0')
 1
 SELECT 1 IN ('1.1',2);
 1 IN ('1.1', 2)
 0
 SELECT 1 IN ('1.1',2.0);
-1 IN ('1.1', 2)
+1 IN ('1.1', 2.0)
 0
 CREATE TABLE t1 (id int, key(id));
 INSERT INTO t1 VALUES (1),(2),(3);
