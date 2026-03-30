@@ -58,10 +58,13 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 21 | func_date_add, type_nchar, truth_value_transform, ctype_ascii | DATE_ADD intervals, NCHAR types, IS TRUE/FALSE, ASCII ordering |
 | 22 | round, sum_distinct, implicit_char_to_num_conversion, subquery_exists | String-to-int rounding, DISTINCT aggregates, type coercion, JOINs |
 | 23 | key_primary, temporal_literal, bug28940878, func_default | PK lookups, temporal literals, DATE comparisons, DEFAULT keyword |
+| 24 | empty_table, count_distinct2, multi_update_innodb, filesort_merge | Empty tables, COUNT(DISTINCT) NULL, multi-table JOINs, large datasets |
+| 25 | delete_where, update_expr, replace_into, create_table_select | Complex DELETE/UPDATE, REPLACE INTO, CREATE TABLE ... SELECT |
+| 26 | decimal_arithmetic, key_diff, bulk_replace, join_outer_innodb | Exact decimal math, CHAR key joins, bulk REPLACE, LEFT JOIN NULLs |
 
 ## Current Status
 
-**112 MySQL compat tests across 23 tiers — all pass**
+**124 MySQL compat tests across 26 tiers — all pass**
 **210+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -202,6 +205,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Bool arithmetic coercion | TRUE/FALSE convert to 1/0 in arithmetic contexts |
 | UPDATE type coercion | UPDATE calls coerce_to_column_type, matching INSERT behavior |
 | INSERT DEFAULT keyword | DEFAULT in VALUES clause uses column's actual default value |
+| Exact decimal literals | `0.7` parsed as Decimal(7,1) not Float — `0.7+0.1=0.8` exact |
+| Decimal-to-Float cast | Decimal values inserted into FLOAT/DOUBLE columns convert correctly |
 | MySQL RAND(seed) | Deterministic LCG matching MySQL's algorithm; thread-local state |
 | B'...' bit string literals | `B'10101'` parsed as unsigned integer from binary |
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
