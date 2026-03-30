@@ -3363,6 +3363,12 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         }
         "FORMAT" => Ok(DataType::Text),
         "SHA" | "SHA1" | "SHA2" | "MD5" => Ok(DataType::Text),
+        "TO_BASE64" | "FROM_BASE64" | "QUOTE" | "UUID" => Ok(DataType::Text),
+        "RANDOM_BYTES" | "AES_ENCRYPT" | "AES_DECRYPT" | "COMPRESS" => Ok(DataType::Blob),
+        "UNCOMPRESS" => Ok(DataType::Text),
+        "UNCOMPRESSED_LENGTH" | "UUID_SHORT" | "BENCHMARK" | "IS_IPV4" | "IS_IPV6" => {
+            Ok(DataType::BigInt)
+        }
         "WEIGHT_STRING" => Ok(DataType::Blob),
         "CRC32" => Ok(DataType::BigInt),
         "CONNECTION_ID" | "LAST_INSERT_ID" => Ok(DataType::BigInt),

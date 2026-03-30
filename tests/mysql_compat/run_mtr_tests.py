@@ -279,6 +279,15 @@ TIERS = {
         "func_convert_tz",                    # CONVERT_TZ timezone conversion
         "func_weekofyear_toseconds",          # WEEKOFYEAR, TO_SECONDS
     ],
+    37: [
+        "func_hash",                          # MD5, SHA1, SHA, SHA2 hash functions
+        "func_base64",                        # TO_BASE64, FROM_BASE64
+        "func_crypto",                        # RANDOM_BYTES, AES_ENCRYPT/DECRYPT
+        "func_compress",                      # COMPRESS, UNCOMPRESS, UNCOMPRESSED_LENGTH
+        "func_quote_export",                  # QUOTE, EXPORT_SET
+        "func_network",                       # IS_IPV4, IS_IPV6
+        "func_uuid",                          # UUID, UUID_SHORT, BENCHMARK
+    ],
 }
 
 

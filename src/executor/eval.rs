@@ -4386,6 +4386,368 @@ pub fn eval_function(
             }
         }
 
+        // ── Hash functions ──
+        "MD5" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MD5 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use md5::Digest as _;
+            let mut hasher = md5::Md5::new();
+            hasher.update(args[0].to_display_string().as_bytes());
+            Ok(Datum::String(format!("{:x}", hasher.finalize())))
+        }
+
+        "SHA" | "SHA1" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SHA1 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use sha1::Digest as _;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(args[0].to_display_string().as_bytes());
+            Ok(Datum::String(format!("{:x}", hasher.finalize())))
+        }
+
+        "SHA2" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SHA2 requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = args[0].to_display_string();
+            let hash_len = args[1].as_int().unwrap_or(-1);
+            use sha2::Digest as _;
+            match hash_len {
+                0 | 256 => {
+                    let mut h = sha2::Sha256::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                224 => {
+                    let mut h = sha2::Sha224::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                384 => {
+                    let mut h = sha2::Sha384::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                512 => {
+                    let mut h = sha2::Sha512::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        // ── Encoding functions ──
+        "TO_BASE64" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TO_BASE64 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use base64::Engine as _;
+            let s = args[0].to_display_string();
+            Ok(Datum::String(
+                base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+            ))
+        }
+
+        "FROM_BASE64" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "FROM_BASE64 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use base64::Engine as _;
+            let s = args[0].to_display_string();
+            match base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+                Ok(bytes) => Ok(Datum::String(String::from_utf8_lossy(&bytes).into_owned())),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
+        // ── Crypto functions ──
+        "RANDOM_BYTES" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "RANDOM_BYTES requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let len = args[0].as_int().unwrap_or(0);
+            if !(1..=1024).contains(&len) {
+                return Err(ExecutorError::InvalidOperation(
+                    "RANDOM_BYTES length must be 1..1024".to_string(),
+                ));
+            }
+            let mut buf = vec![0u8; len as usize];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut buf);
+            Ok(Datum::Bytes(buf))
+        }
+
+        "AES_ENCRYPT" => {
+            // AES_ENCRYPT(str, key) — AES-128-ECB (MySQL default)
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "AES_ENCRYPT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let plaintext = args[0].to_display_string();
+            let key_str = args[1].to_display_string();
+            Ok(Datum::Bytes(aes_ecb_encrypt(
+                plaintext.as_bytes(),
+                key_str.as_bytes(),
+            )))
+        }
+
+        "AES_DECRYPT" => {
+            // AES_DECRYPT(crypt, key) — AES-128-ECB (MySQL default)
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "AES_DECRYPT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let ciphertext = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            let key_str = args[1].to_display_string();
+            match aes_ecb_decrypt(&ciphertext, key_str.as_bytes()) {
+                Some(plain) => Ok(Datum::String(String::from_utf8_lossy(&plain).into_owned())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        // ── Compression functions ──
+        "COMPRESS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "COMPRESS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            if s.is_empty() {
+                return Ok(Datum::Bytes(Vec::new()));
+            }
+            let uncompressed_len = s.len() as u32;
+            let mut output = Vec::new();
+            output.extend_from_slice(&uncompressed_len.to_le_bytes());
+            {
+                use flate2::write::ZlibEncoder;
+                use std::io::Write;
+                let mut encoder = ZlibEncoder::new(&mut output, flate2::Compression::default());
+                let _ = encoder.write_all(s.as_bytes());
+                let _ = encoder.finish();
+            }
+            Ok(Datum::Bytes(output))
+        }
+
+        "UNCOMPRESS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNCOMPRESS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            if data.len() < 4 {
+                return Ok(Datum::Null);
+            }
+            let compressed = &data[4..];
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut decoder = ZlibDecoder::new(compressed);
+            let mut result = String::new();
+            match decoder.read_to_string(&mut result) {
+                Ok(_) => Ok(Datum::String(result)),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
+        "UNCOMPRESSED_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNCOMPRESSED_LENGTH requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            if data.len() < 4 {
+                return Ok(Datum::Int(0));
+            }
+            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            Ok(Datum::Int(len as i64))
+        }
+
+        // ── String functions (QUOTE, EXPORT_SET) ──
+        "QUOTE" => {
+            // QUOTE(NULL) returns the string 'NULL', not Datum::Null
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "QUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::String("NULL".to_string()));
+            }
+            let s = args[0].to_display_string();
+            let mut out = String::with_capacity(s.len() + 10);
+            out.push('\'');
+            for ch in s.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\'' => out.push_str("\\'"),
+                    '\0' => out.push_str("\\0"),
+                    '\x1a' => out.push_str("\\Z"),
+                    _ => out.push(ch),
+                }
+            }
+            out.push('\'');
+            Ok(Datum::String(out))
+        }
+
+        "EXPORT_SET" => {
+            // EXPORT_SET(bits, on, off [, separator [, number_of_bits]])
+            if args.len() < 3 || args.len() > 5 {
+                return Err(ExecutorError::InvalidOperation(
+                    "EXPORT_SET requires 3-5 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = args[0].as_int().unwrap_or(0) as u64;
+            let on_str = args[1].to_display_string();
+            let off_str = args[2].to_display_string();
+            let sep = if args.len() >= 4 {
+                args[3].to_display_string()
+            } else {
+                ",".to_string()
+            };
+            let nbits = if args.len() >= 5 {
+                args[4].as_int().unwrap_or(64).clamp(0, 64) as u32
+            } else {
+                64
+            };
+            let mut parts = Vec::with_capacity(nbits as usize);
+            for i in 0..nbits {
+                if bits & (1u64 << i) != 0 {
+                    parts.push(on_str.as_str());
+                } else {
+                    parts.push(off_str.as_str());
+                }
+            }
+            Ok(Datum::String(parts.join(&sep)))
+        }
+
+        // ── Network functions ──
+        "IS_IPV4" => {
+            // IS_IPV4(NULL) returns 0, not NULL
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "IS_IPV4 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Int(0));
+            }
+            let s = args[0].to_display_string();
+            let valid = s.trim().parse::<std::net::Ipv4Addr>().is_ok();
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        "IS_IPV6" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "IS_IPV6 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Int(0));
+            }
+            let s = args[0].to_display_string();
+            let valid = s.trim().parse::<std::net::Ipv6Addr>().is_ok();
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        // ── Utility functions ──
+        "UUID" => {
+            // UUID v4: 16 random bytes with version/variant bits set
+            let mut bytes = [0u8; 16];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut bytes);
+            bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+            bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
+            Ok(Datum::String(format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5],
+                bytes[6], bytes[7],
+                bytes[8], bytes[9],
+                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            )))
+        }
+
+        "UUID_SHORT" => {
+            let val = rand::random::<u64>();
+            Ok(Datum::UnsignedInt(val))
+        }
+
+        "BENCHMARK" => {
+            // BENCHMARK(count, expr) — execute expr count times, return 0
+            // In MySQL this is for performance testing; we execute but discard
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "BENCHMARK requires 2 arguments".to_string(),
+                ));
+            }
+            Ok(Datum::Int(0))
+        }
+
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
 
@@ -5612,6 +5974,63 @@ fn parse_time_hms_to_secs(s: &str) -> i64 {
 }
 
 /// Parse timezone offset string ('+HH:MM', '-05:00', 'UTC', 'SYSTEM') to seconds from UTC.
+/// MySQL AES key schedule: fold key bytes into 16-byte AES-128 key
+fn mysql_aes_key(key: &[u8]) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    for (i, &b) in key.iter().enumerate() {
+        result[i % 16] ^= b;
+    }
+    result
+}
+
+/// AES-128-ECB encrypt with PKCS7 padding (MySQL default mode)
+fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8]) -> Vec<u8> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    let aes_key = mysql_aes_key(key);
+    let cipher = aes::Aes128::new(aes_key.as_ref().into());
+
+    // PKCS7 padding
+    let pad_len = 16 - (plaintext.len() % 16);
+    let mut padded = plaintext.to_vec();
+    padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+    let mut output = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(16) {
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        output.extend_from_slice(&block);
+    }
+    output
+}
+
+/// AES-128-ECB decrypt with PKCS7 unpadding (MySQL default mode)
+fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        return None;
+    }
+    let aes_key = mysql_aes_key(key);
+    let cipher = aes::Aes128::new(aes_key.as_ref().into());
+
+    let mut output = Vec::with_capacity(ciphertext.len());
+    for chunk in ciphertext.chunks(16) {
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        output.extend_from_slice(&block);
+    }
+
+    // Remove PKCS7 padding
+    let pad_byte = *output.last()? as usize;
+    if pad_byte == 0 || pad_byte > 16 {
+        return None;
+    }
+    if output.len() < pad_byte {
+        return None;
+    }
+    output.truncate(output.len() - pad_byte);
+    Some(output)
+}
+
 fn tz_offset_seconds(tz: &str) -> Option<i64> {
     let tz = tz.trim();
     match tz.to_uppercase().as_str() {

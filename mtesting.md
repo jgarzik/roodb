@@ -71,10 +71,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 34 | multi_column_orderby, having_complex, aggregate_subquery_mix | Multi-key ORDER BY, HAVING arithmetic, aggregate+subquery combos |
 | 35 | func_new_scalar, group_concat_basic, any_value_agg, multi_table_delete | New scalar funcs, GROUP_CONCAT, ANY_VALUE, multi-table DELETE |
 | 36 | func_utc_datetime, func_addtime_subtime, func_convert_tz, func_weekofyear_toseconds | UTC funcs, ADDTIME/SUBTIME, CONVERT_TZ, WEEKOFYEAR, TO_SECONDS |
+| 37 | func_hash, func_base64, func_crypto, func_compress, func_quote_export, func_network, func_uuid | MD5/SHA/SHA2, base64, AES, COMPRESS, QUOTE, EXPORT_SET, IS_IPV4/6, UUID |
 
 ## Current Status
 
-**158 MySQL compat tests across 36 tiers — all pass**
+**165 MySQL compat tests across 37 tiers — all pass**
 **428+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -267,6 +268,20 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | ADDTIME/SUBTIME | Add/subtract time from datetime or time values, with cross-midnight rollover |
 | CONVERT_TZ | Timezone conversion with +HH:MM offset format and UTC/SYSTEM named zones |
 | TO_SECONDS | Total seconds since year 0 (TO_DAYS * 86400 + time-of-day seconds) |
+| MD5 | MD5 hash → 32-char lowercase hex string |
+| SHA / SHA1 | SHA-1 hash → 40-char lowercase hex string |
+| SHA2 | SHA-224/256/384/512 hash; hash_length 0 = SHA-256 |
+| TO_BASE64 / FROM_BASE64 | Base64 encode/decode with standard alphabet |
+| AES_ENCRYPT / AES_DECRYPT | AES-128-ECB with MySQL key schedule and PKCS7 padding |
+| RANDOM_BYTES | Cryptographically random bytes (1-1024 length) |
+| COMPRESS / UNCOMPRESS | Zlib compression with 4-byte LE length prefix (MySQL format) |
+| UNCOMPRESSED_LENGTH | Read 4-byte LE length prefix from compressed data |
+| QUOTE | Escape and single-quote a string; QUOTE(NULL) returns 'NULL' string |
+| EXPORT_SET | Build string from bitmask: on/off per bit with separator |
+| IS_IPV4 / IS_IPV6 | Validate IP address format; returns 0 for NULL (not NULL) |
+| UUID | UUID v4 generation (random, proper version/variant bits) |
+| UUID_SHORT | Random 64-bit unsigned integer |
+| BENCHMARK | MySQL compat stub, returns 0 |
 
 ## Gap Analysis — Next Steps
 

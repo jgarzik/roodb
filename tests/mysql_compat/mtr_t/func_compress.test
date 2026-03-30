@@ -1,0 +1,18 @@
+--echo # COMPRESS / UNCOMPRESS / UNCOMPRESSED_LENGTH
+
+--echo # --- Round-trip ---
+SELECT UNCOMPRESS(COMPRESS('Hello'));
+SELECT UNCOMPRESS(COMPRESS(''));
+SELECT UNCOMPRESS(COMPRESS('The quick brown fox jumps over the lazy dog'));
+
+--echo # --- UNCOMPRESSED_LENGTH ---
+SELECT UNCOMPRESSED_LENGTH(COMPRESS('Hello')) = 5;
+SELECT UNCOMPRESSED_LENGTH(COMPRESS('test')) = 4;
+
+--echo # --- COMPRESS produces shorter output for repeated data ---
+SELECT LENGTH(COMPRESS(REPEAT('a', 100))) < 100;
+
+--echo # --- NULL handling ---
+SELECT COMPRESS(NULL) IS NULL;
+SELECT UNCOMPRESS(NULL) IS NULL;
+SELECT UNCOMPRESSED_LENGTH(NULL) IS NULL;
