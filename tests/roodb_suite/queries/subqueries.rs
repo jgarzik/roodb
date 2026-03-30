@@ -198,9 +198,11 @@ async fn test_nested_scalar_subquery() {
         .await
         .expect("CREATE TABLE failed");
 
-    conn.query_drop("INSERT INTO subq_t7 (id, val) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
-        .await
-        .expect("INSERT failed");
+    conn.query_drop(
+        "INSERT INTO subq_t7 (id, val) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+    )
+    .await
+    .expect("INSERT failed");
 
     // Nested scalar subquery: subquery inside a subquery's WHERE clause
     // SELECT (SELECT MAX(val) FROM t WHERE val > (SELECT MIN(val) FROM t))

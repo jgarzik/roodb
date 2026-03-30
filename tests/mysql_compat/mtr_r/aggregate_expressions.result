@@ -1,0 +1,192 @@
+DROP TABLE IF EXISTS sales, products, regions;
+CREATE TABLE regions (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(20) NOT NULL
+);
+INSERT INTO regions VALUES (1, 'North'), (2, 'South'), (3, 'East'), (4, 'West');
+CREATE TABLE products (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(30) NOT NULL,
+category VARCHAR(20) NOT NULL,
+unit_price DECIMAL(10,2) NOT NULL
+);
+INSERT INTO products VALUES
+(1, 'Alpha', 'electronics', 100.00),
+(2, 'Beta', 'electronics', 250.00),
+(3, 'Gamma', 'clothing', 45.00),
+(4, 'Delta', 'clothing', 80.00),
+(5, 'Epsilon', 'food', 12.50),
+(6, 'Zeta', 'food', 8.75);
+CREATE TABLE sales (
+id INT NOT NULL PRIMARY KEY,
+product_id INT NOT NULL,
+region_id INT NOT NULL,
+qty INT NOT NULL,
+discount DECIMAL(5,2),
+sale_date DATE NOT NULL
+);
+INSERT INTO sales VALUES
+(1,  1, 1, 10, 0.00,  '2025-01-15'),
+(2,  1, 2, 5,  5.00,  '2025-01-20'),
+(3,  2, 1, 3,  NULL,  '2025-02-01'),
+(4,  2, 3, 8,  10.00, '2025-02-10'),
+(5,  3, 1, 20, 2.50,  '2025-02-15'),
+(6,  3, 4, 15, NULL,  '2025-03-01'),
+(7,  4, 2, 12, 5.00,  '2025-03-05'),
+(8,  4, 3, 7,  0.00,  '2025-03-10'),
+(9,  5, 1, 50, 1.00,  '2025-03-15'),
+(10, 5, 4, 30, NULL,  '2025-03-20'),
+(11, 6, 2, 40, 0.50,  '2025-04-01'),
+(12, 6, 3, 25, NULL,  '2025-04-05');
+# --- SUM with CASE expression ---
+SELECT p.category,
+SUM(CASE WHEN s.region_id = 1 THEN s.qty ELSE 0 END) AS north_qty,
+SUM(CASE WHEN s.region_id = 2 THEN s.qty ELSE 0 END) AS south_qty,
+SUM(CASE WHEN s.region_id = 3 THEN s.qty ELSE 0 END) AS east_qty,
+SUM(CASE WHEN s.region_id = 4 THEN s.qty ELSE 0 END) AS west_qty,
+SUM(s.qty) AS total_qty
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+category	north_qty	south_qty	east_qty	west_qty	total_qty
+clothing	20	12	7	15	54
+electronics	13	5	8	0	26
+food	50	40	25	30	145
+# --- COUNT with CASE (conditional counting) ---
+SELECT p.category,
+COUNT(*) AS total_sales,
+COUNT(CASE WHEN s.discount IS NOT NULL AND s.discount > 0 THEN 1 END) AS discounted_sales,
+COUNT(CASE WHEN s.discount IS NULL THEN 1 END) AS no_discount_sales
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+category	total_sales	discounted_sales	no_discount_sales
+clothing	4	2	1
+electronics	4	2	1
+food	4	2	2
+# --- AVG with arithmetic inside ---
+SELECT p.category,
+ROUND(AVG(s.qty * p.unit_price), 2) AS avg_revenue_per_sale,
+ROUND(AVG(s.qty * p.unit_price - COALESCE(s.discount, 0) * s.qty), 2) AS avg_net_per_sale
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+category	avg_revenue_per_sale	avg_net_per_sale
+clothing	773.75	746.25
+electronics	1062.5	1036.25
+food	392.189999999999998	374.689999999999998
+# --- MIN/MAX of computed expressions ---
+SELECT p.category,
+MIN(s.qty * p.unit_price) AS min_sale_value,
+MAX(s.qty * p.unit_price) AS max_sale_value,
+MAX(s.qty * p.unit_price) - MIN(s.qty * p.unit_price) AS value_range
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+category	min_sale_value	max_sale_value	value_range
+clothing	560.00	960.00	400.00
+electronics	500.00	2000.00	1500.00
+food	218.75	625.00	406.25
+# --- SUM of COALESCE (handling NULLs in aggregates) ---
+SELECT r.name AS region,
+SUM(s.qty) AS total_qty,
+SUM(COALESCE(s.discount, 0)) AS total_discount_given,
+SUM(s.qty * p.unit_price) AS gross_revenue,
+SUM(s.qty * p.unit_price - COALESCE(s.discount, 0) * s.qty) AS net_revenue
+FROM regions r
+JOIN sales s ON r.id = s.region_id
+JOIN products p ON s.product_id = p.id
+GROUP BY r.name
+ORDER BY r.name;
+region	total_qty	total_discount_given	gross_revenue	net_revenue
+East	40	10	2778.75	2698.75
+North	83	3.5	3275	3175
+South	57	10.5	1810	1705
+West	45	0	1050	1050
+# --- Aggregate with IF-like CASE and NULL ---
+SELECT
+COUNT(*) AS total_rows,
+SUM(CASE WHEN discount IS NULL THEN 1 ELSE 0 END) AS null_discounts,
+SUM(CASE WHEN discount IS NOT NULL THEN 1 ELSE 0 END) AS non_null_discounts,
+SUM(CASE WHEN discount > 0 THEN 1 ELSE 0 END) AS positive_discounts,
+SUM(CASE WHEN discount = 0 THEN 1 ELSE 0 END) AS zero_discounts
+FROM sales;
+total_rows	null_discounts	non_null_discounts	positive_discounts	zero_discounts
+12	4	8	6	2
+# --- Nested aggregate: aggregate over aggregate via derived table ---
+SELECT
+MAX(dept_total) AS highest_dept_revenue,
+MIN(dept_total) AS lowest_dept_revenue,
+ROUND(AVG(dept_total), 2) AS avg_dept_revenue
+FROM (
+SELECT p.category, SUM(s.qty * p.unit_price) AS dept_total
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+) sub;
+highest_dept_revenue	lowest_dept_revenue	avg_dept_revenue
+4250	1568.75	2971.25
+# --- HAVING with complex aggregate expressions ---
+SELECT p.category,
+COUNT(*) AS num_sales,
+SUM(s.qty) AS total_qty,
+ROUND(SUM(s.qty * p.unit_price), 2) AS revenue
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+HAVING SUM(s.qty * p.unit_price) > 1000
+ORDER BY revenue DESC;
+category	num_sales	total_qty	revenue
+electronics	4	26	4250
+clothing	4	54	3095
+food	4	145	1568.75
+# --- Multiple aggregates of same column with different filters ---
+SELECT
+SUM(qty) AS all_qty,
+SUM(CASE WHEN qty >= 20 THEN qty ELSE 0 END) AS large_order_qty,
+SUM(CASE WHEN qty < 20 THEN qty ELSE 0 END) AS small_order_qty,
+ROUND(AVG(CASE WHEN qty >= 20 THEN qty END), 2) AS avg_large_order,
+ROUND(AVG(CASE WHEN qty < 20 THEN qty END), 2) AS avg_small_order
+FROM sales;
+all_qty	large_order_qty	small_order_qty	avg_large_order	avg_small_order
+225	165	60	33	8.57
+# --- Aggregate over ROUND/ABS expressions ---
+SELECT p.category,
+SUM(ABS(s.qty - 15)) AS total_deviation_from_15,
+ROUND(AVG(ABS(s.qty - 15)), 2) AS avg_deviation
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+category	total_deviation_from_15	avg_deviation
+clothing	16	4
+electronics	34	8.5
+food	85	21.25
+# --- Empty group aggregate ---
+SELECT COUNT(*) AS cnt, SUM(qty) AS total, AVG(qty) AS avg_qty, MIN(qty) AS mn, MAX(qty) AS mx
+FROM sales
+WHERE qty > 9999;
+cnt	total	avg_qty	mn	mx
+0	NULL	NULL	NULL	NULL
+# --- Aggregate with subquery in HAVING ---
+SELECT p.category, SUM(s.qty) AS total_qty
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+HAVING SUM(s.qty) > (SELECT AVG(qty) * 5 FROM sales)
+ORDER BY p.category;
+category	total_qty
+food	145
+# --- COUNT DISTINCT with expression ---
+SELECT COUNT(DISTINCT region_id) AS num_regions,
+COUNT(DISTINCT product_id) AS num_products,
+COUNT(DISTINCT CASE WHEN qty >= 10 THEN product_id END) AS products_with_large_orders
+FROM sales;
+num_regions	num_products	products_with_large_orders
+4	6	5
+# --- Cleanup ---
+DROP TABLE sales, products, regions;

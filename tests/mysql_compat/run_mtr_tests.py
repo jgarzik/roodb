@@ -245,6 +245,12 @@ TIERS = {
         "select_expressions",                 # complex SELECT: CASE, COALESCE, arithmetic with subqueries
         "dml_subquery",                       # INSERT...SELECT, UPDATE, DELETE with subqueries
     ],
+    31: [
+        "subquery_derived_join",              # subqueries as derived tables in JOINs
+        "subquery_union",                     # UNION combined with subqueries in WHERE/FROM
+        "aggregate_expressions",              # complex aggregate expressions (SUM(CASE...), etc.)
+        "subquery_where_complex",             # complex WHERE patterns with multiple subqueries
+    ],
 }
 
 
