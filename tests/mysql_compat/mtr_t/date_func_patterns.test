@@ -1,0 +1,138 @@
+#
+# Date function patterns.
+# Tests CURDATE, NOW, DATE arithmetic, YEAR/MONTH/DAY extraction,
+# DATEDIFF, DATE_ADD/DATE_SUB, and date comparison patterns.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS events, milestones;
+--enable_warnings
+
+--echo # --- Date extraction functions ---
+
+SELECT YEAR('2025-06-15') AS y;
+SELECT MONTH('2025-06-15') AS m;
+SELECT DAY('2025-06-15') AS d;
+SELECT DAYOFWEEK('2025-06-15') AS dow;
+SELECT DAYOFYEAR('2025-06-15') AS doy;
+
+--echo # --- Date parts from various formats ---
+
+SELECT YEAR('2025-01-01') AS jan, MONTH('2025-12-31') AS dec_month, DAY('2025-12-31') AS dec_day;
+SELECT YEAR('2000-02-29') AS leap_year, MONTH('2000-02-29') AS leap_month, DAY('2000-02-29') AS leap_day;
+
+--echo # --- DATEDIFF ---
+
+SELECT DATEDIFF('2025-03-15', '2025-03-10') AS five_days;
+SELECT DATEDIFF('2025-03-10', '2025-03-15') AS neg_five;
+SELECT DATEDIFF('2025-01-01', '2025-01-01') AS zero_diff;
+SELECT DATEDIFF('2026-01-01', '2025-01-01') AS one_year;
+
+--echo # --- DATE_ADD / DATE_SUB ---
+
+SELECT DATE_ADD('2025-01-15', INTERVAL 10 DAY) AS plus_10_days;
+SELECT DATE_SUB('2025-01-15', INTERVAL 10 DAY) AS minus_10_days;
+SELECT DATE_ADD('2025-01-31', INTERVAL 1 MONTH) AS plus_1_month;
+SELECT DATE_ADD('2025-12-31', INTERVAL 1 DAY) AS new_year;
+SELECT DATE_SUB('2025-01-01', INTERVAL 1 DAY) AS prev_year;
+SELECT DATE_ADD('2025-01-15', INTERVAL 1 YEAR) AS plus_1_year;
+
+--echo # --- DATE_ADD with HOUR/MINUTE/SECOND on DATETIME ---
+
+SELECT DATE_ADD('2025-01-15 10:30:00', INTERVAL 2 HOUR) AS plus_2h;
+SELECT DATE_ADD('2025-01-15 23:59:59', INTERVAL 1 SECOND) AS next_day;
+
+--echo # --- EXTRACT ---
+
+SELECT EXTRACT(YEAR FROM '2025-06-15') AS y;
+SELECT EXTRACT(MONTH FROM '2025-06-15') AS m;
+SELECT EXTRACT(DAY FROM '2025-06-15') AS d;
+
+--echo # --- Date comparisons ---
+
+SELECT '2025-03-15' > '2025-03-10' AS gt;
+SELECT '2025-03-15' < '2025-03-10' AS lt;
+SELECT '2025-03-15' = '2025-03-15' AS eq;
+SELECT '2025-03-15' BETWEEN '2025-03-01' AND '2025-03-31' AS in_march;
+
+--echo # --- Date functions with table data ---
+
+CREATE TABLE events (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    event_date DATE NOT NULL,
+    created_at DATETIME NOT NULL
+);
+INSERT INTO events VALUES
+    (1, 'Launch', '2025-01-15', '2025-01-10 09:00:00'),
+    (2, 'Update', '2025-03-20', '2025-03-15 14:30:00'),
+    (3, 'Review', '2025-06-01', '2025-05-28 08:00:00'),
+    (4, 'Release', '2025-06-15', '2025-06-10 16:00:00'),
+    (5, 'EOY', '2025-12-31', '2025-12-20 12:00:00');
+
+--echo # --- Filter by year/month ---
+
+SELECT id, name FROM events WHERE YEAR(event_date) = 2025 AND MONTH(event_date) = 6 ORDER BY id;
+
+--echo # --- Date arithmetic in queries ---
+
+SELECT id, name, event_date,
+       DATE_ADD(event_date, INTERVAL 30 DAY) AS plus_30d,
+       DATE_SUB(event_date, INTERVAL 7 DAY) AS minus_7d
+FROM events
+ORDER BY id;
+
+--echo # --- DATEDIFF between columns ---
+
+SELECT id, name,
+       DATEDIFF(event_date, created_at) AS days_lead_time
+FROM events
+ORDER BY id;
+
+--echo # --- GROUP BY month via derived table ---
+
+SELECT ev_month, COUNT(*) AS cnt
+FROM (SELECT MONTH(event_date) AS ev_month FROM events) sub
+GROUP BY ev_month
+ORDER BY ev_month;
+
+--echo # --- Date range filter ---
+
+SELECT id, name FROM events
+WHERE event_date BETWEEN '2025-03-01' AND '2025-06-30'
+ORDER BY event_date;
+
+--echo # --- ORDER BY date expression ---
+
+SELECT id, name, event_date
+FROM events
+ORDER BY YEAR(event_date), MONTH(event_date), DAY(event_date);
+
+--echo # --- Milestones: date comparison with subquery ---
+
+CREATE TABLE milestones (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    deadline DATE NOT NULL
+);
+INSERT INTO milestones VALUES
+    (1, 'Alpha', '2025-02-01'),
+    (2, 'Beta', '2025-04-01'),
+    (3, 'GA', '2025-07-01');
+
+# Find events that fall between milestone deadlines
+SELECT m.name AS milestone, m.deadline, e.name AS event, e.event_date
+FROM milestones m
+JOIN events e ON e.event_date > m.deadline
+ORDER BY m.id, e.event_date
+LIMIT 6;
+
+# Milestones with the count of events after their deadline
+SELECT m.name AS milestone, COUNT(e.id) AS events_after
+FROM milestones m
+JOIN events e ON e.event_date > m.deadline
+GROUP BY m.name, m.id
+ORDER BY m.id;
+
+--echo # --- Cleanup ---
+DROP TABLE events, milestones;

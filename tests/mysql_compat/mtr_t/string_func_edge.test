@@ -1,0 +1,118 @@
+#
+# String function edge cases.
+# Tests boundary conditions for CONCAT, SUBSTRING, REPLACE, TRIM,
+# REPEAT, REVERSE, LENGTH with NULLs, empty strings, and large values.
+# Adapted from patterns in MySQL func_str.test.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+--echo # --- CONCAT edge cases ---
+
+SELECT CONCAT('') AS empty_concat;
+SELECT CONCAT('', '') AS two_empty;
+SELECT CONCAT('a', '', 'b') AS with_empty_middle;
+SELECT CONCAT(NULL) AS null_concat;
+SELECT CONCAT('hello', NULL, 'world') AS null_in_middle;
+SELECT CONCAT(1, 2, 3) AS numeric_concat;
+SELECT CONCAT(1.5, ' + ', 2.5, ' = ', 4.0) AS mixed_concat;
+
+--echo # --- SUBSTRING edge cases ---
+
+SELECT SUBSTRING('hello', 0) AS zero_start;
+SELECT SUBSTRING('hello', 1) AS first_char_on;
+SELECT SUBSTRING('hello', 6) AS past_end;
+SELECT SUBSTRING('hello', -2) AS negative_start;
+SELECT SUBSTRING('hello', 1, 0) AS zero_length;
+SELECT SUBSTRING('hello', 1, 100) AS long_length;
+SELECT SUBSTRING('', 1, 5) AS empty_string;
+SELECT SUBSTRING(NULL, 1, 5) AS null_string;
+
+--echo # --- REPLACE edge cases ---
+
+SELECT REPLACE('aaa', 'a', '') AS delete_all;
+SELECT REPLACE('hello', 'xyz', 'abc') AS no_match;
+SELECT REPLACE('', 'a', 'b') AS empty_source;
+SELECT REPLACE('hello', '', 'x') AS empty_search;
+SELECT REPLACE(NULL, 'a', 'b') AS null_source;
+SELECT REPLACE('hello', NULL, 'b') AS null_search;
+SELECT REPLACE('hello', 'l', NULL) AS null_replace;
+
+--echo # --- TRIM edge cases ---
+
+SELECT TRIM('   ') AS all_spaces;
+SELECT TRIM('') AS empty_trim;
+SELECT TRIM('  abc  ') AS normal_trim;
+SELECT TRIM(LEADING ' ' FROM '   hi   ') AS leading_trim;
+SELECT TRIM(TRAILING ' ' FROM '   hi   ') AS trailing_trim;
+SELECT TRIM(BOTH 'x' FROM 'xxxhixxx') AS trim_x;
+SELECT TRIM(NULL) AS null_trim;
+
+--echo # --- REPEAT edge cases ---
+
+SELECT REPEAT('ab', 3) AS normal_repeat;
+SELECT REPEAT('x', 0) AS zero_repeat;
+SELECT REPEAT('x', -1) AS negative_repeat;
+SELECT REPEAT('', 5) AS empty_repeat;
+SELECT REPEAT(NULL, 3) AS null_repeat;
+SELECT REPEAT('a', NULL) AS null_count;
+
+--echo # --- REVERSE ---
+
+SELECT REVERSE('hello') AS rev;
+SELECT REVERSE('') AS rev_empty;
+SELECT REVERSE('a') AS rev_single;
+SELECT REVERSE(NULL) AS rev_null;
+SELECT REVERSE('12345') AS rev_numbers;
+
+--echo # --- LENGTH / CHAR_LENGTH ---
+
+SELECT LENGTH('') AS empty_len;
+SELECT LENGTH(NULL) AS null_len;
+SELECT LENGTH('hello') AS normal_len;
+SELECT CHAR_LENGTH('hello') AS char_len;
+SELECT LENGTH(12345) AS numeric_len;
+
+--echo # --- UPPER / LOWER edge cases ---
+
+SELECT UPPER('') AS upper_empty;
+SELECT LOWER('') AS lower_empty;
+SELECT UPPER(NULL) AS upper_null;
+SELECT LOWER(NULL) AS lower_null;
+SELECT UPPER('already MIXED Case') AS upper_mixed;
+SELECT LOWER('already MIXED Case') AS lower_mixed;
+
+--echo # --- LEFT / RIGHT edge cases ---
+
+SELECT LEFT('hello', 0) AS left_zero;
+SELECT LEFT('hello', 3) AS left_three;
+SELECT LEFT('hello', 100) AS left_past;
+SELECT LEFT('hello', NULL) AS left_null;
+SELECT LEFT(NULL, 3) AS null_left;
+SELECT RIGHT('hello', 0) AS right_zero;
+SELECT RIGHT('hello', 3) AS right_three;
+SELECT RIGHT('hello', 100) AS right_past;
+
+--echo # --- LPAD / RPAD edge cases ---
+
+SELECT LPAD('hi', 5, '-') AS lpad_normal;
+SELECT LPAD('hello', 3, '-') AS lpad_truncate;
+SELECT LPAD('hi', 0, '-') AS lpad_zero;
+SELECT LPAD('hi', 5, '') AS lpad_empty_pad;
+SELECT RPAD('hi', 5, '-') AS rpad_normal;
+SELECT RPAD('hello', 3, '-') AS rpad_truncate;
+
+--echo # --- String functions with table data ---
+
+CREATE TABLE t1 (id INT PRIMARY KEY, s VARCHAR(50));
+INSERT INTO t1 VALUES (1, '  hello  '), (2, NULL), (3, ''), (4, 'world');
+
+SELECT id, CONCAT('[', TRIM(s), ']') AS trimmed FROM t1 ORDER BY id;
+SELECT id, LENGTH(s) AS len, UPPER(s) AS upper_s FROM t1 ORDER BY id;
+SELECT id, REPLACE(s, 'l', 'L') AS replaced FROM t1 ORDER BY id;
+SELECT id, REVERSE(s) AS reversed FROM t1 ORDER BY id;
+
+--echo # --- Cleanup ---
+DROP TABLE t1;

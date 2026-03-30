@@ -1,0 +1,187 @@
+#
+# Complex JOIN chains with 3+ tables.
+# Tests INNER JOIN chains, mixed INNER/LEFT JOIN, self-joins with third table,
+# derived table joins, and aggregate queries over multi-way joins.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS countries, cities, hotels, bookings, guests;
+--enable_warnings
+
+CREATE TABLE countries (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    continent VARCHAR(20) NOT NULL
+);
+INSERT INTO countries VALUES
+    (1, 'USA', 'North America'),
+    (2, 'France', 'Europe'),
+    (3, 'Japan', 'Asia'),
+    (4, 'Brazil', 'South America');
+
+CREATE TABLE cities (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    country_id INT NOT NULL,
+    population INT NOT NULL
+);
+INSERT INTO cities VALUES
+    (1, 'New York', 1, 8300000),
+    (2, 'Los Angeles', 1, 3900000),
+    (3, 'Paris', 2, 2100000),
+    (4, 'Lyon', 2, 500000),
+    (5, 'Tokyo', 3, 13900000),
+    (6, 'Osaka', 3, 2700000),
+    (7, 'Sao Paulo', 4, 12300000);
+
+CREATE TABLE hotels (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    city_id INT NOT NULL,
+    stars INT NOT NULL,
+    price_per_night DECIMAL(10,2) NOT NULL
+);
+INSERT INTO hotels VALUES
+    (1, 'Grand NYC', 1, 5, 350.00),
+    (2, 'Budget NYC', 1, 2, 89.00),
+    (3, 'Chateau Paris', 3, 5, 420.00),
+    (4, 'Hotel Lyon', 4, 3, 150.00),
+    (5, 'Tokyo Tower', 5, 4, 280.00),
+    (6, 'Osaka Inn', 6, 3, 120.00),
+    (7, 'LA Beach', 2, 4, 250.00),
+    (8, 'SP Central', 7, 3, 95.00);
+
+CREATE TABLE guests (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    home_country_id INT NOT NULL
+);
+INSERT INTO guests VALUES
+    (1, 'Alice', 1),
+    (2, 'Bob', 2),
+    (3, 'Yuki', 3),
+    (4, 'Carlos', 4),
+    (5, 'Diane', 1);
+
+CREATE TABLE bookings (
+    id INT NOT NULL PRIMARY KEY,
+    guest_id INT NOT NULL,
+    hotel_id INT NOT NULL,
+    nights INT NOT NULL
+);
+INSERT INTO bookings VALUES
+    (1, 1, 3, 5),
+    (2, 1, 5, 3),
+    (3, 2, 1, 7),
+    (4, 3, 7, 4),
+    (5, 4, 1, 2),
+    (6, 5, 6, 6),
+    (7, 2, 4, 3),
+    (8, 3, 8, 5);
+
+--echo # --- 3-way INNER JOIN: bookings with hotel and city ---
+
+SELECT b.id AS booking, g.name AS guest, h.name AS hotel, ci.name AS city
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+ORDER BY b.id;
+
+--echo # --- 4-way INNER JOIN: full chain to country ---
+
+SELECT g.name AS guest, h.name AS hotel, ci.name AS city, co.name AS country
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+JOIN countries co ON ci.country_id = co.id
+ORDER BY b.id;
+
+--echo # --- 4-way JOIN with aggregates ---
+
+SELECT co.continent, COUNT(*) AS num_bookings, SUM(b.nights) AS total_nights,
+       ROUND(AVG(h.price_per_night), 2) AS avg_price
+FROM bookings b
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+JOIN countries co ON ci.country_id = co.id
+GROUP BY co.continent
+ORDER BY co.continent;
+
+--echo # --- Mixed INNER/LEFT JOIN chain ---
+
+# All cities, their hotels (if any), and bookings (if any)
+SELECT ci.name AS city, h.name AS hotel, b.id AS booking_id
+FROM cities ci
+LEFT JOIN hotels h ON h.city_id = ci.id
+LEFT JOIN bookings b ON b.hotel_id = h.id
+ORDER BY ci.name, h.name, b.id;
+
+--echo # --- LEFT JOIN anti-pattern: cities with no hotels ---
+
+SELECT ci.name AS city, co.name AS country
+FROM cities ci
+JOIN countries co ON ci.country_id = co.id
+LEFT JOIN hotels h ON h.city_id = ci.id
+WHERE h.id IS NULL
+ORDER BY ci.name;
+
+--echo # --- 3-way JOIN with WHERE filter ---
+
+SELECT g.name AS guest, co.name AS destination_country, b.nights
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+JOIN countries co ON ci.country_id = co.id
+WHERE co.continent = 'Europe'
+ORDER BY g.name, b.id;
+
+--echo # --- Self-join with third table: guests booking in their home country ---
+
+SELECT g.name AS guest, co.name AS home_country, h.name AS hotel
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+JOIN countries co ON ci.country_id = co.id
+WHERE co.id = g.home_country_id
+ORDER BY g.name, h.name;
+
+--echo # --- 3-way JOIN with GROUP BY and HAVING ---
+
+SELECT co.name AS country, COUNT(DISTINCT g.id) AS unique_guests
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+JOIN cities ci ON h.city_id = ci.id
+JOIN countries co ON ci.country_id = co.id
+GROUP BY co.name
+HAVING COUNT(DISTINCT g.id) >= 2
+ORDER BY co.name;
+
+--echo # --- Revenue calculation across 4-way join ---
+
+SELECT g.name AS guest,
+       SUM(b.nights * h.price_per_night) AS total_spend
+FROM bookings b
+JOIN guests g ON b.guest_id = g.id
+JOIN hotels h ON b.hotel_id = h.id
+GROUP BY g.name
+ORDER BY total_spend DESC;
+
+--echo # --- Derived table join: top city by booking count ---
+
+SELECT ci.name AS city, sub.booking_count
+FROM (
+    SELECT h.city_id, COUNT(*) AS booking_count
+    FROM bookings b
+    JOIN hotels h ON b.hotel_id = h.id
+    GROUP BY h.city_id
+) sub
+JOIN cities ci ON ci.id = sub.city_id
+ORDER BY sub.booking_count DESC, ci.name;
+
+--echo # --- Cleanup ---
+DROP TABLE bookings, guests, hotels, cities, countries;

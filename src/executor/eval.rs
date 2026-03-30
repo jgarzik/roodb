@@ -1945,29 +1945,41 @@ pub fn eval_function(
         }
 
         "LTRIM" => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(ExecutorError::InvalidOperation(
-                    "LTRIM requires 1 argument".to_string(),
+                    "LTRIM requires 1 or 2 arguments".to_string(),
                 ));
             }
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            Ok(Datum::String(s.trim_start().to_string()))
+            if args.len() == 2 {
+                let what = args[1].to_display_string();
+                let trimmed = s.trim_start_matches(|c: char| what.contains(c));
+                Ok(Datum::String(trimmed.to_string()))
+            } else {
+                Ok(Datum::String(s.trim_start().to_string()))
+            }
         }
 
         "RTRIM" => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(ExecutorError::InvalidOperation(
-                    "RTRIM requires 1 argument".to_string(),
+                    "RTRIM requires 1 or 2 arguments".to_string(),
                 ));
             }
             if args[0].is_null() {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            Ok(Datum::String(s.trim_end().to_string()))
+            if args.len() == 2 {
+                let what = args[1].to_display_string();
+                let trimmed = s.trim_end_matches(|c: char| what.contains(c));
+                Ok(Datum::String(trimmed.to_string()))
+            } else {
+                Ok(Datum::String(s.trim_end().to_string()))
+            }
         }
 
         "INSERT" | "_ROODB_INSERT" => {

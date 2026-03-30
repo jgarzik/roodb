@@ -1,0 +1,176 @@
+#
+# Mixed subquery + aggregate patterns.
+# Tests aggregates inside subqueries, subqueries inside aggregates,
+# scalar subqueries in SELECT with GROUP BY, and complex combinations.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS departments, employees, projects, assignments;
+--enable_warnings
+
+CREATE TABLE departments (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    budget DECIMAL(12,2) NOT NULL
+);
+INSERT INTO departments VALUES
+    (1, 'Engineering', 500000.00),
+    (2, 'Marketing', 200000.00),
+    (3, 'Sales', 350000.00),
+    (4, 'Support', 100000.00);
+
+CREATE TABLE employees (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    dept_id INT NOT NULL,
+    salary DECIMAL(10,2) NOT NULL,
+    level INT NOT NULL
+);
+INSERT INTO employees VALUES
+    (1, 'Alice', 1, 130000.00, 5),
+    (2, 'Bob', 1, 95000.00, 3),
+    (3, 'Charlie', 1, 110000.00, 4),
+    (4, 'Diana', 2, 85000.00, 4),
+    (5, 'Eve', 2, 72000.00, 2),
+    (6, 'Frank', 3, 90000.00, 4),
+    (7, 'Grace', 3, 88000.00, 3),
+    (8, 'Henry', 3, 75000.00, 2),
+    (9, 'Irene', 4, 65000.00, 3),
+    (10, 'Jack', 4, 60000.00, 2);
+
+CREATE TABLE projects (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    dept_id INT NOT NULL,
+    status VARCHAR(20) NOT NULL
+);
+INSERT INTO projects VALUES
+    (1, 'Alpha', 1, 'active'),
+    (2, 'Beta', 1, 'complete'),
+    (3, 'Campaign', 2, 'active'),
+    (4, 'Outreach', 3, 'active'),
+    (5, 'Portal', 4, 'complete');
+
+CREATE TABLE assignments (
+    id INT NOT NULL PRIMARY KEY,
+    emp_id INT NOT NULL,
+    project_id INT NOT NULL,
+    hours INT NOT NULL
+);
+INSERT INTO assignments VALUES
+    (1, 1, 1, 40), (2, 2, 1, 30), (3, 3, 2, 50),
+    (4, 4, 3, 35), (5, 5, 3, 20),
+    (6, 6, 4, 45), (7, 7, 4, 25),
+    (8, 9, 5, 40), (9, 1, 2, 20), (10, 8, 4, 15);
+
+--echo # --- Scalar subquery with aggregate in SELECT list ---
+
+SELECT e.name, e.salary,
+       (SELECT AVG(salary) FROM employees) AS company_avg,
+       e.salary - (SELECT AVG(salary) FROM employees) AS diff_from_avg
+FROM employees e
+ORDER BY e.id;
+
+--echo # --- Employees above company-wide average, by department ---
+
+SELECT e.name, e.salary, e.dept_id
+FROM employees e
+WHERE e.salary > (SELECT AVG(salary) FROM employees)
+ORDER BY e.dept_id, e.id;
+
+--echo # --- Aggregate of subquery result via derived table ---
+
+SELECT AVG(dept_avg) AS company_avg_of_dept_avgs
+FROM (
+    SELECT dept_id, AVG(salary) AS dept_avg
+    FROM employees
+    GROUP BY dept_id
+) sub;
+
+--echo # --- COUNT with IN subquery ---
+
+SELECT COUNT(*) AS engineers_on_active_projects
+FROM employees
+WHERE id IN (
+    SELECT a.emp_id FROM assignments a
+    JOIN projects p ON a.project_id = p.id
+    WHERE p.status = 'active'
+) AND dept_id = 1;
+
+--echo # --- Department totals with conditional counts ---
+
+SELECT d.name,
+       SUM(e.salary) AS total_salary,
+       SUM(CASE WHEN e.level >= 4 THEN 1 ELSE 0 END) AS senior_count,
+       SUM(CASE WHEN e.level < 4 THEN 1 ELSE 0 END) AS junior_count
+FROM departments d
+JOIN employees e ON e.dept_id = d.id
+GROUP BY d.name
+ORDER BY d.name;
+
+--echo # --- GROUP BY with scalar subquery in HAVING ---
+
+SELECT d.name, COUNT(*) AS emp_count, SUM(e.salary) AS total_salary
+FROM departments d
+JOIN employees e ON e.dept_id = d.id
+GROUP BY d.name
+HAVING SUM(e.salary) > (SELECT AVG(budget) FROM departments)
+ORDER BY d.name;
+
+--echo # --- Aggregate over JOIN with subquery filter ---
+
+SELECT d.name,
+       SUM(a.hours) AS total_hours,
+       COUNT(DISTINCT a.emp_id) AS num_assignees
+FROM departments d
+JOIN projects p ON p.dept_id = d.id
+JOIN assignments a ON a.project_id = p.id
+WHERE p.id IN (SELECT id FROM projects WHERE status = 'active')
+GROUP BY d.name
+ORDER BY d.name;
+
+--echo # --- MAX/MIN of subquery via derived table ---
+
+SELECT MAX(total_hours) AS busiest, MIN(total_hours) AS least_busy
+FROM (
+    SELECT emp_id, SUM(hours) AS total_hours
+    FROM assignments
+    GROUP BY emp_id
+) sub;
+
+--echo # --- Nested aggregate: department with highest average salary ---
+
+SELECT d.name, ROUND(AVG(e.salary), 2) AS avg_sal
+FROM departments d
+JOIN employees e ON e.dept_id = d.id
+GROUP BY d.name
+HAVING AVG(e.salary) = (
+    SELECT MAX(dept_avg) FROM (
+        SELECT AVG(salary) AS dept_avg FROM employees GROUP BY dept_id
+    ) sub
+);
+
+--echo # --- Department employee count with project count via JOIN ---
+
+SELECT d.name,
+       COUNT(DISTINCT e.id) AS emp_count,
+       COUNT(DISTINCT p.id) AS project_count
+FROM departments d
+JOIN employees e ON e.dept_id = d.id
+LEFT JOIN projects p ON p.dept_id = d.id
+GROUP BY d.name
+ORDER BY d.name;
+
+--echo # --- Assigned vs unassigned employees per department ---
+
+SELECT d.name,
+       COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN e.id END) AS assigned_count,
+       COUNT(DISTINCT CASE WHEN a.id IS NULL THEN e.id END) AS unassigned_count
+FROM departments d
+JOIN employees e ON e.dept_id = d.id
+LEFT JOIN assignments a ON a.emp_id = e.id
+GROUP BY d.name
+ORDER BY d.name;
+
+--echo # --- Cleanup ---
+DROP TABLE assignments, projects, employees, departments;

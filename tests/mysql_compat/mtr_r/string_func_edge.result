@@ -1,0 +1,235 @@
+DROP TABLE IF EXISTS t1;
+# --- CONCAT edge cases ---
+SELECT CONCAT('') AS empty_concat;
+empty_concat
+
+SELECT CONCAT('', '') AS two_empty;
+two_empty
+
+SELECT CONCAT('a', '', 'b') AS with_empty_middle;
+with_empty_middle
+ab
+SELECT CONCAT(NULL) AS null_concat;
+null_concat
+NULL
+SELECT CONCAT('hello', NULL, 'world') AS null_in_middle;
+null_in_middle
+NULL
+SELECT CONCAT(1, 2, 3) AS numeric_concat;
+numeric_concat
+123
+SELECT CONCAT(1.5, ' + ', 2.5, ' = ', 4.0) AS mixed_concat;
+mixed_concat
+1.5 + 2.5 = 4.0
+# --- SUBSTRING edge cases ---
+SELECT SUBSTRING('hello', 0) AS zero_start;
+zero_start
+
+SELECT SUBSTRING('hello', 1) AS first_char_on;
+first_char_on
+hello
+SELECT SUBSTRING('hello', 6) AS past_end;
+past_end
+
+SELECT SUBSTRING('hello', -2) AS negative_start;
+negative_start
+lo
+SELECT SUBSTRING('hello', 1, 0) AS zero_length;
+zero_length
+
+SELECT SUBSTRING('hello', 1, 100) AS long_length;
+long_length
+hello
+SELECT SUBSTRING('', 1, 5) AS empty_string;
+empty_string
+
+SELECT SUBSTRING(NULL, 1, 5) AS null_string;
+null_string
+NULL
+# --- REPLACE edge cases ---
+SELECT REPLACE('aaa', 'a', '') AS delete_all;
+delete_all
+
+SELECT REPLACE('hello', 'xyz', 'abc') AS no_match;
+no_match
+hello
+SELECT REPLACE('', 'a', 'b') AS empty_source;
+empty_source
+
+SELECT REPLACE('hello', '', 'x') AS empty_search;
+empty_search
+xhxexlxlxox
+SELECT REPLACE(NULL, 'a', 'b') AS null_source;
+null_source
+NULL
+SELECT REPLACE('hello', NULL, 'b') AS null_search;
+null_search
+hello
+SELECT REPLACE('hello', 'l', NULL) AS null_replace;
+null_replace
+heNULLNULLo
+# --- TRIM edge cases ---
+SELECT TRIM('   ') AS all_spaces;
+all_spaces
+
+SELECT TRIM('') AS empty_trim;
+empty_trim
+
+SELECT TRIM('  abc  ') AS normal_trim;
+normal_trim
+abc
+SELECT TRIM(LEADING ' ' FROM '   hi   ') AS leading_trim;
+leading_trim
+hi   
+SELECT TRIM(TRAILING ' ' FROM '   hi   ') AS trailing_trim;
+trailing_trim
+   hi
+SELECT TRIM(BOTH 'x' FROM 'xxxhixxx') AS trim_x;
+trim_x
+hi
+SELECT TRIM(NULL) AS null_trim;
+null_trim
+NULL
+# --- REPEAT edge cases ---
+SELECT REPEAT('ab', 3) AS normal_repeat;
+normal_repeat
+ababab
+SELECT REPEAT('x', 0) AS zero_repeat;
+zero_repeat
+
+SELECT REPEAT('x', -1) AS negative_repeat;
+negative_repeat
+
+SELECT REPEAT('', 5) AS empty_repeat;
+empty_repeat
+
+SELECT REPEAT(NULL, 3) AS null_repeat;
+null_repeat
+NULL
+SELECT REPEAT('a', NULL) AS null_count;
+null_count
+NULL
+# --- REVERSE ---
+SELECT REVERSE('hello') AS rev;
+rev
+olleh
+SELECT REVERSE('') AS rev_empty;
+rev_empty
+
+SELECT REVERSE('a') AS rev_single;
+rev_single
+a
+SELECT REVERSE(NULL) AS rev_null;
+rev_null
+NULL
+SELECT REVERSE('12345') AS rev_numbers;
+rev_numbers
+54321
+# --- LENGTH / CHAR_LENGTH ---
+SELECT LENGTH('') AS empty_len;
+empty_len
+0
+SELECT LENGTH(NULL) AS null_len;
+null_len
+NULL
+SELECT LENGTH('hello') AS normal_len;
+normal_len
+5
+SELECT CHAR_LENGTH('hello') AS char_len;
+char_len
+5
+SELECT LENGTH(12345) AS numeric_len;
+numeric_len
+5
+# --- UPPER / LOWER edge cases ---
+SELECT UPPER('') AS upper_empty;
+upper_empty
+
+SELECT LOWER('') AS lower_empty;
+lower_empty
+
+SELECT UPPER(NULL) AS upper_null;
+upper_null
+NULL
+SELECT LOWER(NULL) AS lower_null;
+lower_null
+NULL
+SELECT UPPER('already MIXED Case') AS upper_mixed;
+upper_mixed
+ALREADY MIXED CASE
+SELECT LOWER('already MIXED Case') AS lower_mixed;
+lower_mixed
+already mixed case
+# --- LEFT / RIGHT edge cases ---
+SELECT LEFT('hello', 0) AS left_zero;
+left_zero
+
+SELECT LEFT('hello', 3) AS left_three;
+left_three
+hel
+SELECT LEFT('hello', 100) AS left_past;
+left_past
+hello
+SELECT LEFT('hello', NULL) AS left_null;
+left_null
+
+SELECT LEFT(NULL, 3) AS null_left;
+null_left
+NULL
+SELECT RIGHT('hello', 0) AS right_zero;
+right_zero
+
+SELECT RIGHT('hello', 3) AS right_three;
+right_three
+llo
+SELECT RIGHT('hello', 100) AS right_past;
+right_past
+hello
+# --- LPAD / RPAD edge cases ---
+SELECT LPAD('hi', 5, '-') AS lpad_normal;
+lpad_normal
+---hi
+SELECT LPAD('hello', 3, '-') AS lpad_truncate;
+lpad_truncate
+hel
+SELECT LPAD('hi', 0, '-') AS lpad_zero;
+lpad_zero
+
+SELECT LPAD('hi', 5, '') AS lpad_empty_pad;
+lpad_empty_pad
+hi
+SELECT RPAD('hi', 5, '-') AS rpad_normal;
+rpad_normal
+hi---
+SELECT RPAD('hello', 3, '-') AS rpad_truncate;
+rpad_truncate
+hel
+# --- String functions with table data ---
+CREATE TABLE t1 (id INT PRIMARY KEY, s VARCHAR(50));
+INSERT INTO t1 VALUES (1, '  hello  '), (2, NULL), (3, ''), (4, 'world');
+SELECT id, CONCAT('[', TRIM(s), ']') AS trimmed FROM t1 ORDER BY id;
+id	trimmed
+1	[hello]
+2	NULL
+3	[]
+4	[world]
+SELECT id, LENGTH(s) AS len, UPPER(s) AS upper_s FROM t1 ORDER BY id;
+id	len	upper_s
+1	9	  HELLO  
+2	NULL	NULL
+3	0	
+4	5	WORLD
+SELECT id, REPLACE(s, 'l', 'L') AS replaced FROM t1 ORDER BY id;
+id	replaced
+1	  heLLo  
+2	NULL
+3	
+4	worLd
+SELECT id, REVERSE(s) AS reversed FROM t1 ORDER BY id;
+id	reversed
+1	  olleh  
+2	NULL
+3	
+4	dlrow
+# --- Cleanup ---
+DROP TABLE t1;

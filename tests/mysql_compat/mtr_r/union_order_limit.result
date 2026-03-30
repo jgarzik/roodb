@@ -1,0 +1,83 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(20), score INT);
+INSERT INTO t1 VALUES (1,'alpha',90), (2,'beta',80), (3,'gamma',70), (4,'delta',60);
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, val VARCHAR(20), score INT);
+INSERT INTO t2 VALUES (5,'epsilon',55), (6,'zeta',85), (7,'eta',95), (8,'theta',65);
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, val VARCHAR(20), score INT);
+INSERT INTO t3 VALUES (9,'iota',50), (10,'kappa',100), (11,'lambda',75), (12,'mu',45);
+# --- Basic UNION with ORDER BY ---
+SELECT id, val, score FROM t1
+UNION
+SELECT id, val, score FROM t2
+ORDER BY score DESC;
+# --- UNION ALL with ORDER BY ---
+SELECT id, val FROM t1
+UNION ALL
+SELECT id, val FROM t2
+ORDER BY id;
+# --- UNION with LIMIT ---
+SELECT id, val, score FROM t1
+UNION
+SELECT id, val, score FROM t2
+ORDER BY score DESC
+LIMIT 3;
+# --- UNION ALL with LIMIT and OFFSET ---
+SELECT id, val, score FROM t1
+UNION ALL
+SELECT id, val, score FROM t2
+ORDER BY id
+LIMIT 3 OFFSET 2;
+# --- Three-way UNION with ORDER BY ---
+SELECT id, val, score FROM t1
+UNION
+SELECT id, val, score FROM t2
+UNION
+SELECT id, val, score FROM t3
+ORDER BY score;
+# --- Three-way UNION ALL with LIMIT ---
+SELECT id, val, score FROM t1
+UNION ALL
+SELECT id, val, score FROM t2
+UNION ALL
+SELECT id, val, score FROM t3
+ORDER BY id
+LIMIT 5;
+# --- UNION with ORDER BY on expression ---
+SELECT id, val, score FROM t1
+UNION
+SELECT id, val, score FROM t2
+ORDER BY score * -1;
+# --- Parenthesized UNION with per-branch LIMIT ---
+(SELECT id, val, score FROM t1 ORDER BY score DESC LIMIT 2)
+UNION ALL
+(SELECT id, val, score FROM t2 ORDER BY score DESC LIMIT 2)
+ORDER BY score DESC;
+# --- UNION DISTINCT with ORDER BY ---
+SELECT id, val FROM t1 WHERE id <= 2
+UNION DISTINCT
+SELECT id, val FROM t1 WHERE id >= 2
+ORDER BY id;
+# --- UNION with NULL values ---
+SELECT id, val, score FROM t1 WHERE id = 1
+UNION ALL
+SELECT NULL, NULL, NULL
+UNION ALL
+SELECT id, val, score FROM t2 WHERE id = 5
+ORDER BY id;
+# --- UNION with aggregate in branches ---
+SELECT 'max' AS stat, MAX(score) AS value FROM t1
+UNION ALL
+SELECT 'min' AS stat, MIN(score) AS value FROM t1
+UNION ALL
+SELECT 'max' AS stat, MAX(score) AS value FROM t2
+UNION ALL
+SELECT 'min' AS stat, MIN(score) AS value FROM t2
+ORDER BY stat, value;
+# --- UNION with WHERE and ORDER BY ---
+SELECT id, val, score FROM t1 WHERE score >= 70
+UNION
+SELECT id, val, score FROM t2 WHERE score >= 70
+ORDER BY score DESC
+LIMIT 4;
+# --- Cleanup ---
+DROP TABLE t1, t2, t3;

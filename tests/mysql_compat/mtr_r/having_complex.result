@@ -1,0 +1,179 @@
+DROP TABLE IF EXISTS orders, line_items, products;
+CREATE TABLE products (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(50) NOT NULL,
+category VARCHAR(20) NOT NULL,
+price DECIMAL(10,2) NOT NULL
+);
+INSERT INTO products VALUES
+(1, 'Laptop', 'electronics', 999.99),
+(2, 'Phone', 'electronics', 699.50),
+(3, 'Tablet', 'electronics', 499.00),
+(4, 'Novel', 'books', 14.99),
+(5, 'Textbook', 'books', 89.95),
+(6, 'Jacket', 'clothing', 149.00),
+(7, 'T-Shirt', 'clothing', 29.99),
+(8, 'Shoes', 'clothing', 79.99);
+CREATE TABLE orders (
+id INT NOT NULL PRIMARY KEY,
+customer VARCHAR(30) NOT NULL,
+order_date DATE NOT NULL
+);
+INSERT INTO orders VALUES
+(1, 'Alice', '2025-01-15'),
+(2, 'Bob', '2025-01-20'),
+(3, 'Alice', '2025-02-10'),
+(4, 'Charlie', '2025-02-15'),
+(5, 'Bob', '2025-03-01'),
+(6, 'Diana', '2025-03-05');
+CREATE TABLE line_items (
+id INT NOT NULL PRIMARY KEY,
+order_id INT NOT NULL,
+product_id INT NOT NULL,
+qty INT NOT NULL
+);
+INSERT INTO line_items VALUES
+(1, 1, 1, 1), (2, 1, 7, 3),
+(3, 2, 2, 1), (4, 2, 4, 2),
+(5, 3, 3, 1), (6, 3, 5, 1), (7, 3, 6, 2),
+(8, 4, 1, 2), (9, 4, 8, 1),
+(10, 5, 7, 5), (11, 5, 4, 3),
+(12, 6, 6, 1);
+# --- HAVING with SUM > threshold ---
+SELECT o.customer, SUM(li.qty * p.price) AS total_spent
+FROM orders o
+JOIN line_items li ON o.id = li.order_id
+JOIN products p ON li.product_id = p.id
+GROUP BY o.customer
+HAVING SUM(li.qty * p.price) > 500
+ORDER BY total_spent DESC;
+customer	total_spent
+Charlie	2079.9699999999998
+Alice	1976.910000000000082
+Bob	924.400000000000091
+# --- HAVING with COUNT and SUM ---
+SELECT o.customer,
+COUNT(DISTINCT o.id) AS num_orders,
+SUM(li.qty) AS total_items
+FROM orders o
+JOIN line_items li ON o.id = li.order_id
+GROUP BY o.customer
+HAVING COUNT(DISTINCT o.id) >= 2 AND SUM(li.qty) > 3
+ORDER BY o.customer;
+customer	num_orders	total_items
+Alice	2	8
+Bob	2	11
+# --- HAVING with AVG ---
+SELECT p.category, AVG(p.price) AS avg_price
+FROM products p
+GROUP BY p.category
+HAVING AVG(p.price) > 50
+ORDER BY avg_price DESC;
+category	avg_price
+electronics	732.829999999999927
+clothing	86.326666666666668
+books	52.469999999999999
+# --- HAVING with arithmetic expression ---
+SELECT p.category,
+SUM(li.qty * p.price) AS revenue,
+SUM(li.qty) AS units,
+ROUND(SUM(li.qty * p.price) / SUM(li.qty), 2) AS avg_unit_price
+FROM line_items li
+JOIN products p ON li.product_id = p.id
+GROUP BY p.category
+HAVING SUM(li.qty * p.price) / SUM(li.qty) > 100
+ORDER BY p.category;
+category	revenue	units	avg_unit_price
+electronics	4198.469999999999345	5	839.690000000000055
+# --- HAVING with CASE expression ---
+SELECT p.category,
+SUM(CASE WHEN li.qty >= 2 THEN li.qty ELSE 0 END) AS bulk_qty,
+SUM(CASE WHEN li.qty = 1 THEN li.qty ELSE 0 END) AS single_qty
+FROM line_items li
+JOIN products p ON li.product_id = p.id
+GROUP BY p.category
+HAVING SUM(CASE WHEN li.qty >= 2 THEN li.qty ELSE 0 END) > 0
+ORDER BY p.category;
+category	bulk_qty	single_qty
+books	5	1
+clothing	10	2
+electronics	2	3
+# --- HAVING with MAX - MIN spread ---
+SELECT p.category,
+MAX(p.price) AS max_price,
+MIN(p.price) AS min_price,
+MAX(p.price) - MIN(p.price) AS spread
+FROM products p
+GROUP BY p.category
+HAVING MAX(p.price) - MIN(p.price) > 50
+ORDER BY spread DESC;
+category	max_price	min_price	spread
+electronics	999.99	499.00	500.99
+clothing	149.00	29.99	119.01
+books	89.95	14.99	74.96
+# --- HAVING with subquery ---
+SELECT o.customer, SUM(li.qty) AS total_items
+FROM orders o
+JOIN line_items li ON o.id = li.order_id
+GROUP BY o.customer
+HAVING SUM(li.qty) > (SELECT AVG(qty) * 2 FROM line_items)
+ORDER BY o.customer;
+customer	total_items
+Alice	8
+Bob	11
+# --- HAVING with COUNT DISTINCT ---
+SELECT o.customer, COUNT(DISTINCT p.category) AS num_categories
+FROM orders o
+JOIN line_items li ON o.id = li.order_id
+JOIN products p ON li.product_id = p.id
+GROUP BY o.customer
+HAVING COUNT(DISTINCT p.category) >= 2
+ORDER BY num_categories DESC, o.customer;
+customer	num_categories
+Alice	3
+Bob	3
+Charlie	2
+# --- HAVING combined with ORDER BY and LIMIT ---
+SELECT p.category, SUM(li.qty) AS total_sold
+FROM line_items li
+JOIN products p ON li.product_id = p.id
+GROUP BY p.category
+HAVING SUM(li.qty) > 2
+ORDER BY total_sold DESC
+LIMIT 2;
+category	total_sold
+clothing	12
+books	6
+# --- HAVING with multiple aggregate conditions joined by OR ---
+SELECT o.customer,
+COUNT(*) AS num_items,
+SUM(li.qty * p.price) AS total_value
+FROM orders o
+JOIN line_items li ON o.id = li.order_id
+JOIN products p ON li.product_id = p.id
+GROUP BY o.customer
+HAVING COUNT(*) >= 4 OR SUM(li.qty * p.price) > 2000
+ORDER BY o.customer;
+customer	num_items	total_value
+Alice	5	1976.910000000000082
+Bob	4	924.400000000000091
+Charlie	2	2079.9699999999998
+# --- HAVING 1 (always true) ---
+SELECT p.category, COUNT(*) AS cnt
+FROM products p
+GROUP BY p.category
+HAVING 1
+ORDER BY p.category;
+category	cnt
+books	2
+clothing	3
+electronics	3
+# --- HAVING 0 (always false) ---
+SELECT p.category, COUNT(*) AS cnt
+FROM products p
+GROUP BY p.category
+HAVING 0
+ORDER BY p.category;
+category	cnt
+# --- Cleanup ---
+DROP TABLE line_items, orders, products;

@@ -251,6 +251,22 @@ TIERS = {
         "aggregate_expressions",              # complex aggregate expressions (SUM(CASE...), etc.)
         "subquery_where_complex",             # complex WHERE patterns with multiple subqueries
     ],
+    32: [
+        "exists_antijoin",                    # EXISTS/NOT EXISTS anti-join and semi-join patterns
+        "dml_subquery_where",                 # UPDATE/DELETE with subqueries in WHERE clauses
+        "join_chain_3way",                    # complex 3+ table JOIN chains
+        "union_order_limit",                  # UNION with ORDER BY and LIMIT
+    ],
+    33: [
+        "string_func_edge",                   # string function edge cases (NULL, empty, boundary)
+        "date_func_patterns",                 # date functions (YEAR, DATEDIFF, DATE_ADD, etc.)
+        "insert_edge_cases",                  # INSERT edge cases (multi-row, DEFAULT, boundary)
+    ],
+    34: [
+        "multi_column_orderby",               # multi-column ORDER BY with mixed ASC/DESC, NULLs
+        "having_complex",                     # HAVING with complex expressions and subqueries
+        "aggregate_subquery_mix",             # mixed subquery + aggregate patterns
+    ],
 }
 
 

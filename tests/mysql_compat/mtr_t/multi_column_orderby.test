@@ -1,0 +1,127 @@
+#
+# Multi-column ORDER BY patterns.
+# Tests ORDER BY with 2+ columns, mixed ASC/DESC, NULLs in sort keys,
+# ORDER BY with expressions, ORDER BY with GROUP BY, and LIMIT interactions.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS employees, scores;
+--enable_warnings
+
+CREATE TABLE employees (
+    id INT NOT NULL PRIMARY KEY,
+    dept VARCHAR(20) NOT NULL,
+    name VARCHAR(50) NOT NULL,
+    salary DECIMAL(10,2) NOT NULL,
+    hire_year INT,
+    rating INT
+);
+INSERT INTO employees VALUES
+    (1, 'eng', 'Alice', 120000.00, 2018, 5),
+    (2, 'eng', 'Bob', 95000.00, 2020, 3),
+    (3, 'eng', 'Charlie', 95000.00, 2019, 4),
+    (4, 'sales', 'Diana', 80000.00, 2021, NULL),
+    (5, 'sales', 'Eve', 80000.00, 2022, 5),
+    (6, 'sales', 'Frank', 85000.00, 2020, 3),
+    (7, 'hr', 'Grace', 70000.00, NULL, 4),
+    (8, 'hr', 'Henry', 70000.00, 2023, NULL),
+    (9, 'hr', 'Irene', 65000.00, 2021, 2);
+
+--echo # --- Two-column ORDER BY, both ASC ---
+
+SELECT id, dept, name FROM employees
+ORDER BY dept, name;
+
+--echo # --- Two-column ORDER BY, mixed direction ---
+
+SELECT id, dept, salary FROM employees
+ORDER BY dept ASC, salary DESC;
+
+--echo # --- Three-column ORDER BY ---
+
+SELECT id, dept, salary, name FROM employees
+ORDER BY dept, salary DESC, name;
+
+--echo # --- ORDER BY with NULLs (NULLs first in ASC) ---
+
+SELECT id, name, hire_year FROM employees
+ORDER BY hire_year, name;
+
+--echo # --- ORDER BY with NULLs DESC (NULLs last in DESC) ---
+
+SELECT id, name, rating FROM employees
+ORDER BY rating DESC, name;
+
+--echo # --- ORDER BY with expression ---
+
+SELECT id, name, salary, salary * 12 AS annual
+FROM employees
+ORDER BY salary * 12 DESC, name;
+
+--echo # --- ORDER BY with CASE expression ---
+
+SELECT id, name, dept,
+    CASE dept
+        WHEN 'eng' THEN 1
+        WHEN 'sales' THEN 2
+        WHEN 'hr' THEN 3
+    END AS dept_rank
+FROM employees
+ORDER BY CASE dept WHEN 'eng' THEN 1 WHEN 'sales' THEN 2 WHEN 'hr' THEN 3 END,
+         salary DESC;
+
+--echo # --- ORDER BY with GROUP BY ---
+
+SELECT dept, COUNT(*) AS cnt, AVG(salary) AS avg_sal
+FROM employees
+GROUP BY dept
+ORDER BY cnt DESC, dept;
+
+--echo # --- ORDER BY after GROUP BY with ties ---
+
+SELECT dept, MAX(salary) AS max_sal, MIN(salary) AS min_sal
+FROM employees
+GROUP BY dept
+ORDER BY max_sal DESC, min_sal ASC;
+
+--echo # --- Multi-column ORDER BY with LIMIT ---
+
+SELECT id, dept, name, salary FROM employees
+ORDER BY dept, salary DESC
+LIMIT 5;
+
+--echo # --- Multi-column ORDER BY with LIMIT and OFFSET ---
+
+SELECT id, dept, name, salary FROM employees
+ORDER BY dept, salary DESC
+LIMIT 3 OFFSET 3;
+
+--echo # --- ORDER BY column alias ---
+
+SELECT id, name, salary * 0.10 AS bonus FROM employees
+ORDER BY bonus DESC, name
+LIMIT 5;
+
+--echo # --- ORDER BY ordinal position ---
+
+SELECT dept, name, salary FROM employees
+ORDER BY 1, 3 DESC, 2;
+
+--echo # --- ORDER BY with COALESCE (NULL handling) ---
+
+SELECT id, name, COALESCE(rating, 0) AS eff_rating
+FROM employees
+ORDER BY COALESCE(rating, 0) DESC, name;
+
+--echo # --- ORDER BY with JOIN ---
+
+CREATE TABLE scores (emp_id INT NOT NULL PRIMARY KEY, score INT NOT NULL);
+INSERT INTO scores VALUES (1, 95), (2, 78), (3, 88), (5, 92), (6, 70), (9, 85);
+
+SELECT e.name, e.dept, s.score
+FROM employees e
+JOIN scores s ON e.id = s.emp_id
+ORDER BY e.dept, s.score DESC;
+
+--echo # --- Cleanup ---
+DROP TABLE employees, scores;
