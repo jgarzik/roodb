@@ -373,6 +373,7 @@ async fn test_count_aggregate() {
                 args: vec![],
                 distinct: false,
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count".to_string(),
         )],

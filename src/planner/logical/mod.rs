@@ -138,6 +138,8 @@ pub enum ResolvedExpr {
         args: Vec<ResolvedExpr>,
         distinct: bool,
         result_type: DataType,
+        /// GROUP_CONCAT separator (default ",")
+        separator: Option<String>,
     },
     /// IS NULL / IS NOT NULL
     IsNull {

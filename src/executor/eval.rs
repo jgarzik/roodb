@@ -1924,6 +1924,33 @@ pub fn eval_function(
             Ok(Datum::String(result))
         }
 
+        "SUBSTRING_INDEX" => {
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SUBSTRING_INDEX requires 3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let delim = args[1].to_display_string();
+            let count = args[2].as_int().unwrap_or(0);
+            if delim.is_empty() {
+                return Ok(Datum::String(String::new()));
+            }
+            let parts: Vec<&str> = s.split(&*delim).collect();
+            if count > 0 {
+                let n = (count as usize).min(parts.len());
+                Ok(Datum::String(parts[..n].join(&delim)))
+            } else if count < 0 {
+                let n = ((-count) as usize).min(parts.len());
+                Ok(Datum::String(parts[parts.len() - n..].join(&delim)))
+            } else {
+                Ok(Datum::String(String::new()))
+            }
+        }
+
         "TRIM" => {
             if args.is_empty() {
                 return Err(ExecutorError::InvalidOperation(
@@ -3110,6 +3137,27 @@ pub fn eval_function(
             }
         }
 
+        "FROM_DAYS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "FROM_DAYS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let day_num = args[0].as_int().unwrap_or(0);
+            if day_num <= 0 {
+                return Ok(Datum::String("0000-00-00".to_string()));
+            }
+            // MySQL TO_DAYS uses Julian Day Number formula where
+            // TO_DAYS('1970-01-01') = 2440588
+            // Convert MySQL day number to Unix epoch days
+            let epoch_days = day_num - 2440588;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            Ok(Datum::String(format!("{:04}-{:02}-{:02}", y, m, d)))
+        }
+
         "DATEDIFF" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
@@ -3205,6 +3253,25 @@ pub fn eval_function(
             Ok(Datum::Int(0))
         }
 
+        "MAKE_SET" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MAKE_SET requires at least 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = args[0].as_int().unwrap_or(0) as u64;
+            let mut result = Vec::new();
+            for (i, arg) in args[1..].iter().enumerate() {
+                if bits & (1u64 << i) != 0 && !arg.is_null() {
+                    result.push(arg.to_display_string());
+                }
+            }
+            Ok(Datum::String(result.join(",")))
+        }
+
         "TIMEDIFF" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
@@ -3228,6 +3295,52 @@ pub fn eval_function(
                 "{}{:02}:{:02}:{:02}",
                 sign, hours, mins, secs
             )))
+        }
+
+        "TIMESTAMPDIFF" => {
+            // TIMESTAMPDIFF(unit, datetime1, datetime2) -> integer
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIMESTAMPDIFF requires 3 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let unit = args[0].to_display_string().to_uppercase();
+            let s1 = args[1].to_display_string();
+            let s2 = args[2].to_display_string();
+            let dt1 = parse_datetime_simple(&s1);
+            let dt2 = parse_datetime_simple(&s2);
+            match (dt1, dt2) {
+                (Some(d1), Some(d2)) => {
+                    let result = timestampdiff_calc(&unit, &d1, &d2);
+                    Ok(Datum::Int(result))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        "TIMESTAMPADD" => {
+            // TIMESTAMPADD(unit, interval, datetime) -> datetime string
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIMESTAMPADD requires 3 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let unit = args[0].to_display_string().to_uppercase();
+            let interval_val = args[1].as_int().unwrap_or(0);
+            let s = args[2].to_display_string();
+            match parse_datetime_simple(&s) {
+                Some(dt) => {
+                    let result = timestampadd_calc(&unit, interval_val, &dt);
+                    Ok(Datum::String(result))
+                }
+                None => Ok(Datum::Null),
+            }
         }
 
         "GET_LOCK" => {
@@ -5184,6 +5297,137 @@ fn parse_date_to_days(s: &str) -> Option<i64> {
     Some(365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day + 1721119)
 }
 
+/// Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into DateTimeParts
+fn parse_datetime_simple(s: &str) -> Option<DateTimeParts> {
+    let s = s.trim();
+    let (date_part, time_part) = if let Some(pos) = s.find(' ') {
+        (&s[..pos], Some(&s[pos + 1..]))
+    } else {
+        (s, None)
+    };
+    let dp: Vec<&str> = date_part.split('-').collect();
+    if dp.len() < 3 {
+        return None;
+    }
+    let year: i64 = dp[0].parse().ok()?;
+    let month: u32 = dp[1].parse().ok()?;
+    let day: u32 = dp[2].parse().ok()?;
+    let (hour, minute, second) = if let Some(tp) = time_part {
+        let tp: Vec<&str> = tp.split(':').collect();
+        (
+            tp.first().and_then(|v| v.parse().ok()).unwrap_or(0u32),
+            tp.get(1).and_then(|v| v.parse().ok()).unwrap_or(0u32),
+            tp.get(2).and_then(|v| v.parse().ok()).unwrap_or(0u32),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        ..Default::default()
+    })
+}
+
+fn timestampdiff_calc(unit: &str, d1: &DateTimeParts, d2: &DateTimeParts) -> i64 {
+    match unit {
+        "YEAR" => {
+            let mut diff = d2.year - d1.year;
+            // Adjust if d2 hasn't reached d1's month/day yet
+            if (d2.month, d2.day, d2.hour, d2.minute, d2.second)
+                < (d1.month, d1.day, d1.hour, d1.minute, d1.second)
+            {
+                diff -= 1;
+            }
+            diff
+        }
+        "QUARTER" => timestampdiff_calc("MONTH", d1, d2) / 3,
+        "MONTH" => {
+            let mut diff = (d2.year - d1.year) * 12 + d2.month as i64 - d1.month as i64;
+            if (d2.day, d2.hour, d2.minute, d2.second) < (d1.day, d1.hour, d1.minute, d1.second) {
+                diff -= 1;
+            }
+            diff
+        }
+        "WEEK" => timestampdiff_calc("DAY", d1, d2) / 7,
+        _ => {
+            // For DAY, HOUR, MINUTE, SECOND: convert to total seconds and divide
+            let secs1 = ymd_to_days_from_epoch(d1.year, d1.month, d1.day) * 86400
+                + d1.hour as i64 * 3600
+                + d1.minute as i64 * 60
+                + d1.second as i64;
+            let secs2 = ymd_to_days_from_epoch(d2.year, d2.month, d2.day) * 86400
+                + d2.hour as i64 * 3600
+                + d2.minute as i64 * 60
+                + d2.second as i64;
+            let diff_secs = secs2 - secs1;
+            match unit {
+                "DAY" => diff_secs / 86400,
+                "HOUR" => diff_secs / 3600,
+                "MINUTE" => diff_secs / 60,
+                "SECOND" | "FRAC_SECOND" => diff_secs,
+                _ => diff_secs / 86400, // default to days
+            }
+        }
+    }
+}
+
+fn timestampadd_calc(unit: &str, interval: i64, dt: &DateTimeParts) -> String {
+    match unit {
+        "YEAR" => {
+            let new_year = dt.year + interval;
+            let new_day = dt.day.min(days_in_month(new_year, dt.month));
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                new_year, dt.month, new_day, dt.hour, dt.minute, dt.second
+            )
+        }
+        "QUARTER" => timestampadd_calc("MONTH", interval * 3, dt),
+        "MONTH" => {
+            let total_months = dt.year * 12 + dt.month as i64 - 1 + interval;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            let new_day = dt.day.min(days_in_month(new_year, new_month));
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                new_year, new_month, new_day, dt.hour, dt.minute, dt.second
+            )
+        }
+        "WEEK" => timestampadd_calc("DAY", interval * 7, dt),
+        _ => {
+            // Convert to total seconds, add, convert back
+            let total_secs = ymd_to_days_from_epoch(dt.year, dt.month, dt.day) * 86400
+                + dt.hour as i64 * 3600
+                + dt.minute as i64 * 60
+                + dt.second as i64;
+            let add_secs = match unit {
+                "DAY" => interval * 86400,
+                "HOUR" => interval * 3600,
+                "MINUTE" => interval * 60,
+                "SECOND" | "FRAC_SECOND" => interval,
+                _ => interval * 86400,
+            };
+            let new_total = total_secs + add_secs;
+            let new_days = new_total.div_euclid(86400);
+            let day_secs = new_total.rem_euclid(86400);
+            let (y, m, d) = days_from_epoch_to_ymd(new_days);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y,
+                m,
+                d,
+                day_secs / 3600,
+                (day_secs % 3600) / 60,
+                day_secs % 60
+            )
+        }
+    }
+}
+
 fn radix_string(val: i64, radix: u32) -> String {
     if radix == 10 {
         return val.to_string();
@@ -5516,6 +5760,7 @@ mod tests {
             args: vec![col_expr(1)],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("HELLO"));
@@ -5546,6 +5791,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("yes"));
@@ -5563,6 +5809,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("no"));
@@ -5580,6 +5827,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("no"));
@@ -5594,6 +5842,7 @@ mod tests {
             args: vec![ResolvedExpr::Literal(Literal::Null)],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
 
@@ -5603,6 +5852,7 @@ mod tests {
             args: vec![ResolvedExpr::Literal(Literal::Integer(42))],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(0));
     }
@@ -5619,6 +5869,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(2));
 
@@ -5631,6 +5882,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
     }

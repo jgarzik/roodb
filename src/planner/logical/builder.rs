@@ -424,6 +424,8 @@ impl LogicalPlanBuilder {
                 | "VARIANCE"
                 | "VAR_POP"
                 | "VAR_SAMP"
+                | "ANY_VALUE"
+                | "GROUP_CONCAT"
         )
     }
 
@@ -615,15 +617,14 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => {
                 let upper = name.to_uppercase();
                 if Self::is_aggregate_name(&upper) {
-                    Some(AggregateFunc::new(
-                        upper,
-                        args.clone(),
-                        *distinct,
-                        result_type.clone(),
-                    ))
+                    let mut agg =
+                        AggregateFunc::new(upper, args.clone(), *distinct, result_type.clone());
+                    agg.separator = separator.clone();
+                    Some(agg)
                 } else {
                     None
                 }
@@ -808,6 +809,7 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => {
                 // Guard: do not recurse into aggregate function args.
                 // Aggregate args are evaluated pre-aggregation, not post-.
@@ -824,6 +826,7 @@ impl LogicalPlanBuilder {
                         .collect(),
                     distinct: *distinct,
                     result_type: result_type.clone(),
+                    separator: separator.clone(),
                 }
             }
             ResolvedExpr::Case {
@@ -1156,6 +1159,7 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => {
                 // Guard: do not recurse into aggregate function args
                 if Self::extract_aggregate(expr).is_some() {
@@ -1169,6 +1173,7 @@ impl LogicalPlanBuilder {
                         .collect(),
                     distinct: *distinct,
                     result_type: result_type.clone(),
+                    separator: separator.clone(),
                 }
             }
             ResolvedExpr::BinaryOp {
@@ -1560,6 +1565,7 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => ResolvedExpr::Function {
                 name: name.clone(),
                 args: args
@@ -1568,6 +1574,7 @@ impl LogicalPlanBuilder {
                     .collect(),
                 distinct: *distinct,
                 result_type: result_type.clone(),
+                separator: separator.clone(),
             },
             ResolvedExpr::IsNull {
                 expr: inner,

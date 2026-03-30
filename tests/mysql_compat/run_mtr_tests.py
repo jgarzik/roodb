@@ -267,6 +267,12 @@ TIERS = {
         "having_complex",                     # HAVING with complex expressions and subqueries
         "aggregate_subquery_mix",             # mixed subquery + aggregate patterns
     ],
+    35: [
+        "func_new_scalar",                    # FROM_DAYS, SUBSTRING_INDEX, MAKE_SET, TIMESTAMPDIFF/ADD
+        "group_concat_basic",                 # GROUP_CONCAT with SEPARATOR, DISTINCT, NULLs
+        "any_value_agg",                      # ANY_VALUE aggregate function
+        "multi_table_delete",                 # DELETE t1 FROM t1 JOIN t2 ON cond
+    ],
 }
 
 

@@ -31,6 +31,13 @@ enum Accumulator {
     BitAnd(u64),
     BitOr(u64),
     BitXor(u64),
+    /// ANY_VALUE: keeps the first non-null value seen
+    AnyValue(Option<Datum>),
+    /// GROUP_CONCAT: collects string values with separator
+    GroupConcat {
+        values: Vec<String>,
+        separator: String,
+    },
     /// Population variance/stddev: tracks sum, sum of squares, count
     /// is_stddev: if true, finalize returns sqrt(variance)
     VarPop {
@@ -49,7 +56,7 @@ enum Accumulator {
 }
 
 impl Accumulator {
-    fn new(func_name: &str) -> Self {
+    fn new_with_separator(func_name: &str, separator: Option<&str>) -> Self {
         match func_name.to_uppercase().as_str() {
             "COUNT" => Accumulator::Count(0),
             "SUM" => Accumulator::Sum(None),
@@ -82,6 +89,11 @@ impl Accumulator {
                 sum_sq: 0.0,
                 count: 0,
                 is_stddev: true,
+            },
+            "ANY_VALUE" => Accumulator::AnyValue(None),
+            "GROUP_CONCAT" => Accumulator::GroupConcat {
+                values: Vec::new(),
+                separator: separator.unwrap_or(",").to_string(),
             },
             _ => Accumulator::Count(0), // fallback
         }
@@ -143,6 +155,16 @@ impl Accumulator {
                     *acc ^= v;
                 }
             }
+            Accumulator::AnyValue(val) => {
+                if val.is_none() && !value.is_null() {
+                    *val = Some(value.clone());
+                }
+            }
+            Accumulator::GroupConcat { values, .. } => {
+                if !value.is_null() {
+                    values.push(value.to_display_string());
+                }
+            }
             Accumulator::VarPop {
                 sum, sum_sq, count, ..
             }
@@ -193,6 +215,14 @@ impl Accumulator {
             }
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
+            Accumulator::AnyValue(val) => val.clone().unwrap_or(Datum::Null),
+            Accumulator::GroupConcat { values, separator } => {
+                if values.is_empty() {
+                    Datum::Null
+                } else {
+                    Datum::String(values.join(separator))
+                }
+            }
             Accumulator::BitAnd(v) => Datum::UnsignedInt(*v),
             Accumulator::BitOr(v) => Datum::UnsignedInt(*v),
             Accumulator::BitXor(v) => Datum::UnsignedInt(*v),
@@ -249,9 +279,9 @@ struct DistinctAccumulator {
 }
 
 impl DistinctAccumulator {
-    fn new(func_name: &str, distinct: bool) -> Self {
+    fn new(func_name: &str, distinct: bool, separator: Option<&str>) -> Self {
         DistinctAccumulator {
-            inner: Accumulator::new(func_name),
+            inner: Accumulator::new_with_separator(func_name, separator),
             // MIN/MAX don't need distinct tracking - they're naturally idempotent
             seen: if distinct && !matches!(func_name.to_uppercase().as_str(), "MIN" | "MAX") {
                 Some(HashSet::new())
@@ -363,7 +393,9 @@ impl Executor for HashAggregate {
                 let accs: Vec<_> = self
                     .aggregates
                     .iter()
-                    .map(|(agg, _)| DistinctAccumulator::new(&agg.name, agg.distinct))
+                    .map(|(agg, _)| {
+                        DistinctAccumulator::new(&agg.name, agg.distinct, agg.separator.as_deref())
+                    })
                     .collect();
                 (group_values.clone(), accs)
             });
@@ -394,7 +426,8 @@ impl Executor for HashAggregate {
         if self.output.is_empty() && self.group_by.is_empty() && !self.aggregates.is_empty() {
             let mut row_values = Vec::new();
             for (agg, _) in &self.aggregates {
-                let acc = DistinctAccumulator::new(&agg.name, agg.distinct);
+                let acc =
+                    DistinctAccumulator::new(&agg.name, agg.distinct, agg.separator.as_deref());
                 row_values.push(acc.finalize());
             }
             self.output.push(Row::new(row_values));
@@ -475,6 +508,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count".to_string(),
         )];
@@ -511,6 +545,7 @@ mod tests {
                 })],
                 distinct: false,
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum".to_string(),
         )];
@@ -556,6 +591,7 @@ mod tests {
                 })],
                 distinct: false,
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum".to_string(),
         )];
@@ -602,6 +638,7 @@ mod tests {
                 })],
                 distinct: true, // COUNT(DISTINCT c)
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count_distinct".to_string(),
         )];
@@ -640,6 +677,7 @@ mod tests {
                 })],
                 distinct: true, // SUM(DISTINCT c)
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum_distinct".to_string(),
         )];
@@ -679,6 +717,7 @@ mod tests {
                     args: vec![col.clone()],
                     distinct: false,
                     result_type: DataType::BigIntUnsigned,
+                    separator: None,
                 },
                 "bit_and".to_string(),
             ),
@@ -688,6 +727,7 @@ mod tests {
                     args: vec![col.clone()],
                     distinct: false,
                     result_type: DataType::BigIntUnsigned,
+                    separator: None,
                 },
                 "bit_or".to_string(),
             ),
@@ -697,6 +737,7 @@ mod tests {
                     args: vec![col],
                     distinct: false,
                     result_type: DataType::BigIntUnsigned,
+                    separator: None,
                 },
                 "bit_xor".to_string(),
             ),

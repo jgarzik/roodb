@@ -713,28 +713,139 @@ impl<'a> Resolver<'a> {
 
     /// Resolve DELETE statement
     fn resolve_delete(&self, delete: &sp::Delete) -> SqlResult<ResolvedStatement> {
-        let table_name = match &delete.from {
-            sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => {
-                match &tables[0].relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-                }
-            }
-            sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => {
-                match &tables[0].relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-                }
-            }
+        // Extract FROM clause tables and detect multi-table DELETE
+        let from_tables = match &delete.from {
+            sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => tables,
+            sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => tables,
             _ => return Err(SqlError::Parse("DELETE requires a table".to_string())),
+        };
+
+        let table_name = match &from_tables[0].relation {
+            sp::TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+        };
+
+        // Multi-table DELETE: DELETE t1 FROM t1 JOIN t2 ON t1.a = t2.a
+        // Rewrite join condition into an IN-subquery filter that only references
+        // the target table: WHERE t1.a IN (SELECT t2.a FROM t2)
+        let join_filter = if !delete.tables.is_empty() && !from_tables[0].joins.is_empty() {
+            let target = delete.tables[0].to_string();
+            let mut combined_filter: Option<ResolvedExpr> = None;
+
+            for join in &from_tables[0].joins {
+                let joined_table_name = match &join.relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => continue,
+                };
+                let joined_def = self
+                    .catalog
+                    .get_table(&joined_table_name)
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+
+                if let Some(on_expr) = extract_join_condition(&join.join_operator) {
+                    let target_def = self
+                        .catalog
+                        .get_table(&target)
+                        .ok_or_else(|| SqlError::TableNotFound(target.clone()))?;
+                    let mut multi_scope = Scope::single_table(&target, target_def);
+                    multi_scope.add_table(&joined_table_name, &joined_table_name, joined_def);
+
+                    // Extract equi-join pairs from the ON condition
+                    let pairs = extract_equijoin_pairs(on_expr, &target, &joined_table_name);
+
+                    let joined_cols: Vec<_> = joined_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                        .collect();
+
+                    for (target_col, joined_col) in &pairs {
+                        let target_col_def = target_def
+                            .get_column(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let target_col_idx = target_def
+                            .get_column_index(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let joined_col_def = joined_def
+                            .get_column(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let joined_col_idx = joined_def
+                            .get_column_index(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+
+                        let target_ref = ResolvedExpr::Column(ResolvedColumn {
+                            table: target.clone(),
+                            name: target_col.clone(),
+                            index: target_col_idx,
+                            data_type: target_col_def.data_type.clone(),
+                            nullable: target_col_def.nullable,
+                            default_value: None,
+                        });
+                        let subquery_col = ResolvedExpr::Column(ResolvedColumn {
+                            table: joined_table_name.clone(),
+                            name: joined_col.clone(),
+                            index: joined_col_idx,
+                            data_type: joined_col_def.data_type.clone(),
+                            nullable: joined_col_def.nullable,
+                            default_value: None,
+                        });
+
+                        let subquery = ResolvedSelect {
+                            distinct: false,
+                            columns: vec![ResolvedSelectItem::Expr {
+                                expr: subquery_col,
+                                alias: Some(joined_col.clone()),
+                            }],
+                            from: vec![ResolvedTableRef {
+                                name: joined_table_name.clone(),
+                                alias: None,
+                                columns: joined_cols.clone(),
+                                inner_query: None,
+                            }],
+                            joins: vec![],
+                            filter: None,
+                            group_by: vec![],
+                            having: None,
+                            order_by: vec![],
+                            limit: None,
+                            offset: None,
+                        };
+
+                        let in_filter = ResolvedExpr::InSubquery {
+                            expr: Box::new(target_ref),
+                            query: Box::new(subquery),
+                            negated: false,
+                        };
+                        combined_filter = Some(match combined_filter {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                op: BinaryOp::And,
+                                left: Box::new(prev),
+                                right: Box::new(in_filter),
+                                result_type: DataType::Boolean,
+                            },
+                            None => in_filter,
+                        });
+                    }
+                }
+            }
+            combined_filter
+        } else {
+            None
+        };
+
+        // For multi-table DELETE, target is delete.tables[0]; else use FROM table
+        let target_table = if !delete.tables.is_empty() {
+            delete.tables[0].to_string()
+        } else {
+            table_name.clone()
         };
 
         let table_def = self
             .catalog
-            .get_table(&table_name)
-            .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
+            .get_table(&target_table)
+            .ok_or_else(|| SqlError::TableNotFound(target_table.clone()))?;
 
-        let scope = Scope::single_table(&table_name, table_def);
+        let scope = Scope::single_table(&target_table, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -743,12 +854,21 @@ impl<'a> Resolver<'a> {
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect();
 
-        // Resolve filter
-        let resolved_filter = delete
-            .selection
-            .as_ref()
-            .map(|f| self.resolve_expr(f, &scope))
-            .transpose()?;
+        // Resolve filter: combine join filter with WHERE clause
+        let resolved_filter = match (join_filter, &delete.selection) {
+            (Some(jf), Some(wh)) => {
+                let resolved_where = self.resolve_expr(wh, &scope)?;
+                Some(ResolvedExpr::BinaryOp {
+                    op: BinaryOp::And,
+                    left: Box::new(jf),
+                    right: Box::new(resolved_where),
+                    result_type: DataType::Boolean,
+                })
+            }
+            (Some(jf), None) => Some(jf),
+            (None, Some(wh)) => Some(self.resolve_expr(wh, &scope)?),
+            (None, None) => None,
+        };
 
         // Resolve ORDER BY
         let mut resolved_order_by = Vec::new();
@@ -775,7 +895,7 @@ impl<'a> Resolver<'a> {
         };
 
         Ok(ResolvedStatement::Delete {
-            table: table_name,
+            table: target_table,
             table_columns,
             filter: resolved_filter,
             order_by: resolved_order_by,
@@ -1581,8 +1701,10 @@ impl<'a> Resolver<'a> {
                                     // For functions that accept keyword arguments
                                     // (GET_FORMAT, CONVERT, etc.), unresolvable
                                     // identifiers are treated as string literals.
-                                    let accepts_keywords =
-                                        matches!(name.as_str(), "GET_FORMAT" | "CONVERT");
+                                    let accepts_keywords = matches!(
+                                        name.as_str(),
+                                        "GET_FORMAT" | "CONVERT" | "TIMESTAMPDIFF" | "TIMESTAMPADD"
+                                    );
                                     match self.resolve_expr(e, scope) {
                                         Ok(resolved) => result.push(resolved),
                                         Err(_)
@@ -1617,11 +1739,27 @@ impl<'a> Resolver<'a> {
                     _ => return Err(SqlError::Unsupported("Function arguments".to_string())),
                 };
                 let result_type = infer_function_result_type(&name, &args)?;
+                // Extract SEPARATOR clause for GROUP_CONCAT
+                let separator = if let sp::FunctionArguments::List(list) = &func.args {
+                    list.clauses.iter().find_map(|c| {
+                        if let sp::FunctionArgumentClause::Separator(
+                            sp::Value::SingleQuotedString(s),
+                        ) = c
+                        {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
                 Ok(ResolvedExpr::Function {
                     name,
                     args,
                     distinct,
                     result_type,
+                    separator,
                 })
             }
             sp::Expr::IsNull(expr) => Ok(ResolvedExpr::IsNull {
@@ -1819,6 +1957,7 @@ impl<'a> Resolver<'a> {
                     args,
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1845,6 +1984,7 @@ impl<'a> Resolver<'a> {
                     args,
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1858,6 +1998,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved],
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
             sp::Expr::Ceil { expr, .. } => {
@@ -1869,6 +2010,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved],
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1886,6 +2028,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved_expr, resolved_pattern],
                     distinct: false,
                     result_type: DataType::Boolean,
+                    separator: None,
                 };
                 if *negated {
                     Ok(ResolvedExpr::UnaryOp {
@@ -1927,6 +2070,7 @@ impl<'a> Resolver<'a> {
                     ],
                     distinct: false,
                     result_type: DataType::BigInt,
+                    separator: None,
                 })
             }
 
@@ -1943,6 +2087,7 @@ impl<'a> Resolver<'a> {
                     args: vec![value, ResolvedExpr::Literal(Literal::String(unit))],
                     distinct: false,
                     result_type: DataType::Text,
+                    separator: None,
                 })
             }
 
@@ -2802,6 +2947,57 @@ fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
     }
 }
 
+/// Extract equi-join column pairs from an ON condition.
+/// Given `t1.a = t2.a AND t1.b = t2.b`, returns vec of (target_col, joined_col) pairs.
+fn extract_equijoin_pairs(
+    expr: &sp::Expr,
+    target_table: &str,
+    joined_table: &str,
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    extract_equijoin_pairs_inner(expr, target_table, joined_table, &mut pairs);
+    pairs
+}
+
+fn extract_equijoin_pairs_inner(
+    expr: &sp::Expr,
+    target_table: &str,
+    joined_table: &str,
+    pairs: &mut Vec<(String, String)>,
+) {
+    if let sp::Expr::BinaryOp { left, op, right } = expr {
+        if matches!(op, sp::BinaryOperator::And) {
+            extract_equijoin_pairs_inner(left, target_table, joined_table, pairs);
+            extract_equijoin_pairs_inner(right, target_table, joined_table, pairs);
+        } else if matches!(op, sp::BinaryOperator::Eq) {
+            // Try to extract table.column = table.column
+            if let (Some((lt, lc)), Some((rt, rc))) =
+                (extract_table_column(left), extract_table_column(right))
+            {
+                let lt_lower = lt.to_lowercase();
+                let rt_lower = rt.to_lowercase();
+                let target_lower = target_table.to_lowercase();
+                let joined_lower = joined_table.to_lowercase();
+                if lt_lower == target_lower && rt_lower == joined_lower {
+                    pairs.push((lc, rc));
+                } else if lt_lower == joined_lower && rt_lower == target_lower {
+                    pairs.push((rc, lc));
+                }
+            }
+        }
+    }
+}
+
+/// Extract (table_name, column_name) from a CompoundIdentifier like `t1.a`
+fn extract_table_column(expr: &sp::Expr) -> Option<(String, String)> {
+    match expr {
+        sp::Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((parts[0].value.clone(), parts[1].value.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Parse a static default value expression string into a Literal.
 ///
 /// Handles: integers, floats, quoted strings, NULL, TRUE/FALSE.
@@ -3157,6 +3353,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
         | "INSERT" | "_ROODB_INSERT" => Ok(DataType::Text),
         "STRCMP" => Ok(DataType::BigInt),
+        "GROUP_CONCAT" => Ok(DataType::Text),
         "MOD" | "_ROODB_MOD" => {
             if args.is_empty() {
                 Ok(DataType::BigInt)
@@ -3208,7 +3405,7 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
         | "LOCATE" | "INSTR" | "FIND_IN_SET" | "POSITION" => Ok(DataType::BigInt),
-        "ELT" | "MAKE_SET" | "EXPORT_SET" => Ok(DataType::Text),
+        "ELT" | "MAKE_SET" | "EXPORT_SET" | "SUBSTRING_INDEX" => Ok(DataType::Text),
         "GET_LOCK" | "RELEASE_LOCK" | "IS_FREE_LOCK" => Ok(DataType::BigInt),
         "INET_NTOA" | "INET6_NTOA" => Ok(DataType::Text),
         "INET_ATON" | "INET6_ATON" => Ok(DataType::BigInt),

@@ -69,10 +69,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 32 | exists_antijoin, dml_subquery_where, join_chain_3way, union_order_limit | Semi/anti-join, DML subqueries, 3-4 table JOINs, UNION ORDER BY |
 | 33 | string_func_edge, date_func_patterns, insert_edge_cases | String edge cases, DATE_ADD patterns, INSERT boundaries |
 | 34 | multi_column_orderby, having_complex, aggregate_subquery_mix | Multi-key ORDER BY, HAVING arithmetic, aggregate+subquery combos |
+| 35 | func_new_scalar, group_concat_basic, any_value_agg, multi_table_delete | New scalar funcs, GROUP_CONCAT, ANY_VALUE, multi-table DELETE |
 
 ## Current Status
 
-**150 MySQL compat tests across 34 tiers — all pass**
+**154 MySQL compat tests across 35 tiers — all pass**
 **219+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -252,6 +253,14 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | CAST column names | CAST(x AS UNSIGNED) displays as "unsigned" not "BigIntUnsigned" in column headers |
 | CAST float rounding | CAST(float AS UNSIGNED/SIGNED) uses round() not truncation, matching MySQL's rint() |
 | NULL expression type check | `1/NULL` etc. skip type checking (evaluates to NULL at runtime); fixes NOT NULL inserts |
+| FROM_DAYS | Inverse of TO_DAYS — converts MySQL day number back to date string |
+| SUBSTRING_INDEX | Extract substring before/after Nth delimiter occurrence |
+| MAKE_SET | Build comma-separated string from bitmask-selected arguments |
+| TIMESTAMPDIFF | Integer difference between two datetimes in specified unit (DAY, MONTH, etc.) |
+| TIMESTAMPADD | Add interval to datetime — supports DAY, MONTH, YEAR, HOUR, MINUTE, SECOND |
+| GROUP_CONCAT | Aggregate that concatenates string values with SEPARATOR, DISTINCT support |
+| ANY_VALUE | Aggregate returning arbitrary non-NULL value from group |
+| Multi-table DELETE fix | `DELETE t1 FROM t1 JOIN t2 ON cond` correctly deletes only matched rows |
 
 ## Gap Analysis — Next Steps
 
