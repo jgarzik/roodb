@@ -61,11 +61,16 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 24 | empty_table, count_distinct2, multi_update_innodb, filesort_merge | Empty tables, COUNT(DISTINCT) NULL, multi-table JOINs, large datasets |
 | 25 | delete_where, update_expr, replace_into, create_table_select | Complex DELETE/UPDATE, REPLACE INTO, CREATE TABLE ... SELECT |
 | 26 | decimal_arithmetic, key_diff, bulk_replace, join_outer_innodb | Exact decimal math, CHAR key joins, bulk REPLACE, LEFT JOIN NULLs |
+| 27 | func_op, null_expr, cross_join | Arithmetic/bit operators, NULL edge cases, CROSS JOIN |
+| 28 | type_coercion, select_limit_order, insert_boundary | Type coercion, LIMIT/ORDER BY, INSERT boundaries |
+| 29 | subquery_scalar, subquery_in, subquery_nested, subquery_compare | Scalar/IN subqueries, nesting, all comparison operators |
+| 30 | select_expressions, dml_subquery | Expressions with subqueries, INSERT/UPDATE/DELETE with subqueries |
+| 31 | subquery_derived_join, subquery_union, aggregate_expressions, subquery_where_complex | Derived table JOINs, UNION+subqueries, pivot aggregates, complex WHERE |
 
 ## Current Status
 
-**124 MySQL compat tests across 26 tiers — all pass**
-**210+ Rust integration tests — all pass**
+**140 MySQL compat tests across 31 tiers — all pass**
+**216+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 
@@ -207,6 +212,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | INSERT DEFAULT keyword | DEFAULT in VALUES clause uses column's actual default value |
 | Exact decimal literals | `0.7` parsed as Decimal(7,1) not Float — `0.7+0.1=0.8` exact |
 | Decimal-to-Float cast | Decimal values inserted into FLOAT/DOUBLE columns convert correctly |
+| Scalar subqueries | `(SELECT MAX(a) FROM t2)` in SELECT, WHERE, HAVING, ORDER BY |
+| IN subqueries | `WHERE col [NOT] IN (SELECT col FROM t2)` with NULL handling |
+| Nested subqueries | Subqueries inside subqueries — recursive materialization |
 | MySQL RAND(seed) | Deterministic LCG matching MySQL's algorithm; thread-local state |
 | B'...' bit string literals | `B'10101'` parsed as unsigned integer from binary |
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
