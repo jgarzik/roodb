@@ -66,11 +66,14 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 29 | subquery_scalar, subquery_in, subquery_nested, subquery_compare | Scalar/IN subqueries, nesting, all comparison operators |
 | 30 | select_expressions, dml_subquery | Expressions with subqueries, INSERT/UPDATE/DELETE with subqueries |
 | 31 | subquery_derived_join, subquery_union, aggregate_expressions, subquery_where_complex | Derived table JOINs, UNION+subqueries, pivot aggregates, complex WHERE |
+| 32 | exists_antijoin, dml_subquery_where, join_chain_3way, union_order_limit | Semi/anti-join, DML subqueries, 3-4 table JOINs, UNION ORDER BY |
+| 33 | string_func_edge, date_func_patterns, insert_edge_cases | String edge cases, DATE_ADD patterns, INSERT boundaries |
+| 34 | multi_column_orderby, having_complex, aggregate_subquery_mix | Multi-key ORDER BY, HAVING arithmetic, aggregate+subquery combos |
 
 ## Current Status
 
-**140 MySQL compat tests across 31 tiers — all pass**
-**216+ Rust integration tests — all pass**
+**150 MySQL compat tests across 34 tiers — all pass**
+**219+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 
@@ -215,6 +218,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Scalar subqueries | `(SELECT MAX(a) FROM t2)` in SELECT, WHERE, HAVING, ORDER BY |
 | IN subqueries | `WHERE col [NOT] IN (SELECT col FROM t2)` with NULL handling |
 | Nested subqueries | Subqueries inside subqueries — recursive materialization |
+| EXISTS/NOT EXISTS | `WHERE [NOT] EXISTS (SELECT ...)` — materialized to boolean |
+| LTRIM/RTRIM custom char | LTRIM/RTRIM accept optional second argument for custom trim character |
 | MySQL RAND(seed) | Deterministic LCG matching MySQL's algorithm; thread-local state |
 | B'...' bit string literals | `B'10101'` parsed as unsigned integer from binary |
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
