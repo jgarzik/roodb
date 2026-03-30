@@ -657,6 +657,96 @@ impl<'a> Resolver<'a> {
             .get_table(&table_name)
             .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
+        // Handle UPDATE with JOIN: rewrite JOIN ON condition to IN-subquery filter
+        let join_filter = if !table.joins.is_empty() {
+            let mut combined_filter: Option<ResolvedExpr> = None;
+            for join in &table.joins {
+                let joined_table_name = match &join.relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => continue,
+                };
+                let joined_def = self
+                    .catalog
+                    .get_table(&joined_table_name)
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+                if let Some(on_expr) = extract_join_condition(&join.join_operator) {
+                    let pairs = extract_equijoin_pairs(on_expr, &table_name, &joined_table_name);
+                    let joined_cols: Vec<_> = joined_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                        .collect();
+                    for (target_col, joined_col) in &pairs {
+                        let tc = table_def
+                            .get_column(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let ti = table_def
+                            .get_column_index(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let jc = joined_def
+                            .get_column(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let ji = joined_def
+                            .get_column_index(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let target_ref = ResolvedExpr::Column(ResolvedColumn {
+                            table: table_name.clone(),
+                            name: target_col.clone(),
+                            index: ti,
+                            data_type: tc.data_type.clone(),
+                            nullable: tc.nullable,
+                            default_value: None,
+                        });
+                        let subquery_col = ResolvedExpr::Column(ResolvedColumn {
+                            table: joined_table_name.clone(),
+                            name: joined_col.clone(),
+                            index: ji,
+                            data_type: jc.data_type.clone(),
+                            nullable: jc.nullable,
+                            default_value: None,
+                        });
+                        let subquery = ResolvedSelect {
+                            distinct: false,
+                            columns: vec![ResolvedSelectItem::Expr {
+                                expr: subquery_col,
+                                alias: Some(joined_col.clone()),
+                            }],
+                            from: vec![ResolvedTableRef {
+                                name: joined_table_name.clone(),
+                                alias: None,
+                                columns: joined_cols.clone(),
+                                inner_query: None,
+                            }],
+                            joins: vec![],
+                            filter: None,
+                            group_by: vec![],
+                            having: None,
+                            order_by: vec![],
+                            limit: None,
+                            offset: None,
+                        };
+                        let in_filter = ResolvedExpr::InSubquery {
+                            expr: Box::new(target_ref),
+                            query: Box::new(subquery),
+                            negated: false,
+                        };
+                        combined_filter = Some(match combined_filter {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                op: BinaryOp::And,
+                                left: Box::new(prev),
+                                right: Box::new(in_filter),
+                                result_type: DataType::Boolean,
+                            },
+                            None => in_filter,
+                        });
+                    }
+                }
+            }
+            combined_filter
+        } else {
+            None
+        };
+
         let scope = Scope::single_table(&table_name, table_def);
 
         // Get table column info
@@ -666,7 +756,22 @@ impl<'a> Resolver<'a> {
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect();
 
-        // Resolve assignments
+        // Resolve assignments (use multi-table scope if JOINs present)
+        let assign_scope = if !table.joins.is_empty() {
+            let mut ms = Scope::single_table(&table_name, table_def);
+            for join in &table.joins {
+                if let sp::TableFactor::Table { name, .. } = &join.relation {
+                    let jt = name.to_string();
+                    if let Some(jd) = self.catalog.get_table(&jt) {
+                        ms.add_table(&jt, &jt, jd);
+                    }
+                }
+            }
+            ms
+        } else {
+            Scope::single_table(&table_name, table_def)
+        };
+
         let mut resolved_assignments = Vec::new();
         for assign in assignments {
             let col_name = extract_assignment_target(&assign.target)?;
@@ -685,16 +790,26 @@ impl<'a> Resolver<'a> {
                 nullable: col_def.nullable,
                 default_value: None,
             };
-            let value = self.resolve_expr(&assign.value, &scope)?;
+            let value = self.resolve_expr(&assign.value, &assign_scope)?;
 
             resolved_assignments.push(ResolvedAssignment { column, value });
         }
 
-        // Resolve filter
-        let resolved_filter = selection
-            .as_ref()
-            .map(|f| self.resolve_expr(f, &scope))
-            .transpose()?;
+        // Combine JOIN filter with WHERE clause
+        let resolved_filter = match (join_filter, selection) {
+            (Some(jf), Some(wh)) => {
+                let rw = self.resolve_expr(wh, &scope)?;
+                Some(ResolvedExpr::BinaryOp {
+                    op: BinaryOp::And,
+                    left: Box::new(jf),
+                    right: Box::new(rw),
+                    result_type: DataType::Boolean,
+                })
+            }
+            (Some(jf), None) => Some(jf),
+            (None, Some(wh)) => Some(self.resolve_expr(wh, &scope)?),
+            (None, None) => None,
+        };
 
         // Resolve ORDER BY
         let mut resolved_order_by = Vec::new();
@@ -3023,7 +3138,15 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
 /// Extract column name from assignment target
 fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String> {
     match target {
-        sp::AssignmentTarget::ColumnName(names) => Ok(names.to_string()),
+        sp::AssignmentTarget::ColumnName(names) => {
+            // For table-qualified names (t1.b), use only the column part
+            let s = names.to_string();
+            if let Some(dot_pos) = s.rfind('.') {
+                Ok(s[dot_pos + 1..].to_string())
+            } else {
+                Ok(s)
+            }
+        }
         sp::AssignmentTarget::Tuple(_) => {
             Err(SqlError::Unsupported("Tuple assignment".to_string()))
         }

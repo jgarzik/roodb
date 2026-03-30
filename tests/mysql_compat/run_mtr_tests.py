@@ -300,6 +300,7 @@ TIERS = {
     ],
     40: [
         "insert_odku",                        # INSERT ON DUPLICATE KEY UPDATE
+        "update_join",                        # UPDATE t1 JOIN t2 ON cond SET t1.b = val
     ],
 }
 
