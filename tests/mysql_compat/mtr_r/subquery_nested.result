@@ -185,5 +185,23 @@ id	val	grp
 2	20	A
 3	30	B
 4	40	B
+# --- Truly nested subqueries (subquery inside subquery) ---
+SELECT (SELECT MAX(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1));
+(SELECT ...)
+40
+SELECT id, val FROM t1
+WHERE val > (SELECT AVG(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1))
+ORDER BY id;
+id	val
+4	40
+SELECT (SELECT MAX(val) FROM t1 WHERE val > (SELECT AVG(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1)));
+(SELECT ...)
+40
+SELECT id, val FROM t1
+WHERE val IN (SELECT val FROM t1 WHERE val > (SELECT AVG(val) FROM t1))
+ORDER BY id;
+id	val
+3	30
+4	40
 # --- Cleanup ---
 DROP TABLE t1, t2, t3;

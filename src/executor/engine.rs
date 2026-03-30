@@ -362,7 +362,9 @@ impl ExecutorEngine {
         &self,
         query: &crate::planner::logical::ResolvedSelect,
     ) -> ExecutorResult<Datum> {
-        let physical = self.plan_subquery(query)?;
+        let mut physical = self.plan_subquery(query)?;
+        // Recursively materialize any subqueries nested inside this subquery's plan
+        self.materialize_subqueries_in_plan(&mut physical).await?;
         let mut executor = self.build_node(physical)?;
         executor.open().await?;
 
@@ -395,7 +397,9 @@ impl ExecutorEngine {
         &self,
         query: &crate::planner::logical::ResolvedSelect,
     ) -> ExecutorResult<Vec<Datum>> {
-        let physical = self.plan_subquery(query)?;
+        let mut physical = self.plan_subquery(query)?;
+        // Recursively materialize any subqueries nested inside this subquery's plan
+        self.materialize_subqueries_in_plan(&mut physical).await?;
         let mut executor = self.build_node(physical)?;
         executor.open().await?;
 

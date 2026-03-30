@@ -188,3 +188,62 @@ async fn test_scalar_subquery_with_column() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_nested_scalar_subquery() {
+    let server = TestServer::start("subq_nested").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE subq_t7 (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO subq_t7 (id, val) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .await
+        .expect("INSERT failed");
+
+    // Nested scalar subquery: subquery inside a subquery's WHERE clause
+    // SELECT (SELECT MAX(val) FROM t WHERE val > (SELECT MIN(val) FROM t))
+    let rows: Vec<(i64,)> = conn
+        .query("SELECT (SELECT MAX(val) FROM subq_t7 WHERE val > (SELECT MIN(val) FROM subq_t7))")
+        .await
+        .expect("nested scalar subquery failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 50);
+
+    // Nested: scalar subquery inside another scalar subquery in WHERE
+    // Rows where val > (SELECT AVG(val) FROM t WHERE val > (SELECT MIN(val) FROM t))
+    // Inner: MIN(val) = 10, so AVG of 20,30,40,50 = 35
+    // Outer: val > 35 => 40, 50
+    let rows: Vec<(i32, i32)> = conn
+        .query(
+            "SELECT id, val FROM subq_t7 \
+             WHERE val > (SELECT AVG(val) FROM subq_t7 WHERE val > (SELECT MIN(val) FROM subq_t7)) \
+             ORDER BY id",
+        )
+        .await
+        .expect("nested subquery in WHERE failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (4, 40));
+    assert_eq!(rows[1], (5, 50));
+
+    // Three levels deep: subquery inside subquery inside subquery
+    // SELECT (SELECT MAX(val) FROM t WHERE val > (SELECT AVG(val) FROM t WHERE val > (SELECT MIN(val) FROM t)))
+    // Inner: MIN(val)=10, middle: AVG of 20,30,40,50 = 35, outer: MAX of 40,50 = 50
+    let rows: Vec<(i64,)> = conn
+        .query(
+            "SELECT (SELECT MAX(val) FROM subq_t7 \
+             WHERE val > (SELECT AVG(val) FROM subq_t7 \
+             WHERE val > (SELECT MIN(val) FROM subq_t7)))",
+        )
+        .await
+        .expect("3-level nested subquery failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 50);
+
+    conn.query_drop("DROP TABLE subq_t7")
+        .await
+        .expect("DROP TABLE failed");
+    drop(conn);
+    server.shutdown().await;
+}

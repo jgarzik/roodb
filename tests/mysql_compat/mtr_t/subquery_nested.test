@@ -1,9 +1,9 @@
 #
 # Multi-level subquery composition tests for RooDB.
 # Tests multiple subqueries working together: independent subqueries at the same
-# level, subqueries inside derived tables, and various combination patterns.
+# level, subqueries inside derived tables, various combination patterns, and
+# truly nested subqueries (subquery inside subquery).
 #
-# [RooDB-skip] Truly nested subqueries (subquery inside subquery) — not yet supported
 # [RooDB-skip] Correlated subqueries — not yet supported
 #
 
@@ -156,6 +156,24 @@ SELECT * FROM t1 ORDER BY id;
 
 DELETE FROM t1 WHERE grp IN (SELECT category FROM t3 WHERE active = 0);
 SELECT * FROM t1 ORDER BY id;
+
+--echo # --- Truly nested subqueries (subquery inside subquery) ---
+
+# Scalar subquery whose WHERE contains another scalar subquery
+SELECT (SELECT MAX(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1));
+
+# Nested subquery in outer WHERE
+SELECT id, val FROM t1
+WHERE val > (SELECT AVG(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1))
+ORDER BY id;
+
+# Three levels of nesting
+SELECT (SELECT MAX(val) FROM t1 WHERE val > (SELECT AVG(val) FROM t1 WHERE val > (SELECT MIN(val) FROM t1)));
+
+# IN subquery containing a scalar subquery in its WHERE
+SELECT id, val FROM t1
+WHERE val IN (SELECT val FROM t1 WHERE val > (SELECT AVG(val) FROM t1))
+ORDER BY id;
 
 --echo # --- Cleanup ---
 DROP TABLE t1, t2, t3;
