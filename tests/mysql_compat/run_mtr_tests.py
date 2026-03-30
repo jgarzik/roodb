@@ -298,6 +298,9 @@ TIERS = {
         "json_modify",                        # JSON_SET/INSERT/REPLACE/REMOVE, MERGE, CONTAINS, SEARCH, OVERLAPS, SCHEMA
         "json_aggregate",                     # JSON_ARRAYAGG, combined JSON operations
     ],
+    40: [
+        "insert_odku",                        # INSERT ON DUPLICATE KEY UPDATE
+    ],
 }
 
 

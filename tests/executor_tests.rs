@@ -423,6 +423,7 @@ async fn test_insert() {
         auto_increment_indices: vec![],
         pk_column_indices: vec![0], // id is PK
         ignore: false,
+        on_duplicate: vec![],
     };
 
     let mut exec = engine.build(plan).unwrap();

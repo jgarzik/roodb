@@ -127,6 +127,8 @@ pub enum PhysicalPlan {
         pk_column_indices: Vec<usize>,
         /// IGNORE modifier — suppress errors, convert to warnings
         ignore: bool,
+        /// ON DUPLICATE KEY UPDATE: (column_index, new_value_expr)
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
 
     /// INSERT ... SELECT — insert rows from a source query
@@ -1217,6 +1219,7 @@ impl PhysicalPlanner {
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             } => {
                 let (auto_increment_indices, pk_column_indices) =
                     Self::lookup_insert_metadata(&table, &columns, catalog);
@@ -1227,6 +1230,7 @@ impl PhysicalPlanner {
                     auto_increment_indices,
                     pk_column_indices,
                     ignore,
+                    on_duplicate,
                 })
             }
 

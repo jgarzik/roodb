@@ -370,6 +370,8 @@ pub enum ResolvedStatement {
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
+        /// ON DUPLICATE KEY UPDATE assignments: (column_index, new_value_expr)
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
     /// INSERT ... SELECT with resolved source query
     InsertSelect {
@@ -555,6 +557,7 @@ pub enum LogicalPlan {
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
 
     /// INSERT ... SELECT — insert rows from a source query

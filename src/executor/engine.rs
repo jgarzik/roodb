@@ -608,6 +608,7 @@ impl ExecutorEngine {
                 auto_increment_indices,
                 pk_column_indices,
                 ignore,
+                on_duplicate,
             } => Ok(Box::new(Insert::new(
                 table,
                 columns,
@@ -617,6 +618,8 @@ impl ExecutorEngine {
                 pk_column_indices,
                 self.user_variables.clone(),
                 ignore,
+                on_duplicate,
+                Some(self.mvcc.clone()),
             ))),
 
             PhysicalPlan::InsertSelect {

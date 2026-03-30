@@ -74,10 +74,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 37 | func_hash, func_base64, func_crypto, func_compress, func_quote_export, func_network, func_uuid | MD5/SHA/SHA2, base64, AES, COMPRESS, QUOTE, EXPORT_SET, IS_IPV4/6, UUID |
 | 38 | union_multiway, session_functions | 3+ way UNION, CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS |
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
+| 40 | insert_odku | INSERT ON DUPLICATE KEY UPDATE |
 
 ## Current Status
 
-**171 MySQL compat tests across 39 tiers — all pass**
+**172 MySQL compat tests across 40 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -294,6 +295,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | FOUND_ROWS() | Returns row count from last SELECT (was hardcoded 0) |
 | ALTER TABLE error | Unknown ALTER TABLE operations now return error (was silent success) |
 | get_expr_type fix | GROUP BY type inference uses data_type() for all expr types (was fallback Int) |
+| INSERT ON DUPLICATE KEY UPDATE | Full ODKU: detect PK duplicate via storage lookup, apply UPDATE assignments to existing row |
 
 ## Gap Analysis — Next Steps
 
@@ -311,16 +313,16 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 ### Missing Features (discovered by testing)
 - Multi-table UPDATE syntax (`UPDATE t1 JOIN t2 SET ...`)
-- INSERT...ON DUPLICATE KEY UPDATE
 - INTERVAL arithmetic in expressions (`expr + INTERVAL 1 DAY`)
 - Hex literal implicit integer coercion (`0x41+0`)
 - `0b` prefix binary literals (`0b01000001`)
 - Bitwise operations on VARBINARY columns
-- EXPORT_SET()
 - Integer-to-SET member mapping
 - SET column defaults
 - Correlated subqueries in SELECT list / WHERE
 - UPDATE with JOIN
+- Window functions (ROW_NUMBER, RANK, etc.)
+- CTEs (WITH ... AS)
 
 ## Architecture
 

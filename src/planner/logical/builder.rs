@@ -42,11 +42,13 @@ impl LogicalPlanBuilder {
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             } => Ok(LogicalPlan::Insert {
                 table,
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             }),
             ResolvedStatement::InsertSelect {
                 table,

@@ -547,11 +547,29 @@ impl<'a> Resolver<'a> {
             resolved_values.push(full_row);
         }
 
+        // Resolve ON DUPLICATE KEY UPDATE assignments
+        let on_duplicate =
+            if let Some(sp::OnInsert::DuplicateKeyUpdate(ref assignments)) = insert.on {
+                let mut resolved = Vec::new();
+                for assign in assignments {
+                    let col_name = extract_assignment_target(&assign.target)?;
+                    let col_idx = table_def
+                        .get_column_index(&col_name)
+                        .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+                    let value = self.resolve_expr(&assign.value, &scope)?;
+                    resolved.push((col_idx, value));
+                }
+                resolved
+            } else {
+                Vec::new()
+            };
+
         Ok(ResolvedStatement::Insert {
             table,
             columns: resolved_columns,
             values: resolved_values,
             ignore: insert.ignore,
+            on_duplicate,
         })
     }
 
@@ -616,6 +634,7 @@ impl<'a> Resolver<'a> {
             columns: resolved_columns,
             values: vec![full_row],
             ignore: insert.ignore,
+            on_duplicate: Vec::new(),
         })
     }
 

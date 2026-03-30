@@ -4,10 +4,13 @@
 
 use async_trait::async_trait;
 
+use std::sync::Arc;
+
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::sql::resolver::parse_default_value;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::txn::MvccStorage;
 
 use crate::server::session::UserVariables;
 
@@ -50,6 +53,10 @@ pub struct Insert {
     user_variables: UserVariables,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
+    /// ON DUPLICATE KEY UPDATE assignments: (column_index, new_value_expr)
+    on_duplicate: Vec<(usize, ResolvedExpr)>,
+    /// MVCC storage for reading existing rows on duplicate (None in tests)
+    mvcc: Option<Arc<MvccStorage>>,
 }
 
 impl Insert {
@@ -64,6 +71,8 @@ impl Insert {
         pk_column_indices: Vec<usize>,
         user_variables: UserVariables,
         ignore: bool,
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
+        mvcc: Option<Arc<MvccStorage>>,
     ) -> Self {
         Insert {
             table,
@@ -79,6 +88,8 @@ impl Insert {
             pk_column_indices,
             user_variables,
             ignore,
+            on_duplicate,
+            mvcc,
         }
     }
 
@@ -228,9 +239,66 @@ impl Executor for Insert {
                 )
             })?;
 
-            // Intra-batch duplicate check: if this PK key was already inserted
-            // in this same INSERT statement, it's a duplicate.
-            if !self.pk_column_indices.is_empty() && ctx.has_buffered_key(&key) {
+            // Check for duplicate: intra-batch buffer or existing storage
+            let is_duplicate = if !self.pk_column_indices.is_empty() {
+                if ctx.has_buffered_key(&key) {
+                    true
+                } else if !self.on_duplicate.is_empty() {
+                    // Check storage for existing row (needed for ODKU)
+                    if let Some(ref mvcc) = self.mvcc {
+                        mvcc.inner().get(&key).await.ok().flatten().is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_duplicate && !self.on_duplicate.is_empty() {
+                // ON DUPLICATE KEY UPDATE: read existing row, apply updates
+                let existing_data = match ctx.get_buffered(&key) {
+                    Some(Some(data)) => Some(data.clone()),
+                    _ => {
+                        // Read from raw storage — strip 17-byte MVCC header
+                        if let Some(ref mvcc) = self.mvcc {
+                            let storage = mvcc.inner();
+                            storage.get(&key).await.ok().flatten().and_then(|raw| {
+                                if raw.len() > 17 && raw[16] != 1 {
+                                    Some(raw[17..].to_vec())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(data) = existing_data {
+                    if let Ok(mut existing_row) = super::encoding::decode_row(&data) {
+                        // Apply each ON DUPLICATE KEY UPDATE assignment
+                        for (col_idx, expr) in &self.on_duplicate {
+                            let new_val = evaluate(expr, &existing_row, &self.user_variables)?;
+                            if *col_idx < existing_row.len() {
+                                existing_row.set(*col_idx, new_val)?;
+                            }
+                        }
+                        let updated_value = encode_row(&existing_row);
+                        ctx.add_change(RowChange::update(
+                            &self.table,
+                            key.clone(),
+                            updated_value.clone(),
+                        ));
+                        ctx.buffer_write(key, updated_value);
+                        self.rows_inserted += 1;
+                        continue 'row_loop;
+                    }
+                }
+                // Fallback: insert normally if we couldn't read existing row
+            } else if is_duplicate {
                 if self.ignore {
                     continue 'row_loop;
                 }
@@ -325,6 +393,8 @@ mod tests {
             vec![0], // id is PK at index 0
             empty_vars(),
             false,
+            vec![],
+            None,
         );
         insert.open().await.unwrap();
 

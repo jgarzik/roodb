@@ -1,0 +1,32 @@
+# INSERT ON DUPLICATE KEY UPDATE tests
+CREATE TABLE t1 (id INT PRIMARY KEY, val INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alice'), (2, 20, 'bob');
+# --- Basic ODKU: update existing row ---
+INSERT INTO t1 VALUES (1, 99, 'updated') ON DUPLICATE KEY UPDATE val = 99, name = 'updated';
+SELECT * FROM t1 ORDER BY id;
+id	val	name
+1	99	updated
+2	20	bob
+# --- ODKU: no duplicate, normal insert ---
+INSERT INTO t1 VALUES (3, 30, 'carol') ON DUPLICATE KEY UPDATE val = 99;
+SELECT * FROM t1 ORDER BY id;
+id	val	name
+1	99	updated
+2	20	bob
+3	30	carol
+# --- ODKU with expression ---
+INSERT INTO t1 VALUES (2, 50, 'x') ON DUPLICATE KEY UPDATE val = val + 100;
+SELECT * FROM t1 WHERE id = 2;
+id	val	name
+2	120	bob
+# --- ODKU multiple rows ---
+DROP TABLE t1;
+CREATE TABLE t1 (id INT PRIMARY KEY, val INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+INSERT INTO t1 VALUES (1, 100), (3, 300) ON DUPLICATE KEY UPDATE val = val + 1;
+SELECT * FROM t1 ORDER BY id;
+id	val
+1	11
+2	20
+3	300
+DROP TABLE t1;
