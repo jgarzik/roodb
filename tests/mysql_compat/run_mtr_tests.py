@@ -288,6 +288,10 @@ TIERS = {
         "func_network",                       # IS_IPV4, IS_IPV6
         "func_uuid",                          # UUID, UUID_SHORT, BENCHMARK
     ],
+    38: [
+        "union_multiway",                     # 3+ way UNION ALL/DISTINCT
+        "session_functions",                  # CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS
+    ],
 }
 
 

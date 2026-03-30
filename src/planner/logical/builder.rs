@@ -22,7 +22,15 @@ impl LogicalPlanBuilder {
             ResolvedStatement::Select(select) => Self::build_select(select),
             ResolvedStatement::Union { left, right, all } => {
                 let left_plan = Self::build_select(*left)?;
-                let right_plan = Self::build_select(*right)?;
+                let right_plan = match *right {
+                    ResolvedStatement::Select(s) => Self::build_select(s)?,
+                    ResolvedStatement::Union { .. } => Self::build(*right)?,
+                    _ => {
+                        return Err(crate::planner::error::PlannerError::InvalidPlan(
+                            "UNION right side must be SELECT or UNION".to_string(),
+                        ))
+                    }
+                };
                 Ok(LogicalPlan::Union {
                     left: Box::new(left_plan),
                     right: Box::new(right_plan),
@@ -943,7 +951,7 @@ impl LogicalPlanBuilder {
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
-            _ => DataType::Int,
+            other => other.data_type(),
         }
     }
 

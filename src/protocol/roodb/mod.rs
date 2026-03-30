@@ -942,6 +942,12 @@ where
                 self.txn_manager.commit(txn_id).await?;
             }
 
+            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
+            self.session
+                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            self.session
+                .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
+
             let m = metrics::QueryMetrics {
                 total: query_start.elapsed(),
                 plan_ns,
@@ -1477,12 +1483,8 @@ where
                     .iter()
                     .map(|t| RequiredPrivilege::select(db, &t.name))
                     .collect();
-                privs.extend(
-                    right
-                        .from
-                        .iter()
-                        .map(|t| RequiredPrivilege::select(db, &t.name)),
-                );
+                // Recursively extract privileges from right side (may be nested Union)
+                privs.extend(self.extract_required_privileges(right));
                 privs
             }
             // EXPLAIN - same privileges as inner statement
@@ -1749,6 +1751,12 @@ where
                 self.txn_manager.commit(txn_id).await?;
             }
 
+            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
+            self.session
+                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            self.session
+                .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
+
             self.send_ok(affected, last_insert_id).await
         }
     }
@@ -1783,9 +1791,11 @@ where
 
         // Send rows — catch executor errors mid-stream and send ERR packet
         let mut row_error = None;
+        let mut row_count = 0u64;
         loop {
             match executor.next().await {
                 Ok(Some(row)) => {
+                    row_count += 1;
                     let row_packet = encode_text_row(&row);
                     self.writer.write_packet(&row_packet).await?;
                 }
@@ -1796,6 +1806,9 @@ where
                 }
             }
         }
+        // Track row count for FOUND_ROWS()
+        self.session
+            .set_user_variable("__sys_found_rows", Datum::Int(row_count as i64));
 
         // If an error occurred during row streaming, send ERR packet instead of EOF
         if let Some(e) = row_error {
@@ -2840,7 +2853,9 @@ where
             }
 
             _ => {
-                warn!("Unsupported ALTER TABLE operation: {:?}", op);
+                return Err(ProtocolError::Sql(crate::sql::SqlError::Unsupported(
+                    format!("ALTER TABLE operation: {:?}", op),
+                )));
             }
         }
 

@@ -72,10 +72,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 35 | func_new_scalar, group_concat_basic, any_value_agg, multi_table_delete | New scalar funcs, GROUP_CONCAT, ANY_VALUE, multi-table DELETE |
 | 36 | func_utc_datetime, func_addtime_subtime, func_convert_tz, func_weekofyear_toseconds | UTC funcs, ADDTIME/SUBTIME, CONVERT_TZ, WEEKOFYEAR, TO_SECONDS |
 | 37 | func_hash, func_base64, func_crypto, func_compress, func_quote_export, func_network, func_uuid | MD5/SHA/SHA2, base64, AES, COMPRESS, QUOTE, EXPORT_SET, IS_IPV4/6, UUID |
+| 38 | union_multiway, session_functions | 3+ way UNION, CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS |
 
 ## Current Status
 
-**165 MySQL compat tests across 37 tiers — all pass**
+**167 MySQL compat tests across 38 tiers — all pass**
 **428+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -281,7 +282,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | IS_IPV4 / IS_IPV6 | Validate IP address format; returns 0 for NULL (not NULL) |
 | UUID | UUID v4 generation (random, proper version/variant bits) |
 | UUID_SHORT | Random 64-bit unsigned integer |
-| BENCHMARK | MySQL compat stub, returns 0 |
+| BENCHMARK | MySQL compat, returns 0 (args eagerly evaluated) |
+| 3+ way UNION fix | `A UNION B UNION C` now correctly returns all operands (was dropping middle) |
+| Parenthesized UNION fix | `(SELECT a UNION SELECT b)` no longer drops right side |
+| CONNECTION_ID() | Returns real connection ID from session (was hardcoded 0) |
+| USER()/CURRENT_USER() | Returns authenticated user from session (was hardcoded root@localhost) |
+| DATABASE()/SCHEMA() | Returns current database from session, synced on USE (was hardcoded "test") |
+| LAST_INSERT_ID() | Returns last auto_increment ID from INSERT; LAST_INSERT_ID(expr) sets+returns |
+| ROW_COUNT() | Returns affected rows from last DML statement (was hardcoded 0) |
+| FOUND_ROWS() | Returns row count from last SELECT (was hardcoded 0) |
+| ALTER TABLE error | Unknown ALTER TABLE operations now return error (was silent success) |
+| get_expr_type fix | GROUP BY type inference uses data_type() for all expr types (was fallback Int) |
 
 ## Gap Analysis — Next Steps
 

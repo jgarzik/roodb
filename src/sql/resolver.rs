@@ -905,30 +905,37 @@ impl<'a> Resolver<'a> {
 
     /// Resolve SELECT query
     fn resolve_query(&self, query: &sp::Query) -> SqlResult<ResolvedStatement> {
-        // Check for UNION/INTERSECT/EXCEPT at the top level
-        if let sp::SetExpr::SetOperation {
-            left,
-            right,
-            op,
-            set_quantifier,
-            ..
-        } = query.body.as_ref()
-        {
-            if matches!(op, sp::SetOperator::Union) {
-                let left_select = self.resolve_set_expr_as_select(left)?;
-                let right_select = self.resolve_set_expr_as_select(right)?;
-                let all = matches!(
-                    set_quantifier,
-                    sp::SetQuantifier::All | sp::SetQuantifier::AllByName
-                );
-                let stmt = ResolvedStatement::Union {
-                    left: Box::new(left_select),
-                    right: Box::new(right_select),
+        // Check for UNION at the top level (also check parenthesized queries)
+        if Self::contains_union(query.body.as_ref()) {
+            // Collect all UNION leaves and their ALL flags by walking the
+            // left-nested tree iteratively. This correctly handles 3+ way
+            // UNIONs like A UNION B UNION C (parsed as Union(Union(A,B), C)).
+            let mut leaves = Vec::new();
+            let mut all_flags = Vec::new();
+            self.collect_union_parts(query.body.as_ref(), &mut leaves, &mut all_flags)?;
+
+            if leaves.len() < 2 {
+                return Err(SqlError::Parse(
+                    "UNION requires at least 2 operands".to_string(),
+                ));
+            }
+
+            // Fold leaves right-associatively: [A,B,C] with flags [all_ab, all_bc]
+            // => Union(A, Union(B, C, all_bc), all_ab)
+            let mut result = ResolvedStatement::Select(leaves.pop().unwrap());
+            while let Some(leaf) = leaves.pop() {
+                let all = all_flags.pop().unwrap_or(false);
+                result = ResolvedStatement::Union {
+                    left: Box::new(leaf),
+                    right: Box::new(result),
                     all,
                 };
-
-                return Ok(stmt);
             }
+
+            return Ok(result);
+        }
+
+        if let sp::SetExpr::SetOperation { op, .. } = query.body.as_ref() {
             return Err(SqlError::Unsupported(format!("Set operation: {:?}", op)));
         }
 
@@ -939,6 +946,62 @@ impl<'a> Resolver<'a> {
         self.resolve_query_order_limit(&mut result, query)?;
 
         Ok(ResolvedStatement::Select(result))
+    }
+
+    /// Check if a SetExpr contains a UNION (directly or inside parentheses)
+    fn contains_union(expr: &sp::SetExpr) -> bool {
+        match expr {
+            sp::SetExpr::SetOperation { op, .. } => matches!(op, sp::SetOperator::Union),
+            sp::SetExpr::Query(inner) => Self::contains_union(inner.body.as_ref()),
+            _ => false,
+        }
+    }
+
+    /// Recursively collect all leaf SELECTs from a UNION tree and the ALL flags
+    /// between each adjacent pair. For A UNION ALL B UNION C:
+    /// leaves = [A, B, C], all_flags = [true, false]
+    fn collect_union_parts(
+        &self,
+        expr: &sp::SetExpr,
+        leaves: &mut Vec<ResolvedSelect>,
+        all_flags: &mut Vec<bool>,
+    ) -> SqlResult<()> {
+        match expr {
+            sp::SetExpr::SetOperation {
+                left,
+                right,
+                op: sp::SetOperator::Union,
+                set_quantifier,
+                ..
+            } => {
+                // Recurse into left (which may itself be a UNION)
+                self.collect_union_parts(left, leaves, all_flags)?;
+                // The ALL flag applies between the last left leaf and the right leaf
+                let all = matches!(
+                    set_quantifier,
+                    sp::SetQuantifier::All | sp::SetQuantifier::AllByName
+                );
+                all_flags.push(all);
+                // Recurse into right
+                self.collect_union_parts(right, leaves, all_flags)?;
+                Ok(())
+            }
+            sp::SetExpr::Query(inner_query) => {
+                // Parenthesized query — may contain a UNION itself
+                if Self::contains_union(inner_query.body.as_ref()) {
+                    // Recurse into the parenthesized UNION
+                    self.collect_union_parts(inner_query.body.as_ref(), leaves, all_flags)?;
+                } else {
+                    leaves.push(self.resolve_select_body(expr)?);
+                }
+                Ok(())
+            }
+            _ => {
+                // Leaf SELECT
+                leaves.push(self.resolve_select_body(expr)?);
+                Ok(())
+            }
+        }
     }
 
     /// Apply ORDER BY and LIMIT/OFFSET from a parsed Query onto a ResolvedSelect.
@@ -1079,42 +1142,6 @@ impl<'a> Resolver<'a> {
         }
 
         Ok(())
-    }
-
-    /// Resolve a SetExpr into a ResolvedSelect (for UNION operands)
-    fn resolve_set_expr_as_select(&self, expr: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
-        match expr {
-            sp::SetExpr::Select(_) | sp::SetExpr::Query(_) => self.resolve_select_body(expr),
-            sp::SetExpr::SetOperation {
-                left,
-                right,
-                op,
-                set_quantifier,
-                ..
-            } => {
-                // Nested UNION: resolve recursively, flatten into a single select
-                // by collecting all rows — but we can't do that at resolve time.
-                // Instead, error for now on deeply nested UNIONs.
-                if matches!(op, sp::SetOperator::Union) {
-                    let left_select = self.resolve_set_expr_as_select(left)?;
-                    let right_select = self.resolve_set_expr_as_select(right)?;
-                    let all = matches!(
-                        set_quantifier,
-                        sp::SetQuantifier::All | sp::SetQuantifier::AllByName
-                    );
-                    // Wrap as a "union select" — use left's metadata
-                    // The planner will create a Union node
-                    // For now, return left and the builder handles it via ResolvedStatement::Union
-                    // Actually, we need to return ResolvedSelect not ResolvedStatement here.
-                    // The simplest approach: return the left side and let the caller handle UNION.
-                    let _ = (right_select, all);
-                    Ok(left_select)
-                } else {
-                    Err(SqlError::Unsupported(format!("Set operation: {:?}", op)))
-                }
-            }
-            _ => Err(SqlError::Unsupported("Complex set expression".to_string())),
-        }
     }
 
     /// Given a 1-based ordinal, return the corresponding expression from the
@@ -1342,13 +1369,22 @@ impl<'a> Resolver<'a> {
             }
             sp::SetExpr::Query(inner_query) => {
                 // Parenthesized query: (SELECT ... LIMIT ...) ORDER BY ... LIMIT ...
-                // Resolve the inner query fully (including its own ORDER BY/LIMIT),
-                // then the outer ORDER BY/LIMIT is applied by resolve_query().
-                // If the inner query is a UNION, resolve its left side for column metadata.
+                // Resolve the inner query fully (including its own ORDER BY/LIMIT).
                 let inner = self.resolve_query(inner_query)?;
                 match inner {
                     ResolvedStatement::Select(resolved) => Ok(resolved),
-                    ResolvedStatement::Union { left, .. } => Ok(*left),
+                    ResolvedStatement::Union { ref left, .. } => {
+                        // For parenthesized UNIONs used in contexts that need a
+                        // ResolvedSelect (e.g., derived tables), use the left branch
+                        // metadata for column types. The actual UNION execution is
+                        // handled by collect_union_parts when this appears inside
+                        // a larger UNION chain, or by resolve_query at top level.
+                        // When used standalone as a derived table, we need the union
+                        // wrapped as a derived query — use left's columns as schema.
+                        let mut select = (**left).clone();
+                        select.distinct = false; // UNION handles distinctness itself
+                        Ok(select)
+                    }
                     _ => Err(SqlError::Unsupported(
                         "Parenthesized non-SELECT query".to_string(),
                     )),

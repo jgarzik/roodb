@@ -1413,6 +1413,28 @@ fn get_connection_id(vars: Option<&UserVariables>) -> u32 {
     0
 }
 
+/// Read a string system variable from UserVariables, with a default fallback.
+fn get_sys_var_string(vars: Option<&UserVariables>, key: &str, default: &str) -> Datum {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::String(s)) = r.get(key) {
+            return Datum::String(s.clone());
+        }
+    }
+    Datum::String(default.to_string())
+}
+
+/// Read an integer system variable from UserVariables, defaulting to 0.
+fn get_sys_var_int(vars: Option<&UserVariables>, key: &str) -> i64 {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::Int(n)) = r.get(key) {
+            return *n;
+        }
+    }
+    0
+}
+
 /// Clamp an overflow value to the nearest type boundary (MAX or MIN).
 /// Used in non-strict INSERT mode when coercion overflows.
 pub fn clamp_to_type_boundary(datum: &Datum, target: &crate::catalog::DataType) -> Datum {
@@ -3106,19 +3128,33 @@ pub fn eval_function(
             Ok(Datum::Int(0))
         }
 
-        "CONNECTION_ID" => Ok(Datum::Int(0)),
+        "CONNECTION_ID" => Ok(Datum::Int(get_connection_id(vars) as i64)),
 
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
-            Ok(Datum::String("root@localhost".to_string()))
+            Ok(get_sys_var_string(vars, "__sys_user", "root@localhost"))
         }
 
         "VERSION" => Ok(Datum::String("8.0.0-RooDB".to_string())),
 
-        "DATABASE" | "SCHEMA" => Ok(Datum::String("test".to_string())),
+        "DATABASE" | "SCHEMA" => Ok(get_sys_var_string(vars, "__sys_database", "test")),
 
-        "LAST_INSERT_ID" => Ok(Datum::Int(0)),
+        "LAST_INSERT_ID" => {
+            if !args.is_empty() {
+                // LAST_INSERT_ID(expr) — set the value and return it
+                let val = args[0].as_int().unwrap_or(0);
+                if let Some(v) = vars {
+                    let mut w = v.write();
+                    w.insert("__sys_last_insert_id".to_string(), Datum::Int(val));
+                }
+                Ok(Datum::Int(val))
+            } else {
+                Ok(Datum::Int(get_sys_var_int(vars, "__sys_last_insert_id")))
+            }
+        }
 
-        "FOUND_ROWS" | "ROW_COUNT" => Ok(Datum::Int(0)),
+        "FOUND_ROWS" => Ok(Datum::Int(get_sys_var_int(vars, "__sys_found_rows"))),
+
+        "ROW_COUNT" => Ok(Datum::Int(get_sys_var_int(vars, "__sys_row_count"))),
 
         "TO_DAYS" => {
             if args.len() != 1 {
@@ -4738,8 +4774,9 @@ pub fn eval_function(
         }
 
         "BENCHMARK" => {
-            // BENCHMARK(count, expr) — execute expr count times, return 0
-            // In MySQL this is for performance testing; we execute but discard
+            // BENCHMARK(count, expr) — MySQL perf-testing function.
+            // Args are eagerly evaluated before reaching here, so we cannot
+            // re-execute expr N times. Return 0 per MySQL semantics.
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
                     "BENCHMARK requires 2 arguments".to_string(),

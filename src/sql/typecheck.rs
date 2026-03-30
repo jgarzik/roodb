@@ -57,10 +57,10 @@ impl TypeChecker {
             // Multi-table DROP doesn't need type checking
             ResolvedStatement::DropMultipleTables { .. } => Ok(()),
 
-            // UNION - type check both sides
+            // UNION - type check both sides (right may be nested Union)
             ResolvedStatement::Union { left, right, .. } => {
                 Self::check_select(left)?;
-                Self::check_select(right)
+                Self::check(right)
             }
 
             // EXPLAIN - type check the inner statement

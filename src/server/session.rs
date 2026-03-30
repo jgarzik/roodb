@@ -180,10 +180,20 @@ impl Session {
         );
         // Store connection_id for advisory lock ownership
         {
+            use crate::executor::datum::Datum;
             let mut w = self.user_variables.write();
             w.insert(
                 "__sys_connection_id".to_string(),
-                crate::executor::datum::Datum::Int(self.connection_id as i64),
+                Datum::Int(self.connection_id as i64),
+            );
+            // Store user and database for USER()/DATABASE() functions
+            w.insert(
+                "__sys_user".to_string(),
+                Datum::String(format!("{}@localhost", self.user)),
+            );
+            w.insert(
+                "__sys_database".to_string(),
+                Datum::String(self.database.clone().unwrap_or_else(|| "test".to_string())),
             );
         }
     }
@@ -203,6 +213,14 @@ impl Session {
     /// Set the current database
     pub fn set_database(&mut self, database: Option<String>) {
         self.database = database;
+        // Sync to user variables for DATABASE()/SCHEMA() function
+        let mut w = self.user_variables.write();
+        w.insert(
+            "__sys_database".to_string(),
+            crate::executor::datum::Datum::String(
+                self.database.clone().unwrap_or_else(|| "test".to_string()),
+            ),
+        );
     }
 
     /// Check if we're in an explicit transaction

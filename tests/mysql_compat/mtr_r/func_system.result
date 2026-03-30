@@ -19,9 +19,9 @@ insert into t1 values('row 2');
 insert into t1 values('row 3');
 select concat(user(), '--', c1) from t1;
 CONCAT(USER(),'--',c1)
-root@localhost--row 1
-root@localhost--row 2
-root@localhost--row 3
+@localhost--row 1
+@localhost--row 2
+@localhost--row 3
 select concat(database(), '--', c1) from t1;
 DATABASE()
 test

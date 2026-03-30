@@ -400,10 +400,10 @@ pub enum ResolvedStatement {
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
-    /// UNION of two SELECTs
+    /// UNION of two operands (right may be another Union for 3+ way chains)
     Union {
         left: Box<ResolvedSelect>,
-        right: Box<ResolvedSelect>,
+        right: Box<ResolvedStatement>,
         all: bool,
     },
     /// CREATE TABLE ... SELECT (CTAS) — source can be Select or Union
