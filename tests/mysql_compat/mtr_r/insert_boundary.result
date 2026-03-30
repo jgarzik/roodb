@@ -1,0 +1,147 @@
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+CREATE TABLE t1 (
+id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+name VARCHAR(50) DEFAULT 'unnamed',
+score INT DEFAULT 0,
+active TINYINT DEFAULT 1
+);
+INSERT INTO t1 (name) VALUES ('Alice');
+INSERT INTO t1 (score) VALUES (100);
+INSERT INTO t1 (name, score) VALUES ('Bob', 85);
+INSERT INTO t1 () VALUES ();
+SELECT name, score, active FROM t1 ORDER BY name, score;
+name	score	active
+Alice	0	1
+Bob	85	1
+unnamed	0	1
+unnamed	100	1
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	one
+2	two
+3	three
+INSERT INTO t1 VALUES (4, 'four'), (5, 'five'), (6, 'six'), (7, 'seven'), (8, 'eight');
+SELECT COUNT(*) FROM t1;
+COUNT(NULL)
+8
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	one
+2	two
+3	three
+4	four
+5	five
+6	six
+7	seven
+8	eight
+DROP TABLE t1;
+CREATE TABLE t1 (
+ti TINYINT,
+si SMALLINT,
+i INT,
+bi BIGINT
+);
+INSERT INTO t1 VALUES (127, 32767, 2147483647, 9223372036854775807);
+INSERT INTO t1 VALUES (-128, -32768, -2147483648, -9223372036854775808);
+INSERT INTO t1 VALUES (0, 0, 0, 0);
+INSERT INTO t1 VALUES (1, 1, 1, 1);
+INSERT INTO t1 VALUES (-1, -1, -1, -1);
+SELECT * FROM t1 ORDER BY ti, si, i, bi;
+ti	si	i	bi
+-128	-32768	-2147483648	-9223372036854775808
+-1	-1	-1	-1
+0	0	0	0
+1	1	1	1
+127	32767	2147483647	9223372036854775807
+DROP TABLE t1;
+CREATE TABLE t1 (
+tu TINYINT UNSIGNED,
+su SMALLINT UNSIGNED,
+iu INT UNSIGNED,
+bu BIGINT UNSIGNED
+);
+INSERT INTO t1 VALUES (0, 0, 0, 0);
+INSERT INTO t1 VALUES (255, 65535, 4294967295, 18446744073709551615);
+INSERT INTO t1 VALUES (1, 1, 1, 1);
+SELECT * FROM t1 ORDER BY tu;
+tu	su	iu	bu
+0	0	0	0
+1	1	1	1
+255	65535	4294967295	18446744073709551615
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b INT, c VARCHAR(20));
+INSERT INTO t1 VALUES (1+1, 2*3, CONCAT('hello', ' ', 'world'));
+INSERT INTO t1 VALUES (ABS(-5), MOD(10, 3), UPPER('test'));
+INSERT INTO t1 VALUES (GREATEST(1,2,3), LEAST(4,5,6), SUBSTRING('abcdef', 2, 3));
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+2	6	hello world
+3	4	bcd
+5	1	TEST
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL, b VARCHAR(10) NOT NULL);
+INSERT INTO t1 VALUES (1, 'ok');
+INSERT INTO t1 VALUES (NULL, 'bad');
+ERROR 23000: Invalid operation: Column 'a' cannot be NULL
+INSERT INTO t1 VALUES (1, NULL);
+ERROR 23000: Invalid operation: Column 'b' cannot be NULL
+SELECT * FROM t1;
+a	b
+1	ok
+DROP TABLE t1;
+CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'first');
+INSERT INTO t1 VALUES (1, 'duplicate');
+ERROR 23000: Raft error: Raft error: Duplicate key: row in 't1' already exists
+SELECT * FROM t1;
+id	name
+1	first
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE t2 (x INT, y VARCHAR(10));
+INSERT INTO t2 SELECT * FROM t1;
+SELECT * FROM t2 ORDER BY x;
+x	y
+1	one
+2	two
+3	three
+INSERT INTO t2 SELECT a + 10, UPPER(b) FROM t1;
+SELECT * FROM t2 ORDER BY x;
+x	y
+1	one
+2	two
+3	three
+11	ONE
+12	TWO
+13	THREE
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT, b DECIMAL(10,2), c VARCHAR(20));
+INSERT INTO t1 VALUES ('5', '3.14', 42);
+INSERT INTO t1 VALUES ('10', '2.718', 100);
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+5	3.14	42
+10	2.71	100
+SELECT a + 1, b + 1.0, CONCAT(c, '_suffix') FROM t1 ORDER BY a;
+a + 1	b + 1.0	CONCAT(c,'_suffix')
+6	4.14	42_suffix
+11	3.71	100_suffix
+DROP TABLE t1;
+CREATE TABLE t1 (a VARCHAR(10), b VARCHAR(10));
+INSERT INTO t1 VALUES ('', NULL);
+INSERT INTO t1 VALUES (NULL, '');
+INSERT INTO t1 VALUES ('', '');
+INSERT INTO t1 VALUES (NULL, NULL);
+SELECT a, b, a IS NULL, b IS NULL, a = '', b = '' FROM t1 ORDER BY a IS NULL, b IS NULL;
+a	b	a IS NULL	b IS NULL	a = ''	b = ''
+		0	0	1	1
+	NULL	0	1	1	NULL
+NULL		1	0	NULL	1
+NULL	NULL	1	1	NULL	NULL
+DROP TABLE t1;
+# End of insert_boundary tests

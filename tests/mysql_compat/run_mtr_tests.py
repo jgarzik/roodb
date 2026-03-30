@@ -225,6 +225,16 @@ TIERS = {
         "bulk_replace",                       # REPLACE INTO with unique constraints and bulk inserts
         "join_outer_innodb",                  # LEFT JOIN with NULLs, aggregates, multi-table
     ],
+    27: [
+        "func_op",                            # arithmetic operators, bit ops, operator precedence
+        "null_expr",                          # NULL in COALESCE, NULLIF, IFNULL, arithmetic, aggregates
+        "cross_join",                         # CROSS JOIN, NATURAL JOIN, JOIN...USING
+    ],
+    28: [
+        "type_coercion",                      # implicit type coercion (string/int/decimal/date)
+        "select_limit_order",                 # LIMIT/OFFSET, ORDER BY expressions/NULLs/CASE
+        "insert_boundary",                    # INSERT edge cases, type boundaries, multi-row
+    ],
 }
 
 
