@@ -32,6 +32,8 @@ pub enum Datum {
     Decimal { value: i128, scale: u8 },
     /// Spatial geometry (WKB binary)
     Geometry(Vec<u8>),
+    /// JSON document (stored as serde_json::Value)
+    Json(serde_json::Value),
 }
 
 impl Datum {
@@ -52,6 +54,7 @@ impl Datum {
             DataType::Varchar(_) | DataType::Text => Datum::String(String::new()),
             DataType::Blob => Datum::Bytes(Vec::new()),
             DataType::Geometry => Datum::Geometry(Vec::new()),
+            DataType::Json => Datum::Json(serde_json::Value::Null),
             DataType::Bit(w) => Datum::Bit {
                 value: 0,
                 width: *w,
@@ -76,6 +79,7 @@ impl Datum {
             Datum::String(_) => 4,
             Datum::Bytes(_) => 5,
             Datum::Geometry(_) => 5,
+            Datum::Json(_) => 8,
             Datum::Timestamp(_) => 6,
             Datum::Bit { .. } => 7,
             Datum::Decimal { .. } => 3, // same as Float for cross-type ordering
@@ -93,6 +97,7 @@ impl Datum {
             Datum::String(_) => Some(DataType::Text),
             Datum::Bytes(_) => Some(DataType::Blob),
             Datum::Geometry(_) => Some(DataType::Geometry),
+            Datum::Json(_) => Some(DataType::Json),
             Datum::Bit { width, .. } => Some(DataType::Bit(*width)),
             Datum::Timestamp(_) => Some(DataType::Timestamp),
             Datum::Decimal { value, scale } => {
@@ -214,6 +219,10 @@ impl Datum {
             }
             Datum::Timestamp(t) => t.to_string(),
             Datum::Decimal { value, scale } => format_decimal(*value, *scale),
+            Datum::Json(v) => {
+                let j = serde_json::to_string(v).unwrap_or_else(|_| "null".to_string());
+                format!("CAST('{}' AS JSON)", j.replace('\'', "''"))
+            }
         }
     }
 
@@ -243,6 +252,7 @@ impl Datum {
             Datum::Bit { value, .. } => value.to_string(),
             Datum::Timestamp(t) => t.to_string(),
             Datum::Decimal { value, scale } => format_decimal(*value, *scale),
+            Datum::Json(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
         }
     }
 
@@ -691,6 +701,7 @@ impl Hash for Datum {
                     Datum::Bool(b) => b.hash(state),
                     Datum::String(s) => s.hash(state),
                     Datum::Bytes(b) | Datum::Geometry(b) => b.hash(state),
+                    Datum::Json(v) => serde_json::to_string(v).unwrap_or_default().hash(state),
                     Datum::Timestamp(t) => t.hash(state),
                     Datum::Int(_)
                     | Datum::UnsignedInt(_)

@@ -1623,6 +1623,35 @@ impl<'a> Resolver<'a> {
         }
         // For compound expressions, recurse to resolve sub-expressions with aliases
         match expr {
+            sp::Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    sp::BinaryOperator::Arrow | sp::BinaryOperator::LongArrow
+                ) =>
+            {
+                // Rewrite col->path as JSON_EXTRACT(col, path)
+                // Rewrite col->>path as JSON_UNQUOTE(JSON_EXTRACT(col, path))
+                let l = self.resolve_expr_with_aliases(left, scope, select_columns)?;
+                let r = self.resolve_expr_with_aliases(right, scope, select_columns)?;
+                let extract = ResolvedExpr::Function {
+                    name: "JSON_EXTRACT".to_string(),
+                    args: vec![l, r],
+                    distinct: false,
+                    result_type: DataType::Json,
+                    separator: None,
+                };
+                if matches!(op, sp::BinaryOperator::LongArrow) {
+                    Ok(ResolvedExpr::Function {
+                        name: "JSON_UNQUOTE".to_string(),
+                        args: vec![extract],
+                        distinct: false,
+                        result_type: DataType::Text,
+                        separator: None,
+                    })
+                } else {
+                    Ok(extract)
+                }
+            }
             sp::Expr::BinaryOp { left, op, right } => {
                 let l = self.resolve_expr_with_aliases(left, scope, select_columns)?;
                 let r = self.resolve_expr_with_aliases(right, scope, select_columns)?;
@@ -1695,6 +1724,33 @@ impl<'a> Resolver<'a> {
                     }
                 }
                 Ok(ResolvedExpr::Literal(convert_value(val)?))
+            }
+            sp::Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    sp::BinaryOperator::Arrow | sp::BinaryOperator::LongArrow
+                ) =>
+            {
+                let l = self.resolve_expr(left, scope)?;
+                let r = self.resolve_expr(right, scope)?;
+                let extract = ResolvedExpr::Function {
+                    name: "JSON_EXTRACT".to_string(),
+                    args: vec![l, r],
+                    distinct: false,
+                    result_type: DataType::Json,
+                    separator: None,
+                };
+                if matches!(op, sp::BinaryOperator::LongArrow) {
+                    Ok(ResolvedExpr::Function {
+                        name: "JSON_UNQUOTE".to_string(),
+                        args: vec![extract],
+                        distinct: false,
+                        result_type: DataType::Text,
+                        separator: None,
+                    })
+                } else {
+                    Ok(extract)
+                }
             }
             sp::Expr::BinaryOp { left, op, right } => {
                 let resolved_left = self.resolve_expr(left, scope)?;
@@ -2855,7 +2911,7 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         // TIME — map to Text (we don't have a native Time type)
         sp::DataType::Time(_, _) => Ok(DataType::Text),
         // JSON
-        sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Text),
+        sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Json),
         // PostgreSQL-style geometry types
         sp::DataType::GeometricType(_) => Ok(DataType::Geometry),
         // Custom type names (backward compat + types not in sqlparser enum)
@@ -3385,6 +3441,27 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             }
         }
         "NOW" | "CURRENT_TIMESTAMP" => Ok(DataType::Timestamp),
+        // JSON functions
+        "JSON_ARRAY"
+        | "JSON_OBJECT"
+        | "JSON_SET"
+        | "JSON_INSERT"
+        | "JSON_REPLACE"
+        | "JSON_REMOVE"
+        | "JSON_MERGE_PRESERVE"
+        | "JSON_MERGE_PATCH"
+        | "JSON_ARRAY_APPEND"
+        | "JSON_ARRAY_INSERT"
+        | "JSON_EXTRACT"
+        | "JSON_KEYS"
+        | "JSON_SEARCH"
+        | "JSON_PRETTY" => Ok(DataType::Json),
+        "JSON_QUOTE" | "JSON_UNQUOTE" | "JSON_TYPE" | "JSON_VALUE" => Ok(DataType::Text),
+        "JSON_VALID" | "JSON_CONTAINS" | "JSON_CONTAINS_PATH" | "JSON_OVERLAPS" | "JSON_LENGTH"
+        | "JSON_DEPTH" | "JSON_STORAGE_SIZE" | "JSON_STORAGE_FREE" | "JSON_SCHEMA_VALID" => {
+            Ok(DataType::BigInt)
+        }
+        "JSON_SCHEMA_VALIDATION_REPORT" | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => Ok(DataType::Json),
         "HEX" | "UNHEX" => Ok(DataType::Text),
         "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
         | "INSERT" | "_ROODB_INSERT" => Ok(DataType::Text),
@@ -3928,7 +4005,7 @@ mod tests {
         );
 
         // JSON
-        assert_eq!(convert_data_type(&SpDt::JSON).unwrap(), DataType::Text);
-        assert_eq!(convert_data_type(&SpDt::JSONB).unwrap(), DataType::Text);
+        assert_eq!(convert_data_type(&SpDt::JSON).unwrap(), DataType::Json);
+        assert_eq!(convert_data_type(&SpDt::JSONB).unwrap(), DataType::Json);
     }
 }

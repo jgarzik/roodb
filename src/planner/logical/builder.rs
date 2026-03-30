@@ -434,6 +434,8 @@ impl LogicalPlanBuilder {
                 | "VAR_SAMP"
                 | "ANY_VALUE"
                 | "GROUP_CONCAT"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
         )
     }
 

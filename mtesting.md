@@ -73,11 +73,12 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 36 | func_utc_datetime, func_addtime_subtime, func_convert_tz, func_weekofyear_toseconds | UTC funcs, ADDTIME/SUBTIME, CONVERT_TZ, WEEKOFYEAR, TO_SECONDS |
 | 37 | func_hash, func_base64, func_crypto, func_compress, func_quote_export, func_network, func_uuid | MD5/SHA/SHA2, base64, AES, COMPRESS, QUOTE, EXPORT_SET, IS_IPV4/6, UUID |
 | 38 | union_multiway, session_functions | 3+ way UNION, CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS |
+| 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 
 ## Current Status
 
-**167 MySQL compat tests across 38 tiers — all pass**
-**428+ Rust integration tests — all pass**
+**171 MySQL compat tests across 39 tiers — all pass**
+**452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 

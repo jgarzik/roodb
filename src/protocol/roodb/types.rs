@@ -25,6 +25,7 @@ pub enum ColumnType {
     Year = 0x0d,
     Varchar = 0x0f,
     Bit = 0x10,
+    Json = 0xf5,
     NewDecimal = 0xf6,
     Enum = 0xf7,
     Set = 0xf8,
@@ -75,6 +76,7 @@ pub fn datatype_to_protocol(dt: &DataType) -> ColumnType {
         DataType::Text => ColumnType::Blob,
         DataType::Blob => ColumnType::Blob,
         DataType::Geometry => ColumnType::Geometry,
+        DataType::Json => ColumnType::Json,
         DataType::Bit(_) => ColumnType::Bit,
         DataType::Timestamp => ColumnType::Datetime,
         DataType::Decimal { .. } => ColumnType::NewDecimal,
@@ -96,6 +98,7 @@ pub fn datatype_column_length(dt: &DataType) -> u32 {
         DataType::Text => 65535,
         DataType::Blob => 65535,
         DataType::Geometry => 65535,
+        DataType::Json => 4294967295, // max JSON length
         DataType::Bit(n) => *n as u32,
         DataType::Timestamp => 19, // "YYYY-MM-DD HH:MM:SS"
         DataType::Decimal { precision, .. } => *precision as u32 + 2, // sign + decimal point
@@ -121,7 +124,7 @@ pub fn datatype_flags(dt: &DataType, nullable: bool) -> u16 {
         | DataType::Double => {
             flags |= column_flags::NUM;
         }
-        DataType::Blob | DataType::Text | DataType::Geometry => {
+        DataType::Blob | DataType::Text | DataType::Geometry | DataType::Json => {
             flags |= column_flags::BLOB;
         }
         DataType::BigIntUnsigned => {
@@ -183,6 +186,10 @@ pub fn datum_to_text_bytes(datum: &Datum) -> Vec<u8> {
         }
         Datum::Decimal { value, scale } => {
             let s = crate::executor::datum::format_decimal(*value, *scale);
+            encode_length_encoded_string(&s)
+        }
+        Datum::Json(v) => {
+            let s = serde_json::to_string(v).unwrap_or_default();
             encode_length_encoded_string(&s)
         }
     }

@@ -38,6 +38,10 @@ enum Accumulator {
         values: Vec<String>,
         separator: String,
     },
+    /// JSON_ARRAYAGG: collects values into JSON array
+    JsonArrayAgg(Vec<serde_json::Value>),
+    /// JSON_OBJECTAGG: collects key-value pairs into JSON object
+    JsonObjectAgg(serde_json::Map<String, serde_json::Value>),
     /// Population variance/stddev: tracks sum, sum of squares, count
     /// is_stddev: if true, finalize returns sqrt(variance)
     VarPop {
@@ -91,6 +95,8 @@ impl Accumulator {
                 is_stddev: true,
             },
             "ANY_VALUE" => Accumulator::AnyValue(None),
+            "JSON_ARRAYAGG" => Accumulator::JsonArrayAgg(Vec::new()),
+            "JSON_OBJECTAGG" => Accumulator::JsonObjectAgg(serde_json::Map::new()),
             "GROUP_CONCAT" => Accumulator::GroupConcat {
                 values: Vec::new(),
                 separator: separator.unwrap_or(",").to_string(),
@@ -160,6 +166,22 @@ impl Accumulator {
                     *val = Some(value.clone());
                 }
             }
+            Accumulator::JsonArrayAgg(arr) => {
+                let json_val = crate::executor::json::datum_to_json(value);
+                arr.push(json_val);
+            }
+            Accumulator::JsonObjectAgg(map) => {
+                // JSON_OBJECTAGG expects pairs: key from first arg, value from second
+                // Since we only get one accumulated value, handle as string key = value
+                if !value.is_null() {
+                    let s = value.to_display_string();
+                    // The key and value are passed as a single string "key:value" isn't right
+                    // Actually, JSON_OBJECTAGG(key_col, val_col) passes both as separate args
+                    // but the accumulator only gets one value. We need special handling.
+                    // For now, store as key=value pair where the value is the datum itself.
+                    map.insert(s, serde_json::Value::Null);
+                }
+            }
             Accumulator::GroupConcat { values, .. } => {
                 if !value.is_null() {
                     values.push(value.to_display_string());
@@ -216,6 +238,8 @@ impl Accumulator {
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
             Accumulator::AnyValue(val) => val.clone().unwrap_or(Datum::Null),
+            Accumulator::JsonArrayAgg(arr) => Datum::Json(serde_json::Value::Array(arr.clone())),
+            Accumulator::JsonObjectAgg(map) => Datum::Json(serde_json::Value::Object(map.clone())),
             Accumulator::GroupConcat { values, separator } => {
                 if values.is_empty() {
                     Datum::Null

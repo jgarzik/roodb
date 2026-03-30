@@ -250,6 +250,7 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
+        DataType::Json => "JSON".to_string(),
     }
 }
 
@@ -291,6 +292,7 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
             "TEXT" => Some(DataType::Text),
             "BLOB" => Some(DataType::Blob),
             "GEOMETRY" => Some(DataType::Geometry),
+            "JSON" => Some(DataType::Json),
             "TIMESTAMP" => Some(DataType::Timestamp),
             _ => None,
         }

@@ -292,6 +292,12 @@ TIERS = {
         "union_multiway",                     # 3+ way UNION ALL/DISTINCT
         "session_functions",                  # CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS
     ],
+    39: [
+        "json_create",                        # JSON_ARRAY, JSON_OBJECT, JSON_QUOTE, JSON_UNQUOTE, JSON_TYPE, JSON_VALID
+        "json_extract",                       # JSON_EXTRACT, JSON_VALUE, JSON_KEYS, JSON_LENGTH, JSON_DEPTH, JSON column
+        "json_modify",                        # JSON_SET/INSERT/REPLACE/REMOVE, MERGE, CONTAINS, SEARCH, OVERLAPS, SCHEMA
+        "json_aggregate",                     # JSON_ARRAYAGG, combined JSON operations
+    ],
 }
 
 

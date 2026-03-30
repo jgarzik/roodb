@@ -1,0 +1,39 @@
+--echo # JSON extraction functions
+
+--echo # --- JSON_EXTRACT ---
+SELECT JSON_EXTRACT('{"a": 1, "b": 2}', '$.a');
+SELECT JSON_EXTRACT('{"a": {"b": [1, 2, 3]}}', '$.a.b[1]');
+SELECT JSON_EXTRACT('[10, 20, 30]', '$[0]');
+SELECT JSON_EXTRACT('{"a": 1}', '$.missing');
+SELECT JSON_EXTRACT(NULL, '$.a');
+
+--echo # --- JSON_VALUE ---
+SELECT JSON_VALUE('{"name": "alice"}', '$.name');
+SELECT JSON_VALUE('{"age": 30}', '$.age');
+SELECT JSON_VALUE('{"flag": true}', '$.flag');
+
+--echo # --- JSON_KEYS ---
+SELECT JSON_KEYS('{"a": 1, "b": 2, "c": 3}');
+SELECT JSON_KEYS('{"x": {"y": 1}}', '$.x');
+SELECT JSON_KEYS('[1, 2]');
+
+--echo # --- JSON_LENGTH ---
+SELECT JSON_LENGTH('{"a": 1, "b": 2}');
+SELECT JSON_LENGTH('[1, 2, 3, 4]');
+SELECT JSON_LENGTH('"hello"');
+
+--echo # --- JSON_DEPTH ---
+SELECT JSON_DEPTH('1');
+SELECT JSON_DEPTH('[1, 2]');
+SELECT JSON_DEPTH('{"a": {"b": [1]}}');
+
+--echo # --- JSON_STORAGE_SIZE ---
+SELECT JSON_STORAGE_SIZE('{"a": 1}') > 0;
+
+--echo # --- JSON column with extract ---
+CREATE TABLE t1 (id INT, doc JSON);
+INSERT INTO t1 VALUES (1, '{"name": "alice", "scores": [90, 85, 92]}');
+INSERT INTO t1 VALUES (2, '{"name": "bob", "scores": [78, 88]}');
+SELECT id, JSON_EXTRACT(doc, '$.name') FROM t1 ORDER BY id;
+SELECT id, JSON_LENGTH(JSON_EXTRACT(doc, '$.scores')) FROM t1 ORDER BY id;
+DROP TABLE t1;

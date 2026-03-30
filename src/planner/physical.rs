@@ -716,6 +716,7 @@ pub fn datum_to_literal(datum: &Datum) -> Literal {
         Datum::Bit { value, .. } => Literal::Integer(*value as i64),
         Datum::Timestamp(t) => Literal::Integer(*t),
         Datum::Decimal { value, scale } => Literal::Decimal(*value, *scale),
+        Datum::Json(v) => Literal::String(serde_json::to_string(v).unwrap_or_default()),
     }
 }
 

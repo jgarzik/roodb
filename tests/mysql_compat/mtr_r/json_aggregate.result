@@ -1,0 +1,27 @@
+# JSON aggregate functions
+CREATE TABLE t1 (grp INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alice'), (1, 'bob'), (2, 'carol');
+# --- JSON_ARRAYAGG ---
+SELECT grp, JSON_ARRAYAGG(val) FROM t1 GROUP BY grp ORDER BY grp;
+grp	JSON_ARRAYAGG(val)
+1	["alice","bob"]
+2	["carol"]
+DROP TABLE t1;
+# --- JSON_ARRAYAGG with integers ---
+CREATE TABLE t2 (grp INT, val INT);
+INSERT INTO t2 VALUES (1, 10), (1, 20), (2, 30);
+SELECT grp, JSON_ARRAYAGG(val) FROM t2 GROUP BY grp ORDER BY grp;
+grp	JSON_ARRAYAGG(val)
+1	[10,20]
+2	[30]
+DROP TABLE t2;
+# --- JSON functions combined ---
+SELECT JSON_TYPE(JSON_EXTRACT('{"a": [1, 2, 3]}', '$.a'));
+JSON_TYPE(JSON_EXTRACT('{"a": [1, 2, 3]}','$.a'))
+ARRAY
+SELECT JSON_LENGTH(JSON_EXTRACT('{"a": [1, 2, 3]}', '$.a'));
+JSON_LENGTH(JSON_EXTRACT('{"a": [1, 2, 3]}','$.a'))
+3
+SELECT JSON_VALID(JSON_OBJECT('key', JSON_ARRAY(1, 2)));
+JSON_VALID(JSON_OBJECT('key',JSON_ARRAY(1,2)))
+1

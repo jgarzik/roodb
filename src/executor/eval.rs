@@ -1489,6 +1489,7 @@ pub fn coerce_to_column_type(
             | (Datum::Bit { .. }, DataType::Bit(_))
             | (Datum::Timestamp(_), DataType::Timestamp)
             | (Datum::Decimal { .. }, DataType::Decimal { .. })
+            | (Datum::Json(_), DataType::Json)
     );
     if !already_matches {
         match eval_cast(&datum, target) {
@@ -1738,6 +1739,26 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
             match val {
                 Datum::Geometry(_) | Datum::Bytes(_) => Ok(val.clone()),
                 _ => Ok(Datum::String(val.to_display_string())),
+            }
+        }
+        DataType::Json => {
+            // Parse string as JSON; return as Datum::Json if valid
+            match val {
+                Datum::Json(_) => Ok(val.clone()),
+                Datum::String(s) => match serde_json::from_str(s) {
+                    Ok(v) => Ok(Datum::Json(v)),
+                    Err(_) => Err(ExecutorError::InvalidOperation(format!(
+                        "Invalid JSON text: {}",
+                        s
+                    ))),
+                },
+                _ => {
+                    let s = val.to_display_string();
+                    match serde_json::from_str(&s) {
+                        Ok(v) => Ok(Datum::Json(v)),
+                        Err(_) => Ok(Datum::Json(crate::executor::json::datum_to_json(val))),
+                    }
+                }
             }
         }
         _ => Ok(Datum::String(val.to_display_string())),
@@ -4785,6 +4806,579 @@ pub fn eval_function(
             Ok(Datum::Int(0))
         }
 
+        // ── JSON functions ──
+        "JSON_ARRAY" => {
+            let elements: Vec<serde_json::Value> = args
+                .iter()
+                .map(crate::executor::json::datum_to_json)
+                .collect();
+            Ok(Datum::Json(serde_json::Value::Array(elements)))
+        }
+
+        "JSON_OBJECT" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_OBJECT requires an even number of arguments".to_string(),
+                ));
+            }
+            let mut map = serde_json::Map::new();
+            for pair in args.chunks(2) {
+                let key = pair[0].to_display_string();
+                let val = crate::executor::json::datum_to_json(&pair[1]);
+                map.insert(key, val);
+            }
+            Ok(Datum::Json(serde_json::Value::Object(map)))
+        }
+
+        "JSON_QUOTE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_QUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::String(
+                serde_json::to_string(&s).unwrap_or_else(|_| format!("\"{}\"", s)),
+            ))
+        }
+
+        "JSON_UNQUOTE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_UNQUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            // If it's a JSON string literal (starts with "), unquote it
+            if s.starts_with('"') && s.ends_with('"') {
+                let unquoted: Result<String, _> = serde_json::from_str(&s);
+                match unquoted {
+                    Ok(u) => Ok(Datum::String(u)),
+                    Err(_) => Ok(Datum::String(s)),
+                }
+            } else {
+                Ok(Datum::String(s))
+            }
+        }
+
+        "JSON_EXTRACT" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_EXTRACT requires at least 2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Multiple paths: return array if >1 path, single value if 1 path
+            if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                let results = crate::executor::json::json_extract_all(&doc, &path);
+                match results.len() {
+                    0 => Ok(Datum::Null),
+                    1 => Ok(Datum::Json(results[0].clone())),
+                    _ => Ok(Datum::Json(serde_json::Value::Array(
+                        results.into_iter().cloned().collect(),
+                    ))),
+                }
+            } else {
+                // Multiple paths: return array of all results
+                let mut all_results = Vec::new();
+                for arg in &args[1..] {
+                    let path_str = arg.to_display_string();
+                    if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                        match crate::executor::json::json_extract(&doc, &path) {
+                            Some(v) => all_results.push(v.clone()),
+                            None => all_results.push(serde_json::Value::Null),
+                        }
+                    }
+                }
+                Ok(Datum::Json(serde_json::Value::Array(all_results)))
+            }
+        }
+
+        "JSON_VALUE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_VALUE requires 2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let path_str = args[1].to_display_string();
+            let path = match crate::executor::json::parse_json_path(&path_str) {
+                Some(p) => p,
+                None => return Ok(Datum::Null),
+            };
+            match crate::executor::json::json_extract(&doc, &path) {
+                Some(serde_json::Value::String(s)) => Ok(Datum::String(s.clone())),
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        Ok(Datum::Int(i))
+                    } else if let Some(f) = n.as_f64() {
+                        Ok(Datum::Float(f))
+                    } else {
+                        Ok(Datum::String(n.to_string()))
+                    }
+                }
+                Some(serde_json::Value::Bool(b)) => Ok(Datum::Bool(*b)),
+                Some(serde_json::Value::Null) => Ok(Datum::Null),
+                Some(other) => Ok(Datum::String(other.to_string())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "JSON_KEYS" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_KEYS requires 1-2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let target = if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&doc, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                doc
+            };
+            match target {
+                serde_json::Value::Object(obj) => {
+                    let keys: Vec<serde_json::Value> = obj
+                        .keys()
+                        .map(|k| serde_json::Value::String(k.clone()))
+                        .collect();
+                    Ok(Datum::Json(serde_json::Value::Array(keys)))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        "JSON_TYPE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_TYPE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::String(
+                crate::executor::json::json_type(&doc).to_string(),
+            ))
+        }
+
+        "JSON_VALID" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_VALID requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let valid = serde_json::from_str::<serde_json::Value>(&s).is_ok()
+                || matches!(&args[0], Datum::Json(_));
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        "JSON_LENGTH" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_LENGTH requires 1-2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let target = if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&doc, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                doc
+            };
+            let len = match &target {
+                serde_json::Value::Object(obj) => obj.len(),
+                serde_json::Value::Array(arr) => arr.len(),
+                _ => 1, // scalars have length 1
+            };
+            Ok(Datum::Int(len as i64))
+        }
+
+        "JSON_DEPTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_DEPTH requires 1 argument".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::Int(crate::executor::json::json_depth(&doc) as i64))
+        }
+
+        "JSON_PRETTY" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_PRETTY requires 1 argument".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_STORAGE_SIZE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_STORAGE_SIZE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::Int(s.len() as i64))
+        }
+
+        "JSON_STORAGE_FREE" => {
+            // MySQL-specific: returns 0 for non-partially-updated documents
+            Ok(Datum::Int(0))
+        }
+
+        // ── JSON modification functions ──
+        "JSON_SET" | "JSON_INSERT" | "JSON_REPLACE" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires odd number of arguments >= 3",
+                    name_upper
+                )));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let value = crate::executor::json::datum_to_json(&pair[1]);
+                match name_upper.as_str() {
+                    "JSON_SET" => crate::executor::json::json_set(&mut doc, &path, value),
+                    "JSON_INSERT" => crate::executor::json::json_insert(&mut doc, &path, value),
+                    "JSON_REPLACE" => crate::executor::json::json_replace(&mut doc, &path, value),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_REMOVE" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_REMOVE requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let path_str = arg.to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    crate::executor::json::json_remove(&mut doc, &path);
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_ARRAY_APPEND" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_ARRAY_APPEND requires odd number of arguments >= 3".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    let value = crate::executor::json::datum_to_json(&pair[1]);
+                    crate::executor::json::json_array_append(&mut doc, &path, value);
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_ARRAY_INSERT" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_ARRAY_INSERT requires odd number of arguments >= 3".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    let value = crate::executor::json::datum_to_json(&pair[1]);
+                    // The last leg must be an array index
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let parent_path = &path[..path.len() - 1];
+                    if let Some(crate::executor::json::PathLeg::Index(idx)) = path.last() {
+                        if let Some(parent) =
+                            crate::executor::json::json_extract_mut(&mut doc, parent_path)
+                        {
+                            if let Some(arr) = parent.as_array_mut() {
+                                let pos = (*idx).min(arr.len());
+                                arr.insert(pos, value);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_MERGE_PRESERVE" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_MERGE_PRESERVE requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut result = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let other = match crate::executor::json::parse_json_arg(arg) {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                };
+                result = crate::executor::json::json_merge_preserve(&result, &other);
+            }
+            Ok(Datum::Json(result))
+        }
+
+        "JSON_MERGE_PATCH" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_MERGE_PATCH requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut result = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let other = match crate::executor::json::parse_json_arg(arg) {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                };
+                result = crate::executor::json::json_merge_patch(&result, &other);
+            }
+            Ok(Datum::Json(result))
+        }
+
+        // ── JSON search functions ──
+        "JSON_CONTAINS" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_CONTAINS requires 2-3 arguments".to_string(),
+                ));
+            }
+            let target = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let candidate = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let search_target = if args.len() == 3 {
+                let path_str = args[2].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&target, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                target
+            };
+            Ok(Datum::Int(
+                if crate::executor::json::json_contains(&search_target, &candidate) {
+                    1
+                } else {
+                    0
+                },
+            ))
+        }
+
+        "JSON_CONTAINS_PATH" => {
+            if args.len() < 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_CONTAINS_PATH requires at least 3 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let mode = args[1].to_display_string().to_lowercase();
+            let is_one = mode == "one";
+            let mut found_count = 0;
+            let total = args.len() - 2;
+            for arg in &args[2..] {
+                let path_str = arg.to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    if crate::executor::json::json_extract(&doc, &path).is_some() {
+                        found_count += 1;
+                        if is_one {
+                            return Ok(Datum::Int(1));
+                        }
+                    }
+                }
+            }
+            Ok(Datum::Int(if is_one {
+                0
+            } else if found_count == total {
+                1
+            } else {
+                0
+            }))
+        }
+
+        "JSON_SEARCH" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_SEARCH requires 3-4 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let mode = args[1].to_display_string();
+            let pattern = args[2].to_display_string();
+            let results = crate::executor::json::json_search(&doc, &mode, &pattern);
+            if results.is_empty() {
+                Ok(Datum::Null)
+            } else if mode.eq_ignore_ascii_case("one") {
+                Ok(Datum::String(results[0].clone()))
+            } else {
+                let arr: Vec<serde_json::Value> =
+                    results.into_iter().map(serde_json::Value::String).collect();
+                Ok(Datum::Json(serde_json::Value::Array(arr)))
+            }
+        }
+
+        "JSON_OVERLAPS" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_OVERLAPS requires 2 arguments".to_string(),
+                ));
+            }
+            let a = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let b = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Two arrays overlap if they share at least one element
+            // Two objects overlap if they share at least one key-value pair
+            let overlaps = match (&a, &b) {
+                (serde_json::Value::Array(a1), serde_json::Value::Array(a2)) => {
+                    a1.iter().any(|v| a2.contains(v))
+                }
+                (serde_json::Value::Object(o1), serde_json::Value::Object(o2)) => {
+                    o1.iter().any(|(k, v)| o2.get(k) == Some(v))
+                }
+                _ => a == b,
+            };
+            Ok(Datum::Int(if overlaps { 1 } else { 0 }))
+        }
+
+        "JSON_SCHEMA_VALID" | "JSON_SCHEMA_VALIDATION_REPORT" => {
+            // JSON Schema validation: parse the schema, validate the document
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            let schema = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let doc = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Basic schema validation: check "type" constraint
+            let valid = validate_json_schema(&schema, &doc);
+            if name_upper == "JSON_SCHEMA_VALID" {
+                Ok(Datum::Int(if valid { 1 } else { 0 }))
+            } else {
+                let report = if valid {
+                    serde_json::json!({"valid": true})
+                } else {
+                    serde_json::json!({"valid": false, "reason": "Schema validation failed"})
+                };
+                Ok(Datum::Json(report))
+            }
+        }
+
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
 
@@ -6066,6 +6660,92 @@ fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     }
     output.truncate(output.len() - pad_byte);
     Some(output)
+}
+
+/// Basic JSON Schema validation (Draft 4 subset).
+/// Checks: type, properties, required, items, minimum, maximum, minLength, maxLength, enum.
+fn validate_json_schema(schema: &serde_json::Value, doc: &serde_json::Value) -> bool {
+    if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
+        let type_matches = match type_str {
+            "object" => doc.is_object(),
+            "array" => doc.is_array(),
+            "string" => doc.is_string(),
+            "number" | "integer" => doc.is_number(),
+            "boolean" => doc.is_boolean(),
+            "null" => doc.is_null(),
+            _ => true,
+        };
+        if !type_matches {
+            return false;
+        }
+    }
+    // Check required properties
+    if let (Some(required), Some(obj)) = (
+        schema.get("required").and_then(|r| r.as_array()),
+        doc.as_object(),
+    ) {
+        for req in required {
+            if let Some(key) = req.as_str() {
+                if !obj.contains_key(key) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Check property schemas
+    if let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(|p| p.as_object()),
+        doc.as_object(),
+    ) {
+        for (key, prop_schema) in props {
+            if let Some(val) = obj.get(key) {
+                if !validate_json_schema(prop_schema, val) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Check items schema (array)
+    if let (Some(items_schema), Some(arr)) = (schema.get("items"), doc.as_array()) {
+        for item in arr {
+            if !validate_json_schema(items_schema, item) {
+                return false;
+            }
+        }
+    }
+    // Check enum
+    if let Some(enum_values) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !enum_values.contains(doc) {
+            return false;
+        }
+    }
+    // Check numeric bounds
+    if let Some(n) = doc.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|m| m.as_f64()) {
+            if n < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|m| m.as_f64()) {
+            if n > max {
+                return false;
+            }
+        }
+    }
+    // Check string length
+    if let Some(s) = doc.as_str() {
+        if let Some(min) = schema.get("minLength").and_then(|m| m.as_u64()) {
+            if (s.len() as u64) < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maxLength").and_then(|m| m.as_u64()) {
+            if (s.len() as u64) > max {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn tz_offset_seconds(tz: &str) -> Option<i64> {

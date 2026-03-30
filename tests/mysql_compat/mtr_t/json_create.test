@@ -1,0 +1,34 @@
+--echo # JSON creation and type functions
+
+--echo # --- JSON_ARRAY ---
+SELECT JSON_ARRAY();
+SELECT JSON_ARRAY(1, 2, 3);
+SELECT JSON_ARRAY('a', 'b', 'c');
+SELECT JSON_ARRAY(1, 'abc', NULL, TRUE, FALSE);
+
+--echo # --- JSON_OBJECT ---
+SELECT JSON_OBJECT('key1', 1, 'key2', 'abc');
+SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2));
+
+--echo # --- JSON_QUOTE / JSON_UNQUOTE ---
+SELECT JSON_QUOTE('hello');
+SELECT JSON_QUOTE('hello "world"');
+SELECT JSON_UNQUOTE('"hello"');
+SELECT JSON_UNQUOTE('hello');
+SELECT JSON_QUOTE(NULL);
+SELECT JSON_UNQUOTE(NULL);
+
+--echo # --- JSON_TYPE ---
+SELECT JSON_TYPE('{"a": 1}');
+SELECT JSON_TYPE('[1, 2]');
+SELECT JSON_TYPE('"hello"');
+SELECT JSON_TYPE('42');
+SELECT JSON_TYPE('true');
+SELECT JSON_TYPE('null');
+
+--echo # --- JSON_VALID ---
+SELECT JSON_VALID('{"a": 1}');
+SELECT JSON_VALID('[1, 2, 3]');
+SELECT JSON_VALID('not json');
+SELECT JSON_VALID('');
+SELECT JSON_VALID(NULL);

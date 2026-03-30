@@ -279,6 +279,9 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
             let s = crate::executor::datum::format_decimal(*value, *scale);
             val(Value::Number(s, false))
         }
+        Datum::Json(v) => val(Value::SingleQuotedString(
+            serde_json::to_string(v).unwrap_or_default(),
+        )),
     }
 }
 

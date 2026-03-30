@@ -1,0 +1,51 @@
+--echo # JSON modification functions
+
+--echo # --- JSON_SET ---
+SELECT JSON_SET('{"a": 1}', '$.b', 2);
+SELECT JSON_SET('{"a": 1}', '$.a', 99);
+SELECT JSON_SET('{"a": 1}', '$.b', JSON_ARRAY(1, 2));
+
+--echo # --- JSON_INSERT (only adds, never replaces) ---
+SELECT JSON_INSERT('{"a": 1}', '$.b', 2);
+SELECT JSON_INSERT('{"a": 1}', '$.a', 99);
+
+--echo # --- JSON_REPLACE (only replaces, never adds) ---
+SELECT JSON_REPLACE('{"a": 1}', '$.a', 99);
+SELECT JSON_REPLACE('{"a": 1}', '$.b', 2);
+
+--echo # --- JSON_REMOVE ---
+SELECT JSON_REMOVE('{"a": 1, "b": 2, "c": 3}', '$.b');
+SELECT JSON_REMOVE('[1, 2, 3]', '$[1]');
+
+--echo # --- JSON_ARRAY_APPEND ---
+SELECT JSON_ARRAY_APPEND('[1, 2]', '$', 3);
+SELECT JSON_ARRAY_APPEND('{"a": [1]}', '$.a', 2);
+
+--echo # --- JSON_MERGE_PRESERVE ---
+SELECT JSON_MERGE_PRESERVE('{"a": 1}', '{"a": 2, "b": 3}');
+SELECT JSON_MERGE_PRESERVE('[1, 2]', '[3, 4]');
+
+--echo # --- JSON_MERGE_PATCH ---
+SELECT JSON_MERGE_PATCH('{"a": 1, "b": 2}', '{"a": 3, "b": null, "c": 4}');
+
+--echo # --- JSON_CONTAINS ---
+SELECT JSON_CONTAINS('{"a": 1, "b": 2}', '{"a": 1}');
+SELECT JSON_CONTAINS('{"a": 1}', '{"a": 2}');
+SELECT JSON_CONTAINS('[1, 2, 3]', '2');
+
+--echo # --- JSON_CONTAINS_PATH ---
+SELECT JSON_CONTAINS_PATH('{"a": 1, "b": 2}', 'one', '$.a');
+SELECT JSON_CONTAINS_PATH('{"a": 1}', 'all', '$.a', '$.b');
+
+--echo # --- JSON_SEARCH ---
+SELECT JSON_SEARCH('{"a": "hello", "b": "world"}', 'one', 'hello');
+SELECT JSON_SEARCH('["abc", "def", "abc"]', 'all', 'abc');
+
+--echo # --- JSON_OVERLAPS ---
+SELECT JSON_OVERLAPS('[1, 2, 3]', '[3, 4, 5]');
+SELECT JSON_OVERLAPS('[1, 2]', '[3, 4]');
+
+--echo # --- JSON_SCHEMA_VALID ---
+SELECT JSON_SCHEMA_VALID('{"type": "object"}', '{"a": 1}');
+SELECT JSON_SCHEMA_VALID('{"type": "array"}', '{"a": 1}');
+SELECT JSON_SCHEMA_VALID('{"type": "string"}', '"hello"');

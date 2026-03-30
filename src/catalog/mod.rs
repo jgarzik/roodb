@@ -44,6 +44,8 @@ pub enum DataType {
     Decimal { precision: u8, scale: u8 },
     /// Spatial geometry (stored as WKB binary)
     Geometry,
+    /// JSON document
+    Json,
 }
 
 impl DataType {
@@ -77,7 +79,7 @@ impl DataType {
 
     /// Check if this type is a string type
     pub fn is_string(&self) -> bool {
-        matches!(self, DataType::Varchar(_) | DataType::Text)
+        matches!(self, DataType::Varchar(_) | DataType::Text | DataType::Json)
     }
 
     /// Return the MySQL-compatible SQL name for use in CAST column headers.
@@ -100,6 +102,7 @@ impl DataType {
                 format!("DECIMAL({},{})", precision, scale)
             }
             DataType::Geometry => "GEOMETRY".to_string(),
+            DataType::Json => "JSON".to_string(),
         }
     }
 }

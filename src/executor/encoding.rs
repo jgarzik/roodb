@@ -134,6 +134,7 @@ const TAG_TIMESTAMP: u8 = 6;
 const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
+const TAG_JSON: u8 = 10;
 
 /// Encode a row value
 ///
@@ -201,6 +202,13 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.push(TAG_DECIMAL);
             buf.push(*scale);
             buf.extend_from_slice(&value.to_le_bytes());
+        }
+        Datum::Json(v) => {
+            buf.push(TAG_JSON);
+            let s = serde_json::to_string(v).unwrap_or_default();
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
         }
     }
 }
@@ -360,6 +368,25 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     .expect("length checked: slice is 16 bytes"),
             );
             Ok((Datum::Decimal { value, scale }, 18))
+        }
+
+        TAG_JSON => {
+            if data.len() < 5 {
+                return Err(ExecutorError::Encoding("json header too short".to_string()));
+            }
+            let len = u32::from_le_bytes(
+                data[1..5]
+                    .try_into()
+                    .expect("length checked: slice is 4 bytes"),
+            ) as usize;
+            if data.len() < 5 + len {
+                return Err(ExecutorError::Encoding("json data too short".to_string()));
+            }
+            let s = std::str::from_utf8(&data[5..5 + len])
+                .map_err(|_| ExecutorError::Encoding("invalid utf8 in json".to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(s)
+                .map_err(|e| ExecutorError::Encoding(format!("invalid json: {}", e)))?;
+            Ok((Datum::Json(v), 5 + len))
         }
 
         _ => Err(ExecutorError::Encoding(format!(

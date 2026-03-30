@@ -205,5 +205,8 @@ pub fn datum_to_sp_value(datum: &crate::executor::datum::Datum) -> sp::Value {
         }
         Datum::Bit { value, .. } => sp::Value::Number(value.to_string(), false),
         Datum::Timestamp(ts) => sp::Value::Number(ts.to_string(), false),
+        Datum::Json(v) => {
+            sp::Value::SingleQuotedString(serde_json::to_string(v).unwrap_or_default())
+        }
     }
 }

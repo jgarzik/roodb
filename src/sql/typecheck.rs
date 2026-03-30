@@ -351,6 +351,12 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         (DataType::Geometry, DataType::Blob) | (DataType::Blob, DataType::Geometry) => true,
         (DataType::Geometry, DataType::Geometry) => true,
 
+        // JSON is compatible with string types (validated on INSERT)
+        (DataType::Json, DataType::Text)
+        | (DataType::Json, DataType::Varchar(_))
+        | (DataType::Text, DataType::Json)
+        | (DataType::Varchar(_), DataType::Json) => true,
+
         _ => false,
     }
 }

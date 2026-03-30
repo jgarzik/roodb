@@ -1,0 +1,75 @@
+# JSON creation and type functions
+# --- JSON_ARRAY ---
+SELECT JSON_ARRAY();
+JSON_ARRAY()
+[]
+SELECT JSON_ARRAY(1, 2, 3);
+JSON_ARRAY(1,2,3)
+[1,2,3]
+SELECT JSON_ARRAY('a', 'b', 'c');
+JSON_ARRAY('a','b','c')
+["a","b","c"]
+SELECT JSON_ARRAY(1, 'abc', NULL, TRUE, FALSE);
+JSON_ARRAY(1,'abc',NULL,TRUE,FALSE)
+[1,"abc",null,true,false]
+# --- JSON_OBJECT ---
+SELECT JSON_OBJECT('key1', 1, 'key2', 'abc');
+JSON_OBJECT('key1',1,'key2','abc')
+{"key1":1,"key2":"abc"}
+SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2));
+JSON_OBJECT('a',JSON_ARRAY(1,2))
+{"a":[1,2]}
+# --- JSON_QUOTE / JSON_UNQUOTE ---
+SELECT JSON_QUOTE('hello');
+JSON_QUOTE('hello')
+"hello"
+SELECT JSON_QUOTE('hello "world"');
+JSON_QUOTE('hello "world"')
+"hello \"world\""
+SELECT JSON_UNQUOTE('"hello"');
+JSON_UNQUOTE('"hello"')
+hello
+SELECT JSON_UNQUOTE('hello');
+JSON_UNQUOTE('hello')
+hello
+SELECT JSON_QUOTE(NULL);
+JSON_QUOTE(NULL)
+NULL
+SELECT JSON_UNQUOTE(NULL);
+JSON_UNQUOTE(NULL)
+NULL
+# --- JSON_TYPE ---
+SELECT JSON_TYPE('{"a": 1}');
+JSON_TYPE('{"a": 1}')
+OBJECT
+SELECT JSON_TYPE('[1, 2]');
+JSON_TYPE('[1, 2]')
+ARRAY
+SELECT JSON_TYPE('"hello"');
+JSON_TYPE('"hello"')
+STRING
+SELECT JSON_TYPE('42');
+JSON_TYPE('42')
+INTEGER
+SELECT JSON_TYPE('true');
+JSON_TYPE('true')
+TRUE
+SELECT JSON_TYPE('null');
+JSON_TYPE('null')
+NULL
+# --- JSON_VALID ---
+SELECT JSON_VALID('{"a": 1}');
+JSON_VALID('{"a": 1}')
+1
+SELECT JSON_VALID('[1, 2, 3]');
+JSON_VALID('[1, 2, 3]')
+1
+SELECT JSON_VALID('not json');
+JSON_VALID('not json')
+0
+SELECT JSON_VALID('');
+JSON_VALID('')
+0
+SELECT JSON_VALID(NULL);
+JSON_VALID(NULL)
+NULL
