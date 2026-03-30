@@ -3137,6 +3137,30 @@ pub fn eval_function(
             }
         }
 
+        "TO_SECONDS" => {
+            // TO_SECONDS(date) — number of seconds since year 0
+            // = TO_DAYS(date) * 86400 + HOUR*3600 + MINUTE*60 + SECOND
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TO_SECONDS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            match parse_date_to_days(&s) {
+                Some(days) => {
+                    let p = parse_to_parts(&s);
+                    let time_secs = p
+                        .map(|p| p.hour as i64 * 3600 + p.minute as i64 * 60 + p.second as i64)
+                        .unwrap_or(0);
+                    Ok(Datum::Int(days * 86400 + time_secs))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
         "FROM_DAYS" => {
             if args.len() != 1 {
                 return Err(ExecutorError::InvalidOperation(
@@ -3295,6 +3319,61 @@ pub fn eval_function(
                 "{}{:02}:{:02}:{:02}",
                 sign, hours, mins, secs
             )))
+        }
+
+        "ADDTIME" | "SUBTIME" => {
+            // ADDTIME(expr1, expr2) — adds time expr2 to expr1
+            // SUBTIME(expr1, expr2) — subtracts time expr2 from expr1
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s1 = args[0].to_display_string();
+            let s2 = args[1].to_display_string();
+            let is_datetime = s1.contains('-');
+            // Parse the time-only part (arg2 is always a time value)
+            let time_secs = parse_time_hms_to_secs(&s2);
+            if is_datetime {
+                // For datetime: parse properly and adjust
+                match parse_to_parts(&s1) {
+                    Some(p) => {
+                        let total_secs = ymd_to_days_from_epoch(p.year, p.month, p.day) * 86400
+                            + p.hour as i64 * 3600
+                            + p.minute as i64 * 60
+                            + p.second as i64;
+                        let result = if name_upper == "ADDTIME" {
+                            total_secs + time_secs
+                        } else {
+                            total_secs - time_secs
+                        };
+                        let rp = DateTimeParts::from_unix_seconds(result);
+                        Ok(Datum::String(rp.format_datetime()))
+                    }
+                    None => Ok(Datum::Null),
+                }
+            } else {
+                // Time + time
+                let secs1 = parse_time_hms_to_secs(&s1);
+                let result = if name_upper == "ADDTIME" {
+                    secs1 + time_secs
+                } else {
+                    secs1 - time_secs
+                };
+                let sign = if result < 0 { "-" } else { "" };
+                let abs_r = result.unsigned_abs();
+                Ok(Datum::String(format!(
+                    "{}{:02}:{:02}:{:02}",
+                    sign,
+                    abs_r / 3600,
+                    (abs_r % 3600) / 60,
+                    abs_r % 60
+                )))
+            }
         }
 
         "TIMESTAMPDIFF" => {
@@ -3457,6 +3536,27 @@ pub fn eval_function(
             let p = system_now_parts();
             Ok(Datum::String(p.format_time()))
         }
+        "UTC_DATE" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_date()))
+        }
+        "UTC_TIME" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_time()))
+        }
+        "UTC_TIMESTAMP" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_datetime()))
+        }
 
         // ── Date/time format-string functions ──
         "DATE_FORMAT" => {
@@ -3570,6 +3670,45 @@ pub fn eval_function(
                 Ok(Datum::String(format_datetime_fmt(&p, &fmt)))
             } else {
                 Ok(Datum::String(p.format_datetime()))
+            }
+        }
+
+        "CONVERT_TZ" => {
+            // CONVERT_TZ(dt, from_tz, to_tz)
+            // Simplified: supports '+HH:MM' / '-HH:MM' offset format and 'SYSTEM'/'UTC'
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "CONVERT_TZ requires 3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let dt_str = args[0].to_display_string();
+            let from_tz = args[1].to_display_string();
+            let to_tz = args[2].to_display_string();
+
+            let from_offset = tz_offset_seconds(&from_tz);
+            let to_offset = tz_offset_seconds(&to_tz);
+
+            match (from_offset, to_offset) {
+                (Some(from_off), Some(to_off)) => {
+                    match parse_to_parts(&dt_str) {
+                        Some(p) => {
+                            // Convert to UTC first, then to target TZ
+                            let unix_secs = ymd_to_days_from_epoch(p.year, p.month, p.day) * 86400
+                                + p.hour as i64 * 3600
+                                + p.minute as i64 * 60
+                                + p.second as i64
+                                - from_off;
+                            let result_secs = unix_secs + to_off;
+                            let rp = DateTimeParts::from_unix_seconds(result_secs);
+                            Ok(Datum::String(rp.format_datetime()))
+                        }
+                        None => Ok(Datum::Null),
+                    }
+                }
+                _ => Ok(Datum::Null),
             }
         }
 
@@ -3736,6 +3875,22 @@ pub fn eval_function(
             };
             match parse_to_parts(&args[0].to_display_string()) {
                 Some(p) => Ok(Datum::Int(p.week_number(mode) as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "WEEKOFYEAR" => {
+            // WEEKOFYEAR(date) is equivalent to WEEK(date, 3) — ISO week number
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEEKOFYEAR requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.week_number(3) as i64)),
                 None => Ok(Datum::Null),
             }
         }
@@ -5426,6 +5581,55 @@ fn timestampadd_calc(unit: &str, interval: i64, dt: &DateTimeParts) -> String {
             )
         }
     }
+}
+
+/// Parse a time-only string (HH:MM:SS or -HH:MM:SS) to total seconds.
+fn parse_time_hms_to_secs(s: &str) -> i64 {
+    let s = s.trim();
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    let parts: Vec<&str> = s.split(':').collect();
+    let secs = if parts.len() >= 3 {
+        let h: i64 = parts[0].parse().unwrap_or(0);
+        let m: i64 = parts[1].parse().unwrap_or(0);
+        let s: i64 = parts[2].parse().unwrap_or(0);
+        h * 3600 + m * 60 + s
+    } else if parts.len() == 2 {
+        let h: i64 = parts[0].parse().unwrap_or(0);
+        let m: i64 = parts[1].parse().unwrap_or(0);
+        h * 3600 + m * 60
+    } else {
+        s.parse::<i64>().unwrap_or(0)
+    };
+    if neg {
+        -secs
+    } else {
+        secs
+    }
+}
+
+/// Parse timezone offset string ('+HH:MM', '-05:00', 'UTC', 'SYSTEM') to seconds from UTC.
+fn tz_offset_seconds(tz: &str) -> Option<i64> {
+    let tz = tz.trim();
+    match tz.to_uppercase().as_str() {
+        "UTC" | "+00:00" | "GMT" => return Some(0),
+        "SYSTEM" => return Some(0), // Treat SYSTEM as UTC for simplicity
+        _ => {}
+    }
+    // Parse +HH:MM or -HH:MM
+    if tz.len() >= 5 && (tz.starts_with('+') || tz.starts_with('-')) {
+        let sign: i64 = if tz.starts_with('-') { -1 } else { 1 };
+        let parts: Vec<&str> = tz[1..].split(':').collect();
+        if parts.len() == 2 {
+            let hours: i64 = parts[0].parse().ok()?;
+            let mins: i64 = parts[1].parse().ok()?;
+            return Some(sign * (hours * 3600 + mins * 60));
+        }
+    }
+    None
 }
 
 fn radix_string(val: i64, radix: u32) -> String {

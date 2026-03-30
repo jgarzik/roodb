@@ -70,11 +70,12 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 33 | string_func_edge, date_func_patterns, insert_edge_cases | String edge cases, DATE_ADD patterns, INSERT boundaries |
 | 34 | multi_column_orderby, having_complex, aggregate_subquery_mix | Multi-key ORDER BY, HAVING arithmetic, aggregate+subquery combos |
 | 35 | func_new_scalar, group_concat_basic, any_value_agg, multi_table_delete | New scalar funcs, GROUP_CONCAT, ANY_VALUE, multi-table DELETE |
+| 36 | func_utc_datetime, func_addtime_subtime, func_convert_tz, func_weekofyear_toseconds | UTC funcs, ADDTIME/SUBTIME, CONVERT_TZ, WEEKOFYEAR, TO_SECONDS |
 
 ## Current Status
 
-**154 MySQL compat tests across 35 tiers — all pass**
-**219+ Rust integration tests — all pass**
+**158 MySQL compat tests across 36 tiers — all pass**
+**428+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
 
@@ -261,6 +262,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | GROUP_CONCAT | Aggregate that concatenates string values with SEPARATOR, DISTINCT support |
 | ANY_VALUE | Aggregate returning arbitrary non-NULL value from group |
 | Multi-table DELETE fix | `DELETE t1 FROM t1 JOIN t2 ON cond` correctly deletes only matched rows |
+| UTC_DATE/UTC_TIME/UTC_TIMESTAMP | UTC-based date/time functions (no local timezone offset) |
+| WEEKOFYEAR | ISO week number (equivalent to WEEK(date, 3)) |
+| ADDTIME/SUBTIME | Add/subtract time from datetime or time values, with cross-midnight rollover |
+| CONVERT_TZ | Timezone conversion with +HH:MM offset format and UTC/SYSTEM named zones |
+| TO_SECONDS | Total seconds since year 0 (TO_DAYS * 86400 + time-of-day seconds) |
 
 ## Gap Analysis — Next Steps
 
@@ -277,19 +283,17 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - PointGet suppression when LIMIT or ORDER BY present
 
 ### Missing Features (discovered by testing)
-- Multi-table UPDATE/DELETE syntax (`UPDATE t1,t2 SET ...`, `DELETE t1 FROM ...`)
-- Subqueries in WHERE/SELECT (`IN (SELECT ...)`, `EXISTS (SELECT ...)`, scalar subqueries)
+- Multi-table UPDATE syntax (`UPDATE t1 JOIN t2 SET ...`)
 - INSERT...ON DUPLICATE KEY UPDATE
 - INTERVAL arithmetic in expressions (`expr + INTERVAL 1 DAY`)
 - Hex literal implicit integer coercion (`0x41+0`)
 - `0b` prefix binary literals (`0b01000001`)
 - Bitwise operations on VARBINARY columns
-- GROUP_CONCAT(DISTINCT ...)
-- GROUP BY with expression (IF, CASE, etc.)
-- FROM_DAYS(), ADDTIME/SUBTIME, TIMESTAMPADD/TIMESTAMPDIFF
-- MAKE_SET()/EXPORT_SET()
+- EXPORT_SET()
 - Integer-to-SET member mapping
 - SET column defaults
+- Correlated subqueries in SELECT list / WHERE
+- UPDATE with JOIN
 
 ## Architecture
 

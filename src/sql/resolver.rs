@@ -3394,13 +3394,12 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "TO_DAYS" | "FROM_DAYS" | "DATEDIFF" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR"
         | "HOUR" | "MINUTE" | "SECOND" | "MONTH" | "YEAR" | "WEEK" | "QUARTER" | "WEEKDAY"
-        | "YEARWEEK" | "UNIX_TIMESTAMP" | "TIME_TO_SEC" | "PERIOD_ADD" | "PERIOD_DIFF" => {
-            Ok(DataType::BigInt)
-        }
+        | "YEARWEEK" | "WEEKOFYEAR" | "UNIX_TIMESTAMP" | "TIME_TO_SEC" | "PERIOD_ADD"
+        | "PERIOD_DIFF" | "TO_SECONDS" => Ok(DataType::BigInt),
         "FROM_UNIXTIME" | "DATE_FORMAT" | "STR_TO_DATE" | "DATE_ADD" | "DATE_SUB" | "ADDDATE"
         | "SUBDATE" | "MAKEDATE" | "MAKETIME" | "SEC_TO_TIME" | "TIMEDIFF" | "TIMESTAMPADD"
         | "TIMESTAMPDIFF" | "CURDATE" | "CURTIME" | "SYSDATE" | "UTC_DATE" | "UTC_TIME"
-        | "UTC_TIMESTAMP" => Ok(DataType::Text),
+        | "UTC_TIMESTAMP" | "ADDTIME" | "SUBTIME" | "CONVERT_TZ" => Ok(DataType::Text),
         "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"

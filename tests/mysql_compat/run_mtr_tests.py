@@ -273,6 +273,12 @@ TIERS = {
         "any_value_agg",                      # ANY_VALUE aggregate function
         "multi_table_delete",                 # DELETE t1 FROM t1 JOIN t2 ON cond
     ],
+    36: [
+        "func_utc_datetime",                  # UTC_DATE, UTC_TIME, UTC_TIMESTAMP
+        "func_addtime_subtime",               # ADDTIME/SUBTIME for datetime and time
+        "func_convert_tz",                    # CONVERT_TZ timezone conversion
+        "func_weekofyear_toseconds",          # WEEKOFYEAR, TO_SECONDS
+    ],
 }
 
 
