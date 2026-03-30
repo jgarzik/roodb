@@ -182,6 +182,17 @@ pub enum ResolvedExpr {
         /// Inferred result type
         result_type: DataType,
     },
+    /// Scalar subquery: (SELECT expr FROM ...) that returns a single value
+    ScalarSubquery {
+        query: Box<ResolvedSelect>,
+        result_type: DataType,
+    },
+    /// IN subquery: expr [NOT] IN (SELECT col FROM ...)
+    InSubquery {
+        expr: Box<ResolvedExpr>,
+        query: Box<ResolvedSelect>,
+        negated: bool,
+    },
 }
 
 impl ResolvedExpr {
@@ -220,6 +231,8 @@ impl ResolvedExpr {
             ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
             ResolvedExpr::UserVariable { .. } => DataType::Text,
             ResolvedExpr::Case { result_type, .. } => result_type.clone(),
+            ResolvedExpr::ScalarSubquery { result_type, .. } => result_type.clone(),
+            ResolvedExpr::InSubquery { .. } => DataType::Boolean,
         }
     }
 
@@ -250,6 +263,8 @@ impl ResolvedExpr {
                 // Case is nullable if any result is nullable or there's no ELSE
                 else_result.is_none() || results.iter().any(|r| r.is_nullable())
             }
+            ResolvedExpr::ScalarSubquery { .. } => true, // Subquery may return NULL or no rows
+            ResolvedExpr::InSubquery { .. } => true,     // IN subquery can return NULL
         }
     }
 }

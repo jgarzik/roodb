@@ -1,7 +1,6 @@
 # Custom test for RooDB: Advanced JOIN patterns and aggregation.
 # Exercises INNER JOIN, LEFT JOIN, self-join, derived tables, multi-table queries.
 #
-# [RooDB-skip] Subqueries in WHERE/SELECT — not supported
 # [RooDB-skip] EXISTS/NOT EXISTS — not supported
 
 --disable_warnings

@@ -870,7 +870,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             let t_open = Instant::now();
             executor.open().await?;
@@ -898,7 +898,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             let t_open = Instant::now();
             executor.open().await?;
@@ -1683,7 +1683,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             self.send_result_set(&columns, &mut *executor).await
         } else {
@@ -1698,7 +1698,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             executor.open().await?;
             let mut affected = 0u64;
@@ -2302,7 +2302,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan)?;
+        let mut executor = engine.build_async(plan).await?;
         executor.open().await?;
         let mut all_rows = Vec::new();
         while let Some(row) = executor.next().await? {
@@ -2358,7 +2358,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
             executor.open().await?;
             while let Some(row) = executor.next().await? {
                 all_rows.push(row);
@@ -6042,7 +6042,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+        let mut executor = engine.build_async(plan).await.map_err(|e| e.to_string())?;
 
         executor.open().await.map_err(|e| e.to_string())?;
         let mut rows = Vec::new();
@@ -6128,7 +6128,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+        let mut executor = engine.build_async(plan).await.map_err(|e| e.to_string())?;
 
         executor.open().await.map_err(|e| e.to_string())?;
         let mut affected = 0u64;

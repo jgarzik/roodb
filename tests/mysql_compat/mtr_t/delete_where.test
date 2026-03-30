@@ -114,9 +114,9 @@ SELECT * FROM t1 ORDER BY a;
 
 DROP TABLE t1;
 
-# [RooDB-skip] DELETE WHERE b IN (SELECT ...) — subquery in DELETE WHERE not supported
-# [RooDB-skip] DELETE WHERE EXISTS (SELECT ...) — correlated subquery in DELETE not supported
-# [RooDB-skip] DELETE WHERE NOT EXISTS (SELECT ...) — correlated subquery in DELETE not supported
+# [RooDB-note] DELETE WHERE b IN (SELECT ...) — now supported
+# [RooDB-skip] DELETE WHERE EXISTS (SELECT ...) — correlated subquery not yet supported
+# [RooDB-skip] DELETE WHERE NOT EXISTS (SELECT ...) — correlated subquery not yet supported
 
 #
 # DELETE with multiple conditions involving different columns

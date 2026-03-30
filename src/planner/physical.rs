@@ -692,12 +692,17 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
                 substitute_expr(e, params)?;
             }
         }
+        // Subqueries are self-contained plans, no placeholder substitution needed
+        ResolvedExpr::ScalarSubquery { .. } => {}
+        ResolvedExpr::InSubquery { expr, .. } => {
+            substitute_expr(expr, params)?;
+        }
     }
     Ok(())
 }
 
 /// Convert a Datum to a Literal for plan substitution.
-fn datum_to_literal(datum: &Datum) -> Literal {
+pub fn datum_to_literal(datum: &Datum) -> Literal {
     match datum {
         Datum::Null => Literal::Null,
         Datum::Bool(b) => Literal::Boolean(*b),

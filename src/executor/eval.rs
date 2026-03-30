@@ -322,6 +322,14 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
             };
             Ok(Datum::Bool(result))
         }
+
+        // Subqueries should have been materialized before evaluation
+        ResolvedExpr::ScalarSubquery { .. } => Err(ExecutorError::Internal(
+            "ScalarSubquery not materialized before evaluation".to_string(),
+        )),
+        ResolvedExpr::InSubquery { .. } => Err(ExecutorError::Internal(
+            "InSubquery not materialized before evaluation".to_string(),
+        )),
     }
 }
 

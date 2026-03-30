@@ -471,6 +471,9 @@ impl LogicalPlanBuilder {
                     || Self::expr_has_aggregate(high)
             }
             ResolvedExpr::BooleanTest { expr, .. } => Self::expr_has_aggregate(expr),
+            // Scalar subqueries are self-contained; aggregates inside don't affect the outer query
+            ResolvedExpr::ScalarSubquery { .. } => false,
+            ResolvedExpr::InSubquery { expr, .. } => Self::expr_has_aggregate(expr),
             _ => false,
         }
     }
@@ -582,6 +585,11 @@ impl LogicalPlanBuilder {
             ResolvedExpr::BooleanTest { expr, .. } => {
                 Self::collect_aggregates(expr, idx, None, out);
             }
+            // InSubquery: collect aggregates from the outer expr only (subquery is self-contained)
+            ResolvedExpr::InSubquery { expr, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
+            }
+            // ScalarSubquery is self-contained, no outer aggregates to collect
             _ => {}
         }
     }
@@ -865,6 +873,17 @@ impl LogicalPlanBuilder {
             ResolvedExpr::BooleanTest { expr, test } => ResolvedExpr::BooleanTest {
                 expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
                 test: *test,
+            },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
+                query: query.clone(),
+                negated: *negated,
             },
             // For other expression types (Column, Literal, etc.), pass through
             other => other.clone(),
@@ -1235,6 +1254,17 @@ impl LogicalPlanBuilder {
                 expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
                 test: *test,
             },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
+                query: query.clone(),
+                negated: *negated,
+            },
             other => other.clone(),
         }
     }
@@ -1394,6 +1424,11 @@ impl LogicalPlanBuilder {
                     Self::expr_to_sql(low),
                     Self::expr_to_sql(high)
                 )
+            }
+            ResolvedExpr::ScalarSubquery { .. } => "(SELECT ...)".to_string(),
+            ResolvedExpr::InSubquery { expr, negated, .. } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!("{}{} IN (SELECT ...)", Self::expr_to_sql(expr), neg)
             }
         }
     }
@@ -1581,6 +1616,17 @@ impl LogicalPlanBuilder {
             ResolvedExpr::BooleanTest { expr: inner, test } => ResolvedExpr::BooleanTest {
                 expr: Box::new(Self::transform_to_output_columns(inner, columns)),
                 test: *test,
+            },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                query: query.clone(),
+                negated: *negated,
             },
             // Other expression types pass through unchanged
             _ => expr.clone(),

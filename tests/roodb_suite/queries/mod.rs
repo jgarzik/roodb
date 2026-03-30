@@ -10,5 +10,6 @@ mod joins;
 mod ordering;
 mod procedures;
 mod select_basic;
+mod subqueries;
 mod user_variables;
 mod where_clause;

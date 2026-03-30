@@ -1,14 +1,46 @@
 DROP TABLE IF EXISTS t1;
-# Subquery-equivalent using joins
+DROP TABLE IF EXISTS t2;
+# Scalar subquery in SELECT list
 CREATE TABLE t1 (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a));
 INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
-SELECT MAX(a) FROM t1;
-MAX(a)
+SELECT (SELECT MAX(a) FROM t1);
+(SELECT ...)
 3
-SELECT MIN(b) FROM t1;
-MIN(b)
+SELECT (SELECT MIN(b) FROM t1);
+(SELECT ...)
 10
-SELECT COUNT(*) FROM t1;
-COUNT(NULL)
+SELECT (SELECT COUNT(*) FROM t1);
+(SELECT ...)
 3
+# Scalar subquery in WHERE clause
+SELECT a, b FROM t1 WHERE b = (SELECT MAX(b) FROM t1);
+a	b
+3	30
+SELECT a, b FROM t1 WHERE b > (SELECT MIN(b) FROM t1) ORDER BY a;
+a	b
+2	20
+3	30
+# Scalar subquery alongside columns
+SELECT a, (SELECT MAX(b) FROM t1) FROM t1 ORDER BY a;
+a	(SELECT ...)
+1	30
+2	30
+3	30
+# IN subquery
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, ref_val INT NOT NULL);
+INSERT INTO t2 VALUES (1, 10), (2, 30);
+SELECT a, b FROM t1 WHERE b IN (SELECT ref_val FROM t2) ORDER BY a;
+a	b
+1	10
+3	30
+SELECT a, b FROM t1 WHERE b NOT IN (SELECT ref_val FROM t2) ORDER BY a;
+a	b
+2	20
+# Scalar subquery from empty table
 DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY);
+SELECT (SELECT MAX(a) FROM t1);
+(SELECT ...)
+NULL
+DROP TABLE t1;
+DROP TABLE t2;

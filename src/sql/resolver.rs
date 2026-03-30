@@ -1762,9 +1762,32 @@ impl<'a> Resolver<'a> {
             sp::Expr::Collate { expr, .. } => self.resolve_expr(expr, scope),
 
             // Subquery: (SELECT ...) — resolve as scalar subquery
-            sp::Expr::Subquery(_) => Err(SqlError::Unsupported(
-                "Subqueries not yet supported".to_string(),
-            )),
+            sp::Expr::Subquery(query) => {
+                let mut inner_select = self.resolve_select_body(query.body.as_ref())?;
+                self.resolve_query_order_limit(&mut inner_select, query)?;
+                // Determine the result type from the first output column
+                let result_type = Self::scalar_subquery_result_type(&inner_select)?;
+                Ok(ResolvedExpr::ScalarSubquery {
+                    query: Box::new(inner_select),
+                    result_type,
+                })
+            }
+
+            // IN subquery: expr [NOT] IN (SELECT ...)
+            sp::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                self.resolve_query_order_limit(&mut inner_select, subquery)?;
+                Ok(ResolvedExpr::InSubquery {
+                    expr: Box::new(resolved_expr),
+                    query: Box::new(inner_select),
+                    negated: *negated,
+                })
+            }
 
             // SUBSTRING(expr, from, for) — sqlparser parses as AST node
             sp::Expr::Substring {
@@ -2000,6 +2023,26 @@ impl<'a> Resolver<'a> {
             expr: Box::new(self.resolve_expr(inner, scope)?),
             test,
         })
+    }
+
+    /// Determine the result type of a scalar subquery from its SELECT list.
+    /// Scalar subqueries must produce exactly one column.
+    fn scalar_subquery_result_type(select: &ResolvedSelect) -> SqlResult<DataType> {
+        let col_count = Self::select_column_count(&select.columns);
+        if col_count != 1 {
+            return Err(SqlError::InvalidOperation(format!(
+                "Scalar subquery must return exactly one column, got {}",
+                col_count
+            )));
+        }
+        // Get the data type of the single output column
+        match select.columns.first() {
+            Some(ResolvedSelectItem::Expr { expr, .. }) => Ok(expr.data_type()),
+            Some(ResolvedSelectItem::Columns(cols)) if cols.len() == 1 => {
+                Ok(cols[0].data_type.clone())
+            }
+            _ => Ok(DataType::Text), // fallback
+        }
     }
 
     // ============ Auth statement resolution ============

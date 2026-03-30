@@ -1,6 +1,6 @@
 #
 # Test complex SQL expressions and patterns
-# [RooDB-note] Subqueries (IN, EXISTS, scalar) not yet supported.
+# [RooDB-note] Scalar subqueries and IN subqueries supported. EXISTS not yet supported.
 # This test covers expression evaluation, CASE, COALESCE, IF, NULLIF,
 # and complex WHERE/SELECT patterns instead.
 #
