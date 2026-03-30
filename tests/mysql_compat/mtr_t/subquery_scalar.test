@@ -1,0 +1,110 @@
+#
+# Thorough scalar subquery tests for RooDB.
+# Tests scalar subqueries in SELECT, WHERE, HAVING, ORDER BY, and as function arguments.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma'),
+                      (4, 40, 'delta'), (5, 50, 'epsilon');
+
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, ref_id INT, amount DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 1, 100.50), (2, 1, 200.75), (3, 2, 50.00),
+                      (4, 3, 75.25), (5, 5, 300.00);
+
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, category VARCHAR(10));
+INSERT INTO t3 VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'B'), (5, 'A');
+
+--echo # --- Scalar subquery in SELECT list ---
+
+SELECT (SELECT MAX(val) FROM t1);
+SELECT (SELECT MIN(val) FROM t1);
+SELECT (SELECT COUNT(*) FROM t1);
+SELECT (SELECT SUM(val) FROM t1);
+SELECT (SELECT AVG(val) FROM t1);
+
+--echo # Scalar subquery alongside regular columns
+SELECT id, val, (SELECT MAX(val) FROM t1) AS max_val FROM t1 ORDER BY id;
+
+--echo # Multiple scalar subqueries in SELECT
+SELECT (SELECT MIN(val) FROM t1) AS min_v,
+       (SELECT MAX(val) FROM t1) AS max_v,
+       (SELECT COUNT(*) FROM t1) AS cnt;
+
+--echo # Scalar subquery with arithmetic
+SELECT id, val, val - (SELECT AVG(val) FROM t1) AS diff_from_avg FROM t1 ORDER BY id;
+
+--echo # --- Scalar subquery in WHERE clause ---
+
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1);
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1);
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val < (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(val) FROM t1) - 10 ORDER BY id;
+
+--echo # Scalar subquery with different table
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(amount) FROM t2) ORDER BY id;
+SELECT t2.id, t2.amount FROM t2 WHERE t2.amount = (SELECT MIN(amount) FROM t2);
+
+--echo # Scalar subquery in WHERE with arithmetic
+SELECT id, val FROM t1 WHERE val * 2 > (SELECT SUM(val) FROM t1) ORDER BY id;
+
+--echo # --- Scalar subquery in HAVING clause ---
+
+SELECT category, COUNT(*) AS cnt FROM t3
+GROUP BY category
+HAVING COUNT(*) = (SELECT MAX(grp_cnt) FROM (SELECT COUNT(*) AS grp_cnt FROM t3 GROUP BY category) sub)
+ORDER BY category;
+
+SELECT category, COUNT(*) AS cnt FROM t3
+GROUP BY category
+HAVING COUNT(*) >= (SELECT MIN(grp_cnt) FROM (SELECT COUNT(*) AS grp_cnt FROM t3 GROUP BY category) sub)
+ORDER BY category;
+
+--echo # --- Scalar subquery in ORDER BY ---
+
+SELECT id, val FROM t1 ORDER BY val - (SELECT AVG(val) FROM t1);
+SELECT id, val FROM t1 ORDER BY (SELECT MAX(val) FROM t1) - val;
+
+--echo # --- Scalar subquery as function argument ---
+
+SELECT ABS((SELECT MIN(val) FROM t1) - 100);
+SELECT COALESCE((SELECT NULL), (SELECT MAX(val) FROM t1));
+SELECT IF(val > (SELECT AVG(val) FROM t1), 'above', 'below') AS position, id
+FROM t1 ORDER BY id;
+
+--echo # --- Scalar subquery returning NULL ---
+
+# Empty table subquery returns NULL
+DROP TABLE IF EXISTS t_empty;
+CREATE TABLE t_empty (a INT NOT NULL PRIMARY KEY);
+SELECT (SELECT MAX(a) FROM t_empty);
+SELECT (SELECT MIN(a) FROM t_empty);
+SELECT (SELECT SUM(a) FROM t_empty);
+SELECT (SELECT COUNT(*) FROM t_empty);
+
+# NULL in comparisons
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(a) FROM t_empty) ORDER BY id;
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(a) FROM t_empty);
+SELECT COALESCE((SELECT MAX(a) FROM t_empty), 999);
+DROP TABLE t_empty;
+
+--echo # --- Scalar subquery with single row ---
+
+SELECT id, val FROM t1 WHERE val = (SELECT val FROM t1 WHERE id = 3);
+SELECT id, val FROM t1 WHERE val > (SELECT val FROM t1 WHERE id = 2) ORDER BY id;
+SELECT id, val FROM t1 WHERE val <> (SELECT val FROM t1 WHERE id = 1) ORDER BY id;
+
+--echo # --- Scalar subquery with type coercion ---
+
+# INT compared with DECIMAL
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+
+# INT compared with COUNT (BIGINT)
+SELECT id, val FROM t1 WHERE val > (SELECT COUNT(*) FROM t2) ORDER BY id;
+
+--echo # --- Cleanup ---
+DROP TABLE t1, t2, t3;

@@ -1,0 +1,103 @@
+#
+# Thorough IN/NOT IN subquery tests for RooDB.
+# Tests IN subqueries, NOT IN, with NULLs, empty results, type coercion.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3, t4;
+--enable_warnings
+
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, ref_val INT NOT NULL);
+INSERT INTO t2 VALUES (1, 10), (2, 30), (3, 50);
+
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, ref_val INT);
+INSERT INTO t3 VALUES (1, 10), (2, NULL), (3, 30), (4, NULL);
+
+--echo # --- Basic IN subquery ---
+
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id;
+
+--echo # --- Basic NOT IN subquery ---
+
+SELECT id, val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE id NOT IN (SELECT id FROM t2) ORDER BY id;
+
+--echo # --- IN subquery with empty result ---
+
+CREATE TABLE t_empty (a INT NOT NULL PRIMARY KEY);
+SELECT id, val FROM t1 WHERE val IN (SELECT a FROM t_empty) ORDER BY id;
+SELECT id, val FROM t1 WHERE val NOT IN (SELECT a FROM t_empty) ORDER BY id;
+DROP TABLE t_empty;
+
+--echo # --- IN subquery with single value ---
+
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t2 WHERE id = 1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t2 WHERE id = 1) ORDER BY id;
+
+--echo # --- IN with NULLs in subquery result ---
+
+# When subquery returns NULLs, IN may return NULL instead of FALSE
+# Rows matching a non-NULL value should still be found
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t3) ORDER BY id;
+
+# NOT IN with NULLs: if any NULL in subquery result, non-matching rows return NULL (not TRUE)
+SELECT id, val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t3) ORDER BY id;
+
+# Only non-NULL values from subquery
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t3 WHERE ref_val IS NOT NULL) ORDER BY id;
+SELECT id, val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t3 WHERE ref_val IS NOT NULL) ORDER BY id;
+
+--echo # --- IN subquery with duplicates ---
+
+CREATE TABLE t4 (id INT NOT NULL PRIMARY KEY, ref_val INT NOT NULL);
+INSERT INTO t4 VALUES (1, 10), (2, 10), (3, 30), (4, 30), (5, 50);
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t4) ORDER BY id;
+DROP TABLE t4;
+
+--echo # --- IN subquery with expressions ---
+
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val * 2 FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE val + 10 IN (SELECT ref_val FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE val IN (SELECT MAX(ref_val) FROM t2) ORDER BY id;
+
+--echo # --- IN subquery with multiple columns in outer WHERE ---
+
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t2) AND id > 1 ORDER BY id;
+SELECT id, val FROM t1 WHERE val IN (SELECT ref_val FROM t2) OR id = 4 ORDER BY id;
+
+--echo # --- IN subquery in SELECT list ---
+
+SELECT id, val, val IN (SELECT ref_val FROM t2) AS is_matched FROM t1 ORDER BY id;
+SELECT id, val, val NOT IN (SELECT ref_val FROM t2) AS not_matched FROM t1 ORDER BY id;
+
+--echo # --- IN subquery with different types ---
+
+# VARCHAR IN (SELECT INT)
+CREATE TABLE t_str (id INT NOT NULL PRIMARY KEY, sval VARCHAR(10));
+INSERT INTO t_str VALUES (1, '10'), (2, '20'), (3, '30');
+SELECT id, sval FROM t_str WHERE sval IN (SELECT ref_val FROM t2) ORDER BY id;
+DROP TABLE t_str;
+
+# DECIMAL IN (SELECT INT)
+CREATE TABLE t_dec (id INT NOT NULL PRIMARY KEY, dval DECIMAL(10,2));
+INSERT INTO t_dec VALUES (1, 10.00), (2, 20.00), (3, 30.00);
+SELECT id, dval FROM t_dec WHERE dval IN (SELECT ref_val FROM t2) ORDER BY id;
+DROP TABLE t_dec;
+
+--echo # --- Multiple IN subqueries ---
+
+SELECT id, val FROM t1
+WHERE val IN (SELECT ref_val FROM t2)
+  AND id IN (SELECT id FROM t3)
+ORDER BY id;
+
+--echo # --- IN subquery with DISTINCT ---
+
+SELECT id, val FROM t1 WHERE val IN (SELECT DISTINCT ref_val FROM t3 WHERE ref_val IS NOT NULL) ORDER BY id;
+
+--echo # --- Cleanup ---
+DROP TABLE t1, t2, t3;

@@ -1,0 +1,139 @@
+DROP TABLE IF EXISTS employees, departments, salaries, bonuses, audit_log;
+CREATE TABLE departments (id INT NOT NULL PRIMARY KEY, name VARCHAR(30));
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales');
+CREATE TABLE employees (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(50) NOT NULL,
+dept_id INT NOT NULL,
+salary DECIMAL(10,2) NOT NULL,
+active INT NOT NULL DEFAULT 1
+);
+INSERT INTO employees VALUES
+(1, 'Alice',   1, 95000.00, 1),
+(2, 'Bob',     1, 85000.00, 1),
+(3, 'Charlie', 2, 70000.00, 1),
+(4, 'Diana',   2, 75000.00, 1),
+(5, 'Eve',     3, 65000.00, 1),
+(6, 'Frank',   3, 60000.00, 1),
+(7, 'Grace',   1, 90000.00, 1),
+(8, 'Henry',   3, 55000.00, 0);
+# --- INSERT ... SELECT with subquery in WHERE ---
+CREATE TABLE salaries (id INT NOT NULL PRIMARY KEY, emp_id INT NOT NULL, salary DECIMAL(10,2) NOT NULL);
+INSERT INTO salaries SELECT id, id, salary FROM employees
+WHERE salary > (SELECT AVG(salary) FROM employees) AND active = 1;
+SELECT * FROM salaries ORDER BY id;
+id	emp_id	salary
+1	1	95000.00
+2	2	85000.00
+4	4	75000.00
+7	7	90000.00
+# --- INSERT ... SELECT with IN subquery ---
+DROP TABLE salaries;
+CREATE TABLE salaries (id INT NOT NULL PRIMARY KEY, emp_id INT NOT NULL, salary DECIMAL(10,2) NOT NULL);
+INSERT INTO salaries SELECT id, id, salary FROM employees
+WHERE dept_id IN (SELECT id FROM departments WHERE name = 'Engineering');
+SELECT * FROM salaries ORDER BY id;
+id	emp_id	salary
+1	1	95000.00
+2	2	85000.00
+7	7	90000.00
+# --- INSERT ... SELECT with complex filter ---
+CREATE TABLE bonuses (emp_id INT NOT NULL PRIMARY KEY, bonus DECIMAL(10,2) NOT NULL);
+INSERT INTO bonuses
+SELECT e.id, e.salary * 0.10
+FROM employees e
+WHERE e.active = 1
+AND e.salary > (SELECT AVG(salary) FROM employees WHERE active = 1);
+SELECT * FROM bonuses ORDER BY emp_id;
+emp_id	bonus
+1	9500.0000
+2	8500.0000
+7	9000.0000
+# --- UPDATE with scalar subquery ---
+UPDATE employees SET salary = (SELECT AVG(salary) FROM employees WHERE dept_id = 3)
+WHERE id = 8;
+SELECT id, name, salary FROM employees WHERE dept_id = 3 ORDER BY id;
+id	name	salary
+5	Eve	65000.00
+6	Frank	60000.00
+8	Henry	60000.00
+# --- UPDATE with IN subquery ---
+UPDATE employees SET active = 0
+WHERE dept_id IN (SELECT id FROM departments WHERE name = 'Marketing');
+SELECT id, name, dept_id, active FROM employees ORDER BY id;
+id	name	dept_id	active
+1	Alice	1	1
+2	Bob	1	1
+3	Charlie	2	0
+4	Diana	2	0
+5	Eve	3	1
+6	Frank	3	1
+7	Grace	1	1
+8	Henry	3	0
+# --- UPDATE with comparison subquery ---
+UPDATE employees SET active = 1;
+UPDATE employees SET salary = 70000.00
+WHERE salary < (SELECT 65000.00);
+SELECT id, name, salary FROM employees ORDER BY id;
+id	name	salary
+1	Alice	95000.00
+2	Bob	85000.00
+3	Charlie	70000.00
+4	Diana	75000.00
+5	Eve	65000.00
+6	Frank	70000.00
+7	Grace	90000.00
+8	Henry	70000.00
+# --- DELETE with IN subquery ---
+DELETE FROM bonuses WHERE emp_id NOT IN (SELECT id FROM employees WHERE dept_id = 1);
+SELECT * FROM bonuses ORDER BY emp_id;
+emp_id	bonus
+1	9500.0000
+2	8500.0000
+7	9000.0000
+# --- DELETE with scalar subquery ---
+DELETE FROM bonuses WHERE bonus < (SELECT AVG(b.bonus) FROM (SELECT bonus FROM bonuses) b);
+SELECT * FROM bonuses ORDER BY emp_id;
+emp_id	bonus
+1	9500.0000
+7	9000.0000
+# --- Verify data integrity after all DML ---
+SELECT COUNT(*) AS emp_count FROM employees;
+emp_count
+8
+SELECT COUNT(*) AS bonus_count FROM bonuses;
+bonus_count
+2
+SELECT COUNT(*) AS salary_count FROM salaries;
+salary_count
+3
+# --- INSERT ... SELECT with aggregation ---
+CREATE TABLE audit_log (dept_name VARCHAR(30) NOT NULL, emp_count INT NOT NULL, total_salary DECIMAL(12,2) NOT NULL);
+INSERT INTO audit_log
+SELECT d.name, COUNT(*), SUM(e.salary)
+FROM employees e
+JOIN departments d ON e.dept_id = d.id
+WHERE e.active = 1
+GROUP BY d.name;
+SELECT * FROM audit_log ORDER BY dept_name;
+dept_name	emp_count	total_salary
+Engineering	3	270000.00
+Marketing	2	145000.00
+Sales	3	205000.00
+# --- INSERT ... SELECT from subquery/derived table ---
+DROP TABLE audit_log;
+CREATE TABLE audit_log (dept_name VARCHAR(30) NOT NULL, avg_salary DECIMAL(10,2) NOT NULL);
+INSERT INTO audit_log
+SELECT d.name, sub.avg_sal
+FROM departments d
+JOIN (SELECT dept_id, AVG(salary) AS avg_sal FROM employees WHERE active = 1 GROUP BY dept_id) sub
+ON d.id = sub.dept_id;
+SELECT * FROM audit_log ORDER BY dept_name;
+dept_name	avg_salary
+# --- DELETE all from table with subquery validation ---
+DELETE FROM salaries WHERE emp_id IN (SELECT id FROM employees WHERE active = 1);
+SELECT COUNT(*) AS remaining FROM salaries;
+remaining
+0
+# --- Cleanup ---
+DROP TABLE employees, departments, salaries, bonuses, audit_log;

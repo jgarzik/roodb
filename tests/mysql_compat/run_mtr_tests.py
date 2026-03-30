@@ -235,6 +235,16 @@ TIERS = {
         "select_limit_order",                 # LIMIT/OFFSET, ORDER BY expressions/NULLs/CASE
         "insert_boundary",                    # INSERT edge cases, type boundaries, multi-row
     ],
+    29: [
+        "subquery_scalar",                    # scalar subqueries in SELECT, WHERE, HAVING, ORDER BY
+        "subquery_in",                        # IN/NOT IN subqueries, NULLs, empty results
+        "subquery_nested",                    # nested subqueries (subquery inside subquery)
+        "subquery_compare",                   # subqueries with comparison operators (=, <, >, <=, >=, <>)
+    ],
+    30: [
+        "select_expressions",                 # complex SELECT: CASE, COALESCE, arithmetic with subqueries
+        "dml_subquery",                       # INSERT...SELECT, UPDATE, DELETE with subqueries
+    ],
 }
 
 

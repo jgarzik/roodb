@@ -1,0 +1,166 @@
+#
+# Complex SELECT expressions combining subqueries with CASE, COALESCE,
+# arithmetic, string functions, and aggregates.
+# Exercises expression evaluation depth and type interactions.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS products, orders, categories;
+--enable_warnings
+
+CREATE TABLE categories (id INT NOT NULL PRIMARY KEY, name VARCHAR(30));
+INSERT INTO categories VALUES (1, 'Electronics'), (2, 'Books'), (3, 'Clothing');
+
+CREATE TABLE products (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    cat_id INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    stock INT NOT NULL
+);
+INSERT INTO products VALUES
+    (1, 'Laptop', 1, 999.99, 10),
+    (2, 'Phone', 1, 699.50, 25),
+    (3, 'Novel', 2, 14.99, 100),
+    (4, 'Textbook', 2, 89.95, 30),
+    (5, 'Jacket', 3, 149.00, 15),
+    (6, 'T-Shirt', 3, 29.99, 50),
+    (7, 'Tablet', 1, 499.00, 20),
+    (8, 'Biography', 2, 24.99, 45);
+
+CREATE TABLE orders (
+    id INT NOT NULL PRIMARY KEY,
+    product_id INT NOT NULL,
+    qty INT NOT NULL,
+    order_date DATE NOT NULL
+);
+INSERT INTO orders VALUES
+    (1, 1, 2, '2025-01-15'),
+    (2, 2, 5, '2025-01-20'),
+    (3, 3, 10, '2025-02-01'),
+    (4, 5, 3, '2025-02-10'),
+    (5, 1, 1, '2025-03-01'),
+    (6, 7, 4, '2025-03-05'),
+    (7, 6, 8, '2025-03-10'),
+    (8, 4, 2, '2025-03-15');
+
+--echo # --- CASE with subquery ---
+
+SELECT id, name, price,
+    CASE
+        WHEN price > (SELECT AVG(price) FROM products) THEN 'above avg'
+        WHEN price = (SELECT AVG(price) FROM products) THEN 'at avg'
+        ELSE 'below avg'
+    END AS price_tier
+FROM products ORDER BY id;
+
+--echo # --- COALESCE with subquery ---
+
+SELECT COALESCE((SELECT MAX(price) FROM products WHERE cat_id = 99), 0.00) AS missing_cat;
+SELECT COALESCE((SELECT MAX(price) FROM products WHERE cat_id = 1), 0.00) AS electronics_max;
+
+--echo # --- Arithmetic with subqueries ---
+
+SELECT id, name, price,
+    price - (SELECT AVG(price) FROM products) AS diff_from_avg,
+    ROUND(price / (SELECT MAX(price) FROM products) * 100, 1) AS pct_of_max
+FROM products ORDER BY id;
+
+--echo # --- String functions with subquery results ---
+
+SELECT id, name,
+    CONCAT(name, ' ($', price, ')') AS display,
+    LENGTH(name) AS name_len
+FROM products
+WHERE price > (SELECT AVG(price) FROM products)
+ORDER BY id;
+
+--echo # --- Aggregate over subquery-filtered set ---
+
+SELECT cat_id,
+    COUNT(*) AS product_count,
+    SUM(price) AS total_price,
+    ROUND(AVG(price), 2) AS avg_price
+FROM products
+WHERE price > (SELECT MIN(price) FROM products)
+GROUP BY cat_id
+ORDER BY cat_id;
+
+--echo # --- IN subquery with JOIN ---
+
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE p.id IN (SELECT o.product_id FROM orders o)
+ORDER BY p.id;
+
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE p.id NOT IN (SELECT o.product_id FROM orders o)
+ORDER BY p.id;
+
+--echo # --- Subquery in derived table ---
+
+SELECT d.cat_id, c.name AS category, d.cnt, d.avg_price
+FROM (
+    SELECT cat_id, COUNT(*) AS cnt, ROUND(AVG(price), 2) AS avg_price
+    FROM products
+    GROUP BY cat_id
+) d
+JOIN categories c ON d.cat_id = c.id
+WHERE d.avg_price > (SELECT AVG(price) FROM products)
+ORDER BY d.cat_id;
+
+--echo # --- Complex WHERE combining subqueries ---
+
+SELECT p.id, p.name, p.price, p.stock
+FROM products p
+WHERE p.price > (SELECT AVG(price) FROM products)
+  AND p.stock > (SELECT AVG(stock) FROM products)
+ORDER BY p.id;
+
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE p.cat_id IN (SELECT cat_id FROM products GROUP BY cat_id HAVING COUNT(*) >= 3)
+  AND p.price < (SELECT AVG(price) FROM products)
+ORDER BY p.id;
+
+--echo # --- Nested CASE with multiple subqueries ---
+
+SELECT id, name,
+    CASE
+        WHEN price > (SELECT AVG(price) FROM products WHERE cat_id = 1) THEN 'expensive'
+        WHEN price > (SELECT AVG(price) FROM products WHERE cat_id = 2) THEN 'moderate'
+        ELSE 'affordable'
+    END AS tier
+FROM products ORDER BY id;
+
+--echo # --- Subquery with LIMIT in outer query ---
+
+SELECT id, name, price FROM products
+WHERE price >= (SELECT AVG(price) FROM products)
+ORDER BY price DESC
+LIMIT 3;
+
+--echo # --- NULL-safe comparisons with subqueries ---
+
+# COALESCE with subquery that returns NULL (empty result)
+SELECT COALESCE((SELECT SUM(qty) FROM orders WHERE product_id = 999), 0) AS no_orders;
+
+# Subquery returning NULL from aggregate on no rows
+SELECT (SELECT SUM(qty) FROM orders WHERE qty > 9999) AS none_found;
+SELECT COALESCE((SELECT SUM(qty) FROM orders WHERE qty > 9999), 0) AS safe_none;
+
+# Products that are ordered (using IN subquery)
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE p.id IN (SELECT product_id FROM orders)
+ORDER BY p.id;
+
+# Products that are NOT ordered
+SELECT p.id, p.name, p.price
+FROM products p
+WHERE p.id NOT IN (SELECT product_id FROM orders)
+ORDER BY p.id;
+
+--echo # --- Cleanup ---
+DROP TABLE products, orders, categories;

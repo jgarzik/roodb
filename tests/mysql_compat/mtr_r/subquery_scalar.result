@@ -1,0 +1,169 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma'),
+(4, 40, 'delta'), (5, 50, 'epsilon');
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, ref_id INT, amount DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 1, 100.50), (2, 1, 200.75), (3, 2, 50.00),
+(4, 3, 75.25), (5, 5, 300.00);
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, category VARCHAR(10));
+INSERT INTO t3 VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'B'), (5, 'A');
+# --- Scalar subquery in SELECT list ---
+SELECT (SELECT MAX(val) FROM t1);
+(SELECT ...)
+50
+SELECT (SELECT MIN(val) FROM t1);
+(SELECT ...)
+10
+SELECT (SELECT COUNT(*) FROM t1);
+(SELECT ...)
+5
+SELECT (SELECT SUM(val) FROM t1);
+(SELECT ...)
+150
+SELECT (SELECT AVG(val) FROM t1);
+(SELECT ...)
+30
+# Scalar subquery alongside regular columns
+SELECT id, val, (SELECT MAX(val) FROM t1) AS max_val FROM t1 ORDER BY id;
+id	val	max_val
+1	10	50
+2	20	50
+3	30	50
+4	40	50
+5	50	50
+# Multiple scalar subqueries in SELECT
+SELECT (SELECT MIN(val) FROM t1) AS min_v,
+(SELECT MAX(val) FROM t1) AS max_v,
+(SELECT COUNT(*) FROM t1) AS cnt;
+min_v	max_v	cnt
+10	50	5
+# Scalar subquery with arithmetic
+SELECT id, val, val - (SELECT AVG(val) FROM t1) AS diff_from_avg FROM t1 ORDER BY id;
+id	val	diff_from_avg
+1	10	-20
+2	20	-10
+3	30	0
+4	40	10
+5	50	20
+# --- Scalar subquery in WHERE clause ---
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1);
+id	val
+5	50
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1);
+id	val
+1	10
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val < (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(val) FROM t1) - 10 ORDER BY id;
+id	val
+4	40
+5	50
+# Scalar subquery with different table
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(amount) FROM t2) ORDER BY id;
+id	val
+SELECT t2.id, t2.amount FROM t2 WHERE t2.amount = (SELECT MIN(amount) FROM t2);
+id	amount
+3	50.00
+# Scalar subquery in WHERE with arithmetic
+SELECT id, val FROM t1 WHERE val * 2 > (SELECT SUM(val) FROM t1) ORDER BY id;
+id	val
+# --- Scalar subquery in HAVING clause ---
+SELECT category, COUNT(*) AS cnt FROM t3
+GROUP BY category
+HAVING COUNT(*) = (SELECT MAX(grp_cnt) FROM (SELECT COUNT(*) AS grp_cnt FROM t3 GROUP BY category) sub)
+ORDER BY category;
+category	cnt
+A	3
+SELECT category, COUNT(*) AS cnt FROM t3
+GROUP BY category
+HAVING COUNT(*) >= (SELECT MIN(grp_cnt) FROM (SELECT COUNT(*) AS grp_cnt FROM t3 GROUP BY category) sub)
+ORDER BY category;
+category	cnt
+A	3
+B	2
+# --- Scalar subquery in ORDER BY ---
+SELECT id, val FROM t1 ORDER BY val - (SELECT AVG(val) FROM t1);
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 ORDER BY (SELECT MAX(val) FROM t1) - val;
+id	val
+5	50
+4	40
+3	30
+2	20
+1	10
+# --- Scalar subquery as function argument ---
+SELECT ABS((SELECT MIN(val) FROM t1) - 100);
+ABS((SELECT ...) - 100)
+90
+SELECT COALESCE((SELECT NULL), (SELECT MAX(val) FROM t1));
+COALESCE((SELECT ...),(SELECT ...))
+50
+SELECT IF(val > (SELECT AVG(val) FROM t1), 'above', 'below') AS position, id
+FROM t1 ORDER BY id;
+position	id
+below	1
+below	2
+below	3
+above	4
+above	5
+# --- Scalar subquery returning NULL ---
+DROP TABLE IF EXISTS t_empty;
+CREATE TABLE t_empty (a INT NOT NULL PRIMARY KEY);
+SELECT (SELECT MAX(a) FROM t_empty);
+(SELECT ...)
+NULL
+SELECT (SELECT MIN(a) FROM t_empty);
+(SELECT ...)
+NULL
+SELECT (SELECT SUM(a) FROM t_empty);
+(SELECT ...)
+NULL
+SELECT (SELECT COUNT(*) FROM t_empty);
+(SELECT ...)
+0
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(a) FROM t_empty) ORDER BY id;
+id	val
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT COALESCE((SELECT MAX(a) FROM t_empty), 999);
+COALESCE((SELECT ...),999)
+999
+DROP TABLE t_empty;
+# --- Scalar subquery with single row ---
+SELECT id, val FROM t1 WHERE val = (SELECT val FROM t1 WHERE id = 3);
+id	val
+3	30
+SELECT id, val FROM t1 WHERE val > (SELECT val FROM t1 WHERE id = 2) ORDER BY id;
+id	val
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val <> (SELECT val FROM t1 WHERE id = 1) ORDER BY id;
+id	val
+2	20
+3	30
+4	40
+5	50
+# --- Scalar subquery with type coercion ---
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+id	val
+SELECT id, val FROM t1 WHERE val > (SELECT COUNT(*) FROM t2) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+# --- Cleanup ---
+DROP TABLE t1, t2, t3;

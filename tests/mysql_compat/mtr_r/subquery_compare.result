@@ -1,0 +1,209 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma'),
+(4, 40, 'delta'), (5, 50, 'epsilon');
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, amount DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 25.50), (2, 35.75), (3, 45.00), (4, 15.25), (5, 55.00);
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, score INT);
+INSERT INTO t3 VALUES (1, 100), (2, 200), (3, 300);
+# --- Equality (=) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1);
+id	val
+1	10
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1);
+id	val
+5	50
+SELECT id, val FROM t1 WHERE val = (SELECT val FROM t1 WHERE id = 3);
+id	val
+3	30
+# --- Not equal (<>) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val <> (SELECT MIN(val) FROM t1) ORDER BY id;
+id	val
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val <> (SELECT MAX(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+SELECT id, val FROM t1 WHERE val != (SELECT val FROM t1 WHERE id = 3) ORDER BY id;
+id	val
+1	10
+2	20
+4	40
+5	50
+# --- Less than (<) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val < (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+SELECT id, val FROM t1 WHERE val < (SELECT MAX(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+SELECT id, val FROM t1 WHERE val < (SELECT MIN(val) FROM t1) ORDER BY id;
+id	val
+# --- Greater than (>) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val > (SELECT MIN(val) FROM t1) ORDER BY id;
+id	val
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(val) FROM t1) ORDER BY id;
+id	val
+# --- Less than or equal (<=) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val <= (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+SELECT id, val FROM t1 WHERE val <= (SELECT MIN(val) FROM t1) ORDER BY id;
+id	val
+1	10
+SELECT id, val FROM t1 WHERE val <= (SELECT MAX(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+# --- Greater than or equal (>=) with scalar subquery ---
+SELECT id, val FROM t1 WHERE val >= (SELECT AVG(val) FROM t1) ORDER BY id;
+id	val
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val >= (SELECT MIN(val) FROM t1) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(val) FROM t1) ORDER BY id;
+id	val
+5	50
+# --- Comparison with subquery from different table ---
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+id	val
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val < (SELECT MIN(amount) FROM t2) ORDER BY id;
+id	val
+1	10
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(amount) FROM t2) ORDER BY id;
+id	val
+# --- Comparison with subquery returning single row ---
+SELECT id, val FROM t1 WHERE val = (SELECT amount FROM t2 WHERE id = 1);
+id	val
+SELECT id, val FROM t1 WHERE val > (SELECT amount FROM t2 WHERE id = 4) ORDER BY id;
+id	val
+2	20
+3	30
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val <= (SELECT amount FROM t2 WHERE id = 2) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+# --- Comparison with NULL result ---
+CREATE TABLE t_empty (a INT NOT NULL PRIMARY KEY);
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT id, val FROM t1 WHERE val < (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT id, val FROM t1 WHERE val <> (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT id, val FROM t1 WHERE val <= (SELECT MAX(a) FROM t_empty);
+id	val
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(a) FROM t_empty);
+id	val
+DROP TABLE t_empty;
+# --- Comparison with type coercion ---
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+id	val
+4	40
+5	50
+SELECT id, val FROM t1 WHERE val > (SELECT COUNT(*) FROM t2) ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+# --- Multiple comparisons with subqueries ---
+SELECT id, val FROM t1
+WHERE val > (SELECT MIN(val) FROM t1)
+AND val < (SELECT MAX(val) FROM t1)
+ORDER BY id;
+id	val
+2	20
+3	30
+4	40
+SELECT id, val FROM t1
+WHERE val >= (SELECT AVG(val) FROM t1)
+AND val <= (SELECT MAX(val) FROM t1) - 5
+ORDER BY id;
+id	val
+3	30
+4	40
+SELECT id, val FROM t1
+WHERE val > (SELECT MIN(val) FROM t1)
+OR val = (SELECT MIN(val) FROM t1)
+ORDER BY id;
+id	val
+1	10
+2	20
+3	30
+4	40
+5	50
+# --- Comparison in different clauses ---
+SELECT COUNT(*) AS cnt, MIN(val) AS min_v FROM t1
+GROUP BY val
+HAVING MIN(val) > (SELECT AVG(val) FROM t1)
+ORDER BY min_v;
+cnt	min_v
+1	40
+1	50
+SELECT id, val FROM t1 ORDER BY ABS(val - (SELECT AVG(val) FROM t1)), id;
+id	val
+3	30
+2	20
+4	40
+1	10
+5	50
+# --- Comparison with aggregate subquery on same table ---
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1 WHERE val < 50);
+id	val
+4	40
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1 WHERE val > 10);
+id	val
+2	20
+# --- Edge case: comparison both sides are subqueries ---
+SELECT (SELECT MIN(val) FROM t1) < (SELECT MAX(val) FROM t1);
+(SELECT ...) < (SELECT ...)
+1
+SELECT (SELECT MIN(val) FROM t1) = (SELECT MAX(val) FROM t1);
+(SELECT ...) = (SELECT ...)
+0
+SELECT (SELECT COUNT(*) FROM t1) >= (SELECT COUNT(*) FROM t2);
+(SELECT ...) >= (SELECT ...)
+1
+SELECT (SELECT AVG(val) FROM t1) <> (SELECT AVG(amount) FROM t2);
+(SELECT ...) <> (SELECT ...)
+1
+# --- Cleanup ---
+DROP TABLE t1, t2, t3;
