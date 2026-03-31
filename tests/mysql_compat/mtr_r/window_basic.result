@@ -1,0 +1,72 @@
+# Window function tests
+CREATE TABLE t1 (id INT, dept INT, name VARCHAR(10), salary INT);
+INSERT INTO t1 VALUES (1, 1, 'alice', 50000);
+INSERT INTO t1 VALUES (2, 1, 'bob', 60000);
+INSERT INTO t1 VALUES (3, 2, 'carol', 70000);
+INSERT INTO t1 VALUES (4, 2, 'dave', 55000);
+INSERT INTO t1 VALUES (5, 2, 'eve', 70000);
+# --- ROW_NUMBER ---
+SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) as rn FROM t1;
+name	salary	rn
+alice	50000	5
+bob	60000	3
+carol	70000	1
+dave	55000	4
+eve	70000	2
+# --- RANK with ties ---
+SELECT name, salary, RANK() OVER (ORDER BY salary DESC) as rnk FROM t1;
+name	salary	rnk
+alice	50000	5
+bob	60000	3
+carol	70000	1
+dave	55000	4
+eve	70000	1
+# --- DENSE_RANK ---
+SELECT name, salary, DENSE_RANK() OVER (ORDER BY salary DESC) as drnk FROM t1;
+name	salary	drnk
+alice	50000	4
+bob	60000	2
+carol	70000	1
+dave	55000	3
+eve	70000	1
+# --- SUM OVER PARTITION BY ---
+SELECT dept, name, salary, SUM(salary) OVER (PARTITION BY dept) as dept_total FROM t1 ORDER BY dept, name;
+dept	name	salary	dept_total
+1	alice	50000	110000
+1	bob	60000	110000
+2	carol	70000	195000
+2	dave	55000	195000
+2	eve	70000	195000
+# --- COUNT(*) OVER PARTITION BY ---
+SELECT dept, name, COUNT(*) OVER (PARTITION BY dept) as dept_size FROM t1 ORDER BY dept, name;
+dept	name	dept_size
+1	alice	2
+1	bob	2
+2	carol	3
+2	dave	3
+2	eve	3
+# --- LAG and LEAD ---
+SELECT id, salary, LAG(salary, 1) OVER (ORDER BY id) as prev, LEAD(salary, 1) OVER (ORDER BY id) as next FROM t1;
+id	salary	prev	next
+1	50000	NULL	60000
+2	60000	50000	70000
+3	70000	60000	55000
+4	55000	70000	70000
+5	70000	55000	NULL
+# --- AVG OVER ---
+SELECT dept, name, salary, AVG(salary) OVER (PARTITION BY dept) as dept_avg FROM t1 ORDER BY dept, name;
+dept	name	salary	dept_avg
+1	alice	50000	55000
+1	bob	60000	55000
+2	carol	70000	65000
+2	dave	55000	65000
+2	eve	70000	65000
+# --- MIN/MAX OVER ---
+SELECT dept, MIN(salary) OVER (PARTITION BY dept) as mn, MAX(salary) OVER (PARTITION BY dept) as mx FROM t1 ORDER BY dept, name;
+dept	mn	mx
+1	50000	60000
+1	50000	60000
+2	55000	70000
+2	55000	70000
+2	55000	70000
+DROP TABLE t1;

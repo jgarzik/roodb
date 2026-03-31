@@ -302,6 +302,10 @@ TIERS = {
         "insert_odku",                        # INSERT ON DUPLICATE KEY UPDATE
         "update_join",                        # UPDATE t1 JOIN t2 ON cond SET t1.b = val
     ],
+    41: [
+        "cte_basic",                          # WITH ... AS common table expressions
+        "window_basic",                       # ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG
+    ],
 }
 
 

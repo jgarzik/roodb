@@ -248,6 +248,10 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
             collect_explain_rows(right, rows, extra);
         }
 
+        PhysicalPlan::Window { input, .. } => {
+            collect_explain_rows(input, rows, extra);
+        }
+
         // DDL, Auth, Analyze — no EXPLAIN rows
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::CreateTableAs { .. }

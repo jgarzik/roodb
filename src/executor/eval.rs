@@ -333,6 +333,9 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
         ResolvedExpr::ExistsSubquery { .. } => Err(ExecutorError::Internal(
             "ExistsSubquery not materialized before evaluation".to_string(),
         )),
+        ResolvedExpr::WindowFunction { .. } => Err(ExecutorError::Internal(
+            "WindowFunction must be pre-computed by Window executor".to_string(),
+        )),
     }
 }
 

@@ -193,6 +193,9 @@ impl ExecutorEngine {
                 PhysicalPlan::Materialize { input } => {
                     self.materialize_subqueries_in_plan(input).await?;
                 }
+                PhysicalPlan::Window { input, .. } => {
+                    self.materialize_subqueries_in_plan(input).await?;
+                }
                 PhysicalPlan::Insert { values, .. } => {
                     for row in values {
                         for expr in row {
@@ -338,6 +341,8 @@ impl ExecutorEngine {
                     }
                     Ok(())
                 }
+                // Window functions are pre-computed by the Window executor — nothing to materialize
+                ResolvedExpr::WindowFunction { .. } => Ok(()),
                 // Leaf nodes — nothing to do
                 ResolvedExpr::Column(_)
                 | ResolvedExpr::Literal(_)
@@ -599,6 +604,18 @@ impl ExecutorEngine {
                 let left_exec = self.build_node(*left)?;
                 let right_exec = self.build_node(*right)?;
                 Ok(Box::new(Union::new(left_exec, right_exec, all)))
+            }
+
+            PhysicalPlan::Window {
+                input,
+                window_funcs,
+            } => {
+                let input_exec = self.build_node(*input)?;
+                Ok(Box::new(crate::executor::window::Window::new(
+                    input_exec,
+                    window_funcs,
+                    self.user_variables.clone(),
+                )))
             }
 
             PhysicalPlan::Insert {

@@ -75,10 +75,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 38 | union_multiway, session_functions | 3+ way UNION, CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS |
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 | 40 | insert_odku, update_join | INSERT ON DUPLICATE KEY UPDATE, UPDATE with JOIN |
+| 41 | cte_basic, window_basic | WITH...AS CTEs, ROW_NUMBER/RANK/DENSE_RANK/SUM/COUNT/AVG/MIN/MAX OVER, LEAD/LAG |
 
 ## Current Status
 
-**173 MySQL compat tests across 40 tiers — all pass**
+**175 MySQL compat tests across 41 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -297,6 +298,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | get_expr_type fix | GROUP BY type inference uses data_type() for all expr types (was fallback Int) |
 | INSERT ON DUPLICATE KEY UPDATE | Full ODKU: detect PK duplicate via storage lookup, apply UPDATE assignments to existing row |
 | UPDATE with JOIN | `UPDATE t1 JOIN t2 ON cond SET t1.b = val` — rewrite JOIN to IN-subquery filter |
+| CTEs (WITH...AS) | Common Table Expressions — resolve CTE body, inject as derived table into main query |
+| Window functions | Full pipeline: resolver → planner → executor. ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTILE with PARTITION BY and ORDER BY |
 
 ## Gap Analysis — Next Steps
 
@@ -320,8 +323,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - Integer-to-SET member mapping
 - SET column defaults
 - Correlated subqueries in SELECT list / WHERE
-- Window functions (ROW_NUMBER, RANK, etc.)
-- CTEs (WITH ... AS)
+- Multi-column IN tuples `(a, b) IN ((1,2), (3,4))`
 
 ## Architecture
 

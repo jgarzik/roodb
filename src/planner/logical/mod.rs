@@ -12,6 +12,16 @@ pub use expr::{AggregateFunc, ColumnId, OutputColumn};
 use crate::catalog::{ColumnDef, Constraint, DataType};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
+/// Window function descriptor: (select_col_index, func_name, args, partition_by, order_by, result_type)
+pub type WindowFuncDesc = (
+    usize,
+    String,
+    Vec<ResolvedExpr>,
+    Vec<ResolvedExpr>,
+    Vec<(ResolvedExpr, bool)>,
+    DataType,
+);
+
 // ============ Operator types (shared with resolver/executor) ============
 
 /// Binary operators
@@ -200,6 +210,14 @@ pub enum ResolvedExpr {
         query: Box<ResolvedSelect>,
         negated: bool,
     },
+    /// Window function: func OVER (PARTITION BY ... ORDER BY ...)
+    WindowFunction {
+        name: String,
+        args: Vec<ResolvedExpr>,
+        partition_by: Vec<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        result_type: DataType,
+    },
 }
 
 impl ResolvedExpr {
@@ -241,6 +259,7 @@ impl ResolvedExpr {
             ResolvedExpr::ScalarSubquery { result_type, .. } => result_type.clone(),
             ResolvedExpr::InSubquery { .. } => DataType::Boolean,
             ResolvedExpr::ExistsSubquery { .. } => DataType::Boolean,
+            ResolvedExpr::WindowFunction { result_type, .. } => result_type.clone(),
         }
     }
 
@@ -273,7 +292,8 @@ impl ResolvedExpr {
             }
             ResolvedExpr::ScalarSubquery { .. } => true, // Subquery may return NULL or no rows
             ResolvedExpr::InSubquery { .. } => true,     // IN subquery can return NULL
-            ResolvedExpr::ExistsSubquery { .. } => false, // EXISTS always returns true/false
+            ResolvedExpr::ExistsSubquery { .. } => false,
+            ResolvedExpr::WindowFunction { .. } => true,
         }
     }
 }
@@ -550,6 +570,12 @@ pub enum LogicalPlan {
         alias: String,
     },
 
+    /// Window function computation over input rows
+    Window {
+        input: Box<LogicalPlan>,
+        window_funcs: Vec<WindowFuncDesc>,
+    },
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -756,6 +782,7 @@ impl LogicalPlan {
             }
 
             LogicalPlan::Sort { input, .. } => input.output_columns(),
+            LogicalPlan::Window { input, .. } => input.output_columns(),
             LogicalPlan::Limit { input, .. } => input.output_columns(),
             LogicalPlan::Distinct { input } => input.output_columns(),
             LogicalPlan::SingleRow => vec![],

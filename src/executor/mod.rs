@@ -36,6 +36,7 @@ pub mod sort;
 pub mod trigger;
 pub mod union;
 pub mod update;
+pub mod window;
 
 pub use context::TransactionContext;
 pub use datum::Datum;

@@ -4,7 +4,7 @@
 
 use super::{
     BinaryOp, JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
-    ResolvedStatement, ResolvedTableRef, UnaryOp,
+    ResolvedStatement, ResolvedTableRef, UnaryOp, WindowFuncDesc,
 };
 use crate::catalog::DataType;
 
@@ -247,7 +247,7 @@ impl LogicalPlanBuilder {
     }
 
     /// Build logical plan for SELECT statement
-    fn build_select(select: ResolvedSelect) -> PlannerResult<LogicalPlan> {
+    fn build_select(mut select: ResolvedSelect) -> PlannerResult<LogicalPlan> {
         // 1. Build scan for each table in FROM
         let mut plan = Self::build_from(&select.from)?;
 
@@ -263,17 +263,21 @@ impl LogicalPlanBuilder {
         }
 
         // 2. Apply WHERE filter
-        if let Some(filter) = select.filter {
+        if let Some(ref filter) = select.filter {
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
-                predicate: filter,
+                predicate: filter.clone(),
             };
         }
 
-        // 3. Apply GROUP BY / aggregates
+        // 3. Detect window functions BEFORE aggregation/projection
+        // Window functions are computed on the full row set, then projection
+        // selects the output columns including the computed window values.
+        let window_funcs = Self::collect_window_functions(&select.columns);
+
+        // 4. Apply GROUP BY / aggregates
         let has_aggregates = Self::has_aggregates(&select.columns);
         if !select.group_by.is_empty() || has_aggregates {
-            // Collect all aggregates from SELECT columns AND HAVING clause
             let all_aggs = Self::collect_all_aggregates(&select.columns, select.having.as_ref());
 
             plan = Self::build_aggregate(
@@ -283,22 +287,50 @@ impl LogicalPlanBuilder {
                 select.having.as_ref(),
             )?;
 
-            // After aggregation, apply HAVING (with transformed aggregates)
-            if let Some(having) = select.having {
-                // Transform aggregate expressions in HAVING to column references
+            if let Some(ref having) = select.having {
                 let transformed_having =
-                    Self::transform_having_expr(&having, &select.group_by, &all_aggs);
+                    Self::transform_having_expr(having, &select.group_by, &all_aggs);
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: transformed_having,
                 };
             }
 
-            // After aggregation, build projection that maps to aggregate output columns
+            // After aggregation, build projection
             plan = Self::build_post_aggregate_project(plan, &select.columns, &select.group_by)?;
-        } else {
-            // 4. For non-aggregate queries: ORDER BY before Project
-            // so ORDER BY can access columns not in the SELECT list.
+        }
+
+        // 5. Apply window functions BEFORE projection
+        // Window executor appends computed columns at the end of each row.
+        // Then we rewrite SELECT references from WindowFunction expressions
+        // to Column references pointing to the appended columns.
+        if !window_funcs.is_empty() {
+            let num_input_cols = plan.output_columns().len();
+            plan = LogicalPlan::Window {
+                input: Box::new(plan),
+                window_funcs: window_funcs.clone(),
+            };
+            // Rewrite WindowFunction exprs in SELECT list to column refs
+            for (wf_idx, (sel_idx, ..)) in window_funcs.iter().enumerate() {
+                if let Some(ResolvedSelectItem::Expr { expr, .. }) =
+                    select.columns.get_mut(*sel_idx)
+                {
+                    let col_idx = num_input_cols + wf_idx;
+                    let dt = expr.data_type();
+                    *expr = ResolvedExpr::Column(ResolvedColumn {
+                        table: String::new(),
+                        name: format!("__window_{}", wf_idx),
+                        index: col_idx,
+                        data_type: dt,
+                        nullable: true,
+                        default_value: None,
+                    });
+                }
+            }
+        }
+
+        if !has_aggregates && select.group_by.is_empty() {
+            // 6. For non-aggregate queries: ORDER BY before Project
             if !select.order_by.is_empty() {
                 let order_by: Vec<_> = select
                     .order_by
@@ -311,7 +343,7 @@ impl LogicalPlanBuilder {
                 };
             }
 
-            // Apply projection (SELECT list)
+            // Apply projection (SELECT list) — now with window exprs already rewritten
             plan = Self::build_project(plan, &select.columns)?;
         }
 
@@ -408,6 +440,35 @@ impl LogicalPlanBuilder {
     }
 
     /// Check if select items contain aggregates
+    /// Collect window functions from SELECT items
+    fn collect_window_functions(columns: &[ResolvedSelectItem]) -> Vec<WindowFuncDesc> {
+        let mut result = Vec::new();
+        for (i, item) in columns.iter().enumerate() {
+            if let ResolvedSelectItem::Expr {
+                expr:
+                    ResolvedExpr::WindowFunction {
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        result_type,
+                    },
+                ..
+            } = item
+            {
+                result.push((
+                    i,
+                    name.clone(),
+                    args.clone(),
+                    partition_by.clone(),
+                    order_by.clone(),
+                    result_type.clone(),
+                ));
+            }
+        }
+        result
+    }
+
     fn has_aggregates(columns: &[ResolvedSelectItem]) -> bool {
         columns.iter().any(|item| match item {
             ResolvedSelectItem::Expr { expr, .. } => Self::expr_has_aggregate(expr),
@@ -1462,6 +1523,10 @@ impl LogicalPlanBuilder {
                 } else {
                     "EXISTS (SELECT ...)".to_string()
                 }
+            }
+            ResolvedExpr::WindowFunction { name, args, .. } => {
+                let arg_strs: Vec<String> = args.iter().map(Self::expr_to_sql).collect();
+                format!("{}({})", name, arg_strs.join(", "))
             }
         }
     }

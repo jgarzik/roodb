@@ -29,6 +29,8 @@ pub struct Resolver<'a> {
     placeholder_counter: Cell<usize>,
     /// Track view expansion depth to prevent infinite recursion from circular views
     view_depth: Cell<usize>,
+    /// CTE definitions (WITH ... AS) — populated at resolve_query time
+    ctes: std::cell::RefCell<std::collections::HashMap<String, ResolvedSelect>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -39,6 +41,7 @@ impl<'a> Resolver<'a> {
             placeholder_mode: false,
             placeholder_counter: Cell::new(0),
             view_depth: Cell::new(0),
+            ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -49,6 +52,7 @@ impl<'a> Resolver<'a> {
             placeholder_mode: true,
             placeholder_counter: Cell::new(0),
             view_depth: Cell::new(0),
+            ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1039,6 +1043,28 @@ impl<'a> Resolver<'a> {
 
     /// Resolve SELECT query
     fn resolve_query(&self, query: &sp::Query) -> SqlResult<ResolvedStatement> {
+        // Process CTEs (WITH ... AS) — resolve each CTE body and register it
+        if let Some(ref with) = query.with {
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.to_lowercase();
+                let cte_select = self.resolve_query(&cte.query)?;
+                match cte_select {
+                    ResolvedStatement::Select(resolved) => {
+                        self.ctes.borrow_mut().insert(cte_name, resolved);
+                    }
+                    ResolvedStatement::Union { ref left, .. } => {
+                        // For UNION CTEs, use the left branch metadata
+                        self.ctes.borrow_mut().insert(cte_name, (**left).clone());
+                    }
+                    _ => {
+                        return Err(SqlError::Unsupported(
+                            "CTE must be a SELECT or UNION".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Check for UNION at the top level (also check parenthesized queries)
         if Self::contains_union(query.body.as_ref()) {
             // Collect all UNION leaves and their ALL flags by walking the
@@ -1560,6 +1586,40 @@ impl<'a> Resolver<'a> {
                     });
                 }
 
+                // Check CTE definitions
+                {
+                    let ctes = self.ctes.borrow();
+                    if let Some(cte_select) = ctes.get(&table_name.to_lowercase()) {
+                        let columns: Vec<_> = cte_select
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, item)| match item {
+                                ResolvedSelectItem::Expr { expr, alias } => {
+                                    let col_name = alias.clone().unwrap_or_else(|| match expr {
+                                        ResolvedExpr::Column(c) => c.name.clone(),
+                                        _ => format!("col_{}", i),
+                                    });
+                                    vec![(col_name, expr.data_type(), true)]
+                                }
+                                ResolvedSelectItem::Columns(cols) => cols
+                                    .iter()
+                                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                                    .collect(),
+                            })
+                            .collect();
+                        return Ok(ResolvedTableRef {
+                            name: alias
+                                .as_ref()
+                                .map(|a| a.name.value.clone())
+                                .unwrap_or(table_name),
+                            alias: alias.as_ref().map(|a| a.name.value.clone()),
+                            columns,
+                            inner_query: Some(Box::new(cte_select.clone())),
+                        });
+                    }
+                }
+
                 // Fall back to view — expand view query as a derived table
                 if let Some(view_def) = self.catalog.get_view(&table_name) {
                     let depth = self.view_depth.get();
@@ -1980,6 +2040,52 @@ impl<'a> Resolver<'a> {
                 } else {
                     None
                 };
+                // Check for window function OVER clause
+                if let Some(sp::WindowType::WindowSpec(ref spec)) = func.over {
+                    let partition_by: Vec<ResolvedExpr> = spec
+                        .partition_by
+                        .iter()
+                        .map(|e| self.resolve_expr(e, scope))
+                        .collect::<SqlResult<Vec<_>>>()?;
+                    let order_by: Vec<(ResolvedExpr, bool)> = spec
+                        .order_by
+                        .iter()
+                        .map(|o| {
+                            let expr = self.resolve_expr(&o.expr, scope)?;
+                            let asc = o.options.asc.is_none_or(|a| a);
+                            Ok((expr, asc))
+                        })
+                        .collect::<SqlResult<Vec<_>>>()?;
+                    // Infer result type for window functions
+                    let wf_result_type = match name.as_str() {
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "COUNT" => {
+                            DataType::BigInt
+                        }
+                        "SUM" | "AVG" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" => {
+                            if args.is_empty() {
+                                DataType::BigInt
+                            } else {
+                                args[0].data_type()
+                            }
+                        }
+                        "MIN" | "MAX" => {
+                            if args.is_empty() {
+                                DataType::BigInt
+                            } else {
+                                args[0].data_type()
+                            }
+                        }
+                        _ => result_type.clone(),
+                    };
+                    return Ok(ResolvedExpr::WindowFunction {
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        result_type: wf_result_type,
+                    });
+                }
+
                 Ok(ResolvedExpr::Function {
                     name,
                     args,

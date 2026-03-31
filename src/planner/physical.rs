@@ -115,6 +115,12 @@ pub enum PhysicalPlan {
     /// Single empty row (TABLE_DEE)
     SingleRow,
 
+    /// Window function computation
+    Window {
+        input: Box<PhysicalPlan>,
+        window_funcs: Vec<crate::planner::logical::WindowFuncDesc>,
+    },
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -350,6 +356,7 @@ impl PhysicalPlan {
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
             PhysicalPlan::Union { left, .. } => left.output_columns(),
             PhysicalPlan::Materialize { input } => input.output_columns(),
+            PhysicalPlan::Window { input, .. } => input.output_columns(),
             PhysicalPlan::SingleRow => vec![],
 
             // DML/DDL operations don't produce query output
@@ -599,6 +606,23 @@ impl PhysicalPlan {
             PhysicalPlan::Materialize { input } => {
                 input.substitute_params(params)?;
             }
+            PhysicalPlan::Window {
+                input,
+                window_funcs,
+            } => {
+                input.substitute_params(params)?;
+                for (_, _, args, partition_by, order_by, _) in window_funcs {
+                    for arg in args {
+                        substitute_expr(arg, params)?;
+                    }
+                    for expr in partition_by {
+                        substitute_expr(expr, params)?;
+                    }
+                    for (expr, _) in order_by {
+                        substitute_expr(expr, params)?;
+                    }
+                }
+            }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
             | PhysicalPlan::CreateTable { .. }
@@ -701,6 +725,23 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
         }
         // EXISTS subqueries are self-contained, no placeholder substitution needed
         ResolvedExpr::ExistsSubquery { .. } => {}
+        // Window functions: substitute in args, partition_by, order_by
+        ResolvedExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                substitute_expr(arg, params)?;
+            }
+            for expr in partition_by {
+                substitute_expr(expr, params)?;
+            }
+            for (expr, _) in order_by {
+                substitute_expr(expr, params)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1205,6 +1246,13 @@ impl PhysicalPlanner {
                 input: Box::new(Self::plan_node(*input, catalog)?),
             }),
 
+            LogicalPlan::Window {
+                input,
+                window_funcs,
+            } => Ok(PhysicalPlan::Window {
+                input: Box::new(Self::plan_node(*input, catalog)?),
+                window_funcs,
+            }),
             LogicalPlan::Union { left, right, all } => Ok(PhysicalPlan::Union {
                 left: Box::new(Self::plan_node(*left, catalog)?),
                 right: Box::new(Self::plan_node(*right, catalog)?),
