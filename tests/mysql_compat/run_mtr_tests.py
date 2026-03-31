@@ -306,6 +306,9 @@ TIERS = {
         "cte_basic",                          # WITH ... AS common table expressions
         "window_basic",                       # ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG
     ],
+    42: [
+        "correlated_subquery",                # Correlated EXISTS, NOT EXISTS, scalar subqueries
+    ],
 }
 
 

@@ -387,6 +387,7 @@ impl<'a> Resolver<'a> {
                         data_type: col_def.data_type.clone(),
                         nullable: col_def.nullable || col_def.auto_increment,
                         default_value: col_def.default.clone(),
+                        is_outer_ref: false,
                     })
                     .collect();
 
@@ -464,6 +465,7 @@ impl<'a> Resolver<'a> {
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
                 default_value: col_def.default.clone(),
+                is_outer_ref: false,
             });
         }
 
@@ -597,6 +599,7 @@ impl<'a> Resolver<'a> {
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
                 default_value: col_def.default.clone(),
+                is_outer_ref: false,
             });
         }
 
@@ -700,6 +703,7 @@ impl<'a> Resolver<'a> {
                             data_type: tc.data_type.clone(),
                             nullable: tc.nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         });
                         let subquery_col = ResolvedExpr::Column(ResolvedColumn {
                             table: joined_table_name.clone(),
@@ -708,6 +712,7 @@ impl<'a> Resolver<'a> {
                             data_type: jc.data_type.clone(),
                             nullable: jc.nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         });
                         let subquery = ResolvedSelect {
                             distinct: false,
@@ -793,6 +798,7 @@ impl<'a> Resolver<'a> {
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable,
                 default_value: None,
+                is_outer_ref: false,
             };
             let value = self.resolve_expr(&assign.value, &assign_scope)?;
 
@@ -918,6 +924,7 @@ impl<'a> Resolver<'a> {
                             data_type: target_col_def.data_type.clone(),
                             nullable: target_col_def.nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         });
                         let subquery_col = ResolvedExpr::Column(ResolvedColumn {
                             table: joined_table_name.clone(),
@@ -926,6 +933,7 @@ impl<'a> Resolver<'a> {
                             data_type: joined_col_def.data_type.clone(),
                             nullable: joined_col_def.nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         });
 
                         let subquery = ResolvedSelect {
@@ -1350,10 +1358,23 @@ impl<'a> Resolver<'a> {
 
     /// Resolve SELECT body
     fn resolve_select_body(&self, body: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
+        self.resolve_select_body_inner(body, None)
+    }
+
+    /// Resolve SELECT body with optional outer scope (for correlated subqueries)
+    fn resolve_select_body_inner(
+        &self,
+        body: &sp::SetExpr,
+        outer_scope: Option<&Scope>,
+    ) -> SqlResult<ResolvedSelect> {
         match body {
             sp::SetExpr::Select(select) => {
-                // Build scope from FROM clause
-                let mut scope = Scope::new();
+                // Build scope from FROM clause, with optional outer scope
+                let mut scope = if let Some(outer) = outer_scope {
+                    Scope::with_outer(outer)
+                } else {
+                    Scope::new()
+                };
 
                 for table in &select.from {
                     let table_ref = self.resolve_table_factor(&table.relation)?;
@@ -1751,6 +1772,7 @@ impl<'a> Resolver<'a> {
                             data_type: data_type.clone(),
                             nullable: *nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         });
                     }
                 }
@@ -1779,6 +1801,7 @@ impl<'a> Resolver<'a> {
                             data_type: data_type.clone(),
                             nullable: *nullable,
                             default_value: None,
+                            is_outer_ref: false,
                         }
                     })
                     .collect();
@@ -2232,10 +2255,11 @@ impl<'a> Resolver<'a> {
             sp::Expr::Collate { expr, .. } => self.resolve_expr(expr, scope),
 
             // Subquery: (SELECT ...) — resolve as scalar subquery
+            // Pass outer scope for correlated subquery support
             sp::Expr::Subquery(query) => {
-                let mut inner_select = self.resolve_select_body(query.body.as_ref())?;
+                let mut inner_select =
+                    self.resolve_select_body_inner(query.body.as_ref(), Some(scope))?;
                 self.resolve_query_order_limit(&mut inner_select, query)?;
-                // Determine the result type from the first output column
                 let result_type = Self::scalar_subquery_result_type(&inner_select)?;
                 Ok(ResolvedExpr::ScalarSubquery {
                     query: Box::new(inner_select),
@@ -2250,7 +2274,8 @@ impl<'a> Resolver<'a> {
                 negated,
             } => {
                 let resolved_expr = self.resolve_expr(expr, scope)?;
-                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                let mut inner_select =
+                    self.resolve_select_body_inner(subquery.body.as_ref(), Some(scope))?;
                 self.resolve_query_order_limit(&mut inner_select, subquery)?;
                 Ok(ResolvedExpr::InSubquery {
                     expr: Box::new(resolved_expr),
@@ -2261,7 +2286,8 @@ impl<'a> Resolver<'a> {
 
             // EXISTS / NOT EXISTS subquery
             sp::Expr::Exists { subquery, negated } => {
-                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                let mut inner_select =
+                    self.resolve_select_body_inner(subquery.body.as_ref(), Some(scope))?;
                 self.resolve_query_order_limit(&mut inner_select, subquery)?;
                 Ok(ResolvedExpr::ExistsSubquery {
                     query: Box::new(inner_select),
@@ -2434,35 +2460,53 @@ impl<'a> Resolver<'a> {
         name: &str,
         scope: &Scope,
     ) -> SqlResult<ResolvedExpr> {
+        // Try inner scope first
+        let inner_result = Self::resolve_column_in_scope(table, name, scope, false);
+        if inner_result.is_ok() {
+            return inner_result;
+        }
+        // Fall back to outer scope for correlated subqueries
+        if let Some(ref outer) = scope.outer {
+            let outer_result = Self::resolve_column_in_scope(table, name, outer, true);
+            if outer_result.is_ok() {
+                return outer_result;
+            }
+        }
+        // Return the inner error (not the outer one)
+        inner_result
+    }
+
+    /// Resolve a column within a single scope level
+    fn resolve_column_in_scope(
+        table: Option<&str>,
+        name: &str,
+        scope: &Scope,
+        is_outer: bool,
+    ) -> SqlResult<ResolvedExpr> {
         if let Some(table_name) = table {
-            // Qualified column reference (case-insensitive table name)
             let table_key = table_name.to_lowercase();
             let table_info = scope
                 .tables
                 .get(&table_key)
                 .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
-
             let (local_idx, col_info) = table_info
                 .columns
                 .iter()
                 .enumerate()
                 .find(|(_, (n, _, _))| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
-
             let global_idx = table_info.column_offset + local_idx;
-
             Ok(ResolvedExpr::Column(ResolvedColumn {
                 table: table_name.to_string(),
-                name: col_info.0.clone(), // Use the original column name from catalog
+                name: col_info.0.clone(),
                 index: global_idx,
                 data_type: col_info.1.clone(),
                 nullable: col_info.2,
                 default_value: None,
+                is_outer_ref: is_outer,
             }))
         } else {
-            // Unqualified column reference - search all tables
             let mut found: Option<(String, usize, DataType, bool)> = None;
-
             for (table_alias, table_info) in &scope.tables {
                 if let Some((local_idx, col_info)) = table_info
                     .columns
@@ -2482,16 +2526,16 @@ impl<'a> Resolver<'a> {
                     ));
                 }
             }
-
             match found {
-                Some((table, index, data_type, nullable)) => {
+                Some((tbl, index, data_type, nullable)) => {
                     Ok(ResolvedExpr::Column(ResolvedColumn {
-                        table,
+                        table: tbl,
                         name: name.to_string(),
                         index,
                         data_type,
                         nullable,
                         default_value: None,
+                        is_outer_ref: is_outer,
                     }))
                 }
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
@@ -2771,13 +2815,16 @@ fn convert_grant_objects(objects: &sp::GrantObjects) -> SqlResult<PrivilegeObjec
 
 // ============ Scope ============
 
-/// Scope for name resolution
+/// Scope for name resolution. Has optional outer scope for correlated subqueries.
 struct Scope {
     tables: HashMap<String, TableInfo>,
     table_order: Vec<(String, usize)>, // (alias, column_offset)
     total_columns: usize,
+    /// Outer scope for correlated subquery column resolution
+    outer: Option<Box<Scope>>,
 }
 
+#[derive(Clone)]
 struct TableInfo {
     columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
     column_offset: usize,
@@ -2789,6 +2836,7 @@ impl Scope {
             tables: HashMap::new(),
             table_order: Vec::new(),
             total_columns: 0,
+            outer: None,
         }
     }
 
@@ -2796,6 +2844,21 @@ impl Scope {
         let mut scope = Self::new();
         scope.add_table(name, name, table_def);
         scope
+    }
+
+    /// Create a new scope with an outer scope for correlated subqueries
+    fn with_outer(outer: &Scope) -> Self {
+        Self {
+            tables: HashMap::new(),
+            table_order: Vec::new(),
+            total_columns: 0,
+            outer: Some(Box::new(Scope {
+                tables: outer.tables.clone(),
+                table_order: outer.table_order.clone(),
+                total_columns: outer.total_columns,
+                outer: None, // Only one level of nesting for now
+            })),
+        }
     }
 
     fn add_table(&mut self, alias: &str, _real_name: &str, table_def: &crate::catalog::TableDef) {

@@ -4,12 +4,38 @@
 
 use std::cell::RefCell;
 
-use crate::planner::logical::{BinaryOp, BooleanTestType, ResolvedExpr, UnaryOp};
+use std::sync::Arc;
+
+use crate::planner::logical::{BinaryOp, BooleanTestType, Literal, ResolvedExpr, UnaryOp};
 use crate::server::session::UserVariables;
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
+use super::Executor as _;
+
+// Thread-local engine context for correlated subquery execution.
+thread_local! {
+    static SUBQUERY_ENGINE: RefCell<Option<SubqueryContext>> = const { RefCell::new(None) };
+}
+
+/// Context needed to execute correlated subqueries inline
+#[derive(Clone)]
+pub struct SubqueryContext {
+    pub mvcc: Arc<crate::txn::MvccStorage>,
+    pub catalog: Arc<parking_lot::RwLock<crate::catalog::Catalog>>,
+    pub user_variables: UserVariables,
+}
+
+/// Set the subquery execution context (called by ExecutorEngine before query execution)
+pub fn set_subquery_context(ctx: SubqueryContext) {
+    SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = Some(ctx));
+}
+
+/// Clear the subquery execution context (called after query execution)
+pub fn clear_subquery_context() {
+    SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = None);
+}
 
 // MySQL-compatible RAND() state: (seed1, seed2)
 thread_local! {
@@ -324,15 +350,32 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
         }
 
         // Subqueries should have been materialized before evaluation
-        ResolvedExpr::ScalarSubquery { .. } => Err(ExecutorError::Internal(
-            "ScalarSubquery not materialized before evaluation".to_string(),
-        )),
-        ResolvedExpr::InSubquery { .. } => Err(ExecutorError::Internal(
-            "InSubquery not materialized before evaluation".to_string(),
-        )),
-        ResolvedExpr::ExistsSubquery { .. } => Err(ExecutorError::Internal(
-            "ExistsSubquery not materialized before evaluation".to_string(),
-        )),
+        ResolvedExpr::ScalarSubquery { query, .. } => {
+            // Correlated subquery: substitute outer-ref columns, execute inline
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            run_correlated_subquery_scalar(bound)
+        }
+        ResolvedExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let left = evaluate(expr, row, vars)?;
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            let values = run_correlated_subquery_values(bound)?;
+            let found = values.iter().any(|v| v == &left);
+            let result = if *negated { !found } else { found };
+            Ok(Datum::Bool(result))
+        }
+        ResolvedExpr::ExistsSubquery { query, negated } => {
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            let exists = run_correlated_subquery_exists(bound)?;
+            let result = if *negated { !exists } else { exists };
+            Ok(Datum::Bool(result))
+        }
         ResolvedExpr::WindowFunction { .. } => Err(ExecutorError::Internal(
             "WindowFunction must be pre-computed by Window executor".to_string(),
         )),
@@ -6667,6 +6710,190 @@ fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 
 /// Basic JSON Schema validation (Draft 4 subset).
 /// Checks: type, properties, required, items, minimum, maximum, minLength, maxLength, enum.
+/// Substitute outer-ref column references in a ResolvedSelect's filter
+/// with literal values from the given row.
+fn substitute_outer_refs_in_select(
+    select: &mut crate::planner::logical::ResolvedSelect,
+    row: &super::row::Row,
+) {
+    if let Some(ref mut filter) = select.filter {
+        substitute_outer_refs(filter, row);
+    }
+    for item in &mut select.columns {
+        if let crate::planner::logical::ResolvedSelectItem::Expr { expr, .. } = item {
+            substitute_outer_refs(expr, row);
+        }
+    }
+}
+
+/// Recursively replace outer-ref Column nodes with Literal values from the row
+fn substitute_outer_refs(expr: &mut ResolvedExpr, row: &super::row::Row) {
+    match expr {
+        ResolvedExpr::Column(col) if col.is_outer_ref => {
+            if let Ok(val) = row.get(col.index) {
+                *expr = ResolvedExpr::Literal(datum_to_literal(val));
+            }
+        }
+        ResolvedExpr::BinaryOp { left, right, .. } => {
+            substitute_outer_refs(left, row);
+            substitute_outer_refs(right, row);
+        }
+        ResolvedExpr::UnaryOp { expr: inner, .. } => substitute_outer_refs(inner, row),
+        ResolvedExpr::Function { args, .. } => {
+            for arg in args {
+                substitute_outer_refs(arg, row);
+            }
+        }
+        ResolvedExpr::IsNull { expr: inner, .. } => substitute_outer_refs(inner, row),
+        ResolvedExpr::InList { expr, list, .. } => {
+            substitute_outer_refs(expr, row);
+            for item in list {
+                substitute_outer_refs(item, row);
+            }
+        }
+        ResolvedExpr::Between {
+            expr, low, high, ..
+        } => {
+            substitute_outer_refs(expr, row);
+            substitute_outer_refs(low, row);
+            substitute_outer_refs(high, row);
+        }
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                substitute_outer_refs(op, row);
+            }
+            for c in conditions {
+                substitute_outer_refs(c, row);
+            }
+            for r in results {
+                substitute_outer_refs(r, row);
+            }
+            if let Some(e) = else_result {
+                substitute_outer_refs(e, row);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a Datum to a Literal for substitution
+fn datum_to_literal(datum: &Datum) -> Literal {
+    match datum {
+        Datum::Null => Literal::Null,
+        Datum::Bool(b) => Literal::Boolean(*b),
+        Datum::Int(i) => Literal::Integer(*i),
+        Datum::UnsignedInt(u) => Literal::UnsignedInteger(*u),
+        Datum::Float(f) => Literal::Float(*f),
+        Datum::String(s) => Literal::String(s.clone()),
+        Datum::Decimal { value, scale } => Literal::Decimal(*value, *scale),
+        _ => Literal::String(datum.to_display_string()),
+    }
+}
+
+/// Run a correlated subquery synchronously from within an async context.
+/// Captures the thread-local SubqueryContext and passes it to a new thread
+/// with its own tokio runtime (avoids nested block_on panic).
+fn run_correlated_subquery_values(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Vec<Datum>> {
+    // Capture context from thread-local BEFORE spawning
+    let ctx = SUBQUERY_ENGINE.with(|c| c.borrow().clone());
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ExecutorError::Internal(format!("Failed to create runtime: {}", e)))?;
+        // Restore context in the new thread
+        if let Some(ref ctx) = ctx {
+            SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+        }
+        rt.block_on(execute_inline_subquery_values(&select))
+    });
+    handle
+        .join()
+        .map_err(|_| ExecutorError::Internal("Correlated subquery thread panicked".to_string()))?
+}
+
+fn run_correlated_subquery_scalar(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Datum> {
+    let values = run_correlated_subquery_values(select)?;
+    Ok(values.into_iter().next().unwrap_or(Datum::Null))
+}
+
+fn run_correlated_subquery_exists(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<bool> {
+    let values = run_correlated_subquery_values(select)?;
+    Ok(!values.is_empty())
+}
+
+/// Execute a correlated scalar subquery inline (returns single Datum)
+/// Execute a correlated subquery inline using the thread-local engine context.
+/// Builds a lightweight executor for the substituted (now non-correlated) subquery.
+async fn execute_inline_subquery_values(
+    select: &crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Vec<Datum>> {
+    let ctx = SUBQUERY_ENGINE.with(|c| c.borrow().clone());
+    let ctx = match ctx {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+
+    // For each table in the FROM clause, scan it and apply the filter
+    if select.from.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table_name = &select.from[0].name;
+
+    // Create a read-everything transaction context (max_txn_id=MAX sees all committed rows)
+    let read_view =
+        crate::txn::ReadView::new(0, std::collections::HashSet::new(), u64::MAX);
+    let txn_ctx = super::context::TransactionContext::new(0, read_view);
+
+    // Build a table scan with no filter (we'll apply the correlated filter ourselves)
+    let mut scanner = super::scan::TableScan::new(
+        table_name.clone(),
+        None,
+        ctx.mvcc.clone(),
+        Some(txn_ctx),
+        ctx.user_variables.clone(),
+    );
+    scanner.open().await?;
+
+    let mut values = Vec::new();
+    while let Some(row) = scanner.next().await? {
+        // Apply filter
+        let matches = if let Some(ref filter) = select.filter {
+            evaluate(filter, &row, &ctx.user_variables)?
+                .as_bool()
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if matches {
+            // Extract the first column value from the SELECT list
+            if let Some(crate::planner::logical::ResolvedSelectItem::Expr { expr, .. }) =
+                select.columns.first()
+            {
+                values.push(evaluate(expr, &row, &ctx.user_variables)?);
+            } else {
+                values.push(Datum::Int(1)); // EXISTS just needs any row
+            }
+        }
+    }
+    scanner.close().await?;
+    Ok(values)
+}
+
+/// Execute a correlated EXISTS subquery inline (returns bool)
 fn validate_json_schema(schema: &serde_json::Value, doc: &serde_json::Value) -> bool {
     if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
         let type_matches = match type_str {

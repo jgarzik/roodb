@@ -45,6 +45,55 @@ use super::union::Union;
 use super::update::{Update, UpdateParams};
 use super::Executor;
 
+/// Check if a ResolvedExpr tree contains any outer-scope column references
+fn has_outer_refs(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::Column(col) => col.is_outer_ref,
+        ResolvedExpr::BinaryOp { left, right, .. } => has_outer_refs(left) || has_outer_refs(right),
+        ResolvedExpr::UnaryOp { expr, .. } => has_outer_refs(expr),
+        ResolvedExpr::Function { args, .. } => args.iter().any(has_outer_refs),
+        ResolvedExpr::IsNull { expr, .. } => has_outer_refs(expr),
+        ResolvedExpr::Between {
+            expr, low, high, ..
+        } => has_outer_refs(expr) || has_outer_refs(low) || has_outer_refs(high),
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|e| has_outer_refs(e))
+                || conditions.iter().any(has_outer_refs)
+                || results.iter().any(has_outer_refs)
+                || else_result.as_ref().is_some_and(|e| has_outer_refs(e))
+        }
+        ResolvedExpr::InList { expr, list, .. } => {
+            has_outer_refs(expr) || list.iter().any(has_outer_refs)
+        }
+        _ => false,
+    }
+}
+
+/// Check if a ResolvedSelect contains any outer-scope column references
+fn has_outer_refs_in_select(select: &crate::planner::logical::ResolvedSelect) -> bool {
+    // Check filter
+    if let Some(ref filter) = select.filter {
+        if has_outer_refs(filter) {
+            return true;
+        }
+    }
+    // Check SELECT columns
+    for item in &select.columns {
+        if let crate::planner::logical::ResolvedSelectItem::Expr { expr, .. } = item {
+            if has_outer_refs(expr) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Executor engine - builds executors from physical plans
 pub struct ExecutorEngine {
     /// MVCC-aware storage
@@ -101,6 +150,12 @@ impl ExecutorEngine {
     /// Build an executor tree, first materializing any subquery expressions in the plan.
     /// Use this instead of `build()` when the plan may contain scalar or IN subqueries.
     pub async fn build_async(&self, mut plan: PhysicalPlan) -> ExecutorResult<Box<dyn Executor>> {
+        // Set up thread-local context for correlated subquery execution
+        super::eval::set_subquery_context(super::eval::SubqueryContext {
+            mvcc: self.mvcc.clone(),
+            catalog: self.catalog.clone(),
+            user_variables: self.user_variables.clone(),
+        });
         self.materialize_subqueries_in_plan(&mut plan).await?;
         self.build_node(plan)
     }
@@ -261,6 +316,10 @@ impl ExecutorEngine {
         Box::pin(async move {
             match expr {
                 ResolvedExpr::ScalarSubquery { query, .. } => {
+                    // Skip materialization for correlated subqueries (has outer refs)
+                    if has_outer_refs_in_select(query) {
+                        return Ok(());
+                    }
                     let datum = self.execute_scalar_subquery(query).await?;
                     *expr = ResolvedExpr::Literal(datum_to_literal(&datum));
                     Ok(())
@@ -270,8 +329,10 @@ impl ExecutorEngine {
                     query,
                     negated,
                 } => {
-                    // First materialize any subqueries in the left-hand expression
                     self.materialize_expr(inner_expr).await?;
+                    if has_outer_refs_in_select(query) {
+                        return Ok(());
+                    }
                     let values = self.execute_in_subquery(query).await?;
                     let negated_val = *negated;
                     let materialized_inner = inner_expr.as_ref().clone();
@@ -287,6 +348,9 @@ impl ExecutorEngine {
                     Ok(())
                 }
                 ResolvedExpr::ExistsSubquery { query, negated } => {
+                    if has_outer_refs_in_select(query) {
+                        return Ok(());
+                    }
                     let exists = self.execute_exists_subquery(query).await?;
                     let result = if *negated { !exists } else { exists };
                     *expr = ResolvedExpr::Literal(Literal::Boolean(result));

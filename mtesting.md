@@ -76,10 +76,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 | 40 | insert_odku, update_join | INSERT ON DUPLICATE KEY UPDATE, UPDATE with JOIN |
 | 41 | cte_basic, window_basic | WITH...AS CTEs, ROW_NUMBER/RANK/DENSE_RANK/SUM/COUNT/AVG/MIN/MAX OVER, LEAD/LAG |
+| 42 | correlated_subquery | Correlated EXISTS, NOT EXISTS, scalar subqueries |
 
 ## Current Status
 
-**175 MySQL compat tests across 41 tiers — all pass**
+**176 MySQL compat tests across 42 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -300,6 +301,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | UPDATE with JOIN | `UPDATE t1 JOIN t2 ON cond SET t1.b = val` — rewrite JOIN to IN-subquery filter |
 | CTEs (WITH...AS) | Common Table Expressions — resolve CTE body, inject as derived table into main query |
 | Window functions | Full pipeline: resolver → planner → executor. ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTILE with PARTITION BY and ORDER BY |
+| Correlated subqueries | Outer scope chain in resolver (is_outer_ref), per-row substitution + inline execution via thread-local engine context. EXISTS, NOT EXISTS, scalar subqueries. |
 
 ## Gap Analysis — Next Steps
 
@@ -322,7 +324,6 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - Bitwise operations on VARBINARY columns
 - Integer-to-SET member mapping
 - SET column defaults
-- Correlated subqueries in SELECT list / WHERE
 - Multi-column IN tuples `(a, b) IN ((1,2), (3,4))`
 
 ## Architecture

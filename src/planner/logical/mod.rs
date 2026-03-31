@@ -120,6 +120,8 @@ pub struct ResolvedColumn {
     pub nullable: bool,
     /// Column DEFAULT value expression (as string), from ColumnDef.default
     pub default_value: Option<String>,
+    /// True if this column references the outer query in a correlated subquery
+    pub is_outer_ref: bool,
 }
 
 /// Resolved expression with type information

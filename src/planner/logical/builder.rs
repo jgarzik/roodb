@@ -324,6 +324,7 @@ impl LogicalPlanBuilder {
                         data_type: dt,
                         nullable: true,
                         default_value: None,
+                        is_outer_ref: false,
                     });
                 }
             }
@@ -775,6 +776,7 @@ impl LogicalPlanBuilder {
                                 data_type: result_type,
                                 nullable: true,
                                 default_value: None,
+                                is_outer_ref: false,
                             });
                             expressions.push((col_ref, name));
                         } else {
@@ -823,6 +825,7 @@ impl LogicalPlanBuilder {
                     data_type: result_type,
                     nullable: true,
                     default_value: None,
+                    is_outer_ref: false,
                 });
             }
         }
@@ -838,6 +841,7 @@ impl LogicalPlanBuilder {
                 data_type: result_type,
                 nullable: true,
                 default_value: None,
+                is_outer_ref: false,
             });
         }
 
@@ -1222,6 +1226,7 @@ impl LogicalPlanBuilder {
                     data_type: result_type,
                     nullable: true,
                     default_value: None,
+                    is_outer_ref: false,
                 });
             }
         }
@@ -1285,6 +1290,7 @@ impl LogicalPlanBuilder {
                         data_type: col.data_type.clone(),
                         nullable: col.nullable,
                         default_value: None,
+                        is_outer_ref: false,
                     })
                 } else {
                     expr.clone()
@@ -1559,6 +1565,7 @@ impl LogicalPlanBuilder {
                             data_type: expr.data_type(),
                             nullable: true,
                             default_value: None,
+                            is_outer_ref: false,
                         });
                     }
                     output_idx += 1;
@@ -1587,6 +1594,7 @@ impl LogicalPlanBuilder {
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
                                         default_value: None,
+                                        is_outer_ref: false,
                                     });
                                 }
                             }
@@ -1607,6 +1615,7 @@ impl LogicalPlanBuilder {
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
                                         default_value: None,
+                                        is_outer_ref: false,
                                     });
                                 }
                                 output_idx += 1;
