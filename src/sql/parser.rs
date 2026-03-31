@@ -209,8 +209,8 @@ impl Parser {
         // Normalize CREATE PROCEDURE: insert AS before BEGIN if missing
         // MySQL: CREATE PROCEDURE name(...) BEGIN ... END
         // sqlparser expects: CREATE PROCEDURE name(...) AS BEGIN ... END
-        let re_proc = Regex::new(r"(?i)(CREATE\s+PROCEDURE\s+\w+\s*\([^)]*\))\s+BEGIN\b").unwrap();
-        let result = re_proc.replace_all(&result, "$1 AS BEGIN");
+        // Use a non-regex approach to handle nested parens in param types like VARCHAR(50)
+        let result = Self::insert_procedure_as_keyword(&result);
 
         // Normalize single-statement procedure bodies (no BEGIN/END):
         // MySQL: CREATE PROCEDURE name(...) SELECT ...;
@@ -231,6 +231,86 @@ impl Parser {
         // sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...,
         // not DECLARE var TYPE [DEFAULT expr]. Convert to SET statements.
         Self::normalize_declare_in_body(&result)
+    }
+
+    /// Find the matching closing paren for an opening paren at `start`,
+    /// skipping parens inside single-quoted string literals.
+    fn find_matching_close_paren(sql: &str, start: usize) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut i = start;
+        while i < bytes.len() {
+            let ch = bytes[i];
+            if in_string {
+                if ch == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else {
+                match ch {
+                    b'\'' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Insert AS keyword before BEGIN in CREATE PROCEDURE if missing.
+    /// Handles nested parens in parameter types like VARCHAR(50).
+    fn insert_procedure_as_keyword(sql: &str) -> String {
+        let upper = sql.to_uppercase();
+        if !upper.contains("CREATE PROCEDURE") {
+            return sql.to_string();
+        }
+        let mut result = sql.to_string();
+        let mut search_start = 0;
+        loop {
+            let upper_remaining = result[search_start..].to_uppercase();
+            let Some(cp_pos) = upper_remaining.find("CREATE PROCEDURE") else {
+                break;
+            };
+            let abs_pos = search_start + cp_pos;
+            // Find the opening paren of the param list
+            let Some(rel_paren) = result[abs_pos..].find('(') else {
+                break;
+            };
+            let paren_start = abs_pos + rel_paren;
+            let Some(paren_end) = Self::find_matching_close_paren(&result, paren_start) else {
+                break;
+            };
+            // Get text after closing paren, trimmed of whitespace
+            let after = result[paren_end + 1..].trim_start();
+            let after_upper = after.to_uppercase();
+            // Check: starts with BEGIN as a keyword (not part of longer word), not already AS
+            let starts_with_begin = after_upper.starts_with("BEGIN")
+                && after_upper
+                    .as_bytes()
+                    .get(5)
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+            if starts_with_begin {
+                // Find exact position of BEGIN in the original string
+                let ws_len = result[paren_end + 1..].len() - after.len();
+                let insert_pos = paren_end + 1 + ws_len;
+                result.insert_str(insert_pos, "AS ");
+                search_start = insert_pos + 3 + 5; // past "AS BEGIN"
+            } else {
+                search_start = paren_end + 1;
+            }
+        }
+        result
     }
 
     /// Normalize MySQL procedure body syntax that sqlparser doesn't support:
@@ -269,8 +349,22 @@ impl Parser {
             }
         }
 
+        // Normalize FETCH: MySQL uses FETCH cursor INTO var1, var2, ...
+        // sqlparser's FETCH only supports single INTO target (sqlparser 0.61).
+        // Convert to sentinel SET that execute_procedure_stmt detects at runtime.
+        // Uses @__roodb_fetch__ (reserved internal name) as the carrier.
+        let sql_upper = sql.to_uppercase();
+        if sql_upper.contains("FETCH ") {
+            use std::sync::LazyLock;
+            static RE_FETCH: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"(?i)\bFETCH\s+(\w+)\s+INTO\s+([^;]+)").unwrap());
+            sql = RE_FETCH
+                .replace_all(&sql, "SET @__roodb_fetch__ = '$1 INTO $2'")
+                .to_string();
+        }
+
         // Only process DECLARE if it exists
-        if !upper.contains("DECLARE ") {
+        if !sql_upper.contains("DECLARE ") {
             return sql;
         }
 

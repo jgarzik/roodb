@@ -40,6 +40,8 @@ pub struct ProcedureContext {
     pub found: bool,
     /// Total rows affected by DML within the procedure
     pub rows_affected: u64,
+    /// Top-level DECLARE HANDLERs: (handler_type, sqlstate, handler_sql)
+    pub handlers: Vec<(String, String, String)>,
 }
 
 impl Default for ProcedureContext {
@@ -49,6 +51,7 @@ impl Default for ProcedureContext {
             cursors: HashMap::new(),
             found: true,
             rows_affected: 0,
+            handlers: Vec::new(),
         }
     }
 }

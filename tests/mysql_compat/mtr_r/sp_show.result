@@ -1,0 +1,86 @@
+DROP PROCEDURE IF EXISTS p1;
+DROP PROCEDURE IF EXISTS p2;
+DROP PROCEDURE IF EXISTS p3;
+#
+# SHOW PROCEDURE STATUS — empty (no procedures)
+#
+SHOW PROCEDURE STATUS;
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+#
+# Create procedures and check SHOW PROCEDURE STATUS
+#
+CREATE PROCEDURE p1()
+BEGIN
+SET @x = 1;
+END|
+CREATE PROCEDURE p2(IN a INT)
+BEGIN
+SET @x = a;
+END|
+CREATE PROCEDURE p3(IN a INT, OUT b INT)
+BEGIN
+SET b = a * 2;
+END|
+SHOW PROCEDURE STATUS;
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+test	p1	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+test	p2	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+test	p3	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# SHOW PROCEDURE STATUS LIKE pattern
+#
+SHOW PROCEDURE STATUS LIKE 'p1';
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+test	p1	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+SHOW PROCEDURE STATUS LIKE 'p2';
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+test	p2	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+SHOW PROCEDURE STATUS LIKE 'p%';
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+test	p1	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+test	p2	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+test	p3	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# SHOW CREATE PROCEDURE — no params
+#
+SHOW CREATE PROCEDURE p1;
+Procedure	sql_mode	Create Procedure	character_set_client	collation_connection	Database Collation
+p1		CREATE PROCEDURE p1() BEGIN
+SET @x = 1;
+END	utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# SHOW CREATE PROCEDURE — IN param
+#
+SHOW CREATE PROCEDURE p2;
+Procedure	sql_mode	Create Procedure	character_set_client	collation_connection	Database Collation
+p2		CREATE PROCEDURE p2(IN a INT) BEGIN
+SET @x = a;
+END	utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# SHOW CREATE PROCEDURE — IN + OUT params
+#
+SHOW CREATE PROCEDURE p3;
+Procedure	sql_mode	Create Procedure	character_set_client	collation_connection	Database Collation
+p3		CREATE PROCEDURE p3(IN a INT, OUT b INT) BEGIN
+SET b = a * 2;
+END	utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# Drop a procedure and verify SHOW status updates
+#
+DROP PROCEDURE p2;
+SHOW PROCEDURE STATUS;
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation
+test	p1	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+test	p3	PROCEDURE	root@localhost	0000-00-00 00:00:00	0000-00-00 00:00:00	DEFINER		utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
+#
+# SHOW CREATE PROCEDURE on dropped procedure — should error
+#
+SHOW CREATE PROCEDURE p2;
+ERROR HY000: PROCEDURE p2 does not exist
+#
+# Cleanup
+#
+DROP PROCEDURE p1;
+DROP PROCEDURE p3;
+SHOW PROCEDURE STATUS;
+Db	Name	Type	Definer	Modified	Created	Security_type	Comment	character_set_client	collation_connection	Database Collation

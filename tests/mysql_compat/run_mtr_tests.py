@@ -313,6 +313,11 @@ TIERS = {
         "interval_hex_set",                   # INTERVAL +/-, hex=int comparison, SET defaults
         "real_world_patterns",                # ORM pagination, JOINs, CTEs+Windows, JSON CRUD, correlated subqueries
     ],
+    43: [
+        "sp_basic",                           # stored procedure CREATE/DROP/CALL, params, control flow, DML
+        "sp_cursor",                          # stored procedure cursors (DECLARE, OPEN, FETCH, CLOSE)
+        "sp_show",                            # SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE
+    ],
 }
 
 

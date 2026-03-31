@@ -1228,6 +1228,7 @@ where
                 name: sqlparser::ast::ObjectName,
                 params: Option<Vec<sqlparser::ast::ProcedureParam>>,
                 body: sqlparser::ast::ConditionalStatements,
+                raw_sql: String,
             },
             DropProc {
                 name: String,
@@ -1253,7 +1254,12 @@ where
                 S::LockTables { .. } | S::UnlockTables => Intercept::NoOp,
                 S::CreateProcedure {
                     name, params, body, ..
-                } => Intercept::CreateProc { name, params, body },
+                } => Intercept::CreateProc {
+                    name,
+                    params,
+                    body,
+                    raw_sql: sql.to_string(),
+                },
                 S::DropProcedure {
                     if_exists,
                     proc_desc,
@@ -1293,9 +1299,14 @@ where
 
         let stmt = match action {
             Intercept::NoOp => return self.send_ok(0, 0).await,
-            Intercept::CreateProc { name, params, body } => {
+            Intercept::CreateProc {
+                name,
+                params,
+                body,
+                raw_sql,
+            } => {
                 return self
-                    .handle_create_procedure(&name, params.as_deref(), &body)
+                    .handle_create_procedure(&name, params.as_deref(), &body, &raw_sql)
                     .await;
             }
             Intercept::DropProc { name, if_exists } => {
@@ -3631,6 +3642,169 @@ where
             )
             .await
             .map(Some)
+        }
+        // SHOW PROCEDURE STATUS [LIKE 'pattern']
+        else if sql_upper.starts_with("SHOW PROCEDURE STATUS")
+            || sql_upper.starts_with("SHOW FUNCTION STATUS")
+        {
+            let is_function = sql_upper.starts_with("SHOW FUNCTION");
+            // Extract optional LIKE pattern
+            let like_pattern = if let Some(idx) = sql_upper.find("LIKE ") {
+                let pat_str = sql_trimmed[idx + 5..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_matches('\'');
+                Some(pat_str.to_string())
+            } else {
+                None
+            };
+            let db = self
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let procs = {
+                let catalog = self.catalog.read();
+                catalog
+                    .list_procedures()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for proc in &procs {
+                let proc_is_func = proc.returns_type.is_some();
+                if proc_is_func != is_function {
+                    continue;
+                }
+                if let Some(ref pat) = like_pattern {
+                    if !crate::executor::datum::like_match(
+                        &proc.name.to_lowercase(),
+                        &pat.to_lowercase(),
+                    ) {
+                        continue;
+                    }
+                }
+                let type_str = if proc_is_func {
+                    "FUNCTION"
+                } else {
+                    "PROCEDURE"
+                };
+                rows.push(vec![
+                    db.clone(),
+                    proc.name.clone(),
+                    type_str.to_string(),
+                    "root@localhost".to_string(),
+                    "0000-00-00 00:00:00".to_string(),
+                    "0000-00-00 00:00:00".to_string(),
+                    "DEFINER".to_string(),
+                    String::new(),
+                    "utf8mb4".to_string(),
+                    "utf8mb4_general_ci".to_string(),
+                    "utf8mb4_general_ci".to_string(),
+                ]);
+            }
+            rows.sort_by(|a, b| a[1].cmp(&b[1]));
+            self.send_custom_result_set(
+                &[
+                    "Db",
+                    "Name",
+                    "Type",
+                    "Definer",
+                    "Modified",
+                    "Created",
+                    "Security_type",
+                    "Comment",
+                    "character_set_client",
+                    "collation_connection",
+                    "Database Collation",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
+        }
+        // SHOW CREATE PROCEDURE proc_name / SHOW CREATE FUNCTION func_name
+        else if sql_upper.starts_with("SHOW CREATE PROCEDURE ")
+            || sql_upper.starts_with("SHOW CREATE FUNCTION ")
+        {
+            let is_function = sql_upper.starts_with("SHOW CREATE FUNCTION");
+            let offset = if is_function { 21 } else { 22 };
+            let proc_name = sql_trimmed[offset..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('`')
+                .trim_matches('\'')
+                .trim_matches('"');
+            let proc_def = {
+                let catalog = self.catalog.read();
+                catalog.get_procedure(proc_name).cloned()
+            };
+            match proc_def {
+                Some(def) => {
+                    // Reconstruct CREATE DDL
+                    let params_str = def
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let mode = match p.mode {
+                                crate::catalog::ParamMode::In => "IN",
+                                crate::catalog::ParamMode::Out => "OUT",
+                                crate::catalog::ParamMode::InOut => "INOUT",
+                            };
+                            format!("{} {} {}", mode, p.name, p.data_type)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let create_ddl = if is_function {
+                        let ret = def.returns_type.as_deref().unwrap_or("VARCHAR(255)");
+                        format!(
+                            "CREATE FUNCTION {}({}) RETURNS {} {}",
+                            def.name, params_str, ret, def.body_sql
+                        )
+                    } else {
+                        format!(
+                            "CREATE PROCEDURE {}({}) {}",
+                            def.name, params_str, def.body_sql
+                        )
+                    };
+                    let (col_name, col_create) = if is_function {
+                        ("Function", "Create Function")
+                    } else {
+                        ("Procedure", "Create Procedure")
+                    };
+                    let rows = vec![vec![
+                        proc_name.to_string(),
+                        String::new(),
+                        create_ddl,
+                        "utf8mb4".to_string(),
+                        "utf8mb4_general_ci".to_string(),
+                        "utf8mb4_general_ci".to_string(),
+                    ]];
+                    self.send_custom_result_set(
+                        &[
+                            col_name,
+                            "sql_mode",
+                            col_create,
+                            "character_set_client",
+                            "collation_connection",
+                            "Database Collation",
+                        ],
+                        &rows,
+                    )
+                    .await
+                    .map(Some)
+                }
+                None => {
+                    let kind = if is_function { "FUNCTION" } else { "PROCEDURE" };
+                    self.send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("{} {} does not exist", kind, proc_name),
+                    )
+                    .await
+                    .map(|_| Some(()))
+                }
+            }
         } else {
             Ok(None)
         }
@@ -4637,6 +4811,57 @@ where
         Ok(())
     }
 
+    /// Find the matching closing paren for an opening paren at `start`,
+    /// skipping parens inside single-quoted string literals.
+    fn find_matching_close_paren(sql: &str, start: usize) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut i = start;
+        while i < bytes.len() {
+            let ch = bytes[i];
+            if in_string {
+                if ch == b'\'' {
+                    // Check for escaped quote ('')
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else {
+                match ch {
+                    b'\'' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Extract procedure body (BEGIN...END) from raw CREATE PROCEDURE SQL.
+    fn extract_body_from_raw_sql(raw_sql: &str) -> Option<String> {
+        let upper = raw_sql.to_uppercase();
+        let cp = upper.find("CREATE PROCEDURE")?;
+        let paren_start = raw_sql[cp..].find('(')?;
+        let paren_start = cp + paren_start;
+        let paren_end = Self::find_matching_close_paren(raw_sql, paren_start)?;
+        let body = raw_sql[paren_end + 1..].trim();
+        if body.is_empty() {
+            None
+        } else {
+            Some(body.to_string())
+        }
+    }
+
     // ============ Stored Procedure Handlers ============
 
     /// Handle CREATE PROCEDURE statement
@@ -4644,7 +4869,8 @@ where
         &mut self,
         name: &sqlparser::ast::ObjectName,
         params: Option<&[sqlparser::ast::ProcedureParam]>,
-        body: &sqlparser::ast::ConditionalStatements,
+        ast_body: &sqlparser::ast::ConditionalStatements,
+        raw_sql: &str,
     ) -> ProtocolResult<()> {
         let proc_name = name.to_string().to_lowercase();
 
@@ -4666,7 +4892,11 @@ where
             })
             .collect();
 
-        let body_sql = body.to_string();
+        // Extract the original body SQL from the raw SQL (before normalization)
+        // to preserve DECLARE HANDLER and DECLARE CURSOR statements.
+        // Find the param list closing paren, then take everything after it as body.
+        let body_sql =
+            Self::extract_body_from_raw_sql(raw_sql).unwrap_or_else(|| ast_body.to_string());
 
         // Check if procedure already exists
         let exists = {
@@ -5173,6 +5403,7 @@ where
 
         // Extract DECLARE HANDLER declarations before parsing
         let handlers = Self::extract_handlers(&proc_def.body_sql);
+        ctx.handlers = handlers.clone();
 
         // Parse procedure body into Vec<Statement>
         let body_stmts = match Self::parse_body_to_stmts(&proc_def.body_sql) {
@@ -5274,6 +5505,9 @@ where
     /// Leaves DECLARE ... CURSOR FOR ... unchanged (sqlparser handles those).
     /// Strips DECLARE ... HANDLER ... statements (handled separately).
     fn normalize_declare_stmts(body: &str) -> String {
+        use std::sync::LazyLock;
+        static RE_FETCH: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"(?i)^FETCH\s+(\w+)\s+INTO\s+(.+)$").unwrap());
         let mut result = String::with_capacity(body.len());
         // Split on semicolons, process each statement
         for part in body.split(';') {
@@ -5316,6 +5550,27 @@ where
                         result.push(' ');
                     }
                     result.push_str(&format!("SET {} = NULL;", var_name));
+                }
+            } else if upper.starts_with("FETCH ") {
+                // Normalize FETCH cursor INTO var1, var2, ... to sentinel SET
+                // that execute_procedure_stmt detects at runtime.
+                // Uses @__roodb_fetch__ (reserved internal name) as the carrier.
+                if let Some(caps) = RE_FETCH.captures(trimmed) {
+                    let cursor = caps[1].replace('\'', "''");
+                    let vars = caps[2].replace('\'', "''");
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(&format!(
+                        "SET @__roodb_fetch__ = '{} INTO {}';",
+                        cursor, vars
+                    ));
+                } else {
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(trimmed);
+                    result.push(';');
                 }
             } else {
                 if !result.is_empty() {
@@ -5483,7 +5738,9 @@ where
     /// Map error message to SQLSTATE code
     fn error_to_sqlstate(err_msg: &str) -> String {
         let lower = err_msg.to_lowercase();
-        if lower.contains("out of range") || lower.contains("overflow") {
+        if lower.contains("no data") || lower.contains("zero rows fetched") {
+            "02000".to_string()
+        } else if lower.contains("out of range") || lower.contains("overflow") {
             "22003".to_string()
         } else if (lower.contains("null") && lower.contains("constraint"))
             || lower.contains("duplicate")
@@ -5561,6 +5818,18 @@ where
                         variable, values, ..
                     } => {
                         let var_name_full = variable.to_string();
+                        // Detect FETCH sentinel: SET @__roodb_fetch__ = 'cursor INTO var1,var2'
+                        if var_name_full == "@@__roodb_fetch__"
+                            || var_name_full == "@__roodb_fetch__"
+                        {
+                            let val = if let Some(expr) = values.first() {
+                                eval_sp_expr(expr, ctx, &user_vars)?
+                            } else {
+                                return Ok(ProcControlFlow::Continue);
+                            };
+                            let fetch_spec = val.to_display_string();
+                            return self.execute_fetch_sentinel(&fetch_spec, ctx).await;
+                        }
                         let val = if let Some(expr) = values.first() {
                             eval_sp_expr(expr, ctx, &user_vars)?
                         } else {
@@ -5623,10 +5892,15 @@ where
                 let max_iterations = 100_000;
                 let mut iterations = 0;
 
-                // Extract handlers from the WHILE body SQL (handles nested BEGIN blocks)
+                // Combine top-level handlers from context with any nested in the WHILE body
                 let while_body_sql = while_stmt.while_block.to_string();
-                let nested_handlers = Self::extract_handlers(&while_body_sql);
-
+                let mut nested_handlers = Self::extract_handlers(&while_body_sql);
+                // Append parent handlers so they apply in the WHILE body
+                for h in &ctx.handlers {
+                    if !nested_handlers.iter().any(|(_, s, _)| s == &h.1) {
+                        nested_handlers.push(h.clone());
+                    }
+                }
                 loop {
                     if iterations >= max_iterations {
                         return Err(format!("WHILE loop exceeded {} iterations", max_iterations));
@@ -5751,6 +6025,8 @@ where
                             ctx.found = true;
                         } else {
                             ctx.found = false;
+                            // Raise SQLSTATE 02000 (NOT FOUND) so DECLARE HANDLER can catch it
+                            return Err("No data - zero rows fetched".to_string());
                         }
                     }
                     Some(CursorState::Declared { .. }) => {
@@ -5860,6 +6136,54 @@ where
             result = result.replace(name, &val.to_sql_literal());
         }
         result
+    }
+
+    /// Execute a FETCH sentinel produced by normalization.
+    /// Parses 'cursor_name INTO var1, var2, ...' and performs the fetch.
+    async fn execute_fetch_sentinel(
+        &mut self,
+        spec: &str,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+    ) -> Result<crate::executor::procedure::ProcControlFlow, String> {
+        use crate::executor::procedure::{CursorState, ProcControlFlow};
+
+        // Parse: "cursor_name INTO var1, var2, ..."
+        let upper = spec.to_uppercase();
+        let into_pos = upper.find(" INTO ").ok_or("Invalid FETCH sentinel")?;
+        let cursor_name = spec[..into_pos].trim().to_lowercase();
+        let vars_str = &spec[into_pos + 6..]; // skip " INTO "
+        let into_vars: Vec<String> = vars_str
+            .split(',')
+            .map(|v| v.trim().to_lowercase())
+            .collect();
+
+        match ctx.cursors.get_mut(&cursor_name) {
+            Some(CursorState::Open { rows, position }) => {
+                if *position < rows.len() {
+                    let row = &rows[*position];
+                    for (i, var_name) in into_vars.iter().enumerate() {
+                        let val = row.get_opt(i).cloned().unwrap_or(Datum::Null);
+                        ctx.locals.insert(var_name.clone(), val);
+                    }
+                    *position += 1;
+                    ctx.found = true;
+                } else {
+                    ctx.found = false;
+                    // Raise SQLSTATE 02000 (NOT FOUND) so DECLARE HANDLER can catch it
+                    return Err("No data - zero rows fetched".to_string());
+                }
+            }
+            Some(CursorState::Declared { .. }) => {
+                return Err(format!("Cursor '{}' is not open", cursor_name));
+            }
+            Some(CursorState::Closed) => {
+                return Err(format!("Cursor '{}' is closed", cursor_name));
+            }
+            None => {
+                return Err(format!("Cursor '{}' is not declared", cursor_name));
+            }
+        }
+        Ok(ProcControlFlow::Continue)
     }
 
     /// Execute a SELECT inside a stored procedure and send the result set to the client.

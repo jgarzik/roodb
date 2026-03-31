@@ -378,7 +378,7 @@ pub fn format_decimal(value: i128, scale: u8) -> String {
 /// Simple SQL LIKE pattern matching without regex
 /// % matches any sequence of characters
 /// _ matches any single character
-fn like_match(s: &str, pattern: &str) -> bool {
+pub(crate) fn like_match(s: &str, pattern: &str) -> bool {
     let s_chars: Vec<char> = s.chars().collect();
     let p_chars: Vec<char> = pattern.chars().collect();
     like_match_impl(&s_chars, &p_chars)

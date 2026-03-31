@@ -751,6 +751,11 @@ impl Catalog {
         self.procedures.clear();
     }
 
+    /// List all stored procedures
+    pub fn list_procedures(&self) -> Vec<&ProcedureDef> {
+        self.procedures.values().collect()
+    }
+
     // ============ View operations ============
 
     /// Create a view

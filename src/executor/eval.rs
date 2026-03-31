@@ -6314,6 +6314,7 @@ fn try_eval_udf(
         cursors: std::collections::HashMap::new(),
         found: false,
         rows_affected: 0,
+        handlers: Vec::new(),
     };
 
     for (i, pname) in param_list.iter().enumerate() {

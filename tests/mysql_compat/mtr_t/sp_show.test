@@ -1,0 +1,75 @@
+#
+# Stored procedure introspection — SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE
+#
+
+--disable_warnings
+DROP PROCEDURE IF EXISTS p1;
+DROP PROCEDURE IF EXISTS p2;
+DROP PROCEDURE IF EXISTS p3;
+--enable_warnings
+
+--echo #
+--echo # SHOW PROCEDURE STATUS — empty (no procedures)
+--echo #
+SHOW PROCEDURE STATUS;
+
+--echo #
+--echo # Create procedures and check SHOW PROCEDURE STATUS
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  SET @x = 1;
+END|
+CREATE PROCEDURE p2(IN a INT)
+BEGIN
+  SET @x = a;
+END|
+CREATE PROCEDURE p3(IN a INT, OUT b INT)
+BEGIN
+  SET b = a * 2;
+END|
+DELIMITER ;|
+
+SHOW PROCEDURE STATUS;
+
+--echo #
+--echo # SHOW PROCEDURE STATUS LIKE pattern
+--echo #
+SHOW PROCEDURE STATUS LIKE 'p1';
+SHOW PROCEDURE STATUS LIKE 'p2';
+SHOW PROCEDURE STATUS LIKE 'p%';
+
+--echo #
+--echo # SHOW CREATE PROCEDURE — no params
+--echo #
+SHOW CREATE PROCEDURE p1;
+
+--echo #
+--echo # SHOW CREATE PROCEDURE — IN param
+--echo #
+SHOW CREATE PROCEDURE p2;
+
+--echo #
+--echo # SHOW CREATE PROCEDURE — IN + OUT params
+--echo #
+SHOW CREATE PROCEDURE p3;
+
+--echo #
+--echo # Drop a procedure and verify SHOW status updates
+--echo #
+DROP PROCEDURE p2;
+SHOW PROCEDURE STATUS;
+
+--echo #
+--echo # SHOW CREATE PROCEDURE on dropped procedure — should error
+--echo #
+--error 1105
+SHOW CREATE PROCEDURE p2;
+
+--echo #
+--echo # Cleanup
+--echo #
+DROP PROCEDURE p1;
+DROP PROCEDURE p3;
+SHOW PROCEDURE STATUS;
