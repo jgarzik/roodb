@@ -5508,6 +5508,8 @@ where
         use std::sync::LazyLock;
         static RE_FETCH: LazyLock<regex::Regex> =
             LazyLock::new(|| regex::Regex::new(r"(?i)^FETCH\s+(\w+)\s+INTO\s+(.+)$").unwrap());
+        // Pre-process: split multi-variable DECLARE into individual ones
+        let body = crate::sql::Parser::split_multi_var_declare(body);
         let mut result = String::with_capacity(body.len());
         // Split on semicolons, process each statement
         for part in body.split(';') {
@@ -6070,6 +6072,17 @@ where
 
             // RETURN
             S::Return(_) => Ok(ProcControlFlow::Return),
+
+            // CALL procedure(args) — nested procedure call
+            S::Call(_) => {
+                // Route through handle_query which has the Call intercept
+                let sql = stmt.to_string();
+                let substituted = self.substitute_locals(&sql, ctx);
+                self.handle_query(&substituted)
+                    .await
+                    .map_err(|e| format!("{}", e))?;
+                Ok(ProcControlFlow::Continue)
+            }
 
             // Everything else: fallback to string-based execution with local var substitution
             _ => {

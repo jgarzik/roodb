@@ -215,22 +215,52 @@ impl Parser {
         // Normalize single-statement procedure bodies (no BEGIN/END):
         // MySQL: CREATE PROCEDURE name(...) SELECT ...;
         // → CREATE PROCEDURE name(...) AS BEGIN SELECT ...; END
-        let re_proc_single = Regex::new(
-            r"(?is)(CREATE\s+PROCEDURE\s+\w+\s*\([^)]*\))\s+((?:SELECT|INSERT|UPDATE|DELETE|SET)\b.+)"
-        ).unwrap();
-        let result =
-            if re_proc_single.is_match(&result) && !result.to_uppercase().contains(" AS BEGIN") {
-                re_proc_single
-                    .replace_all(&result, "$1 AS BEGIN $2; END")
-                    .to_string()
-            } else {
-                result.to_string()
-            };
+        // Uses balanced-paren scanner to handle types like CHAR(16) in params.
+        let result = Self::normalize_single_stmt_procedure(&result);
 
         // Normalize DECLARE variable statements inside procedure bodies.
         // sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...,
         // not DECLARE var TYPE [DEFAULT expr]. Convert to SET statements.
         Self::normalize_declare_in_body(&result)
+    }
+
+    /// Normalize single-statement procedure bodies (no BEGIN/END) to AS BEGIN...END.
+    fn normalize_single_stmt_procedure(sql: &str) -> String {
+        let upper = sql.to_uppercase();
+        if !upper.contains("CREATE PROCEDURE") || upper.contains(" AS BEGIN") {
+            return sql.to_string();
+        }
+        // Find CREATE PROCEDURE, then its param list
+        let Some(cp) = upper.find("CREATE PROCEDURE") else {
+            return sql.to_string();
+        };
+        let Some(rel_paren) = sql[cp..].find('(') else {
+            return sql.to_string();
+        };
+        let paren_start = cp + rel_paren;
+        let Some(paren_end) = Self::find_matching_close_paren(sql, paren_start) else {
+            return sql.to_string();
+        };
+        // Check what follows the closing paren
+        let after = sql[paren_end + 1..].trim_start();
+        let after_upper = after.to_uppercase();
+        // If it starts with BEGIN, the multi-statement handler handles it
+        if after_upper.starts_with("BEGIN") || after_upper.starts_with("AS ") {
+            return sql.to_string();
+        }
+        // Check if it starts with a DML/SET keyword (single-statement body)
+        let is_single_stmt = after_upper.starts_with("SELECT ")
+            || after_upper.starts_with("INSERT ")
+            || after_upper.starts_with("UPDATE ")
+            || after_upper.starts_with("DELETE ")
+            || after_upper.starts_with("SET ");
+        if is_single_stmt {
+            let prefix = &sql[..paren_end + 1];
+            let body = after.trim_end_matches(';').trim();
+            format!("{} AS BEGIN {}; END", prefix, body)
+        } else {
+            sql.to_string()
+        }
     }
 
     /// Find the matching closing paren for an opening paren at `start`,
@@ -323,30 +353,10 @@ impl Parser {
             return sql.to_string();
         }
 
-        // Normalize WHILE: END WHILE → END, DO → BEGIN (for WHILE bodies)
+        // Normalize WHILE blocks structurally (not with regex)
         let mut sql = sql.to_string();
         if upper.contains("WHILE") {
-            // Replace END WHILE with END
-            let re_end_while = Regex::new(r"(?i)\bEND\s+WHILE\b").unwrap();
-            sql = re_end_while.replace_all(&sql, "END").to_string();
-
-            // Replace DO with nothing when followed by BEGIN (compound block)
-            // and flatten: the inner BEGIN...END + remaining stmts merge into
-            // a single WHILE BEGIN ... END block
-            let re_do_begin = Regex::new(r"(?is)\bDO\s+BEGIN\b").unwrap();
-            if re_do_begin.is_match(&sql) {
-                sql = re_do_begin.replace_all(&sql, "BEGIN").to_string();
-                // Flatten: remove inner END; that precedes SET/SELECT etc.
-                // Replace "END;" followed by whitespace + a keyword with just ";"
-                let re_inner_end =
-                    Regex::new(r"(?is)\bEND\s*;\s*(SET|SELECT|INSERT|UPDATE|DELETE|IF|WHILE|CALL)")
-                        .unwrap();
-                sql = re_inner_end.replace_all(&sql, " $1").to_string();
-            } else {
-                // For DO not followed by BEGIN, replace with BEGIN
-                let re_do = Regex::new(r"(?i)\bDO\s").unwrap();
-                sql = re_do.replace_all(&sql, "BEGIN ").to_string();
-            }
+            sql = Self::normalize_while_blocks(&sql);
         }
 
         // Normalize FETCH: MySQL uses FETCH cursor INTO var1, var2, ...
@@ -363,10 +373,27 @@ impl Parser {
                 .to_string();
         }
 
+        // Remove semicolons after inner END blocks inside IF/CASE.
+        // MySQL: END; ELSE → sqlparser expects: END ELSE
+        // Only targets ELSE/ELSEIF/END IF/END CASE — NOT bare END (which needs its semicolon).
+        {
+            use std::sync::LazyLock;
+            static RE_END_SEMI: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r"(?i)\bEND\s*;\s*(ELSE\b|ELSEIF\b|END\s+IF\b|END\s+CASE\b)").unwrap()
+            });
+            while RE_END_SEMI.is_match(&sql) {
+                sql = RE_END_SEMI.replace_all(&sql, "END $1").to_string();
+            }
+        }
+
         // Only process DECLARE if it exists
         if !sql_upper.contains("DECLARE ") {
             return sql;
         }
+
+        // Pre-process: split multi-variable DECLARE into individual ones.
+        // DECLARE x, y, z INT DEFAULT 0 → DECLARE x INT DEFAULT 0; DECLARE y INT DEFAULT 0; DECLARE z INT DEFAULT 0
+        sql = Self::split_multi_var_declare(&sql);
 
         // Process each semicolon-delimited segment
         let re_declare = Regex::new(r"(?i)\bDECLARE\s+(\w+)\s+").unwrap();
@@ -428,6 +455,374 @@ impl Parser {
         result.push_str(&sql[last_end..]);
         result
     }
+    /// Structurally transform `WHILE cond DO body END WHILE` blocks
+    /// into `WHILE cond BEGIN body END;` for sqlparser.
+    ///
+    /// sqlparser 0.61 doesn't support MySQL's DO/END WHILE keywords.
+    /// If the body starts with a nested BEGIN...END block followed by more
+    /// statements, the inner block is flattened into the WHILE body.
+    fn normalize_while_blocks(sql: &str) -> String {
+        let bytes = sql.as_bytes();
+        let len = bytes.len();
+        let mut result = String::with_capacity(len);
+        let mut pos = 0;
+
+        while pos < len {
+            // Find next WHILE keyword (word boundary aware)
+            let while_pos = match Self::find_keyword(sql, pos, "WHILE") {
+                Some(p) => p,
+                None => break,
+            };
+            // Copy text before WHILE
+            result.push_str(&sql[pos..while_pos]);
+
+            // Find DO keyword after the WHILE condition
+            let do_pos = match Self::find_keyword(sql, while_pos + 5, "DO") {
+                Some(p) => p,
+                None => {
+                    // No DO found — not a WHILE...DO block, copy as-is
+                    result.push_str(&sql[while_pos..while_pos + 5]);
+                    pos = while_pos + 5;
+                    continue;
+                }
+            };
+
+            // Check: is there an END WHILE between while_pos and do_pos?
+            // If so, the DO we found belongs to a deeper context — skip
+            if Self::find_keyword_before(sql, while_pos + 5, do_pos, "END").is_some() {
+                result.push_str(&sql[while_pos..while_pos + 5]);
+                pos = while_pos + 5;
+                continue;
+            }
+
+            // Extract condition
+            let condition = sql[while_pos + 5..do_pos].trim();
+
+            // Find matching END WHILE — track WHILE nesting
+            let body_start = do_pos + 2; // skip "DO"
+            let end_while_pos = match Self::find_matching_end_while(sql, body_start) {
+                Some(p) => p,
+                None => {
+                    // Malformed — copy as-is
+                    result.push_str(&sql[while_pos..while_pos + 5]);
+                    pos = while_pos + 5;
+                    continue;
+                }
+            };
+
+            // Extract body between DO and END WHILE
+            let body = sql[body_start..end_while_pos].trim();
+
+            // Flatten: if body starts with BEGIN, merge inner block with trailing stmts
+            let flat_body = Self::flatten_while_body(body);
+
+            // Emit: WHILE condition BEGIN flat_body END;
+            result.push_str("WHILE ");
+            result.push_str(condition);
+            result.push_str(" BEGIN ");
+            result.push_str(&flat_body);
+            result.push_str(" END;");
+
+            // Advance past END WHILE + optional semicolon
+            let mut skip = end_while_pos;
+            // Skip "END" + whitespace + "WHILE"
+            let after_end = sql[skip..].trim_start();
+            if after_end.to_uppercase().starts_with("END") {
+                skip += sql[skip..].len() - after_end.len() + 3; // past "END"
+                let after_end2 = sql[skip..].trim_start();
+                if after_end2.to_uppercase().starts_with("WHILE") {
+                    skip += sql[skip..].len() - after_end2.len() + 5; // past "WHILE"
+                }
+            }
+            // Skip optional semicolon
+            let after = sql[skip..].trim_start();
+            if after.starts_with(';') {
+                skip += sql[skip..].len() - after.len() + 1;
+            }
+            pos = skip;
+        }
+
+        result.push_str(&sql[pos..]);
+        result
+    }
+
+    /// Find a keyword (case-insensitive, word-boundary aware) starting at `from`.
+    fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
+        let upper = sql[from..].to_uppercase();
+        let kw = keyword.to_uppercase();
+        let kw_len = kw.len();
+        let mut search_from = 0;
+        loop {
+            let rel = upper[search_from..].find(&kw)?;
+            let abs = from + search_from + rel;
+            // Check word boundaries
+            let before_ok = abs == 0
+                || !sql.as_bytes()[abs - 1].is_ascii_alphanumeric()
+                    && sql.as_bytes()[abs - 1] != b'_';
+            let after_ok = abs + kw_len >= sql.len()
+                || !sql.as_bytes()[abs + kw_len].is_ascii_alphanumeric()
+                    && sql.as_bytes()[abs + kw_len] != b'_';
+            if before_ok && after_ok {
+                // Make sure we're not inside a string literal
+                if !Self::is_inside_string(sql, abs) {
+                    return Some(abs);
+                }
+            }
+            search_from += rel + kw_len;
+        }
+    }
+
+    /// Check if position `pos` is inside a single-quoted string literal.
+    fn is_inside_string(sql: &str, pos: usize) -> bool {
+        let mut in_str = false;
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < pos && i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if in_str {
+                    // Check escaped quote
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_str = false;
+                } else {
+                    in_str = true;
+                }
+            }
+            i += 1;
+        }
+        in_str
+    }
+
+    /// Find keyword between `from` and `before` positions.
+    fn find_keyword_before(sql: &str, from: usize, before: usize, keyword: &str) -> Option<usize> {
+        let result = Self::find_keyword(sql, from, keyword)?;
+        if result < before {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    /// Find matching END WHILE for a WHILE body starting at `body_start`.
+    /// Tracks WHILE nesting depth to handle nested WHILEs.
+    fn find_matching_end_while(sql: &str, body_start: usize) -> Option<usize> {
+        use regex::Regex;
+        use std::sync::LazyLock;
+        // Find all WHILE and END WHILE tokens, process in order
+        static RE_END_WHILE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\bEND\s+WHILE\b").unwrap());
+        static RE_WHILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bWHILE\b").unwrap());
+
+        let mut depth: i32 = 1; // we're inside one WHILE
+        let mut pos = body_start;
+
+        loop {
+            // Find next END WHILE
+            let ew = RE_END_WHILE
+                .find(&sql[pos..])
+                .filter(|m| !Self::is_inside_string(sql, pos + m.start()))
+                .map(|m| pos + m.start());
+            // Find next bare WHILE (not part of END WHILE)
+            let w = {
+                let mut search = pos;
+                loop {
+                    match RE_WHILE.find(&sql[search..]) {
+                        Some(m) => {
+                            let abs = search + m.start();
+                            if Self::is_inside_string(sql, abs) {
+                                search = abs + 5;
+                                continue;
+                            }
+                            // Check it's not preceded by END (which makes it END WHILE)
+                            let before = sql[..abs].trim_end();
+                            if before.to_uppercase().ends_with("END") {
+                                search = abs + 5;
+                                continue;
+                            }
+                            break Some(abs);
+                        }
+                        None => break None,
+                    }
+                }
+            };
+
+            // Process whichever comes first
+            match (w, ew) {
+                (Some(w_pos), Some(ew_pos)) if w_pos < ew_pos => {
+                    depth += 1;
+                    pos = w_pos + 5;
+                }
+                (_, Some(ew_pos)) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(ew_pos);
+                    }
+                    // Skip past "END WHILE"
+                    let m = RE_END_WHILE.find(&sql[ew_pos..]).unwrap();
+                    pos = ew_pos + m.end();
+                }
+                (Some(w_pos), None) => {
+                    depth += 1;
+                    pos = w_pos + 5;
+                }
+                (None, None) => return None,
+            }
+        }
+    }
+
+    /// Flatten a WHILE body: if it starts with BEGIN...END; followed by more
+    /// statements, remove the inner BEGIN/END to produce a flat statement list.
+    fn flatten_while_body(body: &str) -> String {
+        let trimmed = body.trim();
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("BEGIN") {
+            return trimmed.to_string();
+        }
+        // Check it's BEGIN as keyword
+        if upper
+            .as_bytes()
+            .get(5)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            return trimmed.to_string();
+        }
+
+        // Find matching END for this inner BEGIN (track nesting)
+        let mut depth = 0;
+        let mut end_pos = None;
+        let mut i = 0;
+        let bytes = trimmed.as_bytes();
+        let mut in_str = false;
+        while i < bytes.len() {
+            if in_str {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'\'' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            // Check for BEGIN keyword
+            if i + 5 <= bytes.len() && trimmed[i..].to_uppercase().starts_with("BEGIN") {
+                let before_ok =
+                    i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                let after_ok = i + 5 >= bytes.len()
+                    || !bytes[i + 5].is_ascii_alphanumeric() && bytes[i + 5] != b'_';
+                if before_ok && after_ok {
+                    depth += 1;
+                    i += 5;
+                    continue;
+                }
+            }
+            // Check for END keyword (but not END IF, END CASE, END WHILE)
+            if i + 3 <= bytes.len() && trimmed[i..].to_uppercase().starts_with("END") {
+                let before_ok =
+                    i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                let after_ok = i + 3 >= bytes.len()
+                    || !bytes[i + 3].is_ascii_alphanumeric() && bytes[i + 3] != b'_';
+                if before_ok && after_ok {
+                    // Check it's not END IF / END CASE / END WHILE
+                    let after_end = trimmed[i + 3..].trim_start().to_uppercase();
+                    if !after_end.starts_with("IF")
+                        && !after_end.starts_with("CASE")
+                        && !after_end.starts_with("WHILE")
+                    {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_pos = Some(i);
+                            break;
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        let Some(end_pos) = end_pos else {
+            return trimmed.to_string();
+        };
+
+        // Check if there are more statements after the inner END
+        let after_inner_end = trimmed[end_pos + 3..].trim_start();
+        let after_semi = after_inner_end.strip_prefix(';').unwrap_or(after_inner_end);
+        let trailing = after_semi.trim();
+
+        if trailing.is_empty() {
+            // Body is just BEGIN...END with nothing after — use contents directly
+            let inner = trimmed[5..end_pos].trim();
+            inner.to_string()
+        } else {
+            // Body is BEGIN...END; more_stmts — flatten into contents + trailing
+            let inner = trimmed[5..end_pos].trim();
+            let mut flat = inner.to_string();
+            if !flat.ends_with(';') {
+                flat.push(';');
+            }
+            flat.push(' ');
+            flat.push_str(trailing);
+            flat
+        }
+    }
+
+    /// Split multi-variable DECLARE into individual statements.
+    /// Public for use by protocol/roodb normalize_declare_stmts.
+    /// `DECLARE x, y, z INT DEFAULT 0` → `DECLARE x INT DEFAULT 0; DECLARE y INT DEFAULT 0; DECLARE z INT DEFAULT 0`
+    /// Skips DECLARE CURSOR and DECLARE HANDLER which have different syntax.
+    pub fn split_multi_var_declare(sql: &str) -> String {
+        use regex::Regex;
+        use std::sync::LazyLock;
+        // Match DECLARE followed by comma-separated names then a type keyword
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)\bDECLARE\s+((\w+\s*,\s*)+\w+)\s+(INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|FLOAT|DOUBLE|DECIMAL|NUMERIC|CHAR|VARCHAR|TEXT|BLOB|DATE|TIME|DATETIME|TIMESTAMP|BOOLEAN|BOOL)\b").unwrap()
+        });
+
+        if !RE.is_match(sql) {
+            return sql.to_string();
+        }
+
+        let mut result = sql.to_string();
+        // Keep replacing until no more multi-var DECLAREs exist
+        loop {
+            let Some(caps) = RE.captures(&result) else {
+                break;
+            };
+            let full_match = caps.get(0).unwrap();
+            let names_str = &caps[1];
+            let type_keyword = &caps[3];
+
+            // Get the rest of the statement after the type keyword (e.g., " DEFAULT 0" or " UNSIGNED")
+            let after_type_start = full_match.end();
+            // Find the semicolon that ends this statement
+            let rest = &result[after_type_start..];
+            let semi_pos = rest.find(';').unwrap_or(rest.len());
+            let suffix = rest[..semi_pos].to_string();
+
+            let names: Vec<&str> = names_str.split(',').map(|n| n.trim()).collect();
+            let replacements: Vec<String> = names
+                .iter()
+                .map(|name| format!("DECLARE {} {}{}", name, type_keyword, suffix))
+                .collect();
+            let replacement = replacements.join("; ");
+
+            let start = full_match.start();
+            let end = after_type_start + semi_pos;
+            result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
+        }
+        result
+    }
+
     /// Fix DIV associativity in a statement by walking expressions.
     /// sqlparser's MySQL dialect parses `A DIV B / C` as `A DIV (B / C)`.
     /// We need `(A DIV B) / C` (left-associative, same as MySQL).

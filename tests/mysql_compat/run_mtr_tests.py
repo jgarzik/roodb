@@ -317,6 +317,8 @@ TIERS = {
         "sp_basic",                           # stored procedure CREATE/DROP/CALL, params, control flow, DML
         "sp_cursor",                          # stored procedure cursors (DECLARE, OPEN, FETCH, CLOSE)
         "sp_show",                            # SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE
+        "sp_fib",                             # recursive procedure with cursors (Fibonacci)
+        "sp_nested",                          # nested CALL, multi-var DECLARE, single-stmt bodies
     ],
 }
 

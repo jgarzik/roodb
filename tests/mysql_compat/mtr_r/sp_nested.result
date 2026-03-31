@@ -1,0 +1,156 @@
+drop table if exists t1, t2;
+drop procedure if exists p1;
+drop procedure if exists p2;
+drop procedure if exists p3;
+#
+# Single-statement body (no BEGIN/END)
+#
+create table t1 (id char(16) not null default '', data int not null);
+create procedure p1()
+insert into t1 values ("foo", 42)|
+call p1();
+select * from t1;
+id	data
+foo	42
+delete from t1;
+drop procedure p1;
+#
+# Single-statement body with IN params
+#
+create procedure p1(x char(16), y int)
+insert into t1 values (x, y)|
+call p1("bar", 666);
+select * from t1;
+id	data
+bar	666
+delete from t1;
+drop procedure p1;
+#
+# Two statements in body
+#
+create procedure p1(x1 char(16), x2 char(16), y int)
+begin
+insert into t1 values (x1, y);
+insert into t1 values (x2, y);
+end|
+call p1("one", "two", 3);
+select * from t1;
+id	data
+one	3
+two	3
+delete from t1;
+drop procedure p1;
+#
+# Multi-variable DECLARE
+#
+create procedure p1(x char(16), y int)
+begin
+declare z1, z2 int;
+set z1 = y;
+set z2 = z1+2;
+insert into t1 values (x, z2);
+end|
+call p1("locset", 19);
+select * from t1;
+id	data
+locset	21
+delete from t1;
+drop procedure p1;
+#
+# Multi-var DECLARE with DEFAULT
+#
+create procedure p1()
+begin
+declare a, b, c int default 10;
+set @r = a + b + c;
+end|
+call p1();
+select @r;
+@r
+30
+drop procedure p1;
+#
+# Nested CALL — procedure calling procedure
+#
+create procedure p1(IN v INT)
+begin
+insert into t1 values ('inner', v);
+end|
+create procedure p2()
+begin
+call p1(1);
+call p1(2);
+call p1(3);
+end|
+call p2();
+select * from t1 order by data;
+delete from t1;
+drop procedure p2;
+drop procedure p1;
+id	data
+inner	1
+inner	2
+inner	3
+#
+# Nested CALL with parameters passed through
+#
+create procedure p1(IN val INT, OUT result INT)
+begin
+set result = val * val;
+end|
+create procedure p2(IN n INT)
+begin
+call p1(n, @squared);
+end|
+call p2(7);
+select @squared;
+drop procedure p2;
+drop procedure p1;
+#
+# Three levels of nesting
+#
+create procedure p1(IN v INT)
+begin
+insert into t1 values ('level3', v);
+end|
+create procedure p2(IN v INT)
+begin
+call p1(v * 10);
+end|
+@squared
+49
+create procedure p3(IN v INT)
+begin
+call p2(v + 1);
+end|
+call p3(5);
+select * from t1;
+delete from t1;
+drop procedure p3;
+drop procedure p2;
+drop procedure p1;
+#
+# Nested BEGIN blocks in IF
+#
+create procedure p1(IN n INT)
+begin
+if n > 0 then
+begin
+declare msg varchar(50) default 'positive';
+set @result = msg;
+end;
+else
+begin
+declare msg varchar(50) default 'non-positive';
+set @result = msg;
+end;
+end if;
+end|
+call p1(5);
+id	data
+le60el3	60
+select @result;
+call p1(-1);
+select @result;
+drop procedure p1;
+drop table t1;
