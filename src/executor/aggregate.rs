@@ -566,6 +566,7 @@ mod tests {
                     data_type: DataType::Int,
                     nullable: false,
                     default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
@@ -600,6 +601,7 @@ mod tests {
             data_type: DataType::Text,
             nullable: false,
             default_value: None,
+            is_outer_ref: false,
         })];
 
         let aggregates = vec![(
@@ -612,6 +614,7 @@ mod tests {
                     data_type: DataType::Int,
                     nullable: false,
                     default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
@@ -659,6 +662,7 @@ mod tests {
                     data_type: DataType::Int,
                     nullable: false,
                     default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: true, // COUNT(DISTINCT c)
                 result_type: DataType::BigInt,
@@ -698,6 +702,7 @@ mod tests {
                     data_type: DataType::Int,
                     nullable: false,
                     default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: true, // SUM(DISTINCT c)
                 result_type: DataType::Double,
@@ -732,6 +737,7 @@ mod tests {
             data_type: DataType::Int,
             nullable: false,
             default_value: None,
+            is_outer_ref: false,
         });
 
         let aggregates = vec![

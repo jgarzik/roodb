@@ -7252,6 +7252,7 @@ mod tests {
             data_type: DataType::Int,
             nullable: true,
             default_value: None,
+            is_outer_ref: false,
         })
     }
 

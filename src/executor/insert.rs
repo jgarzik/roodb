@@ -366,6 +366,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             },
             ResolvedColumn {
                 table: "users".to_string(),
@@ -374,6 +375,7 @@ mod tests {
                 data_type: DataType::Varchar(100),
                 nullable: true,
                 default_value: None,
+                is_outer_ref: false,
             },
         ];
 

@@ -429,6 +429,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -443,6 +444,7 @@ mod tests {
                 data_type: DataType::Varchar(100),
                 nullable: true,
                 default_value: None,
+                is_outer_ref: false,
             },
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
@@ -505,6 +507,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -519,6 +522,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             },
             ResolvedExpr::Literal(Literal::Integer(10)),
         )];

@@ -356,6 +356,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),

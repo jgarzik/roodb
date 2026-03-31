@@ -165,6 +165,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             }),
             true, // ascending
         )];
@@ -206,6 +207,7 @@ mod tests {
                 data_type: DataType::Int,
                 nullable: false,
                 default_value: None,
+                is_outer_ref: false,
             }),
             false, // descending
         )];
