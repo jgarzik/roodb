@@ -14,6 +14,20 @@ use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor as _;
 
+/// Convert a Datum::Bytes (hex literal) to Datum::UnsignedInt for numeric comparison
+fn bytes_to_int(datum: &Datum) -> Datum {
+    match datum {
+        Datum::Bytes(b) => {
+            let mut val: u64 = 0;
+            for &byte in b.iter().take(8) {
+                val = (val << 8) | byte as u64;
+            }
+            Datum::UnsignedInt(val)
+        }
+        _ => datum.clone(),
+    }
+}
+
 // Thread-local engine context for correlated subquery execution.
 thread_local! {
     static SUBQUERY_ENGINE: RefCell<Option<SubqueryContext>> = const { RefCell::new(None) };
@@ -446,6 +460,30 @@ fn eval_binary_op_ex(
     {
         return Ok(Datum::Null);
     }
+
+    // Coerce hex literals (Bytes) to integer when compared with numeric types
+    let coerced_left;
+    let coerced_right;
+    let left = if matches!(left, Datum::Bytes(_))
+        && matches!(
+            right,
+            Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_)
+        ) {
+        coerced_left = bytes_to_int(left);
+        &coerced_left
+    } else {
+        left
+    };
+    let right = if matches!(right, Datum::Bytes(_))
+        && matches!(
+            left,
+            Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_)
+        ) {
+        coerced_right = bytes_to_int(right);
+        &coerced_right
+    } else {
+        right
+    };
 
     // In strict DML context (INSERT/UPDATE), non-numeric strings in arithmetic
     // must raise ER_TRUNCATED_WRONG_VALUE (1292) instead of silently becoming 0

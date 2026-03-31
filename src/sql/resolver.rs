@@ -1972,6 +1972,24 @@ impl<'a> Resolver<'a> {
             sp::Expr::BinaryOp { left, op, right } => {
                 let resolved_left = self.resolve_expr(left, scope)?;
                 let resolved_right = self.resolve_expr(right, scope)?;
+                // Rewrite expr +/- INTERVAL to DATE_ADD/DATE_SUB
+                if matches!(op, sp::BinaryOperator::Plus | sp::BinaryOperator::Minus) {
+                    let is_interval = matches!(&resolved_right, ResolvedExpr::Function { name, .. } if name == "__INTERVAL");
+                    if is_interval {
+                        let func_name = if matches!(op, sp::BinaryOperator::Plus) {
+                            "DATE_ADD"
+                        } else {
+                            "DATE_SUB"
+                        };
+                        return Ok(ResolvedExpr::Function {
+                            name: func_name.to_string(),
+                            args: vec![resolved_left, resolved_right],
+                            distinct: false,
+                            result_type: DataType::Text,
+                            separator: None,
+                        });
+                    }
+                }
                 let binary_op = convert_binary_op(op)?;
                 let result_type =
                     infer_binary_result_type(binary_op, &resolved_left, &resolved_right)?;
@@ -3071,18 +3089,7 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
         }
     }
 
-    // MySQL: BLOB/TEXT columns cannot have a non-empty default value
-    if let Some(ref default_val) = col_def.default {
-        if matches!(col_def.data_type, DataType::Text | DataType::Blob) {
-            let trimmed = default_val.trim_matches('\'').trim_matches('"');
-            if !trimmed.is_empty() {
-                return Err(SqlError::InvalidOperation(format!(
-                    "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
-                    col_def.name
-                )));
-            }
-        }
-    }
+    // MySQL 8.0+ allows defaults on TEXT/BLOB columns (relaxed from older versions)
 
     Ok(col_def)
 }

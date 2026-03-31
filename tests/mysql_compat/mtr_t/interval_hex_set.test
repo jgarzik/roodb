@@ -1,0 +1,24 @@
+--echo # INTERVAL arithmetic, hex comparison, SET defaults
+
+--echo # --- INTERVAL + operator ---
+SELECT DATE '2024-01-15' + INTERVAL 10 DAY;
+SELECT DATE '2024-01-15' + INTERVAL 1 MONTH;
+SELECT DATE '2024-03-01' - INTERVAL 1 MONTH;
+
+--echo # --- Column + INTERVAL ---
+CREATE TABLE t1 (d DATE);
+INSERT INTO t1 VALUES ('2024-06-15');
+SELECT d + INTERVAL 7 DAY FROM t1;
+SELECT d - INTERVAL 1 YEAR FROM t1;
+DROP TABLE t1;
+
+--echo # --- Hex = integer comparison ---
+SELECT 0x41 = 65;
+SELECT 0xFF = 255;
+SELECT 0x00 = 0;
+
+--echo # --- SET column with default ---
+CREATE TABLE t1 (s SET('a','b','c') DEFAULT 'a');
+INSERT INTO t1 () VALUES ();
+SELECT s FROM t1;
+DROP TABLE t1;

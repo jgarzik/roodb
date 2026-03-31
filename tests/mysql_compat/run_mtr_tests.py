@@ -310,6 +310,7 @@ TIERS = {
         "correlated_subquery",                # Correlated EXISTS, NOT EXISTS, scalar subqueries
         "tuple_in_union_sub",                 # Multi-column IN, UNION in IN subquery, JSON arrow WHERE
         "window_aggregate",                   # Window functions over GROUP BY aggregate results
+        "interval_hex_set",                   # INTERVAL +/-, hex=int comparison, SET defaults
     ],
 }
 

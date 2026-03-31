@@ -76,11 +76,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 | 40 | insert_odku, update_join | INSERT ON DUPLICATE KEY UPDATE, UPDATE with JOIN |
 | 41 | cte_basic, window_basic | WITH...AS CTEs, ROW_NUMBER/RANK/DENSE_RANK/SUM/COUNT/AVG/MIN/MAX OVER, LEAD/LAG |
-| 42 | correlated_subquery, tuple_in_union_sub, window_aggregate | Correlated subqueries, multi-column IN, UNION in subquery, JSON WHERE, window+aggregate |
+| 42 | correlated_subquery, tuple_in_union_sub, window_aggregate, interval_hex_set | Correlated subqueries, multi-column IN, UNION in subquery, JSON WHERE, window+agg, INTERVAL +/-, hex=int, SET defaults |
 
 ## Current Status
 
-**178 MySQL compat tests across 42 tiers — all pass**
+**179 MySQL compat tests across 42 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -305,6 +305,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | Multi-column IN tuples | `(a,b) IN ((1,2),(3,4))` rewritten to `(a=1 AND b=2) OR (a=3 AND b=4)` |
 | UNION in IN subquery | `a IN (SELECT 1 UNION SELECT 2)` — resolver uses resolve_query for subquery body |
 | JSON in WHERE | JSON type allowed in boolean contexts; JSON_EXTRACT comparison works |
+| INTERVAL + operator | `expr + INTERVAL 1 DAY` rewritten to DATE_ADD; `expr - INTERVAL` to DATE_SUB |
+| Hex = integer comparison | `0x41 = 65` returns true; hex bytes coerced to integer in comparisons |
+| SET/TEXT column defaults | Relaxed MySQL 8.0+ default restriction; SET columns accept default values |
 
 ## Gap Analysis — Next Steps
 
@@ -321,13 +324,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - PointGet suppression when LIMIT or ORDER BY present
 
 ### Missing Features (discovered by testing)
-- INTERVAL arithmetic in expressions (`expr + INTERVAL 1 DAY`)
-- Hex literal implicit integer coercion (`0x41+0`)
-- `0b` prefix binary literals (`0b01000001`)
-- Bitwise operations on VARBINARY columns
-- Integer-to-SET member mapping
-- SET column defaults
-- GROUP BY WITH ROLLUP (parser limitation)
+- `0b` prefix binary literals (sqlparser limitation)
+- GROUP BY WITH ROLLUP (sqlparser limitation)
+- Integer-to-SET member mapping (SET stored as Text, integer insertion stores raw number)
 
 ## Architecture
 
