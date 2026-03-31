@@ -76,11 +76,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 | 40 | insert_odku, update_join | INSERT ON DUPLICATE KEY UPDATE, UPDATE with JOIN |
 | 41 | cte_basic, window_basic | WITH...AS CTEs, ROW_NUMBER/RANK/DENSE_RANK/SUM/COUNT/AVG/MIN/MAX OVER, LEAD/LAG |
-| 42 | correlated_subquery, tuple_in_union_sub | Correlated subqueries, multi-column IN, UNION in subquery, JSON WHERE |
+| 42 | correlated_subquery, tuple_in_union_sub, window_aggregate | Correlated subqueries, multi-column IN, UNION in subquery, JSON WHERE, window+aggregate |
 
 ## Current Status
 
-**177 MySQL compat tests across 42 tiers — all pass**
+**178 MySQL compat tests across 42 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -328,7 +328,6 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - Integer-to-SET member mapping
 - SET column defaults
 - GROUP BY WITH ROLLUP (parser limitation)
-- Window functions over aggregate expressions (Window + GROUP BY interaction)
 
 ## Architecture
 

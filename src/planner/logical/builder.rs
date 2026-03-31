@@ -270,15 +270,11 @@ impl LogicalPlanBuilder {
             };
         }
 
-        // 3. Detect window functions BEFORE aggregation/projection
-        // Window functions are computed on the full row set, then projection
-        // selects the output columns including the computed window values.
-        let window_funcs = Self::collect_window_functions(&select.columns);
-
-        // 4. Apply GROUP BY / aggregates
+        // 3. Apply GROUP BY / aggregates
         let has_aggregates = Self::has_aggregates(&select.columns);
+        let mut all_aggs: Vec<(AggregateFunc, String)> = Vec::new();
         if !select.group_by.is_empty() || has_aggregates {
-            let all_aggs = Self::collect_all_aggregates(&select.columns, select.having.as_ref());
+            all_aggs = Self::collect_all_aggregates(&select.columns, select.having.as_ref());
 
             plan = Self::build_aggregate(
                 plan,
@@ -296,21 +292,36 @@ impl LogicalPlanBuilder {
                 };
             }
 
-            // After aggregation, build projection
+            // After aggregation, build projection (window funcs get NULL placeholders)
             plan = Self::build_post_aggregate_project(plan, &select.columns, &select.group_by)?;
         }
 
-        // 5. Apply window functions BEFORE projection
-        // Window executor appends computed columns at the end of each row.
-        // Then we rewrite SELECT references from WindowFunction expressions
-        // to Column references pointing to the appended columns.
+        // 4. Detect and apply window functions AFTER aggregation
+        // This ensures aggregate results are available as column refs.
+        let mut window_funcs = Self::collect_window_functions(&select.columns);
         if !window_funcs.is_empty() {
+            // If there was aggregation, rewrite aggregate refs inside window funcs'
+            // order_by and args to point to post-aggregate output columns.
+            if has_aggregates || !select.group_by.is_empty() {
+                for wf in &mut window_funcs {
+                    let (_, _, ref mut args, _, ref mut order_by, _) = wf;
+                    for arg in args.iter_mut() {
+                        *arg = Self::rewrite_agg_refs(arg, &select.group_by, &all_aggs);
+                    }
+                    for (ob_expr, _) in order_by.iter_mut() {
+                        *ob_expr = Self::rewrite_agg_refs(ob_expr, &select.group_by, &all_aggs);
+                    }
+                }
+            }
+
             let num_input_cols = plan.output_columns().len();
             plan = LogicalPlan::Window {
                 input: Box::new(plan),
                 window_funcs: window_funcs.clone(),
             };
+
             // Rewrite WindowFunction exprs in SELECT list to column refs
+            // pointing to the appended window output columns
             for (wf_idx, (sel_idx, ..)) in window_funcs.iter().enumerate() {
                 if let Some(ResolvedSelectItem::Expr { expr, .. }) =
                     select.columns.get_mut(*sel_idx)
@@ -327,6 +338,59 @@ impl LogicalPlanBuilder {
                         is_outer_ref: false,
                     });
                 }
+            }
+
+            // For aggregate+window queries, build a final projection that maps:
+            // - Non-window columns from their post-aggregate positions
+            // - Window columns from the appended positions after Window executor
+            if has_aggregates || !select.group_by.is_empty() {
+                let mut final_exprs = Vec::new();
+                for (idx, item) in select.columns.iter().enumerate() {
+                    let name = match item {
+                        ResolvedSelectItem::Expr { alias, expr, .. } => {
+                            alias.clone().unwrap_or_else(|| Self::expr_name(expr, idx))
+                        }
+                        ResolvedSelectItem::Columns(cols) => cols
+                            .first()
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| format!("col_{}", idx)),
+                    };
+                    match item {
+                        ResolvedSelectItem::Expr { expr, .. } => {
+                            // If this was rewritten to a Column ref (window), use it
+                            // Otherwise use the post-aggregate column index
+                            if matches!(expr, ResolvedExpr::Column(c) if c.name.starts_with("__window_"))
+                            {
+                                final_exprs.push((expr.clone(), name));
+                            } else {
+                                // Reference the post-aggregate output column by index
+                                let dt = expr.data_type();
+                                final_exprs.push((
+                                    ResolvedExpr::Column(ResolvedColumn {
+                                        table: String::new(),
+                                        name: name.clone(),
+                                        index: idx,
+                                        data_type: dt,
+                                        nullable: true,
+                                        default_value: None,
+                                        is_outer_ref: false,
+                                    }),
+                                    name,
+                                ));
+                            }
+                        }
+                        ResolvedSelectItem::Columns(cols) => {
+                            for col in cols {
+                                final_exprs
+                                    .push((ResolvedExpr::Column(col.clone()), col.name.clone()));
+                            }
+                        }
+                    }
+                }
+                plan = LogicalPlan::Project {
+                    input: Box::new(plan),
+                    expressions: final_exprs,
+                };
             }
         }
 
@@ -765,6 +829,11 @@ impl LogicalPlanBuilder {
                         // with column references to the aggregate output
                         let rewritten = Self::rewrite_agg_refs(expr, group_by, &all_aggs);
                         expressions.push((rewritten, name));
+                    } else if matches!(expr, ResolvedExpr::WindowFunction { .. }) {
+                        // Window functions get a NULL placeholder — the real value
+                        // is computed by the Window executor and picked up by the
+                        // final projection after Window.
+                        expressions.push((ResolvedExpr::Literal(Literal::Null), name));
                     } else {
                         // Non-aggregate expression - check if it's a group-by column
                         if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
