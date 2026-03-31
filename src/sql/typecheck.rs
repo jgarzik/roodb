@@ -168,7 +168,8 @@ impl TypeChecker {
     /// MySQL treats non-zero numeric values as true, so accept numeric types too
     fn check_is_boolean(expr: &ResolvedExpr) -> SqlResult<()> {
         let dt = expr.data_type();
-        if dt == DataType::Boolean || dt.is_numeric() {
+        // MySQL allows comparison results, strings, and JSON in boolean contexts
+        if dt == DataType::Boolean || dt.is_numeric() || dt.is_string() || dt == DataType::Json {
             Ok(())
         } else {
             Err(SqlError::TypeMismatch {

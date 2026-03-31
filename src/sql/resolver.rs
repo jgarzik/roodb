@@ -2125,6 +2125,69 @@ impl<'a> Resolver<'a> {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
                 negated: true,
             }),
+            // Multi-column IN: (a, b) IN ((1,2), (3,4)) → (a=1 AND b=2) OR (a=3 AND b=4)
+            sp::Expr::InList {
+                expr,
+                list,
+                negated,
+            } if matches!(expr.as_ref(), sp::Expr::Tuple(_)) => {
+                let cols = match expr.as_ref() {
+                    sp::Expr::Tuple(exprs) => exprs
+                        .iter()
+                        .map(|e| self.resolve_expr(e, scope))
+                        .collect::<SqlResult<Vec<_>>>()?,
+                    _ => unreachable!(),
+                };
+                let mut or_parts: Vec<ResolvedExpr> = Vec::new();
+                for item in list {
+                    let vals = match item {
+                        sp::Expr::Tuple(exprs) => exprs
+                            .iter()
+                            .map(|e| self.resolve_expr(e, scope))
+                            .collect::<SqlResult<Vec<_>>>()?,
+                        other => vec![self.resolve_expr(other, scope)?],
+                    };
+                    // Build AND chain: col[0]=val[0] AND col[1]=val[1] ...
+                    let mut and_expr: Option<ResolvedExpr> = None;
+                    for (col, val) in cols.iter().zip(vals.iter()) {
+                        let eq = ResolvedExpr::BinaryOp {
+                            left: Box::new(col.clone()),
+                            op: BinaryOp::Eq,
+                            right: Box::new(val.clone()),
+                            result_type: DataType::Boolean,
+                        };
+                        and_expr = Some(match and_expr {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                left: Box::new(prev),
+                                op: BinaryOp::And,
+                                right: Box::new(eq),
+                                result_type: DataType::Boolean,
+                            },
+                            None => eq,
+                        });
+                    }
+                    if let Some(part) = and_expr {
+                        or_parts.push(part);
+                    }
+                }
+                let mut result = or_parts
+                    .into_iter()
+                    .reduce(|acc, part| ResolvedExpr::BinaryOp {
+                        left: Box::new(acc),
+                        op: BinaryOp::Or,
+                        right: Box::new(part),
+                        result_type: DataType::Boolean,
+                    })
+                    .unwrap_or(ResolvedExpr::Literal(Literal::Boolean(false)));
+                if *negated {
+                    result = ResolvedExpr::UnaryOp {
+                        op: UnaryOp::Not,
+                        expr: Box::new(result),
+                        result_type: DataType::Boolean,
+                    };
+                }
+                Ok(result)
+            }
             sp::Expr::InList {
                 expr,
                 list,
@@ -2274,9 +2337,17 @@ impl<'a> Resolver<'a> {
                 negated,
             } => {
                 let resolved_expr = self.resolve_expr(expr, scope)?;
-                let mut inner_select =
-                    self.resolve_select_body_inner(subquery.body.as_ref(), Some(scope))?;
-                self.resolve_query_order_limit(&mut inner_select, subquery)?;
+                // Use resolve_query to handle UNION subqueries properly
+                let inner = self.resolve_query(subquery)?;
+                let inner_select = match inner {
+                    ResolvedStatement::Select(s) => s,
+                    ResolvedStatement::Union { left, .. } => *left, // Use left metadata
+                    _ => {
+                        return Err(SqlError::Unsupported(
+                            "IN subquery must be SELECT or UNION".to_string(),
+                        ))
+                    }
+                };
                 Ok(ResolvedExpr::InSubquery {
                     expr: Box::new(resolved_expr),
                     query: Box::new(inner_select),

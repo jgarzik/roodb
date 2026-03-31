@@ -1,0 +1,23 @@
+--echo # Multi-column IN tuples and UNION in subqueries
+
+--echo # --- Multi-column IN ---
+CREATE TABLE t1 (a INT, b INT, c INT);
+INSERT INTO t1 VALUES (1, 2, 10), (3, 4, 20), (5, 6, 30), (7, 8, 40);
+SELECT * FROM t1 WHERE (a, b) IN ((1, 2), (5, 6)) ORDER BY a;
+SELECT * FROM t1 WHERE (a, b) NOT IN ((1, 2), (5, 6)) ORDER BY a;
+
+--echo # --- UNION in IN subquery ---
+DROP TABLE t1;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (2), (3), (4), (5);
+SELECT * FROM t1 WHERE a IN (SELECT 1 UNION SELECT 3 UNION SELECT 5) ORDER BY a;
+
+--echo # --- JSON arrow in WHERE ---
+DROP TABLE t1;
+CREATE TABLE t1 (id INT, doc JSON);
+INSERT INTO t1 VALUES (1, '{"status": "active"}');
+INSERT INTO t1 VALUES (2, '{"status": "inactive"}');
+INSERT INTO t1 VALUES (3, '{"status": "active"}');
+SELECT id FROM t1 WHERE JSON_UNQUOTE(doc->'$.status') = 'active' ORDER BY id;
+
+DROP TABLE t1;

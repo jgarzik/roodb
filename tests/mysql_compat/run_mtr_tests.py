@@ -308,6 +308,7 @@ TIERS = {
     ],
     42: [
         "correlated_subquery",                # Correlated EXISTS, NOT EXISTS, scalar subqueries
+        "tuple_in_union_sub",                 # Multi-column IN, UNION in IN subquery, JSON arrow WHERE
     ],
 }
 

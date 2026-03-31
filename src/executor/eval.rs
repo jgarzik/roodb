@@ -6854,8 +6854,7 @@ async fn execute_inline_subquery_values(
     let table_name = &select.from[0].name;
 
     // Create a read-everything transaction context (max_txn_id=MAX sees all committed rows)
-    let read_view =
-        crate::txn::ReadView::new(0, std::collections::HashSet::new(), u64::MAX);
+    let read_view = crate::txn::ReadView::new(0, std::collections::HashSet::new(), u64::MAX);
     let txn_ctx = super::context::TransactionContext::new(0, read_view);
 
     // Build a table scan with no filter (we'll apply the correlated filter ourselves)

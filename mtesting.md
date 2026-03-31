@@ -76,11 +76,11 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | 39 | json_create, json_extract, json_modify, json_aggregate | Full JSON support: 35 functions, JSON column type, ->/->>, schema validation |
 | 40 | insert_odku, update_join | INSERT ON DUPLICATE KEY UPDATE, UPDATE with JOIN |
 | 41 | cte_basic, window_basic | WITH...AS CTEs, ROW_NUMBER/RANK/DENSE_RANK/SUM/COUNT/AVG/MIN/MAX OVER, LEAD/LAG |
-| 42 | correlated_subquery | Correlated EXISTS, NOT EXISTS, scalar subqueries |
+| 42 | correlated_subquery, tuple_in_union_sub | Correlated subqueries, multi-column IN, UNION in subquery, JSON WHERE |
 
 ## Current Status
 
-**176 MySQL compat tests across 42 tiers — all pass**
+**177 MySQL compat tests across 42 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -302,6 +302,9 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | CTEs (WITH...AS) | Common Table Expressions — resolve CTE body, inject as derived table into main query |
 | Window functions | Full pipeline: resolver → planner → executor. ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTILE with PARTITION BY and ORDER BY |
 | Correlated subqueries | Outer scope chain in resolver (is_outer_ref), per-row substitution + inline execution via thread-local engine context. EXISTS, NOT EXISTS, scalar subqueries. |
+| Multi-column IN tuples | `(a,b) IN ((1,2),(3,4))` rewritten to `(a=1 AND b=2) OR (a=3 AND b=4)` |
+| UNION in IN subquery | `a IN (SELECT 1 UNION SELECT 2)` — resolver uses resolve_query for subquery body |
+| JSON in WHERE | JSON type allowed in boolean contexts; JSON_EXTRACT comparison works |
 
 ## Gap Analysis — Next Steps
 
@@ -324,7 +327,8 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 - Bitwise operations on VARBINARY columns
 - Integer-to-SET member mapping
 - SET column defaults
-- Multi-column IN tuples `(a, b) IN ((1,2), (3,4))`
+- GROUP BY WITH ROLLUP (parser limitation)
+- Window functions over aggregate expressions (Window + GROUP BY interaction)
 
 ## Architecture
 
