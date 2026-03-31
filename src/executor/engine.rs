@@ -142,6 +142,22 @@ impl ExecutorEngine {
         }
     }
 
+    /// Create an ExecutorEngine for read-only subquery execution (no Raft node needed)
+    pub fn with_raft_and_txn(
+        mvcc: Arc<MvccStorage>,
+        catalog: Arc<RwLock<Catalog>>,
+        txn_context: Option<TransactionContext>,
+        user_variables: UserVariables,
+    ) -> Self {
+        ExecutorEngine {
+            mvcc,
+            catalog,
+            txn_context,
+            raft_node: None,
+            user_variables,
+        }
+    }
+
     /// Build an executor tree from a physical plan
     pub fn build(&self, plan: PhysicalPlan) -> ExecutorResult<Box<dyn Executor>> {
         self.build_node(plan)

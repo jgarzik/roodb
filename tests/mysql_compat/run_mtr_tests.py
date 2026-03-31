@@ -311,6 +311,7 @@ TIERS = {
         "tuple_in_union_sub",                 # Multi-column IN, UNION in IN subquery, JSON arrow WHERE
         "window_aggregate",                   # Window functions over GROUP BY aggregate results
         "interval_hex_set",                   # INTERVAL +/-, hex=int comparison, SET defaults
+        "real_world_patterns",                # ORM pagination, JOINs, CTEs+Windows, JSON CRUD, correlated subqueries
     ],
 }
 

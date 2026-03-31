@@ -80,7 +80,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 
 ## Current Status
 
-**179 MySQL compat tests across 42 tiers — all pass**
+**180 MySQL compat tests across 42 tiers — all pass**
 **452+ Rust integration tests — all pass**
 
 ### Tier 1 — 6/6 pass
@@ -308,6 +308,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | INTERVAL + operator | `expr + INTERVAL 1 DAY` rewritten to DATE_ADD; `expr - INTERVAL` to DATE_SUB |
 | Hex = integer comparison | `0x41 = 65` returns true; hex bytes coerced to integer in comparisons |
 | SET/TEXT column defaults | Relaxed MySQL 8.0+ default restriction; SET columns accept default values |
+| Correlated subquery aggregates | Correlated subqueries with AVG/SUM/COUNT/MIN/MAX now use full planner pipeline |
 
 ## Gap Analysis — Next Steps
 

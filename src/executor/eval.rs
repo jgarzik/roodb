@@ -12,7 +12,6 @@ use crate::server::session::UserVariables;
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
-use super::Executor as _;
 
 /// Convert a Datum::Bytes (hex literal) to Datum::UnsignedInt for numeric comparison
 fn bytes_to_int(datum: &Datum) -> Datum {
@@ -6872,61 +6871,50 @@ fn run_correlated_subquery_exists(
     Ok(!values.is_empty())
 }
 
-/// Execute a correlated scalar subquery inline (returns single Datum)
-/// Execute a correlated subquery inline using the thread-local engine context.
-/// Builds a lightweight executor for the substituted (now non-correlated) subquery.
+/// Execute a correlated subquery inline using the full planner+executor pipeline.
+/// After outer-ref substitution, the subquery is a regular non-correlated query.
 async fn execute_inline_subquery_values(
     select: &crate::planner::logical::ResolvedSelect,
 ) -> ExecutorResult<Vec<Datum>> {
+    use crate::planner::logical::builder::LogicalPlanBuilder;
+    use crate::planner::logical::ResolvedStatement;
+
     let ctx = SUBQUERY_ENGINE.with(|c| c.borrow().clone());
     let ctx = match ctx {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
 
-    // For each table in the FROM clause, scan it and apply the filter
-    if select.from.is_empty() {
-        return Ok(Vec::new());
-    }
+    // Build the full pipeline: resolve → plan → physical plan → executor
+    let stmt = ResolvedStatement::Select(select.clone());
+    let logical = LogicalPlanBuilder::build(stmt)
+        .map_err(|e| ExecutorError::Internal(format!("Subquery plan error: {}", e)))?;
+    let physical = {
+        let catalog_guard = ctx.catalog.read();
+        crate::planner::physical::PhysicalPlanner::plan(logical, &catalog_guard)
+            .map_err(|e| ExecutorError::Internal(format!("Subquery physical plan error: {}", e)))?
+    };
 
-    let table_name = &select.from[0].name;
-
-    // Create a read-everything transaction context (max_txn_id=MAX sees all committed rows)
+    // Create a read-everything transaction context
     let read_view = crate::txn::ReadView::new(0, std::collections::HashSet::new(), u64::MAX);
     let txn_ctx = super::context::TransactionContext::new(0, read_view);
 
-    // Build a table scan with no filter (we'll apply the correlated filter ourselves)
-    let mut scanner = super::scan::TableScan::new(
-        table_name.clone(),
-        None,
+    let engine = super::engine::ExecutorEngine::with_raft_and_txn(
         ctx.mvcc.clone(),
+        ctx.catalog.clone(),
         Some(txn_ctx),
         ctx.user_variables.clone(),
     );
-    scanner.open().await?;
+    let mut executor = engine.build(physical)?;
+    executor.open().await?;
 
     let mut values = Vec::new();
-    while let Some(row) = scanner.next().await? {
-        // Apply filter
-        let matches = if let Some(ref filter) = select.filter {
-            evaluate(filter, &row, &ctx.user_variables)?
-                .as_bool()
-                .unwrap_or(false)
-        } else {
-            true
-        };
-        if matches {
-            // Extract the first column value from the SELECT list
-            if let Some(crate::planner::logical::ResolvedSelectItem::Expr { expr, .. }) =
-                select.columns.first()
-            {
-                values.push(evaluate(expr, &row, &ctx.user_variables)?);
-            } else {
-                values.push(Datum::Int(1)); // EXISTS just needs any row
-            }
+    while let Some(row) = executor.next().await? {
+        if let Ok(val) = row.get(0) {
+            values.push(val.clone());
         }
     }
-    scanner.close().await?;
+    executor.close().await?;
     Ok(values)
 }
 
