@@ -145,15 +145,24 @@ impl Delete {
             matching.push((key, row_version, row));
         }
 
-        // Apply ORDER BY if present
+        // Apply ORDER BY if present — precompute sort keys to propagate eval errors
         if !self.order_by.is_empty() {
             let order_by = &self.order_by;
             let user_vars = &self.user_variables;
-            matching.sort_by(|a, b| {
-                for (expr, asc) in order_by {
-                    let va = evaluate(expr, &a.2, user_vars).unwrap_or(super::datum::Datum::Null);
-                    let vb = evaluate(expr, &b.2, user_vars).unwrap_or(super::datum::Datum::Null);
-                    let ord = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+            let mut sort_keys: Vec<Vec<super::datum::Datum>> = Vec::with_capacity(matching.len());
+            for (_key, _ver, row) in &matching {
+                let mut keys = Vec::with_capacity(order_by.len());
+                for (expr, _asc) in order_by {
+                    keys.push(evaluate(expr, row, user_vars)?);
+                }
+                sort_keys.push(keys);
+            }
+            let mut indices: Vec<usize> = (0..matching.len()).collect();
+            indices.sort_by(|&ai, &bi| {
+                for (i, (_expr, asc)) in order_by.iter().enumerate() {
+                    let ord = sort_keys[ai][i]
+                        .partial_cmp(&sort_keys[bi][i])
+                        .unwrap_or(std::cmp::Ordering::Equal);
                     let ord = if *asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -161,6 +170,7 @@ impl Delete {
                 }
                 std::cmp::Ordering::Equal
             });
+            matching = indices.into_iter().map(|i| matching[i].clone()).collect();
         }
 
         // Apply LIMIT if specified
