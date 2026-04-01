@@ -340,6 +340,7 @@ where
 
         if let Some(ref db) = response.database {
             self.database = Some(db.clone());
+            self.session.set_database(Some(db.clone()));
         }
 
         Ok(())

@@ -193,7 +193,10 @@ impl Session {
             );
             w.insert(
                 "__sys_database".to_string(),
-                Datum::String(self.database.clone().unwrap_or_else(|| "test".to_string())),
+                match &self.database {
+                    Some(db) => Datum::String(db.clone()),
+                    None => Datum::Null,
+                },
             );
         }
     }
@@ -217,9 +220,10 @@ impl Session {
         let mut w = self.user_variables.write();
         w.insert(
             "__sys_database".to_string(),
-            crate::executor::datum::Datum::String(
-                self.database.clone().unwrap_or_else(|| "test".to_string()),
-            ),
+            match &self.database {
+                Some(db) => crate::executor::datum::Datum::String(db.clone()),
+                None => crate::executor::datum::Datum::Null,
+            },
         );
     }
 

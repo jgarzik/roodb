@@ -3240,7 +3240,18 @@ pub fn eval_function(
 
         "VERSION" => Ok(Datum::String("8.0.0-RooDB".to_string())),
 
-        "DATABASE" | "SCHEMA" => Ok(get_sys_var_string(vars, "__sys_database", "test")),
+        "DATABASE" | "SCHEMA" => {
+            // MySQL returns NULL when no database is selected
+            if let Some(v) = vars {
+                let r = v.read();
+                match r.get("__sys_database") {
+                    Some(Datum::Null) | None => Ok(Datum::Null),
+                    Some(d) => Ok(d.clone()),
+                }
+            } else {
+                Ok(Datum::Null)
+            }
+        }
 
         "LAST_INSERT_ID" => {
             if !args.is_empty() {

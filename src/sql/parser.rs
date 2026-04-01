@@ -133,6 +133,13 @@ impl Parser {
         let sql = re_do.replace(&sql, "SELECT ");
         let sql = sql.to_string();
 
+        // SCHEMA() is a synonym for DATABASE() but SCHEMA is a reserved keyword
+        // in sqlparser and can't be parsed as a function call. Rewrite to DATABASE().
+        let sql = {
+            let re_schema = Regex::new(r"(?i)\bSCHEMA\s*\(\s*\)").unwrap();
+            re_schema.replace_all(&sql, "DATABASE()").to_string()
+        };
+
         // MOD is a keyword in sqlparser. Handle both MOD(x,y) function and x MOD y infix.
         // Replace MOD( with _ROODB_MOD( for function call form.
         let re_mod_fn = Regex::new(r"(?i)\bMOD\s*\(").unwrap();
