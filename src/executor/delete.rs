@@ -447,4 +447,115 @@ mod tests {
         let changes = delete.take_changes();
         assert_eq!(changes.len(), 2);
     }
+
+    /// Helper: create 4-row test dataset with MVCC headers
+    fn four_row_dataset() -> Vec<KeyValue> {
+        let rows = vec![
+            Row::new(vec![Datum::Int(1), Datum::String("d".to_string())]),
+            Row::new(vec![Datum::Int(2), Datum::String("b".to_string())]),
+            Row::new(vec![Datum::Int(3), Datum::String("a".to_string())]),
+            Row::new(vec![Datum::Int(4), Datum::String("c".to_string())]),
+        ];
+        rows.into_iter()
+            .map(|r| {
+                let id = r.get(0).unwrap().as_int().unwrap();
+                (
+                    encode_pk_key("t1", &[Datum::Int(id)]),
+                    encode_with_mvcc_header(0, &encode_row(&r)),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_delete_order_by_limit() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        let storage = Arc::new(MockStorage::new(four_row_dataset()));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
+
+        // DELETE FROM t1 ORDER BY name ASC LIMIT 2
+        // Sorted by name: a(3), b(2), c(4), d(1) → delete first 2 → ids 3, 2
+        let order_col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t1".to_string(),
+            name: "name".to_string(),
+            index: 1,
+            data_type: DataType::Text,
+            nullable: false,
+            default_value: None,
+            is_outer_ref: false,
+        });
+
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new(DeleteParams {
+            table: "t1".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![(order_col, true)], // ASC
+            limit: Some(2),
+            mvcc,
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
+        delete.open().await.unwrap();
+
+        let result = delete.next().await.unwrap().unwrap();
+        assert_eq!(result.get(0).unwrap().as_int(), Some(2)); // 2 rows deleted
+
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 2);
+        // Verify the correct rows were selected (ids 3 and 2, sorted by name asc)
+        let deleted_keys: Vec<_> = changes.iter().map(|c| c.key.clone()).collect();
+        assert!(deleted_keys.contains(&encode_pk_key("t1", &[Datum::Int(3)])));
+        assert!(deleted_keys.contains(&encode_pk_key("t1", &[Datum::Int(2)])));
+    }
+
+    #[tokio::test]
+    async fn test_delete_order_by_desc_limit() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        let storage = Arc::new(MockStorage::new(four_row_dataset()));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
+
+        // DELETE FROM t1 ORDER BY id DESC LIMIT 1 → delete id=4
+        let order_col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t1".to_string(),
+            name: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int,
+            nullable: false,
+            default_value: None,
+            is_outer_ref: false,
+        });
+
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new(DeleteParams {
+            table: "t1".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![(order_col, false)], // DESC
+            limit: Some(1),
+            mvcc,
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
+        delete.open().await.unwrap();
+
+        let result = delete.next().await.unwrap().unwrap();
+        assert_eq!(result.get(0).unwrap().as_int(), Some(1)); // 1 row deleted
+
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, encode_pk_key("t1", &[Datum::Int(4)]));
+    }
 }
