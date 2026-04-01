@@ -4007,25 +4007,8 @@ where
         Ok(None)
     }
 
-    async fn try_handle_database_function(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
-        let sql_upper = sql.trim().to_uppercase();
-
-        // Match SELECT DATABASE()
-        if !sql_upper.contains("DATABASE()") {
-            return Ok(None);
-        }
-
-        let db_value = self
-            .database
-            .clone()
-            .or_else(|| self.session.database.clone())
-            .unwrap_or_default();
-
-        let rows = vec![vec![db_value]];
-        self.send_custom_result_set(&["DATABASE()"], &rows)
-            .await
-            .map(Some)
-    }
+    // DATABASE() is handled by the eval pipeline via __sys_database user variable.
+    // No special intercept needed.
 
     /// Handle SET @var = expr (user variable assignment).
     /// Supports multiple assignments: SET @a = 1, @b = 2, @c = 3
@@ -4238,10 +4221,7 @@ where
     async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         use regex::Regex;
 
-        // Check for DATABASE() function first
-        if let Some(()) = self.try_handle_database_function(sql).await? {
-            return Ok(Some(()));
-        }
+        // DATABASE() is handled by the eval pipeline — no special intercept needed.
 
         // Simple pattern matching for SELECT @@variable queries
         let sql_upper = sql.to_uppercase();

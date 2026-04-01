@@ -2,8 +2,8 @@ select database();
 DATABASE()
 test
 select database() = "test";
-DATABASE()
-test
+DATABASE() = 'test'
+1
 select user() like "%@%";
 USER() LIKE '%@%'
 1
@@ -23,15 +23,16 @@ CONCAT(USER(),'--',c1)
 @localhost--row 2
 @localhost--row 3
 select concat(database(), '--', c1) from t1;
-DATABASE()
-test
+CONCAT(DATABASE(),'--',c1)
+test--row 1
+test--row 2
+test--row 3
 drop table t1;
 create table t1 (a char(10));
 select * from t1 where a=version();
 a
 select * from t1 where a=database();
-DATABASE()
-test
+a
 select * from t1 where a=user();
 a
 insert into t1 values ('a');
@@ -47,4 +48,5 @@ DATABASE()
 test
 SELECT DATABASE() UNION ALL SELECT DATABASE();
 DATABASE()
+test
 test

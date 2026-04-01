@@ -393,7 +393,9 @@ async fn test_insert_select_intra_batch_duplicate_error() {
         .await;
     assert!(result.is_err(), "Expected duplicate key error");
 
-    conn.query_drop("DROP TABLE isde_src, isde_dst").await.unwrap();
+    conn.query_drop("DROP TABLE isde_src, isde_dst")
+        .await
+        .unwrap();
 
     drop(conn);
     server.shutdown().await;
