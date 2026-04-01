@@ -39,6 +39,9 @@ pub struct InsertSelect {
     /// Maps source column index → target column index for partial column lists.
     /// None when all columns are targeted (1:1 positional mapping).
     column_map: Option<Vec<usize>>,
+    /// Precomputed: which target column indices are covered by column_map.
+    /// Used to apply defaults for unmapped columns without per-row allocation.
+    mapped_targets: std::collections::HashSet<usize>,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
 }
@@ -56,6 +59,10 @@ impl InsertSelect {
         column_map: Option<Vec<usize>>,
         ignore: bool,
     ) -> Self {
+        let mapped_targets: std::collections::HashSet<usize> = column_map
+            .as_ref()
+            .map(|m| m.iter().copied().collect())
+            .unwrap_or_default();
         InsertSelect {
             table,
             columns,
@@ -67,6 +74,7 @@ impl InsertSelect {
             last_insert_id: 0,
             pk_column_indices,
             column_map,
+            mapped_targets,
             ignore,
         }
     }
@@ -122,13 +130,8 @@ impl Executor for InsertSelect {
             // When column_map is present, only mapped columns get source values;
             // the rest should get their DEFAULT value if one is defined.
             if self.column_map.is_some() {
-                let mapped_targets: std::collections::HashSet<usize> = self
-                    .column_map
-                    .as_ref()
-                    .map(|m| m.iter().copied().collect())
-                    .unwrap_or_default();
                 for (col_idx, datum) in datums.iter_mut().enumerate() {
-                    if !mapped_targets.contains(&col_idx)
+                    if !self.mapped_targets.contains(&col_idx)
                         && datum.is_null()
                         && col_idx < self.columns.len()
                     {
