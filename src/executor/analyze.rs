@@ -71,13 +71,13 @@ impl Executor for AnalyzeTable {
             .await
             .map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
-        const MVCC_HEADER_SIZE: usize = 17;
+        use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
         let mut row_count: i64 = 0;
         let mut data_size: i64 = 0;
         for (key, value) in &rows {
             // Skip MVCC deleted rows
-            if value.len() > MVCC_HEADER_SIZE && value[16] == 1 {
+            if is_mvcc_tombstone(value) {
                 continue;
             }
             row_count += 1;

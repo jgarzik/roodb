@@ -22,8 +22,7 @@ use crate::raft::types::{
 };
 use crate::storage::StorageEngine;
 
-/// MVCC row header size: txn_id(8) + roll_ptr(8) + deleted(1) = 17 bytes
-const MVCC_HEADER_SIZE: usize = 17;
+use super::types::MVCC_HEADER_SIZE;
 
 /// Encode a row with MVCC header format (matches MvccStorage::encode_row)
 ///
@@ -228,7 +227,7 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                                     {
                                         if let Ok(Some(existing)) = storage.get(&change.key).await {
                                             let is_tombstone =
-                                                existing.len() > 16 && existing[16] == 1;
+                                                super::types::is_mvcc_tombstone(&existing);
                                             if !is_tombstone {
                                                 if changeset.ignore_duplicates {
                                                     skip_indices.push(idx);

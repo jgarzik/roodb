@@ -1533,15 +1533,12 @@ where
         let client_host = self.client_ip.to_string();
 
         for (_key, value) in rows {
-            // Skip MVCC header (17 bytes) if present
-            if value.len() <= 17 {
+            use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
+            // Skip short rows or MVCC tombstones
+            if value.len() <= MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
                 continue;
             }
-            // Check deleted flag
-            if value[16] == 1 {
-                continue;
-            }
-            let row_data = &value[17..];
+            let row_data = &value[MVCC_HEADER_SIZE..];
             if let Ok(row) = decode_row(row_data) {
                 // system.grants columns: grantee, grantee_host, grantee_type, privilege,
                 // object_type, database_name, table_name, with_grant_option, granted_by, granted_at

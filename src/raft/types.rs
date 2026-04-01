@@ -28,6 +28,20 @@ pub enum Command {
     Noop,
 }
 
+// ============ MVCC header layout constants ============
+// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data...]
+
+/// Total size of the MVCC header prefix (8 + 8 + 1 = 17 bytes)
+pub const MVCC_HEADER_SIZE: usize = 17;
+
+/// Byte offset of the deleted/tombstone flag within the MVCC header
+pub const MVCC_DELETED_OFFSET: usize = 16;
+
+/// Check whether an MVCC-encoded row is a tombstone (deleted).
+pub fn is_mvcc_tombstone(data: &[u8]) -> bool {
+    data.len() > MVCC_DELETED_OFFSET && data[MVCC_DELETED_OFFSET] == 1
+}
+
 /// Response from applying a command
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CommandResponse {

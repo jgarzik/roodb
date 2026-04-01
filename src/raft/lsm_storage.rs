@@ -28,8 +28,7 @@ use crate::raft::types::{
 };
 use crate::storage::StorageEngine;
 
-/// MVCC row header size: DB_TRX_ID (8 bytes) + DB_ROLL_PTR (8 bytes) + deleted flag (1 byte)
-const MVCC_HEADER_SIZE: usize = 17;
+use super::types::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
 /// Encode row data with MVCC header for storage
 ///
@@ -61,7 +60,7 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
 fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
     if value.len() > MVCC_HEADER_SIZE {
         // MVCC-wrapped: check deleted flag
-        if value[16] == 1 {
+        if is_mvcc_tombstone(value) {
             return None; // deleted
         }
         Some(&value[MVCC_HEADER_SIZE..])
@@ -1076,9 +1075,8 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                         self.storage.get(&change.key).await
                                                     {
                                                         // Skip tombstones (deleted rows)
-                                                        // MVCC: byte 16 = deleted flag (1=tombstone)
-                                                        let is_tombstone = existing_data.len() > 16
-                                                            && existing_data[16] == 1;
+                                                        let is_tombstone =
+                                                            is_mvcc_tombstone(&existing_data);
                                                         if !is_tombstone {
                                                             if changeset.ignore_duplicates {
                                                                 // IGNORE: silently skip this row

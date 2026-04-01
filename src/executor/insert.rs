@@ -262,12 +262,13 @@ impl Executor for Insert {
                 let existing_data = match ctx.get_buffered(&key) {
                     Some(Some(data)) => Some(data.clone()),
                     _ => {
-                        // Read from raw storage — strip 17-byte MVCC header
+                        // Read from raw storage — strip MVCC header
                         if let Some(ref mvcc) = self.mvcc {
                             let storage = mvcc.inner();
                             storage.get(&key).await.ok().flatten().and_then(|raw| {
-                                if raw.len() > 17 && raw[16] != 1 {
-                                    Some(raw[17..].to_vec())
+                                use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
+                                if raw.len() > MVCC_HEADER_SIZE && !is_mvcc_tombstone(&raw) {
+                                    Some(raw[MVCC_HEADER_SIZE..].to_vec())
                                 } else {
                                     None
                                 }
