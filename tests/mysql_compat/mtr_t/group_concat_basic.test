@@ -1,0 +1,37 @@
+--echo # GROUP_CONCAT basic tests
+
+CREATE TABLE t1 (grp INT, val VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'a'), (1, 'b'), (1, 'c');
+INSERT INTO t1 VALUES (2, 'x'), (2, 'y');
+INSERT INTO t1 VALUES (3, 'only');
+
+--echo # --- Basic GROUP_CONCAT ---
+SELECT grp, GROUP_CONCAT(val) FROM t1 GROUP BY grp ORDER BY grp;
+
+--echo # --- GROUP_CONCAT with custom separator ---
+SELECT grp, GROUP_CONCAT(val SEPARATOR '; ') FROM t1 GROUP BY grp ORDER BY grp;
+
+--echo # --- GROUP_CONCAT with empty separator ---
+SELECT grp, GROUP_CONCAT(val SEPARATOR '') FROM t1 GROUP BY grp ORDER BY grp;
+
+--echo # --- GROUP_CONCAT DISTINCT ---
+DROP TABLE t1;
+CREATE TABLE t1 (grp INT, val VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'a'), (1, 'a'), (1, 'b'), (1, 'b'), (1, 'c');
+INSERT INTO t1 VALUES (2, 'x'), (2, 'x');
+SELECT grp, GROUP_CONCAT(DISTINCT val) FROM t1 GROUP BY grp ORDER BY grp;
+
+--echo # --- GROUP_CONCAT with NULLs (should skip NULLs) ---
+DROP TABLE t1;
+CREATE TABLE t1 (grp INT, val VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'a'), (1, NULL), (1, 'b');
+INSERT INTO t1 VALUES (2, NULL), (2, NULL);
+SELECT grp, GROUP_CONCAT(val) FROM t1 GROUP BY grp ORDER BY grp;
+
+--echo # --- GROUP_CONCAT with integers ---
+DROP TABLE t1;
+CREATE TABLE t1 (grp INT, val INT);
+INSERT INTO t1 VALUES (1, 10), (1, 20), (1, 30);
+SELECT grp, GROUP_CONCAT(val) FROM t1 GROUP BY grp;
+
+DROP TABLE t1;

@@ -4,3 +4,4 @@ plan.md
 tests/mysql_compat/r/*.log
 __pycache__/
 stdin.log
+tests/mysql_compat/mtr_r/*.log

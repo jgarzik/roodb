@@ -4,7 +4,7 @@
 
 use super::{
     BinaryOp, JoinType, Literal, ResolvedColumn, ResolvedExpr, ResolvedSelect, ResolvedSelectItem,
-    ResolvedStatement, ResolvedTableRef, UnaryOp,
+    ResolvedStatement, ResolvedTableRef, UnaryOp, WindowFuncDesc,
 };
 use crate::catalog::DataType;
 
@@ -22,7 +22,15 @@ impl LogicalPlanBuilder {
             ResolvedStatement::Select(select) => Self::build_select(select),
             ResolvedStatement::Union { left, right, all } => {
                 let left_plan = Self::build_select(*left)?;
-                let right_plan = Self::build_select(*right)?;
+                let right_plan = match *right {
+                    ResolvedStatement::Select(s) => Self::build_select(s)?,
+                    ResolvedStatement::Union { .. } => Self::build(*right)?,
+                    _ => {
+                        return Err(crate::planner::error::PlannerError::InvalidPlan(
+                            "UNION right side must be SELECT or UNION".to_string(),
+                        ))
+                    }
+                };
                 Ok(LogicalPlan::Union {
                     left: Box::new(left_plan),
                     right: Box::new(right_plan),
@@ -34,16 +42,19 @@ impl LogicalPlanBuilder {
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             } => Ok(LogicalPlan::Insert {
                 table,
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             }),
             ResolvedStatement::InsertSelect {
                 table,
                 columns,
                 source,
+                column_map,
                 ignore,
             } => {
                 let source_plan = Self::build(*source)?;
@@ -51,6 +62,7 @@ impl LogicalPlanBuilder {
                     table,
                     columns,
                     source: Box::new(source_plan),
+                    column_map,
                     ignore,
                 })
             }
@@ -58,6 +70,8 @@ impl LogicalPlanBuilder {
                 table,
                 assignments,
                 filter,
+                order_by,
+                limit,
                 ..
             } => {
                 let assigns = assignments
@@ -68,11 +82,22 @@ impl LogicalPlanBuilder {
                     table,
                     assignments: assigns,
                     filter,
+                    order_by,
+                    limit,
                 })
             }
-            ResolvedStatement::Delete { table, filter, .. } => {
-                Ok(LogicalPlan::Delete { table, filter })
-            }
+            ResolvedStatement::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+                ..
+            } => Ok(LogicalPlan::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+            }),
             ResolvedStatement::CreateTable {
                 name,
                 columns,
@@ -222,7 +247,7 @@ impl LogicalPlanBuilder {
     }
 
     /// Build logical plan for SELECT statement
-    fn build_select(select: ResolvedSelect) -> PlannerResult<LogicalPlan> {
+    fn build_select(mut select: ResolvedSelect) -> PlannerResult<LogicalPlan> {
         // 1. Build scan for each table in FROM
         let mut plan = Self::build_from(&select.from)?;
 
@@ -238,34 +263,139 @@ impl LogicalPlanBuilder {
         }
 
         // 2. Apply WHERE filter
-        if let Some(filter) = select.filter {
+        if let Some(ref filter) = select.filter {
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
-                predicate: filter,
+                predicate: filter.clone(),
             };
         }
 
         // 3. Apply GROUP BY / aggregates
         let has_aggregates = Self::has_aggregates(&select.columns);
+        let mut all_aggs: Vec<(AggregateFunc, String)> = Vec::new();
         if !select.group_by.is_empty() || has_aggregates {
-            plan = Self::build_aggregate(plan, &select.group_by, &select.columns)?;
+            all_aggs = Self::collect_all_aggregates(&select.columns, select.having.as_ref());
 
-            // After aggregation, apply HAVING (with transformed aggregates)
-            if let Some(having) = select.having {
-                // Transform aggregate expressions in HAVING to column references
+            plan = Self::build_aggregate(
+                plan,
+                &select.group_by,
+                &select.columns,
+                select.having.as_ref(),
+            )?;
+
+            if let Some(ref having) = select.having {
                 let transformed_having =
-                    Self::transform_aggregates_in_expr(&having, &select.columns, &select.group_by);
+                    Self::transform_having_expr(having, &select.group_by, &all_aggs);
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: transformed_having,
                 };
             }
 
-            // After aggregation, build projection that maps to aggregate output columns
+            // After aggregation, build projection (window funcs get NULL placeholders)
             plan = Self::build_post_aggregate_project(plan, &select.columns, &select.group_by)?;
-        } else {
-            // 4. For non-aggregate queries: ORDER BY before Project
-            // so ORDER BY can access columns not in the SELECT list.
+        }
+
+        // 4. Detect and apply window functions AFTER aggregation
+        // This ensures aggregate results are available as column refs.
+        let mut window_funcs = Self::collect_window_functions(&select.columns);
+        if !window_funcs.is_empty() {
+            // If there was aggregation, rewrite aggregate refs inside window funcs'
+            // order_by and args to point to post-aggregate output columns.
+            if has_aggregates || !select.group_by.is_empty() {
+                for wf in &mut window_funcs {
+                    let (_, _, ref mut args, _, ref mut order_by, _) = wf;
+                    for arg in args.iter_mut() {
+                        *arg = Self::rewrite_agg_refs(arg, &select.group_by, &all_aggs);
+                    }
+                    for (ob_expr, _) in order_by.iter_mut() {
+                        *ob_expr = Self::rewrite_agg_refs(ob_expr, &select.group_by, &all_aggs);
+                    }
+                }
+            }
+
+            let num_input_cols = plan.output_columns().len();
+            plan = LogicalPlan::Window {
+                input: Box::new(plan),
+                window_funcs: window_funcs.clone(),
+            };
+
+            // Rewrite WindowFunction exprs in SELECT list to column refs
+            // pointing to the appended window output columns
+            for (wf_idx, (sel_idx, ..)) in window_funcs.iter().enumerate() {
+                if let Some(ResolvedSelectItem::Expr { expr, .. }) =
+                    select.columns.get_mut(*sel_idx)
+                {
+                    let col_idx = num_input_cols + wf_idx;
+                    let dt = expr.data_type();
+                    *expr = ResolvedExpr::Column(ResolvedColumn {
+                        table: String::new(),
+                        name: format!("__window_{}", wf_idx),
+                        index: col_idx,
+                        data_type: dt,
+                        nullable: true,
+                        default_value: None,
+                        is_outer_ref: false,
+                    });
+                }
+            }
+
+            // For aggregate+window queries, build a final projection that maps:
+            // - Non-window columns from their post-aggregate positions
+            // - Window columns from the appended positions after Window executor
+            if has_aggregates || !select.group_by.is_empty() {
+                let mut final_exprs = Vec::new();
+                for (idx, item) in select.columns.iter().enumerate() {
+                    let name = match item {
+                        ResolvedSelectItem::Expr { alias, expr, .. } => {
+                            alias.clone().unwrap_or_else(|| Self::expr_name(expr, idx))
+                        }
+                        ResolvedSelectItem::Columns(cols) => cols
+                            .first()
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| format!("col_{}", idx)),
+                    };
+                    match item {
+                        ResolvedSelectItem::Expr { expr, .. } => {
+                            // If this was rewritten to a Column ref (window), use it
+                            // Otherwise use the post-aggregate column index
+                            if matches!(expr, ResolvedExpr::Column(c) if c.name.starts_with("__window_"))
+                            {
+                                final_exprs.push((expr.clone(), name));
+                            } else {
+                                // Reference the post-aggregate output column by index
+                                let dt = expr.data_type();
+                                final_exprs.push((
+                                    ResolvedExpr::Column(ResolvedColumn {
+                                        table: String::new(),
+                                        name: name.clone(),
+                                        index: idx,
+                                        data_type: dt,
+                                        nullable: true,
+                                        default_value: None,
+                                        is_outer_ref: false,
+                                    }),
+                                    name,
+                                ));
+                            }
+                        }
+                        ResolvedSelectItem::Columns(cols) => {
+                            for col in cols {
+                                final_exprs
+                                    .push((ResolvedExpr::Column(col.clone()), col.name.clone()));
+                            }
+                        }
+                    }
+                }
+                plan = LogicalPlan::Project {
+                    input: Box::new(plan),
+                    expressions: final_exprs,
+                };
+            }
+        }
+
+        if !has_aggregates && select.group_by.is_empty() {
+            // 6. For non-aggregate queries: ORDER BY before Project
             if !select.order_by.is_empty() {
                 let order_by: Vec<_> = select
                     .order_by
@@ -278,7 +408,7 @@ impl LogicalPlanBuilder {
                 };
             }
 
-            // Apply projection (SELECT list)
+            // Apply projection (SELECT list) — now with window exprs already rewritten
             plan = Self::build_project(plan, &select.columns)?;
         }
 
@@ -375,6 +505,35 @@ impl LogicalPlanBuilder {
     }
 
     /// Check if select items contain aggregates
+    /// Collect window functions from SELECT items
+    fn collect_window_functions(columns: &[ResolvedSelectItem]) -> Vec<WindowFuncDesc> {
+        let mut result = Vec::new();
+        for (i, item) in columns.iter().enumerate() {
+            if let ResolvedSelectItem::Expr {
+                expr:
+                    ResolvedExpr::WindowFunction {
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        result_type,
+                    },
+                ..
+            } = item
+            {
+                result.push((
+                    i,
+                    name.clone(),
+                    args.clone(),
+                    partition_by.clone(),
+                    order_by.clone(),
+                    result_type.clone(),
+                ));
+            }
+        }
+        result
+    }
+
     fn has_aggregates(columns: &[ResolvedSelectItem]) -> bool {
         columns.iter().any(|item| match item {
             ResolvedSelectItem::Expr { expr, .. } => Self::expr_has_aggregate(expr),
@@ -382,20 +541,81 @@ impl LogicalPlanBuilder {
         })
     }
 
+    /// Check if a function name is a known aggregate function
+    fn is_aggregate_name(name: &str) -> bool {
+        matches!(
+            name,
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "BIT_AND"
+                | "BIT_OR"
+                | "BIT_XOR"
+                | "STDDEV"
+                | "STD"
+                | "STDDEV_POP"
+                | "STDDEV_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
+                | "VAR_SAMP"
+                | "ANY_VALUE"
+                | "GROUP_CONCAT"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
+        )
+    }
+
     /// Check if expression contains aggregate functions
     fn expr_has_aggregate(expr: &ResolvedExpr) -> bool {
         match expr {
-            ResolvedExpr::Function { name, .. } => {
+            ResolvedExpr::Function { name, args, .. } => {
                 let upper = name.to_uppercase();
-                matches!(
-                    upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
-                )
+                if Self::is_aggregate_name(&upper) {
+                    true
+                } else {
+                    args.iter().any(Self::expr_has_aggregate)
+                }
             }
             ResolvedExpr::BinaryOp { left, right, .. } => {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::IsNull { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Cast { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_aggregate(e))
+                    || conditions.iter().any(Self::expr_has_aggregate)
+                    || results.iter().any(Self::expr_has_aggregate)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_aggregate(e))
+            }
+            ResolvedExpr::InList { expr, list, .. } => {
+                Self::expr_has_aggregate(expr) || list.iter().any(Self::expr_has_aggregate)
+            }
+            ResolvedExpr::Between {
+                expr, low, high, ..
+            } => {
+                Self::expr_has_aggregate(expr)
+                    || Self::expr_has_aggregate(low)
+                    || Self::expr_has_aggregate(high)
+            }
+            ResolvedExpr::BooleanTest { expr, .. } => Self::expr_has_aggregate(expr),
+            // Scalar subqueries are self-contained; aggregates inside don't affect the outer query
+            ResolvedExpr::ScalarSubquery { .. } => false,
+            ResolvedExpr::InSubquery { expr, .. } => Self::expr_has_aggregate(expr),
+            // EXISTS subqueries are self-contained
+            ResolvedExpr::ExistsSubquery { .. } => false,
             _ => false,
         }
     }
@@ -405,6 +625,7 @@ impl LogicalPlanBuilder {
         input: LogicalPlan,
         group_by: &[ResolvedExpr],
         columns: &[ResolvedSelectItem],
+        having: Option<&ResolvedExpr>,
     ) -> PlannerResult<LogicalPlan> {
         let mut aggregates: Vec<(AggregateFunc, String)> = Vec::new();
 
@@ -414,6 +635,12 @@ impl LogicalPlanBuilder {
             if let ResolvedSelectItem::Expr { expr, alias } = item {
                 Self::collect_aggregates(expr, idx, alias.as_deref(), &mut aggregates);
             }
+        }
+
+        // Also collect aggregates from HAVING clause
+        if let Some(having_expr) = having {
+            let next_idx = columns.len();
+            Self::collect_aggregates(having_expr, next_idx, None, &mut aggregates);
         }
 
         Ok(LogicalPlan::Aggregate {
@@ -461,13 +688,63 @@ impl LogicalPlanBuilder {
             ResolvedExpr::Cast { expr: inner, .. } => {
                 Self::collect_aggregates(inner, idx, None, out);
             }
+            ResolvedExpr::IsNull { expr: inner, .. } => {
+                Self::collect_aggregates(inner, idx, None, out);
+            }
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_aggregates(op, idx, None, out);
+                }
+                for cond in conditions {
+                    Self::collect_aggregates(cond, idx, None, out);
+                }
+                for res in results {
+                    Self::collect_aggregates(res, idx, None, out);
+                }
+                if let Some(el) = else_result {
+                    Self::collect_aggregates(el, idx, None, out);
+                }
+            }
+            ResolvedExpr::InList { expr, list, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
+                for item in list {
+                    Self::collect_aggregates(item, idx, None, out);
+                }
+            }
+            ResolvedExpr::Between {
+                expr, low, high, ..
+            } => {
+                Self::collect_aggregates(expr, idx, None, out);
+                Self::collect_aggregates(low, idx, None, out);
+                Self::collect_aggregates(high, idx, None, out);
+            }
+            ResolvedExpr::BooleanTest { expr, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
+            }
+            // InSubquery: collect aggregates from the outer expr only (subquery is self-contained)
+            ResolvedExpr::InSubquery { expr, .. } => {
+                Self::collect_aggregates(expr, idx, None, out);
+            }
+            // ScalarSubquery and ExistsSubquery are self-contained, no outer aggregates to collect
             _ => {}
         }
     }
 
     /// Check if two AggregateFunc instances represent the same aggregate.
     fn aggregates_match_func(a: &AggregateFunc, b: &AggregateFunc) -> bool {
-        a.name == b.name && a.distinct == b.distinct && a.args.len() == b.args.len()
+        a.name == b.name
+            && a.distinct == b.distinct
+            && a.args.len() == b.args.len()
+            && a.args
+                .iter()
+                .zip(b.args.iter())
+                .all(|(x, y)| Self::exprs_equal(x, y))
     }
 
     /// Extract aggregate function from expression
@@ -478,18 +755,14 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => {
                 let upper = name.to_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
-                ) {
-                    Some(AggregateFunc::new(
-                        upper,
-                        args.clone(),
-                        *distinct,
-                        result_type.clone(),
-                    ))
+                if Self::is_aggregate_name(&upper) {
+                    let mut agg =
+                        AggregateFunc::new(upper, args.clone(), *distinct, result_type.clone());
+                    agg.separator = separator.clone();
+                    Some(agg)
                 } else {
                     None
                 }
@@ -554,8 +827,13 @@ impl LogicalPlanBuilder {
                     if Self::expr_has_aggregate(expr) {
                         // Rewrite the expression: replace aggregate sub-expressions
                         // with column references to the aggregate output
-                        let rewritten = Self::rewrite_agg_refs(expr, group_by.len(), &all_aggs);
+                        let rewritten = Self::rewrite_agg_refs(expr, group_by, &all_aggs);
                         expressions.push((rewritten, name));
+                    } else if matches!(expr, ResolvedExpr::WindowFunction { .. }) {
+                        // Window functions get a NULL placeholder — the real value
+                        // is computed by the Window executor and picked up by the
+                        // final projection after Window.
+                        expressions.push((ResolvedExpr::Literal(Literal::Null), name));
                     } else {
                         // Non-aggregate expression - check if it's a group-by column
                         if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
@@ -566,6 +844,8 @@ impl LogicalPlanBuilder {
                                 index: gb_idx,
                                 data_type: result_type,
                                 nullable: true,
+                                default_value: None,
+                                is_outer_ref: false,
                             });
                             expressions.push((col_ref, name));
                         } else {
@@ -589,13 +869,16 @@ impl LogicalPlanBuilder {
     }
 
     /// Rewrite an expression by replacing aggregate function calls with
-    /// column references to the aggregate output. For example,
+    /// column references to the aggregate output, and group-by column
+    /// references with their output indices. For example,
     /// `max(big) - 1` becomes `Column(agg_idx) - 1`.
     fn rewrite_agg_refs(
         expr: &ResolvedExpr,
-        group_by_len: usize,
+        group_by: &[ResolvedExpr],
         all_aggs: &[(AggregateFunc, String)],
     ) -> ResolvedExpr {
+        let group_by_len = group_by.len();
+
         // If this expression itself is a direct aggregate, replace it
         if let Some(agg) = Self::extract_aggregate(expr) {
             if let Some(pos) = all_aggs
@@ -610,8 +893,25 @@ impl LogicalPlanBuilder {
                     index: col_idx,
                     data_type: result_type,
                     nullable: true,
+                    default_value: None,
+                    is_outer_ref: false,
                 });
             }
+        }
+
+        // If this is a column reference that matches a group-by expression,
+        // rewrite it to point to the group-by output index.
+        if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
+            let result_type = Self::get_expr_type(expr);
+            return ResolvedExpr::Column(ResolvedColumn {
+                table: String::new(),
+                name: format!("gb_{}", gb_idx),
+                index: gb_idx,
+                data_type: result_type,
+                nullable: true,
+                default_value: None,
+                is_outer_ref: false,
+            });
         }
 
         // Recurse into sub-expressions
@@ -622,9 +922,9 @@ impl LogicalPlanBuilder {
                 right,
                 result_type,
             } => ResolvedExpr::BinaryOp {
-                left: Box::new(Self::rewrite_agg_refs(left, group_by_len, all_aggs)),
+                left: Box::new(Self::rewrite_agg_refs(left, group_by, all_aggs)),
                 op: *op,
-                right: Box::new(Self::rewrite_agg_refs(right, group_by_len, all_aggs)),
+                right: Box::new(Self::rewrite_agg_refs(right, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::UnaryOp {
@@ -633,16 +933,110 @@ impl LogicalPlanBuilder {
                 result_type,
             } => ResolvedExpr::UnaryOp {
                 op: *op,
-                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::Cast {
                 expr: inner,
                 target_type,
             } => ResolvedExpr::Cast {
-                expr: Box::new(Self::rewrite_agg_refs(inner, group_by_len, all_aggs)),
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
                 target_type: target_type.clone(),
             },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
+                negated: *negated,
+            },
+            ResolvedExpr::Function {
+                name,
+                args,
+                distinct,
+                result_type,
+                separator,
+            } => {
+                // Guard: do not recurse into aggregate function args.
+                // Aggregate args are evaluated pre-aggregation, not post-.
+                // If we reach here, the aggregate was not found in all_aggs
+                // (should not happen with correct exprs_equal), return as-is.
+                if Self::extract_aggregate(expr).is_some() {
+                    return expr.clone();
+                }
+                ResolvedExpr::Function {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::rewrite_agg_refs(a, group_by, all_aggs))
+                        .collect(),
+                    distinct: *distinct,
+                    result_type: result_type.clone(),
+                    separator: separator.clone(),
+                }
+            }
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_agg_refs(e, group_by, all_aggs))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::rewrite_agg_refs(c, group_by, all_aggs))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::rewrite_agg_refs(r, group_by, all_aggs))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_agg_refs(e, group_by, all_aggs))),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                list: list
+                    .iter()
+                    .map(|e| Self::rewrite_agg_refs(e, group_by, all_aggs))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                low: Box::new(Self::rewrite_agg_refs(low, group_by, all_aggs)),
+                high: Box::new(Self::rewrite_agg_refs(high, group_by, all_aggs)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::rewrite_agg_refs(expr, group_by, all_aggs)),
+                test: *test,
+            },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::rewrite_agg_refs(inner, group_by, all_aggs)),
+                query: query.clone(),
+                negated: *negated,
+            },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
             // For other expression types (Column, Literal, etc.), pass through
             other => other.clone(),
         }
@@ -659,6 +1053,8 @@ impl LogicalPlanBuilder {
                     "COUNT" => DataType::BigInt,
                     "SUM" => DataType::Double,
                     "AVG" => DataType::Double,
+                    "STDDEV" | "STD" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
+                    | "VAR_SAMP" => DataType::Double,
                     _ => result_type.clone(),
                 }
             }
@@ -693,18 +1089,16 @@ impl LogicalPlanBuilder {
             },
             ResolvedExpr::Function { result_type, .. } => result_type.clone(),
             ResolvedExpr::BinaryOp { result_type, .. } => result_type.clone(),
-            _ => DataType::Int,
+            other => other.data_type(),
         }
     }
 
     /// Find if an expression matches one in the group-by list
     fn find_in_group_by(expr: &ResolvedExpr, group_by: &[ResolvedExpr]) -> Option<usize> {
-        for (idx, gb_expr) in group_by.iter().enumerate() {
-            if Self::exprs_equal(expr, gb_expr) {
-                return Some(idx);
-            }
-        }
-        None
+        group_by
+            .iter()
+            .enumerate()
+            .find_map(|(idx, gb_expr)| Self::exprs_equal(expr, gb_expr).then_some(idx))
     }
 
     /// Check if two expressions are structurally equal
@@ -761,46 +1155,172 @@ impl LogicalPlanBuilder {
                     target_type: tb,
                 },
             ) => ta == tb && Self::exprs_equal(ea, eb),
+            (
+                ResolvedExpr::Case {
+                    operand: oa,
+                    conditions: ca,
+                    results: ra,
+                    else_result: ea,
+                    ..
+                },
+                ResolvedExpr::Case {
+                    operand: ob,
+                    conditions: cb,
+                    results: rb,
+                    else_result: eb,
+                    ..
+                },
+            ) => {
+                let operands_eq = match (oa.as_ref(), ob.as_ref()) {
+                    (Some(a), Some(b)) => Self::exprs_equal(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let else_eq = match (ea.as_ref(), eb.as_ref()) {
+                    (Some(a), Some(b)) => Self::exprs_equal(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                operands_eq
+                    && ca.len() == cb.len()
+                    && ra.len() == rb.len()
+                    && ca
+                        .iter()
+                        .zip(cb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+                    && ra
+                        .iter()
+                        .zip(rb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+                    && else_eq
+            }
+            (
+                ResolvedExpr::IsNull {
+                    expr: ea,
+                    negated: na,
+                },
+                ResolvedExpr::IsNull {
+                    expr: eb,
+                    negated: nb,
+                },
+            ) => na == nb && Self::exprs_equal(ea, eb),
+            (
+                ResolvedExpr::InList {
+                    expr: ea,
+                    list: la,
+                    negated: na,
+                },
+                ResolvedExpr::InList {
+                    expr: eb,
+                    list: lb,
+                    negated: nb,
+                },
+            ) => {
+                na == nb
+                    && Self::exprs_equal(ea, eb)
+                    && la.len() == lb.len()
+                    && la
+                        .iter()
+                        .zip(lb.iter())
+                        .all(|(x, y)| Self::exprs_equal(x, y))
+            }
+            (
+                ResolvedExpr::Between {
+                    expr: ea,
+                    low: la,
+                    high: ha,
+                    negated: na,
+                },
+                ResolvedExpr::Between {
+                    expr: eb,
+                    low: lb,
+                    high: hb,
+                    negated: nb,
+                },
+            ) => {
+                na == nb
+                    && Self::exprs_equal(ea, eb)
+                    && Self::exprs_equal(la, lb)
+                    && Self::exprs_equal(ha, hb)
+            }
+            (
+                ResolvedExpr::BooleanTest { expr: ea, test: ta },
+                ResolvedExpr::BooleanTest { expr: eb, test: tb },
+            ) => ta == tb && Self::exprs_equal(ea, eb),
+            // ExistsSubquery: compare by negation (queries are opaque here)
+            (
+                ResolvedExpr::ExistsSubquery { negated: na, .. },
+                ResolvedExpr::ExistsSubquery { negated: nb, .. },
+            ) => na == nb,
             _ => false,
         }
     }
 
-    /// Transform aggregate expressions in an expression tree to column references
-    /// Used for HAVING clauses where aggregates need to reference aggregate output
-    fn transform_aggregates_in_expr(
-        expr: &ResolvedExpr,
+    /// Collect all aggregates from SELECT columns and HAVING clause
+    fn collect_all_aggregates(
         columns: &[ResolvedSelectItem],
+        having: Option<&ResolvedExpr>,
+    ) -> Vec<(AggregateFunc, String)> {
+        let mut aggs = Vec::new();
+        for (idx, item) in columns.iter().enumerate() {
+            if let ResolvedSelectItem::Expr { expr, alias } = item {
+                Self::collect_aggregates(expr, idx, alias.as_deref(), &mut aggs);
+            }
+        }
+        if let Some(having_expr) = having {
+            let next_idx = columns.len();
+            Self::collect_aggregates(having_expr, next_idx, None, &mut aggs);
+        }
+        aggs
+    }
+
+    /// Transform HAVING expression using the full aggregates list
+    fn transform_having_expr(
+        expr: &ResolvedExpr,
         group_by: &[ResolvedExpr],
+        all_aggs: &[(AggregateFunc, String)],
     ) -> ResolvedExpr {
+        // Check if this expression is a direct aggregate
+        if let Some(agg) = Self::extract_aggregate(expr) {
+            if let Some(pos) = all_aggs
+                .iter()
+                .position(|(a, _)| Self::aggregates_match_func(a, &agg))
+            {
+                let col_idx = group_by.len() + pos;
+                let result_type = Self::get_aggregate_result_type(expr);
+                return ResolvedExpr::Column(ResolvedColumn {
+                    table: String::new(),
+                    name: all_aggs[pos].1.clone(),
+                    index: col_idx,
+                    data_type: result_type,
+                    nullable: true,
+                    default_value: None,
+                    is_outer_ref: false,
+                });
+            }
+        }
+        // Recurse into sub-expressions
         match expr {
-            ResolvedExpr::Function { name, args, .. } => {
-                let upper = name.to_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
-                ) {
-                    // This is an aggregate function - find its index in the aggregate output
-                    if let Some(agg_idx) = Self::find_aggregate_index(expr, columns) {
-                        let col_idx = group_by.len() + agg_idx;
-                        let result_type = Self::get_aggregate_result_type(expr);
-                        return ResolvedExpr::Column(ResolvedColumn {
-                            table: String::new(),
-                            name: upper,
-                            index: col_idx,
-                            data_type: result_type,
-                            nullable: true,
-                        });
-                    }
+            ResolvedExpr::Function {
+                name,
+                args,
+                distinct,
+                result_type,
+                separator,
+            } => {
+                // Guard: do not recurse into aggregate function args
+                if Self::extract_aggregate(expr).is_some() {
+                    return expr.clone();
                 }
-                // Non-aggregate function - transform arguments
                 ResolvedExpr::Function {
                     name: name.clone(),
                     args: args
                         .iter()
-                        .map(|a| Self::transform_aggregates_in_expr(a, columns, group_by))
+                        .map(|a| Self::transform_having_expr(a, group_by, all_aggs))
                         .collect(),
-                    distinct: false,
-                    result_type: Self::get_expr_type(expr),
+                    distinct: *distinct,
+                    result_type: result_type.clone(),
+                    separator: separator.clone(),
                 }
             }
             ResolvedExpr::BinaryOp {
@@ -809,9 +1329,9 @@ impl LogicalPlanBuilder {
                 right,
                 result_type,
             } => ResolvedExpr::BinaryOp {
-                left: Box::new(Self::transform_aggregates_in_expr(left, columns, group_by)),
+                left: Box::new(Self::transform_having_expr(left, group_by, all_aggs)),
                 op: *op,
-                right: Box::new(Self::transform_aggregates_in_expr(right, columns, group_by)),
+                right: Box::new(Self::transform_having_expr(right, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
             ResolvedExpr::UnaryOp {
@@ -820,45 +1340,95 @@ impl LogicalPlanBuilder {
                 result_type,
             } => ResolvedExpr::UnaryOp {
                 op: *op,
-                expr: Box::new(Self::transform_aggregates_in_expr(inner, columns, group_by)),
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
                 result_type: result_type.clone(),
             },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
+                negated: *negated,
+            },
             ResolvedExpr::Column(col) => {
-                // Check if this column is in the group-by list
                 if let Some(gb_idx) = Self::find_in_group_by(expr, group_by) {
                     ResolvedExpr::Column(ResolvedColumn {
                         table: String::new(),
-                        name: col.name.clone(),
+                        name: format!("gb_{}", gb_idx),
                         index: gb_idx,
                         data_type: col.data_type.clone(),
                         nullable: col.nullable,
+                        default_value: None,
+                        is_outer_ref: false,
                     })
                 } else {
                     expr.clone()
                 }
             }
-            // Other expressions pass through unchanged
-            _ => expr.clone(),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_having_expr(e, group_by, all_aggs))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::transform_having_expr(c, group_by, all_aggs))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::transform_having_expr(r, group_by, all_aggs))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_having_expr(e, group_by, all_aggs))),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                list: list
+                    .iter()
+                    .map(|e| Self::transform_having_expr(e, group_by, all_aggs))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                low: Box::new(Self::transform_having_expr(low, group_by, all_aggs)),
+                high: Box::new(Self::transform_having_expr(high, group_by, all_aggs)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::transform_having_expr(expr, group_by, all_aggs)),
+                test: *test,
+            },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::transform_having_expr(inner, group_by, all_aggs)),
+                query: query.clone(),
+                negated: *negated,
+            },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
+            other => other.clone(),
         }
-    }
-
-    /// Find the index of an aggregate function in the SELECT list
-    fn find_aggregate_index(
-        target: &ResolvedExpr,
-        columns: &[ResolvedSelectItem],
-    ) -> Option<usize> {
-        let mut agg_idx = 0usize;
-        for item in columns {
-            if let ResolvedSelectItem::Expr { expr, .. } = item {
-                if Self::expr_has_aggregate(expr) {
-                    if Self::aggregates_match(target, expr) {
-                        return Some(agg_idx);
-                    }
-                    agg_idx += 1;
-                }
-            }
-        }
-        None
     }
 
     /// Check if two aggregate expressions match (same function and arguments)
@@ -981,14 +1551,58 @@ impl LogicalPlanBuilder {
             ResolvedExpr::Cast {
                 expr, target_type, ..
             } => {
-                format!("CAST({} AS {:?})", Self::expr_to_sql(expr), target_type)
+                format!(
+                    "CAST({} AS {})",
+                    Self::expr_to_sql(expr),
+                    target_type.sql_name()
+                )
             }
             ResolvedExpr::UserVariable { name } => format!("@{}", name),
             ResolvedExpr::Case { .. } => "CASE".to_string(),
             ResolvedExpr::BooleanTest { expr, test } => {
                 format!("{} IS {:?}", Self::expr_to_sql(expr), test)
             }
-            _ => "expr".to_string(),
+            ResolvedExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let expr_sql = Self::expr_to_sql(expr);
+                let neg = if *negated { " NOT" } else { "" };
+                let items: Vec<String> = list.iter().map(Self::expr_to_sql).collect();
+                format!("{}{} IN ({})", expr_sql, neg, items.join(", "))
+            }
+            ResolvedExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!(
+                    "{}{} BETWEEN {} AND {}",
+                    Self::expr_to_sql(expr),
+                    neg,
+                    Self::expr_to_sql(low),
+                    Self::expr_to_sql(high)
+                )
+            }
+            ResolvedExpr::ScalarSubquery { .. } => "(SELECT ...)".to_string(),
+            ResolvedExpr::InSubquery { expr, negated, .. } => {
+                let neg = if *negated { " NOT" } else { "" };
+                format!("{}{} IN (SELECT ...)", Self::expr_to_sql(expr), neg)
+            }
+            ResolvedExpr::ExistsSubquery { negated, .. } => {
+                if *negated {
+                    "NOT EXISTS (SELECT ...)".to_string()
+                } else {
+                    "EXISTS (SELECT ...)".to_string()
+                }
+            }
+            ResolvedExpr::WindowFunction { name, args, .. } => {
+                let arg_strs: Vec<String> = args.iter().map(Self::expr_to_sql).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
         }
     }
 
@@ -1019,6 +1633,8 @@ impl LogicalPlanBuilder {
                             index: output_idx,
                             data_type: expr.data_type(),
                             nullable: true,
+                            default_value: None,
+                            is_outer_ref: false,
                         });
                     }
                     output_idx += 1;
@@ -1046,6 +1662,8 @@ impl LogicalPlanBuilder {
                                         index: output_idx,
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
+                                        default_value: None,
+                                        is_outer_ref: false,
                                     });
                                 }
                             }
@@ -1065,6 +1683,8 @@ impl LogicalPlanBuilder {
                                         index: output_idx,
                                         data_type: col.data_type.clone(),
                                         nullable: col.nullable,
+                                        default_value: None,
+                                        is_outer_ref: false,
                                     });
                                 }
                                 output_idx += 1;
@@ -1100,6 +1720,7 @@ impl LogicalPlanBuilder {
                 args,
                 distinct,
                 result_type,
+                separator,
             } => ResolvedExpr::Function {
                 name: name.clone(),
                 args: args
@@ -1108,7 +1729,84 @@ impl LogicalPlanBuilder {
                     .collect(),
                 distinct: *distinct,
                 result_type: result_type.clone(),
+                separator: separator.clone(),
             },
+            ResolvedExpr::IsNull {
+                expr: inner,
+                negated,
+            } => ResolvedExpr::IsNull {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                negated: *negated,
+            },
+            ResolvedExpr::Cast {
+                expr: inner,
+                target_type,
+            } => ResolvedExpr::Cast {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                target_type: target_type.clone(),
+            },
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                result_type,
+            } => ResolvedExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_to_output_columns(e, columns))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::transform_to_output_columns(c, columns))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::transform_to_output_columns(r, columns))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::transform_to_output_columns(e, columns))),
+                result_type: result_type.clone(),
+            },
+            ResolvedExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => ResolvedExpr::InList {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                list: list
+                    .iter()
+                    .map(|e| Self::transform_to_output_columns(e, columns))
+                    .collect(),
+                negated: *negated,
+            },
+            ResolvedExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => ResolvedExpr::Between {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                low: Box::new(Self::transform_to_output_columns(low, columns)),
+                high: Box::new(Self::transform_to_output_columns(high, columns)),
+                negated: *negated,
+            },
+            ResolvedExpr::BooleanTest { expr: inner, test } => ResolvedExpr::BooleanTest {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                test: *test,
+            },
+            // Subqueries are self-contained, pass through
+            ResolvedExpr::ScalarSubquery { .. } => expr.clone(),
+            ResolvedExpr::InSubquery {
+                expr: inner,
+                query,
+                negated,
+            } => ResolvedExpr::InSubquery {
+                expr: Box::new(Self::transform_to_output_columns(inner, columns)),
+                query: query.clone(),
+                negated: *negated,
+            },
+            ResolvedExpr::ExistsSubquery { .. } => expr.clone(),
             // Other expression types pass through unchanged
             _ => expr.clone(),
         }

@@ -72,5 +72,8 @@ pub async fn handle_connection(
         }
     }
 
+    // Release any advisory locks held by this connection
+    crate::server::locks::global_lock_manager().release_all_for_connection(connection_id);
+
     info!(%peer_addr, connection_id, "Client disconnected");
 }

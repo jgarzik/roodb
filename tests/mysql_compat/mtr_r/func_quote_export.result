@@ -1,0 +1,34 @@
+# QUOTE and EXPORT_SET
+# --- QUOTE ---
+SELECT QUOTE('hello');
+QUOTE('hello')
+'hello'
+SELECT QUOTE('');
+QUOTE('')
+''
+SELECT QUOTE(NULL);
+QUOTE(NULL)
+NULL
+SELECT QUOTE('it''s');
+QUOTE('it's')
+'it\'s'
+# --- EXPORT_SET ---
+SELECT EXPORT_SET(5, 'Y', 'N', ',', 4);
+EXPORT_SET(5,'Y','N',',',4)
+Y,N,Y,N
+SELECT EXPORT_SET(6, '1', '0', ',', 10);
+EXPORT_SET(6,'1','0',',',10)
+0,1,1,0,0,0,0,0,0,0
+SELECT EXPORT_SET(0, 'Y', 'N', ',', 4);
+EXPORT_SET(0,'Y','N',',',4)
+N,N,N,N
+SELECT EXPORT_SET(15, 'Y', 'N', ',', 4);
+EXPORT_SET(15,'Y','N',',',4)
+Y,Y,Y,Y
+SELECT EXPORT_SET(1, 'on', 'off', '-', 3);
+EXPORT_SET(1,'on','off','-',3)
+on-off-off
+# --- EXPORT_SET defaults ---
+SELECT EXPORT_SET(5, 'Y', 'N', ',', 8);
+EXPORT_SET(5,'Y','N',',',8)
+Y,N,Y,N,N,N,N,N

@@ -1,0 +1,147 @@
+#
+# Stored procedure cursor tests — DECLARE CURSOR, OPEN, FETCH, CLOSE, handlers
+#
+# [RooDB-skip] Labeled loops (read_loop: WHILE), LOOP/ITERATE/LEAVE
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+DROP PROCEDURE IF EXISTS p1;
+--enable_warnings
+
+--echo #
+--echo # Basic cursor — iterate all rows
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(50), PRIMARY KEY (id));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_id INT;
+  DECLARE v_val VARCHAR(50);
+  DECLARE total INT DEFAULT 0;
+  DECLARE cur CURSOR FOR SELECT id, val FROM t1 ORDER BY id;
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET done = 1;
+  OPEN cur;
+  WHILE done = 0 DO
+    FETCH cur INTO v_id, v_val;
+    IF done = 0 THEN
+      SET total = total + v_id;
+    END IF;
+  END WHILE;
+  CLOSE cur;
+  SET @cursor_total = total;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT @cursor_total;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # Cursor with parameterized WHERE — local var in cursor query
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN min_id INT)
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_val VARCHAR(50);
+  DECLARE result VARCHAR(200) DEFAULT '';
+  DECLARE cur CURSOR FOR SELECT val FROM t1 WHERE id >= min_id ORDER BY id;
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET done = 1;
+  OPEN cur;
+  WHILE done = 0 DO
+    FETCH cur INTO v_val;
+    IF done = 0 THEN
+      IF result = '' THEN
+        SET result = v_val;
+      ELSE
+        SET result = CONCAT(result, ',', v_val);
+      END IF;
+    END IF;
+  END WHILE;
+  CLOSE cur;
+  SET @cursor_vals = result;
+END|
+DELIMITER ;|
+CALL p1(2);
+SELECT @cursor_vals;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # Cursor collecting into a table
+--echo #
+CREATE TABLE t2 (val VARCHAR(50));
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_id INT;
+  DECLARE v_val VARCHAR(50);
+  DECLARE cur CURSOR FOR SELECT id, val FROM t1 ORDER BY id;
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET done = 1;
+  OPEN cur;
+  WHILE done = 0 DO
+    FETCH cur INTO v_id, v_val;
+    IF done = 0 THEN
+      INSERT INTO t2 VALUES (CONCAT(v_val, '_copy'));
+    END IF;
+  END WHILE;
+  CLOSE cur;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT * FROM t2 ORDER BY val;
+DROP PROCEDURE p1;
+DROP TABLE t1, t2;
+
+--echo #
+--echo # Cursor with single row
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(50), PRIMARY KEY (id));
+INSERT INTO t1 VALUES (99, 'only');
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_val VARCHAR(50);
+  DECLARE cur CURSOR FOR SELECT val FROM t1;
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET done = 1;
+  OPEN cur;
+  FETCH cur INTO v_val;
+  SET @single_val = v_val;
+  CLOSE cur;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT @single_val;
+DROP PROCEDURE p1;
+DROP TABLE t1;
+
+--echo #
+--echo # Cursor on empty table
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(50), PRIMARY KEY (id));
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE v_id INT;
+  DECLARE cnt INT DEFAULT 0;
+  DECLARE cur CURSOR FOR SELECT id FROM t1;
+  DECLARE CONTINUE HANDLER FOR SQLSTATE '02000' SET done = 1;
+  OPEN cur;
+  WHILE done = 0 DO
+    FETCH cur INTO v_id;
+    IF done = 0 THEN
+      SET cnt = cnt + 1;
+    END IF;
+  END WHILE;
+  CLOSE cur;
+  SET @empty_count = cnt;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT @empty_count;
+DROP PROCEDURE p1;
+DROP TABLE t1;

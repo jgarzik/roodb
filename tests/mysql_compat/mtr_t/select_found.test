@@ -1,0 +1,103 @@
+#
+# Trimmed from MySQL select_found.test for RooDB compatibility testing.
+# SQL_CALC_FOUND_ROWS is deprecated; test basic SELECT/COUNT/LIMIT patterns.
+#
+
+# [RooDB-skip] --source include/not_hypergraph.inc
+# [RooDB-skip] SQL_CALC_FOUND_ROWS / FOUND_ROWS() not supported
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# Basic SELECT with LIMIT
+#
+CREATE TABLE t1 (a int NOT NULL, b int NOT NULL, PRIMARY KEY(a));
+INSERT INTO t1 (a, b) VALUES (1,2),(2,3),(3,5),(4,5),(5,5),(6,6),(7,7),(8,9);
+
+SELECT * FROM t1;
+SELECT * FROM t1 LIMIT 1;
+SELECT * FROM t1 ORDER BY b DESC LIMIT 1;
+SELECT COUNT(*) FROM t1;
+
+SELECT DISTINCT b FROM t1 LIMIT 1;
+SELECT b, count(*) AS c FROM t1 GROUP BY b ORDER BY c DESC LIMIT 1;
+
+# LIMIT with OFFSET
+SELECT * FROM t1 LIMIT 10 OFFSET 100;
+
+DROP TABLE t1;
+
+#
+# Test with range optimization
+#
+CREATE TABLE t1 (a int NOT NULL PRIMARY KEY);
+INSERT INTO t1 VALUES (1),(2),(3),(4),(5);
+
+SELECT a FROM t1 WHERE a IN (1,2,3) ORDER BY a DESC LIMIT 0,2;
+SELECT a FROM t1 WHERE a IN (1,2,3) ORDER BY a+2 DESC LIMIT 0,2;
+SELECT COUNT(*) FROM t1 WHERE a IN (1,2,3);
+
+DROP TABLE t1;
+
+#
+# Test problem with impossible WHERE (Bug #1468)
+#
+CREATE TABLE t1 (id int, PRIMARY KEY (id));
+INSERT INTO t1 VALUES (1), (2), (3), (4), (5);
+
+SELECT * FROM t1 WHERE id > 3 LIMIT 0, 1;
+SELECT COUNT(*) FROM t1 WHERE id > 3;
+SELECT * FROM t1 WHERE id > 3 AND 1=2 LIMIT 0, 1;
+SELECT * FROM t1 WHERE id > 6 LIMIT 0, 1;
+SELECT COUNT(*) FROM t1 WHERE id > 6;
+
+DROP TABLE t1;
+
+#
+# Other bugs with range optimization (bug #2448)
+#
+CREATE TABLE t1 ( a int NOT NULL, b int NOT NULL, KEY ab(a,b) );
+INSERT INTO t1 VALUES ( 47, 1 );
+INSERT INTO t1 VALUES ( 70, 1 );
+SELECT * FROM t1
+WHERE
+(
+ ( b =1 AND a BETWEEN 14 AND 21 ) OR
+ ( b =2 AND a BETWEEN 16 AND 18 ) OR
+ ( b =3 AND a BETWEEN 15 AND 19 )
+);
+DROP TABLE t1;
+
+#
+# Bug #3738: we have a ref key
+#
+CREATE TABLE t1 (a VARCHAR(16), UNIQUE(a));
+INSERT INTO t1 VALUES ('1'), ('2'), ('3');
+SELECT * FROM t1 WHERE a = '2' LIMIT 0, 1;
+DROP TABLE t1;
+
+#
+# Bug #3845: group by, having and empty result
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (0), (0), (1), (2);
+SELECT * FROM t1 WHERE a = 0 GROUP BY a HAVING a > 10;
+DROP TABLE t1;
+
+#
+# Bug #6089: queries which do not use any tables
+#
+SELECT 'foo';
+
+#
+# Bug #7945: group by + distinct with constant expression + limit
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1,2), (1,3), (1,4), (1,5);
+SELECT DISTINCT 'a' FROM t1 GROUP BY b LIMIT 2;
+DROP TABLE t1;
+
+# [RooDB-skip] PREPARE/EXECUTE skipped
+# [RooDB-skip] UNION skipped

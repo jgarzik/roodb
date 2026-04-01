@@ -4,9 +4,13 @@
 
 use async_trait::async_trait;
 
+use std::sync::Arc;
+
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
+use crate::sql::resolver::parse_default_value;
 use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::txn::MvccStorage;
 
 use crate::server::session::UserVariables;
 
@@ -49,6 +53,10 @@ pub struct Insert {
     user_variables: UserVariables,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
+    /// ON DUPLICATE KEY UPDATE assignments: (column_index, new_value_expr)
+    on_duplicate: Vec<(usize, ResolvedExpr)>,
+    /// MVCC storage for reading existing rows on duplicate (None in tests)
+    mvcc: Option<Arc<MvccStorage>>,
 }
 
 impl Insert {
@@ -63,6 +71,8 @@ impl Insert {
         pk_column_indices: Vec<usize>,
         user_variables: UserVariables,
         ignore: bool,
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
+        mvcc: Option<Arc<MvccStorage>>,
     ) -> Self {
         Insert {
             table,
@@ -78,6 +88,8 @@ impl Insert {
             pk_column_indices,
             user_variables,
             ignore,
+            on_duplicate,
+            mvcc,
         }
     }
 
@@ -134,8 +146,20 @@ impl Executor for Insert {
                     Err(e) => return Err(e),
                 };
                 // Coerce value to match column type (e.g. Bytes → Bit)
+                // In non-strict mode (sql_mode lacks STRICT_TRANS_TABLES), clamp
+                // overflows to MIN/MAX with a warning instead of erroring.
                 let datum = if col_idx < self.columns.len() {
-                    super::eval::coerce_to_column_type(datum, &self.columns[col_idx].data_type)
+                    let col_type = &self.columns[col_idx].data_type;
+                    match super::eval::coerce_to_column_type(datum.clone(), col_type) {
+                        Ok(d) => d,
+                        Err(super::error::ExecutorError::DataOutOfRange(_))
+                            if !super::eval::is_strict_trans_tables(&self.user_variables) =>
+                        {
+                            // Non-strict mode: clamp overflow to type boundary
+                            super::eval::clamp_to_type_boundary(&datum, col_type)
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     datum
                 };
@@ -154,9 +178,14 @@ impl Executor for Insert {
             // Use the low 48 bits (local counter) as the auto_increment value
             let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() && datums[idx].is_null() {
-                    datums[idx] = super::datum::Datum::Int(auto_id as i64);
-                    self.last_insert_id = auto_id;
+                if idx < datums.len() {
+                    // MySQL: both NULL and 0 trigger auto_increment
+                    let should_generate =
+                        datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
+                    if should_generate {
+                        datums[idx] = super::datum::Datum::Int(auto_id as i64);
+                        self.last_insert_id = auto_id;
+                    }
                 }
             }
 
@@ -171,9 +200,13 @@ impl Executor for Insert {
                     && datum.is_null()
                 {
                     if is_multi_row || self.ignore {
-                        // Non-strict mode / IGNORE: replace NULL with type default
-                        *datum =
-                            super::datum::Datum::default_for_type(&self.columns[col_idx].data_type);
+                        // Non-strict mode / IGNORE: prefer column DEFAULT, fall back to type default
+                        *datum = if let Some(ref default_expr) = self.columns[col_idx].default_value
+                        {
+                            super::datum::Datum::from_literal(&parse_default_value(default_expr))
+                        } else {
+                            super::datum::Datum::default_for_type(&self.columns[col_idx].data_type)
+                        };
                     } else {
                         return Err(super::error::ExecutorError::NullValue(format!(
                             "Column '{}' cannot be null",
@@ -196,16 +229,86 @@ impl Executor for Insert {
             } else {
                 encode_row_key(&self.table, row_id)
             };
+
             let value = encode_row(&row);
 
             // Collect the change for Raft replication.
-            // Data is written to storage in apply() after Raft commit.
-            // This ensures Raft-as-WAL: no writes until consensus.
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
                 super::error::ExecutorError::Internal(
                     "INSERT requires transaction context".to_string(),
                 )
             })?;
+
+            // Check for duplicate: intra-batch buffer or existing storage
+            let is_duplicate = if !self.pk_column_indices.is_empty() {
+                if ctx.has_buffered_key(&key) {
+                    true
+                } else if !self.on_duplicate.is_empty() {
+                    // Check storage for existing row (needed for ODKU)
+                    if let Some(ref mvcc) = self.mvcc {
+                        mvcc.inner().get(&key).await.ok().flatten().is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_duplicate && !self.on_duplicate.is_empty() {
+                // ON DUPLICATE KEY UPDATE: read existing row, apply updates
+                let existing_data = match ctx.get_buffered(&key) {
+                    Some(Some(data)) => Some(data.clone()),
+                    _ => {
+                        // Read from raw storage — strip MVCC header
+                        if let Some(ref mvcc) = self.mvcc {
+                            let storage = mvcc.inner();
+                            storage.get(&key).await.ok().flatten().and_then(|raw| {
+                                use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
+                                if raw.len() > MVCC_HEADER_SIZE && !is_mvcc_tombstone(&raw) {
+                                    Some(raw[MVCC_HEADER_SIZE..].to_vec())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(data) = existing_data {
+                    if let Ok(mut existing_row) = super::encoding::decode_row(&data) {
+                        // Apply each ON DUPLICATE KEY UPDATE assignment
+                        for (col_idx, expr) in &self.on_duplicate {
+                            let new_val = evaluate(expr, &existing_row, &self.user_variables)?;
+                            if *col_idx < existing_row.len() {
+                                existing_row.set(*col_idx, new_val)?;
+                            }
+                        }
+                        let updated_value = encode_row(&existing_row);
+                        ctx.add_change(RowChange::update(
+                            &self.table,
+                            key.clone(),
+                            updated_value.clone(),
+                        ));
+                        ctx.buffer_write(key, updated_value);
+                        self.rows_inserted += 1;
+                        continue 'row_loop;
+                    }
+                }
+                // Fallback: insert normally if we couldn't read existing row
+            } else if is_duplicate {
+                if self.ignore {
+                    continue 'row_loop;
+                }
+                return Err(super::error::ExecutorError::DuplicateKey(format!(
+                    "Duplicate entry for key 'PRIMARY' in table '{}'",
+                    self.table
+                )));
+            }
+
             ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
             // Buffer for read-your-writes within this transaction
             ctx.buffer_write(key, value);
@@ -230,6 +333,10 @@ impl Executor for Insert {
             .as_mut()
             .map(|ctx| ctx.take_changes())
             .unwrap_or_default()
+    }
+
+    fn is_ignore_duplicates(&self) -> bool {
+        self.ignore
     }
 }
 
@@ -259,6 +366,8 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             },
             ResolvedColumn {
                 table: "users".to_string(),
@@ -266,6 +375,8 @@ mod tests {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             },
         ];
 
@@ -285,6 +396,8 @@ mod tests {
             vec![0], // id is PK at index 0
             empty_vars(),
             false,
+            vec![],
+            None,
         );
         insert.open().await.unwrap();
 

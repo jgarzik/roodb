@@ -13,6 +13,7 @@ use crate::txn::MvccStorage;
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
+use super::datum::Datum;
 use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
@@ -29,6 +30,12 @@ pub struct Update {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    /// ORDER BY expressions for UPDATE ... ORDER BY ... LIMIT
+    order_by: Vec<(ResolvedExpr, bool)>,
+    /// LIMIT for UPDATE ... LIMIT n
+    limit: Option<usize>,
+    /// Primary key column indices (positions in the full table row)
+    pk_column_indices: Vec<usize>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility and versioning)
@@ -41,32 +48,106 @@ pub struct Update {
     user_variables: UserVariables,
 }
 
+/// Parameters for creating an Update executor.
+pub struct UpdateParams {
+    pub table: String,
+    pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
+    pub filter: Option<ResolvedExpr>,
+    pub key_value: Option<ResolvedExpr>,
+    pub order_by: Vec<(ResolvedExpr, bool)>,
+    pub limit: Option<usize>,
+    pub pk_column_indices: Vec<usize>,
+    pub mvcc: Arc<MvccStorage>,
+    pub txn_context: Option<TransactionContext>,
+    pub user_variables: UserVariables,
+}
+
 impl Update {
     /// Create a new update executor
-    pub fn new(
-        table: String,
-        assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
-        filter: Option<ResolvedExpr>,
-        key_value: Option<ResolvedExpr>,
-        mvcc: Arc<MvccStorage>,
-        txn_context: Option<TransactionContext>,
-        user_variables: UserVariables,
-    ) -> Self {
+    pub fn new(p: UpdateParams) -> Self {
         Update {
-            table,
-            assignments,
-            filter,
-            key_value,
-            mvcc,
-            txn_context,
+            table: p.table,
+            assignments: p.assignments,
+            filter: p.filter,
+            key_value: p.key_value,
+            order_by: p.order_by,
+            limit: p.limit,
+            pk_column_indices: p.pk_column_indices,
+            mvcc: p.mvcc,
+            txn_context: p.txn_context,
             rows_updated: 0,
             done: false,
-            user_variables,
+            user_variables: p.user_variables,
         }
     }
 }
 
 impl Update {
+    /// Emit the correct Raft changes for an updated row.
+    ///
+    /// If a PK column was modified, the storage key changes:
+    /// we must delete the old key and insert at the new key.
+    /// Otherwise, emit a normal update at the same key.
+    fn emit_row_change(
+        &mut self,
+        old_key: Vec<u8>,
+        row: &Row,
+        row_version: u64,
+    ) -> ExecutorResult<()> {
+        let new_value = encode_row(row);
+
+        // Compute new PK-based key from updated row values
+        let new_key = if !self.pk_column_indices.is_empty() {
+            let pk_values: Vec<_> = self
+                .pk_column_indices
+                .iter()
+                .map(|&idx| row.get(idx).unwrap().clone())
+                .collect();
+            encode_pk_key(&self.table, &pk_values)
+        } else {
+            old_key.clone()
+        };
+
+        let ctx = self.txn_context.as_mut().ok_or_else(|| {
+            super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
+        })?;
+
+        if new_key != old_key {
+            // PK changed: check for duplicate at the new key
+            if ctx.has_buffered_key(&new_key) {
+                return Err(super::error::ExecutorError::DuplicateKey(format!(
+                    "Duplicate entry for key 'PRIMARY' in table '{}'",
+                    self.table
+                )));
+            }
+            // Delete old key, insert at new key
+            ctx.add_change(RowChange::delete_with_version(
+                &self.table,
+                old_key.clone(),
+                row_version,
+            ));
+            ctx.buffer_delete(old_key);
+            ctx.add_change(RowChange::insert(
+                &self.table,
+                new_key.clone(),
+                new_value.clone(),
+            ));
+            ctx.buffer_write(new_key, new_value);
+        } else {
+            // Same key: normal update
+            ctx.add_change(RowChange::update_with_version(
+                &self.table,
+                old_key.clone(),
+                new_value.clone(),
+                row_version,
+            ));
+            ctx.buffer_write(old_key, new_value);
+        }
+
+        self.rows_updated += 1;
+        Ok(())
+    }
+
     /// PointGet fast path: O(1) single-key lookup + update
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
@@ -98,18 +179,10 @@ impl Update {
                 if new_value.is_null() && !col.nullable {
                     new_value = super::datum::Datum::default_for_type(&col.data_type);
                 }
+                new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            let new_value = encode_row(&row);
-            let ctx = self.txn_context.as_mut().unwrap();
-            ctx.add_change(RowChange::update_with_version(
-                &self.table,
-                storage_key.clone(),
-                new_value.clone(),
-                row_version,
-            ));
-            ctx.buffer_write(storage_key, new_value);
-            self.rows_updated += 1;
+            self.emit_row_change(storage_key, &row, row_version)?;
         }
 
         Ok(())
@@ -134,36 +207,63 @@ impl Update {
                 .collect()
         };
 
+        // Collect matching rows (with keys for later update)
+        let mut matching: Vec<(Vec<u8>, Vec<u8>, u64, Row)> = Vec::new();
         for (key, value, row_version) in kv_pairs {
-            let mut row = decode_row(&value)?;
+            let row = decode_row(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
                     continue;
                 }
             }
+            matching.push((key, value, row_version, row));
+        }
+
+        // Apply ORDER BY if present — precompute sort keys to propagate eval errors
+        if !self.order_by.is_empty() {
+            let order_by = &self.order_by;
+            let user_vars = &self.user_variables;
+            let mut sort_keys: Vec<Vec<Datum>> = Vec::with_capacity(matching.len());
+            for (_key, _val, _ver, row) in &matching {
+                let mut keys = Vec::with_capacity(order_by.len());
+                for (expr, _asc) in order_by {
+                    keys.push(evaluate(expr, row, user_vars)?);
+                }
+                sort_keys.push(keys);
+            }
+            let mut indices: Vec<usize> = (0..matching.len()).collect();
+            indices.sort_by(|&ai, &bi| {
+                for (i, (_expr, asc)) in order_by.iter().enumerate() {
+                    let ord = sort_keys[ai][i]
+                        .partial_cmp(&sort_keys[bi][i])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if *asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            matching = indices.into_iter().map(|i| matching[i].clone()).collect();
+        }
+
+        // Apply LIMIT if present
+        if let Some(limit) = self.limit {
+            matching.truncate(limit);
+        }
+
+        // Perform the updates
+        for (key, _value, row_version, mut row) in matching {
             for (col, expr) in &self.assignments {
                 let mut new_value = evaluate(expr, &row, &self.user_variables)?;
-                // MySQL: SET col=NULL on NOT NULL column → use default value
                 if new_value.is_null() && !col.nullable {
                     new_value = super::datum::Datum::default_for_type(&col.data_type);
                 }
+                new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            let new_value = encode_row(&row);
-            let ctx = self.txn_context.as_mut().ok_or_else(|| {
-                super::error::ExecutorError::Internal(
-                    "UPDATE requires transaction context".to_string(),
-                )
-            })?;
-            ctx.add_change(RowChange::update_with_version(
-                &self.table,
-                key.clone(),
-                new_value.clone(),
-                row_version,
-            ));
-            ctx.buffer_write(key, new_value);
-            self.rows_updated += 1;
+            self.emit_row_change(key, &row, row_version)?;
         }
 
         Ok(())
@@ -338,6 +438,8 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -351,21 +453,26 @@ mod tests {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             },
             ResolvedExpr::Literal(Literal::String("alice_updated".to_string())),
         )];
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut update = Update::new(
-            "users".to_string(),
+        let mut update = Update::new(UpdateParams {
+            table: "users".to_string(),
             assignments,
-            Some(filter),
-            None,
+            filter: Some(filter),
+            key_value: None,
+            order_by: vec![],
+            limit: None,
+            pk_column_indices: vec![0], // id is PK at index 0
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         update.open().await.unwrap();
 
         let result = update.next().await.unwrap().unwrap();
@@ -376,5 +483,86 @@ mod tests {
         // Verify changes were collected (data written via Raft apply, not directly)
         let changes = update.take_changes();
         assert_eq!(changes.len(), 1);
+        // Non-PK update: single Update change at same key
+        assert_eq!(changes[0].op, crate::raft::ChangeOp::Update);
+    }
+
+    #[tokio::test]
+    async fn test_update_pk_column_recomputes_key() {
+        use crate::executor::context::TransactionContext;
+        use crate::raft::ChangeOp;
+        use crate::txn::ReadView;
+
+        // Setup: row with id=1 (PK), name="alice"
+        let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
+
+        let initial = vec![(
+            encode_pk_key("users", &[Datum::Int(1)]),
+            encode_with_mvcc_header(0, &encode_row(&row1)),
+        )];
+
+        let storage = Arc::new(MockStorage::new(initial));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
+
+        // UPDATE users SET id = 10 WHERE id = 1  (PK change!)
+        let filter = ResolvedExpr::BinaryOp {
+            left: Box::new(ResolvedExpr::Column(ResolvedColumn {
+                table: "users".to_string(),
+                name: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int,
+                nullable: false,
+                default_value: None,
+                is_outer_ref: false,
+            })),
+            op: BinaryOp::Eq,
+            right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
+            result_type: DataType::Boolean,
+        };
+
+        let assignments = vec![(
+            ResolvedColumn {
+                table: "users".to_string(),
+                name: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int,
+                nullable: false,
+                default_value: None,
+                is_outer_ref: false,
+            },
+            ResolvedExpr::Literal(Literal::Integer(10)),
+        )];
+
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut update = Update::new(UpdateParams {
+            table: "users".to_string(),
+            assignments,
+            filter: Some(filter),
+            key_value: None,
+            order_by: vec![],
+            limit: None,
+            pk_column_indices: vec![0], // id is PK at index 0
+            mvcc,
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
+        update.open().await.unwrap();
+
+        let result = update.next().await.unwrap().unwrap();
+        assert_eq!(result.get(0).unwrap().as_int(), Some(1)); // 1 row updated
+
+        update.close().await.unwrap();
+
+        let changes = update.take_changes();
+        // PK changed: should produce DELETE(old_key) + INSERT(new_key) = 2 changes
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].op, ChangeOp::Delete);
+        assert_eq!(changes[0].key, encode_pk_key("users", &[Datum::Int(1)]));
+        assert_eq!(changes[1].op, ChangeOp::Insert);
+        assert_eq!(changes[1].key, encode_pk_key("users", &[Datum::Int(10)]));
     }
 }

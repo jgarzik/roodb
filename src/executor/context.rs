@@ -82,6 +82,11 @@ impl TransactionContext {
         std::mem::take(&mut self.changes)
     }
 
+    /// Check if a key exists in the write buffer (for duplicate detection)
+    pub fn has_buffered_key(&self, key: &[u8]) -> bool {
+        matches!(self.write_buffer.get(key), Some(Some(_)))
+    }
+
     /// Buffer a write for read-your-writes semantics
     pub fn buffer_write(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.write_buffer.insert(key, Some(value));

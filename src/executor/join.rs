@@ -292,6 +292,8 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Column(ResolvedColumn {
@@ -300,6 +302,8 @@ mod tests {
                 index: 2,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             result_type: DataType::Boolean,
         };
@@ -356,6 +360,8 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Column(ResolvedColumn {
@@ -364,6 +370,8 @@ mod tests {
                 index: 1,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             result_type: DataType::Boolean,
         };

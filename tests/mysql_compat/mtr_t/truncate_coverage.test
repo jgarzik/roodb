@@ -1,0 +1,72 @@
+#
+# Adapted from MySQL truncate_coverage.test for RooDB.
+# Original tests HANDLER, LOCK TABLE, DEBUG_SYNC, KILL QUERY, multi-connection —
+# none of which RooDB supports. We extract the basic TRUNCATE TABLE semantics.
+#
+
+# [RooDB-skip] --source include/have_debug_sync.inc
+# [RooDB-skip] SET DEBUG_SYNC='RESET' — not supported
+# [RooDB-skip] --let $MYSQLD_DATADIR — not supported
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+#
+# Basic TRUNCATE from Bug#20667 context
+#
+CREATE TABLE t1 (c1 INT);
+INSERT INTO t1 VALUES (1);
+SELECT * FROM t1;
+TRUNCATE TABLE t1;
+SELECT * FROM t1;
+
+# [RooDB-skip] HANDLER t1 OPEN — HANDLER not supported
+# [RooDB-skip] --connect (con1, ...) — multi-connection not supported
+# [RooDB-skip] LOCK TABLE t1 WRITE — LOCK TABLES not supported
+# [RooDB-skip] SET DEBUG_SYNC='mdl_upgrade_lock SIGNAL waiting' — not supported
+# [RooDB-skip] KILL QUERY @id — not supported
+# [RooDB-skip] --error ER_QUERY_INTERRUPTED — not supported
+# [RooDB-skip] UNLOCK TABLES — not supported
+
+DROP TABLE t1;
+
+#
+# Second TRUNCATE scenario: verify table is empty after truncate
+#
+CREATE TABLE t1 (c1 INT);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t1 VALUES (2);
+SELECT count(*) FROM t1;
+TRUNCATE TABLE t1;
+SELECT count(*) FROM t1;
+
+# [RooDB-skip] START TRANSACTION + multi-connection MDL test — not supported
+# [RooDB-skip] --connect / --disconnect — not supported
+# [RooDB-skip] SET DEBUG_SYNC / KILL QUERY pattern — not supported
+
+DROP TABLE t1;
+
+#
+# Verify TRUNCATE resets auto-increment behavior
+#
+CREATE TABLE t1 (c1 INT NOT NULL PRIMARY KEY);
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT * FROM t1;
+TRUNCATE TABLE t1;
+INSERT INTO t1 VALUES (1), (2);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# TRUNCATE on table with multiple columns
+#
+CREATE TABLE t1 (c1 INT, c2 VARCHAR(20), c3 DECIMAL(10,2));
+INSERT INTO t1 VALUES (1, 'hello', 3.14);
+INSERT INTO t1 VALUES (2, 'world', 2.72);
+SELECT * FROM t1;
+TRUNCATE TABLE t1;
+SELECT * FROM t1;
+INSERT INTO t1 VALUES (10, 'after', 99.99);
+SELECT * FROM t1;
+DROP TABLE t1;

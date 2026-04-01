@@ -1,0 +1,481 @@
+DROP TABLE IF EXISTS t1,t2;
+CREATE TABLE t1(
+product VARCHAR(32),
+country_id INTEGER NOT NULL,
+year INTEGER,
+profit INTEGER);
+INSERT INTO t1  VALUES ( 'Computer', 2,2000, 1200),
+( 'TV', 1, 1999, 150),
+( 'Calculator', 1, 1999,50),
+( 'Computer', 1, 1999,1500),
+( 'Computer', 1, 2000,1500),
+( 'TV', 1, 2000, 150),
+( 'TV', 2, 2000, 100),
+( 'TV', 2, 2000, 100),
+( 'Calculator', 1, 2000,75),
+( 'Calculator', 2, 2000,75),
+( 'TV', 1, 1999, 100),
+( 'Computer', 1, 1999,1200),
+( 'Computer', 2, 2000,1500),
+( 'Calculator', 2, 2000,75),
+( 'Phone', 3, 2003,10)
+;
+CREATE TABLE t2 (
+country_id INTEGER PRIMARY KEY,
+country CHAR(20) NOT NULL);
+INSERT INTO t2 VALUES (1, 'USA'),(2,'India'), (3,'Finland');
+SELECT product, SUM(profit) FROM t1 GROUP BY product;
+product	SUM(profit)
+Calculator	275
+Computer	6900
+Phone	10
+TV	600
+SELECT product, SUM(profit), AVG(profit) FROM t1 GROUP BY product;
+product	SUM(profit)	AVG(profit)
+Calculator	275	68.75
+Computer	6900	1380
+Phone	10	10
+TV	600	120
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year;
+product	country_id	year	SUM(profit)
+Calculator	1	1999	50
+Calculator	1	2000	75
+Calculator	2	2000	150
+Computer	1	1999	2700
+Computer	1	2000	1500
+Computer	2	2000	2700
+Phone	3	2003	10
+TV	1	1999	250
+TV	1	2000	150
+TV	2	2000	200
+SELECT product, country_id, SUM(profit) FROM t1
+GROUP BY product, country_id
+ORDER BY product, country_id;
+product	country_id	SUM(profit)
+Calculator	1	125
+Calculator	2	150
+Computer	1	4200
+Computer	2	2700
+Phone	3	10
+TV	1	400
+TV	2	200
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year
+ORDER BY product, country_id, year
+LIMIT 5;
+product	country_id	year	SUM(profit)
+Calculator	1	1999	50
+Calculator	1	2000	75
+Calculator	2	2000	150
+Computer	1	1999	2700
+Computer	1	2000	1500
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year
+ORDER BY product, country_id, year
+LIMIT 3 OFFSET 3;
+product	country_id	year	SUM(profit)
+Computer	1	1999	2700
+Computer	1	2000	1500
+Computer	2	2000	2700
+SELECT product, country_id, COUNT(*), COUNT(DISTINCT year)
+FROM t1 GROUP BY product, country_id;
+product	country_id	COUNT(NULL)	COUNT(year)
+Calculator	1	2	2
+Calculator	2	2	1
+Computer	1	3	2
+Computer	2	2	1
+Phone	3	1	1
+TV	1	3	2
+TV	2	2	1
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year HAVING country_id = 1
+ORDER BY product, year;
+product	country_id	year	SUM(profit)
+Calculator	1	1999	50
+Calculator	1	2000	75
+Computer	1	1999	2700
+Computer	1	2000	1500
+TV	1	1999	250
+TV	1	2000	150
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year HAVING SUM(profit) > 200;
+product	country_id	year	SUM(profit)
+Computer	1	1999	2700
+Computer	1	2000	1500
+Computer	2	2000	2700
+TV	1	1999	250
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year HAVING SUM(profit) > 7000;
+product	country_id	year	SUM(profit)
+SELECT CONCAT(product,':',country_id) AS prod, CONCAT(":",year,":") AS yr,
+1+1, SUM(profit)/COUNT(*) FROM t1 GROUP BY CONCAT(product,':',country_id), CONCAT(":",year,":");
+prod	yr	1 + 1	SUM(profit) / COUNT(NULL)
+Calculator:1	:1999:	2	50
+Calculator:1	:2000:	2	75
+Calculator:2	:2000:	2	75
+Computer:1	:1999:	2	1350
+Computer:1	:2000:	2	1500
+Computer:2	:2000:	2	1350
+Phone:3	:2003:	2	10
+TV:1	:1999:	2	125
+TV:1	:2000:	2	150
+TV:2	:2000:	2	100
+SELECT product, SUM(profit)/COUNT(*) FROM t1 GROUP BY product;
+product	SUM(profit) / COUNT(NULL)
+Calculator	68.75
+Computer	1380
+Phone	10
+TV	120
+SELECT LEFT(product,4) AS prod, SUM(profit)/COUNT(*) FROM t1
+GROUP BY prod;
+prod	SUM(profit) / COUNT(NULL)
+Calc	68.75
+Comp	1380
+Phon	10
+TV	120
+SELECT CONCAT(product,':',country_id), 1+1, SUM(profit)/COUNT(*) FROM t1
+GROUP BY CONCAT(product,':',country_id);
+CONCAT(product,':',country_id)	1 + 1	SUM(profit) / COUNT(NULL)
+Calculator:1	2	62.5
+Calculator:2	2	75
+Computer:1	2	1400
+Computer:2	2	1350
+Phone:3	2	10
+TV:1	2	133.333333333333343
+TV:2	2	100
+SELECT product, country, year, SUM(profit) FROM t1,t2 WHERE
+t1.country_id=t2.country_id GROUP BY product, country, year
+ORDER BY product, country, year;
+product	country	year	SUM(profit)
+Calculator	India	2000	150
+Calculator	USA	1999	50
+Calculator	USA	2000	75
+Computer	India	2000	2700
+Computer	USA	1999	2700
+Computer	USA	2000	1500
+Phone	Finland	2003	10
+TV	India	2000	200
+TV	USA	1999	250
+TV	USA	2000	150
+SELECT product, `SUM` FROM (SELECT product, SUM(profit) AS 'sum' FROM t1
+GROUP BY product) AS tmp
+WHERE product = 'Computer';
+product	SUM
+Computer	6900
+SELECT product, country_id, year, SUM(profit) FROM t1
+GROUP BY product, country_id, year HAVING country_id IS NULL;
+product	country_id	year	SUM(profit)
+SELECT CONCAT(':',product,':'), SUM(profit), AVG(profit) FROM t1
+GROUP BY product
+ORDER BY product;
+CONCAT(':',product,':')	SUM(profit)	AVG(profit)
+:Calculator:	275	68.75
+:Computer:	6900	1380
+:Phone:	10	10
+:TV:	600	120
+drop table t1,t2;
+CREATE TABLE t1 (i int);
+INSERT INTO t1 VALUES(100);
+CREATE TABLE t2 (i int);
+INSERT INTO t2 VALUES (100),(200);
+SELECT i, COUNT(*) FROM t1 GROUP BY i;
+i	COUNT(NULL)
+100	1
+SELECT t1.i, t2.i, COUNT(*) FROM t1,t2 GROUP BY t1.i,t2.i ORDER BY t1.i, t2.i;
+i	i	COUNT(NULL)
+100	100	1
+100	200	1
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES
+(1,4),
+(2,2), (2,2),
+(4,1), (4,1), (4,1), (4,1),
+(2,1), (2,1);
+SELECT SUM(b) FROM t1 GROUP BY a;
+SUM(b)
+4
+4
+6
+SELECT DISTINCT SUM(b) FROM t1 GROUP BY a;
+SUM(b)
+4
+6
+SELECT SUM(b), COUNT(DISTINCT b) FROM t1 GROUP BY a;
+SUM(b)	COUNT(b)
+4	1
+4	1
+6	2
+SELECT DISTINCT SUM(b), COUNT(DISTINCT b) FROM t1 GROUP BY a;
+SUM(b)	COUNT(b)
+4	1
+6	2
+SELECT SUM(b), COUNT(*) FROM t1 GROUP BY a;
+SUM(b)	COUNT(NULL)
+4	1
+4	4
+6	4
+SELECT DISTINCT SUM(b), COUNT(*) FROM t1 GROUP BY a;
+SUM(b)	COUNT(NULL)
+4	1
+4	4
+6	4
+SELECT SUM(b), COUNT(DISTINCT b), COUNT(*) FROM t1 GROUP BY a;
+SUM(b)	COUNT(b)	COUNT(NULL)
+4	1	1
+4	1	4
+6	2	4
+SELECT DISTINCT SUM(b), COUNT(DISTINCT b), COUNT(*) FROM t1
+GROUP BY a;
+SUM(b)	COUNT(b)	COUNT(NULL)
+4	1	1
+4	1	4
+6	2	4
+SELECT a, SUM(b) FROM t1 GROUP BY a,b;
+a	SUM(b)
+1	4
+2	2
+2	4
+4	4
+SELECT DISTINCT a, SUM(b) FROM t1 GROUP BY a,b;
+a	SUM(b)
+1	4
+2	2
+2	4
+4	4
+SELECT b, a, SUM(b) FROM t1 GROUP BY a,b;
+b	a	SUM(b)
+1	2	2
+1	4	4
+2	2	4
+4	1	4
+SELECT DISTINCT b, a, SUM(b) FROM t1 GROUP BY a,b;
+b	a	SUM(b)
+1	2	2
+1	4	4
+2	2	4
+4	1	4
+DROP TABLE t1;
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES
+(1,4),
+(2,2), (2,2),
+(4,1), (4,1), (4,1), (4,1),
+(2,1), (2,1);
+SELECT a, SUM(b) FROM t1 GROUP BY a ORDER BY a LIMIT 1;
+a	SUM(b)
+1	4
+DROP TABLE t1;
+CREATE TABLE t1 (a int NOT NULL);
+INSERT INTO t1 VALUES (1),(2);
+SELECT a, SUM(a) m FROM t1 GROUP BY a;
+a	m
+1	1
+2	2
+SELECT * FROM ( SELECT a, SUM(a) m FROM t1 GROUP BY a ) t2;
+a	m
+1	1
+2	2
+DROP TABLE t1;
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1),(2);
+SELECT a, SUM(a), SUM(a)+1 FROM t1 GROUP BY a ORDER BY a;
+a	SUM(a)	SUM(a) + 1
+1	1	2
+2	2	3
+DROP TABLE t1;
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1),(2);
+SELECT a, a+1, SUM(a) FROM t1 GROUP BY a ORDER BY a;
+a	a + 1	SUM(a)
+1	2	1
+2	3	2
+SELECT a+1 FROM t1 GROUP BY a ORDER BY a;
+a + 1
+2
+3
+SELECT a+SUM(a) FROM t1 GROUP BY a ORDER BY a;
+a + SUM(a)
+2
+4
+SELECT a, a+1 as b FROM t1 GROUP BY a HAVING b > 2 ORDER BY a;
+a	b
+2	3
+SELECT IFNULL(a, 'TEST') FROM t1 GROUP BY a ORDER BY a;
+IFNULL(a,'TEST')
+1
+2
+CREATE TABLE t2 (a int, b int);
+INSERT INTO t2 VALUES
+(1,4),
+(2,2), (2,2),
+(4,1), (4,1), (4,1), (4,1),
+(2,1), (2,1);
+SELECT a,b,SUM(b) FROM t2 GROUP BY a,b ORDER BY a,b;
+a	b	SUM(b)
+1	4	4
+2	1	2
+2	2	4
+4	1	4
+SELECT IFNULL(a, 'TEST'), COALESCE(b, 'TEST') FROM t2
+GROUP BY a, b ORDER BY a, b;
+IFNULL(a,'TEST')	COALESCE(b,'TEST')
+1	4
+2	1
+2	2
+4	1
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a int NOT NULL);
+INSERT INTO t1 VALUES (1),(2);
+SELECT * FROM (SELECT a, a + 1, COUNT(*) FROM t1 GROUP BY a) t ORDER BY a;
+a	a + 1	COUNT(NULL)
+1	2	1
+2	3	1
+SELECT * FROM (SELECT a, LENGTH(CAST(a AS CHAR)), COUNT(*) FROM t1 GROUP BY a) t ORDER BY a;
+a	LENGTH(CAST(a AS CHAR(1)))	COUNT(NULL)
+1	1	1
+2	1	1
+DROP TABLE t1;
+CREATE TABLE t1 ( a VARCHAR(9), b INT );
+INSERT INTO t1 VALUES('a',1),(NULL,2);
+SELECT a, MAX(b) FROM t1 GROUP BY a ORDER BY a;
+a	MAX(b)
+NULL	2
+a	1
+SELECT DISTINCT a, MAX(b) FROM t1 GROUP BY a ORDER BY a;
+a	MAX(b)
+NULL	2
+a	1
+DROP TABLE t1;
+CREATE TABLE t1 (a VARCHAR(22) NOT NULL , b INT);
+INSERT INTO t1 VALUES ("2006-07-01 21:30", 1), ("2006-07-01 23:30", 10);
+SELECT LEFT(a,10), a, SUM(b) FROM t1 GROUP BY 1,2;
+LEFT(a,10)	a	SUM(b)
+2006-07-01	2006-07-01 21:30	1
+2006-07-01	2006-07-01 23:30	10
+SELECT LEFT(a,10) x, a, SUM(b) FROM t1 GROUP BY x,a;
+x	a	SUM(b)
+2006-07-01	2006-07-01 21:30	1
+2006-07-01	2006-07-01 23:30	10
+DROP TABLE t1;
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1
+VALUES (2,10),(3,30),(2,40),(1,10),(2,30),(1,20),(2,10);
+SELECT a, SUM(b) FROM t1 GROUP BY a;
+a	SUM(b)
+1	30
+2	90
+3	30
+SELECT DISTINCT a, SUM(b) FROM t1 GROUP BY a;
+a	SUM(b)
+1	30
+2	90
+3	30
+SELECT a, b, COUNT(*) FROM t1 GROUP BY a,b;
+a	b	COUNT(NULL)
+1	10	1
+1	20	1
+2	10	2
+2	30	1
+2	40	1
+3	30	1
+SELECT DISTINCT a, b, COUNT(*) FROM t1 GROUP BY a,b;
+a	b	COUNT(NULL)
+1	10	1
+1	20	1
+2	10	2
+2	30	1
+2	40	1
+3	30	1
+SELECT 'x', a, SUM(b) FROM t1 GROUP BY 1,2;
+'x'	a	SUM(b)
+x	1	30
+x	2	90
+x	3	30
+SELECT DISTINCT 'x', a, SUM(b) FROM t1 GROUP BY 1,2;
+'x'	a	SUM(b)
+x	1	30
+x	2	90
+x	3	30
+DROP TABLE t1;
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (3), (1), (4), (1), (3), (1), (1);
+SELECT * FROM (SELECT a, SUM(a) FROM t1 GROUP BY a) as t ORDER BY a;
+a	SUM(a)
+1	4
+3	6
+4	4
+DROP TABLE t1;
+CREATE TABLE t1(a int);
+INSERT INTO t1 VALUES (1),(2),(3);
+SELECT COUNT(a) FROM t1 GROUP BY NULL;
+COUNT(a)
+3
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY);
+INSERT INTO t1 VALUES (1), (2);
+CREATE TABLE t2 (b INT);
+INSERT INTO t2 VALUES (100);
+SELECT a, b FROM t1, t2 GROUP BY a, b;
+a	b
+1	100
+2	100
+SELECT DISTINCT b FROM t1, t2 GROUP BY a, b;
+b
+100
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a INT);
+CREATE TABLE t2 (b INT);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (1);
+SELECT b FROM t1, t2 GROUP BY a, b;
+b
+1
+SELECT DISTINCT b FROM t1, t2 GROUP BY a, b;
+b
+1
+DROP TABLE t1, t2;
+CREATE TABLE t1 (a DECIMAL(6,3));
+INSERT INTO t1 VALUES (1.1);
+SELECT a FROM t1 GROUP BY a;
+a
+1.1
+DROP TABLE t1;
+CREATE TABLE t1 (f1 INTEGER,f2 INTEGER);
+INSERT INTO t1 VALUES (1,10),(1,20),(2,NULL),(2,NULL),(3,50);
+SELECT f1, SUM(f2) FROM t1 GROUP BY f1 HAVING SUM(f2) > 0 ORDER BY f1;
+f1	SUM(f2)
+1	30
+3	50
+DROP TABLE t1;
+CREATE TABLE t1 ( i INTEGER NOT NULL PRIMARY KEY );
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT DISTINCT i FROM t1 WHERE i = 1 GROUP BY i;
+i
+1
+DROP TABLE t1;
+CREATE TABLE t1 (f1 INTEGER PRIMARY KEY);
+INSERT INTO t1 values (1);
+SELECT CONCAT(INSTR(f1,'w')) FROM t1 GROUP BY f1;
+CONCAT(INSTR(f1,'w'))
+0
+DROP TABLE t1;
+CREATE TABLE t1 (a INTEGER, b INTEGER);
+INSERT INTO t1 VALUES (2020, 2);
+CREATE TABLE t2 (b INTEGER);
+INSERT INTO t2 VALUES (2);
+SELECT a FROM t1 JOIN t2 ON t1.b = t2.b GROUP BY a;
+a
+2020
+DROP TABLE t1, t2;
+CREATE TABLE t (x INTEGER);
+INSERT INTO t VALUES (NULL), (0), (1), (2), (3);
+SELECT DISTINCT x AS a, x AS b FROM t GROUP BY a, b;
+a	b
+0	0
+1	1
+2	2
+3	3
+NULL	NULL
+DROP TABLE t;

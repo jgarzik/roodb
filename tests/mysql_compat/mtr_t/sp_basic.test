@@ -1,0 +1,222 @@
+#
+# Stored procedure basic tests — core CREATE/DROP/CALL, params, control flow, DML
+#
+# [RooDB-skip] LOOP/ITERATE/LEAVE, REPEAT/UNTIL, SIGNAL/RESIGNAL,
+#   DECLARE CONDITION, recursive procedures, nested CALL, multi-result SELECTs
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+DROP PROCEDURE IF EXISTS p1;
+--enable_warnings
+
+--echo #
+--echo # Basic CREATE and CALL — no parameters
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  SET @x = 42;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT @x;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # DROP PROCEDURE IF EXISTS on non-existent — should succeed silently
+--echo #
+DROP PROCEDURE IF EXISTS no_such_proc;
+
+--echo #
+--echo # IN parameter
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN val INT)
+BEGIN
+  SET @out_val = val;
+END|
+DELIMITER ;|
+CALL p1(99);
+SELECT @out_val;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # OUT parameter
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN a INT, IN b INT, OUT result INT)
+BEGIN
+  SET result = a + b;
+END|
+DELIMITER ;|
+SET @answer = 0;
+CALL p1(3, 7, @answer);
+SELECT @answer;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # INOUT parameter
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(INOUT x INT)
+BEGIN
+  SET x = x * 2;
+END|
+DELIMITER ;|
+SET @val = 5;
+CALL p1(@val);
+SELECT @val;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # DECLARE with DEFAULT
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  DECLARE msg VARCHAR(50) DEFAULT 'hello';
+  SET @out_msg = msg;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT @out_msg;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # IF / ELSEIF / ELSE
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN n INT)
+BEGIN
+  IF n > 0 THEN
+    SET @sign = 'positive';
+  ELSEIF n < 0 THEN
+    SET @sign = 'negative';
+  ELSE
+    SET @sign = 'zero';
+  END IF;
+END|
+DELIMITER ;|
+CALL p1(5);
+SELECT @sign;
+CALL p1(-3);
+SELECT @sign;
+CALL p1(0);
+SELECT @sign;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # WHILE loop
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE total INT DEFAULT 0;
+  WHILE i < n DO
+    SET i = i + 1;
+    SET total = total + i;
+  END WHILE;
+  SET @result = total;
+END|
+DELIMITER ;|
+CALL p1(10);
+SELECT @result;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # CASE statement (searched form)
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN d INT)
+BEGIN
+  CASE
+    WHEN d = 1 THEN SET @dtype = 'Monday';
+    WHEN d = 7 THEN SET @dtype = 'Sunday';
+    ELSE SET @dtype = 'other';
+  END CASE;
+END|
+DELIMITER ;|
+CALL p1(1);
+SELECT @dtype;
+CALL p1(7);
+SELECT @dtype;
+CALL p1(3);
+SELECT @dtype;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # Procedure with DML — INSERT
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  INSERT INTO t1 VALUES (1, 'hello');
+  INSERT INTO t1 VALUES (2, 'world');
+END|
+DELIMITER ;|
+CALL p1();
+SELECT * FROM t1 ORDER BY id;
+DROP PROCEDURE p1;
+
+--echo #
+--echo # Procedure with DML — UPDATE and DELETE
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1()
+BEGIN
+  UPDATE t1 SET val = 'updated' WHERE id = 1;
+  DELETE FROM t1 WHERE id = 2;
+END|
+DELIMITER ;|
+CALL p1();
+SELECT * FROM t1 ORDER BY id;
+DROP PROCEDURE p1;
+DROP TABLE t1;
+
+--echo #
+--echo # DECLARE local var + use in DML
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+DELIMITER |;
+CREATE PROCEDURE p1(IN p_id INT, IN p_val TEXT)
+BEGIN
+  DECLARE local_id INT DEFAULT 0;
+  SET local_id = p_id;
+  INSERT INTO t1 VALUES (local_id, p_val);
+END|
+DELIMITER ;|
+CALL p1(42, 'test');
+SELECT * FROM t1;
+DROP PROCEDURE p1;
+DROP TABLE t1;
+
+--echo #
+--echo # SELECT ... INTO variable
+--echo #
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta');
+DELIMITER |;
+CREATE PROCEDURE p1(IN p_id INT)
+BEGIN
+  SELECT val INTO @fetched FROM t1 WHERE id = p_id;
+END|
+DELIMITER ;|
+CALL p1(2);
+SELECT @fetched;
+DROP PROCEDURE p1;
+DROP TABLE t1;
+
+--echo #
+--echo # Multiple parameters with mixed types
+--echo #
+DELIMITER |;
+CREATE PROCEDURE p1(IN a INT, IN b VARCHAR(50), OUT c VARCHAR(100))
+BEGIN
+  SET c = CONCAT(b, ': ', a);
+END|
+DELIMITER ;|
+CALL p1(42, 'answer', @msg);
+SELECT @msg;
+DROP PROCEDURE p1;

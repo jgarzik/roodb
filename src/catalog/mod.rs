@@ -42,6 +42,10 @@ pub enum DataType {
     Timestamp,
     /// Fixed-point decimal with precision and scale
     Decimal { precision: u8, scale: u8 },
+    /// Spatial geometry (stored as WKB binary)
+    Geometry,
+    /// JSON document
+    Json,
 }
 
 impl DataType {
@@ -75,7 +79,31 @@ impl DataType {
 
     /// Check if this type is a string type
     pub fn is_string(&self) -> bool {
-        matches!(self, DataType::Varchar(_) | DataType::Text)
+        matches!(self, DataType::Varchar(_) | DataType::Text | DataType::Json)
+    }
+
+    /// Return the MySQL-compatible SQL name for use in CAST column headers.
+    pub fn sql_name(&self) -> String {
+        match self {
+            DataType::Boolean => "BOOLEAN".to_string(),
+            DataType::TinyInt => "TINYINT".to_string(),
+            DataType::SmallInt => "SMALLINT".to_string(),
+            DataType::Int => "INT".to_string(),
+            DataType::BigInt => "BIGINT".to_string(),
+            DataType::BigIntUnsigned => "unsigned".to_string(),
+            DataType::Float => "FLOAT".to_string(),
+            DataType::Double => "DOUBLE".to_string(),
+            DataType::Varchar(n) => format!("CHAR({})", n),
+            DataType::Text => "CHAR".to_string(),
+            DataType::Blob => "BINARY".to_string(),
+            DataType::Bit(w) => format!("BIT({})", w),
+            DataType::Timestamp => "DATETIME".to_string(),
+            DataType::Decimal { precision, scale } => {
+                format!("DECIMAL({},{})", precision, scale)
+            }
+            DataType::Geometry => "GEOMETRY".to_string(),
+            DataType::Json => "JSON".to_string(),
+        }
     }
 }
 
@@ -137,6 +165,7 @@ pub enum Constraint {
     Unique(Vec<String>),
     /// Foreign key constraint
     ForeignKey {
+        name: Option<String>,
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
@@ -252,12 +281,14 @@ pub struct ProcedureParam {
     pub mode: ParamMode,
 }
 
-/// Stored procedure definition
+/// Stored procedure / function definition
 #[derive(Debug, Clone)]
 pub struct ProcedureDef {
     pub name: String,
     pub params: Vec<ProcedureParam>,
     pub body_sql: String,
+    /// For CREATE FUNCTION: return type (e.g. "BIGINT"). None for procedures.
+    pub returns_type: Option<String>,
 }
 
 /// View definition
@@ -265,6 +296,34 @@ pub struct ProcedureDef {
 pub struct ViewDef {
     pub name: String,
     pub query_sql: String,
+}
+
+/// Trigger timing (BEFORE or AFTER)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// Trigger event (INSERT, UPDATE, DELETE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Trigger definition — stores the parsed body as an AST statement
+#[derive(Debug, Clone)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table_name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    /// The trigger body as a parsed sqlparser Statement
+    pub body: sqlparser::ast::Statement,
+    /// Original SQL for SHOW CREATE TRIGGER
+    pub create_sql: String,
 }
 
 /// Catalog error
@@ -366,6 +425,8 @@ pub struct Catalog {
     procedures: HashMap<String, ProcedureDef>,
     /// Views by name
     views: HashMap<String, ViewDef>,
+    /// Triggers by name
+    triggers: HashMap<String, TriggerDef>,
 }
 
 impl Catalog {
@@ -380,6 +441,7 @@ impl Catalog {
             databases,
             procedures: HashMap::new(),
             views: HashMap::new(),
+            triggers: HashMap::new(),
         }
     }
 
@@ -508,6 +570,32 @@ impl Catalog {
             for col in cols {
                 if def.get_column(col).is_none() {
                     return Err(CatalogError::ColumnNotFound(def.name.clone(), col.clone()));
+                }
+            }
+        }
+
+        // Validate FK ref_table and ref_columns exist
+        for constraint in &def.constraints {
+            if let Constraint::ForeignKey {
+                ref_table,
+                ref_columns,
+                ..
+            } = constraint
+            {
+                if let Some(ref_def) = self.tables.get(ref_table) {
+                    for rc in ref_columns {
+                        if ref_def.get_column(rc).is_none() {
+                            return Err(CatalogError::InvalidConstraint(format!(
+                                "Foreign key references non-existent column '{}' in table '{}'",
+                                rc, ref_table
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(CatalogError::InvalidConstraint(format!(
+                        "Foreign key references non-existent table '{}'",
+                        ref_table
+                    )));
                 }
             }
         }
@@ -663,6 +751,11 @@ impl Catalog {
         self.procedures.clear();
     }
 
+    /// List all stored procedures
+    pub fn list_procedures(&self) -> Vec<&ProcedureDef> {
+        self.procedures.values().collect()
+    }
+
     // ============ View operations ============
 
     /// Create a view
@@ -683,11 +776,14 @@ impl Catalog {
 
     /// Drop a view
     pub fn drop_view(&mut self, name: &str, if_exists: bool) -> CatalogResult<()> {
-        if self.views.remove(name).is_none() && !if_exists {
-            return Err(CatalogError::ViewNotFound(name.to_string()));
+        match self.views.remove(name) {
+            Some(_) => {
+                self.schema_version += 1;
+                Ok(())
+            }
+            None if if_exists => Ok(()),
+            None => Err(CatalogError::ViewNotFound(name.to_string())),
         }
-        self.schema_version += 1;
-        Ok(())
     }
 
     /// Get a view definition
@@ -698,6 +794,54 @@ impl Catalog {
     /// Check if a view exists
     pub fn view_exists(&self, name: &str) -> bool {
         self.views.contains_key(name)
+    }
+
+    /// Register a view directly (used during catalog rebuild from system tables)
+    pub fn register_view(&mut self, def: ViewDef) {
+        self.views.insert(def.name.clone(), def);
+    }
+
+    /// Clear all views (used before catalog rebuild)
+    pub fn clear_views(&mut self) {
+        self.views.clear();
+    }
+
+    /// Get all view names in current database
+    pub fn get_view_names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
+    }
+
+    // ============ Trigger operations ============
+
+    /// Create a trigger
+    pub fn create_trigger(&mut self, def: TriggerDef) {
+        self.triggers.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// Drop a trigger
+    pub fn drop_trigger(&mut self, name: &str) -> CatalogResult<()> {
+        if self.triggers.remove(name).is_none() {
+            return Err(CatalogError::ViewNotFound(format!(
+                "Trigger '{}' not found",
+                name
+            )));
+        }
+        self.schema_version += 1;
+        Ok(())
+    }
+
+    /// Get triggers for a specific table, timing, and event
+    pub fn get_triggers(
+        &self,
+        table_name: &str,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+    ) -> Vec<&TriggerDef> {
+        self.triggers
+            .values()
+            .filter(|t| t.table_name == table_name && t.timing == timing && t.event == event)
+            .collect()
     }
 }
 
@@ -782,6 +926,7 @@ mod tests {
             .column(ColumnDef::new("status", DataType::Varchar(50)))
             .constraint(Constraint::PrimaryKey(vec!["id".to_string()]))
             .constraint(Constraint::ForeignKey {
+                name: Some("fk_user".to_string()),
                 columns: vec!["user_id".to_string()],
                 ref_table: "users".to_string(),
                 ref_columns: vec!["id".to_string()],

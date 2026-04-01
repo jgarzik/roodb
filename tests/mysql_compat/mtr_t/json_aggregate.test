@@ -1,0 +1,20 @@
+--echo # JSON aggregate functions
+
+CREATE TABLE t1 (grp INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alice'), (1, 'bob'), (2, 'carol');
+
+--echo # --- JSON_ARRAYAGG ---
+SELECT grp, JSON_ARRAYAGG(val) FROM t1 GROUP BY grp ORDER BY grp;
+
+DROP TABLE t1;
+
+--echo # --- JSON_ARRAYAGG with integers ---
+CREATE TABLE t2 (grp INT, val INT);
+INSERT INTO t2 VALUES (1, 10), (1, 20), (2, 30);
+SELECT grp, JSON_ARRAYAGG(val) FROM t2 GROUP BY grp ORDER BY grp;
+DROP TABLE t2;
+
+--echo # --- JSON functions combined ---
+SELECT JSON_TYPE(JSON_EXTRACT('{"a": [1, 2, 3]}', '$.a'));
+SELECT JSON_LENGTH(JSON_EXTRACT('{"a": [1, 2, 3]}', '$.a'));
+SELECT JSON_VALID(JSON_OBJECT('key', JSON_ARRAY(1, 2)));

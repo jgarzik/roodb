@@ -309,3 +309,97 @@ async fn test_multiple_aggregates() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// Regression test: COUNT(expr) from LEFT JOIN should not count NULLs.
+/// When a LEFT JOIN produces NULL for unmatched rows, COUNT(column_from_right_table)
+/// should return 0 for groups with no matches, not count the NULL rows.
+#[tokio::test]
+async fn test_count_expr_null_left_join() {
+    let server = TestServer::start("count_lj").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE count_lj_t1 (a INT)")
+        .await
+        .expect("CREATE TABLE t1 failed");
+
+    conn.query_drop("CREATE TABLE count_lj_t2 (a INT, b INT)")
+        .await
+        .expect("CREATE TABLE t2 failed");
+
+    // t1 has values 1, 2, 3
+    conn.query_drop("INSERT INTO count_lj_t1 (a) VALUES (1), (2), (3)")
+        .await
+        .expect("INSERT t1 failed");
+
+    // t2 only has rows matching a=1 and a=2
+    conn.query_drop("INSERT INTO count_lj_t2 (a, b) VALUES (1, 10), (1, 20), (2, 30)")
+        .await
+        .expect("INSERT t2 failed");
+
+    // LEFT JOIN: a=3 has no match in t2, so t2.b is NULL for that group
+    // COUNT(t2.b) should skip NULLs: a=1->2, a=2->1, a=3->0
+    // COUNT(*) should count all rows: a=1->2, a=2->1, a=3->1
+    let rows: Vec<(i32, i64, i64)> = conn
+        .query(
+            "SELECT t1.a, COUNT(t2.b), COUNT(*) FROM count_lj_t1 t1 LEFT JOIN count_lj_t2 t2 ON t1.a = t2.a GROUP BY t1.a ORDER BY t1.a",
+        )
+        .await
+        .expect("COUNT with LEFT JOIN failed");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], (1, 2, 2)); // a=1: two matching rows
+    assert_eq!(rows[1], (2, 1, 1)); // a=2: one matching row
+    assert_eq!(rows[2], (3, 0, 1)); // a=3: no match, COUNT(t2.b)=0, COUNT(*)=1
+
+    conn.query_drop("DROP TABLE count_lj_t2")
+        .await
+        .expect("DROP TABLE t2 failed");
+    conn.query_drop("DROP TABLE count_lj_t1")
+        .await
+        .expect("DROP TABLE t1 failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+/// Regression test: aggregate functions inside CASE WHEN expressions
+/// must be recognized and handled by the aggregate executor.
+#[tokio::test]
+async fn test_aggregate_inside_case_when() {
+    let server = TestServer::start("agg_case").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE agg_case_tbl (id INT, max_req INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO agg_case_tbl (id, max_req) VALUES (1, 3), (2, 3), (3, 3), (4, 2), (5, 2)",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // COUNT(*) inside CASE WHEN condition
+    let rows: Vec<(i64, i32)> = conn
+        .query("SELECT CASE WHEN COUNT(*) < max_req THEN 1 ELSE 0 END AS flag, max_req FROM agg_case_tbl GROUP BY max_req ORDER BY max_req")
+        .await
+        .expect("CASE WHEN COUNT(*) failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (0, 2)); // COUNT(*)=2, 2<2 is false -> 0
+    assert_eq!(rows[1], (0, 3)); // COUNT(*)=3, 3<3 is false -> 0
+
+    // SUM() inside CASE WHEN condition
+    let rows: Vec<(String, i32)> = conn
+        .query("SELECT CASE WHEN SUM(id) > max_req THEN 'yes' ELSE 'no' END AS result, max_req FROM agg_case_tbl GROUP BY max_req ORDER BY max_req")
+        .await
+        .expect("CASE WHEN SUM() failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "yes"); // SUM(id)=9, 9>2 -> yes
+    assert_eq!(rows[1].0, "yes"); // SUM(id)=6, 6>3 -> yes
+
+    conn.query_drop("DROP TABLE agg_case_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}

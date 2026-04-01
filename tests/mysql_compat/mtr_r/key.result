@@ -1,0 +1,51 @@
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (
+ID CHAR(32) NOT NULL,
+name CHAR(32) NOT NULL,
+value CHAR(255),
+INDEX indexIDname (ID, name)
+);
+INSERT INTO t1 VALUES ('keyword', 'indexdir', '/path/to/indexes');
+INSERT INTO t1 VALUES ('keyword', 'urlprefix', 'text/ /text');
+INSERT INTO t1 VALUES ('emailgids', 'indexdir', '/path/to/email');
+INSERT INTO t1 VALUES ('emailgids', 'attr', 'personal employee');
+SELECT value FROM t1 WHERE ID = 'emailgids' AND name = 'attr' ORDER BY value;
+value
+personal employee
+DROP TABLE t1;
+CREATE TABLE t1 (
+SEQNO INT NOT NULL,
+MOTYPEID INT NOT NULL,
+VALUE VARCHAR(120) NOT NULL,
+PRIMARY KEY (SEQNO, MOTYPEID, VALUE)
+);
+INSERT INTO t1 VALUES (1, 1, 'a');
+INSERT INTO t1 VALUES (1, 1, 'b');
+INSERT INTO t1 VALUES (1, 1, 'a');
+ERROR 23000: Raft error: Raft error: Duplicate key: row in 't1' already exists
+SELECT * FROM t1 ORDER BY SEQNO, MOTYPEID, VALUE;
+SEQNO	MOTYPEID	VALUE
+1	1	a
+1	1	b
+DROP TABLE t1;
+CREATE TABLE t1 (a INT NOT NULL, b INT, UNIQUE KEY (a));
+INSERT INTO t1 VALUES (1, 10);
+INSERT INTO t1 VALUES (2, 20);
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b INT, c INT);
+INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+CREATE INDEX idx_a ON t1 (a);
+CREATE INDEX idx_b ON t1 (b);
+SELECT * FROM t1 WHERE a = 2 ORDER BY a;
+a	b	c
+2	20	200
+SELECT * FROM t1 WHERE b = 20 ORDER BY a;
+a	b	c
+2	20	200
+DROP INDEX idx_a ON t1;
+DROP INDEX idx_b ON t1;
+DROP TABLE t1;

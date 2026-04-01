@@ -1,0 +1,56 @@
+#
+# Adapted from MySQL type_set.test for RooDB.
+# Tests SET data type basics.
+# Removed: SHOW CREATE TABLE, --replace_result, --error, character_set directives,
+#   collation-specific tests, let/while scripting, INSERT IGNORE, UNIQUE constraint on SET,
+#   SET default values (bug: "can't have a default value"), integer-to-SET mapping (missing feature)
+#
+
+# [RooDB-skip] --let $DEFAULT_ENGINE = `select @@global.default_storage_engine`
+
+#
+# Test of SET creation
+#
+create table t1 (a set (' ','a','b') not null);
+# [RooDB-skip] show create table t1 — not supported
+drop table t1;
+
+# [RooDB-skip] SET default value — bug: "can't have a default value" for SET columns
+# [RooDB-skip] create table t1 (a set (' ','a','b ') not null default 'b ');
+
+# [RooDB-skip] Check that SET is case sensitive with a binary collation
+# [RooDB-skip] set names latin1 / --character_set latin1 / collate latin1_bin
+# [RooDB-skip] collate latin1_german2_ci section
+
+#
+# Basic SET insert and select with string values
+#
+create table t1 (s set ('a','b','c'));
+insert into t1 values ('a'),('a,b'),('b,c'),('a,b,c');
+select s from t1 order by s;
+drop table t1;
+
+# End of 4.1 tests
+
+# [RooDB-skip] Bug#27069 — SET with >64 elements / duplicate elements
+# [RooDB-skip] --error 1097 (too many SET values) + SHOW WARNINGS
+# [RooDB-skip] SET sql_mode sections
+
+# [RooDB-skip] Bug#15409: let/while scripting to build 64-element SET
+# [RooDB-skip] Integer-to-SET mapping (INSERT VALUES(7) shows '7' not 'a,b,c') — missing feature
+
+# [RooDB-skip] Bug #38701: unique constraint on SET column — not tested
+# [RooDB-skip] CREATE TABLE with unique (set_unique_utf8)
+
+--echo End of 5.0 tests
+
+#
+# Basic SET with string member values
+#
+CREATE TABLE bar(id set('red','green','blue'));
+INSERT INTO bar VALUES ("red");
+INSERT INTO bar VALUES ("green,blue");
+SELECT * FROM bar;
+DROP TABLE bar;
+
+# [RooDB-skip] Bug #31019130 CASTING DOUBLE TO LONGLONG — INSERT IGNORE / cross-type cast

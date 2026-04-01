@@ -3,7 +3,9 @@
 //! Schema metadata is stored in system tables that are replicated via Raft
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
-use super::{ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef};
+use super::{
+    ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef, ViewDef,
+};
 use crate::executor::{Datum, Row};
 
 /// System table names
@@ -26,6 +28,9 @@ pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
 
 // Stored procedures
 pub const SYSTEM_PROCEDURES: &str = "system.procedures";
+
+// Views
+pub const SYSTEM_VIEWS: &str = "system.views";
 
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
@@ -75,6 +80,7 @@ pub fn constraints_table_def() -> TableDef {
         .column(ColumnDef::new("ref_table", DataType::Varchar(255)).nullable(true)) // for FK
         .column(ColumnDef::new("ref_columns", DataType::Text).nullable(true)) // comma-separated, for FK
         .column(ColumnDef::new("check_expr", DataType::Text).nullable(true)) // for CHECK
+        .column(ColumnDef::new("constraint_name", DataType::Varchar(255)).nullable(true)) // FK name
         .constraint(Constraint::PrimaryKey(vec![
             "table_name".to_string(),
             "ordinal".to_string(),
@@ -169,7 +175,16 @@ pub fn procedures_table_def() -> TableDef {
         .column(ColumnDef::new("procedure_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("params_json", DataType::Text).nullable(false))
         .column(ColumnDef::new("body_sql", DataType::Text).nullable(false))
+        .column(ColumnDef::new("returns_type", DataType::Varchar(255)).nullable(true))
         .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
+}
+
+/// Create the TableDef for system.views
+pub fn views_table_def() -> TableDef {
+    TableDef::new(SYSTEM_VIEWS)
+        .column(ColumnDef::new("view_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("query_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["view_name".to_string()]))
 }
 
 /// Get all system table definitions for bootstrapping
@@ -186,6 +201,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         databases_table_def(),
         table_statistics_table_def(),
         procedures_table_def(),
+        views_table_def(),
     ]
 }
 
@@ -230,9 +246,11 @@ pub fn data_type_to_string(dt: &DataType) -> String {
         DataType::Varchar(n) => format!("VARCHAR({})", n),
         DataType::Text => "TEXT".to_string(),
         DataType::Blob => "BLOB".to_string(),
+        DataType::Geometry => "GEOMETRY".to_string(),
         DataType::Bit(n) => format!("BIT({})", n),
         DataType::Timestamp => "TIMESTAMP".to_string(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({},{})", precision, scale),
+        DataType::Json => "JSON".to_string(),
     }
 }
 
@@ -273,6 +291,8 @@ pub fn string_to_data_type(s: &str) -> Option<DataType> {
             "DOUBLE" => Some(DataType::Double),
             "TEXT" => Some(DataType::Text),
             "BLOB" => Some(DataType::Blob),
+            "GEOMETRY" => Some(DataType::Geometry),
+            "JSON" => Some(DataType::Json),
             "TIMESTAMP" => Some(DataType::Timestamp),
             _ => None,
         }
@@ -295,24 +315,31 @@ pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
         .iter()
         .enumerate()
         .map(|(ordinal, constraint)| {
-            let (constraint_type, columns, ref_table, ref_columns, check_expr) = match constraint {
-                Constraint::PrimaryKey(cols) => {
-                    ("PRIMARY_KEY", Some(cols.join(",")), None, None, None)
-                }
-                Constraint::Unique(cols) => ("UNIQUE", Some(cols.join(",")), None, None, None),
-                Constraint::ForeignKey {
-                    columns,
-                    ref_table,
-                    ref_columns,
-                } => (
-                    "FOREIGN_KEY",
-                    Some(columns.join(",")),
-                    Some(ref_table.clone()),
-                    Some(ref_columns.join(",")),
-                    None,
-                ),
-                Constraint::Check(expr) => ("CHECK", None, None, None, Some(expr.clone())),
-            };
+            let (constraint_type, columns, ref_table, ref_columns, check_expr, constraint_name) =
+                match constraint {
+                    Constraint::PrimaryKey(cols) => {
+                        ("PRIMARY_KEY", Some(cols.join(",")), None, None, None, None)
+                    }
+                    Constraint::Unique(cols) => {
+                        ("UNIQUE", Some(cols.join(",")), None, None, None, None)
+                    }
+                    Constraint::ForeignKey {
+                        name,
+                        columns,
+                        ref_table,
+                        ref_columns,
+                    } => (
+                        "FOREIGN_KEY",
+                        Some(columns.join(",")),
+                        Some(ref_table.clone()),
+                        Some(ref_columns.join(",")),
+                        None,
+                        name.clone(),
+                    ),
+                    Constraint::Check(expr) => {
+                        ("CHECK", None, None, None, Some(expr.clone()), None)
+                    }
+                };
 
             Row::new(vec![
                 Datum::String(def.name.clone()),
@@ -322,6 +349,7 @@ pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
                 ref_table.map(Datum::String).unwrap_or(Datum::Null),
                 ref_columns.map(Datum::String).unwrap_or(Datum::Null),
                 check_expr.map(Datum::String).unwrap_or(Datum::Null),
+                constraint_name.map(Datum::String).unwrap_or(Datum::Null),
             ])
         })
         .collect()
@@ -378,7 +406,17 @@ pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
                     let cols = columns?;
                     let rt = ref_table?;
                     let rc = ref_columns?;
+                    // Backward compat: older rows may not have column 7 (constraint_name)
+                    let fk_name = if row.values().len() > 7 {
+                        match &row.values()[7] {
+                            Datum::String(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     Some(Constraint::ForeignKey {
+                        name: fk_name,
                         columns: cols,
                         ref_table: rt,
                         ref_columns: rc,
@@ -457,6 +495,7 @@ pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
         Datum::String(def.name.clone()),
         Datum::String(params_json),
         Datum::String(def.body_sql.clone()),
+        Datum::String(def.returns_type.clone().unwrap_or_default()),
     ])
 }
 
@@ -475,11 +514,41 @@ pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
         _ => return None,
     };
     let params: Vec<ProcedureParam> = serde_json::from_str(&params_json).ok()?;
+    let returns_type = if row.values().len() > 3 {
+        match &row.values()[3] {
+            Datum::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Some(ProcedureDef {
         name,
         params,
         body_sql,
+        returns_type,
     })
+}
+
+/// Convert a ViewDef to a row for system.views
+pub fn view_def_to_row(def: &ViewDef) -> Row {
+    Row::new(vec![
+        Datum::String(def.name.clone()),
+        Datum::String(def.query_sql.clone()),
+    ])
+}
+
+/// Reconstruct a ViewDef from a system.views row
+pub fn row_to_view_def(row: &Row) -> Option<ViewDef> {
+    let name = match &row.values()[0] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    let query_sql = match &row.values()[1] {
+        Datum::String(s) => s.clone(),
+        _ => return None,
+    };
+    Some(ViewDef { name, query_sql })
 }
 
 /// Reconstruct an IndexDef from a system.indexes row
@@ -604,7 +673,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 11);
+        assert_eq!(tables.len(), 12);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -617,6 +686,7 @@ mod tests {
         assert!(names.contains(&SYSTEM_ROLE_GRANTS));
         assert!(names.contains(&SYSTEM_DATABASES));
         assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
+        assert!(names.contains(&SYSTEM_VIEWS));
         assert!(names.contains(&SYSTEM_PROCEDURES));
     }
 
@@ -632,6 +702,7 @@ mod tests {
                 "status".to_string(),
             ]))
             .constraint(Constraint::ForeignKey {
+                name: Some("fk_user".to_string()),
                 columns: vec!["user_id".to_string()],
                 ref_table: "users".to_string(),
                 ref_columns: vec!["id".to_string()],

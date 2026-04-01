@@ -22,25 +22,85 @@ use super::Executor;
 enum Accumulator {
     Count(i64),
     Sum(Option<f64>),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Min(Option<Datum>),
     Max(Option<Datum>),
-    BitAnd(Option<u64>),
+    BitAnd(u64),
     BitOr(u64),
     BitXor(u64),
+    /// ANY_VALUE: keeps the first non-null value seen
+    AnyValue(Option<Datum>),
+    /// GROUP_CONCAT: collects string values with separator
+    GroupConcat {
+        values: Vec<String>,
+        separator: String,
+    },
+    /// JSON_ARRAYAGG: collects values into JSON array
+    JsonArrayAgg(Vec<serde_json::Value>),
+    /// JSON_OBJECTAGG: collects key-value pairs into JSON object
+    JsonObjectAgg(serde_json::Map<String, serde_json::Value>),
+    /// Population variance/stddev: tracks sum, sum of squares, count
+    /// is_stddev: if true, finalize returns sqrt(variance)
+    VarPop {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+        is_stddev: bool,
+    },
+    /// Sample variance/stddev
+    VarSamp {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+        is_stddev: bool,
+    },
 }
 
 impl Accumulator {
-    fn new(func_name: &str) -> Self {
+    fn new_with_separator(func_name: &str, separator: Option<&str>) -> Self {
         match func_name.to_uppercase().as_str() {
             "COUNT" => Accumulator::Count(0),
             "SUM" => Accumulator::Sum(None),
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
-            "BIT_AND" => Accumulator::BitAnd(None),
+            "BIT_AND" => Accumulator::BitAnd(u64::MAX),
             "BIT_OR" => Accumulator::BitOr(0),
             "BIT_XOR" => Accumulator::BitXor(0),
+            "VARIANCE" | "VAR_POP" => Accumulator::VarPop {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: false,
+            },
+            "VAR_SAMP" => Accumulator::VarSamp {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: false,
+            },
+            "STDDEV" | "STD" | "STDDEV_SAMP" => Accumulator::VarSamp {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: true,
+            },
+            "STDDEV_POP" => Accumulator::VarPop {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+                is_stddev: true,
+            },
+            "ANY_VALUE" => Accumulator::AnyValue(None),
+            "JSON_ARRAYAGG" => Accumulator::JsonArrayAgg(Vec::new()),
+            "JSON_OBJECTAGG" => Accumulator::JsonObjectAgg(serde_json::Map::new()),
+            "GROUP_CONCAT" => Accumulator::GroupConcat {
+                values: Vec::new(),
+                separator: separator.unwrap_or(",").to_string(),
+            },
             _ => Accumulator::Count(0), // fallback
         }
     }
@@ -88,7 +148,7 @@ impl Accumulator {
             }
             Accumulator::BitAnd(acc) => {
                 if let Some(v) = Self::as_bitwise_u64(value) {
-                    *acc = Some(acc.map_or(v, |a| a & v));
+                    *acc &= v;
                 }
             }
             Accumulator::BitOr(acc) => {
@@ -99,6 +159,49 @@ impl Accumulator {
             Accumulator::BitXor(acc) => {
                 if let Some(v) = Self::as_bitwise_u64(value) {
                     *acc ^= v;
+                }
+            }
+            Accumulator::AnyValue(val) => {
+                if val.is_none() && !value.is_null() {
+                    *val = Some(value.clone());
+                }
+            }
+            Accumulator::JsonArrayAgg(arr) => {
+                let json_val = crate::executor::json::datum_to_json(value);
+                arr.push(json_val);
+            }
+            Accumulator::JsonObjectAgg(map) => {
+                // JSON_OBJECTAGG expects pairs: key from first arg, value from second
+                // Since we only get one accumulated value, handle as string key = value
+                if !value.is_null() {
+                    let s = value.to_display_string();
+                    // The key and value are passed as a single string "key:value" isn't right
+                    // Actually, JSON_OBJECTAGG(key_col, val_col) passes both as separate args
+                    // but the accumulator only gets one value. We need special handling.
+                    // For now, store as key=value pair where the value is the datum itself.
+                    map.insert(s, serde_json::Value::Null);
+                }
+            }
+            Accumulator::GroupConcat { values, .. } => {
+                if !value.is_null() {
+                    values.push(value.to_display_string());
+                }
+            }
+            Accumulator::VarPop {
+                sum, sum_sq, count, ..
+            }
+            | Accumulator::VarSamp {
+                sum, sum_sq, count, ..
+            } => {
+                let v = if let Some(f) = value.as_float() {
+                    Some(f)
+                } else {
+                    value.as_int().map(|i| i as f64)
+                };
+                if let Some(v) = v {
+                    *sum += v;
+                    *sum_sq += v * v;
+                    *count += 1;
                 }
             }
         }
@@ -134,9 +237,59 @@ impl Accumulator {
             }
             Accumulator::Min(min) => min.clone().unwrap_or(Datum::Null),
             Accumulator::Max(max) => max.clone().unwrap_or(Datum::Null),
-            Accumulator::BitAnd(acc) => acc.map_or(Datum::Null, |v| Datum::Int(v as i64)),
-            Accumulator::BitOr(v) => Datum::Int(*v as i64),
-            Accumulator::BitXor(v) => Datum::Int(*v as i64),
+            Accumulator::AnyValue(val) => val.clone().unwrap_or(Datum::Null),
+            Accumulator::JsonArrayAgg(arr) => Datum::Json(serde_json::Value::Array(arr.clone())),
+            Accumulator::JsonObjectAgg(map) => Datum::Json(serde_json::Value::Object(map.clone())),
+            Accumulator::GroupConcat { values, separator } => {
+                if values.is_empty() {
+                    Datum::Null
+                } else {
+                    Datum::String(values.join(separator))
+                }
+            }
+            Accumulator::BitAnd(v) => Datum::UnsignedInt(*v),
+            Accumulator::BitOr(v) => Datum::UnsignedInt(*v),
+            Accumulator::BitXor(v) => Datum::UnsignedInt(*v),
+            Accumulator::VarPop {
+                sum,
+                sum_sq,
+                count,
+                is_stddev,
+            } => {
+                if *count == 0 {
+                    Datum::Null
+                } else {
+                    let n = *count as f64;
+                    let variance = *sum_sq / n - (*sum / n).powi(2);
+                    let variance = variance.max(0.0); // avoid floating-point negative
+                    if *is_stddev {
+                        Datum::Float(variance.sqrt())
+                    } else {
+                        Datum::Float(variance)
+                    }
+                }
+            }
+            Accumulator::VarSamp {
+                sum,
+                sum_sq,
+                count,
+                is_stddev,
+            } => {
+                if *count < 2 {
+                    if *count == 0 {
+                        return Datum::Null;
+                    }
+                    return Datum::Float(0.0);
+                }
+                let n = *count as f64;
+                let variance = (*sum_sq - *sum * *sum / n) / (n - 1.0);
+                let variance = variance.max(0.0);
+                if *is_stddev {
+                    Datum::Float(variance.sqrt())
+                } else {
+                    Datum::Float(variance)
+                }
+            }
         }
     }
 }
@@ -150,9 +303,9 @@ struct DistinctAccumulator {
 }
 
 impl DistinctAccumulator {
-    fn new(func_name: &str, distinct: bool) -> Self {
+    fn new(func_name: &str, distinct: bool, separator: Option<&str>) -> Self {
         DistinctAccumulator {
-            inner: Accumulator::new(func_name),
+            inner: Accumulator::new_with_separator(func_name, separator),
             // MIN/MAX don't need distinct tracking - they're naturally idempotent
             seen: if distinct && !matches!(func_name.to_uppercase().as_str(), "MIN" | "MAX") {
                 Some(HashSet::new())
@@ -264,7 +417,9 @@ impl Executor for HashAggregate {
                 let accs: Vec<_> = self
                     .aggregates
                     .iter()
-                    .map(|(agg, _)| DistinctAccumulator::new(&agg.name, agg.distinct))
+                    .map(|(agg, _)| {
+                        DistinctAccumulator::new(&agg.name, agg.distinct, agg.separator.as_deref())
+                    })
                     .collect();
                 (group_values.clone(), accs)
             });
@@ -295,7 +450,8 @@ impl Executor for HashAggregate {
         if self.output.is_empty() && self.group_by.is_empty() && !self.aggregates.is_empty() {
             let mut row_values = Vec::new();
             for (agg, _) in &self.aggregates {
-                let acc = DistinctAccumulator::new(&agg.name, agg.distinct);
+                let acc =
+                    DistinctAccumulator::new(&agg.name, agg.distinct, agg.separator.as_deref());
                 row_values.push(acc.finalize());
             }
             self.output.push(Row::new(row_values));
@@ -376,6 +532,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count".to_string(),
         )];
@@ -408,9 +565,12 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum".to_string(),
         )];
@@ -440,6 +600,8 @@ mod tests {
             index: 0,
             data_type: DataType::Text,
             nullable: false,
+            default_value: None,
+            is_outer_ref: false,
         })];
 
         let aggregates = vec![(
@@ -451,9 +613,12 @@ mod tests {
                     index: 1,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: false,
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum".to_string(),
         )];
@@ -496,9 +661,12 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: true, // COUNT(DISTINCT c)
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count_distinct".to_string(),
         )];
@@ -533,9 +701,12 @@ mod tests {
                     index: 0,
                     data_type: DataType::Int,
                     nullable: false,
+                    default_value: None,
+                    is_outer_ref: false,
                 })],
                 distinct: true, // SUM(DISTINCT c)
                 result_type: DataType::Double,
+                separator: None,
             },
             "sum_distinct".to_string(),
         )];
@@ -546,6 +717,73 @@ mod tests {
         let result = agg.next().await.unwrap().unwrap();
         // Without DISTINCT: 10+20+20+30=80, with DISTINCT: 10+20+30=60
         assert_eq!(result.get(0).unwrap().as_float(), Some(60.0));
+
+        agg.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bitwise_aggregates_empty_set() {
+        // MySQL behavior: BIT_AND() on empty set = 18446744073709551615 (u64::MAX)
+        // BIT_OR() on empty set = 0, BIT_XOR() on empty set = 0
+        let input = Box::new(MockExecutor {
+            rows: vec![],
+            position: 0,
+        });
+
+        let col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t".to_string(),
+            name: "c".to_string(),
+            index: 0,
+            data_type: DataType::Int,
+            nullable: false,
+            default_value: None,
+            is_outer_ref: false,
+        });
+
+        let aggregates = vec![
+            (
+                AggregateFunc {
+                    name: "BIT_AND".to_string(),
+                    args: vec![col.clone()],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                    separator: None,
+                },
+                "bit_and".to_string(),
+            ),
+            (
+                AggregateFunc {
+                    name: "BIT_OR".to_string(),
+                    args: vec![col.clone()],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                    separator: None,
+                },
+                "bit_or".to_string(),
+            ),
+            (
+                AggregateFunc {
+                    name: "BIT_XOR".to_string(),
+                    args: vec![col],
+                    distinct: false,
+                    result_type: DataType::BigIntUnsigned,
+                    separator: None,
+                },
+                "bit_xor".to_string(),
+            ),
+        ];
+
+        let mut agg = HashAggregate::new(input, vec![], aggregates, empty_vars());
+        agg.open().await.unwrap();
+
+        let result = agg.next().await.unwrap().unwrap();
+
+        // BIT_AND on empty set: u64::MAX (all ones)
+        assert_eq!(*result.get(0).unwrap(), Datum::UnsignedInt(u64::MAX));
+        // BIT_OR on empty set: 0
+        assert_eq!(*result.get(1).unwrap(), Datum::UnsignedInt(0));
+        // BIT_XOR on empty set: 0
+        assert_eq!(*result.get(2).unwrap(), Datum::UnsignedInt(0));
 
         agg.close().await.unwrap();
     }

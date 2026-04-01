@@ -19,6 +19,18 @@ use super::eval::evaluate;
 use super::row::Row;
 use super::Executor;
 
+/// Parameters for creating a Delete executor.
+pub struct DeleteParams {
+    pub table: String,
+    pub filter: Option<ResolvedExpr>,
+    pub key_value: Option<ResolvedExpr>,
+    pub order_by: Vec<(ResolvedExpr, bool)>,
+    pub limit: Option<usize>,
+    pub mvcc: Arc<MvccStorage>,
+    pub txn_context: Option<TransactionContext>,
+    pub user_variables: UserVariables,
+}
+
 /// Delete executor
 pub struct Delete {
     /// Table name
@@ -27,6 +39,10 @@ pub struct Delete {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    /// ORDER BY expressions for DELETE ... ORDER BY ... LIMIT
+    order_by: Vec<(ResolvedExpr, bool)>,
+    /// Optional LIMIT
+    limit: Option<usize>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context (for MVCC visibility and versioning)
@@ -41,23 +57,18 @@ pub struct Delete {
 
 impl Delete {
     /// Create a new delete executor
-    pub fn new(
-        table: String,
-        filter: Option<ResolvedExpr>,
-        key_value: Option<ResolvedExpr>,
-        mvcc: Arc<MvccStorage>,
-        txn_context: Option<TransactionContext>,
-        user_variables: UserVariables,
-    ) -> Self {
+    pub fn new(p: DeleteParams) -> Self {
         Delete {
-            table,
-            filter,
-            key_value,
-            mvcc,
-            txn_context,
+            table: p.table,
+            filter: p.filter,
+            key_value: p.key_value,
+            order_by: p.order_by,
+            limit: p.limit,
+            mvcc: p.mvcc,
+            txn_context: p.txn_context,
             rows_deleted: 0,
             done: false,
-            user_variables,
+            user_variables: p.user_variables,
         }
     }
 }
@@ -121,7 +132,7 @@ impl Delete {
                 .collect()
         };
 
-        let mut keys_to_delete = Vec::new();
+        let mut matching: Vec<(Vec<u8>, u64, Row)> = Vec::new();
 
         for (key, value, row_version) in kv_pairs {
             let row = decode_row(&value)?;
@@ -131,8 +142,43 @@ impl Delete {
                     continue;
                 }
             }
-            keys_to_delete.push((key, row_version));
+            matching.push((key, row_version, row));
         }
+
+        // Apply ORDER BY if present — precompute sort keys to propagate eval errors
+        if !self.order_by.is_empty() {
+            let order_by = &self.order_by;
+            let user_vars = &self.user_variables;
+            let mut sort_keys: Vec<Vec<super::datum::Datum>> = Vec::with_capacity(matching.len());
+            for (_key, _ver, row) in &matching {
+                let mut keys = Vec::with_capacity(order_by.len());
+                for (expr, _asc) in order_by {
+                    keys.push(evaluate(expr, row, user_vars)?);
+                }
+                sort_keys.push(keys);
+            }
+            let mut indices: Vec<usize> = (0..matching.len()).collect();
+            indices.sort_by(|&ai, &bi| {
+                for (i, (_expr, asc)) in order_by.iter().enumerate() {
+                    let ord = sort_keys[ai][i]
+                        .partial_cmp(&sort_keys[bi][i])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if *asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            matching = indices.into_iter().map(|i| matching[i].clone()).collect();
+        }
+
+        // Apply LIMIT if specified
+        if let Some(limit) = self.limit {
+            matching.truncate(limit);
+        }
+
+        let keys_to_delete: Vec<_> = matching.into_iter().map(|(k, v, _)| (k, v)).collect();
 
         let ctx = self.txn_context.as_mut().ok_or_else(|| {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
@@ -319,6 +365,8 @@ mod tests {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -327,14 +375,16 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut delete = Delete::new(
-            "users".to_string(),
-            Some(filter),
-            None,
+        let mut delete = Delete::new(DeleteParams {
+            table: "users".to_string(),
+            filter: Some(filter),
+            key_value: None,
+            order_by: vec![],
+            limit: None,
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -376,14 +426,16 @@ mod tests {
 
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
-        let mut delete = Delete::new(
-            "users".to_string(),
-            None,
-            None,
+        let mut delete = Delete::new(DeleteParams {
+            table: "users".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![],
+            limit: None,
             mvcc,
-            Some(txn_context),
-            empty_vars(),
-        );
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
         delete.open().await.unwrap();
 
         let result = delete.next().await.unwrap().unwrap();
@@ -394,5 +446,116 @@ mod tests {
         // Verify changes were collected (data written via Raft apply, not directly)
         let changes = delete.take_changes();
         assert_eq!(changes.len(), 2);
+    }
+
+    /// Helper: create 4-row test dataset with MVCC headers
+    fn four_row_dataset() -> Vec<KeyValue> {
+        let rows = vec![
+            Row::new(vec![Datum::Int(1), Datum::String("d".to_string())]),
+            Row::new(vec![Datum::Int(2), Datum::String("b".to_string())]),
+            Row::new(vec![Datum::Int(3), Datum::String("a".to_string())]),
+            Row::new(vec![Datum::Int(4), Datum::String("c".to_string())]),
+        ];
+        rows.into_iter()
+            .map(|r| {
+                let id = r.get(0).unwrap().as_int().unwrap();
+                (
+                    encode_pk_key("t1", &[Datum::Int(id)]),
+                    encode_with_mvcc_header(0, &encode_row(&r)),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_delete_order_by_limit() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        let storage = Arc::new(MockStorage::new(four_row_dataset()));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
+
+        // DELETE FROM t1 ORDER BY name ASC LIMIT 2
+        // Sorted by name: a(3), b(2), c(4), d(1) → delete first 2 → ids 3, 2
+        let order_col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t1".to_string(),
+            name: "name".to_string(),
+            index: 1,
+            data_type: DataType::Text,
+            nullable: false,
+            default_value: None,
+            is_outer_ref: false,
+        });
+
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new(DeleteParams {
+            table: "t1".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![(order_col, true)], // ASC
+            limit: Some(2),
+            mvcc,
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
+        delete.open().await.unwrap();
+
+        let result = delete.next().await.unwrap().unwrap();
+        assert_eq!(result.get(0).unwrap().as_int(), Some(2)); // 2 rows deleted
+
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 2);
+        // Verify the correct rows were selected (ids 3 and 2, sorted by name asc)
+        let deleted_keys: Vec<_> = changes.iter().map(|c| c.key.clone()).collect();
+        assert!(deleted_keys.contains(&encode_pk_key("t1", &[Datum::Int(3)])));
+        assert!(deleted_keys.contains(&encode_pk_key("t1", &[Datum::Int(2)])));
+    }
+
+    #[tokio::test]
+    async fn test_delete_order_by_desc_limit() {
+        use crate::executor::context::TransactionContext;
+        use crate::txn::ReadView;
+
+        let storage = Arc::new(MockStorage::new(four_row_dataset()));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let mvcc = Arc::new(MvccStorage::new(
+            storage.clone() as Arc<dyn StorageEngine>,
+            txn_manager,
+        ));
+
+        // DELETE FROM t1 ORDER BY id DESC LIMIT 1 → delete id=4
+        let order_col = ResolvedExpr::Column(ResolvedColumn {
+            table: "t1".to_string(),
+            name: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int,
+            nullable: false,
+            default_value: None,
+            is_outer_ref: false,
+        });
+
+        let txn_context = TransactionContext::new(1, ReadView::default());
+        let mut delete = Delete::new(DeleteParams {
+            table: "t1".to_string(),
+            filter: None,
+            key_value: None,
+            order_by: vec![(order_col, false)], // DESC
+            limit: Some(1),
+            mvcc,
+            txn_context: Some(txn_context),
+            user_variables: empty_vars(),
+        });
+        delete.open().await.unwrap();
+
+        let result = delete.next().await.unwrap().unwrap();
+        assert_eq!(result.get(0).unwrap().as_int(), Some(1)); // 1 row deleted
+
+        let changes = delete.take_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, encode_pk_key("t1", &[Datum::Int(4)]));
     }
 }

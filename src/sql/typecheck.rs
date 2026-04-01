@@ -57,10 +57,10 @@ impl TypeChecker {
             // Multi-table DROP doesn't need type checking
             ResolvedStatement::DropMultipleTables { .. } => Ok(()),
 
-            // UNION - type check both sides
+            // UNION - type check both sides (right may be nested Union)
             ResolvedStatement::Union { left, right, .. } => {
                 Self::check_select(left)?;
-                Self::check_select(right)
+                Self::check(right)
             }
 
             // EXPLAIN - type check the inner statement
@@ -150,16 +150,35 @@ impl TypeChecker {
         Ok(())
     }
 
-    /// Check if expression is definitely NULL
+    /// Check if expression is definitely NULL or will evaluate to NULL at runtime
+    /// (e.g. `1/NULL`, `NULL + 5`, `COALESCE(NULL)`)
     fn is_definitely_null(expr: &ResolvedExpr) -> bool {
-        matches!(expr, ResolvedExpr::Literal(Literal::Null))
+        use crate::planner::logical::BinaryOp;
+        match expr {
+            ResolvedExpr::Literal(Literal::Null) => true,
+            ResolvedExpr::BinaryOp {
+                op, left, right, ..
+            } => {
+                // AND/OR use SQL three-valued logic where NULL doesn't always propagate:
+                //   NULL OR TRUE = TRUE,  NULL AND FALSE = FALSE
+                // Only arithmetic, comparison, bitwise, and string ops guarantee
+                // NULL propagation when either operand is NULL.
+                match op {
+                    BinaryOp::And | BinaryOp::Or => false,
+                    _ => Self::is_definitely_null(left) || Self::is_definitely_null(right),
+                }
+            }
+            ResolvedExpr::UnaryOp { expr: inner, .. } => Self::is_definitely_null(inner),
+            _ => false,
+        }
     }
 
     /// Check if expression evaluates to boolean
     /// MySQL treats non-zero numeric values as true, so accept numeric types too
     fn check_is_boolean(expr: &ResolvedExpr) -> SqlResult<()> {
         let dt = expr.data_type();
-        if dt == DataType::Boolean || dt.is_numeric() {
+        // MySQL allows comparison results, strings, and JSON in boolean contexts
+        if dt == DataType::Boolean || dt.is_numeric() || dt.is_string() || dt == DataType::Json {
             Ok(())
         } else {
             Err(SqlError::TypeMismatch {
@@ -224,6 +243,22 @@ impl TypeChecker {
                 Self::expr_has_aggregate(left) || Self::expr_has_aggregate(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_aggregate(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_aggregate(e))
+                    || conditions.iter().any(Self::expr_has_aggregate)
+                    || results.iter().any(Self::expr_has_aggregate)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_aggregate(e))
+            }
             _ => false,
         }
     }
@@ -257,6 +292,22 @@ impl TypeChecker {
                     || Self::expr_has_non_aggregate_column(right)
             }
             ResolvedExpr::UnaryOp { expr, .. } => Self::expr_has_non_aggregate_column(expr),
+            ResolvedExpr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_non_aggregate_column(e))
+                    || conditions.iter().any(Self::expr_has_non_aggregate_column)
+                    || results.iter().any(Self::expr_has_non_aggregate_column)
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_non_aggregate_column(e))
+            }
             ResolvedExpr::UserVariable { .. } => false,
             _ => false,
         }
@@ -305,6 +356,16 @@ fn types_compatible(target: &DataType, source: &DataType) -> bool {
         (DataType::Text, b) | (DataType::Varchar(_), b) | (DataType::Blob, b) if b.is_numeric() => {
             true
         }
+
+        // Geometry is compatible with Blob (WKB binary storage)
+        (DataType::Geometry, DataType::Blob) | (DataType::Blob, DataType::Geometry) => true,
+        (DataType::Geometry, DataType::Geometry) => true,
+
+        // JSON is compatible with string types (validated on INSERT)
+        (DataType::Json, DataType::Text)
+        | (DataType::Json, DataType::Varchar(_))
+        | (DataType::Text, DataType::Json)
+        | (DataType::Varchar(_), DataType::Json) => true,
 
         _ => false,
     }

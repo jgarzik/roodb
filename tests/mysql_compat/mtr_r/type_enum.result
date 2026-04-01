@@ -1,0 +1,100 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (a ENUM('a', 'b', 'c') NOT NULL);
+INSERT INTO t1 VALUES ('a');
+INSERT INTO t1 VALUES ('b');
+INSERT INTO t1 VALUES ('c');
+SELECT * FROM t1;
+a
+a
+b
+c
+SELECT * FROM t1 WHERE a = 'b';
+a
+b
+SELECT * FROM t1 WHERE a != 'b';
+a
+a
+c
+SELECT * FROM t1 ORDER BY a;
+a
+a
+b
+c
+DROP TABLE t1;
+CREATE TABLE t1 (a ENUM('0', '1'));
+INSERT INTO t1 VALUES ('0');
+INSERT INTO t1 VALUES ('1');
+SELECT * FROM t1;
+a
+0
+1
+DROP TABLE t1;
+CREATE TABLE t1 (a ENUM(' ', 'a', 'b') NOT NULL);
+INSERT INTO t1 VALUES (' ');
+INSERT INTO t1 VALUES ('a');
+INSERT INTO t1 VALUES ('b');
+SELECT * FROM t1;
+a
+ 
+a
+b
+DROP TABLE t1;
+CREATE TABLE t1 (c1 ENUM('a', '', 'b'));
+INSERT INTO t1 (c1) VALUES ('a');
+INSERT INTO t1 (c1) VALUES ('');
+INSERT INTO t1 (c1) VALUES ('b');
+SELECT * FROM t1;
+c1
+a
+
+b
+SELECT c1 + 0, c1 FROM t1;
+c1 + 0	c1
+0	a
+0	
+0	b
+DROP TABLE t1;
+CREATE TABLE t1 (a ENUM('a','b','c','d'));
+INSERT INTO t1 VALUES ('d'), ('a'), ('c'), ('b');
+SELECT a FROM t1 ORDER BY a;
+a
+a
+b
+c
+d
+SELECT a + 0, a FROM t1 ORDER BY a;
+a + 0	a
+0	a
+0	b
+0	c
+0	d
+DROP TABLE t1;
+CREATE TABLE t1 (a ENUM('small', 'medium', 'large'));
+INSERT INTO t1 VALUES ('small'), ('medium'), ('large');
+SELECT * FROM t1 WHERE a > 'small';
+a
+SELECT * FROM t1 WHERE a < 'large';
+a
+SELECT * FROM t1 WHERE a BETWEEN 'small' AND 'medium';
+a
+DROP TABLE t1;
+CREATE TABLE t1 (
+USER char(32),
+HOST char(60),
+PRIV char(32),
+WITH_GRANT_OPTION enum('N','Y'),
+PRIMARY KEY (WITH_GRANT_OPTION, USER, HOST, PRIV)
+);
+INSERT INTO t1 VALUES ('alice','localhost','SELECT','N');
+INSERT INTO t1 VALUES ('bob','localhost','INSERT','Y');
+INSERT INTO t1 VALUES ('charlie','localhost','UPDATE','N');
+SELECT * FROM t1 ORDER BY USER;
+USER	HOST	PRIV	WITH_GRANT_OPTION
+alice	localhost	SELECT	N
+bob	localhost	INSERT	Y
+charlie	localhost	UPDATE	N
+SELECT * FROM t1 WHERE WITH_GRANT_OPTION = 'Y';
+USER	HOST	PRIV	WITH_GRANT_OPTION
+bob	localhost	INSERT	Y
+DROP TABLE t1;
+# End of type_enum tests

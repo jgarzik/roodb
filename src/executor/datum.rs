@@ -30,6 +30,10 @@ pub enum Datum {
     Timestamp(i64),
     /// Fixed-point decimal (unscaled value, scale)
     Decimal { value: i128, scale: u8 },
+    /// Spatial geometry (WKB binary)
+    Geometry(Vec<u8>),
+    /// JSON document (stored as serde_json::Value)
+    Json(serde_json::Value),
 }
 
 impl Datum {
@@ -49,6 +53,8 @@ impl Datum {
             DataType::Float | DataType::Double => Datum::Float(0.0),
             DataType::Varchar(_) | DataType::Text => Datum::String(String::new()),
             DataType::Blob => Datum::Bytes(Vec::new()),
+            DataType::Geometry => Datum::Geometry(Vec::new()),
+            DataType::Json => Datum::Json(serde_json::Value::Null),
             DataType::Bit(w) => Datum::Bit {
                 value: 0,
                 width: *w,
@@ -72,6 +78,8 @@ impl Datum {
             Datum::Float(_) => 3,
             Datum::String(_) => 4,
             Datum::Bytes(_) => 5,
+            Datum::Geometry(_) => 5,
+            Datum::Json(_) => 8,
             Datum::Timestamp(_) => 6,
             Datum::Bit { .. } => 7,
             Datum::Decimal { .. } => 3, // same as Float for cross-type ordering
@@ -88,6 +96,8 @@ impl Datum {
             Datum::Float(_) => Some(DataType::Double),
             Datum::String(_) => Some(DataType::Text),
             Datum::Bytes(_) => Some(DataType::Blob),
+            Datum::Geometry(_) => Some(DataType::Geometry),
+            Datum::Json(_) => Some(DataType::Json),
             Datum::Bit { width, .. } => Some(DataType::Bit(*width)),
             Datum::Timestamp(_) => Some(DataType::Timestamp),
             Datum::Decimal { value, scale } => {
@@ -188,7 +198,7 @@ impl Datum {
                 let escaped = s.replace('\'', "''");
                 format!("'{}'", escaped)
             }
-            Datum::Bytes(b) => {
+            Datum::Bytes(b) | Datum::Geometry(b) => {
                 let mut s = String::with_capacity(3 + b.len() * 2);
                 s.push_str("X'");
                 for byte in b {
@@ -209,6 +219,10 @@ impl Datum {
             }
             Datum::Timestamp(t) => t.to_string(),
             Datum::Decimal { value, scale } => format_decimal(*value, *scale),
+            Datum::Json(v) => {
+                let j = serde_json::to_string(v).unwrap_or_else(|_| "null".to_string());
+                format!("CAST('{}' AS JSON)", j.replace('\'', "''"))
+            }
         }
     }
 
@@ -227,7 +241,7 @@ impl Datum {
                 }
             }
             Datum::String(s) => s.clone(),
-            Datum::Bytes(b) => {
+            Datum::Bytes(b) | Datum::Geometry(b) => {
                 let mut s = String::with_capacity(2 + b.len() * 2);
                 s.push_str("0x");
                 for byte in b {
@@ -238,6 +252,7 @@ impl Datum {
             Datum::Bit { value, .. } => value.to_string(),
             Datum::Timestamp(t) => t.to_string(),
             Datum::Decimal { value, scale } => format_decimal(*value, *scale),
+            Datum::Json(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
         }
     }
 
@@ -264,6 +279,7 @@ impl Datum {
     /// Negate this datum (for unary minus)
     pub fn negate(&self) -> Option<Datum> {
         match self {
+            Datum::Bool(b) => Some(Datum::Int(if *b { -1 } else { 0 })),
             Datum::Int(i) => i.checked_neg().map(Datum::Int),
             Datum::Float(f) => Some(Datum::Float(-f)),
             Datum::UnsignedInt(u) => {
@@ -362,7 +378,7 @@ pub fn format_decimal(value: i128, scale: u8) -> String {
 /// Simple SQL LIKE pattern matching without regex
 /// % matches any sequence of characters
 /// _ matches any single character
-fn like_match(s: &str, pattern: &str) -> bool {
+pub(crate) fn like_match(s: &str, pattern: &str) -> bool {
     let s_chars: Vec<char> = s.chars().collect();
     let p_chars: Vec<char> = pattern.chars().collect();
     like_match_impl(&s_chars, &p_chars)
@@ -422,6 +438,9 @@ impl PartialEq for Datum {
             // Cross-type: Bit/Int — BIT is unsigned, compare as u64
             (Datum::Bit { value, .. }, Datum::Int(i))
             | (Datum::Int(i), Datum::Bit { value, .. }) => *value == *i as u64,
+            // Cross-type: Bit/UnsignedInt
+            (Datum::Bit { value, .. }, Datum::UnsignedInt(u))
+            | (Datum::UnsignedInt(u), Datum::Bit { value, .. }) => *value == *u,
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) | (Datum::Float(b), Datum::Int(a)) => {
                 (*a as f64).to_bits() == b.to_bits()
@@ -521,7 +540,9 @@ impl Ord for Datum {
             // Cross-type: Bit/Int — BIT is unsigned, compare as u64
             (Datum::Bit { value, .. }, Datum::Int(i)) => value.cmp(&(*i as u64)),
             (Datum::Int(i), Datum::Bit { value, .. }) => (*i as u64).cmp(value),
-
+            // Cross-type: Bit/UnsignedInt
+            (Datum::Bit { value, .. }, Datum::UnsignedInt(u)) => value.cmp(u),
+            (Datum::UnsignedInt(u), Datum::Bit { value, .. }) => u.cmp(value),
             // Cross-type numeric comparisons
             (Datum::Int(a), Datum::Float(b)) => (*a as f64).total_cmp(b),
             (Datum::Float(a), Datum::Int(b)) => a.total_cmp(&(*b as f64)),
@@ -679,7 +700,8 @@ impl Hash for Datum {
                     Datum::Null => {}
                     Datum::Bool(b) => b.hash(state),
                     Datum::String(s) => s.hash(state),
-                    Datum::Bytes(b) => b.hash(state),
+                    Datum::Bytes(b) | Datum::Geometry(b) => b.hash(state),
+                    Datum::Json(v) => serde_json::to_string(v).unwrap_or_default().hash(state),
                     Datum::Timestamp(t) => t.hash(state),
                     Datum::Int(_)
                     | Datum::UnsignedInt(_)

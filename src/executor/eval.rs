@@ -2,12 +2,76 @@
 //!
 //! Evaluates ResolvedExpr against a Row to produce a Datum.
 
-use crate::planner::logical::{BinaryOp, BooleanTestType, ResolvedExpr, UnaryOp};
+use std::cell::RefCell;
+
+use std::sync::Arc;
+
+use crate::planner::logical::{BinaryOp, BooleanTestType, Literal, ResolvedExpr, UnaryOp};
 use crate::server::session::UserVariables;
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
+
+/// Convert a Datum::Bytes (hex literal) to Datum::UnsignedInt for numeric comparison
+fn bytes_to_int(datum: &Datum) -> Datum {
+    match datum {
+        Datum::Bytes(b) => {
+            let mut val: u64 = 0;
+            for &byte in b.iter().take(8) {
+                val = (val << 8) | byte as u64;
+            }
+            Datum::UnsignedInt(val)
+        }
+        _ => datum.clone(),
+    }
+}
+
+// Thread-local engine context for correlated subquery execution.
+thread_local! {
+    static SUBQUERY_ENGINE: RefCell<Option<SubqueryContext>> = const { RefCell::new(None) };
+}
+
+/// Context needed to execute correlated subqueries inline
+#[derive(Clone)]
+pub struct SubqueryContext {
+    pub mvcc: Arc<crate::txn::MvccStorage>,
+    pub catalog: Arc<parking_lot::RwLock<crate::catalog::Catalog>>,
+    pub user_variables: UserVariables,
+}
+
+/// Set the subquery execution context (called by ExecutorEngine before query execution)
+pub fn set_subquery_context(ctx: SubqueryContext) {
+    SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = Some(ctx));
+}
+
+/// Clear the subquery execution context (called after query execution)
+pub fn clear_subquery_context() {
+    SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = None);
+}
+
+// MySQL-compatible RAND() state: (seed1, seed2)
+thread_local! {
+    static RAND_STATE: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
+}
+
+/// MySQL's my_rnd() algorithm — advance state and return [0, 1) double
+fn mysql_rand_next(seed1: &mut u64, seed2: &mut u64) -> f64 {
+    const MAX_VALUE: u64 = 0x3FFFFFFF;
+    *seed1 = (*seed1 * 3 + *seed2) % MAX_VALUE;
+    *seed2 = (*seed1 + *seed2 + 33) % MAX_VALUE;
+    *seed1 as f64 / MAX_VALUE as f64
+}
+
+/// Seed MySQL RAND from integer — matches MySQL's seed_random() in item_func.cc
+/// MySQL uses `(uint32)` casts causing 32-bit wrapping, and only seed1 gets +55555555.
+fn mysql_rand_seed(seed: u64) -> (u64, u64) {
+    const MAX_VALUE: u64 = 0x3FFFFFFF;
+    let tmp = seed as u32;
+    let s1 = tmp.wrapping_mul(0x10001).wrapping_add(55555555);
+    let s2 = tmp.wrapping_mul(0x10000001); // No +55555555 on seed2
+    ((s1 as u64) % MAX_VALUE, (s2 as u64) % MAX_VALUE)
+}
 
 /// Internal variable name for NO_UNSIGNED_SUBTRACTION flag (stored in UserVariables)
 const NO_UNSIGNED_SUB_VAR: &str = "__sys_no_unsigned_sub";
@@ -17,6 +81,25 @@ const ERROR_DIV_ZERO_VAR: &str = "__sys_error_div_zero";
 
 /// Internal variable name for strict-DML context flag (set during INSERT/UPDATE evaluation)
 const STRICT_DML_CONTEXT_VAR: &str = "__sys_strict_dml";
+
+/// Internal variable name for STRICT_TRANS_TABLES sql_mode flag
+const STRICT_TRANS_VAR: &str = "__sys_strict_trans_tables";
+
+/// Set the STRICT_TRANS_TABLES flag for a session
+pub fn set_strict_trans_tables(vars: &UserVariables, val: bool) {
+    let mut w = vars.write();
+    if val {
+        w.insert(STRICT_TRANS_VAR.to_string(), Datum::Bool(true));
+    } else {
+        w.remove(STRICT_TRANS_VAR);
+    }
+}
+
+/// Check if STRICT_TRANS_TABLES is active
+pub fn is_strict_trans_tables(vars: &UserVariables) -> bool {
+    let r = vars.read();
+    matches!(r.get(STRICT_TRANS_VAR), Some(Datum::Bool(true)))
+}
 
 /// Set the NO_UNSIGNED_SUBTRACTION flag for a session (stored in UserVariables)
 pub fn set_no_unsigned_subtraction(vars: &UserVariables, val: bool) {
@@ -185,9 +268,11 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
                 return Ok(Datum::Null);
             }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = evaluate(item, row, vars)?;
                 if item_val.is_null() {
+                    has_null = true;
                     continue;
                 }
                 if val == item_val {
@@ -195,7 +280,11 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
                     break;
                 }
             }
-            Ok(Datum::Bool(if *negated { !found } else { found }))
+            if !found && has_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(if *negated { !found } else { found }))
+            }
         }
 
         ResolvedExpr::Between {
@@ -272,6 +361,37 @@ pub fn evaluate(expr: &ResolvedExpr, row: &Row, vars: &UserVariables) -> Executo
             };
             Ok(Datum::Bool(result))
         }
+
+        // Subqueries should have been materialized before evaluation
+        ResolvedExpr::ScalarSubquery { query, .. } => {
+            // Correlated subquery: substitute outer-ref columns, execute inline
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            run_correlated_subquery_scalar(bound)
+        }
+        ResolvedExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            let left = evaluate(expr, row, vars)?;
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            let values = run_correlated_subquery_values(bound)?;
+            let found = values.iter().any(|v| v == &left);
+            let result = if *negated { !found } else { found };
+            Ok(Datum::Bool(result))
+        }
+        ResolvedExpr::ExistsSubquery { query, negated } => {
+            let mut bound = (**query).clone();
+            substitute_outer_refs_in_select(&mut bound, row);
+            let exists = run_correlated_subquery_exists(bound)?;
+            let result = if *negated { !exists } else { exists };
+            Ok(Datum::Bool(result))
+        }
+        ResolvedExpr::WindowFunction { .. } => Err(ExecutorError::Internal(
+            "WindowFunction must be pre-computed by Window executor".to_string(),
+        )),
     }
 }
 
@@ -288,6 +408,32 @@ fn eval_binary_op_ex(
     vars: Option<&UserVariables>,
 ) -> ExecutorResult<Datum> {
     // Handle NULL propagation for most operations
+    // Geometry in arithmetic/DIV is always an error (MySQL: "Incorrect arguments to ...")
+    if matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::IntDiv
+    ) && (matches!(left, Datum::Geometry(_)) || matches!(right, Datum::Geometry(_)))
+    {
+        let op_name = match op {
+            BinaryOp::IntDiv => "DIV",
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "MOD",
+            _ => "operator",
+        };
+        return Err(ExecutorError::InvalidOperation(format!(
+            "Incorrect arguments to {}",
+            op_name
+        )));
+    }
+
     if matches!(
         op,
         BinaryOp::Add
@@ -313,6 +459,77 @@ fn eval_binary_op_ex(
     {
         return Ok(Datum::Null);
     }
+
+    // Coerce hex literals (Bytes) to integer when compared with numeric types
+    let coerced_left;
+    let coerced_right;
+    let left = if matches!(left, Datum::Bytes(_))
+        && matches!(
+            right,
+            Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_)
+        ) {
+        coerced_left = bytes_to_int(left);
+        &coerced_left
+    } else {
+        left
+    };
+    let right = if matches!(right, Datum::Bytes(_))
+        && matches!(
+            left,
+            Datum::Int(_) | Datum::UnsignedInt(_) | Datum::Float(_)
+        ) {
+        coerced_right = bytes_to_int(right);
+        &coerced_right
+    } else {
+        right
+    };
+
+    // In strict DML context (INSERT/UPDATE), non-numeric strings in arithmetic
+    // must raise ER_TRUNCATED_WRONG_VALUE (1292) instead of silently becoming 0
+    if matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::IntDiv
+    ) && in_strict_dml_context(vars)
+        && vars.is_some_and(is_strict_trans_tables)
+    {
+        for operand in [left, right] {
+            if let Datum::String(s) = operand {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
+                    // Leading digits might exist (e.g. "123abc" → 123) but MySQL
+                    // still raises TRUNCATED_WRONG_VALUE in strict mode
+                    return Err(ExecutorError::TruncatedWrongValue(format!(
+                        "Truncated incorrect DOUBLE value: '{}'",
+                        trimmed
+                    )));
+                }
+            }
+        }
+    }
+
+    // Coerce Bool to Int when comparing with Bit (MySQL: TRUE=1, FALSE=0)
+    let coerced = match (left, right) {
+        (Datum::Bit { .. }, Datum::Bool(b)) => {
+            Some((None, Some(Datum::Int(if *b { 1 } else { 0 }))))
+        }
+        (Datum::Bool(b), Datum::Bit { .. }) => {
+            Some((Some(Datum::Int(if *b { 1 } else { 0 })), None))
+        }
+        _ => None,
+    };
+    let left = coerced
+        .as_ref()
+        .and_then(|(l, _)| l.as_ref())
+        .unwrap_or(left);
+    let right = coerced
+        .as_ref()
+        .and_then(|(_, r)| r.as_ref())
+        .unwrap_or(right);
 
     match op {
         // Arithmetic
@@ -403,10 +620,24 @@ fn checked_float_to_int(v: f64) -> ExecutorResult<Datum> {
 }
 
 /// Promote Bit and String to numeric types for arithmetic operations (MySQL implicit coercion).
+/// Convert a byte slice (big-endian) to a u64 for numeric context.
+/// MySQL interprets hex literals as big-endian unsigned integers in numeric contexts.
+/// Bytes beyond the first 8 are silently ignored (only the last 8 bytes matter for u64).
+fn bytes_to_u64(b: &[u8]) -> u64 {
+    let start = if b.len() > 8 { b.len() - 8 } else { 0 };
+    b[start..]
+        .iter()
+        .fold(0u64, |acc, &byte| (acc << 8) | byte as u64)
+}
+
 fn promote_to_numeric(d: &Datum) -> std::borrow::Cow<'_, Datum> {
     match d {
+        // MySQL: TRUE=1, FALSE=0 in numeric context
+        Datum::Bool(b) => std::borrow::Cow::Owned(Datum::Int(if *b { 1 } else { 0 })),
         Datum::Bit { value, .. } => std::borrow::Cow::Owned(Datum::Int(*value as i64)),
         Datum::Decimal { .. } => std::borrow::Cow::Borrowed(d),
+        // MySQL: hex literals (Bytes) become unsigned integers in numeric context
+        Datum::Bytes(b) => std::borrow::Cow::Owned(Datum::UnsignedInt(bytes_to_u64(b))),
         Datum::String(s) => {
             // MySQL coerces strings to numbers in arithmetic: "123.5" → 123.5, "abc" → 0
             let trimmed = s.trim();
@@ -1026,6 +1257,8 @@ fn to_bitwise_int(d: &Datum) -> Option<i64> {
             Some((value / divisor) as i64)
         }
         Datum::String(s) => Some(parse_leading_int(s)),
+        // MySQL: hex literals (Bytes) become unsigned integers in bitwise context
+        Datum::Bytes(b) => Some(bytes_to_u64(b) as i64),
         _ => None,
     }
 }
@@ -1252,13 +1485,78 @@ fn eval_spaceship(left: &Datum, right: &Datum) -> bool {
     }
 }
 
+/// Get the connection ID from user variables (stored as __sys_connection_id).
+fn get_connection_id(vars: Option<&UserVariables>) -> u32 {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::Int(id)) = r.get("__sys_connection_id") {
+            return *id as u32;
+        }
+    }
+    0
+}
+
+/// Read a string system variable from UserVariables, with a default fallback.
+fn get_sys_var_string(vars: Option<&UserVariables>, key: &str, default: &str) -> Datum {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::String(s)) = r.get(key) {
+            return Datum::String(s.clone());
+        }
+    }
+    Datum::String(default.to_string())
+}
+
+/// Read an integer system variable from UserVariables, defaulting to 0.
+fn get_sys_var_int(vars: Option<&UserVariables>, key: &str) -> i64 {
+    if let Some(v) = vars {
+        let r = v.read();
+        if let Some(Datum::Int(n)) = r.get(key) {
+            return *n;
+        }
+    }
+    0
+}
+
+/// Clamp an overflow value to the nearest type boundary (MAX or MIN).
+/// Used in non-strict INSERT mode when coercion overflows.
+pub fn clamp_to_type_boundary(datum: &Datum, target: &crate::catalog::DataType) -> Datum {
+    use crate::catalog::DataType;
+
+    // Determine the numeric value to clamp
+    let f_val = match datum {
+        Datum::Float(f) => Some(*f),
+        Datum::String(s) => s.trim().parse::<f64>().ok(),
+        Datum::Int(i) => Some(*i as f64),
+        Datum::UnsignedInt(u) => Some(*u as f64),
+        _ => None,
+    };
+
+    match target {
+        DataType::BigInt | DataType::Int | DataType::SmallInt | DataType::TinyInt => match f_val {
+            Some(f) if f >= 0.0 => Datum::Int(i64::MAX),
+            Some(_) => Datum::Int(i64::MIN),
+            None => Datum::Int(0),
+        },
+        DataType::BigIntUnsigned => match f_val {
+            Some(f) if f >= 0.0 => Datum::UnsignedInt(u64::MAX),
+            Some(_) => Datum::UnsignedInt(0), // negative → 0
+            None => Datum::UnsignedInt(0),
+        },
+        _ => Datum::default_for_type(target),
+    }
+}
+
 /// Coerce a datum to match a target column type for implicit conversion (e.g. INSERT).
 /// Only performs conversion when the source type doesn't match the target and a safe
 /// conversion exists. Returns the datum unchanged for non-Bit types.
-pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) -> Datum {
+pub fn coerce_to_column_type(
+    datum: Datum,
+    target: &crate::catalog::DataType,
+) -> ExecutorResult<Datum> {
     use crate::catalog::DataType;
     if datum.is_null() {
-        return datum;
+        return Ok(datum);
     }
     // Check if type already matches
     let already_matches = matches!(
@@ -1274,11 +1572,24 @@ pub fn coerce_to_column_type(datum: Datum, target: &crate::catalog::DataType) ->
             | (Datum::Bit { .. }, DataType::Bit(_))
             | (Datum::Timestamp(_), DataType::Timestamp)
             | (Datum::Decimal { .. }, DataType::Decimal { .. })
+            | (Datum::Json(_), DataType::Json)
     );
     if !already_matches {
-        eval_cast(&datum, target).unwrap_or(datum)
+        match eval_cast(&datum, target) {
+            Ok(v) => Ok(v),
+            Err(ExecutorError::DataOutOfRange(ref msg))
+                if msg.starts_with("Out of range value for column") =>
+            {
+                // Propagate INSERT column overflow — real data integrity violation
+                Err(ExecutorError::DataOutOfRange(msg.clone()))
+            }
+            Err(_) => {
+                // Other cast failures (type mismatch, internal overflow, etc.) — fall back
+                Ok(datum)
+            }
+        }
     } else {
-        datum
+        Ok(datum)
     }
 }
 
@@ -1293,10 +1604,48 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
     match target {
         DataType::BigInt | DataType::Int | DataType::SmallInt | DataType::TinyInt => match val {
             Datum::Int(i) => Ok(Datum::Int(*i)),
-            Datum::UnsignedInt(u) => Ok(Datum::Int(*u as i64)),
-            Datum::Float(f) => Ok(Datum::Int(*f as i64)),
+            Datum::UnsignedInt(u) => {
+                if *u > i64::MAX as u64 {
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "BIGINT value is out of range, casting {} to SIGNED",
+                        u
+                    )));
+                }
+                Ok(Datum::Int(*u as i64))
+            }
+            Datum::Float(f) => {
+                let rounded = f.round();
+                // 2^63 = 9223372036854775808.0 — exact threshold
+                const MAX_SIGNED: f64 = 9_223_372_036_854_775_808.0; // 2^63
+                const MIN_SIGNED: f64 = -9_223_372_036_854_775_808.0; // -2^63
+                if !(MIN_SIGNED..MAX_SIGNED).contains(&rounded) || f.is_nan() || f.is_infinite() {
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "BIGINT value is out of range, casting {} to SIGNED",
+                        f
+                    )));
+                }
+                Ok(Datum::Int(rounded as i64))
+            }
             Datum::Bool(b) => Ok(Datum::Int(if *b { 1 } else { 0 })),
-            Datum::String(s) => Ok(Datum::Int(parse_leading_int(s.trim()))),
+            Datum::String(s) => {
+                let trimmed = s.trim();
+                // Try direct i64 parse
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    return Ok(Datum::Int(v));
+                }
+                // Try f64 — check for overflow
+                if let Ok(v) = trimmed.parse::<f64>() {
+                    if v.is_finite() && v >= i64::MIN as f64 && v < 9_223_372_036_854_775_808.0 {
+                        return Ok(Datum::Int(v.round() as i64));
+                    }
+                    return Err(ExecutorError::DataOutOfRange(format!(
+                        "Out of range value for column, value '{}'",
+                        &trimmed[..trimmed.len().min(64)]
+                    )));
+                }
+                // Extract leading digits
+                Ok(Datum::Int(parse_leading_int(trimmed)))
+            }
             Datum::Bytes(b) => {
                 // Interpret bytes as big-endian unsigned integer
                 let mut val = 0i64;
@@ -1310,15 +1659,30 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
         DataType::BigIntUnsigned => match val {
             Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
             Datum::Int(i) => Ok(Datum::UnsignedInt(*i as u64)),
-            Datum::Float(f) => Ok(Datum::UnsignedInt(*f as u64)),
+            Datum::Float(f) => Ok(Datum::UnsignedInt(f.round() as u64)),
             Datum::Bool(b) => Ok(Datum::UnsignedInt(if *b { 1 } else { 0 })),
             Datum::String(s) => {
                 let trimmed = s.trim();
-                let v = trimmed.parse::<u64>().unwrap_or_else(|_| {
-                    // Try parsing as i64 first for negative strings
-                    trimmed.parse::<i64>().map(|i| i as u64).unwrap_or(0)
-                });
-                Ok(Datum::UnsignedInt(v))
+                // Try direct u64 parse
+                if let Ok(v) = trimmed.parse::<u64>() {
+                    return Ok(Datum::UnsignedInt(v));
+                }
+                // Try i64 for negative strings (wraps via two's complement)
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    return Ok(Datum::UnsignedInt(i as u64));
+                }
+                // Try f64
+                if let Ok(v) = trimmed.parse::<f64>() {
+                    if v.is_finite() && v >= 0.0 && v <= u64::MAX as f64 {
+                        return Ok(Datum::UnsignedInt(v.round() as u64));
+                    }
+                    if v.is_finite() && v < 0.0 {
+                        return Ok(Datum::UnsignedInt(v.round() as i64 as u64));
+                    }
+                    // Overflow: clamp to u64::MAX (MySQL behavior for SELECT CAST)
+                    return Ok(Datum::UnsignedInt(u64::MAX));
+                }
+                Ok(Datum::UnsignedInt(0))
             }
             Datum::Bit { value, .. } => Ok(Datum::UnsignedInt(*value)),
             Datum::Bytes(b) => {
@@ -1332,9 +1696,14 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
         },
         DataType::Double | DataType::Float => match val {
             Datum::Int(i) => Ok(Datum::Float(*i as f64)),
+            Datum::UnsignedInt(u) => Ok(Datum::Float(*u as f64)),
             Datum::Float(f) => Ok(Datum::Float(*f)),
             Datum::Bool(b) => Ok(Datum::Float(if *b { 1.0 } else { 0.0 })),
             Datum::String(s) => Ok(Datum::Float(s.parse::<f64>().unwrap_or(0.0))),
+            Datum::Decimal { value, scale } => {
+                let divisor = 10f64.powi(*scale as i32);
+                Ok(Datum::Float(*value as f64 / divisor))
+            }
             _ => Ok(Datum::Float(0.0)),
         },
         DataType::Varchar(_) | DataType::Text => Ok(Datum::String(val.to_display_string())),
@@ -1344,6 +1713,10 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
             match val {
                 Datum::Int(i) => Ok(Datum::Bit {
                     value: (*i as u64) & mask,
+                    width: *w,
+                }),
+                Datum::UnsignedInt(u) => Ok(Datum::Bit {
+                    value: u & mask,
                     width: *w,
                 }),
                 Datum::Bit { value, .. } => Ok(Datum::Bit {
@@ -1442,6 +1815,33 @@ fn eval_cast(val: &Datum, target: &crate::catalog::DataType) -> ExecutorResult<D
                 }
                 Datum::String(str_val) => parse_decimal_string(str_val, s),
                 _ => Ok(Datum::Decimal { value: 0, scale: s }),
+            }
+        }
+        DataType::Geometry => {
+            // Geometry values pass through — Bytes/Geometry are both valid WKB
+            match val {
+                Datum::Geometry(_) | Datum::Bytes(_) => Ok(val.clone()),
+                _ => Ok(Datum::String(val.to_display_string())),
+            }
+        }
+        DataType::Json => {
+            // Parse string as JSON; return as Datum::Json if valid
+            match val {
+                Datum::Json(_) => Ok(val.clone()),
+                Datum::String(s) => match serde_json::from_str(s) {
+                    Ok(v) => Ok(Datum::Json(v)),
+                    Err(_) => Err(ExecutorError::InvalidOperation(format!(
+                        "Invalid JSON text: {}",
+                        s
+                    ))),
+                },
+                _ => {
+                    let s = val.to_display_string();
+                    match serde_json::from_str(&s) {
+                        Ok(v) => Ok(Datum::Json(v)),
+                        Err(_) => Ok(Datum::Json(crate::executor::json::datum_to_json(val))),
+                    }
+                }
             }
         }
         _ => Ok(Datum::String(val.to_display_string())),
@@ -1604,9 +2004,7 @@ pub fn eval_function(
                 Datum::String(s) => Ok(Datum::Int(s.len() as i64)),
                 Datum::Bytes(b) => Ok(Datum::Int(b.len() as i64)),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(ExecutorError::InvalidOperation(
-                    "LENGTH requires string or bytes".to_string(),
-                )),
+                other => Ok(Datum::Int(other.to_display_string().len() as i64)),
             }
         }
 
@@ -1652,6 +2050,33 @@ pub fn eval_function(
             Ok(Datum::String(result))
         }
 
+        "SUBSTRING_INDEX" => {
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SUBSTRING_INDEX requires 3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let delim = args[1].to_display_string();
+            let count = args[2].as_int().unwrap_or(0);
+            if delim.is_empty() {
+                return Ok(Datum::String(String::new()));
+            }
+            let parts: Vec<&str> = s.split(&*delim).collect();
+            if count > 0 {
+                let n = (count as usize).min(parts.len());
+                Ok(Datum::String(parts[..n].join(&delim)))
+            } else if count < 0 {
+                let n = ((-count) as usize).min(parts.len());
+                Ok(Datum::String(parts[parts.len() - n..].join(&delim)))
+            } else {
+                Ok(Datum::String(String::new()))
+            }
+        }
+
         "TRIM" => {
             if args.is_empty() {
                 return Err(ExecutorError::InvalidOperation(
@@ -1669,6 +2094,44 @@ pub fn eval_function(
                 Ok(Datum::String(trimmed.to_string()))
             } else {
                 Ok(Datum::String(s.trim().to_string()))
+            }
+        }
+
+        "LTRIM" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "LTRIM requires 1 or 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            if args.len() == 2 {
+                let what = args[1].to_display_string();
+                let trimmed = s.trim_start_matches(|c: char| what.contains(c));
+                Ok(Datum::String(trimmed.to_string()))
+            } else {
+                Ok(Datum::String(s.trim_start().to_string()))
+            }
+        }
+
+        "RTRIM" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "RTRIM requires 1 or 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            if args.len() == 2 {
+                let what = args[1].to_display_string();
+                let trimmed = s.trim_end_matches(|c: char| what.contains(c));
+                Ok(Datum::String(trimmed.to_string()))
+            } else {
+                Ok(Datum::String(s.trim_end().to_string()))
             }
         }
 
@@ -1824,6 +2287,35 @@ pub fn eval_function(
             }
         }
 
+        "WEIGHT_STRING" => {
+            // WEIGHT_STRING(str) — returns binary collation sort key
+            // Implements utf8mb4_general_ci weights: case-fold to uppercase
+            // codepoint, pack as big-endian u16 per character.
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEIGHT_STRING requires at least 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let mut weights = Vec::with_capacity(s.len() * 2);
+            for ch in s.chars() {
+                // utf8mb4_general_ci: uppercase the character, use codepoint as weight
+                let upper = ch.to_uppercase().next().unwrap_or(ch);
+                let cp = upper as u32;
+                // Pack as big-endian u16 (clamp BMP; supplementary chars use u32)
+                if cp <= 0xFFFF {
+                    weights.extend_from_slice(&(cp as u16).to_be_bytes());
+                } else {
+                    // Supplementary character: 4-byte weight
+                    weights.extend_from_slice(&cp.to_be_bytes());
+                }
+            }
+            Ok(Datum::Bytes(weights))
+        }
+
         "HEX" => {
             if args.len() != 1 {
                 return Err(ExecutorError::InvalidOperation(
@@ -1848,23 +2340,56 @@ pub fn eval_function(
             }
         }
 
+        "UNHEX" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNHEX requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let hex_str = args[0].to_display_string();
+            let trimmed = hex_str.trim();
+            // Decode hex string to bytes; odd-length gets leading 0
+            let padded = if trimmed.len() % 2 == 1 {
+                format!("0{}", trimmed)
+            } else {
+                trimmed.to_string()
+            };
+            let bytes: Result<Vec<u8>, _> = (0..padded.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&padded[i..i + 2], 16))
+                .collect();
+            match bytes {
+                Ok(b) => Ok(Datum::String(String::from_utf8_lossy(&b).to_string())),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
         "LPAD" => {
             if args.len() < 2 {
                 return Err(ExecutorError::InvalidOperation(
                     "LPAD requires 2-3 arguments".to_string(),
                 ));
             }
-            if args[0].is_null() || args[1].is_null() {
+            if args.iter().any(|a| a.is_null()) {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let len = args[1].as_int().unwrap_or(0) as usize;
+            let len_val = args[1].as_int().unwrap_or(0);
+            if len_val < 0 {
+                return Ok(Datum::Null);
+            }
+            let len = len_val as usize;
             let pad = if args.len() >= 3 {
                 args[2].to_display_string()
             } else {
                 " ".to_string()
             };
-            if pad.is_empty() || len <= s.len() {
+            if len == 0 {
+                Ok(Datum::String(String::new()))
+            } else if pad.is_empty() || len <= s.len() {
                 Ok(Datum::String(s.chars().take(len).collect()))
             } else {
                 let need = len - s.len();
@@ -1884,17 +2409,23 @@ pub fn eval_function(
                     "RPAD requires 2-3 arguments".to_string(),
                 ));
             }
-            if args[0].is_null() || args[1].is_null() {
+            if args.iter().any(|a| a.is_null()) {
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let len = args[1].as_int().unwrap_or(0) as usize;
+            let len_val = args[1].as_int().unwrap_or(0);
+            if len_val < 0 {
+                return Ok(Datum::Null);
+            }
+            let len = len_val as usize;
             let pad = if args.len() >= 3 {
                 args[2].to_display_string()
             } else {
                 " ".to_string()
             };
-            if pad.is_empty() || len <= s.len() {
+            if len == 0 {
+                Ok(Datum::String(String::new()))
+            } else if pad.is_empty() || len <= s.len() {
                 Ok(Datum::String(s.chars().take(len).collect()))
             } else {
                 let need = len - s.len();
@@ -2120,7 +2651,32 @@ pub fn eval_function(
             match &args[0] {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Int(i) => Ok(Datum::Int(*i)),
-                Datum::Float(f) => Ok(Datum::Int(f.ceil() as i64)),
+                Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
+                Datum::Float(f) => {
+                    let v = f.ceil();
+                    if v >= 0.0 && v > i64::MAX as f64 {
+                        Ok(Datum::UnsignedInt(v as u64))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
+                Datum::Decimal { value, scale } => {
+                    if *scale == 0 {
+                        // Already integer — fit into Int or UnsignedInt
+                        decimal_int_result(*value)
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        let truncated = *value / divisor;
+                        let remainder = *value % divisor;
+                        // Ceil: round toward +infinity
+                        let result = if remainder > 0 {
+                            truncated + 1
+                        } else {
+                            truncated
+                        };
+                        decimal_int_result(result)
+                    }
+                }
                 _ => Ok(Datum::Int(0)),
             }
         }
@@ -2134,7 +2690,31 @@ pub fn eval_function(
             match &args[0] {
                 Datum::Null => Ok(Datum::Null),
                 Datum::Int(i) => Ok(Datum::Int(*i)),
-                Datum::Float(f) => Ok(Datum::Int(f.floor() as i64)),
+                Datum::UnsignedInt(u) => Ok(Datum::UnsignedInt(*u)),
+                Datum::Float(f) => {
+                    let v = f.floor();
+                    if v >= 0.0 && v > i64::MAX as f64 {
+                        Ok(Datum::UnsignedInt(v as u64))
+                    } else {
+                        Ok(Datum::Int(v as i64))
+                    }
+                }
+                Datum::Decimal { value, scale } => {
+                    if *scale == 0 {
+                        decimal_int_result(*value)
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        let truncated = *value / divisor;
+                        let remainder = *value % divisor;
+                        // Floor: round toward -infinity
+                        let result = if remainder < 0 {
+                            truncated - 1
+                        } else {
+                            truncated
+                        };
+                        decimal_int_result(result)
+                    }
+                }
                 _ => Ok(Datum::Int(0)),
             }
         }
@@ -2153,9 +2733,50 @@ pub fn eval_function(
             } else {
                 0
             };
+            // For integer types with negative decimals, use integer arithmetic
+            // to avoid float precision loss on large values
+            if decimals < 0 {
+                match &args[0] {
+                    Datum::UnsignedInt(u) => {
+                        let d = (-decimals) as u32;
+                        if d >= 20 {
+                            return Ok(Datum::UnsignedInt(0));
+                        }
+                        let divisor = 10u64.pow(d);
+                        let rounded = (u + divisor / 2) / divisor * divisor;
+                        return Ok(Datum::UnsignedInt(rounded));
+                    }
+                    Datum::Int(i) => {
+                        let d = (-decimals) as u32;
+                        if d >= 19 {
+                            return Ok(Datum::Int(0));
+                        }
+                        let divisor = 10i64.pow(d);
+                        // Check for overflow: i64::MIN rounded can overflow
+                        if *i == i64::MIN && divisor > 1 {
+                            return Err(ExecutorError::DataOutOfRange(
+                                "BIGINT value is out of range".to_string(),
+                            ));
+                        }
+                        let rounded = if *i >= 0 {
+                            (i + divisor / 2) / divisor * divisor
+                        } else {
+                            (i - divisor / 2) / divisor * divisor
+                        };
+                        return Ok(Datum::Int(rounded));
+                    }
+                    _ => {} // fall through to float path
+                }
+            }
+
             let val = args[0].as_float().unwrap_or(0.0);
             let factor = 10_f64.powi(decimals as i32);
-            let rounded = (val * factor).round() / factor;
+            // Handle extreme decimals: when factor overflows, result rounds to 0
+            let rounded = if factor.is_infinite() || factor == 0.0 {
+                0.0
+            } else {
+                (val * factor).round() / factor
+            };
             if decimals <= 0 {
                 Ok(Datum::Int(rounded as i64))
             } else {
@@ -2263,8 +2884,24 @@ pub fn eval_function(
         "PI" => Ok(Datum::Float(std::f64::consts::PI)),
 
         "RAND" => {
-            // RAND() or RAND(seed) — for determinism in tests, use simple approach
-            Ok(Datum::Float(0.0)) // TODO: actual random when not in test mode
+            // MySQL-compatible RAND([seed])
+            // RAND(NULL) seeds with 0 (same as MySQL behavior)
+            let seed_arg = if !args.is_empty() {
+                Some(args[0].as_int().unwrap_or(0) as u64)
+            } else {
+                None
+            };
+            RAND_STATE.with(|state| {
+                let mut st = state.borrow_mut();
+                if let Some(seed) = seed_arg {
+                    let (s1, s2) = mysql_rand_seed(seed);
+                    st.0 = s1;
+                    st.1 = s2;
+                }
+                let (ref mut s1, ref mut s2) = *st;
+                let result = mysql_rand_next(s1, s2);
+                Ok(Datum::Float(result))
+            })
         }
 
         "RADIANS" => {
@@ -2595,19 +3232,44 @@ pub fn eval_function(
             Ok(Datum::Int(0))
         }
 
-        "CONNECTION_ID" => Ok(Datum::Int(0)),
+        "CONNECTION_ID" => Ok(Datum::Int(get_connection_id(vars) as i64)),
 
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
-            Ok(Datum::String("root@localhost".to_string()))
+            Ok(get_sys_var_string(vars, "__sys_user", "root@localhost"))
         }
 
         "VERSION" => Ok(Datum::String("8.0.0-RooDB".to_string())),
 
-        "DATABASE" | "SCHEMA" => Ok(Datum::String("test".to_string())),
+        "DATABASE" | "SCHEMA" => {
+            // MySQL returns NULL when no database is selected
+            if let Some(v) = vars {
+                let r = v.read();
+                match r.get("__sys_database") {
+                    Some(Datum::Null) | None => Ok(Datum::Null),
+                    Some(d) => Ok(d.clone()),
+                }
+            } else {
+                Ok(Datum::Null)
+            }
+        }
 
-        "LAST_INSERT_ID" => Ok(Datum::Int(0)),
+        "LAST_INSERT_ID" => {
+            if !args.is_empty() {
+                // LAST_INSERT_ID(expr) — set the value and return it
+                let val = args[0].as_int().unwrap_or(0);
+                if let Some(v) = vars {
+                    let mut w = v.write();
+                    w.insert("__sys_last_insert_id".to_string(), Datum::Int(val));
+                }
+                Ok(Datum::Int(val))
+            } else {
+                Ok(Datum::Int(get_sys_var_int(vars, "__sys_last_insert_id")))
+            }
+        }
 
-        "FOUND_ROWS" | "ROW_COUNT" => Ok(Datum::Int(0)),
+        "FOUND_ROWS" => Ok(Datum::Int(get_sys_var_int(vars, "__sys_found_rows"))),
+
+        "ROW_COUNT" => Ok(Datum::Int(get_sys_var_int(vars, "__sys_row_count"))),
 
         "TO_DAYS" => {
             if args.len() != 1 {
@@ -2624,6 +3286,51 @@ pub fn eval_function(
                 Some(days) => Ok(Datum::Int(days)),
                 None => Ok(Datum::Null),
             }
+        }
+
+        "TO_SECONDS" => {
+            // TO_SECONDS(date) — number of seconds since year 0
+            // = TO_DAYS(date) * 86400 + HOUR*3600 + MINUTE*60 + SECOND
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TO_SECONDS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            match parse_date_to_days(&s) {
+                Some(days) => {
+                    let p = parse_to_parts(&s);
+                    let time_secs = p
+                        .map(|p| p.hour as i64 * 3600 + p.minute as i64 * 60 + p.second as i64)
+                        .unwrap_or(0);
+                    Ok(Datum::Int(days * 86400 + time_secs))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "FROM_DAYS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "FROM_DAYS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let day_num = args[0].as_int().unwrap_or(0);
+            if day_num <= 0 {
+                return Ok(Datum::String("0000-00-00".to_string()));
+            }
+            // MySQL TO_DAYS uses Julian Day Number formula where
+            // TO_DAYS('1970-01-01') = 2440588
+            // Convert MySQL day number to Unix epoch days
+            let epoch_days = day_num - 2440588;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            Ok(Datum::String(format!("{:04}-{:02}-{:02}", y, m, d)))
         }
 
         "DATEDIFF" => {
@@ -2721,6 +3428,25 @@ pub fn eval_function(
             Ok(Datum::Int(0))
         }
 
+        "MAKE_SET" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MAKE_SET requires at least 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = args[0].as_int().unwrap_or(0) as u64;
+            let mut result = Vec::new();
+            for (i, arg) in args[1..].iter().enumerate() {
+                if bits & (1u64 << i) != 0 && !arg.is_null() {
+                    result.push(arg.to_display_string());
+                }
+            }
+            Ok(Datum::String(result.join(",")))
+        }
+
         "TIMEDIFF" => {
             if args.len() != 2 {
                 return Err(ExecutorError::InvalidOperation(
@@ -2746,14 +3472,138 @@ pub fn eval_function(
             )))
         }
 
-        "GET_LOCK" => {
-            // GET_LOCK(name, timeout) — always return 1 (acquired)
-            Ok(Datum::Int(1))
+        "ADDTIME" | "SUBTIME" => {
+            // ADDTIME(expr1, expr2) — adds time expr2 to expr1
+            // SUBTIME(expr1, expr2) — subtracts time expr2 from expr1
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s1 = args[0].to_display_string();
+            let s2 = args[1].to_display_string();
+            let is_datetime = s1.contains('-');
+            // Parse the time-only part (arg2 is always a time value)
+            let time_secs = parse_time_hms_to_secs(&s2);
+            if is_datetime {
+                // For datetime: parse properly and adjust
+                match parse_to_parts(&s1) {
+                    Some(p) => {
+                        let total_secs = ymd_to_days_from_epoch(p.year, p.month, p.day) * 86400
+                            + p.hour as i64 * 3600
+                            + p.minute as i64 * 60
+                            + p.second as i64;
+                        let result = if name_upper == "ADDTIME" {
+                            total_secs + time_secs
+                        } else {
+                            total_secs - time_secs
+                        };
+                        let rp = DateTimeParts::from_unix_seconds(result);
+                        Ok(Datum::String(rp.format_datetime()))
+                    }
+                    None => Ok(Datum::Null),
+                }
+            } else {
+                // Time + time
+                let secs1 = parse_time_hms_to_secs(&s1);
+                let result = if name_upper == "ADDTIME" {
+                    secs1 + time_secs
+                } else {
+                    secs1 - time_secs
+                };
+                let sign = if result < 0 { "-" } else { "" };
+                let abs_r = result.unsigned_abs();
+                Ok(Datum::String(format!(
+                    "{}{:02}:{:02}:{:02}",
+                    sign,
+                    abs_r / 3600,
+                    (abs_r % 3600) / 60,
+                    abs_r % 60
+                )))
+            }
         }
 
-        "RELEASE_LOCK" => Ok(Datum::Int(1)),
+        "TIMESTAMPDIFF" => {
+            // TIMESTAMPDIFF(unit, datetime1, datetime2) -> integer
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIMESTAMPDIFF requires 3 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let unit = args[0].to_display_string().to_uppercase();
+            let s1 = args[1].to_display_string();
+            let s2 = args[2].to_display_string();
+            let dt1 = parse_datetime_simple(&s1);
+            let dt2 = parse_datetime_simple(&s2);
+            match (dt1, dt2) {
+                (Some(d1), Some(d2)) => {
+                    let result = timestampdiff_calc(&unit, &d1, &d2);
+                    Ok(Datum::Int(result))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
 
-        "IS_FREE_LOCK" => Ok(Datum::Int(1)),
+        "TIMESTAMPADD" => {
+            // TIMESTAMPADD(unit, interval, datetime) -> datetime string
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TIMESTAMPADD requires 3 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let unit = args[0].to_display_string().to_uppercase();
+            let interval_val = args[1].as_int().unwrap_or(0);
+            let s = args[2].to_display_string();
+            match parse_datetime_simple(&s) {
+                Some(dt) => {
+                    let result = timestampadd_calc(&unit, interval_val, &dt);
+                    Ok(Datum::String(result))
+                }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "GET_LOCK" => {
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let conn_id = get_connection_id(vars);
+            let mgr = crate::server::locks::global_lock_manager();
+            Ok(Datum::Int(mgr.get_lock(&lock_name, conn_id)))
+        }
+
+        "RELEASE_LOCK" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let conn_id = get_connection_id(vars);
+            let mgr = crate::server::locks::global_lock_manager();
+            match mgr.release_lock(&lock_name, conn_id) {
+                Some(v) => Ok(Datum::Int(v)),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "IS_FREE_LOCK" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let lock_name = args[0].to_display_string();
+            let mgr = crate::server::locks::global_lock_manager();
+            Ok(Datum::Int(mgr.is_free_lock(&lock_name)))
+        }
 
         "INET_NTOA" => {
             if args.is_empty() || args[0].is_null() {
@@ -2774,19 +3624,55 @@ pub fn eval_function(
                 return Ok(Datum::Null);
             }
             let s = args[0].to_display_string();
-            let parts: Vec<u32> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-            if parts.len() != 4 {
+            let raw_parts: Vec<&str> = s.split('.').collect();
+            if raw_parts.len() != 4 {
                 return Ok(Datum::Null);
+            }
+            let mut parts = [0u32; 4];
+            for (i, p) in raw_parts.iter().enumerate() {
+                match p.parse::<u32>() {
+                    Ok(v) if v <= 255 => parts[i] = v,
+                    _ => return Ok(Datum::Null),
+                }
             }
             let val = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
             Ok(Datum::Int(val as i64))
         }
 
-        "INET6_NTOA" | "INET6_ATON" => {
+        "INET6_ATON" => {
             if args.is_empty() || args[0].is_null() {
                 return Ok(Datum::Null);
             }
+            let s = args[0].to_display_string();
+            let trimmed = s.trim();
+            // Try IPv6
+            if let Ok(addr) = trimmed.parse::<std::net::Ipv6Addr>() {
+                return Ok(Datum::Bytes(addr.octets().to_vec()));
+            }
+            // Try IPv4 (returns 4-byte binary)
+            if let Ok(addr) = trimmed.parse::<std::net::Ipv4Addr>() {
+                return Ok(Datum::Bytes(addr.octets().to_vec()));
+            }
             Ok(Datum::Null)
+        }
+
+        "INET6_NTOA" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match &args[0] {
+                Datum::Bytes(b) if b.len() == 16 => {
+                    let octets: [u8; 16] = b[..16].try_into().unwrap();
+                    let addr = std::net::Ipv6Addr::from(octets);
+                    Ok(Datum::String(addr.to_string()))
+                }
+                Datum::Bytes(b) if b.len() == 4 => {
+                    let octets: [u8; 4] = b[..4].try_into().unwrap();
+                    let addr = std::net::Ipv4Addr::from(octets);
+                    Ok(Datum::String(addr.to_string()))
+                }
+                _ => Ok(Datum::Null),
+            }
         }
 
         "CURDATE" | "CURRENT_DATE" => {
@@ -2800,6 +3686,27 @@ pub fn eval_function(
         "CURTIME" | "CURRENT_TIME" => {
             let p = system_now_parts();
             Ok(Datum::String(p.format_time()))
+        }
+        "UTC_DATE" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_date()))
+        }
+        "UTC_TIME" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_time()))
+        }
+        "UTC_TIMESTAMP" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let p = DateTimeParts::from_unix_seconds(now.as_secs() as i64);
+            Ok(Datum::String(p.format_datetime()))
         }
 
         // ── Date/time format-string functions ──
@@ -2914,6 +3821,45 @@ pub fn eval_function(
                 Ok(Datum::String(format_datetime_fmt(&p, &fmt)))
             } else {
                 Ok(Datum::String(p.format_datetime()))
+            }
+        }
+
+        "CONVERT_TZ" => {
+            // CONVERT_TZ(dt, from_tz, to_tz)
+            // Simplified: supports '+HH:MM' / '-HH:MM' offset format and 'SYSTEM'/'UTC'
+            if args.len() != 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "CONVERT_TZ requires 3 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                return Ok(Datum::Null);
+            }
+            let dt_str = args[0].to_display_string();
+            let from_tz = args[1].to_display_string();
+            let to_tz = args[2].to_display_string();
+
+            let from_offset = tz_offset_seconds(&from_tz);
+            let to_offset = tz_offset_seconds(&to_tz);
+
+            match (from_offset, to_offset) {
+                (Some(from_off), Some(to_off)) => {
+                    match parse_to_parts(&dt_str) {
+                        Some(p) => {
+                            // Convert to UTC first, then to target TZ
+                            let unix_secs = ymd_to_days_from_epoch(p.year, p.month, p.day) * 86400
+                                + p.hour as i64 * 3600
+                                + p.minute as i64 * 60
+                                + p.second as i64
+                                - from_off;
+                            let result_secs = unix_secs + to_off;
+                            let rp = DateTimeParts::from_unix_seconds(result_secs);
+                            Ok(Datum::String(rp.format_datetime()))
+                        }
+                        None => Ok(Datum::Null),
+                    }
+                }
+                _ => Ok(Datum::Null),
             }
         }
 
@@ -3084,6 +4030,22 @@ pub fn eval_function(
             }
         }
 
+        "WEEKOFYEAR" => {
+            // WEEKOFYEAR(date) is equivalent to WEEK(date, 3) — ISO week number
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "WEEKOFYEAR requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match parse_to_parts(&args[0].to_display_string()) {
+                Some(p) => Ok(Datum::Int(p.week_number(3) as i64)),
+                None => Ok(Datum::Null),
+            }
+        }
+
         "QUARTER" => {
             if args.len() != 1 {
                 return Err(ExecutorError::InvalidOperation(
@@ -3180,6 +4142,58 @@ pub fn eval_function(
                         p.year, p.month, last
                     )))
                 }
+                None => Ok(Datum::Null),
+            }
+        }
+
+        // Internal: __INTERVAL(value, unit) — encodes INTERVAL for DATE_ADD/DATE_SUB
+        "__INTERVAL" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "__INTERVAL requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let val = args[0].to_display_string();
+            let unit = args[1].to_display_string();
+            Ok(Datum::String(format!("{} {}", val, unit)))
+        }
+
+        // Internal: __EXTRACT(field, expr) — implements EXTRACT(field FROM expr)
+        "__EXTRACT" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "__EXTRACT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let field = args[0].to_display_string().to_uppercase();
+            let s = args[1].to_display_string();
+            match parse_to_parts(&s) {
+                Some(p) => Ok(Datum::Int(extract_field(&field, &p))),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let date_str = args[0].to_display_string();
+            let interval_str = args[1].to_display_string();
+            let is_sub = name_upper == "DATE_SUB" || name_upper == "SUBDATE";
+            match eval_date_add_sub(&date_str, &interval_str, is_sub) {
+                Some(result) => Ok(Datum::String(result)),
                 None => Ok(Datum::Null),
             }
         }
@@ -3307,12 +4321,13 @@ pub fn eval_function(
             }
         }
 
+        // STDDEV/VARIANCE family: handled as aggregate functions in aggregate.rs.
+        // If called as scalar (e.g. SELECT STDDEV(1)), treat as single-value aggregate.
         "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "STD" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => {
-            // Statistical aggregate functions — when called as scalar on a single value,
-            // return 0 (stddev of one value is 0)
             if args.is_empty() || args[0].is_null() {
                 return Ok(Datum::Null);
             }
+            // Single value: population stddev/variance is 0
             Ok(Datum::Float(0.0))
         }
 
@@ -3360,12 +4375,1117 @@ pub fn eval_function(
             Ok(Datum::Int(crc as i64))
         }
 
+        // ============ Geometry/Spatial Functions ============
+        "ST_GEOMFROMTEXT" | "ST_GEOMETRYFROMTEXT" => {
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_GeomFromText requires at least 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkt = args[0].to_display_string();
+            match crate::executor::geometry::wkt_to_wkb(&wkt) {
+                Ok(wkb) => Ok(Datum::Geometry(wkb)),
+                Err(e) => Err(ExecutorError::InvalidOperation(format!(
+                    "Invalid WKT: {}",
+                    e
+                ))),
+            }
+        }
+
+        // WKB (Well-Known Binary) constructors — accept binary input, return Geometry
+        "ST_GEOMFROMWKB"
+        | "ST_GEOMETRYFROMWKB"
+        | "ST_LINESTRINGFROMWKB"
+        | "ST_POINTFROMWKB"
+        | "ST_POLYFROMWKB"
+        | "ST_POLYGONFROMWKB" => {
+            if args.is_empty() {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires at least 1 argument",
+                    name_upper
+                )));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            match &args[0] {
+                Datum::Bytes(b) | Datum::Geometry(b) => Ok(Datum::Geometry(b.clone())),
+                // MySQL accepts non-binary args and returns a geometry (which then
+                // fails in arithmetic operators like DIV)
+                _ => {
+                    let bytes = args[0].to_display_string().into_bytes();
+                    Ok(Datum::Geometry(bytes))
+                }
+            }
+        }
+
+        "ST_X" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_X requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_X requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_x(wkb) {
+                Ok(x) => Ok(Datum::Float(x)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_Y" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Y requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Y requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_y(wkb) {
+                Ok(y) => Ok(Datum::Float(y)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_NUMPOINTS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_NumPoints requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_NumPoints requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_numpoints(wkb) {
+                Ok(n) => Ok(Datum::Int(n)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Length requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Length requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_length(wkb) {
+                Ok(l) => Ok(Datum::Float(l)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        "ST_AREA" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "ST_Area requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let wkb = match &args[0] {
+                Datum::Geometry(b) | Datum::Bytes(b) => b,
+                _ => {
+                    return Err(ExecutorError::InvalidOperation(
+                        "ST_Area requires a geometry argument".to_string(),
+                    ))
+                }
+            };
+            match crate::executor::geometry::st_area(wkb) {
+                Ok(a) => Ok(Datum::Float(a)),
+                Err(e) => Err(ExecutorError::InvalidOperation(e)),
+            }
+        }
+
+        // ── Hash functions ──
+        "MD5" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "MD5 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use md5::Digest as _;
+            let mut hasher = md5::Md5::new();
+            hasher.update(args[0].to_display_string().as_bytes());
+            Ok(Datum::String(format!("{:x}", hasher.finalize())))
+        }
+
+        "SHA" | "SHA1" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SHA1 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use sha1::Digest as _;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(args[0].to_display_string().as_bytes());
+            Ok(Datum::String(format!("{:x}", hasher.finalize())))
+        }
+
+        "SHA2" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "SHA2 requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = args[0].to_display_string();
+            let hash_len = args[1].as_int().unwrap_or(-1);
+            use sha2::Digest as _;
+            match hash_len {
+                0 | 256 => {
+                    let mut h = sha2::Sha256::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                224 => {
+                    let mut h = sha2::Sha224::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                384 => {
+                    let mut h = sha2::Sha384::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                512 => {
+                    let mut h = sha2::Sha512::new();
+                    h.update(data.as_bytes());
+                    Ok(Datum::String(format!("{:x}", h.finalize())))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        // ── Encoding functions ──
+        "TO_BASE64" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "TO_BASE64 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use base64::Engine as _;
+            let s = args[0].to_display_string();
+            Ok(Datum::String(
+                base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+            ))
+        }
+
+        "FROM_BASE64" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "FROM_BASE64 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            use base64::Engine as _;
+            let s = args[0].to_display_string();
+            match base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+                Ok(bytes) => Ok(Datum::String(String::from_utf8_lossy(&bytes).into_owned())),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
+        // ── Crypto functions ──
+        "RANDOM_BYTES" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "RANDOM_BYTES requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let len = args[0].as_int().unwrap_or(0);
+            if !(1..=1024).contains(&len) {
+                return Err(ExecutorError::InvalidOperation(
+                    "RANDOM_BYTES length must be 1..1024".to_string(),
+                ));
+            }
+            let mut buf = vec![0u8; len as usize];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut buf);
+            Ok(Datum::Bytes(buf))
+        }
+
+        "AES_ENCRYPT" => {
+            // AES_ENCRYPT(str, key) — AES-128-ECB (MySQL default)
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "AES_ENCRYPT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let plaintext = args[0].to_display_string();
+            let key_str = args[1].to_display_string();
+            Ok(Datum::Bytes(aes_ecb_encrypt(
+                plaintext.as_bytes(),
+                key_str.as_bytes(),
+            )))
+        }
+
+        "AES_DECRYPT" => {
+            // AES_DECRYPT(crypt, key) — AES-128-ECB (MySQL default)
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "AES_DECRYPT requires 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Datum::Null);
+            }
+            let ciphertext = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            let key_str = args[1].to_display_string();
+            match aes_ecb_decrypt(&ciphertext, key_str.as_bytes()) {
+                Some(plain) => Ok(Datum::String(String::from_utf8_lossy(&plain).into_owned())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        // ── Compression functions ──
+        "COMPRESS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "COMPRESS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            if s.is_empty() {
+                return Ok(Datum::Bytes(Vec::new()));
+            }
+            let uncompressed_len = s.len() as u32;
+            let mut output = Vec::new();
+            output.extend_from_slice(&uncompressed_len.to_le_bytes());
+            {
+                use flate2::write::ZlibEncoder;
+                use std::io::Write;
+                let mut encoder = ZlibEncoder::new(&mut output, flate2::Compression::default());
+                let _ = encoder.write_all(s.as_bytes());
+                let _ = encoder.finish();
+            }
+            Ok(Datum::Bytes(output))
+        }
+
+        "UNCOMPRESS" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNCOMPRESS requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            if data.len() < 4 {
+                return Ok(Datum::Null);
+            }
+            let compressed = &data[4..];
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut decoder = ZlibDecoder::new(compressed);
+            let mut result = String::new();
+            match decoder.read_to_string(&mut result) {
+                Ok(_) => Ok(Datum::String(result)),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
+
+        "UNCOMPRESSED_LENGTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "UNCOMPRESSED_LENGTH requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let data = match &args[0] {
+                Datum::Bytes(b) => b.clone(),
+                other => other.to_display_string().into_bytes(),
+            };
+            if data.len() < 4 {
+                return Ok(Datum::Int(0));
+            }
+            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            Ok(Datum::Int(len as i64))
+        }
+
+        // ── String functions (QUOTE, EXPORT_SET) ──
+        "QUOTE" => {
+            // QUOTE(NULL) returns the string 'NULL', not Datum::Null
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "QUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::String("NULL".to_string()));
+            }
+            let s = args[0].to_display_string();
+            let mut out = String::with_capacity(s.len() + 10);
+            out.push('\'');
+            for ch in s.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\'' => out.push_str("\\'"),
+                    '\0' => out.push_str("\\0"),
+                    '\x1a' => out.push_str("\\Z"),
+                    _ => out.push(ch),
+                }
+            }
+            out.push('\'');
+            Ok(Datum::String(out))
+        }
+
+        "EXPORT_SET" => {
+            // EXPORT_SET(bits, on, off [, separator [, number_of_bits]])
+            if args.len() < 3 || args.len() > 5 {
+                return Err(ExecutorError::InvalidOperation(
+                    "EXPORT_SET requires 3-5 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = args[0].as_int().unwrap_or(0) as u64;
+            let on_str = args[1].to_display_string();
+            let off_str = args[2].to_display_string();
+            let sep = if args.len() >= 4 {
+                args[3].to_display_string()
+            } else {
+                ",".to_string()
+            };
+            let nbits = if args.len() >= 5 {
+                args[4].as_int().unwrap_or(64).clamp(0, 64) as u32
+            } else {
+                64
+            };
+            let mut parts = Vec::with_capacity(nbits as usize);
+            for i in 0..nbits {
+                if bits & (1u64 << i) != 0 {
+                    parts.push(on_str.as_str());
+                } else {
+                    parts.push(off_str.as_str());
+                }
+            }
+            Ok(Datum::String(parts.join(&sep)))
+        }
+
+        // ── Network functions ──
+        "IS_IPV4" => {
+            // IS_IPV4(NULL) returns 0, not NULL
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "IS_IPV4 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Int(0));
+            }
+            let s = args[0].to_display_string();
+            let valid = s.trim().parse::<std::net::Ipv4Addr>().is_ok();
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        "IS_IPV6" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "IS_IPV6 requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Int(0));
+            }
+            let s = args[0].to_display_string();
+            let valid = s.trim().parse::<std::net::Ipv6Addr>().is_ok();
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        // ── Utility functions ──
+        "UUID" => {
+            // UUID v4: 16 random bytes with version/variant bits set
+            let mut bytes = [0u8; 16];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut bytes);
+            bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+            bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
+            Ok(Datum::String(format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5],
+                bytes[6], bytes[7],
+                bytes[8], bytes[9],
+                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            )))
+        }
+
+        "UUID_SHORT" => {
+            let val = rand::random::<u64>();
+            Ok(Datum::UnsignedInt(val))
+        }
+
+        "BENCHMARK" => {
+            // BENCHMARK(count, expr) — MySQL perf-testing function.
+            // Args are eagerly evaluated before reaching here, so we cannot
+            // re-execute expr N times. Return 0 per MySQL semantics.
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "BENCHMARK requires 2 arguments".to_string(),
+                ));
+            }
+            Ok(Datum::Int(0))
+        }
+
+        // ── JSON functions ──
+        "JSON_ARRAY" => {
+            let elements: Vec<serde_json::Value> = args
+                .iter()
+                .map(crate::executor::json::datum_to_json)
+                .collect();
+            Ok(Datum::Json(serde_json::Value::Array(elements)))
+        }
+
+        "JSON_OBJECT" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_OBJECT requires an even number of arguments".to_string(),
+                ));
+            }
+            let mut map = serde_json::Map::new();
+            for pair in args.chunks(2) {
+                let key = pair[0].to_display_string();
+                let val = crate::executor::json::datum_to_json(&pair[1]);
+                map.insert(key, val);
+            }
+            Ok(Datum::Json(serde_json::Value::Object(map)))
+        }
+
+        "JSON_QUOTE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_QUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::String(
+                serde_json::to_string(&s).unwrap_or_else(|_| format!("\"{}\"", s)),
+            ))
+        }
+
+        "JSON_UNQUOTE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_UNQUOTE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            // If it's a JSON string literal (starts with "), unquote it
+            if s.starts_with('"') && s.ends_with('"') {
+                let unquoted: Result<String, _> = serde_json::from_str(&s);
+                match unquoted {
+                    Ok(u) => Ok(Datum::String(u)),
+                    Err(_) => Ok(Datum::String(s)),
+                }
+            } else {
+                Ok(Datum::String(s))
+            }
+        }
+
+        "JSON_EXTRACT" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_EXTRACT requires at least 2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Multiple paths: return array if >1 path, single value if 1 path
+            if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                let results = crate::executor::json::json_extract_all(&doc, &path);
+                match results.len() {
+                    0 => Ok(Datum::Null),
+                    1 => Ok(Datum::Json(results[0].clone())),
+                    _ => Ok(Datum::Json(serde_json::Value::Array(
+                        results.into_iter().cloned().collect(),
+                    ))),
+                }
+            } else {
+                // Multiple paths: return array of all results
+                let mut all_results = Vec::new();
+                for arg in &args[1..] {
+                    let path_str = arg.to_display_string();
+                    if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                        match crate::executor::json::json_extract(&doc, &path) {
+                            Some(v) => all_results.push(v.clone()),
+                            None => all_results.push(serde_json::Value::Null),
+                        }
+                    }
+                }
+                Ok(Datum::Json(serde_json::Value::Array(all_results)))
+            }
+        }
+
+        "JSON_VALUE" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_VALUE requires 2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let path_str = args[1].to_display_string();
+            let path = match crate::executor::json::parse_json_path(&path_str) {
+                Some(p) => p,
+                None => return Ok(Datum::Null),
+            };
+            match crate::executor::json::json_extract(&doc, &path) {
+                Some(serde_json::Value::String(s)) => Ok(Datum::String(s.clone())),
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        Ok(Datum::Int(i))
+                    } else if let Some(f) = n.as_f64() {
+                        Ok(Datum::Float(f))
+                    } else {
+                        Ok(Datum::String(n.to_string()))
+                    }
+                }
+                Some(serde_json::Value::Bool(b)) => Ok(Datum::Bool(*b)),
+                Some(serde_json::Value::Null) => Ok(Datum::Null),
+                Some(other) => Ok(Datum::String(other.to_string())),
+                None => Ok(Datum::Null),
+            }
+        }
+
+        "JSON_KEYS" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_KEYS requires 1-2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let target = if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&doc, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                doc
+            };
+            match target {
+                serde_json::Value::Object(obj) => {
+                    let keys: Vec<serde_json::Value> = obj
+                        .keys()
+                        .map(|k| serde_json::Value::String(k.clone()))
+                        .collect();
+                    Ok(Datum::Json(serde_json::Value::Array(keys)))
+                }
+                _ => Ok(Datum::Null),
+            }
+        }
+
+        "JSON_TYPE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_TYPE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::String(
+                crate::executor::json::json_type(&doc).to_string(),
+            ))
+        }
+
+        "JSON_VALID" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_VALID requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            let valid = serde_json::from_str::<serde_json::Value>(&s).is_ok()
+                || matches!(&args[0], Datum::Json(_));
+            Ok(Datum::Int(if valid { 1 } else { 0 }))
+        }
+
+        "JSON_LENGTH" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_LENGTH requires 1-2 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let target = if args.len() == 2 {
+                let path_str = args[1].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&doc, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                doc
+            };
+            let len = match &target {
+                serde_json::Value::Object(obj) => obj.len(),
+                serde_json::Value::Array(arr) => arr.len(),
+                _ => 1, // scalars have length 1
+            };
+            Ok(Datum::Int(len as i64))
+        }
+
+        "JSON_DEPTH" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_DEPTH requires 1 argument".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::Int(crate::executor::json::json_depth(&doc) as i64))
+        }
+
+        "JSON_PRETTY" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_PRETTY requires 1 argument".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_STORAGE_SIZE" => {
+            if args.len() != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_STORAGE_SIZE requires 1 argument".to_string(),
+                ));
+            }
+            if args[0].is_null() {
+                return Ok(Datum::Null);
+            }
+            let s = args[0].to_display_string();
+            Ok(Datum::Int(s.len() as i64))
+        }
+
+        "JSON_STORAGE_FREE" => {
+            // MySQL-specific: returns 0 for non-partially-updated documents
+            Ok(Datum::Int(0))
+        }
+
+        // ── JSON modification functions ──
+        "JSON_SET" | "JSON_INSERT" | "JSON_REPLACE" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires odd number of arguments >= 3",
+                    name_upper
+                )));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let value = crate::executor::json::datum_to_json(&pair[1]);
+                match name_upper.as_str() {
+                    "JSON_SET" => crate::executor::json::json_set(&mut doc, &path, value),
+                    "JSON_INSERT" => crate::executor::json::json_insert(&mut doc, &path, value),
+                    "JSON_REPLACE" => crate::executor::json::json_replace(&mut doc, &path, value),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_REMOVE" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_REMOVE requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let path_str = arg.to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    crate::executor::json::json_remove(&mut doc, &path);
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_ARRAY_APPEND" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_ARRAY_APPEND requires odd number of arguments >= 3".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    let value = crate::executor::json::datum_to_json(&pair[1]);
+                    crate::executor::json::json_array_append(&mut doc, &path, value);
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_ARRAY_INSERT" => {
+            if args.len() < 3 || args.len() % 2 != 1 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_ARRAY_INSERT requires odd number of arguments >= 3".to_string(),
+                ));
+            }
+            let mut doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for pair in args[1..].chunks(2) {
+                let path_str = pair[0].to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    let value = crate::executor::json::datum_to_json(&pair[1]);
+                    // The last leg must be an array index
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let parent_path = &path[..path.len() - 1];
+                    if let Some(crate::executor::json::PathLeg::Index(idx)) = path.last() {
+                        if let Some(parent) =
+                            crate::executor::json::json_extract_mut(&mut doc, parent_path)
+                        {
+                            if let Some(arr) = parent.as_array_mut() {
+                                let pos = (*idx).min(arr.len());
+                                arr.insert(pos, value);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Datum::Json(doc))
+        }
+
+        "JSON_MERGE_PRESERVE" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_MERGE_PRESERVE requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut result = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let other = match crate::executor::json::parse_json_arg(arg) {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                };
+                result = crate::executor::json::json_merge_preserve(&result, &other);
+            }
+            Ok(Datum::Json(result))
+        }
+
+        "JSON_MERGE_PATCH" => {
+            if args.len() < 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_MERGE_PATCH requires at least 2 arguments".to_string(),
+                ));
+            }
+            let mut result = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            for arg in &args[1..] {
+                let other = match crate::executor::json::parse_json_arg(arg) {
+                    Some(v) => v,
+                    None => return Ok(Datum::Null),
+                };
+                result = crate::executor::json::json_merge_patch(&result, &other);
+            }
+            Ok(Datum::Json(result))
+        }
+
+        // ── JSON search functions ──
+        "JSON_CONTAINS" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_CONTAINS requires 2-3 arguments".to_string(),
+                ));
+            }
+            let target = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let candidate = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let search_target = if args.len() == 3 {
+                let path_str = args[2].to_display_string();
+                let path = match crate::executor::json::parse_json_path(&path_str) {
+                    Some(p) => p,
+                    None => return Ok(Datum::Null),
+                };
+                match crate::executor::json::json_extract(&target, &path) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Datum::Null),
+                }
+            } else {
+                target
+            };
+            Ok(Datum::Int(
+                if crate::executor::json::json_contains(&search_target, &candidate) {
+                    1
+                } else {
+                    0
+                },
+            ))
+        }
+
+        "JSON_CONTAINS_PATH" => {
+            if args.len() < 3 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_CONTAINS_PATH requires at least 3 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let mode = args[1].to_display_string().to_lowercase();
+            let is_one = mode == "one";
+            let mut found_count = 0;
+            let total = args.len() - 2;
+            for arg in &args[2..] {
+                let path_str = arg.to_display_string();
+                if let Some(path) = crate::executor::json::parse_json_path(&path_str) {
+                    if crate::executor::json::json_extract(&doc, &path).is_some() {
+                        found_count += 1;
+                        if is_one {
+                            return Ok(Datum::Int(1));
+                        }
+                    }
+                }
+            }
+            Ok(Datum::Int(if is_one {
+                0
+            } else if found_count == total {
+                1
+            } else {
+                0
+            }))
+        }
+
+        "JSON_SEARCH" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_SEARCH requires 3-4 arguments".to_string(),
+                ));
+            }
+            let doc = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let mode = args[1].to_display_string();
+            let pattern = args[2].to_display_string();
+            let results = crate::executor::json::json_search(&doc, &mode, &pattern);
+            if results.is_empty() {
+                Ok(Datum::Null)
+            } else if mode.eq_ignore_ascii_case("one") {
+                Ok(Datum::String(results[0].clone()))
+            } else {
+                let arr: Vec<serde_json::Value> =
+                    results.into_iter().map(serde_json::Value::String).collect();
+                Ok(Datum::Json(serde_json::Value::Array(arr)))
+            }
+        }
+
+        "JSON_OVERLAPS" => {
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(
+                    "JSON_OVERLAPS requires 2 arguments".to_string(),
+                ));
+            }
+            let a = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let b = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Two arrays overlap if they share at least one element
+            // Two objects overlap if they share at least one key-value pair
+            let overlaps = match (&a, &b) {
+                (serde_json::Value::Array(a1), serde_json::Value::Array(a2)) => {
+                    a1.iter().any(|v| a2.contains(v))
+                }
+                (serde_json::Value::Object(o1), serde_json::Value::Object(o2)) => {
+                    o1.iter().any(|(k, v)| o2.get(k) == Some(v))
+                }
+                _ => a == b,
+            };
+            Ok(Datum::Int(if overlaps { 1 } else { 0 }))
+        }
+
+        "JSON_SCHEMA_VALID" | "JSON_SCHEMA_VALIDATION_REPORT" => {
+            // JSON Schema validation: parse the schema, validate the document
+            if args.len() != 2 {
+                return Err(ExecutorError::InvalidOperation(format!(
+                    "{} requires 2 arguments",
+                    name_upper
+                )));
+            }
+            let schema = match crate::executor::json::parse_json_arg(&args[0]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            let doc = match crate::executor::json::parse_json_arg(&args[1]) {
+                Some(v) => v,
+                None => return Ok(Datum::Null),
+            };
+            // Basic schema validation: check "type" constraint
+            let valid = validate_json_schema(&schema, &doc);
+            if name_upper == "JSON_SCHEMA_VALID" {
+                Ok(Datum::Int(if valid { 1 } else { 0 }))
+            } else {
+                let report = if valid {
+                    serde_json::json!({"valid": true})
+                } else {
+                    serde_json::json!({"valid": false, "reason": "Schema validation failed"})
+                };
+                Ok(Datum::Json(report))
+            }
+        }
+
         // Note: Aggregate functions (COUNT, SUM, AVG, MIN, MAX) are handled
         // by the Aggregate executor, not here
-        _ => Err(ExecutorError::InvalidOperation(format!(
-            "unknown function: {}",
-            name
-        ))),
+
+        // Check for user-defined functions via __udf_NAME in user variables
+        _ => {
+            if let Some(udf_result) = try_eval_udf(&name_upper, args, vars) {
+                return udf_result;
+            }
+            Err(ExecutorError::InvalidOperation(format!(
+                "unknown function: {}",
+                name
+            )))
+        }
     }
 }
 
@@ -3445,6 +5565,7 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+#[derive(Default)]
 struct DateTimeParts {
     year: i64,
     month: u32,
@@ -3550,11 +5671,7 @@ impl DateTimeParts {
                     year: self.year - 1,
                     month: 12,
                     day: 31,
-                    hour: 0,
-                    minute: 0,
-                    second: 0,
-                    microsecond: 0,
-                    negative: false,
+                    ..Default::default()
                 };
                 return prev.week_number(mode);
             }
@@ -3597,8 +5714,7 @@ impl DateTimeParts {
             hour: (day_secs / 3600) as u32,
             minute: ((day_secs % 3600) / 60) as u32,
             second: (day_secs % 60) as u32,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         }
     }
 
@@ -3613,6 +5729,83 @@ impl DateTimeParts {
     fn format_datetime(&self) -> String {
         format!("{} {}", self.format_date(), self.format_time())
     }
+
+    fn format_with_time(&self, include_time: bool) -> String {
+        if include_time {
+            if self.microsecond > 0 {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                    self.year,
+                    self.month,
+                    self.day,
+                    self.hour,
+                    self.minute,
+                    self.second,
+                    self.microsecond
+                )
+            } else {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    self.year, self.month, self.day, self.hour, self.minute, self.second
+                )
+            }
+        } else {
+            format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+        }
+    }
+}
+
+/// Extract a field from DateTimeParts for the EXTRACT() SQL function.
+/// Returns an integer value corresponding to the requested field.
+/// Compound fields (e.g. YEAR_MONTH, DAY_HOUR) return concatenated numeric values
+/// matching MySQL behavior.
+fn extract_field(field: &str, p: &DateTimeParts) -> i64 {
+    match field {
+        "YEAR" | "YEARS" => p.year,
+        "MONTH" | "MONTHS" => p.month as i64,
+        "DAY" | "DAYS" => p.day as i64,
+        "HOUR" | "HOURS" => p.hour as i64,
+        "MINUTE" | "MINUTES" => p.minute as i64,
+        "SECOND" | "SECONDS" => p.second as i64,
+        "MICROSECOND" | "MICROSECONDS" => p.microsecond as i64,
+        "WEEK" | "WEEKS" => p.week_number(0) as i64,
+        "QUARTER" => p.quarter() as i64,
+        "YEAR_MONTH" => p.year * 100 + p.month as i64,
+        "DAY_HOUR" => p.day as i64 * 100 + p.hour as i64,
+        "DAY_MINUTE" => p.day as i64 * 10000 + p.hour as i64 * 100 + p.minute as i64,
+        "DAY_SECOND" => {
+            p.day as i64 * 1_000_000
+                + p.hour as i64 * 10_000
+                + p.minute as i64 * 100
+                + p.second as i64
+        }
+        "HOUR_MINUTE" => p.hour as i64 * 100 + p.minute as i64,
+        "HOUR_SECOND" => p.hour as i64 * 10_000 + p.minute as i64 * 100 + p.second as i64,
+        "MINUTE_SECOND" => p.minute as i64 * 100 + p.second as i64,
+        "DAY_MICROSECOND" => {
+            p.day as i64 * 1_000_000_000_000
+                + p.hour as i64 * 10_000_000_000
+                + p.minute as i64 * 100_000_000
+                + p.second as i64 * 1_000_000
+                + p.microsecond as i64
+        }
+        "HOUR_MICROSECOND" => {
+            p.hour as i64 * 10_000_000_000
+                + p.minute as i64 * 100_000_000
+                + p.second as i64 * 1_000_000
+                + p.microsecond as i64
+        }
+        "MINUTE_MICROSECOND" => {
+            p.minute as i64 * 100_000_000 + p.second as i64 * 1_000_000 + p.microsecond as i64
+        }
+        "SECOND_MICROSECOND" => p.second as i64 * 1_000_000 + p.microsecond as i64,
+        _ => 0,
+    }
+}
+
+fn parse_microseconds(frac: &str) -> u32 {
+    let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
+    padded.parse().unwrap_or(0)
 }
 
 /// Parse MySQL date/time/datetime input string into parts
@@ -3631,9 +5824,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
         let minute: u32 = s[14..16].parse().ok()?;
         let second: u32 = s[17..19].parse().ok()?;
         let microsecond = if s.len() > 20 && s.as_bytes()[19] == b'.' {
-            let frac = &s[20..];
-            let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
-            padded.parse().unwrap_or(0)
+            parse_microseconds(&s[20..])
         } else {
             0
         };
@@ -3645,7 +5836,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
             minute,
             second,
             microsecond,
-            negative: false,
+            ..Default::default()
         });
     }
 
@@ -3658,11 +5849,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
             year,
             month,
             day,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         });
     }
 
@@ -3697,8 +5884,7 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
                 hour,
                 minute,
                 second,
-                microsecond: 0,
-                negative: false,
+                ..Default::default()
             });
         } else if s.len() == 8 {
             let year: i64 = s[0..4].parse().ok()?;
@@ -3708,27 +5894,14 @@ fn parse_to_parts(input: &str) -> Option<DateTimeParts> {
                 year,
                 month,
                 day,
-                hour: 0,
-                minute: 0,
-                second: 0,
-                microsecond: 0,
-                negative: false,
+                ..Default::default()
             });
         }
     }
 
     // Try integer coercion (e.g., Datum would have produced "0")
     if s == "0" {
-        return Some(DateTimeParts {
-            year: 0,
-            month: 0,
-            day: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
-        });
+        return Some(DateTimeParts::default());
     }
 
     None
@@ -3743,22 +5916,17 @@ fn parse_time_parts(s: &str) -> Option<DateTimeParts> {
     let minute: u32 = rest[..colon2].parse().ok()?;
     let sec_part = &rest[colon2 + 1..];
     let (sec_str, micro) = if let Some(dot) = sec_part.find('.') {
-        let frac = &sec_part[dot + 1..];
-        let padded = format!("{:0<6}", &frac[..frac.len().min(6)]);
-        (&sec_part[..dot], padded.parse::<u32>().unwrap_or(0))
+        (&sec_part[..dot], parse_microseconds(&sec_part[dot + 1..]))
     } else {
         (sec_part, 0)
     };
     let second: u32 = sec_str.parse().ok()?;
     Some(DateTimeParts {
-        year: 0,
-        month: 0,
-        day: 0,
         hour,
         minute,
         second,
         microsecond: micro,
-        negative: false,
+        ..Default::default()
     })
 }
 
@@ -3872,16 +6040,7 @@ fn format_datetime_fmt(parts: &DateTimeParts, fmt: &str) -> String {
 
 /// STR_TO_DATE: parse input using a MySQL format string
 fn parse_datetime_fmt(input: &str, fmt: &str) -> Option<DateTimeParts> {
-    let mut parts = DateTimeParts {
-        year: 0,
-        month: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        microsecond: 0,
-        negative: false,
-    };
+    let mut parts = DateTimeParts::default();
     let ibytes = input.as_bytes();
     let fbytes = fmt.as_bytes();
     let mut ii = 0; // index into input
@@ -4129,6 +6288,185 @@ fn months_to_period(months: i64) -> i64 {
 
 // ── End date/time infrastructure ──────────────────────────────────────
 
+/// Try to evaluate a user-defined function (UDF) stored in user variables.
+/// UDFs are registered as `__udf_NAME` = body_sql and `__udf_NAME_params` = param_names
+fn try_eval_udf(
+    name: &str,
+    args: &[Datum],
+    vars: Option<&UserVariables>,
+) -> Option<ExecutorResult<Datum>> {
+    let vars = vars?;
+    let udf_key = format!("__udf_{}", name.to_lowercase());
+
+    // Look up UDF body and params from user variables
+    let (body_sql, param_names) = {
+        let r = vars.read();
+        let body = match r.get(&udf_key) {
+            Some(Datum::String(s)) => s.clone(),
+            _ => return None,
+        };
+        let params_key = format!("{}_params", udf_key);
+        let params = match r.get(&params_key) {
+            Some(Datum::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        (body, params)
+    };
+
+    // Build a mini procedure context with args bound to param names
+    let param_list: Vec<&str> = if param_names.is_empty() {
+        vec![]
+    } else {
+        param_names.split(',').collect()
+    };
+
+    let mut ctx = crate::executor::procedure::ProcedureContext {
+        locals: std::collections::HashMap::new(),
+        cursors: std::collections::HashMap::new(),
+        found: false,
+        rows_affected: 0,
+        handlers: Vec::new(),
+    };
+
+    for (i, pname) in param_list.iter().enumerate() {
+        let val = args.get(i).cloned().unwrap_or(Datum::Null);
+        ctx.locals.insert(pname.trim().to_string(), val);
+    }
+
+    // Parse and execute the body statements
+    // Execute the body statements by splitting on ';' and processing each
+    let trimmed = body_sql.trim();
+    let upper = trimmed.to_uppercase();
+    let inner_body = if upper.starts_with("BEGIN") && upper.ends_with("END") {
+        trimmed[5..trimmed.len() - 3].trim()
+    } else {
+        trimmed
+    };
+
+    // Split body into statements and process each
+    let into_re = regex::Regex::new(r"(?i)\bINTO\s+(\w+)").ok()?;
+    for raw_stmt in inner_body.split(';') {
+        let stmt_text = raw_stmt.trim();
+        if stmt_text.is_empty() {
+            continue;
+        }
+        let stmt_upper = stmt_text.to_uppercase();
+
+        // DECLARE var TYPE → SET var = NULL
+        if stmt_upper.starts_with("DECLARE ") {
+            let parts: Vec<&str> = stmt_text.splitn(3, char::is_whitespace).collect();
+            if let Some(var_name) = parts.get(1) {
+                ctx.locals.insert(var_name.to_lowercase(), Datum::Null);
+            }
+            continue;
+        }
+
+        // SET var = expr
+        if stmt_upper.starts_with("SET ") {
+            let rest = stmt_text[4..].trim();
+            if let Some(eq_pos) = rest.find('=') {
+                let var_name = rest[..eq_pos].trim().to_lowercase();
+                let expr_text = rest[eq_pos + 1..].trim();
+                // Substitute locals in expression
+                let subst = substitute_locals_in_sql(expr_text, &ctx);
+                if let Some(val) = eval_sql_expr_in_sp_context(&subst, &ctx, vars) {
+                    ctx.locals.insert(var_name, val);
+                }
+            }
+            continue;
+        }
+
+        // RETURN expr
+        if stmt_upper.starts_with("RETURN ") {
+            let expr_text = stmt_text[7..].trim();
+            let subst = substitute_locals_in_sql(expr_text, &ctx);
+            if let Some(val) = eval_sql_expr_in_sp_context(&subst, &ctx, vars) {
+                return Some(Ok(val));
+            }
+            continue;
+        }
+
+        // SELECT ... INTO var
+        if stmt_upper.starts_with("SELECT ") {
+            if let Some(caps) = into_re.captures(stmt_text) {
+                let var_name = caps.get(1)?.as_str().to_lowercase();
+                let into_match = caps.get(0)?;
+                let select_sql = format!(
+                    "{}{}",
+                    &stmt_text[..into_match.start()],
+                    &stmt_text[into_match.end()..]
+                );
+                let subst = substitute_locals_in_sql(&select_sql, &ctx);
+                // The select_sql is already a full SELECT, no need to wrap
+                if let Ok(sqlparser::ast::Statement::Query(q)) =
+                    crate::sql::Parser::parse_one(&subst).as_ref()
+                {
+                    if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                        if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+                            sel.projection.first()
+                        {
+                            if let Ok(val) =
+                                crate::executor::procedure::eval_sp_expr(expr, &ctx, vars)
+                            {
+                                ctx.locals.insert(var_name, val);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+    }
+
+    // If no explicit RETURN, return NULL
+    Some(Ok(Datum::Null))
+}
+
+/// Parse a SQL expression from "SELECT expr" and evaluate it in procedure context
+fn eval_sql_expr_in_sp_context(
+    expr_sql: &str,
+    ctx: &crate::executor::procedure::ProcedureContext,
+    vars: &UserVariables,
+) -> Option<Datum> {
+    if let Ok(sqlparser::ast::Statement::Query(q)) =
+        crate::sql::Parser::parse_one(&format!("SELECT {}", expr_sql)).as_ref()
+    {
+        if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) = sel.projection.first() {
+                return crate::executor::procedure::eval_sp_expr(expr, ctx, vars).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Substitute local variable names in SQL text with their values
+fn substitute_locals_in_sql(
+    sql: &str,
+    ctx: &crate::executor::procedure::ProcedureContext,
+) -> String {
+    let mut result = sql.to_string();
+    let mut vars: Vec<(&String, &Datum)> = ctx.locals.iter().collect();
+    vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (name, val) in vars {
+        result = result.replace(name.as_str(), &val.to_sql_literal());
+    }
+    result
+}
+
+/// Convert an i128 decimal integer result to the best-fitting Datum type.
+/// Values in i64 range → Int, values in u64 range → UnsignedInt,
+/// otherwise stays as Decimal with scale 0.
+fn decimal_int_result(v: i128) -> ExecutorResult<Datum> {
+    if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
+        Ok(Datum::Int(v as i64))
+    } else if v >= 0 && v <= u64::MAX as i128 {
+        Ok(Datum::UnsignedInt(v as u64))
+    } else {
+        Ok(Datum::Decimal { value: v, scale: 0 })
+    }
+}
+
 /// Return Datum::Float for finite values, Datum::Null for NaN/Infinity.
 /// MySQL returns NULL for mathematically undefined results (log of negative, etc.)
 fn float_or_null(v: f64) -> Datum {
@@ -4202,6 +6540,501 @@ fn parse_date_to_days(s: &str) -> Option<i64> {
     Some(365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day + 1721119)
 }
 
+/// Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into DateTimeParts
+fn parse_datetime_simple(s: &str) -> Option<DateTimeParts> {
+    let s = s.trim();
+    let (date_part, time_part) = if let Some(pos) = s.find(' ') {
+        (&s[..pos], Some(&s[pos + 1..]))
+    } else {
+        (s, None)
+    };
+    let dp: Vec<&str> = date_part.split('-').collect();
+    if dp.len() < 3 {
+        return None;
+    }
+    let year: i64 = dp[0].parse().ok()?;
+    let month: u32 = dp[1].parse().ok()?;
+    let day: u32 = dp[2].parse().ok()?;
+    let (hour, minute, second) = if let Some(tp) = time_part {
+        let tp: Vec<&str> = tp.split(':').collect();
+        (
+            tp.first().and_then(|v| v.parse().ok()).unwrap_or(0u32),
+            tp.get(1).and_then(|v| v.parse().ok()).unwrap_or(0u32),
+            tp.get(2).and_then(|v| v.parse().ok()).unwrap_or(0u32),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        ..Default::default()
+    })
+}
+
+fn timestampdiff_calc(unit: &str, d1: &DateTimeParts, d2: &DateTimeParts) -> i64 {
+    match unit {
+        "YEAR" => {
+            let mut diff = d2.year - d1.year;
+            // Adjust if d2 hasn't reached d1's month/day yet
+            if (d2.month, d2.day, d2.hour, d2.minute, d2.second)
+                < (d1.month, d1.day, d1.hour, d1.minute, d1.second)
+            {
+                diff -= 1;
+            }
+            diff
+        }
+        "QUARTER" => timestampdiff_calc("MONTH", d1, d2) / 3,
+        "MONTH" => {
+            let mut diff = (d2.year - d1.year) * 12 + d2.month as i64 - d1.month as i64;
+            if (d2.day, d2.hour, d2.minute, d2.second) < (d1.day, d1.hour, d1.minute, d1.second) {
+                diff -= 1;
+            }
+            diff
+        }
+        "WEEK" => timestampdiff_calc("DAY", d1, d2) / 7,
+        _ => {
+            // For DAY, HOUR, MINUTE, SECOND: convert to total seconds and divide
+            let secs1 = ymd_to_days_from_epoch(d1.year, d1.month, d1.day) * 86400
+                + d1.hour as i64 * 3600
+                + d1.minute as i64 * 60
+                + d1.second as i64;
+            let secs2 = ymd_to_days_from_epoch(d2.year, d2.month, d2.day) * 86400
+                + d2.hour as i64 * 3600
+                + d2.minute as i64 * 60
+                + d2.second as i64;
+            let diff_secs = secs2 - secs1;
+            match unit {
+                "DAY" => diff_secs / 86400,
+                "HOUR" => diff_secs / 3600,
+                "MINUTE" => diff_secs / 60,
+                "SECOND" | "FRAC_SECOND" => diff_secs,
+                _ => diff_secs / 86400, // default to days
+            }
+        }
+    }
+}
+
+fn timestampadd_calc(unit: &str, interval: i64, dt: &DateTimeParts) -> String {
+    match unit {
+        "YEAR" => {
+            let new_year = dt.year + interval;
+            let new_day = dt.day.min(days_in_month(new_year, dt.month));
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                new_year, dt.month, new_day, dt.hour, dt.minute, dt.second
+            )
+        }
+        "QUARTER" => timestampadd_calc("MONTH", interval * 3, dt),
+        "MONTH" => {
+            let total_months = dt.year * 12 + dt.month as i64 - 1 + interval;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            let new_day = dt.day.min(days_in_month(new_year, new_month));
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                new_year, new_month, new_day, dt.hour, dt.minute, dt.second
+            )
+        }
+        "WEEK" => timestampadd_calc("DAY", interval * 7, dt),
+        _ => {
+            // Convert to total seconds, add, convert back
+            let total_secs = ymd_to_days_from_epoch(dt.year, dt.month, dt.day) * 86400
+                + dt.hour as i64 * 3600
+                + dt.minute as i64 * 60
+                + dt.second as i64;
+            let add_secs = match unit {
+                "DAY" => interval * 86400,
+                "HOUR" => interval * 3600,
+                "MINUTE" => interval * 60,
+                "SECOND" | "FRAC_SECOND" => interval,
+                _ => interval * 86400,
+            };
+            let new_total = total_secs + add_secs;
+            let new_days = new_total.div_euclid(86400);
+            let day_secs = new_total.rem_euclid(86400);
+            let (y, m, d) = days_from_epoch_to_ymd(new_days);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y,
+                m,
+                d,
+                day_secs / 3600,
+                (day_secs % 3600) / 60,
+                day_secs % 60
+            )
+        }
+    }
+}
+
+/// Parse a time-only string (HH:MM:SS or -HH:MM:SS) to total seconds.
+fn parse_time_hms_to_secs(s: &str) -> i64 {
+    let s = s.trim();
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    let parts: Vec<&str> = s.split(':').collect();
+    let secs = if parts.len() >= 3 {
+        let h: i64 = parts[0].parse().unwrap_or(0);
+        let m: i64 = parts[1].parse().unwrap_or(0);
+        let s: i64 = parts[2].parse().unwrap_or(0);
+        h * 3600 + m * 60 + s
+    } else if parts.len() == 2 {
+        let h: i64 = parts[0].parse().unwrap_or(0);
+        let m: i64 = parts[1].parse().unwrap_or(0);
+        h * 3600 + m * 60
+    } else {
+        s.parse::<i64>().unwrap_or(0)
+    };
+    if neg {
+        -secs
+    } else {
+        secs
+    }
+}
+
+/// Parse timezone offset string ('+HH:MM', '-05:00', 'UTC', 'SYSTEM') to seconds from UTC.
+/// MySQL AES key schedule: fold key bytes into 16-byte AES-128 key
+fn mysql_aes_key(key: &[u8]) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    for (i, &b) in key.iter().enumerate() {
+        result[i % 16] ^= b;
+    }
+    result
+}
+
+/// AES-128-ECB encrypt with PKCS7 padding (MySQL default mode)
+fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8]) -> Vec<u8> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    let aes_key = mysql_aes_key(key);
+    let cipher = aes::Aes128::new(aes_key.as_ref().into());
+
+    // PKCS7 padding
+    let pad_len = 16 - (plaintext.len() % 16);
+    let mut padded = plaintext.to_vec();
+    padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+    let mut output = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(16) {
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        output.extend_from_slice(&block);
+    }
+    output
+}
+
+/// AES-128-ECB decrypt with PKCS7 unpadding (MySQL default mode)
+fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        return None;
+    }
+    let aes_key = mysql_aes_key(key);
+    let cipher = aes::Aes128::new(aes_key.as_ref().into());
+
+    let mut output = Vec::with_capacity(ciphertext.len());
+    for chunk in ciphertext.chunks(16) {
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        output.extend_from_slice(&block);
+    }
+
+    // Remove PKCS7 padding
+    let pad_byte = *output.last()? as usize;
+    if pad_byte == 0 || pad_byte > 16 {
+        return None;
+    }
+    if output.len() < pad_byte {
+        return None;
+    }
+    output.truncate(output.len() - pad_byte);
+    Some(output)
+}
+
+/// Basic JSON Schema validation (Draft 4 subset).
+/// Checks: type, properties, required, items, minimum, maximum, minLength, maxLength, enum.
+/// Substitute outer-ref column references in a ResolvedSelect's filter
+/// with literal values from the given row.
+fn substitute_outer_refs_in_select(
+    select: &mut crate::planner::logical::ResolvedSelect,
+    row: &super::row::Row,
+) {
+    if let Some(ref mut filter) = select.filter {
+        substitute_outer_refs(filter, row);
+    }
+    for item in &mut select.columns {
+        if let crate::planner::logical::ResolvedSelectItem::Expr { expr, .. } = item {
+            substitute_outer_refs(expr, row);
+        }
+    }
+}
+
+/// Recursively replace outer-ref Column nodes with Literal values from the row
+fn substitute_outer_refs(expr: &mut ResolvedExpr, row: &super::row::Row) {
+    match expr {
+        ResolvedExpr::Column(col) if col.is_outer_ref => {
+            if let Ok(val) = row.get(col.index) {
+                *expr = ResolvedExpr::Literal(datum_to_literal(val));
+            }
+        }
+        ResolvedExpr::BinaryOp { left, right, .. } => {
+            substitute_outer_refs(left, row);
+            substitute_outer_refs(right, row);
+        }
+        ResolvedExpr::UnaryOp { expr: inner, .. } => substitute_outer_refs(inner, row),
+        ResolvedExpr::Function { args, .. } => {
+            for arg in args {
+                substitute_outer_refs(arg, row);
+            }
+        }
+        ResolvedExpr::IsNull { expr: inner, .. } => substitute_outer_refs(inner, row),
+        ResolvedExpr::InList { expr, list, .. } => {
+            substitute_outer_refs(expr, row);
+            for item in list {
+                substitute_outer_refs(item, row);
+            }
+        }
+        ResolvedExpr::Between {
+            expr, low, high, ..
+        } => {
+            substitute_outer_refs(expr, row);
+            substitute_outer_refs(low, row);
+            substitute_outer_refs(high, row);
+        }
+        ResolvedExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                substitute_outer_refs(op, row);
+            }
+            for c in conditions {
+                substitute_outer_refs(c, row);
+            }
+            for r in results {
+                substitute_outer_refs(r, row);
+            }
+            if let Some(e) = else_result {
+                substitute_outer_refs(e, row);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a Datum to a Literal for substitution
+fn datum_to_literal(datum: &Datum) -> Literal {
+    match datum {
+        Datum::Null => Literal::Null,
+        Datum::Bool(b) => Literal::Boolean(*b),
+        Datum::Int(i) => Literal::Integer(*i),
+        Datum::UnsignedInt(u) => Literal::UnsignedInteger(*u),
+        Datum::Float(f) => Literal::Float(*f),
+        Datum::String(s) => Literal::String(s.clone()),
+        Datum::Decimal { value, scale } => Literal::Decimal(*value, *scale),
+        _ => Literal::String(datum.to_display_string()),
+    }
+}
+
+/// Run a correlated subquery synchronously from within an async context.
+/// Captures the thread-local SubqueryContext and passes it to a new thread
+/// with its own tokio runtime (avoids nested block_on panic).
+fn run_correlated_subquery_values(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Vec<Datum>> {
+    // Capture context from thread-local BEFORE spawning
+    let ctx = SUBQUERY_ENGINE.with(|c| c.borrow().clone());
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ExecutorError::Internal(format!("Failed to create runtime: {}", e)))?;
+        // Restore context in the new thread
+        if let Some(ref ctx) = ctx {
+            SUBQUERY_ENGINE.with(|c| *c.borrow_mut() = Some(ctx.clone()));
+        }
+        rt.block_on(execute_inline_subquery_values(&select))
+    });
+    handle
+        .join()
+        .map_err(|_| ExecutorError::Internal("Correlated subquery thread panicked".to_string()))?
+}
+
+fn run_correlated_subquery_scalar(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Datum> {
+    let values = run_correlated_subquery_values(select)?;
+    Ok(values.into_iter().next().unwrap_or(Datum::Null))
+}
+
+fn run_correlated_subquery_exists(
+    select: crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<bool> {
+    let values = run_correlated_subquery_values(select)?;
+    Ok(!values.is_empty())
+}
+
+/// Execute a correlated subquery inline using the full planner+executor pipeline.
+/// After outer-ref substitution, the subquery is a regular non-correlated query.
+async fn execute_inline_subquery_values(
+    select: &crate::planner::logical::ResolvedSelect,
+) -> ExecutorResult<Vec<Datum>> {
+    use crate::planner::logical::builder::LogicalPlanBuilder;
+    use crate::planner::logical::ResolvedStatement;
+
+    let ctx = SUBQUERY_ENGINE.with(|c| c.borrow().clone());
+    let ctx = match ctx {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+
+    // Build the full pipeline: resolve → plan → physical plan → executor
+    let stmt = ResolvedStatement::Select(select.clone());
+    let logical = LogicalPlanBuilder::build(stmt)
+        .map_err(|e| ExecutorError::Internal(format!("Subquery plan error: {}", e)))?;
+    let physical = {
+        let catalog_guard = ctx.catalog.read();
+        crate::planner::physical::PhysicalPlanner::plan(logical, &catalog_guard)
+            .map_err(|e| ExecutorError::Internal(format!("Subquery physical plan error: {}", e)))?
+    };
+
+    // Create a read-everything transaction context
+    let read_view = crate::txn::ReadView::new(0, std::collections::HashSet::new(), u64::MAX);
+    let txn_ctx = super::context::TransactionContext::new(0, read_view);
+
+    let engine = super::engine::ExecutorEngine::with_raft_and_txn(
+        ctx.mvcc.clone(),
+        ctx.catalog.clone(),
+        Some(txn_ctx),
+        ctx.user_variables.clone(),
+    );
+    let mut executor = engine.build(physical)?;
+    executor.open().await?;
+
+    let mut values = Vec::new();
+    while let Some(row) = executor.next().await? {
+        if let Ok(val) = row.get(0) {
+            values.push(val.clone());
+        }
+    }
+    executor.close().await?;
+    Ok(values)
+}
+
+/// Execute a correlated EXISTS subquery inline (returns bool)
+fn validate_json_schema(schema: &serde_json::Value, doc: &serde_json::Value) -> bool {
+    if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
+        let type_matches = match type_str {
+            "object" => doc.is_object(),
+            "array" => doc.is_array(),
+            "string" => doc.is_string(),
+            "number" | "integer" => doc.is_number(),
+            "boolean" => doc.is_boolean(),
+            "null" => doc.is_null(),
+            _ => true,
+        };
+        if !type_matches {
+            return false;
+        }
+    }
+    // Check required properties
+    if let (Some(required), Some(obj)) = (
+        schema.get("required").and_then(|r| r.as_array()),
+        doc.as_object(),
+    ) {
+        for req in required {
+            if let Some(key) = req.as_str() {
+                if !obj.contains_key(key) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Check property schemas
+    if let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(|p| p.as_object()),
+        doc.as_object(),
+    ) {
+        for (key, prop_schema) in props {
+            if let Some(val) = obj.get(key) {
+                if !validate_json_schema(prop_schema, val) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Check items schema (array)
+    if let (Some(items_schema), Some(arr)) = (schema.get("items"), doc.as_array()) {
+        for item in arr {
+            if !validate_json_schema(items_schema, item) {
+                return false;
+            }
+        }
+    }
+    // Check enum
+    if let Some(enum_values) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !enum_values.contains(doc) {
+            return false;
+        }
+    }
+    // Check numeric bounds
+    if let Some(n) = doc.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|m| m.as_f64()) {
+            if n < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|m| m.as_f64()) {
+            if n > max {
+                return false;
+            }
+        }
+    }
+    // Check string length
+    if let Some(s) = doc.as_str() {
+        if let Some(min) = schema.get("minLength").and_then(|m| m.as_u64()) {
+            if (s.len() as u64) < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maxLength").and_then(|m| m.as_u64()) {
+            if (s.len() as u64) > max {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn tz_offset_seconds(tz: &str) -> Option<i64> {
+    let tz = tz.trim();
+    match tz.to_uppercase().as_str() {
+        "UTC" | "+00:00" | "GMT" => return Some(0),
+        "SYSTEM" => return Some(0), // Treat SYSTEM as UTC for simplicity
+        _ => {}
+    }
+    // Parse +HH:MM or -HH:MM
+    if tz.len() >= 5 && (tz.starts_with('+') || tz.starts_with('-')) {
+        let sign: i64 = if tz.starts_with('-') { -1 } else { 1 };
+        let parts: Vec<&str> = tz[1..].split(':').collect();
+        if parts.len() == 2 {
+            let hours: i64 = parts[0].parse().ok()?;
+            let mins: i64 = parts[1].parse().ok()?;
+            return Some(sign * (hours * 3600 + mins * 60));
+        }
+    }
+    None
+}
+
 fn radix_string(val: i64, radix: u32) -> String {
     if radix == 10 {
         return val.to_string();
@@ -4265,6 +7098,136 @@ fn eval_if_function(
     }
 }
 
+fn add_seconds_preserving_micros(parts: &DateTimeParts, delta_secs: i64) -> DateTimeParts {
+    let mut r = total_seconds_to_datetime(parts.to_unix_seconds() + delta_secs);
+    r.microsecond = parts.microsecond;
+    r
+}
+
+/// Evaluate DATE_ADD/DATE_SUB with an interval string like "1 DAY".
+/// Returns the resulting date/datetime string, or None for NULL.
+fn eval_date_add_sub(date_str: &str, interval_str: &str, is_sub: bool) -> Option<String> {
+    let parts = parse_to_parts(date_str)?;
+    let has_time = date_str.contains(' ') || (date_str.contains(':') && date_str.contains('-'));
+
+    // Parse interval: "N UNIT" e.g. "1 DAY", "3 MONTH", "-2 YEAR"
+    let interval_str = interval_str.trim();
+    let (amount_str, unit) = interval_str.rsplit_once(' ')?;
+    let amount: i64 = amount_str.trim().parse().ok()?;
+    let amount = if is_sub { -amount } else { amount };
+    let unit_upper = unit.to_uppercase();
+
+    match unit_upper.as_str() {
+        "SECOND" | "SECONDS" => {
+            let result = add_seconds_preserving_micros(&parts, amount);
+            Some(result.format_with_time(true))
+        }
+        "MINUTE" | "MINUTES" => {
+            let result = add_seconds_preserving_micros(&parts, amount * 60);
+            Some(result.format_with_time(true))
+        }
+        "HOUR" | "HOURS" => {
+            let result = add_seconds_preserving_micros(&parts, amount * 3600);
+            Some(result.format_with_time(true))
+        }
+        "DAY" | "DAYS" => {
+            let epoch_days = ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            let result = DateTimeParts {
+                year: y,
+                month: m,
+                day: d,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(result.format_with_time(has_time))
+        }
+        "WEEK" | "WEEKS" => {
+            let epoch_days =
+                ymd_to_days_from_epoch(parts.year, parts.month, parts.day) + amount * 7;
+            let (y, m, d) = days_from_epoch_to_ymd(epoch_days);
+            let result = DateTimeParts {
+                year: y,
+                month: m,
+                day: d,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(result.format_with_time(has_time))
+        }
+        "MONTH" | "MONTHS" => {
+            let total_months = parts.year * 12 + parts.month as i64 - 1 + amount;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            let max_day = days_in_month(new_year, new_month);
+            let new_day = parts.day.min(max_day);
+            let result = DateTimeParts {
+                year: new_year,
+                month: new_month,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(result.format_with_time(has_time))
+        }
+        "QUARTER" => {
+            let total_months = parts.year * 12 + parts.month as i64 - 1 + amount * 3;
+            let new_year = total_months.div_euclid(12);
+            let new_month = (total_months.rem_euclid(12) + 1) as u32;
+            let max_day = days_in_month(new_year, new_month);
+            let new_day = parts.day.min(max_day);
+            let result = DateTimeParts {
+                year: new_year,
+                month: new_month,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(result.format_with_time(has_time))
+        }
+        "YEAR" | "YEARS" => {
+            let new_year = parts.year + amount;
+            let max_day = days_in_month(new_year, parts.month);
+            let new_day = parts.day.min(max_day);
+            let result = DateTimeParts {
+                year: new_year,
+                day: new_day,
+                microsecond: parts.microsecond,
+                ..parts
+            };
+            Some(result.format_with_time(has_time))
+        }
+        "MICROSECOND" | "MICROSECONDS" => {
+            let total_us = parts.microsecond as i64 + amount;
+            let extra_secs = total_us.div_euclid(1_000_000);
+            let new_us = total_us.rem_euclid(1_000_000) as u32;
+            let mut result = add_seconds_preserving_micros(&parts, extra_secs);
+            result.microsecond = new_us;
+            Some(result.format_with_time(true))
+        }
+        _ => None,
+    }
+}
+
+/// Convert total seconds since epoch back to DateTimeParts
+fn total_seconds_to_datetime(total_secs: i64) -> DateTimeParts {
+    let days = total_secs.div_euclid(86400);
+    let remainder = total_secs.rem_euclid(86400);
+    let (y, m, d) = days_from_epoch_to_ymd(days);
+    let hour = (remainder / 3600) as u32;
+    let minute = ((remainder % 3600) / 60) as u32;
+    let second = (remainder % 60) as u32;
+    DateTimeParts {
+        year: y,
+        month: m,
+        day: d,
+        hour,
+        minute,
+        second,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4299,6 +7262,8 @@ mod tests {
             index,
             data_type: DataType::Int,
             nullable: true,
+            default_value: None,
+            is_outer_ref: false,
         })
     }
 
@@ -4403,6 +7368,7 @@ mod tests {
             args: vec![col_expr(1)],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("HELLO"));
@@ -4433,6 +7399,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("yes"));
@@ -4450,6 +7417,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("no"));
@@ -4467,6 +7435,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::Text,
+            separator: None,
         };
         let result = eval(&expr, &row).unwrap();
         assert_eq!(result.as_str(), Some("no"));
@@ -4481,6 +7450,7 @@ mod tests {
             args: vec![ResolvedExpr::Literal(Literal::Null)],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
 
@@ -4490,6 +7460,7 @@ mod tests {
             args: vec![ResolvedExpr::Literal(Literal::Integer(42))],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(0));
     }
@@ -4506,6 +7477,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(2));
 
@@ -4518,6 +7490,7 @@ mod tests {
             ],
             distinct: false,
             result_type: DataType::BigInt,
+            separator: None,
         };
         assert_eq!(eval(&expr, &row).unwrap().as_int(), Some(1));
     }
@@ -4908,11 +7881,7 @@ mod tests {
             year: 2024,
             month: 1,
             day: d,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            microsecond: 0,
-            negative: false,
+            ..Default::default()
         };
         assert_eq!(format_datetime_fmt(&p(1), "%D"), "1st");
         assert_eq!(format_datetime_fmt(&p(2), "%D"), "2nd");
@@ -5430,5 +8399,492 @@ mod tests {
             "Expected InvalidOperation, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn test_date_add_days() {
+        // DATE_ADD('2020-01-01', INTERVAL 1 DAY) → '2020-01-02'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("1 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-01-02".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_months() {
+        // DATE_ADD('2020-01-31', INTERVAL 1 MONTH) → '2020-02-29' (leap year, clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-31".to_string()),
+                Datum::String("1 MONTH".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-02-29".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_years() {
+        // DATE_ADD('2020-02-29', INTERVAL 1 YEAR) → '2021-02-28' (not leap, clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-02-29".to_string()),
+                Datum::String("1 YEAR".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2021-02-28".to_string()));
+    }
+
+    #[test]
+    fn test_date_sub_days() {
+        // DATE_SUB('2020-01-01', INTERVAL 1 DAY) → '2019-12-31'
+        let result = eval_function(
+            "DATE_SUB",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("1 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2019-12-31".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_datetime_hours() {
+        // DATE_ADD('2020-01-01 10:00:00', INTERVAL 3 HOUR) → '2020-01-01 13:00:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 10:00:00".to_string()),
+                Datum::String("3 HOUR".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-01 13:00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_adddate_alias() {
+        // ADDDATE is alias for DATE_ADD
+        let result = eval_function(
+            "ADDDATE",
+            &[
+                Datum::String("2020-06-15".to_string()),
+                Datum::String("10 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-06-25".to_string()));
+    }
+
+    #[test]
+    fn test_subdate_alias() {
+        // SUBDATE is alias for DATE_SUB
+        let result = eval_function(
+            "SUBDATE",
+            &[
+                Datum::String("2020-06-15".to_string()),
+                Datum::String("10 DAY".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-06-05".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_null() {
+        // NULL input → NULL output
+        let result = eval_function(
+            "DATE_ADD",
+            &[Datum::Null, Datum::String("1 DAY".to_string())],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::Null);
+
+        let result = eval_function(
+            "DATE_ADD",
+            &[Datum::String("2020-01-01".to_string()), Datum::Null],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::Null);
+    }
+
+    #[test]
+    fn test_date_add_week() {
+        // DATE_ADD('2020-01-01', INTERVAL 2 WEEK) → '2020-01-15'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01".to_string()),
+                Datum::String("2 WEEK".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-01-15".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_quarter() {
+        // DATE_ADD('2020-01-31', INTERVAL 1 QUARTER) → '2020-04-30' (clamped)
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-31".to_string()),
+                Datum::String("1 QUARTER".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(result.unwrap(), Datum::String("2020-04-30".to_string()));
+    }
+
+    #[test]
+    fn test_date_add_seconds() {
+        // DATE_ADD('2020-01-01 23:59:59', INTERVAL 1 SECOND) → '2020-01-02 00:00:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 23:59:59".to_string()),
+                Datum::String("1 SECOND".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-02 00:00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_date_add_minutes() {
+        // DATE_ADD('2020-01-01 10:30:00', INTERVAL 45 MINUTE) → '2020-01-01 11:15:00'
+        let result = eval_function(
+            "DATE_ADD",
+            &[
+                Datum::String("2020-01-01 10:30:00".to_string()),
+                Datum::String("45 MINUTE".to_string()),
+            ],
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            Datum::String("2020-01-01 11:15:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_basic_fields() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        // EXTRACT(YEAR FROM '2024-03-23 14:30:45') = 2024
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2024)
+        );
+        // EXTRACT(MONTH FROM ...) = 3
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MONTH".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(3)
+        );
+        // EXTRACT(DAY FROM ...) = 23
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(23)
+        );
+        // EXTRACT(HOUR FROM ...) = 14
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(14)
+        );
+        // EXTRACT(MINUTE FROM ...) = 30
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(30)
+        );
+        // EXTRACT(SECOND FROM ...) = 45
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(45)
+        );
+        // EXTRACT(MICROSECOND FROM ...) = 0 (no fractional seconds)
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(0)
+        );
+        // EXTRACT(QUARTER FROM ...) = 1 (March is Q1)
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("QUARTER".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(1)
+        );
+        // EXTRACT(WEEK FROM ...) — week number with mode 0
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("WEEK".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            eval_function("WEEK", &[dt], None).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_extract_compound_fields() {
+        let dt = Datum::String("2024-03-23 14:30:45".to_string());
+        // EXTRACT(YEAR_MONTH FROM '2024-03-23 14:30:45') = 202403
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR_MONTH".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(202403)
+        );
+        // EXTRACT(DAY_HOUR FROM ...) = 2314
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_HOUR".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2314)
+        );
+        // EXTRACT(DAY_MINUTE FROM ...) = 231430
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(231430)
+        );
+        // EXTRACT(DAY_SECOND FROM ...) = 23143045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(23143045)
+        );
+        // EXTRACT(HOUR_MINUTE FROM ...) = 1430
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR_MINUTE".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(1430)
+        );
+        // EXTRACT(HOUR_SECOND FROM ...) = 143045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(143045)
+        );
+        // EXTRACT(MINUTE_SECOND FROM ...) = 3045
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MINUTE_SECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(3045)
+        );
+    }
+
+    #[test]
+    fn test_extract_with_microseconds() {
+        let dt = Datum::String("2024-03-23 14:30:45.123456".to_string());
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(123456)
+        );
+        // SECOND_MICROSECOND = SSffffff = 45123456
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("SECOND_MICROSECOND".to_string()), dt.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(45123456)
+        );
+    }
+
+    #[test]
+    fn test_extract_date_only() {
+        let d = Datum::String("2024-12-25".to_string());
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(2024)
+        );
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("MONTH".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(12)
+        );
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("DAY".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(25)
+        );
+        // Time fields should be 0 for date-only input
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("HOUR".to_string()), d.clone()],
+                None
+            )
+            .unwrap(),
+            Datum::Int(0)
+        );
+    }
+
+    #[test]
+    fn test_extract_null_propagation() {
+        assert_eq!(
+            eval_function(
+                "__EXTRACT",
+                &[Datum::String("YEAR".to_string()), Datum::Null],
+                None
+            )
+            .unwrap(),
+            Datum::Null
+        );
+    }
+
+    #[test]
+    fn test_bytes_to_u64_conversion() {
+        // Single byte: 0x41 = 65
+        assert_eq!(bytes_to_u64(&[0x41]), 65);
+        // Two bytes: 0xFF00 = 65280
+        assert_eq!(bytes_to_u64(&[0xFF, 0x00]), 65280);
+        // Empty bytes = 0
+        assert_eq!(bytes_to_u64(&[]), 0);
+        // Single byte 0xFF = 255
+        assert_eq!(bytes_to_u64(&[0xFF]), 255);
+        // 8 bytes: full u64
+        assert_eq!(
+            bytes_to_u64(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            1
+        );
+        assert_eq!(
+            bytes_to_u64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn test_hex_bytes_in_arithmetic() {
+        // 0x41 + 0 = 65 (MySQL: hex literal in numeric context becomes unsigned int)
+        let result = eval_add(&Datum::Bytes(vec![0x41]), &Datum::Int(0)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(65));
+
+        // 0x41 + 1 = 66
+        let result = eval_add(&Datum::Bytes(vec![0x41]), &Datum::Int(1)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(66));
+
+        // 0xFF * 2 = 510
+        let result = eval_mul(&Datum::Bytes(vec![0xFF]), &Datum::Int(2)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(510));
+    }
+
+    #[test]
+    fn test_hex_bytes_in_bitwise() {
+        // 0x41 | 0x0F = 0x4F = 79
+        let result = eval_bitwise_or(&Datum::Bytes(vec![0x41]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0x4F));
+
+        // 0x41 & 0x0F = 0x01 = 1
+        let result =
+            eval_bitwise_and(&Datum::Bytes(vec![0x41]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0x01));
+
+        // 0xFF ^ 0x0F = 0xF0 = 240
+        let result =
+            eval_bitwise_xor(&Datum::Bytes(vec![0xFF]), &Datum::Bytes(vec![0x0F])).unwrap();
+        assert_eq!(result, Datum::Int(0xF0));
+
+        // 0xFF << 8 = 65280
+        let result = eval_shift_left(&Datum::Bytes(vec![0xFF]), &Datum::Int(8)).unwrap();
+        assert_eq!(result, Datum::UnsignedInt(65280));
     }
 }

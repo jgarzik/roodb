@@ -167,6 +167,40 @@ impl Session {
         }
     }
 
+    /// Initialize evaluator flags from the current sql_mode.
+    /// Call after creating a session to sync UserVariables with sql_modes.
+    pub fn init_eval_flags(&self) {
+        crate::executor::eval::set_error_for_division_by_zero(
+            &self.user_variables,
+            self.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
+        );
+        crate::executor::eval::set_strict_trans_tables(
+            &self.user_variables,
+            self.has_sql_mode("STRICT_TRANS_TABLES"),
+        );
+        // Store connection_id for advisory lock ownership
+        {
+            use crate::executor::datum::Datum;
+            let mut w = self.user_variables.write();
+            w.insert(
+                "__sys_connection_id".to_string(),
+                Datum::Int(self.connection_id as i64),
+            );
+            // Store user and database for USER()/DATABASE() functions
+            w.insert(
+                "__sys_user".to_string(),
+                Datum::String(format!("{}@localhost", self.user)),
+            );
+            w.insert(
+                "__sys_database".to_string(),
+                match &self.database {
+                    Some(db) => Datum::String(db.clone()),
+                    None => Datum::Null,
+                },
+            );
+        }
+    }
+
     /// Create a new session for a replica (read-only)
     pub fn new_read_only(connection_id: u32) -> Self {
         let mut session = Self::new(connection_id);
@@ -182,6 +216,15 @@ impl Session {
     /// Set the current database
     pub fn set_database(&mut self, database: Option<String>) {
         self.database = database;
+        // Sync to user variables for DATABASE()/SCHEMA() function
+        let mut w = self.user_variables.write();
+        w.insert(
+            "__sys_database".to_string(),
+            match &self.database {
+                Some(db) => crate::executor::datum::Datum::String(db.clone()),
+                None => crate::executor::datum::Datum::Null,
+            },
+        );
     }
 
     /// Check if we're in an explicit transaction

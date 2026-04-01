@@ -1,0 +1,71 @@
+drop table if exists t1, t2;
+create table t1 (v varchar(30), c char(3), e enum('abc','def','ghi'), t text);
+insert into t1 values ('abc', 'de', 'ghi', 'jkl');
+insert into t1 values ('abc ', 'de ', 'ghi', 'jkl ');
+insert into t1 values ('abc    ', 'd  ', 'ghi', 'jkl    ');
+select length(v),length(c),length(e),length(t) from t1;
+LENGTH(v)	LENGTH(c)	LENGTH(e)	LENGTH(t)
+3	2	3	3
+4	3	3	4
+7	3	3	7
+drop table t1;
+create table t1 (pkcol varchar(16), othercol varchar(16), primary key (pkcol));
+insert into t1 values ('test', 'something');
+update t1 set othercol='somethingelse' where pkcol='test';
+select * from t1;
+pkcol	othercol
+test	somethingelse
+drop table t1;
+create table t1 (a int, b varchar(12));
+insert into t1 values (1, 'A'), (22, NULL);
+create table t2 (a int);
+insert into t2 values (22), (22);
+select t1.a, t1.b, min(t1.b) from t1 inner join t2 ON t2.a = t1.a
+group by t1.b, t1.a;
+a	b	MIN(b)
+22	NULL	NULL
+drop table t1, t2;
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (a CHAR(2));
+INSERT INTO t1 VALUES (10), (50), (30), ('1a'), (60), ('t');
+SELECT a,(a + 0) FROM t1 ORDER BY a;
+a	a + 0
+10	10
+1a	1
+30	30
+50	50
+60	60
+t	0
+SELECT a,(a DIV 2) FROM t1 ORDER BY a;
+a	a DIV 2
+10	5
+1a	0
+30	15
+50	25
+60	30
+t	0
+SELECT a,CAST(a AS SIGNED) FROM t1 ORDER BY a;
+a	CAST(a AS BIGINT)
+10	10
+1a	1
+30	30
+50	50
+60	60
+t	0
+DROP TABLE t1;
+CREATE TABLE t1 (a VARCHAR(16));
+INSERT INTO t1 VALUES ('5'), ('s'), ('');
+SELECT 5 = a FROM t1;
+5 = a
+0
+0
+0
+DROP TABLE t1;
+CREATE TABLE t1 (a CHAR(16));
+INSERT INTO t1 VALUES ('5'), ('s'), ('');
+SELECT 5 = a FROM t1;
+5 = a
+0
+0
+0
+DROP TABLE t1;

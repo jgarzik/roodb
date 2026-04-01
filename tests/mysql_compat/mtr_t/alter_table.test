@@ -1,0 +1,148 @@
+#
+# Test of ALTER TABLE — adapted from MySQL alter_table.test for RooDB
+#
+# [RooDB-skip] MyISAM-specific: DISABLE/ENABLE KEYS, LOCK/UNLOCK TABLES,
+#   OPTIMIZE TABLE, CHECK TABLE, ORDER BY clause, engine= changes
+# [RooDB-skip] SHOW INDEX/KEYS, SHOW TABLE STATUS, SHOW FULL COLUMNS,
+#   CREATE DATABASE, ANALYZE TABLE, FLUSH TABLES
+# [RooDB-skip] CHARACTER SET / COLLATE changes, GEOMETRY, FULLTEXT
+# [RooDB-skip] PARTITION, TABLESPACE, ROW_FORMAT
+# [RooDB-skip] ADD auto_increment column to existing table
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# ADD COLUMN on empty table then INSERT
+#
+CREATE TABLE t1 (a int);
+ALTER TABLE t1 ADD COLUMN b int;
+INSERT INTO t1 VALUES (1, 10);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# ADD COLUMN with NOT NULL and DEFAULT (schema only)
+#
+CREATE TABLE t1 (a int, b int);
+ALTER TABLE t1 ADD COLUMN c varchar(20) NOT NULL DEFAULT 'x';
+DESC t1;
+DROP TABLE t1;
+
+#
+# MODIFY COLUMN — change data type
+#
+CREATE TABLE t1 (a int, b varchar(10));
+INSERT INTO t1 VALUES (1, 'abc');
+ALTER TABLE t1 MODIFY COLUMN b varchar(50);
+DESC t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# CHANGE COLUMN — rename + change type
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1, 100);
+ALTER TABLE t1 CHANGE COLUMN b new_b bigint;
+DESC t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# RENAME TABLE via ALTER TABLE
+#
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1),(2);
+ALTER TABLE t1 RENAME TO t2;
+SELECT * FROM t2;
+DROP TABLE t2;
+
+#
+# Multiple ALTER operations (schema only, no data)
+#
+CREATE TABLE t1 (a int, b int, c int);
+ALTER TABLE t1 ADD COLUMN d varchar(10), DROP COLUMN b;
+DESC t1;
+DROP TABLE t1;
+
+#
+# ALTER COLUMN SET DEFAULT / DROP DEFAULT
+#
+CREATE TABLE t1 (a int NOT NULL, b int);
+ALTER TABLE t1 ALTER COLUMN b SET DEFAULT 42;
+DESC t1;
+ALTER TABLE t1 ALTER COLUMN b DROP DEFAULT;
+DESC t1;
+DROP TABLE t1;
+
+#
+# CHANGE column varchar to varchar (fast alter)
+#
+CREATE TABLE t1 (v varchar(32));
+INSERT INTO t1 VALUES ('def'),('abc'),('hij'),('3r4f');
+SELECT * FROM t1;
+ALTER TABLE t1 CHANGE v v2 varchar(32);
+SELECT * FROM t1;
+ALTER TABLE t1 CHANGE v2 v varchar(64);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# ALTER TABLE with ADD PRIMARY KEY
+#
+CREATE TABLE t1 (a int NOT NULL, b int);
+INSERT INTO t1 VALUES (1, 10),(2, 20);
+ALTER TABLE t1 ADD PRIMARY KEY (a);
+DESC t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# DROP PRIMARY KEY
+#
+CREATE TABLE t1 (a int PRIMARY KEY, b int);
+INSERT INTO t1 VALUES (1, 10);
+ALTER TABLE t1 DROP PRIMARY KEY;
+DESC t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# MODIFY to NOT NULL
+#
+CREATE TABLE t1 (a int, b int);
+ALTER TABLE t1 MODIFY b int NOT NULL;
+DESC t1;
+DROP TABLE t1;
+
+#
+# RENAME COLUMN
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1, 2);
+ALTER TABLE t1 RENAME COLUMN b TO c;
+DESC t1;
+SELECT a, c FROM t1;
+DROP TABLE t1;
+
+#
+# Multiple ADD COLUMNs (schema only)
+#
+CREATE TABLE t1 (id int);
+ALTER TABLE t1 ADD COLUMN x int, ADD COLUMN y int, ADD COLUMN z varchar(10);
+DESC t1;
+DROP TABLE t1;
+
+#
+# Chained operations: ADD COLUMN, then MODIFY, then RENAME
+#
+CREATE TABLE t1 (a int);
+ALTER TABLE t1 ADD COLUMN b varchar(10);
+DESC t1;
+ALTER TABLE t1 MODIFY b varchar(50) NOT NULL;
+DESC t1;
+ALTER TABLE t1 RENAME COLUMN b TO c;
+DESC t1;
+DROP TABLE t1;

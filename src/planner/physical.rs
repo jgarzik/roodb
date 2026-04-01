@@ -115,6 +115,12 @@ pub enum PhysicalPlan {
     /// Single empty row (TABLE_DEE)
     SingleRow,
 
+    /// Window function computation
+    Window {
+        input: Box<PhysicalPlan>,
+        window_funcs: Vec<crate::planner::logical::WindowFuncDesc>,
+    },
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -127,6 +133,8 @@ pub enum PhysicalPlan {
         pk_column_indices: Vec<usize>,
         /// IGNORE modifier — suppress errors, convert to warnings
         ignore: bool,
+        /// ON DUPLICATE KEY UPDATE: (column_index, new_value_expr)
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
 
     /// INSERT ... SELECT — insert rows from a source query
@@ -138,6 +146,9 @@ pub enum PhysicalPlan {
         auto_increment_indices: Vec<usize>,
         /// Primary key column indices for PK-based storage keys
         pk_column_indices: Vec<usize>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         /// IGNORE modifier — suppress errors, convert to warnings
         ignore: bool,
     },
@@ -150,6 +161,10 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
+        /// Primary key column indices (positions in the full table row)
+        pk_column_indices: Vec<usize>,
     },
 
     /// DELETE rows from a table
@@ -158,6 +173,8 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     // ============ DDL Operations ============
@@ -339,6 +356,7 @@ impl PhysicalPlan {
             PhysicalPlan::HashDistinct { input } => input.output_columns(),
             PhysicalPlan::Union { left, .. } => left.output_columns(),
             PhysicalPlan::Materialize { input } => input.output_columns(),
+            PhysicalPlan::Window { input, .. } => input.output_columns(),
             PhysicalPlan::SingleRow => vec![],
 
             // DML/DDL operations don't produce query output
@@ -547,6 +565,7 @@ impl PhysicalPlan {
                 assignments,
                 filter,
                 key_value,
+                order_by,
                 ..
             } => {
                 for (_, expr) in assignments {
@@ -558,15 +577,24 @@ impl PhysicalPlan {
                 if let Some(kv) = key_value {
                     substitute_expr(kv, params)?;
                 }
+                for (expr, _) in order_by {
+                    substitute_expr(expr, params)?;
+                }
             }
             PhysicalPlan::Delete {
-                filter, key_value, ..
+                filter,
+                key_value,
+                order_by,
+                ..
             } => {
                 if let Some(f) = filter {
                     substitute_expr(f, params)?;
                 }
                 if let Some(kv) = key_value {
                     substitute_expr(kv, params)?;
+                }
+                for (expr, _) in order_by {
+                    substitute_expr(expr, params)?;
                 }
             }
             PhysicalPlan::Explain { inner } => {
@@ -577,6 +605,23 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Materialize { input } => {
                 input.substitute_params(params)?;
+            }
+            PhysicalPlan::Window {
+                input,
+                window_funcs,
+            } => {
+                input.substitute_params(params)?;
+                for (_, _, args, partition_by, order_by, _) in window_funcs {
+                    for arg in args {
+                        substitute_expr(arg, params)?;
+                    }
+                    for expr in partition_by {
+                        substitute_expr(expr, params)?;
+                    }
+                    for (expr, _) in order_by {
+                        substitute_expr(expr, params)?;
+                    }
+                }
             }
             // DDL/Auth operations have no expression parameters
             PhysicalPlan::SingleRow
@@ -673,12 +718,36 @@ fn substitute_expr(expr: &mut ResolvedExpr, params: &[Datum]) -> PlannerResult<(
                 substitute_expr(e, params)?;
             }
         }
+        // Subqueries are self-contained plans, no placeholder substitution needed
+        ResolvedExpr::ScalarSubquery { .. } => {}
+        ResolvedExpr::InSubquery { expr, .. } => {
+            substitute_expr(expr, params)?;
+        }
+        // EXISTS subqueries are self-contained, no placeholder substitution needed
+        ResolvedExpr::ExistsSubquery { .. } => {}
+        // Window functions: substitute in args, partition_by, order_by
+        ResolvedExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                substitute_expr(arg, params)?;
+            }
+            for expr in partition_by {
+                substitute_expr(expr, params)?;
+            }
+            for (expr, _) in order_by {
+                substitute_expr(expr, params)?;
+            }
+        }
     }
     Ok(())
 }
 
 /// Convert a Datum to a Literal for plan substitution.
-fn datum_to_literal(datum: &Datum) -> Literal {
+pub fn datum_to_literal(datum: &Datum) -> Literal {
     match datum {
         Datum::Null => Literal::Null,
         Datum::Bool(b) => Literal::Boolean(*b),
@@ -686,10 +755,11 @@ fn datum_to_literal(datum: &Datum) -> Literal {
         Datum::UnsignedInt(u) => Literal::Integer(*u as i64),
         Datum::Float(f) => Literal::Float(*f),
         Datum::String(s) => Literal::String(s.clone()),
-        Datum::Bytes(b) => Literal::Blob(b.clone()),
+        Datum::Bytes(b) | Datum::Geometry(b) => Literal::Blob(b.clone()),
         Datum::Bit { value, .. } => Literal::Integer(*value as i64),
         Datum::Timestamp(t) => Literal::Integer(*t),
         Datum::Decimal { value, scale } => Literal::Decimal(*value, *scale),
+        Datum::Json(v) => Literal::String(serde_json::to_string(v).unwrap_or_default()),
     }
 }
 
@@ -812,7 +882,11 @@ impl PhysicalPlanner {
             let pk_indices: Vec<usize> = if let Some(pk_cols) = table_def.primary_key() {
                 pk_cols
                     .iter()
-                    .filter_map(|pk_name| columns.iter().position(|c| c.name == *pk_name))
+                    .filter_map(|pk_name| {
+                        columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(pk_name))
+                    })
                     .collect()
             } else {
                 vec![]
@@ -1172,6 +1246,13 @@ impl PhysicalPlanner {
                 input: Box::new(Self::plan_node(*input, catalog)?),
             }),
 
+            LogicalPlan::Window {
+                input,
+                window_funcs,
+            } => Ok(PhysicalPlan::Window {
+                input: Box::new(Self::plan_node(*input, catalog)?),
+                window_funcs,
+            }),
             LogicalPlan::Union { left, right, all } => Ok(PhysicalPlan::Union {
                 left: Box::new(Self::plan_node(*left, catalog)?),
                 right: Box::new(Self::plan_node(*right, catalog)?),
@@ -1186,6 +1267,7 @@ impl PhysicalPlanner {
                 columns,
                 values,
                 ignore,
+                on_duplicate,
             } => {
                 let (auto_increment_indices, pk_column_indices) =
                     Self::lookup_insert_metadata(&table, &columns, catalog);
@@ -1196,6 +1278,7 @@ impl PhysicalPlanner {
                     auto_increment_indices,
                     pk_column_indices,
                     ignore,
+                    on_duplicate,
                 })
             }
 
@@ -1203,6 +1286,7 @@ impl PhysicalPlanner {
                 table,
                 columns,
                 source,
+                column_map,
                 ignore,
             } => {
                 let source_plan = Self::plan_node(*source, catalog)?;
@@ -1214,6 +1298,7 @@ impl PhysicalPlanner {
                     source: Box::new(source_plan),
                     auto_increment_indices,
                     pk_column_indices,
+                    column_map,
                     ignore,
                 })
             }
@@ -1222,26 +1307,66 @@ impl PhysicalPlanner {
                 table,
                 assignments,
                 filter,
+                order_by,
+                limit,
             } => {
-                let key_value = filter
-                    .as_ref()
-                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+                // Suppress PointGet when ORDER BY or LIMIT is present:
+                // ORDER BY requires full-scan sorting; LIMIT 0 must update 0 rows.
+                let key_value = if order_by.is_empty() && limit.is_none() {
+                    filter
+                        .as_ref()
+                        .and_then(|f| Self::extract_point_get(&table, f, catalog))
+                } else {
+                    None
+                };
+                // Look up PK column indices so the executor can detect PK changes
+                let pk_column_indices = if let Some(table_def) = catalog.get_table(&table) {
+                    if let Some(pk_cols) = table_def.primary_key() {
+                        pk_cols
+                            .iter()
+                            .filter_map(|pk_name| {
+                                table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(pk_name))
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
                 Ok(PhysicalPlan::Update {
                     table,
                     assignments,
                     filter,
                     key_value,
+                    order_by,
+                    limit,
+                    pk_column_indices,
                 })
             }
 
-            LogicalPlan::Delete { table, filter } => {
-                let key_value = filter
-                    .as_ref()
-                    .and_then(|f| Self::extract_point_get(&table, f, catalog));
+            LogicalPlan::Delete {
+                table,
+                filter,
+                order_by,
+                limit,
+            } => {
+                let key_value = if order_by.is_empty() && limit.is_none() {
+                    filter
+                        .as_ref()
+                        .and_then(|f| Self::extract_point_get(&table, f, catalog))
+                } else {
+                    None
+                };
                 Ok(PhysicalPlan::Delete {
                     table,
                     filter,
                     key_value,
+                    order_by,
+                    limit,
                 })
             }
 

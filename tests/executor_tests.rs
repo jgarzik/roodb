@@ -191,6 +191,8 @@ async fn test_table_scan_with_filter() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -245,6 +247,8 @@ async fn test_project_single_column() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             }),
             "name".to_string(),
         )],
@@ -290,6 +294,8 @@ async fn test_sort_descending() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             }),
             false, // descending
         )],
@@ -370,6 +376,7 @@ async fn test_count_aggregate() {
                 args: vec![],
                 distinct: false,
                 result_type: DataType::BigInt,
+                separator: None,
             },
             "count".to_string(),
         )],
@@ -401,6 +408,8 @@ async fn test_insert() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             },
             ResolvedColumn {
                 table: "users".to_string(),
@@ -408,6 +417,8 @@ async fn test_insert() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             },
         ],
         values: vec![vec![
@@ -417,6 +428,7 @@ async fn test_insert() {
         auto_increment_indices: vec![],
         pk_column_indices: vec![0], // id is PK
         ignore: false,
+        on_duplicate: vec![],
     };
 
     let mut exec = engine.build(plan).unwrap();
@@ -452,12 +464,16 @@ async fn test_delete_with_filter() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Eq,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(2))),
             result_type: DataType::Boolean,
         }),
         key_value: None,
+        order_by: vec![],
+        limit: None,
     };
 
     let mut exec = engine.build(plan).unwrap();
@@ -610,6 +626,8 @@ async fn test_full_query_pipeline() {
                 index: 0,
                 data_type: DataType::Int,
                 nullable: false,
+                default_value: None,
+                is_outer_ref: false,
             })),
             op: BinaryOp::Gt,
             right: Box::new(ResolvedExpr::Literal(Literal::Integer(1))),
@@ -626,6 +644,8 @@ async fn test_full_query_pipeline() {
                 index: 1,
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             }),
             "name".to_string(),
         )],
@@ -640,6 +660,8 @@ async fn test_full_query_pipeline() {
                 index: 0, // After projection, name is at index 0
                 data_type: DataType::Varchar(100),
                 nullable: true,
+                default_value: None,
+                is_outer_ref: false,
             }),
             false, // descending
         )],

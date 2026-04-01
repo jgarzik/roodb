@@ -1,0 +1,158 @@
+#
+# Case-insensitive column/alias/keyword tests for RooDB (extended)
+# Adapted from MySQL lowercase_table2.test
+#
+# [RooDB-note] RooDB uses case-sensitive table names (lower_case_table_names=0)
+# [RooDB-skip] cross-case table name access (T1 vs t1)
+# [RooDB-skip] RENAME TABLE, ALTER TABLE, SHOW CREATE TABLE, SHOW TABLES LIKE
+# [RooDB-skip] LOCK TABLE, UNLOCK TABLES, ENGINE= directives
+# [RooDB-skip] CREATE DATABASE, DROP DATABASE, USE
+# [RooDB-skip] FOREIGN KEY, information_schema, CREATE TRIGGER, DELIMITER
+# [RooDB-skip] ALTER TABLE ADD INDEX, CREATE TABLE LIKE
+#
+# Tests: case-insensitive column refs, aliases, keywords, function names,
+#        mixed-case in complex expressions, GROUP BY, HAVING, JOINs, subqueries
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+#
+# Case-insensitive column access
+#
+CREATE TABLE t1 (MyCol INT, ANOTHERCOL VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'hello');
+INSERT INTO t1 VALUES (2, 'world');
+
+SELECT mycol FROM t1 ORDER BY MYCOL;
+SELECT MYCOL FROM t1 ORDER BY mycol;
+SELECT MyCol, AnotherCol FROM t1 ORDER BY MyCol;
+SELECT MYCOL, ANOTHERCOL FROM t1 ORDER BY MYCOL;
+SELECT mycol, anothercol FROM t1 ORDER BY mycol;
+DROP TABLE t1;
+
+#
+# Mixed case in WHERE clause
+#
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+SELECT a, b FROM t1 WHERE a > 1 ORDER BY a;
+SELECT A, B FROM t1 WHERE A < 3 ORDER BY A;
+SELECT a, B FROM t1 WHERE A = 2;
+DROP TABLE t1;
+
+#
+# Mixed case table references in JOIN (table names same case, alias case-insensitive)
+#
+CREATE TABLE t1 (col1 INT);
+CREATE TABLE t2 (col1 INT);
+INSERT INTO t1 VALUES (10), (30);
+INSERT INTO t2 VALUES (10), (20);
+SELECT t1.col1 FROM t1, t2 WHERE t1.col1 = t2.col1 ORDER BY t1.col1;
+
+# Use aliases with different case
+SELECT A.col1 FROM t1 AS a, t2 AS B WHERE A.col1 = B.col1 ORDER BY A.col1;
+DROP TABLE t1, t2;
+
+#
+# Case-insensitive aliases
+#
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+SELECT T.id, T.val FROM t1 AS T WHERE T.id > 1 ORDER BY T.id;
+SELECT t.ID, t.VAL FROM t1 AS t ORDER BY t.id;
+DROP TABLE t1;
+
+#
+# UNION with mixed case columns
+#
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'first');
+CREATE TABLE t2 (id INT, val VARCHAR(20));
+INSERT INTO t2 VALUES (2, 'second');
+
+SELECT id, val FROM t1 UNION SELECT id, val FROM t2 ORDER BY id;
+SELECT ID, VAL FROM t1 UNION SELECT ID, VAL FROM t2 ORDER BY id;
+DROP TABLE t1, t2;
+
+#
+# GROUP BY with mixed case column references
+#
+CREATE TABLE t1 (category VARCHAR(20), amount INT);
+INSERT INTO t1 VALUES ('A', 10), ('B', 20), ('A', 30), ('B', 40);
+
+SELECT category, SUM(amount) AS total FROM t1 GROUP BY category ORDER BY category;
+SELECT CATEGORY, SUM(AMOUNT) AS TOTAL FROM t1 GROUP BY CATEGORY ORDER BY CATEGORY;
+DROP TABLE t1;
+
+#
+# ORDER BY with mixed case
+#
+CREATE TABLE t1 (name VARCHAR(20), score INT);
+INSERT INTO t1 VALUES ('Alice', 90), ('Bob', 85), ('Carol', 95);
+
+SELECT name, score FROM t1 ORDER BY SCORE DESC;
+SELECT NAME, SCORE FROM t1 ORDER BY score;
+DROP TABLE t1;
+
+#
+# Case-insensitive function names
+#
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'Hello'), (2, 'World'), (3, 'Test');
+
+SELECT upper(b) FROM t1 ORDER BY a;
+SELECT UPPER(b) FROM t1 ORDER BY a;
+SELECT Upper(B) FROM t1 ORDER BY a;
+SELECT lower(b) FROM t1 ORDER BY a;
+SELECT LOWER(b) FROM t1 ORDER BY a;
+SELECT length(b) FROM t1 ORDER BY a;
+SELECT LENGTH(b) FROM t1 ORDER BY a;
+SELECT concat(b, '!') FROM t1 ORDER BY a;
+SELECT CONCAT(b, '!') FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+#
+# Case-insensitive in HAVING clause
+#
+CREATE TABLE t1 (grp VARCHAR(10), val INT);
+INSERT INTO t1 VALUES ('x', 1), ('x', 2), ('y', 3), ('y', 4), ('y', 5);
+
+SELECT grp, SUM(val) AS s FROM t1 GROUP BY grp HAVING s > 3 ORDER BY grp;
+SELECT GRP, SUM(VAL) AS S FROM t1 GROUP BY GRP HAVING S > 3 ORDER BY GRP;
+DROP TABLE t1;
+
+#
+# Case-insensitive in complex expressions
+#
+CREATE TABLE t1 (x INT, y INT);
+INSERT INTO t1 VALUES (10, 20), (30, 40), (50, 60);
+
+SELECT X + Y AS total FROM t1 ORDER BY TOTAL;
+SELECT x * y AS product FROM t1 WHERE X > 10 ORDER BY product;
+SELECT CASE WHEN x < 30 THEN 'low' WHEN X < 50 THEN 'mid' ELSE 'high' END AS level FROM t1 ORDER BY x;
+DROP TABLE t1;
+
+#
+# Case-insensitive in LEFT JOIN
+#
+CREATE TABLE t1 (id INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE t2 (id INT, score INT);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+
+SELECT A.name, B.score FROM t1 AS A LEFT JOIN t2 AS B ON A.ID = B.ID ORDER BY A.id;
+SELECT a.NAME, b.SCORE FROM t1 AS a LEFT JOIN t2 AS b ON a.id = b.id ORDER BY a.ID;
+DROP TABLE t1, t2;
+
+#
+# Case-insensitive in subquery (derived table)
+#
+CREATE TABLE t1 (id INT, val INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+
+SELECT D.id, D.val FROM (SELECT ID, VAL FROM t1 WHERE val > 10) AS D ORDER BY D.id;
+SELECT d.ID, d.VAL FROM (SELECT id, val FROM t1) AS d WHERE d.val > 10 ORDER BY d.id;
+DROP TABLE t1;

@@ -1,0 +1,66 @@
+#
+# Simple SELECT tests — adapted from MySQL select_all / select.inc
+# Trimmed for RooDB compatibility
+#
+
+--disable_warnings
+drop table if exists t1,t2;
+--enable_warnings
+
+#
+# Basic SELECT with simple table
+#
+CREATE TABLE t1 (
+  Period smallint DEFAULT 0 NOT NULL,
+  Varor_period smallint DEFAULT 0 NOT NULL
+);
+
+INSERT INTO t1 VALUES (9410,9412);
+
+select Period from t1;
+select * from t1;
+select t1.* from t1;
+
+#
+# Test with multiple data types
+#
+CREATE TABLE t2 (
+  auto int not null auto_increment,
+  fld1 int DEFAULT 0 NOT NULL,
+  companynr tinyint DEFAULT 0 NOT NULL,
+  fld3 char(30) DEFAULT '' NOT NULL,
+  fld4 char(35) DEFAULT '' NOT NULL,
+  PRIMARY KEY (auto)
+);
+
+INSERT INTO t2 VALUES (1,1,0,'Omaha','teethe');
+INSERT INTO t2 VALUES (2,11401,37,'breaking','dreaded');
+INSERT INTO t2 VALUES (3,11402,37,'Romans','scholastics');
+
+select * from t2;
+select auto, fld3 from t2;
+select fld3, fld4 from t2 where companynr = 37;
+select * from t2 where auto = 1;
+select * from t2 where fld1 > 100;
+select count(*) from t2;
+select count(*) from t2 where companynr = 37;
+
+#
+# SELECT with ORDER BY
+#
+select * from t2 order by fld3;
+select fld3 from t2 order by fld3 desc;
+
+#
+# SELECT with LIMIT
+#
+select * from t2 limit 2;
+select * from t2 order by auto desc limit 1;
+
+#
+# SELECT with expressions
+#
+select 1+1;
+select auto, fld1+10 from t2;
+
+drop table t1, t2;

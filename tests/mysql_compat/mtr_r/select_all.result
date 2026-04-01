@@ -1,0 +1,79 @@
+drop table if exists t1,t2;
+CREATE TABLE t1 (
+Period smallint DEFAULT 0 NOT NULL,
+Varor_period smallint DEFAULT 0 NOT NULL
+);
+INSERT INTO t1 VALUES (9410,9412);
+select Period from t1;
+Period
+9410
+select * from t1;
+Period	Varor_period
+9410	9412
+select t1.* from t1;
+Period	Varor_period
+9410	9412
+CREATE TABLE t2 (
+auto int not null auto_increment,
+fld1 int DEFAULT 0 NOT NULL,
+companynr tinyint DEFAULT 0 NOT NULL,
+fld3 char(30) DEFAULT '' NOT NULL,
+fld4 char(35) DEFAULT '' NOT NULL,
+PRIMARY KEY (auto)
+);
+INSERT INTO t2 VALUES (1,1,0,'Omaha','teethe');
+INSERT INTO t2 VALUES (2,11401,37,'breaking','dreaded');
+INSERT INTO t2 VALUES (3,11402,37,'Romans','scholastics');
+select * from t2;
+auto	fld1	companynr	fld3	fld4
+1	1	0	Omaha	teethe
+2	11401	37	breaking	dreaded
+3	11402	37	Romans	scholastics
+select auto, fld3 from t2;
+auto	fld3
+1	Omaha
+2	breaking
+3	Romans
+select fld3, fld4 from t2 where companynr = 37;
+fld3	fld4
+breaking	dreaded
+Romans	scholastics
+select * from t2 where auto = 1;
+auto	fld1	companynr	fld3	fld4
+1	1	0	Omaha	teethe
+select * from t2 where fld1 > 100;
+auto	fld1	companynr	fld3	fld4
+2	11401	37	breaking	dreaded
+3	11402	37	Romans	scholastics
+select count(*) from t2;
+COUNT(NULL)
+3
+select count(*) from t2 where companynr = 37;
+COUNT(NULL)
+2
+select * from t2 order by fld3;
+auto	fld1	companynr	fld3	fld4
+1	1	0	Omaha	teethe
+3	11402	37	Romans	scholastics
+2	11401	37	breaking	dreaded
+select fld3 from t2 order by fld3 desc;
+fld3
+breaking
+Romans
+Omaha
+select * from t2 limit 2;
+auto	fld1	companynr	fld3	fld4
+1	1	0	Omaha	teethe
+2	11401	37	breaking	dreaded
+select * from t2 order by auto desc limit 1;
+auto	fld1	companynr	fld3	fld4
+3	11402	37	Romans	scholastics
+select 1+1;
+1 + 1
+2
+select auto, fld1+10 from t2;
+auto	fld1 + 10
+1	11
+2	11411
+3	11412
+drop table t1, t2;

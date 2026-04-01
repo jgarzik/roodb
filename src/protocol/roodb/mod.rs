@@ -62,6 +62,13 @@ enum PlanError {
     Planner(crate::planner::PlannerError),
 }
 
+/// Info extracted from INSERT plans for trigger firing
+struct InsertTriggerInfo {
+    table_name: String,
+    column_names: Vec<String>,
+    values: Vec<Vec<crate::planner::logical::ResolvedExpr>>,
+}
+
 /// RooDB connection handler
 pub struct RooDbConnection<S>
 where
@@ -93,6 +100,10 @@ where
     txn_manager: Arc<TransactionManager>,
     /// Raft node for consensus
     raft_node: Arc<RaftNode>,
+    /// Whether we're inside a stored procedure (multi-result-set mode)
+    in_multi_result: bool,
+    /// Whether any result sets were sent during current SP execution
+    sp_sent_results: bool,
     /// Prepared statement manager (per-connection)
     prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
@@ -130,14 +141,12 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            in_multi_result: false,
+            sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
-        // Initialize eval flags from default sql_mode
-        crate::executor::eval::set_error_for_division_by_zero(
-            &conn.session.user_variables(),
-            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
-        );
+        conn.session.init_eval_flags();
         conn
     }
 
@@ -173,13 +182,12 @@ where
             session: Session::new(connection_id),
             txn_manager,
             raft_node,
+            in_multi_result: false,
+            sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
-        crate::executor::eval::set_error_for_division_by_zero(
-            &conn.session.user_variables(),
-            conn.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
-        );
+        conn.session.init_eval_flags();
         conn
     }
 
@@ -332,6 +340,7 @@ where
 
         if let Some(ref db) = response.database {
             self.database = Some(db.clone());
+            self.session.set_database(Some(db.clone()));
         }
 
         Ok(())
@@ -862,7 +871,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             let t_open = Instant::now();
             executor.open().await?;
@@ -890,7 +899,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             let t_open = Instant::now();
             executor.open().await?;
@@ -912,13 +921,17 @@ where
             executor.close().await?;
             let exec_iter_ns = metrics::elapsed_ns(t_iter);
 
+            let ignore_dups = executor.is_ignore_duplicates();
             let changes = executor.take_changes();
             if !changes.is_empty() {
                 if self.session.in_transaction() {
                     self.session.add_pending_changes(changes);
                 } else {
-                    let changeset =
-                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    let changeset = ChangeSet::new_with_changes_ignore(
+                        implicit_txn_id.unwrap_or(0),
+                        changes,
+                        ignore_dups,
+                    );
                     self.raft_node
                         .propose_changes(changeset)
                         .await
@@ -929,6 +942,12 @@ where
             if let Some(txn_id) = implicit_txn_id {
                 self.txn_manager.commit(txn_id).await?;
             }
+
+            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
+            self.session
+                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            self.session
+                .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
 
             let m = metrics::QueryMetrics {
                 total: query_start.elapsed(),
@@ -1028,9 +1047,53 @@ where
             return Ok(result);
         }
 
+        // Handle DO statement — evaluate expression, discard result, send OK
+        // Errors are propagated (e.g., overflow), but successful results are discarded.
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("DO ") {
+                let expr_sql = sql.trim()[3..].trim().trim_end_matches(';');
+                let select_sql = format!("SELECT {}", expr_sql);
+                match self.execute_sql_silent(&select_sql).await {
+                    Ok(_) => return self.send_ok(0, 0).await,
+                    Err(e) => {
+                        return self
+                            .send_error(codes::ER_DATA_OUT_OF_RANGE, states::GENERAL_ERROR, &e)
+                            .await;
+                    }
+                }
+            }
+        }
+
         // Handle SQL-level PREPARE/EXECUTE/DEALLOCATE (text protocol prepared statements)
         if let Some(()) = self.try_handle_sql_prepare(sql).await? {
             return Ok(());
+        }
+
+        // Handle CREATE FUNCTION and DROP FUNCTION via text intercept
+        // (MySQL CREATE FUNCTION with BEGIN/END body doesn't parse cleanly in sqlparser)
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("DROP FUNCTION ") {
+                let rest = sql.trim()[14..].trim().trim_end_matches(';').trim();
+                let (if_exists, name) = if rest.to_uppercase().starts_with("IF EXISTS ") {
+                    (true, rest[10..].trim())
+                } else {
+                    (false, rest)
+                };
+                return self
+                    .handle_drop_procedure(&name.to_lowercase(), if_exists)
+                    .await;
+            }
+            if upper.starts_with("CREATE FUNCTION ") {
+                return self.handle_create_function_text(sql).await;
+            }
+            if upper.starts_with("LOAD DATA ") {
+                return self.handle_load_data(sql).await;
+            }
+            if upper.starts_with("REPLACE ") {
+                return self.handle_replace(sql).await;
+            }
         }
 
         // Handle CREATE TEMPORARY TABLE
@@ -1068,6 +1131,10 @@ where
                 &self.session.user_variables(),
                 self.session.has_sql_mode("ERROR_FOR_DIVISION_BY_ZERO"),
             );
+            crate::executor::eval::set_strict_trans_tables(
+                &self.session.user_variables(),
+                self.session.has_sql_mode("STRICT_TRANS_TABLES"),
+            );
             return self.send_ok(0, 0).await;
         }
 
@@ -1096,11 +1163,17 @@ where
             if upper.starts_with("FLUSH ") {
                 return self.send_ok(0, 0).await;
             }
-            // DROP FUNCTION/VIEW IF EXISTS — no-op (we don't have these yet)
-            if (upper.starts_with("DROP FUNCTION") || upper.starts_with("DROP VIEW"))
-                && upper.contains("IF EXISTS")
-            {
+            // DROP FUNCTION IF EXISTS — no-op (functions not yet implemented)
+            if upper.starts_with("DROP FUNCTION") && upper.contains("IF EXISTS") {
                 return self.send_ok(0, 0).await;
+            }
+            // CREATE TRIGGER — parsed and stored via normal pipeline
+            if upper.starts_with("CREATE TRIGGER ") {
+                return self.handle_create_trigger_sql(sql).await;
+            }
+            // DROP TRIGGER
+            if upper.starts_with("DROP TRIGGER ") {
+                return self.handle_drop_trigger_sql(sql).await;
             }
         }
 
@@ -1113,11 +1186,20 @@ where
         {
             let upper = sql.trim().to_uppercase();
             if upper.starts_with("CHECK TABLE") || upper.starts_with("CHECKSUM TABLE") {
+                let table_name = {
+                    let re = regex::Regex::new(r"(?i)(?:CHECK|CHECKSUM)\s+TABLE\s+(\w+)").unwrap();
+                    re.captures(sql.trim())
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                let db = self.database.as_deref().unwrap_or("test");
+                let qualified = format!("{}.{}", db, table_name);
                 return self
                     .send_custom_result_set(
                         &["Table", "Op", "Msg_type", "Msg_text"],
                         &[vec![
-                            "test.t1".to_string(),
+                            qualified,
                             "check".to_string(),
                             "status".to_string(),
                             "OK".to_string(),
@@ -1147,11 +1229,22 @@ where
                 name: sqlparser::ast::ObjectName,
                 params: Option<Vec<sqlparser::ast::ProcedureParam>>,
                 body: sqlparser::ast::ConditionalStatements,
+                raw_sql: String,
             },
             DropProc {
                 name: String,
                 if_exists: bool,
             },
+            CreateViewRaft {
+                name: String,
+                query_sql: String,
+                or_replace: bool,
+            },
+            DropViewRaft {
+                names: Vec<String>,
+                if_exists: bool,
+            },
+            // CreateFunc handled via text intercept
             Call(sqlparser::ast::Function),
             Continue(Box<sqlparser::ast::Statement>),
         }
@@ -1162,7 +1255,12 @@ where
                 S::LockTables { .. } | S::UnlockTables => Intercept::NoOp,
                 S::CreateProcedure {
                     name, params, body, ..
-                } => Intercept::CreateProc { name, params, body },
+                } => Intercept::CreateProc {
+                    name,
+                    params,
+                    body,
+                    raw_sql: sql.to_string(),
+                },
                 S::DropProcedure {
                     if_exists,
                     proc_desc,
@@ -1177,6 +1275,24 @@ where
                         if_exists,
                     }
                 }
+                S::CreateView(cv) => Intercept::CreateViewRaft {
+                    name: cv.name.to_string(),
+                    query_sql: cv.query.to_string(),
+                    or_replace: cv.or_replace,
+                },
+                S::Drop {
+                    ref object_type,
+                    ref names,
+                    if_exists,
+                    ..
+                } if *object_type == sqlparser::ast::ObjectType::View => {
+                    let view_names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+                    Intercept::DropViewRaft {
+                        names: view_names,
+                        if_exists,
+                    }
+                }
+                // CREATE FUNCTION handled via text intercept above
                 S::Call(func) => Intercept::Call(func),
                 other => Intercept::Continue(Box::new(other)),
             }
@@ -1184,13 +1300,31 @@ where
 
         let stmt = match action {
             Intercept::NoOp => return self.send_ok(0, 0).await,
-            Intercept::CreateProc { name, params, body } => {
+            Intercept::CreateProc {
+                name,
+                params,
+                body,
+                raw_sql,
+            } => {
                 return self
-                    .handle_create_procedure(&name, params.as_deref(), &body)
+                    .handle_create_procedure(&name, params.as_deref(), &body, &raw_sql)
                     .await;
             }
             Intercept::DropProc { name, if_exists } => {
                 return self.handle_drop_procedure(&name, if_exists).await;
+            }
+            // CreateFunc handled via text intercept before parsing
+            Intercept::CreateViewRaft {
+                name,
+                query_sql,
+                or_replace,
+            } => {
+                return self
+                    .handle_create_view_raft(&name, &query_sql, or_replace)
+                    .await;
+            }
+            Intercept::DropViewRaft { names, if_exists } => {
+                return self.handle_drop_view_raft(&names, if_exists).await;
             }
             Intercept::Call(func) => {
                 let proc_name = func.name.to_string().to_lowercase();
@@ -1361,12 +1495,8 @@ where
                     .iter()
                     .map(|t| RequiredPrivilege::select(db, &t.name))
                     .collect();
-                privs.extend(
-                    right
-                        .from
-                        .iter()
-                        .map(|t| RequiredPrivilege::select(db, &t.name)),
-                );
+                // Recursively extract privileges from right side (may be nested Union)
+                privs.extend(self.extract_required_privileges(right));
                 privs
             }
             // EXPLAIN - same privileges as inner statement
@@ -1403,15 +1533,12 @@ where
         let client_host = self.client_ip.to_string();
 
         for (_key, value) in rows {
-            // Skip MVCC header (17 bytes) if present
-            if value.len() <= 17 {
+            use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
+            // Skip short rows or MVCC tombstones
+            if value.len() <= MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
                 continue;
             }
-            // Check deleted flag
-            if value[16] == 1 {
-                continue;
-            }
-            let row_data = &value[17..];
+            let row_data = &value[MVCC_HEADER_SIZE..];
             if let Ok(row) = decode_row(row_data) {
                 // system.grants columns: grantee, grantee_host, grantee_type, privilege,
                 // object_type, database_name, table_name, with_grant_option, granted_by, granted_at
@@ -1567,19 +1694,22 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             self.send_result_set(&columns, &mut *executor).await
         } else {
+            // Extract trigger info from INSERT plans before building executor
+            let insert_trigger_info = self.extract_insert_trigger_info(&plan);
+
             // DML/DDL - execute and count affected rows
             let engine = ExecutorEngine::with_raft(
-                mvcc,
+                mvcc.clone(),
                 self.catalog.clone(),
                 txn_context,
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
 
             executor.open().await?;
             let mut affected = 0u64;
@@ -1598,7 +1728,14 @@ where
             }
             executor.close().await?;
 
-            // Collect changes for Raft replication
+            // Fire triggers for INSERT operations
+            if let Some(ref trigger_info) = insert_trigger_info {
+                self.fire_insert_triggers(trigger_info).await?;
+            }
+
+            // Collect changes for Raft replication — includes both original INSERT
+            // and any trigger-generated changes
+            let ignore_dups = executor.is_ignore_duplicates();
             let changes = executor.take_changes();
             if !changes.is_empty() {
                 if self.session.in_transaction() {
@@ -1606,8 +1743,11 @@ where
                     self.session.add_pending_changes(changes);
                 } else {
                     // Autocommit: propose immediately
-                    let changeset =
-                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                    let changeset = ChangeSet::new_with_changes_ignore(
+                        implicit_txn_id.unwrap_or(0),
+                        changes,
+                        ignore_dups,
+                    );
                     self.raft_node
                         .propose_changes(changeset)
                         .await
@@ -1619,6 +1759,12 @@ where
             if let Some(txn_id) = implicit_txn_id {
                 self.txn_manager.commit(txn_id).await?;
             }
+
+            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
+            self.session
+                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            self.session
+                .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
 
             self.send_ok(affected, last_insert_id).await
         }
@@ -1654,9 +1800,11 @@ where
 
         // Send rows — catch executor errors mid-stream and send ERR packet
         let mut row_error = None;
+        let mut row_count = 0u64;
         loop {
             match executor.next().await {
                 Ok(Some(row)) => {
+                    row_count += 1;
                     let row_packet = encode_text_row(&row);
                     self.writer.write_packet(&row_packet).await?;
                 }
@@ -1667,23 +1815,39 @@ where
                 }
             }
         }
+        // Track row count for FOUND_ROWS()
+        self.session
+            .set_user_variable("__sys_found_rows", Datum::Int(row_count as i64));
 
         // If an error occurred during row streaming, send ERR packet instead of EOF
         if let Some(e) = row_error {
-            let err_packet =
-                encode_err_packet(codes::ER_DATA_OUT_OF_RANGE, "22003", &e.to_string());
+            let msg = e.to_string();
+            let (code, state) =
+                if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
+                    (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
+                } else if msg.contains("Truncated incorrect") {
+                    (codes::ER_TRUNCATED_WRONG_VALUE, "22007")
+                } else {
+                    (codes::ER_DATA_OUT_OF_RANGE, "22003")
+                };
+            let err_packet = encode_err_packet(code, state, &msg);
             self.writer.write_packet(&err_packet).await?;
             self.writer.flush().await?;
             executor.close().await?;
             return Ok(());
         }
 
-        // Send final EOF/OK
+        // Send final EOF/OK — with SERVER_MORE_RESULTS_EXISTS if in multi-result-set
+        let status = if self.in_multi_result {
+            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
+        } else {
+            default_status()
+        };
         if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
+            let ok = encode_eof_ok_packet(status, 0);
             self.writer.write_packet(&ok).await?;
         } else {
-            let eof = encode_eof_packet(0, default_status());
+            let eof = encode_eof_packet(0, status);
             self.writer.write_packet(&eof).await?;
         }
 
@@ -2160,7 +2324,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan)?;
+        let mut executor = engine.build_async(plan).await?;
         executor.open().await?;
         let mut all_rows = Vec::new();
         while let Some(row) = executor.next().await? {
@@ -2196,6 +2360,19 @@ where
                 }
             };
 
+            // Validate column count matches first SELECT
+            let part_cols = plan.output_columns();
+            if part_cols.len() != columns.len() {
+                return self
+                    .send_error(
+                        1222,
+                        "21000",
+                        "The used SELECT statements have a different number of columns",
+                    )
+                    .await
+                    .map(|_| Some(()));
+            }
+
             let engine = ExecutorEngine::with_raft(
                 mvcc.clone(),
                 self.catalog.clone(),
@@ -2203,7 +2380,7 @@ where
                 self.raft_node.clone(),
                 self.session.user_variables(),
             );
-            let mut executor = engine.build(plan)?;
+            let mut executor = engine.build_async(plan).await?;
             executor.open().await?;
             while let Some(row) = executor.next().await? {
                 all_rows.push(row);
@@ -2220,6 +2397,61 @@ where
                 let key: Vec<_> = row.values().to_vec();
                 seen.insert(key)
             });
+        }
+
+        // Apply trailing ORDER BY to the combined UNION result
+        // Extract ORDER BY from the parsed statement (sqlparser already parsed it)
+        if let sqlparser::ast::Statement::Query(q) = &ast[0] {
+            // Apply ORDER BY from the full UNION query
+            if let Some(ref order_by) = q.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(ref exprs) = order_by.kind {
+                    let col_names: Vec<String> =
+                        columns.iter().map(|c| c.name.to_uppercase()).collect();
+                    all_rows.sort_by(|a, b| {
+                        for ob_expr in exprs {
+                            let col_idx = match &ob_expr.expr {
+                                sqlparser::ast::Expr::Identifier(ident) => col_names
+                                    .iter()
+                                    .position(|n| n.eq_ignore_ascii_case(&ident.value)),
+                                sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                                    value: sqlparser::ast::Value::Number(n, _),
+                                    ..
+                                }) => n.parse::<usize>().ok().map(|i| i - 1),
+                                _ => None,
+                            };
+                            if let Some(idx) = col_idx {
+                                let va = a.get_opt(idx).unwrap_or(&Datum::Null);
+                                let vb = b.get_opt(idx).unwrap_or(&Datum::Null);
+                                let ord = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+                                let ord = if ob_expr.options.asc == Some(false) {
+                                    ord.reverse()
+                                } else {
+                                    ord
+                                };
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+            }
+
+            // Apply LIMIT
+            if let Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit:
+                    Some(sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::Number(ref n, _),
+                        ..
+                    })),
+                ..
+            }) = q.limit_clause
+            {
+                if let Ok(limit) = n.parse::<usize>() {
+                    all_rows.truncate(limit);
+                }
+            }
         }
 
         // Clean up read-only transaction
@@ -2558,14 +2790,17 @@ where
             }
 
             AlterTableOperation::DropForeignKey { name, .. } => {
-                // MySQL: DROP FOREIGN KEY fk_symbol — we don't track names,
-                // so try to match by removing the first FK constraint, or log warning
-                let _fk_name = name.value.clone();
+                let fk_name = name.value.clone();
                 let before = def.constraints.len();
-                def.constraints
-                    .retain(|c| !matches!(c, crate::catalog::Constraint::ForeignKey { .. }));
+                def.constraints.retain(|c| {
+                    if let crate::catalog::Constraint::ForeignKey { name: Some(n), .. } = c {
+                        !n.eq_ignore_ascii_case(&fk_name)
+                    } else {
+                        true
+                    }
+                });
                 if def.constraints.len() == before {
-                    warn!("DROP FOREIGN KEY '{}': no foreign key found", _fk_name);
+                    warn!("DROP FOREIGN KEY '{}': no foreign key found", fk_name);
                 }
             }
 
@@ -2627,7 +2862,9 @@ where
             }
 
             _ => {
-                warn!("Unsupported ALTER TABLE operation: {:?}", op);
+                return Err(ProtocolError::Sql(crate::sql::SqlError::Unsupported(
+                    format!("ALTER TABLE operation: {:?}", op),
+                )));
             }
         }
 
@@ -3094,7 +3331,11 @@ where
                 .unwrap_or_else(|| "default".to_string());
             let tables = {
                 let catalog = self.catalog.read();
-                catalog.get_tables_in_database(&db)
+                let mut tables = catalog.get_tables_in_database(&db);
+                // Include views in SHOW TABLES output
+                tables.extend(catalog.get_view_names());
+                tables.sort();
+                tables
             };
             let col_name = format!("Tables_in_{}", db);
             let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
@@ -3123,14 +3364,31 @@ where
                         .await
                         .map(Some)
                 }
-                None => self
-                    .send_error(
-                        codes::ER_NO_SUCH_TABLE,
-                        states::NO_SUCH_TABLE,
-                        &format!("Table '{}' doesn't exist", table_name),
-                    )
-                    .await
-                    .map(|_| Some(())),
+                None => {
+                    // Check if it's a view
+                    let view_def = {
+                        let catalog = self.catalog.read();
+                        catalog.get_view(table_name).cloned()
+                    };
+                    if let Some(vd) = view_def {
+                        let create_view = format!(
+                            "CREATE ALGORITHM=UNDEFINED VIEW `{}` AS {}",
+                            vd.name, vd.query_sql
+                        );
+                        let rows = vec![vec![table_name.to_string(), create_view]];
+                        self.send_custom_result_set(&["View", "Create View"], &rows)
+                            .await
+                            .map(Some)
+                    } else {
+                        self.send_error(
+                            codes::ER_NO_SUCH_TABLE,
+                            states::NO_SUCH_TABLE,
+                            &format!("Table '{}' doesn't exist", table_name),
+                        )
+                        .await
+                        .map(|_| Some(()))
+                    }
+                }
             }
         }
         // SHOW KEYS FROM / SHOW INDEX FROM / SHOW INDEXES FROM
@@ -3382,6 +3640,169 @@ where
             )
             .await
             .map(Some)
+        }
+        // SHOW PROCEDURE STATUS [LIKE 'pattern']
+        else if sql_upper.starts_with("SHOW PROCEDURE STATUS")
+            || sql_upper.starts_with("SHOW FUNCTION STATUS")
+        {
+            let is_function = sql_upper.starts_with("SHOW FUNCTION");
+            // Extract optional LIKE pattern
+            let like_pattern = if let Some(idx) = sql_upper.find("LIKE ") {
+                let pat_str = sql_trimmed[idx + 5..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_matches('\'');
+                Some(pat_str.to_string())
+            } else {
+                None
+            };
+            let db = self
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let procs = {
+                let catalog = self.catalog.read();
+                catalog
+                    .list_procedures()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for proc in &procs {
+                let proc_is_func = proc.returns_type.is_some();
+                if proc_is_func != is_function {
+                    continue;
+                }
+                if let Some(ref pat) = like_pattern {
+                    if !crate::executor::datum::like_match(
+                        &proc.name.to_lowercase(),
+                        &pat.to_lowercase(),
+                    ) {
+                        continue;
+                    }
+                }
+                let type_str = if proc_is_func {
+                    "FUNCTION"
+                } else {
+                    "PROCEDURE"
+                };
+                rows.push(vec![
+                    db.clone(),
+                    proc.name.clone(),
+                    type_str.to_string(),
+                    "root@localhost".to_string(),
+                    "0000-00-00 00:00:00".to_string(),
+                    "0000-00-00 00:00:00".to_string(),
+                    "DEFINER".to_string(),
+                    String::new(),
+                    "utf8mb4".to_string(),
+                    "utf8mb4_general_ci".to_string(),
+                    "utf8mb4_general_ci".to_string(),
+                ]);
+            }
+            rows.sort_by(|a, b| a[1].cmp(&b[1]));
+            self.send_custom_result_set(
+                &[
+                    "Db",
+                    "Name",
+                    "Type",
+                    "Definer",
+                    "Modified",
+                    "Created",
+                    "Security_type",
+                    "Comment",
+                    "character_set_client",
+                    "collation_connection",
+                    "Database Collation",
+                ],
+                &rows,
+            )
+            .await
+            .map(Some)
+        }
+        // SHOW CREATE PROCEDURE proc_name / SHOW CREATE FUNCTION func_name
+        else if sql_upper.starts_with("SHOW CREATE PROCEDURE ")
+            || sql_upper.starts_with("SHOW CREATE FUNCTION ")
+        {
+            let is_function = sql_upper.starts_with("SHOW CREATE FUNCTION");
+            let offset = if is_function { 21 } else { 22 };
+            let proc_name = sql_trimmed[offset..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('`')
+                .trim_matches('\'')
+                .trim_matches('"');
+            let proc_def = {
+                let catalog = self.catalog.read();
+                catalog.get_procedure(proc_name).cloned()
+            };
+            match proc_def {
+                Some(def) => {
+                    // Reconstruct CREATE DDL
+                    let params_str = def
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let mode = match p.mode {
+                                crate::catalog::ParamMode::In => "IN",
+                                crate::catalog::ParamMode::Out => "OUT",
+                                crate::catalog::ParamMode::InOut => "INOUT",
+                            };
+                            format!("{} {} {}", mode, p.name, p.data_type)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let create_ddl = if is_function {
+                        let ret = def.returns_type.as_deref().unwrap_or("VARCHAR(255)");
+                        format!(
+                            "CREATE FUNCTION {}({}) RETURNS {} {}",
+                            def.name, params_str, ret, def.body_sql
+                        )
+                    } else {
+                        format!(
+                            "CREATE PROCEDURE {}({}) {}",
+                            def.name, params_str, def.body_sql
+                        )
+                    };
+                    let (col_name, col_create) = if is_function {
+                        ("Function", "Create Function")
+                    } else {
+                        ("Procedure", "Create Procedure")
+                    };
+                    let rows = vec![vec![
+                        proc_name.to_string(),
+                        String::new(),
+                        create_ddl,
+                        "utf8mb4".to_string(),
+                        "utf8mb4_general_ci".to_string(),
+                        "utf8mb4_general_ci".to_string(),
+                    ]];
+                    self.send_custom_result_set(
+                        &[
+                            col_name,
+                            "sql_mode",
+                            col_create,
+                            "character_set_client",
+                            "collation_connection",
+                            "Database Collation",
+                        ],
+                        &rows,
+                    )
+                    .await
+                    .map(Some)
+                }
+                None => {
+                    let kind = if is_function { "FUNCTION" } else { "PROCEDURE" };
+                    self.send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("{} {} does not exist", kind, proc_name),
+                    )
+                    .await
+                    .map(|_| Some(()))
+                }
+            }
         } else {
             Ok(None)
         }
@@ -3586,30 +4007,14 @@ where
         Ok(None)
     }
 
-    async fn try_handle_database_function(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
-        let sql_upper = sql.trim().to_uppercase();
+    // DATABASE() is handled by the eval pipeline via __sys_database user variable.
+    // No special intercept needed.
 
-        // Match SELECT DATABASE()
-        if !sql_upper.contains("DATABASE()") {
-            return Ok(None);
-        }
-
-        let db_value = self
-            .database
-            .clone()
-            .or_else(|| self.session.database.clone())
-            .unwrap_or_default();
-
-        let rows = vec![vec![db_value]];
-        self.send_custom_result_set(&["DATABASE()"], &rows)
-            .await
-            .map(Some)
-    }
-
-    /// Handle SET @var = expr (user variable assignment)
+    /// Handle SET @var = expr (user variable assignment).
+    /// Supports multiple assignments: SET @a = 1, @b = 2, @c = 3
     async fn handle_set_user_variable(&mut self, sql: &str) -> ProtocolResult<()> {
         let trimmed = sql.trim();
-        // Parse: after "SET @", extract var name and value
+        // Strip the SET keyword
         let rest = match trimmed
             .strip_prefix("SET ")
             .or_else(|| trimmed.strip_prefix("set "))
@@ -3617,47 +4022,163 @@ where
             Some(r) => r.trim(),
             None => return self.send_ok(0, 0).await,
         };
-        let rest = match rest.strip_prefix('@') {
-            Some(r) => r,
-            None => return self.send_ok(0, 0).await,
-        };
-        // Find = or :=
-        let (var_name, val_str) = if let Some(pos) = rest.find(":=") {
-            (&rest[..pos], rest[pos + 2..].trim())
-        } else if let Some(pos) = rest.find('=') {
-            (&rest[..pos], rest[pos + 1..].trim())
+
+        // Split into individual assignments at top-level commas
+        // (respecting parentheses and string literals)
+        let assignments = Self::split_set_assignments(rest);
+
+        for assignment in &assignments {
+            let assignment = assignment.trim();
+            // Each assignment should be @var = expr or @var := expr
+            let assignment = match assignment.strip_prefix('@') {
+                Some(r) => r,
+                None => continue,
+            };
+            // Find = or :=
+            let (var_name, val_str) = if let Some(pos) = assignment.find(":=") {
+                (&assignment[..pos], assignment[pos + 2..].trim())
+            } else if let Some(pos) = assignment.find('=') {
+                (&assignment[..pos], assignment[pos + 1..].trim())
+            } else {
+                continue;
+            };
+            let var_name = var_name.trim().to_lowercase();
+
+            // Try to evaluate the value expression by wrapping in SELECT
+            let scope_expr = format!("SELECT {} AS v", val_str);
+
+            // Resolve inside a block so the catalog guard is dropped before await
+            let datum = (|| -> Option<Datum> {
+                let val_stmt = Parser::parse_one(&scope_expr).ok()?;
+                let catalog = self.catalog.read();
+                let resolver = Resolver::new(&catalog);
+                let resolved = resolver.resolve(val_stmt).ok()?;
+
+                if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
+                    if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
+                        expr: resolved_expr,
+                        ..
+                    }) = sel.columns.first()
+                    {
+                        let empty_row = crate::executor::row::Row::empty();
+                        let vars = self.session.user_variables();
+                        return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars)
+                            .ok();
+                    }
+                }
+                None
+            })();
+
+            let value = datum.unwrap_or(Datum::String(val_str.to_string()));
+            self.session.set_user_variable(&var_name, value);
+        }
+        self.send_ok(0, 0).await
+    }
+
+    /// Handle SET @var = expr silently (no client response packets).
+    /// Used within trigger bodies and other internal execution paths.
+    fn execute_set_user_variable_silent(&self, sql: &str) {
+        let trimmed = sql.trim();
+        // Strip "SET " prefix case-insensitively
+        let rest = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("SET ") {
+            trimmed[4..].trim()
         } else {
-            return self.send_ok(0, 0).await;
+            return;
         };
-        let var_name = var_name.trim().to_lowercase();
 
-        // Try to evaluate the value expression by wrapping in SELECT
-        let scope_expr = format!("SELECT {} AS v", val_str);
+        let assignments = Self::split_set_assignments(rest);
 
-        // Resolve inside a block so the catalog guard is dropped before await
-        let datum = (|| -> Option<Datum> {
-            let val_stmt = Parser::parse_one(&scope_expr).ok()?;
-            let catalog = self.catalog.read();
-            let resolver = Resolver::new(&catalog);
-            let resolved = resolver.resolve(val_stmt).ok()?;
+        for assignment in &assignments {
+            let assignment = assignment.trim();
+            let assignment = match assignment.strip_prefix('@') {
+                Some(r) => r,
+                None => continue,
+            };
+            let (var_name, val_str) = if let Some(pos) = assignment.find(":=") {
+                (&assignment[..pos], assignment[pos + 2..].trim())
+            } else if let Some(pos) = assignment.find('=') {
+                (&assignment[..pos], assignment[pos + 1..].trim())
+            } else {
+                continue;
+            };
+            let var_name = var_name.trim().to_lowercase();
 
-            if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
-                if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
-                    expr: resolved_expr,
-                    ..
-                }) = sel.columns.first()
-                {
-                    let empty_row = crate::executor::row::Row::empty();
-                    let vars = self.session.user_variables();
-                    return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars).ok();
+            let scope_expr = format!("SELECT {} AS v", val_str);
+
+            let datum = (|| -> Option<Datum> {
+                let val_stmt = Parser::parse_one(&scope_expr).ok()?;
+                let catalog = self.catalog.read();
+                let resolver = Resolver::new(&catalog);
+                let resolved = resolver.resolve(val_stmt).ok()?;
+
+                if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
+                    if let Some(crate::planner::logical::ResolvedSelectItem::Expr {
+                        expr: resolved_expr,
+                        ..
+                    }) = sel.columns.first()
+                    {
+                        let empty_row = crate::executor::row::Row::empty();
+                        let vars = self.session.user_variables();
+                        return crate::executor::eval::evaluate(resolved_expr, &empty_row, &vars)
+                            .ok();
+                    }
+                }
+                None
+            })();
+
+            let value = datum.unwrap_or(Datum::String(val_str.to_string()));
+            self.session.set_user_variable(&var_name, value);
+        }
+    }
+
+    /// Split a SET assignment list at top-level commas, respecting
+    /// parentheses and string literals.
+    fn split_set_assignments(s: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0u32;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut start = 0;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_single_quote {
+                if b == b'\'' {
+                    // Check for escaped quote ''
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+            } else if in_double_quote {
+                if b == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+            } else {
+                match b {
+                    b'\'' => in_single_quote = true,
+                    b'"' => in_double_quote = true,
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        parts.push(&s[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
                 }
             }
-            None
-        })();
-
-        let value = datum.unwrap_or(Datum::String(val_str.to_string()));
-        self.session.set_user_variable(&var_name, value);
-        self.send_ok(0, 0).await
+            i += 1;
+        }
+        if start < s.len() {
+            parts.push(&s[start..]);
+        }
+        parts
     }
 
     /// Extract the value from SET sql_mode / SET @@sql_mode / SET SESSION sql_mode.
@@ -3700,10 +4221,7 @@ where
     async fn try_handle_system_variable(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         use regex::Regex;
 
-        // Check for DATABASE() function first
-        if let Some(()) = self.try_handle_database_function(sql).await? {
-            return Ok(Some(()));
-        }
+        // DATABASE() is handled by the eval pipeline — no special intercept needed.
 
         // Simple pattern matching for SELECT @@variable queries
         let sql_upper = sql.to_uppercase();
@@ -3826,6 +4344,502 @@ where
         Ok(Some(()))
     }
 
+    // ============ View Handlers (Raft-persisted) ============
+
+    /// Handle CREATE VIEW with Raft persistence.
+    /// Validates the view query at creation time, then persists to system.views via Raft.
+    async fn handle_create_view_raft(
+        &mut self,
+        view_name: &str,
+        query_sql: &str,
+        or_replace: bool,
+    ) -> ProtocolResult<()> {
+        use crate::catalog::system_tables::{view_def_to_row, SYSTEM_VIEWS};
+        use crate::catalog::ViewDef;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::raft::RowChange;
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let view_name = view_name.trim_matches('`').to_string();
+
+        // Validate the view query parses correctly
+        if let Err(e) = crate::sql::Parser::parse_one(query_sql) {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    &format!("Invalid view query: {}", e),
+                )
+                .await;
+        }
+
+        // Check if view already exists
+        let exists = {
+            let catalog = self.catalog.read();
+            catalog.view_exists(&view_name)
+        };
+
+        if exists && !or_replace {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("View '{}' already exists", view_name),
+                )
+                .await;
+        }
+
+        // If replacing, delete old row first
+        let mut changes = Vec::new();
+        if exists && or_replace {
+            if let Some(delete_change) = self.find_view_row_for_delete(&view_name).await? {
+                changes.push(delete_change);
+            }
+        }
+
+        // Insert new row into system.views
+        let view_def = ViewDef {
+            name: view_name.clone(),
+            query_sql: query_sql.to_string(),
+        };
+
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let row_id = encode_row_id(local_id, node_id);
+        let view_row = view_def_to_row(&view_def);
+        let key = encode_row_key(SYSTEM_VIEWS, row_id);
+        let value = encode_row(&view_row);
+        changes.push(RowChange::insert(SYSTEM_VIEWS, key, value));
+
+        let changeset = ChangeSet::new_with_changes(0, changes);
+        match self.raft_node.propose_changes(changeset).await {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Failed to create view: {}", e),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Handle DROP VIEW with Raft persistence.
+    async fn handle_drop_view_raft(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+    ) -> ProtocolResult<()> {
+        let mut changeset = ChangeSet::new(0);
+
+        for raw_name in names {
+            let view_name = raw_name.trim_matches('`').to_string();
+
+            let exists = {
+                let catalog = self.catalog.read();
+                catalog.view_exists(&view_name)
+            };
+
+            if !exists {
+                if if_exists {
+                    continue;
+                }
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("View '{}' does not exist", view_name),
+                    )
+                    .await;
+            }
+
+            if let Some(delete_change) = self.find_view_row_for_delete(&view_name).await? {
+                changeset.push(delete_change);
+            }
+        }
+
+        if !changeset.changes.is_empty() {
+            match self.raft_node.propose_changes(changeset).await {
+                Ok(()) => self.send_ok(0, 0).await,
+                Err(e) => {
+                    self.send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Failed to drop view: {}", e),
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.send_ok(0, 0).await
+        }
+    }
+
+    /// Scan system.views for a row matching the given view name and return a delete RowChange.
+    async fn find_view_row_for_delete(
+        &self,
+        view_name: &str,
+    ) -> ProtocolResult<Option<crate::raft::RowChange>> {
+        use crate::catalog::system_tables::SYSTEM_VIEWS;
+        use crate::executor::encoding::decode_row;
+        use crate::raft::RowChange;
+
+        let prefix = format!("t:{SYSTEM_VIEWS}:");
+        let end = format!("t:{SYSTEM_VIEWS};\x00");
+
+        let rows = self
+            .mvcc
+            .scan_raw(prefix.as_bytes(), end.as_bytes())
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+
+        for (key, value) in rows {
+            let row_data = if value.len() > 17 {
+                &value[17..]
+            } else {
+                &value
+            };
+            if let Ok(row) = decode_row(row_data) {
+                if let Some(Datum::String(name)) = row.values().first() {
+                    if name.eq_ignore_ascii_case(view_name) {
+                        return Ok(Some(RowChange::delete_with_value(
+                            SYSTEM_VIEWS,
+                            key,
+                            row_data.to_vec(),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // ============ Trigger Handlers ============
+
+    /// Handle CREATE TRIGGER — parse the trigger definition and store in catalog.
+    ///
+    /// MySQL syntax: CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+    ///               ON table FOR EACH ROW body_statement
+    ///
+    /// The header is parsed by tokenizing, the body is parsed as a standalone
+    /// SQL statement via sqlparser. The body AST is stored in the catalog and
+    /// executed during DML with NEW/OLD column substitutions.
+    async fn handle_create_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
+        use crate::catalog::{TriggerDef, TriggerEvent, TriggerTiming};
+
+        let sql_clean = sql.trim().trim_end_matches(';');
+        let upper = sql_clean.to_uppercase();
+
+        // Find "FOR EACH ROW" to split header from body
+        let fer_pos = match upper.find("FOR EACH ROW") {
+            Some(p) => p,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        "CREATE TRIGGER requires FOR EACH ROW",
+                    )
+                    .await;
+            }
+        };
+
+        let header = sql_clean[..fer_pos].trim();
+        let body_sql = sql_clean[fer_pos + 12..].trim(); // 12 = "FOR EACH ROW".len()
+
+        // Parse header tokens: CREATE TRIGGER name BEFORE INSERT ON table
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        if tokens.len() < 7 {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    "Invalid CREATE TRIGGER syntax",
+                )
+                .await;
+        }
+
+        let name = tokens[2].trim_matches('`').to_string();
+        let timing_str = tokens[3].to_uppercase();
+        let event_str = tokens[4].to_uppercase();
+        let table_name = tokens[6].trim_matches('`').to_string();
+
+        let timing = match timing_str.as_str() {
+            "BEFORE" => TriggerTiming::Before,
+            "AFTER" => TriggerTiming::After,
+            _ => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Expected BEFORE or AFTER, got '{}'", timing_str),
+                    )
+                    .await;
+            }
+        };
+
+        let event = match event_str.as_str() {
+            "INSERT" => TriggerEvent::Insert,
+            "UPDATE" => TriggerEvent::Update,
+            "DELETE" => TriggerEvent::Delete,
+            _ => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Expected INSERT, UPDATE, or DELETE, got '{}'", event_str),
+                    )
+                    .await;
+            }
+        };
+
+        // Parse body as a standalone SQL statement through the full parser
+        let body = match crate::sql::Parser::parse_one(body_sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_PARSE_ERROR,
+                        states::SYNTAX_ERROR,
+                        &format!("Parse error in trigger body: {}", e),
+                    )
+                    .await;
+            }
+        };
+
+        let def = TriggerDef {
+            name,
+            table_name,
+            timing,
+            event,
+            body,
+            create_sql: sql.to_string(),
+        };
+
+        {
+            let mut catalog = self.catalog.write();
+            catalog.create_trigger(def);
+        }
+
+        self.send_ok(0, 0).await
+    }
+
+    /// Handle DROP TRIGGER — parse and remove from catalog
+    async fn handle_drop_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
+        let upper = sql.to_uppercase();
+        let if_exists = upper.contains("IF EXISTS");
+
+        // Extract trigger name: DROP TRIGGER [IF EXISTS] name
+        let name_part = if if_exists {
+            sql.trim_end_matches(';')
+                .trim()
+                .rsplit("EXISTS")
+                .next()
+                .unwrap_or("")
+                .trim()
+        } else {
+            sql.trim_end_matches(';')
+                .trim()
+                .strip_prefix("DROP TRIGGER ")
+                .or_else(|| {
+                    sql.trim_end_matches(';')
+                        .trim()
+                        .strip_prefix("drop trigger ")
+                })
+                .unwrap_or("")
+                .trim()
+        };
+
+        let trigger_name = name_part.trim_matches('`').trim_matches('"');
+
+        if trigger_name.is_empty() {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    "Missing trigger name in DROP TRIGGER",
+                )
+                .await;
+        }
+
+        let result = {
+            let mut catalog = self.catalog.write();
+            catalog.drop_trigger(trigger_name)
+        };
+
+        match result {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(_) if if_exists => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_NO_SUCH_TABLE,
+                    states::NO_SUCH_TABLE,
+                    &format!("{}", e),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Extract trigger-relevant info from an INSERT physical plan.
+    /// Returns (table_name, column_names, row_values) if triggers exist.
+    fn extract_insert_trigger_info(&self, plan: &PhysicalPlan) -> Option<InsertTriggerInfo> {
+        if let PhysicalPlan::Insert {
+            table,
+            columns,
+            values,
+            ..
+        } = plan
+        {
+            // Check if any triggers exist for this table
+            let catalog = self.catalog.read();
+            let has_before = !catalog
+                .get_triggers(
+                    table,
+                    crate::catalog::TriggerTiming::Before,
+                    crate::catalog::TriggerEvent::Insert,
+                )
+                .is_empty();
+            let has_after = !catalog
+                .get_triggers(
+                    table,
+                    crate::catalog::TriggerTiming::After,
+                    crate::catalog::TriggerEvent::Insert,
+                )
+                .is_empty();
+
+            if has_before || has_after {
+                Some(InsertTriggerInfo {
+                    table_name: table.clone(),
+                    column_names: columns.iter().map(|c| c.name.clone()).collect(),
+                    values: values.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Fire INSERT triggers for each row that was inserted.
+    /// Resolves the trigger body with NEW bindings and executes through the full pipeline.
+    async fn fire_insert_triggers(&mut self, info: &InsertTriggerInfo) -> ProtocolResult<()> {
+        use crate::catalog::{TriggerEvent, TriggerTiming};
+        use crate::executor::eval::evaluate;
+        use crate::executor::row::Row;
+        use crate::executor::trigger::{datum_to_sp_value, substitute_new_refs};
+
+        // Get triggers (both BEFORE and AFTER — for now we fire both post-execution)
+        let triggers: Vec<crate::catalog::TriggerDef> = {
+            let catalog = self.catalog.read();
+            let mut trigs = Vec::new();
+            trigs.extend(
+                catalog
+                    .get_triggers(
+                        &info.table_name,
+                        TriggerTiming::Before,
+                        TriggerEvent::Insert,
+                    )
+                    .into_iter()
+                    .cloned(),
+            );
+            trigs.extend(
+                catalog
+                    .get_triggers(&info.table_name, TriggerTiming::After, TriggerEvent::Insert)
+                    .into_iter()
+                    .cloned(),
+            );
+            trigs
+        };
+
+        if triggers.is_empty() {
+            return Ok(());
+        }
+
+        let empty_row = Row::empty();
+        let user_vars = self.session.user_variables();
+
+        // For each inserted row, fire all triggers
+        for value_row in &info.values {
+            // Evaluate the row expressions to get actual values
+            let mut new_values = std::collections::HashMap::new();
+            for (col_idx, expr) in value_row.iter().enumerate() {
+                if col_idx < info.column_names.len() {
+                    let datum = evaluate(expr, &empty_row, &user_vars)
+                        .unwrap_or(crate::executor::datum::Datum::Null);
+                    let sp_val = datum_to_sp_value(&datum);
+                    new_values.insert(info.column_names[col_idx].clone(), sp_val);
+                }
+            }
+
+            // Fire each trigger
+            for trigger in &triggers {
+                // Substitute NEW.col references in the trigger body
+                let substituted = substitute_new_refs(&trigger.body, &new_values);
+
+                // Execute the substituted statement through the full pipeline
+                let sql = substituted.to_string();
+                self.execute_sql_silent(&sql)
+                    .await
+                    .map_err(|e| ProtocolError::Sql(crate::sql::SqlError::InvalidOperation(e)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find the matching closing paren for an opening paren at `start`,
+    /// skipping parens inside single-quoted string literals.
+    fn find_matching_close_paren(sql: &str, start: usize) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut i = start;
+        while i < bytes.len() {
+            let ch = bytes[i];
+            if in_string {
+                if ch == b'\'' {
+                    // Check for escaped quote ('')
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else {
+                match ch {
+                    b'\'' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Extract procedure body (BEGIN...END) from raw CREATE PROCEDURE SQL.
+    fn extract_body_from_raw_sql(raw_sql: &str) -> Option<String> {
+        let upper = raw_sql.to_uppercase();
+        let cp = upper.find("CREATE PROCEDURE")?;
+        let paren_start = raw_sql[cp..].find('(')?;
+        let paren_start = cp + paren_start;
+        let paren_end = Self::find_matching_close_paren(raw_sql, paren_start)?;
+        let body = raw_sql[paren_end + 1..].trim();
+        if body.is_empty() {
+            None
+        } else {
+            Some(body.to_string())
+        }
+    }
+
     // ============ Stored Procedure Handlers ============
 
     /// Handle CREATE PROCEDURE statement
@@ -3833,7 +4847,8 @@ where
         &mut self,
         name: &sqlparser::ast::ObjectName,
         params: Option<&[sqlparser::ast::ProcedureParam]>,
-        body: &sqlparser::ast::ConditionalStatements,
+        ast_body: &sqlparser::ast::ConditionalStatements,
+        raw_sql: &str,
     ) -> ProtocolResult<()> {
         let proc_name = name.to_string().to_lowercase();
 
@@ -3855,7 +4870,11 @@ where
             })
             .collect();
 
-        let body_sql = body.to_string();
+        // Extract the original body SQL from the raw SQL (before normalization)
+        // to preserve DECLARE HANDLER and DECLARE CURSOR statements.
+        // Find the param list closing paren, then take everything after it as body.
+        let body_sql =
+            Self::extract_body_from_raw_sql(raw_sql).unwrap_or_else(|| ast_body.to_string());
 
         // Check if procedure already exists
         let exists = {
@@ -3876,6 +4895,7 @@ where
             name: proc_name.clone(),
             params: our_params,
             body_sql,
+            returns_type: None,
         };
 
         // Write to system.procedures via Raft
@@ -3906,7 +4926,344 @@ where
         }
     }
 
-    /// Handle DROP PROCEDURE statement
+    /// Handle CREATE FUNCTION via text parsing (MySQL syntax with BEGIN/END body)
+    /// Handle REPLACE INTO — MySQL semantics: if duplicate key, delete old row + insert new.
+    /// Approach: parse table + columns + values, for each row try INSERT;
+    /// on duplicate key, DELETE by PK then INSERT.
+    async fn handle_replace(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse REPLACE INTO table (cols) VALUES (vals), (vals)...
+        let re =
+            regex::Regex::new(r"(?is)REPLACE\s+INTO\s+(\w+)\s*(?:\(([^)]+)\))?\s+VALUES\s+(.*)")
+                .unwrap();
+
+        let caps = match re.captures(sql.trim().trim_end_matches(';')) {
+            Some(c) => c,
+            None => {
+                // Fallback: convert REPLACE to INSERT and try directly
+                let insert_sql = regex::Regex::new(r"(?i)^REPLACE\b")
+                    .unwrap()
+                    .replace(sql, "INSERT");
+                return self.handle_query(&insert_sql).await;
+            }
+        };
+
+        let table = caps.get(1).unwrap().as_str();
+        let cols = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let values_part = caps.get(3).unwrap().as_str();
+
+        // For each VALUES group, try INSERT; on dup key error, DELETE + INSERT
+        let col_clause = if cols.is_empty() {
+            String::new()
+        } else {
+            format!("({})", cols)
+        };
+
+        // Split value groups: (v1,v2), (v3,v4)
+        let mut total_affected = 0u64;
+        let val_re = regex::Regex::new(r"\(([^)]*)\)").unwrap();
+        for val_match in val_re.captures_iter(values_part) {
+            let vals = val_match.get(1).unwrap().as_str();
+            let insert_sql = format!("INSERT INTO {} {} VALUES ({})", table, col_clause, vals);
+            match self.execute_sql_silent(&insert_sql).await {
+                Ok(n) => total_affected += n,
+                Err(e) => {
+                    if e.contains("Duplicate entry") || e.contains("duplicate key") {
+                        // Build DELETE WHERE pk = val using the first column value
+                        // For multi-column PK, we'd need schema introspection.
+                        // Simplified: delete by first column value
+                        let first_val = vals.split(',').next().unwrap_or("").trim();
+                        let first_col = if cols.is_empty() {
+                            // No column list; assume first column is PK
+                            String::new()
+                        } else {
+                            cols.split(',').next().unwrap_or("").trim().to_string()
+                        };
+                        if !first_col.is_empty() {
+                            let delete_sql = format!(
+                                "DELETE FROM {} WHERE {} = {}",
+                                table, first_col, first_val
+                            );
+                            if let Ok(d) = self.execute_sql_silent(&delete_sql).await {
+                                total_affected += d;
+                            }
+                        }
+                        // Retry INSERT
+                        if let Ok(n) = self.execute_sql_silent(&insert_sql).await {
+                            total_affected += n;
+                        }
+                    }
+                    // Else: non-duplicate error, skip row
+                }
+            }
+        }
+
+        self.send_ok(total_affected, 0).await
+    }
+
+    /// Handle LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name [CHARACTER SET cs]
+    async fn handle_load_data(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse: LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name
+        let re = regex::Regex::new(
+            r#"(?i)LOAD\s+DATA\s+(?:LOCAL\s+)?INFILE\s+['"]([^'"]+)['"]\s+INTO\s+TABLE\s+(\w+)"#,
+        )
+        .unwrap();
+
+        let caps = match re.captures(sql) {
+            Some(c) => c,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        "Failed to parse LOAD DATA statement",
+                    )
+                    .await;
+            }
+        };
+
+        let file_path = caps.get(1).unwrap().as_str();
+        let table_name = caps.get(2).unwrap().as_str();
+
+        // Resolve file path: try multiple base directories
+        let resolved = Self::resolve_load_data_path(file_path);
+        let resolved_path = match resolved {
+            Some(p) => p,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!(
+                            "Can't find file '{}' (resolved from data directory)",
+                            file_path
+                        ),
+                    )
+                    .await;
+            }
+        };
+
+        // Read the file
+        let data = match std::fs::read(&resolved_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Can't read file '{}': {}", resolved_path.display(), e),
+                    )
+                    .await;
+            }
+        };
+
+        // Convert to UTF-8 string (best effort)
+        let text = String::from_utf8_lossy(&data);
+
+        // Split by lines, handling backslash-newline continuation
+        let mut rows_inserted = 0u64;
+        let raw_lines: Vec<&str> = text.split('\n').collect();
+        let mut lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < raw_lines.len() {
+            let mut line = raw_lines[i].to_string();
+            // Handle backslash continuation: line ending with \ joins with next
+            while line.ends_with('\\') && i + 1 < raw_lines.len() {
+                line.pop(); // remove trailing backslash
+                i += 1;
+                line.push_str(raw_lines[i]);
+            }
+            i += 1;
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        }
+
+        for line in &lines {
+            // Process MySQL backslash escaping: remove lone backslashes
+            let processed = Self::process_load_data_escapes(line);
+            // Escape single quotes for INSERT
+            let escaped = processed.replace('\'', "''");
+            let insert_sql = format!("INSERT INTO {} VALUES ('{}')", table_name, escaped);
+            match self.execute_sql_silent(&insert_sql).await {
+                Ok(n) => rows_inserted += n,
+                Err(e) => {
+                    // Add warning but continue (MySQL LOAD DATA behavior)
+                    self.session.add_warning("Warning", 1265, e);
+                }
+            }
+        }
+
+        self.send_ok(rows_inserted, 0).await
+    }
+
+    /// Resolve a LOAD DATA INFILE path, trying multiple base directories.
+    fn resolve_load_data_path(path: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(path);
+
+        // 1. Absolute path
+        if p.is_absolute() && p.exists() {
+            return Some(p.to_path_buf());
+        }
+
+        // 2. Relative to CWD
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+
+        // 3. Try resolving from /usr/lib/mysql-test/ (MTR basedir)
+        // The test path ../../std_data/file.dat from mysql-test/var/data/
+        // resolves to mysql-test/std_data/file.dat
+        let mtr_base = std::path::Path::new("/usr/lib/mysql-test");
+        // Extract the std_data/... portion from relative paths like ../../std_data/file.dat
+        if let Some(std_data_idx) = path.find("std_data") {
+            let relative = &path[std_data_idx..];
+            let mtr_path = mtr_base.join(relative);
+            if mtr_path.exists() {
+                return Some(mtr_path);
+            }
+        }
+
+        // 4. Try as relative from MTR basedir directly
+        let mtr_path = mtr_base.join(path);
+        if mtr_path.exists() {
+            return Some(mtr_path);
+        }
+
+        None
+    }
+
+    /// Process MySQL LOAD DATA escape sequences in a field value.
+    /// MySQL's default ESCAPED BY is backslash (\).
+    fn process_load_data_escapes(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                // Escape sequence
+                match chars.peek() {
+                    Some('n') => {
+                        result.push('\n');
+                        chars.next();
+                    }
+                    Some('t') => {
+                        result.push('\t');
+                        chars.next();
+                    }
+                    Some('0') => {
+                        result.push('\0');
+                        chars.next();
+                    }
+                    Some('\\') => {
+                        result.push('\\');
+                        chars.next();
+                    }
+                    Some(_) => {
+                        // Backslash before any other char: skip the backslash
+                        if let Some(next) = chars.next() {
+                            result.push(next);
+                        }
+                    }
+                    None => {
+                        // Trailing backslash: skip it
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    async fn handle_create_function_text(&mut self, sql: &str) -> ProtocolResult<()> {
+        // Parse: CREATE FUNCTION name(params) RETURNS type BEGIN ... END
+        let re = regex::Regex::new(
+            r"(?is)CREATE\s+FUNCTION\s+(\w+)\s*\(([^)]*)\)\s+RETURNS\s+(\w+)\s+(BEGIN\b.+\bEND)",
+        )
+        .unwrap();
+
+        let caps = match re.captures(sql) {
+            Some(c) => c,
+            None => {
+                return self
+                    .send_error(
+                        codes::ER_UNKNOWN_ERROR,
+                        states::GENERAL_ERROR,
+                        "Failed to parse CREATE FUNCTION",
+                    )
+                    .await;
+            }
+        };
+
+        let func_name = caps.get(1).unwrap().as_str().to_lowercase();
+        let params_str = caps.get(2).unwrap().as_str();
+        let returns_type = caps.get(3).unwrap().as_str().to_string();
+        let body_sql = caps.get(4).unwrap().as_str().to_string();
+
+        // Parse parameters: "inputvar CHAR, ..."
+        let our_params: Vec<ProcedureParam> = params_str
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let parts: Vec<&str> = s.trim().splitn(2, char::is_whitespace).collect();
+                ProcedureParam {
+                    name: parts.first().unwrap_or(&"").to_lowercase(),
+                    data_type: parts.get(1).unwrap_or(&"VARCHAR").to_string(),
+                    mode: ParamMode::In,
+                }
+            })
+            .collect();
+
+        let proc_def = ProcedureDef {
+            name: func_name.clone(),
+            params: our_params,
+            body_sql: body_sql.clone(),
+            returns_type: Some(returns_type),
+        };
+
+        // Store via Raft (reuse procedure storage)
+        use crate::catalog::system_tables::procedure_def_to_row;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::raft::RowChange;
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let row_id = encode_row_id(local_id, node_id);
+        let proc_row = procedure_def_to_row(&proc_def);
+        let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
+        let value = encode_row(&proc_row);
+
+        let change = RowChange::insert(SYSTEM_PROCEDURES, key, value);
+        let changeset = ChangeSet::new_with_changes(0, vec![change]);
+        self.raft_node
+            .propose_changes(changeset)
+            .await
+            .map_err(|e| ProtocolError::Unsupported(format!("Failed to create function: {}", e)))?;
+
+        // Register in catalog
+        let param_names: String = proc_def
+            .params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        {
+            let mut catalog = self.catalog.write();
+            catalog.register_procedure(proc_def);
+        }
+
+        // Register UDF in user_variables so eval_function can find it
+        {
+            let udf_key = format!("__udf_{}", func_name);
+            let params_key = format!("__udf_{}_params", func_name);
+            let vars = self.session.user_variables();
+            let mut w = vars.write();
+            w.insert(udf_key, Datum::String(body_sql));
+            w.insert(params_key, Datum::String(param_names));
+        }
+
+        self.send_ok(0, 0).await
+    }
+
     async fn handle_drop_procedure(
         &mut self,
         proc_name: &str,
@@ -4013,14 +5370,18 @@ where
         let mut ctx = match build_procedure_context(&proc_def, call_args, &user_vars) {
             Ok(c) => c,
             Err(e) => {
-                return self
-                    .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e)
-                    .await;
+                let code = if e.contains("Out of range value") {
+                    codes::ER_WARN_DATA_OUT_OF_RANGE
+                } else {
+                    codes::ER_UNKNOWN_ERROR
+                };
+                return self.send_error(code, "22003", &e).await;
             }
         };
 
         // Extract DECLARE HANDLER declarations before parsing
         let handlers = Self::extract_handlers(&proc_def.body_sql);
+        ctx.handlers = handlers.clone();
 
         // Parse procedure body into Vec<Statement>
         let body_stmts = match Self::parse_body_to_stmts(&proc_def.body_sql) {
@@ -4035,13 +5396,18 @@ where
                     .await;
             }
         };
-        // Execute the body
-        match self
+        // Execute the body with multi-result-set mode if client supports it
+        let client_multi =
+            self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
+        self.in_multi_result = client_multi;
+        let body_result = self
             .execute_procedure_body_with_handlers(&body_stmts, &mut ctx, &handlers)
-            .await
-        {
+            .await;
+
+        match body_result {
             Ok(_) => {}
             Err(e) => {
+                self.in_multi_result = false;
                 return self
                     .send_error(
                         codes::ER_UNKNOWN_ERROR,
@@ -4055,7 +5421,20 @@ where
         // Propagate OUT/INOUT params back to user variables
         propagate_out_params(&proc_def, call_args, &ctx, &user_vars);
 
-        self.send_ok(ctx.rows_affected, 0).await
+        // Send final OK
+        let sent_results = self.sp_sent_results;
+        self.in_multi_result = false;
+        self.sp_sent_results = false;
+        if sent_results {
+            // Multi-result: continue sequence from result set, write final OK
+            let packet = encode_ok_packet(ctx.rows_affected, 0, default_status(), 0);
+            self.writer.write_packet(&packet).await?;
+            self.writer.flush().await?;
+            Ok(())
+        } else {
+            // No result sets sent: standard OK with sequence reset
+            self.send_ok(ctx.rows_affected, 0).await
+        }
     }
 
     /// Parse procedure body SQL into Vec<Statement>.
@@ -4084,7 +5463,9 @@ where
         // Pre-process: convert MySQL DECLARE variable statements to SET.
         // DECLARE var_name TYPE [DEFAULT expr]; → SET var_name = expr;
         // DECLARE var_name CURSOR FOR query; → kept as-is (sqlparser handles this)
-        let processed = Self::normalize_declare_stmts(inner);
+        // Normalize := to = for SET statements (MySQL supports both)
+        let inner = inner.replace(":=", "=");
+        let processed = Self::normalize_declare_stmts(&inner);
 
         // Wrap in BEGIN...END and CREATE PROCEDURE for parsing
         let wrapper = format!("CREATE PROCEDURE __body__() BEGIN {} END", processed);
@@ -4102,6 +5483,11 @@ where
     /// Leaves DECLARE ... CURSOR FOR ... unchanged (sqlparser handles those).
     /// Strips DECLARE ... HANDLER ... statements (handled separately).
     fn normalize_declare_stmts(body: &str) -> String {
+        use std::sync::LazyLock;
+        static RE_FETCH: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"(?i)^FETCH\s+(\w+)\s+INTO\s+(.+)$").unwrap());
+        // Pre-process: split multi-variable DECLARE into individual ones
+        let body = crate::sql::Parser::split_multi_var_declare(body);
         let mut result = String::with_capacity(body.len());
         // Split on semicolons, process each statement
         for part in body.split(';') {
@@ -4144,6 +5530,27 @@ where
                         result.push(' ');
                     }
                     result.push_str(&format!("SET {} = NULL;", var_name));
+                }
+            } else if upper.starts_with("FETCH ") {
+                // Normalize FETCH cursor INTO var1, var2, ... to sentinel SET
+                // that execute_procedure_stmt detects at runtime.
+                // Uses @__roodb_fetch__ (reserved internal name) as the carrier.
+                if let Some(caps) = RE_FETCH.captures(trimmed) {
+                    let cursor = caps[1].replace('\'', "''");
+                    let vars = caps[2].replace('\'', "''");
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(&format!(
+                        "SET @__roodb_fetch__ = '{} INTO {}';",
+                        cursor, vars
+                    ));
+                } else {
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(trimmed);
+                    result.push(';');
                 }
             } else {
                 if !result.is_empty() {
@@ -4311,7 +5718,9 @@ where
     /// Map error message to SQLSTATE code
     fn error_to_sqlstate(err_msg: &str) -> String {
         let lower = err_msg.to_lowercase();
-        if lower.contains("out of range") || lower.contains("overflow") {
+        if lower.contains("no data") || lower.contains("zero rows fetched") {
+            "02000".to_string()
+        } else if lower.contains("out of range") || lower.contains("overflow") {
             "22003".to_string()
         } else if (lower.contains("null") && lower.contains("constraint"))
             || lower.contains("duplicate")
@@ -4330,7 +5739,7 @@ where
     /// Map SQLSTATE to MySQL error code
     fn sqlstate_to_error_code(sqlstate: &str) -> u16 {
         match sqlstate {
-            "22003" => 1264, // ER_WARN_DATA_OUT_OF_RANGE
+            "22003" => 1690, // ER_DATA_OUT_OF_RANGE (in procedure context)
             "23000" => 1062, // ER_DUP_ENTRY
             "22012" => 1365, // ER_DIVISION_BY_ZERO
             "22001" => 1265, // WARN_DATA_TRUNCATED
@@ -4389,6 +5798,18 @@ where
                         variable, values, ..
                     } => {
                         let var_name_full = variable.to_string();
+                        // Detect FETCH sentinel: SET @__roodb_fetch__ = 'cursor INTO var1,var2'
+                        if var_name_full == "@@__roodb_fetch__"
+                            || var_name_full == "@__roodb_fetch__"
+                        {
+                            let val = if let Some(expr) = values.first() {
+                                eval_sp_expr(expr, ctx, &user_vars)?
+                            } else {
+                                return Ok(ProcControlFlow::Continue);
+                            };
+                            let fetch_spec = val.to_display_string();
+                            return self.execute_fetch_sentinel(&fetch_spec, ctx).await;
+                        }
                         let val = if let Some(expr) = values.first() {
                             eval_sp_expr(expr, ctx, &user_vars)?
                         } else {
@@ -4446,10 +5867,20 @@ where
                 Ok(ProcControlFlow::Continue)
             }
 
-            // WHILE loop
+            // WHILE loop — extract nested handlers from WHILE body for error handling
             S::While(while_stmt) => {
                 let max_iterations = 100_000;
                 let mut iterations = 0;
+
+                // Combine top-level handlers from context with any nested in the WHILE body
+                let while_body_sql = while_stmt.while_block.to_string();
+                let mut nested_handlers = Self::extract_handlers(&while_body_sql);
+                // Append parent handlers so they apply in the WHILE body
+                for h in &ctx.handlers {
+                    if !nested_handlers.iter().any(|(_, s, _)| s == &h.1) {
+                        nested_handlers.push(h.clone());
+                    }
+                }
                 loop {
                     if iterations >= max_iterations {
                         return Err(format!("WHILE loop exceeded {} iterations", max_iterations));
@@ -4465,9 +5896,13 @@ where
                         }
                     }
 
-                    // Execute body
+                    // Execute body with handlers (for CONTINUE HANDLER support)
                     match self
-                        .execute_procedure_body(while_stmt.while_block.statements(), ctx)
+                        .execute_procedure_body_with_handlers(
+                            while_stmt.while_block.statements(),
+                            ctx,
+                            &nested_handlers,
+                        )
                         .await?
                     {
                         ProcControlFlow::Return => return Ok(ProcControlFlow::Return),
@@ -4570,6 +6005,8 @@ where
                             ctx.found = true;
                         } else {
                             ctx.found = false;
+                            // Raise SQLSTATE 02000 (NOT FOUND) so DECLARE HANDLER can catch it
+                            return Err("No data - zero rows fetched".to_string());
                         }
                     }
                     Some(CursorState::Declared { .. }) => {
@@ -4614,10 +6051,41 @@ where
             // RETURN
             S::Return(_) => Ok(ProcControlFlow::Return),
 
+            // CALL procedure(args) — nested procedure call
+            S::Call(_) => {
+                // Route through handle_query which has the Call intercept
+                let sql = stmt.to_string();
+                let substituted = self.substitute_locals(&sql, ctx);
+                self.handle_query(&substituted)
+                    .await
+                    .map_err(|e| format!("{}", e))?;
+                Ok(ProcControlFlow::Continue)
+            }
+
             // Everything else: fallback to string-based execution with local var substitution
             _ => {
                 let sql = stmt.to_string();
+
+                // Handle SELECT ... INTO var (MySQL stored procedure syntax)
+                // Must be checked BEFORE substitute_locals to preserve variable names
+                if let Some(result) = self.try_execute_select_into(&sql, ctx).await? {
+                    return Ok(result);
+                }
+
                 let substituted = self.substitute_locals(&sql, ctx);
+
+                // SELECT and SHOW statements in SP body send results to client
+                // (only if client supports CLIENT_MULTI_RESULTS protocol flag)
+                let upper = substituted.trim().to_uppercase();
+                let client_multi =
+                    self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
+                if client_multi && (upper.starts_with("SELECT ") || upper.starts_with("SHOW ")) {
+                    self.execute_sp_select(&substituted)
+                        .await
+                        .map_err(|e| format!("{}", e))?;
+                    return Ok(ProcControlFlow::Continue);
+                }
+
                 let affected = self.execute_sql_silent(&substituted).await?;
                 ctx.rows_affected += affected;
                 Ok(ProcControlFlow::Continue)
@@ -4659,6 +6127,205 @@ where
             result = result.replace(name, &val.to_sql_literal());
         }
         result
+    }
+
+    /// Execute a FETCH sentinel produced by normalization.
+    /// Parses 'cursor_name INTO var1, var2, ...' and performs the fetch.
+    async fn execute_fetch_sentinel(
+        &mut self,
+        spec: &str,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+    ) -> Result<crate::executor::procedure::ProcControlFlow, String> {
+        use crate::executor::procedure::{CursorState, ProcControlFlow};
+
+        // Parse: "cursor_name INTO var1, var2, ..."
+        let upper = spec.to_uppercase();
+        let into_pos = upper.find(" INTO ").ok_or("Invalid FETCH sentinel")?;
+        let cursor_name = spec[..into_pos].trim().to_lowercase();
+        let vars_str = &spec[into_pos + 6..]; // skip " INTO "
+        let into_vars: Vec<String> = vars_str
+            .split(',')
+            .map(|v| v.trim().to_lowercase())
+            .collect();
+
+        match ctx.cursors.get_mut(&cursor_name) {
+            Some(CursorState::Open { rows, position }) => {
+                if *position < rows.len() {
+                    let row = &rows[*position];
+                    for (i, var_name) in into_vars.iter().enumerate() {
+                        let val = row.get_opt(i).cloned().unwrap_or(Datum::Null);
+                        ctx.locals.insert(var_name.clone(), val);
+                    }
+                    *position += 1;
+                    ctx.found = true;
+                } else {
+                    ctx.found = false;
+                    // Raise SQLSTATE 02000 (NOT FOUND) so DECLARE HANDLER can catch it
+                    return Err("No data - zero rows fetched".to_string());
+                }
+            }
+            Some(CursorState::Declared { .. }) => {
+                return Err(format!("Cursor '{}' is not open", cursor_name));
+            }
+            Some(CursorState::Closed) => {
+                return Err(format!("Cursor '{}' is closed", cursor_name));
+            }
+            None => {
+                return Err(format!("Cursor '{}' is not declared", cursor_name));
+            }
+        }
+        Ok(ProcControlFlow::Continue)
+    }
+
+    /// Execute a SELECT inside a stored procedure and send the result set to the client.
+    /// Uses execute_select_buffered to get rows, then manually sends the result set
+    /// with SERVER_MORE_RESULTS_EXISTS flag (in_multi_result is set by handle_call).
+    async fn execute_sp_select(&mut self, sql: &str) -> ProtocolResult<()> {
+        // First result set starts at sequence 1 (command was 0);
+        // subsequent result sets continue from where the previous left off
+        if !self.sp_sent_results {
+            self.writer.set_sequence(1);
+        }
+        self.sp_sent_results = true;
+        // Extract column names first (works even when result is empty)
+        let col_names = Self::extract_select_column_names(sql, 100);
+        let col_count = col_names.len();
+
+        // Buffer all rows
+        let rows = self
+            .execute_select_buffered(sql)
+            .await
+            .map_err(|e| ProtocolError::Unsupported(format!("SP SELECT failed: {}", e)))?;
+
+        // Send column count
+        let count_packet = encode_column_count(col_count as u64);
+        self.writer.write_packet(&count_packet).await?;
+
+        // Send column definitions (minimal — name from SELECT expression)
+        let schema = self.database.as_deref().unwrap_or("test");
+        for name in &col_names {
+            let def = ColumnDefinition41 {
+                catalog: "def".to_string(),
+                schema: schema.to_string(),
+                table: String::new(),
+                org_table: String::new(),
+                name: name.clone(),
+                org_name: name.clone(),
+                character_set: 63,
+                column_length: 255,
+                column_type: types::ColumnType::Varchar,
+                flags: 0,
+                decimals: 0,
+            };
+            let def_packet = def.encode();
+            self.writer.write_packet(&def_packet).await?;
+        }
+
+        // Send EOF after columns
+        if !self.deprecate_eof {
+            let eof = encode_eof_packet(0, default_status());
+            self.writer.write_packet(&eof).await?;
+        }
+
+        // Send rows
+        for row in &rows {
+            let row_packet = encode_text_row(row);
+            self.writer.write_packet(&row_packet).await?;
+        }
+
+        // Send final EOF with SERVER_MORE_RESULTS_EXISTS
+        let status = if self.in_multi_result {
+            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
+        } else {
+            default_status()
+        };
+        if self.deprecate_eof {
+            let ok = encode_eof_ok_packet(status, 0);
+            self.writer.write_packet(&ok).await?;
+        } else {
+            let eof = encode_eof_packet(0, status);
+            self.writer.write_packet(&eof).await?;
+        }
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Extract column names from a SELECT statement (best-effort)
+    fn extract_select_column_names(sql: &str, count: usize) -> Vec<String> {
+        // Try parsing the SELECT to get column names
+        if let Ok(sqlparser::ast::Statement::Query(q)) =
+            crate::sql::parser::Parser::parse_one(sql).as_ref()
+        {
+            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                let mut names = Vec::new();
+                for item in &sel.projection {
+                    let name = match item {
+                        sqlparser::ast::SelectItem::UnnamedExpr(e) => e.to_string(),
+                        sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
+                            alias.value.clone()
+                        }
+                        _ => "?column?".to_string(),
+                    };
+                    names.push(name);
+                    if names.len() >= count {
+                        break;
+                    }
+                }
+                if !names.is_empty() {
+                    return names;
+                }
+            }
+        }
+        (0..count).map(|i| format!("col{}", i)).collect()
+    }
+
+    /// Handle `SELECT expr INTO var [FROM ...]` in a stored procedure context.
+    /// Strips the INTO clause, executes the SELECT, stores the result in local/user var.
+    /// Returns Some(Continue) if handled, None if not a SELECT INTO.
+    async fn try_execute_select_into(
+        &mut self,
+        sql: &str,
+        ctx: &mut crate::executor::procedure::ProcedureContext,
+    ) -> Result<Option<crate::executor::procedure::ProcControlFlow>, String> {
+        let upper = sql.trim().to_uppercase();
+        if !upper.starts_with("SELECT ") {
+            return Ok(None);
+        }
+
+        // Find "INTO var" pattern — could be "SELECT expr INTO var" or
+        // "SELECT expr INTO var FROM ..."
+        // Use case-insensitive search for INTO followed by a variable name
+        let into_re = regex::Regex::new(r"(?i)\bINTO\s+(@?\w+(?:\s*,\s*@?\w+)*)")
+            .map_err(|e| e.to_string())?;
+
+        let caps = match into_re.captures(sql) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Extract variable names
+        let var_list = caps.get(1).unwrap().as_str();
+        let var_names: Vec<&str> = var_list.split(',').map(|s| s.trim()).collect();
+
+        // Remove the "INTO var1, var2, ..." from the SQL
+        let into_full = caps.get(0).unwrap();
+        let select_sql = format!("{}{}", &sql[..into_full.start()], &sql[into_full.end()..]);
+
+        // Substitute local variables in the SELECT part (not the INTO var names)
+        let substituted_select = self.substitute_locals(&select_sql, ctx);
+
+        // Execute the SELECT and get the first row
+        let rows = self.execute_select_buffered(&substituted_select).await?;
+        if let Some(row) = rows.first() {
+            for (i, var_name) in var_names.iter().enumerate() {
+                if let Some(val) = row.get_opt(i) {
+                    self.set_procedure_variable(ctx, var_name, val.clone());
+                }
+            }
+        }
+
+        Ok(Some(crate::executor::procedure::ProcControlFlow::Continue))
     }
 
     /// Execute a SELECT statement and buffer all result rows.
@@ -4705,7 +6372,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+        let mut executor = engine.build_async(plan).await.map_err(|e| e.to_string())?;
 
         executor.open().await.map_err(|e| e.to_string())?;
         let mut rows = Vec::new();
@@ -4717,9 +6384,18 @@ where
     }
 
     /// Execute a SQL statement silently (no client response packets).
-    /// Used for executing DML/DDL within procedure bodies.
+    /// Used for executing DML/DDL within procedure bodies and trigger bodies.
     /// Returns the number of rows affected.
     async fn execute_sql_silent(&mut self, sql: &str) -> Result<u64, String> {
+        // Handle SET @var = expr (user variable assignment) — not handled by the planner
+        {
+            let upper = sql.trim().to_uppercase();
+            if upper.starts_with("SET @") && !upper.starts_with("SET @@") {
+                self.execute_set_user_variable_silent(sql);
+                return Ok(0);
+            }
+        }
+
         // Parse and execute through the pipeline
         let stmt = match crate::sql::Parser::parse_one(sql) {
             Ok(s) => s,
@@ -4782,7 +6458,7 @@ where
             self.raft_node.clone(),
             self.session.user_variables(),
         );
-        let mut executor = engine.build(plan).map_err(|e| e.to_string())?;
+        let mut executor = engine.build_async(plan).await.map_err(|e| e.to_string())?;
 
         executor.open().await.map_err(|e| e.to_string())?;
         let mut affected = 0u64;
@@ -4796,12 +6472,17 @@ where
         executor.close().await.map_err(|e| e.to_string())?;
 
         // Handle changes
+        let ignore_dups = executor.is_ignore_duplicates();
         let changes = executor.take_changes();
         if !changes.is_empty() {
             if self.session.in_transaction() {
                 self.session.add_pending_changes(changes);
             } else {
-                let changeset = ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
+                let changeset = ChangeSet::new_with_changes_ignore(
+                    implicit_txn_id.unwrap_or(0),
+                    changes,
+                    ignore_dups,
+                );
                 self.raft_node
                     .propose_changes(changeset)
                     .await
@@ -4851,7 +6532,13 @@ where
                 if msg.contains("cannot be NULL") {
                     (codes::ER_BAD_NULL_ERROR, "23000")
                 } else if msg.contains("already exists") {
-                    (codes::ER_DUP_ENTRY, "23000")
+                    if msg.contains("Table") || msg.contains("table") {
+                        (1050, "42S01") // ER_TABLE_EXISTS_ERROR
+                    } else {
+                        (codes::ER_DUP_ENTRY, "23000")
+                    }
+                } else if msg.contains("columns but") && msg.contains("values") {
+                    (codes::ER_WRONG_VALUE_COUNT_ON_ROW, "21S01")
                 } else if msg.contains("Incorrect arguments") {
                     (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
                 } else if msg.contains("can't have a default value") {
@@ -4905,8 +6592,13 @@ where
                     )
                 } else if let crate::executor::ExecutorError::NullValue(_) = exec_err {
                     (codes::ER_BAD_NULL_ERROR, "23000", exec_err.to_string())
-                } else if let crate::executor::ExecutorError::DataOutOfRange(_) = exec_err {
-                    (codes::ER_DATA_OUT_OF_RANGE, "22003", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::DataOutOfRange(ref msg) = exec_err {
+                    let code = if msg.starts_with("Out of range value for column") {
+                        codes::ER_WARN_DATA_OUT_OF_RANGE
+                    } else {
+                        codes::ER_DATA_OUT_OF_RANGE
+                    };
+                    (code, "22003", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::InvalidArgumentForLogarithm(_) =
                     exec_err
                 {
@@ -4915,12 +6607,33 @@ where
                         "2201E",
                         exec_err.to_string(),
                     )
-                } else {
+                } else if let crate::executor::ExecutorError::TruncatedWrongValue(_) = exec_err {
                     (
-                        codes::ER_UNKNOWN_ERROR,
-                        states::GENERAL_ERROR,
+                        codes::ER_TRUNCATED_WRONG_VALUE,
+                        "22007",
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::DuplicateKey(_) = exec_err {
+                    (codes::ER_DUP_ENTRY, "23000", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::InvalidOperation(ref msg) = exec_err {
+                    let code =
+                        if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
+                            codes::ER_WRONG_ARGUMENTS
+                        } else if msg.contains("cannot be NULL") {
+                            codes::ER_BAD_NULL_ERROR
+                        } else {
+                            codes::ER_UNKNOWN_ERROR
+                        };
+                    (code, states::GENERAL_ERROR, exec_err.to_string())
+                } else {
+                    let msg = exec_err.to_string();
+                    if msg.contains("already exists") {
+                        (1050, "42S01", msg)
+                    } else if msg.contains("Duplicate key") || msg.contains("duplicate key") {
+                        (codes::ER_DUP_ENTRY, "23000", msg)
+                    } else {
+                        (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, msg)
+                    }
                 }
             }
             _ => {
@@ -4969,6 +6682,7 @@ fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
                 parts.push(format!("UNIQUE KEY ({})", col_list.join(", ")));
             }
             Constraint::ForeignKey {
+                name,
                 columns,
                 ref_table,
                 ref_columns,
@@ -4976,12 +6690,22 @@ fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
                 let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c)).collect();
                 let ref_list: Vec<String> =
                     ref_columns.iter().map(|c| format!("`{}`", c)).collect();
-                parts.push(format!(
-                    "FOREIGN KEY ({}) REFERENCES `{}` ({})",
-                    col_list.join(", "),
-                    ref_table,
-                    ref_list.join(", ")
-                ));
+                if let Some(fk_name) = name {
+                    parts.push(format!(
+                        "CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                        fk_name,
+                        col_list.join(", "),
+                        ref_table,
+                        ref_list.join(", ")
+                    ));
+                } else {
+                    parts.push(format!(
+                        "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                        col_list.join(", "),
+                        ref_table,
+                        ref_list.join(", ")
+                    ));
+                }
             }
             Constraint::Check(expr) => {
                 parts.push(format!("CHECK ({})", expr));

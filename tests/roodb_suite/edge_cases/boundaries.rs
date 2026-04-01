@@ -197,3 +197,61 @@ async fn test_boundary_integers() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_inet_aton_malformed_addresses() {
+    let server = TestServer::start("edge_inet_aton").await;
+    let mut conn = server.connect().await;
+
+    // Valid address
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('255.255.255.255')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, Some(4294967295));
+
+    // Octet > 255 must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('255.255.255.2551')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "octet 2551 should produce NULL");
+
+    // Too many octets must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('0.255.255.255.255')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "5 octets should produce NULL");
+
+    // Too few octets must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('127.1')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "2 octets should produce NULL");
+
+    // Octet = 256 must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('122.256.0.0')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "octet 256 should produce NULL");
+
+    // Empty string must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "empty string should produce NULL");
+
+    // Trailing dot must return NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT INET_ATON('122.226.')")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0].0, None, "trailing dot should produce NULL");
+
+    drop(conn);
+    server.shutdown().await;
+}

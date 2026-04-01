@@ -82,7 +82,7 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             out
         }
 
-        Datum::Bytes(b) => {
+        Datum::Bytes(b) | Datum::Geometry(b) => {
             let mut out = encode_length_encoded_int(b.len() as u64);
             out.extend_from_slice(b);
             out
@@ -105,6 +105,14 @@ fn datum_to_binary(datum: &Datum, data_type: &DataType) -> Vec<u8> {
         Datum::Decimal { value, scale } => {
             // Encode as length-encoded string (MySQL sends DECIMAL as string in binary protocol)
             let s = crate::executor::datum::format_decimal(*value, *scale);
+            let bytes = s.as_bytes();
+            let mut out = encode_length_encoded_int(bytes.len() as u64);
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        Datum::Json(v) => {
+            let s = serde_json::to_string(v).unwrap_or_default();
             let bytes = s.as_bytes();
             let mut out = encode_length_encoded_int(bytes.len() as u64);
             out.extend_from_slice(bytes);

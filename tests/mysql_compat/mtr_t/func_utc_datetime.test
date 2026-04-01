@@ -1,0 +1,12 @@
+--echo # UTC date/time functions
+
+--echo # --- UTC_DATE returns a valid date ---
+SELECT LENGTH(UTC_DATE()) = 10;
+SELECT UTC_DATE() >= '2024-01-01';
+
+--echo # --- UTC_TIME returns a valid time ---
+SELECT LENGTH(UTC_TIME()) = 8;
+
+--echo # --- UTC_TIMESTAMP returns a valid datetime ---
+SELECT LENGTH(UTC_TIMESTAMP()) = 19;
+SELECT UTC_TIMESTAMP() >= '2024-01-01 00:00:00';

@@ -1,0 +1,207 @@
+DROP TABLE IF EXISTS employees, scores;
+CREATE TABLE employees (
+id INT NOT NULL PRIMARY KEY,
+dept VARCHAR(20) NOT NULL,
+name VARCHAR(50) NOT NULL,
+salary DECIMAL(10,2) NOT NULL,
+hire_year INT,
+rating INT
+);
+INSERT INTO employees VALUES
+(1, 'eng', 'Alice', 120000.00, 2018, 5),
+(2, 'eng', 'Bob', 95000.00, 2020, 3),
+(3, 'eng', 'Charlie', 95000.00, 2019, 4),
+(4, 'sales', 'Diana', 80000.00, 2021, NULL),
+(5, 'sales', 'Eve', 80000.00, 2022, 5),
+(6, 'sales', 'Frank', 85000.00, 2020, 3),
+(7, 'hr', 'Grace', 70000.00, NULL, 4),
+(8, 'hr', 'Henry', 70000.00, 2023, NULL),
+(9, 'hr', 'Irene', 65000.00, 2021, 2);
+# --- Two-column ORDER BY, both ASC ---
+SELECT id, dept, name FROM employees
+ORDER BY dept, name;
+id	dept	name
+1	eng	Alice
+2	eng	Bob
+3	eng	Charlie
+7	hr	Grace
+8	hr	Henry
+9	hr	Irene
+4	sales	Diana
+5	sales	Eve
+6	sales	Frank
+# --- Two-column ORDER BY, mixed direction ---
+SELECT id, dept, salary FROM employees
+ORDER BY dept ASC, salary DESC;
+id	dept	salary
+1	eng	120000.00
+2	eng	95000.00
+3	eng	95000.00
+7	hr	70000.00
+8	hr	70000.00
+9	hr	65000.00
+6	sales	85000.00
+4	sales	80000.00
+5	sales	80000.00
+# --- Three-column ORDER BY ---
+SELECT id, dept, salary, name FROM employees
+ORDER BY dept, salary DESC, name;
+id	dept	salary	name
+1	eng	120000.00	Alice
+2	eng	95000.00	Bob
+3	eng	95000.00	Charlie
+7	hr	70000.00	Grace
+8	hr	70000.00	Henry
+9	hr	65000.00	Irene
+6	sales	85000.00	Frank
+4	sales	80000.00	Diana
+5	sales	80000.00	Eve
+# --- ORDER BY with NULLs (NULLs first in ASC) ---
+SELECT id, name, hire_year FROM employees
+ORDER BY hire_year, name;
+id	name	hire_year
+7	Grace	NULL
+1	Alice	2018
+3	Charlie	2019
+2	Bob	2020
+6	Frank	2020
+4	Diana	2021
+9	Irene	2021
+5	Eve	2022
+8	Henry	2023
+# --- ORDER BY with NULLs DESC (NULLs last in DESC) ---
+SELECT id, name, rating FROM employees
+ORDER BY rating DESC, name;
+id	name	rating
+1	Alice	5
+5	Eve	5
+3	Charlie	4
+7	Grace	4
+2	Bob	3
+6	Frank	3
+9	Irene	2
+4	Diana	NULL
+8	Henry	NULL
+# --- ORDER BY with expression ---
+SELECT id, name, salary, salary * 12 AS annual
+FROM employees
+ORDER BY salary * 12 DESC, name;
+id	name	salary	annual
+1	Alice	120000.00	1440000.00
+2	Bob	95000.00	1140000.00
+3	Charlie	95000.00	1140000.00
+6	Frank	85000.00	1020000.00
+4	Diana	80000.00	960000.00
+5	Eve	80000.00	960000.00
+7	Grace	70000.00	840000.00
+8	Henry	70000.00	840000.00
+9	Irene	65000.00	780000.00
+# --- ORDER BY with CASE expression ---
+SELECT id, name, dept,
+CASE dept
+WHEN 'eng' THEN 1
+WHEN 'sales' THEN 2
+WHEN 'hr' THEN 3
+END AS dept_rank
+FROM employees
+ORDER BY CASE dept WHEN 'eng' THEN 1 WHEN 'sales' THEN 2 WHEN 'hr' THEN 3 END,
+salary DESC;
+id	name	dept	dept_rank
+1	Alice	eng	1
+2	Bob	eng	1
+3	Charlie	eng	1
+6	Frank	sales	2
+4	Diana	sales	2
+5	Eve	sales	2
+7	Grace	hr	3
+8	Henry	hr	3
+9	Irene	hr	3
+# --- ORDER BY with GROUP BY ---
+SELECT dept, COUNT(*) AS cnt, AVG(salary) AS avg_sal
+FROM employees
+GROUP BY dept
+ORDER BY cnt DESC, dept;
+dept	cnt	avg_sal
+eng	3	103333.333333333328483
+hr	3	68333.333333333328483
+sales	3	81666.666666666671517
+# --- ORDER BY after GROUP BY with ties ---
+SELECT dept, MAX(salary) AS max_sal, MIN(salary) AS min_sal
+FROM employees
+GROUP BY dept
+ORDER BY max_sal DESC, min_sal ASC;
+dept	max_sal	min_sal
+eng	120000.00	95000.00
+sales	85000.00	80000.00
+hr	70000.00	65000.00
+# --- Multi-column ORDER BY with LIMIT ---
+SELECT id, dept, name, salary FROM employees
+ORDER BY dept, salary DESC
+LIMIT 5;
+id	dept	name	salary
+1	eng	Alice	120000.00
+2	eng	Bob	95000.00
+3	eng	Charlie	95000.00
+7	hr	Grace	70000.00
+8	hr	Henry	70000.00
+# --- Multi-column ORDER BY with LIMIT and OFFSET ---
+SELECT id, dept, name, salary FROM employees
+ORDER BY dept, salary DESC
+LIMIT 3 OFFSET 3;
+id	dept	name	salary
+7	hr	Grace	70000.00
+8	hr	Henry	70000.00
+9	hr	Irene	65000.00
+# --- ORDER BY column alias ---
+SELECT id, name, salary * 0.10 AS bonus FROM employees
+ORDER BY bonus DESC, name
+LIMIT 5;
+id	name	bonus
+1	Alice	12000.0000
+2	Bob	9500.0000
+3	Charlie	9500.0000
+6	Frank	8500.0000
+4	Diana	8000.0000
+# --- ORDER BY ordinal position ---
+SELECT dept, name, salary FROM employees
+ORDER BY 1, 3 DESC, 2;
+dept	name	salary
+eng	Alice	120000.00
+eng	Bob	95000.00
+eng	Charlie	95000.00
+hr	Grace	70000.00
+hr	Henry	70000.00
+hr	Irene	65000.00
+sales	Frank	85000.00
+sales	Diana	80000.00
+sales	Eve	80000.00
+# --- ORDER BY with COALESCE (NULL handling) ---
+SELECT id, name, COALESCE(rating, 0) AS eff_rating
+FROM employees
+ORDER BY COALESCE(rating, 0) DESC, name;
+id	name	eff_rating
+1	Alice	5
+5	Eve	5
+3	Charlie	4
+7	Grace	4
+2	Bob	3
+6	Frank	3
+9	Irene	2
+4	Diana	0
+8	Henry	0
+# --- ORDER BY with JOIN ---
+CREATE TABLE scores (emp_id INT NOT NULL PRIMARY KEY, score INT NOT NULL);
+INSERT INTO scores VALUES (1, 95), (2, 78), (3, 88), (5, 92), (6, 70), (9, 85);
+SELECT e.name, e.dept, s.score
+FROM employees e
+JOIN scores s ON e.id = s.emp_id
+ORDER BY e.dept, s.score DESC;
+name	dept	score
+Alice	eng	95
+Charlie	eng	88
+Bob	eng	78
+Irene	hr	85
+Eve	sales	92
+Frank	sales	70
+# --- Cleanup ---
+DROP TABLE employees, scores;

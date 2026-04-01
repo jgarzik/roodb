@@ -1,0 +1,71 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (a int, b int, c int);
+CREATE TABLE t2 (d int);
+CREATE TABLE t3 (a1 int, b1 int, c1 int);
+INSERT INTO t1 VALUES(1,2,3);
+INSERT INTO t1 VALUES(11,22,33);
+INSERT INTO t2 VALUES(99);
+SELECT t1.* AS 'with_alias' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT t2.* AS 'with_alias' FROM t2;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT t1.*, t1.* AS 'with_alias' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 19
+SELECT t1.* AS 'with_alias', t1.* FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT t1.* AS 'with_alias', t1.* AS 'alias2' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT t1.* AS 'with_alias', a, t1.* AS 'alias2' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT a, t1.* AS 'with_alias' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 16
+SELECT t1.* AS 'with_alias', a FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT a, t1.* AS 'with_alias', b FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 16
+SELECT a AS 'x', t1.* AS 'with_alias' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 23
+SELECT t1.* AS 'with_alias', a AS 'x' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 13
+SELECT a AS 'x', t1.* AS 'with_alias', b AS 'x' FROM t1;
+ERROR 42000: Parse error: sql parser error: Expected: end of statement, found: AS at Line: 1, Column: 23
+SELECT t1.* FROM t1;
+a	b	c
+1	2	3
+11	22	33
+SELECT t2.* FROM t2;
+d
+99
+SELECT t1.*, t1.* FROM t1;
+a	b	c	a	b	c
+1	2	3	1	2	3
+11	22	33	11	22	33
+SELECT t1.*, a, t1.* FROM t1;
+a	b	c	a	a	b	c
+1	2	3	1	1	2	3
+11	22	33	11	11	22	33
+SELECT a, t1.* FROM t1;
+a	a	b	c
+1	1	2	3
+11	11	22	33
+SELECT t1.*, a FROM t1;
+a	b	c	a
+1	2	3	1
+11	22	33	11
+SELECT a, t1.*, b FROM t1;
+a	a	b	c	b
+1	1	2	3	2
+11	11	22	33	22
+SELECT a AS 'x', t1.* FROM t1;
+x	a	b	c
+1	1	2	3
+11	11	22	33
+SELECT t1.*, a AS 'x' FROM t1;
+a	b	c	x
+1	2	3	1
+11	22	33	11
+SELECT a AS 'x', t1.*, b AS 'x' FROM t1;
+x	a	b	c	x
+1	1	2	3	2
+11	11	22	33	22
+DROP TABLE t1, t2, t3;

@@ -1,0 +1,128 @@
+#
+# UPDATE and DELETE with subqueries in WHERE clauses.
+# Tests scalar subqueries, IN subqueries, NOT IN, and uncorrelated EXISTS in DML.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS inventory, warehouses, shipments;
+--enable_warnings
+
+CREATE TABLE warehouses (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    region VARCHAR(20) NOT NULL
+);
+INSERT INTO warehouses VALUES
+    (1, 'East Hub', 'east'),
+    (2, 'West Hub', 'west'),
+    (3, 'Central', 'central');
+
+CREATE TABLE inventory (
+    id INT NOT NULL PRIMARY KEY,
+    warehouse_id INT NOT NULL,
+    product VARCHAR(30) NOT NULL,
+    qty INT NOT NULL,
+    min_qty INT NOT NULL DEFAULT 10
+);
+INSERT INTO inventory VALUES
+    (1, 1, 'Widget', 100, 10),
+    (2, 1, 'Gadget', 5, 10),
+    (3, 2, 'Widget', 200, 10),
+    (4, 2, 'Bolt', 50, 20),
+    (5, 3, 'Gadget', 8, 10),
+    (6, 3, 'Nut', 500, 50),
+    (7, 1, 'Bolt', 3, 10),
+    (8, 2, 'Nut', 15, 20);
+
+CREATE TABLE shipments (
+    id INT NOT NULL PRIMARY KEY,
+    inventory_id INT NOT NULL,
+    qty_shipped INT NOT NULL
+);
+INSERT INTO shipments VALUES
+    (1, 1, 20), (2, 1, 30), (3, 3, 50), (4, 6, 100);
+
+--echo # --- UPDATE with IN subquery in WHERE ---
+
+# Increase min_qty for items in warehouses in the east region
+UPDATE inventory SET min_qty = min_qty + 5
+WHERE warehouse_id IN (SELECT id FROM warehouses WHERE region = 'east');
+SELECT id, warehouse_id, product, min_qty FROM inventory ORDER BY id;
+
+--echo # --- UPDATE with NOT IN subquery ---
+
+# Reset min_qty for items NOT in central warehouse
+UPDATE inventory SET min_qty = 10
+WHERE warehouse_id NOT IN (SELECT id FROM warehouses WHERE region = 'central');
+SELECT id, warehouse_id, product, min_qty FROM inventory ORDER BY id;
+
+--echo # --- UPDATE with scalar subquery comparison ---
+
+# Bump qty for items below overall average
+UPDATE inventory SET qty = qty + 10
+WHERE qty < (SELECT AVG(i2.qty) FROM (SELECT qty FROM inventory) i2);
+SELECT id, product, qty FROM inventory ORDER BY id;
+
+--echo # --- UPDATE with IN subquery matching shipped items ---
+
+# Mark items that have been shipped (bump qty by 1 as a flag)
+UPDATE inventory SET qty = qty + 1
+WHERE id IN (SELECT inventory_id FROM shipments);
+SELECT id, product, qty FROM inventory ORDER BY id;
+
+--echo # --- DELETE with IN subquery ---
+
+# Delete shipments for inventory items in west warehouse
+DELETE FROM shipments
+WHERE inventory_id IN (SELECT id FROM inventory WHERE warehouse_id = 2);
+SELECT * FROM shipments ORDER BY id;
+
+--echo # --- DELETE with NOT IN subquery ---
+
+# Delete shipments not linked to east hub inventory
+DELETE FROM shipments
+WHERE inventory_id NOT IN (SELECT id FROM inventory WHERE warehouse_id = 1);
+SELECT * FROM shipments ORDER BY id;
+
+--echo # --- DELETE with scalar subquery ---
+
+# Delete inventory items where qty is below the minimum of all min_qty values
+DELETE FROM inventory
+WHERE qty < (SELECT MIN(m.min_qty) FROM (SELECT min_qty FROM inventory) m);
+SELECT id, product, qty FROM inventory ORDER BY id;
+
+--echo # --- DELETE with NOT IN: warehouses with no inventory ---
+
+DELETE FROM warehouses
+WHERE id NOT IN (SELECT DISTINCT warehouse_id FROM inventory);
+SELECT * FROM warehouses ORDER BY id;
+
+--echo # --- UPDATE with subquery in SET value ---
+
+# Set qty to a fixed value derived from a scalar subquery
+UPDATE inventory SET qty = (SELECT MAX(qty_shipped) FROM shipments) WHERE id = 1;
+SELECT id, product, qty FROM inventory WHERE id = 1;
+
+--echo # --- UPDATE with multiple IN subqueries ---
+
+# Reset min_qty for items that are both in east hub AND have shipments
+UPDATE inventory SET min_qty = 25
+WHERE warehouse_id IN (SELECT id FROM warehouses WHERE region = 'east')
+  AND id IN (SELECT inventory_id FROM shipments);
+SELECT id, product, min_qty FROM inventory ORDER BY id;
+
+--echo # --- DELETE with scalar subquery in WHERE ---
+
+# Delete inventory items with qty above double the average
+DELETE FROM inventory
+WHERE qty > (SELECT AVG(q) * 2 FROM (SELECT qty AS q FROM inventory) sub);
+SELECT id, product, qty FROM inventory ORDER BY id;
+
+--echo # --- Verify final state ---
+
+SELECT COUNT(*) AS inv_count FROM inventory;
+SELECT COUNT(*) AS wh_count FROM warehouses;
+SELECT COUNT(*) AS ship_count FROM shipments;
+
+--echo # --- Cleanup ---
+DROP TABLE shipments, inventory, warehouses;

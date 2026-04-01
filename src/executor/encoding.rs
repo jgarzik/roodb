@@ -35,6 +35,12 @@ fn encode_comparable_datum(buf: &mut Vec<u8>, datum: &Datum) {
             let v = (*i as u64) ^ (1u64 << 63);
             buf.extend_from_slice(&v.to_be_bytes());
         }
+        Datum::UnsignedInt(u) => {
+            // Big-endian for order-preserving comparison.
+            // Unsigned values are always >= 0, so no sign-bit flip needed —
+            // just straight BE gives correct byte ordering.
+            buf.extend_from_slice(&u.to_be_bytes());
+        }
         Datum::String(s) => {
             // Null-terminated encoding: escape 0x00 bytes
             for &b in s.as_bytes() {
@@ -128,6 +134,7 @@ const TAG_TIMESTAMP: u8 = 6;
 const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
+const TAG_JSON: u8 = 10;
 
 /// Encode a row value
 ///
@@ -173,7 +180,7 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
-        Datum::Bytes(b) => {
+        Datum::Bytes(b) | Datum::Geometry(b) => {
             buf.push(TAG_BYTES);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
@@ -195,6 +202,13 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
             buf.push(TAG_DECIMAL);
             buf.push(*scale);
             buf.extend_from_slice(&value.to_le_bytes());
+        }
+        Datum::Json(v) => {
+            buf.push(TAG_JSON);
+            let s = serde_json::to_string(v).unwrap_or_default();
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
         }
     }
 }
@@ -354,6 +368,25 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                     .expect("length checked: slice is 16 bytes"),
             );
             Ok((Datum::Decimal { value, scale }, 18))
+        }
+
+        TAG_JSON => {
+            if data.len() < 5 {
+                return Err(ExecutorError::Encoding("json header too short".to_string()));
+            }
+            let len = u32::from_le_bytes(
+                data[1..5]
+                    .try_into()
+                    .expect("length checked: slice is 4 bytes"),
+            ) as usize;
+            if data.len() < 5 + len {
+                return Err(ExecutorError::Encoding("json data too short".to_string()));
+            }
+            let s = std::str::from_utf8(&data[5..5 + len])
+                .map_err(|_| ExecutorError::Encoding("invalid utf8 in json".to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(s)
+                .map_err(|e| ExecutorError::Encoding(format!("invalid json: {}", e)))?;
+            Ok((Datum::Json(v), 5 + len))
         }
 
         _ => Err(ExecutorError::Encoding(format!(

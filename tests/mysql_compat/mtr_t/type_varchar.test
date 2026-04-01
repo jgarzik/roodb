@@ -1,0 +1,100 @@
+# Initialise
+--disable_warnings
+drop table if exists t1, t2;
+--enable_warnings
+
+#
+# Basic VARCHAR tests
+#
+
+create table t1 (v varchar(30), c char(3), e enum('abc','def','ghi'), t text);
+insert into t1 values ('abc', 'de', 'ghi', 'jkl');
+insert into t1 values ('abc ', 'de ', 'ghi', 'jkl ');
+insert into t1 values ('abc    ', 'd  ', 'ghi', 'jkl    ');
+select length(v),length(c),length(e),length(t) from t1;
+drop table t1;
+
+# [RooDB-skip] charset latin1, ALTER TABLE ADD PRIMARY KEY on duplicate keys
+# create table t1 (v varchar(20)) charset latin1;
+# insert into t1 values('a ');
+# select v='a' from t1;
+# select binary v='a' from t1;
+# select binary v='a ' from t1;
+# insert into t1 values('a');
+# --error ER_DUP_ENTRY
+# alter table t1 add primary key (v);
+# drop table t1;
+# create table t1 (v varbinary(20));
+# insert into t1 values('a');
+# insert into t1 values('a ');
+# alter table t1 add primary key (v);
+# drop table t1;
+
+# [RooDB-skip] ANALYZE TABLE, EXPLAIN, --skip_if_hypergraph, eval alter, scripting variables
+# varchar length 254-258 loop tests skipped
+
+# [RooDB-skip] EXPLAIN, --replace_column, complex ALTER TABLE
+# varchar(300) with key prefix tests skipped
+
+#
+# bug#9339 - meaningless Field_varstring::get_key_image
+#
+create table t1 (pkcol varchar(16), othercol varchar(16), primary key (pkcol));
+insert into t1 values ('test', 'something');
+update t1 set othercol='somethingelse' where pkcol='test';
+select * from t1;
+drop table t1;
+
+#
+# Bug #9489: problems with key handling
+#
+
+create table t1 (a int, b varchar(12));
+insert into t1 values (1, 'A'), (22, NULL);
+create table t2 (a int);
+insert into t2 values (22), (22);
+select t1.a, t1.b, min(t1.b) from t1 inner join t2 ON t2.a = t1.a
+  group by t1.b, t1.a;
+drop table t1, t2;
+
+# [RooDB-skip] CHARACTER SET, complex ALTER TABLE, SHOW CREATE TABLE
+# Bug #10543 tests skipped
+
+#
+# BUG#15588: String overrun
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+# [RooDB-skip] Lines 71-77 (INSERT with column self-reference SUBSTR(f1, 1, 3))
+
+
+#
+# Bug #11927: Warnings shown for CAST( chr as signed) but not (chr + 0)
+#
+CREATE TABLE t1 (a CHAR(2));
+INSERT INTO t1 VALUES (10), (50), (30), ('1a'), (60), ('t');
+SELECT a,(a + 0) FROM t1 ORDER BY a;
+SELECT a,(a DIV 2) FROM t1 ORDER BY a;
+SELECT a,CAST(a AS SIGNED) FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+#
+# Bug #28299: To-number conversion warnings work differenly with CHAR
+# and VARCHAR sp variables
+#
+# * Verify that 'Truncated incorrect DOUBLE value' is shown for 's'
+#   when using both CHAR and VARCHAR.
+#
+
+CREATE TABLE t1 (a VARCHAR(16));
+INSERT INTO t1 VALUES ('5'), ('s'), ('');
+SELECT 5 = a FROM t1;
+DROP TABLE t1;
+
+CREATE TABLE t1 (a CHAR(16));
+INSERT INTO t1 VALUES ('5'), ('s'), ('');
+SELECT 5 = a FROM t1;
+DROP TABLE t1;

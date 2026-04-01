@@ -34,7 +34,7 @@ pub use engine::{
 };
 pub use limiter::AdaptiveLimiter;
 pub use metrics::{IoMetrics, IoMetricsSnapshot, LatencyHistogram};
-pub use scheduler::{FileHandle, IoScheduler, ScheduledHandle, ScheduledIOFactory};
+pub use scheduler::{IoScheduler, ScheduledHandle, ScheduledIOFactory};
 pub use throughput::ThroughputTracker;
 
 use std::sync::atomic::{AtomicU64, Ordering};

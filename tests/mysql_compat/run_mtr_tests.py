@@ -86,6 +86,240 @@ TIERS = {
         "func_concat",     # 153 lines — CONCAT (has includes)
         "func_if",         # 301 lines — IF function (has includes)
     ],
+    5: [
+        "alias",           # 220 lines — SELECT/table aliases
+        "truncate",        # 180 lines — TRUNCATE TABLE
+        "func_in_none",    # 216 lines — IN/NOT IN
+        "select_found",    # 239 lines — SELECT with LIMIT patterns
+        "distinct",        # 990 lines — SELECT DISTINCT
+        "having",          # 989 lines — HAVING clause
+    ],
+    6: [
+        "func_system",     # 91 lines — system functions (DATABASE, USER, VERSION)
+        "replace",         # 47 lines — REPLACE INTO
+        "func_regexp",     # 205 lines — REGEXP/RLIKE
+        "func_group",      # 1506 lines — aggregate functions (COUNT/SUM/AVG/MIN/MAX)
+        "union",           # 2818 lines — UNION/UNION ALL
+    ],
+    7: [
+        "ansi",                    # 28 lines — ANSI SQL mode basics
+        "binary_to_hex",           # 93 lines — HEX/UNHEX conversions
+        "count_distinct",          # 269 lines — COUNT(DISTINCT)
+        "date_formats",            # 332 lines — DATE_FORMAT/STR_TO_DATE
+        "create_if_not_exists",    # 80 lines — IF NOT EXISTS
+        "constraints",             # 564 lines — NOT NULL/CHECK/DEFAULT
+    ],
+    8: [
+        "subselect",               # 84 lines — scalar subqueries
+        "drop",                    # 305 lines — DROP TABLE
+        "auto_increment",          # 442 lines — AUTO_INCREMENT
+        "type_timestamp",          # 522 lines — TIMESTAMP type
+        "key",                     # 670 lines — indexes and keys
+        "join",                    # 2132 lines — JOIN types
+    ],
+    9: [
+        "select_all",              # 11 lines — basic SELECT (adapted)
+        "overflow",                # 15 lines — identifier overflow
+        "type_uint",               # 18 lines — unsigned int types
+        "bool",                    # 62 lines — boolean expressions
+        "negation_elimination",    # 107 lines — NOT/negation in WHERE clauses
+        "func_sapdb",              # 180 lines — SAP DB compatible functions
+        "order_by_sortkey",        # 142 lines — ORDER BY with various sort keys
+    ],
+    10: [
+        "func_misc",              # misc functions (INET_ATON, FORMAT, COALESCE, etc.)
+        "single_delete_update",   # single-table DELETE/UPDATE with ORDER BY, LIMIT
+        "insert_select",          # INSERT ... SELECT
+    ],
+    11: [
+        "truncate_coverage",      # TRUNCATE TABLE edge cases
+        "func_group_innodb",      # GROUP BY aggregate functions (InnoDB)
+        "type_set",               # SET data type
+        "varbinary",              # VARBINARY/BINARY types
+    ],
+    12: [
+        "order_by_limit",         # ORDER BY with LIMIT edge cases
+        "insert_update",          # INSERT with UNIQUE constraints (ODKU skipped)
+        "type_date",              # DATE type operations
+        "type_time",              # TIME type operations
+    ],
+    13: [
+        "multi_update",           # UPDATE with multiple tables / JOINs
+        "type_datetime",          # DATETIME type operations
+        "func_time",              # time functions (DATE_ADD, EXTRACT, etc.)
+        "func_set",               # SET operations (INTERVAL, FIND_IN_SET, etc.)
+    ],
+    14: [
+        "expressions",            # complex expressions (CASE, COALESCE, IF, NULLIF, etc.)
+        "parser_precedence",      # operator precedence (boolean, bitwise, arithmetic)
+        "select_where",           # WHERE clause patterns (comparisons, IN, BETWEEN, LIKE)
+        "group_by",               # GROUP BY with aggregates, HAVING, ORDER BY
+    ],
+    15: [
+        "ctype_utf8",             # UTF-8 string operations (LOCATE, INSERT, TRIM, etc.)
+        "lowercase_table",        # case-insensitive table/column names
+        "partition_not_windows",  # long identifiers (CREATE/DROP DATABASE)
+        "olap",                   # GROUP BY WITH ROLLUP
+    ],
+    16: [
+        "derived",                # derived tables / subqueries in FROM
+        "join_nested",            # nested JOINs (standard compliant forms)
+        "temp_table",             # basic SQL operations (from temp_table.test)
+        "lowercase_table2",       # case-insensitive table/column names (extended)
+    ],
+    17: [
+        "ctype_latin1",           # character type tests with latin1 (string funcs, HEX, LIKE)
+        "type_newdecimal",        # DECIMAL precision/scale tests (IN, CASE, ROUND, MOD)
+        "join_outer",             # LEFT/RIGHT JOIN tests (IS NULL, multi-table, aggregates)
+        "variables",              # SET/SELECT user variable tests (@var basics)
+    ],
+    18: [
+        "type_bit",               # BIT column type (storage, queries, JOINs, GROUP BY)
+        "null_key",               # NULL key behavior (joins, <=> operator, IS NULL)
+        "group_min_max",          # GROUP BY with MIN/MAX aggregates
+        "func_bitwise",           # integer bitwise operations (&, |, ^, ~, <<, >>)
+    ],
+    19: [
+        "alter_table",            # ALTER TABLE (ADD/DROP/MODIFY/CHANGE COLUMN, RENAME, etc.)
+        "view",                   # CREATE/ALTER/DROP VIEW, view-on-view, joins with views
+        "trigger",                # CREATE/DROP TRIGGER, BEFORE/AFTER INSERT triggers
+        "explain",                # EXPLAIN SELECT (table scan, join, subquery, union)
+    ],
+    20: [
+        "lpad",                   # LPAD() string padding function
+        "rpad",                   # RPAD() string padding function
+    ],
+    21: [
+        "func_date_add",              # DATE_ADD/DATE_SUB/ADDDATE functions
+        "type_nchar",                 # NCHAR/NVARCHAR type synonyms
+        "truth_value_transform",      # IS TRUE / IS FALSE / IS UNKNOWN
+        "ctype_ascii",                # ASCII character comparisons and ordering
+    ],
+    22: [
+        "round",                              # string-to-integer rounding during INSERT
+        "sum_distinct",                       # SUM(DISTINCT), AVG(DISTINCT) aggregate edge cases
+        "implicit_char_to_num_conversion",    # string comparison with numeric columns in WHERE
+        "subquery_exists",                    # INSERT/UPDATE/DELETE with subqueries and JOINs
+    ],
+    23: [
+        "key_primary",                        # primary key lookups with CHAR type
+        "temporal_literal",                   # DATE, TIME, TIMESTAMP literal syntax
+        "bug28940878",                        # DATE comparison edge cases and BETWEEN
+        "func_default",                       # DEFAULT() keyword in INSERT VALUES
+    ],
+    24: [
+        "empty_table",                        # empty table edge cases (COUNT, SELECT *, LIMIT 0)
+        "count_distinct2",                    # COUNT(DISTINCT) with NULLs and multiple columns
+        "multi_update_innodb",                # multi-table UPDATE edge cases
+        "filesort_merge",                     # INSERT...SELECT, complex WHERE with OR, COUNT
+    ],
+    25: [
+        "delete_where",                       # DELETE with complex WHERE (subquery, IS NULL, expressions)
+        "update_expr",                        # UPDATE with expressions (arithmetic, string, CASE, subquery)
+        "replace_into",                       # REPLACE INTO with key conflicts and defaults
+        "create_table_select",                # CREATE TABLE ... SELECT (CTAS)
+    ],
+    26: [
+        "decimal_arithmetic",                 # exact decimal literal arithmetic (0.7+0.1=0.8)
+        "key_diff",                           # self-join with different-length CHAR keys
+        "bulk_replace",                       # REPLACE INTO with unique constraints and bulk inserts
+        "join_outer_innodb",                  # LEFT JOIN with NULLs, aggregates, multi-table
+    ],
+    27: [
+        "func_op",                            # arithmetic operators, bit ops, operator precedence
+        "null_expr",                          # NULL in COALESCE, NULLIF, IFNULL, arithmetic, aggregates
+        "cross_join",                         # CROSS JOIN, NATURAL JOIN, JOIN...USING
+    ],
+    28: [
+        "type_coercion",                      # implicit type coercion (string/int/decimal/date)
+        "select_limit_order",                 # LIMIT/OFFSET, ORDER BY expressions/NULLs/CASE
+        "insert_boundary",                    # INSERT edge cases, type boundaries, multi-row
+    ],
+    29: [
+        "subquery_scalar",                    # scalar subqueries in SELECT, WHERE, HAVING, ORDER BY
+        "subquery_in",                        # IN/NOT IN subqueries, NULLs, empty results
+        "subquery_nested",                    # nested subqueries (subquery inside subquery)
+        "subquery_compare",                   # subqueries with comparison operators (=, <, >, <=, >=, <>)
+    ],
+    30: [
+        "select_expressions",                 # complex SELECT: CASE, COALESCE, arithmetic with subqueries
+        "dml_subquery",                       # INSERT...SELECT, UPDATE, DELETE with subqueries
+    ],
+    31: [
+        "subquery_derived_join",              # subqueries as derived tables in JOINs
+        "subquery_union",                     # UNION combined with subqueries in WHERE/FROM
+        "aggregate_expressions",              # complex aggregate expressions (SUM(CASE...), etc.)
+        "subquery_where_complex",             # complex WHERE patterns with multiple subqueries
+    ],
+    32: [
+        "exists_antijoin",                    # EXISTS/NOT EXISTS anti-join and semi-join patterns
+        "dml_subquery_where",                 # UPDATE/DELETE with subqueries in WHERE clauses
+        "join_chain_3way",                    # complex 3+ table JOIN chains
+        "union_order_limit",                  # UNION with ORDER BY and LIMIT
+    ],
+    33: [
+        "string_func_edge",                   # string function edge cases (NULL, empty, boundary)
+        "date_func_patterns",                 # date functions (YEAR, DATEDIFF, DATE_ADD, etc.)
+        "insert_edge_cases",                  # INSERT edge cases (multi-row, DEFAULT, boundary)
+    ],
+    34: [
+        "multi_column_orderby",               # multi-column ORDER BY with mixed ASC/DESC, NULLs
+        "having_complex",                     # HAVING with complex expressions and subqueries
+        "aggregate_subquery_mix",             # mixed subquery + aggregate patterns
+    ],
+    35: [
+        "func_new_scalar",                    # FROM_DAYS, SUBSTRING_INDEX, MAKE_SET, TIMESTAMPDIFF/ADD
+        "group_concat_basic",                 # GROUP_CONCAT with SEPARATOR, DISTINCT, NULLs
+        "any_value_agg",                      # ANY_VALUE aggregate function
+        "multi_table_delete",                 # DELETE t1 FROM t1 JOIN t2 ON cond
+    ],
+    36: [
+        "func_utc_datetime",                  # UTC_DATE, UTC_TIME, UTC_TIMESTAMP
+        "func_addtime_subtime",               # ADDTIME/SUBTIME for datetime and time
+        "func_convert_tz",                    # CONVERT_TZ timezone conversion
+        "func_weekofyear_toseconds",          # WEEKOFYEAR, TO_SECONDS
+    ],
+    37: [
+        "func_hash",                          # MD5, SHA1, SHA, SHA2 hash functions
+        "func_base64",                        # TO_BASE64, FROM_BASE64
+        "func_crypto",                        # RANDOM_BYTES, AES_ENCRYPT/DECRYPT
+        "func_compress",                      # COMPRESS, UNCOMPRESS, UNCOMPRESSED_LENGTH
+        "func_quote_export",                  # QUOTE, EXPORT_SET
+        "func_network",                       # IS_IPV4, IS_IPV6
+        "func_uuid",                          # UUID, UUID_SHORT, BENCHMARK
+    ],
+    38: [
+        "union_multiway",                     # 3+ way UNION ALL/DISTINCT
+        "session_functions",                  # CONNECTION_ID, USER, DATABASE, LAST_INSERT_ID, ROW_COUNT, FOUND_ROWS
+    ],
+    39: [
+        "json_create",                        # JSON_ARRAY, JSON_OBJECT, JSON_QUOTE, JSON_UNQUOTE, JSON_TYPE, JSON_VALID
+        "json_extract",                       # JSON_EXTRACT, JSON_VALUE, JSON_KEYS, JSON_LENGTH, JSON_DEPTH, JSON column
+        "json_modify",                        # JSON_SET/INSERT/REPLACE/REMOVE, MERGE, CONTAINS, SEARCH, OVERLAPS, SCHEMA
+        "json_aggregate",                     # JSON_ARRAYAGG, combined JSON operations
+    ],
+    40: [
+        "insert_odku",                        # INSERT ON DUPLICATE KEY UPDATE
+        "update_join",                        # UPDATE t1 JOIN t2 ON cond SET t1.b = val
+    ],
+    41: [
+        "cte_basic",                          # WITH ... AS common table expressions
+        "window_basic",                       # ROW_NUMBER, RANK, DENSE_RANK, SUM/COUNT/AVG/MIN/MAX OVER, LEAD, LAG
+    ],
+    42: [
+        "correlated_subquery",                # Correlated EXISTS, NOT EXISTS, scalar subqueries
+        "tuple_in_union_sub",                 # Multi-column IN, UNION in IN subquery, JSON arrow WHERE
+        "window_aggregate",                   # Window functions over GROUP BY aggregate results
+        "interval_hex_set",                   # INTERVAL +/-, hex=int comparison, SET defaults
+        "real_world_patterns",                # ORM pagination, JOINs, CTEs+Windows, JSON CRUD, correlated subqueries
+    ],
+    43: [
+        "sp_basic",                           # stored procedure CREATE/DROP/CALL, params, control flow, DML
+        "sp_cursor",                          # stored procedure cursors (DECLARE, OPEN, FETCH, CLOSE)
+        "sp_show",                            # SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE
+        "sp_fib",                             # recursive procedure with cursors (Fibonacci)
+        "sp_nested",                          # nested CALL, multi-var DECLARE, single-stmt bodies
+    ],
 }
 
 
@@ -239,8 +473,12 @@ def run_one_test(test_name, certs, port, record, log_dir):
     Returns (status, detail) where status is one of:
         'pass', 'mismatch', 'error', 'skip'
     """
+    # Prefer custom trimmed test file over official MySQL test
+    custom_test_file = os.path.join(SCRIPT_DIR, "mtr_t", f"{test_name}.test")
     test_file = os.path.join(MYSQL_TEST_T, f"{test_name}.test")
-    if not os.path.exists(test_file):
+    if os.path.exists(custom_test_file):
+        test_file = custom_test_file
+    elif not os.path.exists(test_file):
         return ("skip", f"test file not found: {test_file}")
 
     result_file = os.path.join(MTR_RESULTS_DIR, f"{test_name}.result")
@@ -287,8 +525,14 @@ def run_one_test(test_name, certs, port, record, log_dir):
             return ("recorded", f"→ {result_file}")
         return ("pass", "")
     elif result.returncode == 1:
+        # Check for reject file to get detailed diff
+        reject_file = os.path.join(log_dir, f"{test_name}.reject")
+        if os.path.exists(reject_file):
+            import shutil
+            saved = os.path.join(MTR_RESULTS_DIR, f"{test_name}.reject")
+            shutil.copy2(reject_file, saved)
         detail = result.stderr.strip() or result.stdout.strip()
-        return ("mismatch", detail[:800])
+        return ("mismatch", detail[:2000])
     elif result.returncode == 62:
         # mysqltest returns 62 for --source file not found and similar
         detail = result.stderr.strip() or result.stdout.strip()

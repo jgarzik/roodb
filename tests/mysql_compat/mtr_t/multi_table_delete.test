@@ -1,0 +1,37 @@
+--echo # Multi-table DELETE tests
+
+--echo # --- Basic multi-table DELETE with JOIN ---
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+CREATE TABLE t2 (a INT);
+INSERT INTO t2 VALUES (1), (3);
+DELETE t1 FROM t1 JOIN t2 ON t1.a = t2.a;
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1, t2;
+
+--echo # --- Multi-table DELETE: no matches ---
+CREATE TABLE t1 (id INT, val VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+CREATE TABLE t2 (id INT);
+INSERT INTO t2 VALUES (10), (20);
+DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id;
+SELECT * FROM t1 ORDER BY id;
+DROP TABLE t1, t2;
+
+--echo # --- Multi-table DELETE: all match ---
+CREATE TABLE t1 (x INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+CREATE TABLE t2 (x INT);
+INSERT INTO t2 VALUES (1), (2), (3);
+DELETE t1 FROM t1 JOIN t2 ON t1.x = t2.x;
+SELECT COUNT(*) FROM t1;
+DROP TABLE t1, t2;
+
+--echo # --- Multi-table DELETE with different column names ---
+CREATE TABLE orders (order_id INT, customer_id INT, amount INT);
+INSERT INTO orders VALUES (1, 100, 50), (2, 200, 75), (3, 100, 30), (4, 300, 90);
+CREATE TABLE cancelled (cust_id INT);
+INSERT INTO cancelled VALUES (100);
+DELETE orders FROM orders JOIN cancelled ON orders.customer_id = cancelled.cust_id;
+SELECT * FROM orders ORDER BY order_id;
+DROP TABLE orders, cancelled;

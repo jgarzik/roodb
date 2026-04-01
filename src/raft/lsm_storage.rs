@@ -15,9 +15,9 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, row_to_procedure_def, rows_to_constraints,
+    is_system_table, row_to_index_def, row_to_procedure_def, row_to_view_def, rows_to_constraints,
     rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES,
-    SYSTEM_PROCEDURES, SYSTEM_TABLES,
+    SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -28,8 +28,7 @@ use crate::raft::types::{
 };
 use crate::storage::StorageEngine;
 
-/// MVCC row header size: DB_TRX_ID (8 bytes) + DB_ROLL_PTR (8 bytes) + deleted flag (1 byte)
-const MVCC_HEADER_SIZE: usize = 17;
+use super::types::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
 /// Encode row data with MVCC header for storage
 ///
@@ -61,7 +60,7 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
 fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
     if value.len() > MVCC_HEADER_SIZE {
         // MVCC-wrapped: check deleted flag
-        if value[16] == 1 {
+        if is_mvcc_tombstone(value) {
             return None; // deleted
         }
         Some(&value[MVCC_HEADER_SIZE..])
@@ -588,6 +587,29 @@ impl LsmRaftStorage {
             }
         }
 
+        // Scan system.views to rebuild views
+        let mut view_defs: Vec<crate::catalog::ViewDef> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_VIEWS);
+            let end = table_key_end(SYSTEM_VIEWS);
+            let view_rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+
+            for (_key, value) in view_rows {
+                let Some(row_data) = extract_row_data(&value) else {
+                    continue;
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(view_def) = row_to_view_def(&row) {
+                        view_defs.push(view_def);
+                    }
+                }
+            }
+        }
+
         // Scan system.procedures to rebuild stored procedures
         let mut procedure_defs: Vec<crate::catalog::ProcedureDef> = Vec::new();
         {
@@ -648,6 +670,13 @@ impl LsmRaftStorage {
         for proc_def in procedure_defs {
             tracing::debug!(procedure = %proc_def.name, "Rebuilding procedure from snapshot");
             catalog.register_procedure(proc_def);
+        }
+
+        // Rebuild views
+        catalog.clear_views();
+        for view_def in view_defs {
+            tracing::debug!(view = %view_def.name, "Rebuilding view from snapshot");
+            catalog.register_view(view_def);
         }
 
         tracing::info!("Rebuilt catalog from system tables after snapshot install");
@@ -721,6 +750,18 @@ impl LsmRaftStorage {
                         let _ = catalog.drop_procedure(&proc_def.name);
                     } else {
                         catalog.register_procedure(proc_def);
+                    }
+                }
+            }
+        } else if table == SYSTEM_VIEWS {
+            // View changes — update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if let Some(view_def) = row_to_view_def(&row) {
+                    let mut catalog = self.catalog.write();
+                    if is_delete {
+                        let _ = catalog.drop_view(&view_def.name, true);
+                    } else {
+                        catalog.replace_view(view_def);
                     }
                 }
             }
@@ -1033,17 +1074,22 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                                                     if let Ok(Some(existing_data)) =
                                                         self.storage.get(&change.key).await
                                                     {
-                                                        if existing_data.len() > 16
-                                                            && existing_data[16] != 1
-                                                        {
+                                                        // Skip tombstones (deleted rows)
+                                                        let is_tombstone =
+                                                            is_mvcc_tombstone(&existing_data);
+                                                        if !is_tombstone {
+                                                            if changeset.ignore_duplicates {
+                                                                // IGNORE: silently skip this row
+                                                                continue;
+                                                            }
                                                             tracing::warn!(
                                                                 table = %change.table,
                                                                 "INSERT conflict: row already exists with this key"
                                                             );
                                                             conflict_error = Some(format!(
-                                                            "Duplicate key: row in '{}' already exists",
-                                                            change.table
-                                                        ));
+                                                                "Duplicate key: row in '{}' already exists",
+                                                                change.table
+                                                            ));
                                                             break;
                                                         }
                                                     }

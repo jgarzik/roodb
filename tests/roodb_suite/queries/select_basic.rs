@@ -301,3 +301,47 @@ async fn test_select_without_from_functions() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_in_list_with_null() {
+    let server = TestServer::start("in_null").await;
+    let mut conn = server.connect().await;
+
+    // Value found in list (NULL irrelevant) -> 1
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT 1.1 IN (1.0, 1.2, 1.1, NULL, 0.5)")
+        .await
+        .expect("IN found query failed");
+    assert_eq!(rows[0].0, Some(1), "Value found in list should return 1");
+
+    // Value NOT found, NULL in list -> NULL (not 0)
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT 1.1 IN (1.0, 1.2, NULL, 1.4, 0.5)")
+        .await
+        .expect("IN with NULL query failed");
+    assert_eq!(
+        rows[0].0, None,
+        "Value not found with NULL in list should return NULL"
+    );
+
+    // Value NOT found, no NULL -> 0
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT 1.1 IN (1.0, 1.2, 1.4, 0.5)")
+        .await
+        .expect("IN without NULL query failed");
+    assert_eq!(
+        rows[0].0,
+        Some(0),
+        "Value not found without NULL should return 0"
+    );
+
+    // NULL value -> NULL
+    let rows: Vec<(Option<i64>,)> = conn
+        .query("SELECT NULL IN (1, 2, 3)")
+        .await
+        .expect("NULL IN query failed");
+    assert_eq!(rows[0].0, None, "NULL IN (list) should return NULL");
+
+    drop(conn);
+    server.shutdown().await;
+}

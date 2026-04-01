@@ -1,0 +1,36 @@
+create table t1 (c nchar(10));
+drop table t1;
+create table t1 (c nvarchar(10));
+drop table t1;
+create table t1 (c nchar(10));
+insert into t1 values ('hello');
+insert into t1 values ('world');
+select * from t1 order by c;
+c
+hello
+world
+select length(c) from t1 order by c;
+LENGTH(c)
+5
+5
+drop table t1;
+create table t1 (c nvarchar(20));
+insert into t1 values ('hello world');
+insert into t1 values ('test');
+select * from t1 order by c;
+c
+hello world
+test
+select length(c) from t1 order by c;
+LENGTH(c)
+11
+4
+drop table t1;
+create table t1 (id int, name nvarchar(50), code nchar(5));
+insert into t1 values (1, 'Alice', 'A001');
+insert into t1 values (2, 'Bob', 'B002');
+select * from t1 order by id;
+id	name	code
+1	Alice	A001
+2	Bob	B002
+drop table t1;

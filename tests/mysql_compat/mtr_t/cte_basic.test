@@ -1,0 +1,25 @@
+--echo # Common Table Expressions (WITH ... AS)
+
+--echo # --- Basic CTE ---
+WITH cte AS (SELECT 1 AS a)
+SELECT * FROM cte;
+
+--echo # --- CTE from table ---
+CREATE TABLE t1 (id INT, name VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
+WITH active AS (SELECT * FROM t1 WHERE id <= 2)
+SELECT * FROM active ORDER BY id;
+
+--echo # --- CTE with JOIN ---
+CREATE TABLE t2 (id INT, score INT);
+INSERT INTO t2 VALUES (1, 90), (2, 85);
+WITH top_users AS (SELECT * FROM t1 WHERE id <= 2)
+SELECT top_users.name, t2.score FROM top_users JOIN t2 ON top_users.id = t2.id ORDER BY top_users.name;
+
+--echo # --- Multiple CTEs ---
+WITH
+  a AS (SELECT 1 AS x),
+  b AS (SELECT 2 AS x)
+SELECT a.x + b.x AS total FROM a, b;
+
+DROP TABLE t1, t2;

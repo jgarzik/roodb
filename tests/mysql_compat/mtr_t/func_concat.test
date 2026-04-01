@@ -1,0 +1,67 @@
+#
+# Trimmed MySQL func_concat.test for RooDB compatibility testing.
+# Original: /usr/lib/mysql-test/t/func_concat.test (153 lines)
+#
+
+# [RooDB-skip] --source include/turn_off_only_full_group_by.inc
+# [RooDB-skip] GROUP BY with non-aggregated columns (lines 11-31)
+# [RooDB-skip] UNION queries (lines 43-74)
+# [RooDB-skip] Stored procedures (lines 125-153)
+# [RooDB-skip] ANALYZE TABLE (line 109)
+# [RooDB-skip] EXPLAIN (lines 115-116)
+# [RooDB-skip] --replace_result directives
+# [RooDB-skip] DEFAULT CHARSET=utf8 / DEFAULT CHARSET=latin1
+# [RooDB-skip] subqueries (lines 62-64)
+
+#
+# Bug #5540: a problem with double type
+#
+
+create table t1 (a char(4), b double, c date, d tinyint(4));
+insert into t1 values ('AAAA', 105, '2003-03-01', 1);
+select * from t1 where concat(A,C,B,D) = 'AAAA2003-03-011051';
+drop table t1;
+
+#
+# Bug #36488: regexp returns false matches, concatenating with previous rows
+#
+
+CREATE TABLE t1 (c1 varchar(100), c2 varchar(100));
+INSERT INTO t1 VALUES ('',''), ('','First'), ('Random','Random');
+SELECT * FROM t1 WHERE CONCAT(c1,' ',c2) REGEXP 'First.*';
+DROP TABLE t1;
+
+#
+# Basic CONCAT and CONCAT_WS tests
+#
+
+CREATE TABLE t1 (a varchar(10), b varchar(10));
+INSERT INTO t1 VALUES ('hello', 'world');
+INSERT INTO t1 VALUES ('foo', 'bar');
+INSERT INTO t1 VALUES (NULL, 'test');
+INSERT INTO t1 VALUES ('test', NULL);
+
+SELECT CONCAT(a, b) FROM t1;
+SELECT CONCAT(a, ' ', b) FROM t1;
+SELECT CONCAT_WS(',', a, b) FROM t1;
+SELECT CONCAT_WS('-', a, b, 'extra') FROM t1;
+SELECT CONCAT_WS(',', NULL, a, b) FROM t1;
+
+--echo # CONCAT with NULL returns NULL
+SELECT CONCAT(a, NULL) FROM t1;
+SELECT CONCAT(NULL, b) FROM t1;
+
+--echo # CONCAT_WS with NULL separator
+SELECT CONCAT_WS(NULL, a, b) FROM t1;
+
+--echo # CONCAT_WS skips NULL arguments
+SELECT CONCAT_WS(',', a, NULL, b) FROM t1;
+
+DROP TABLE t1;
+
+--echo # Numeric concat
+SELECT CONCAT(1, 2, 3);
+SELECT CONCAT_WS('-', 1, 2, 3);
+SELECT CONCAT(1.5, 'x');
+
+--echo # End of func_concat tests

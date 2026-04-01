@@ -1,0 +1,142 @@
+#
+# Basic aggregate function tests - trimmed for RooDB
+#
+
+--disable_warnings
+drop table if exists t1,t2;
+--enable_warnings
+
+# [RooDB-skip] set div_precision_increment
+# [RooDB-skip] --source include/*
+
+create table t1 (grp int, a bigint unsigned, c char(10) not null);
+insert into t1 values (1,1,'a');
+insert into t1 values (2,2,'b');
+insert into t1 values (2,3,'c');
+insert into t1 values (3,4,'E');
+insert into t1 values (3,5,'C');
+insert into t1 values (3,6,'D');
+
+select sum(a) from t1 where a > 10;
+select count(distinct a),count(distinct grp) from t1;
+insert into t1 values (null,null,'');
+select count(distinct a),count(distinct grp) from t1;
+
+select sum(all a),count(all a),avg(all a),min(all a),max(all a),min(all c),max(all c) from t1;
+
+drop table t1;
+
+#
+# Test of count
+#
+create table t1 (a int primary key, c char(10), b text);
+INSERT INTO t1 VALUES (1,'1','1');
+INSERT INTO t1 VALUES (2,'2','2');
+INSERT INTO t1 VALUES (4,'4','4');
+
+select count(*) from t1;
+select count(*) from t1 where a = 1;
+select count(*) from t1 where a = 100;
+select count(*) from t1 where a >= 10;
+select count(a) from t1 where a = 1;
+select count(a) from t1 where a = 100;
+select count(a) from t1 where a >= 10;
+drop table t1;
+
+#
+# COUNT(i)*(i+0)
+#
+CREATE TABLE t1 (d DATETIME, i INT);
+INSERT INTO t1 VALUES ('2024-01-01 00:00:00', 1);
+SELECT COUNT(i), i, COUNT(i)*i FROM t1 GROUP BY i ORDER BY i;
+SELECT COUNT(i), (i+0), COUNT(i)*(i+0) FROM t1 GROUP BY i ORDER BY i;
+DROP TABLE t1;
+
+#
+# SUM with GROUP BY
+#
+create table t1 (
+        num float(5,2),
+        user char(20)
+);
+insert into t1 values (10.3,'nem'),(20.53,'monty'),(30.23,'sinisa');
+insert into t1 values (30.13,'nem'),(20.98,'monty'),(10.45,'sinisa');
+insert into t1 values (5.2,'nem'),(8.64,'monty'),(11.12,'sinisa');
+select sum(num) from t1;
+drop table t1;
+
+#
+# GROUP BY with NULL values
+#
+CREATE TABLE t1 (a int, b int);
+select count(b), sum(b), avg(b), min(b), max(b) from t1;
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+insert into t1 values (1,null);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+insert into t1 values (1,null);
+insert into t1 values (2,null);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+insert into t1 values (2,1);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+insert into t1 values (3,1);
+select a,count(b), sum(b), avg(b), min(b), max(b) from t1 group by a order by a;
+drop table t1;
+
+# [RooDB-skip] bit_and, bit_or, bit_xor
+# [RooDB-skip] SQL_BIG_RESULT / SQL_SMALL_RESULT
+# [RooDB-skip] analyze table / explain
+# [RooDB-skip] variance / stddev / std
+
+#
+# AVG on empty table
+#
+create table t1 (a int);
+select avg(2) from t1;
+drop table t1;
+
+#
+# MIN/MAX basic
+#
+create table t1 (a int, b int);
+insert into t1 values (1,10),(2,20),(3,30),(1,40),(2,50);
+select min(a), max(a) from t1;
+select min(b), max(b) from t1;
+select a, min(b), max(b) from t1 group by a order by a;
+drop table t1;
+
+#
+# HAVING with aggregate
+#
+create table t1 (a int);
+insert into t1 values (1);
+select max(a) as b from t1 having b=1;
+select a from t1 having a=1;
+drop table t1;
+
+#
+# MIN/MAX with empty result
+#
+CREATE TABLE t1 (a int primary key);
+INSERT INTO t1 VALUES (1),(2),(3),(4);
+SELECT MAX(a) FROM t1 WHERE a > 5;
+SELECT MIN(a) FROM t1 WHERE a < 0;
+DROP TABLE t1;
+
+#
+# GROUP BY with multiple columns
+#
+CREATE TABLE t1 (a int, b int, c varchar(10));
+INSERT INTO t1 VALUES (1,10,'x'),(1,20,'y'),(2,10,'z'),(2,30,'w');
+SELECT a, SUM(b) FROM t1 GROUP BY a ORDER BY a;
+SELECT a, COUNT(*), SUM(b), AVG(b), MIN(c), MAX(c) FROM t1 GROUP BY a ORDER BY a;
+SELECT a, b, COUNT(*) FROM t1 GROUP BY a, b ORDER BY a, b;
+DROP TABLE t1;
+
+# [RooDB-skip] ROLLUP, GROUPING
+# [RooDB-skip] window functions
+# [RooDB-skip] subqueries
+# [RooDB-skip] SHOW CREATE TABLE / SHOW COLUMNS
+# [RooDB-skip] CREATE TABLE AS SELECT
+# [RooDB-skip] INSERT...SELECT
+# [RooDB-skip] PREPARE/EXECUTE
+# [RooDB-skip] CHARACTER SET / COLLATE

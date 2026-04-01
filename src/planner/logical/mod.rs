@@ -12,6 +12,16 @@ pub use expr::{AggregateFunc, ColumnId, OutputColumn};
 use crate::catalog::{ColumnDef, Constraint, DataType};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
+/// Window function descriptor: (select_col_index, func_name, args, partition_by, order_by, result_type)
+pub type WindowFuncDesc = (
+    usize,
+    String,
+    Vec<ResolvedExpr>,
+    Vec<ResolvedExpr>,
+    Vec<(ResolvedExpr, bool)>,
+    DataType,
+);
+
 // ============ Operator types (shared with resolver/executor) ============
 
 /// Binary operators
@@ -108,6 +118,10 @@ pub struct ResolvedColumn {
     pub index: usize,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Column DEFAULT value expression (as string), from ColumnDef.default
+    pub default_value: Option<String>,
+    /// True if this column references the outer query in a correlated subquery
+    pub is_outer_ref: bool,
 }
 
 /// Resolved expression with type information
@@ -136,6 +150,8 @@ pub enum ResolvedExpr {
         args: Vec<ResolvedExpr>,
         distinct: bool,
         result_type: DataType,
+        /// GROUP_CONCAT separator (default ",")
+        separator: Option<String>,
     },
     /// IS NULL / IS NOT NULL
     IsNull {
@@ -180,6 +196,30 @@ pub enum ResolvedExpr {
         /// Inferred result type
         result_type: DataType,
     },
+    /// Scalar subquery: (SELECT expr FROM ...) that returns a single value
+    ScalarSubquery {
+        query: Box<ResolvedSelect>,
+        result_type: DataType,
+    },
+    /// IN subquery: expr [NOT] IN (SELECT col FROM ...)
+    InSubquery {
+        expr: Box<ResolvedExpr>,
+        query: Box<ResolvedSelect>,
+        negated: bool,
+    },
+    /// EXISTS / NOT EXISTS subquery
+    ExistsSubquery {
+        query: Box<ResolvedSelect>,
+        negated: bool,
+    },
+    /// Window function: func OVER (PARTITION BY ... ORDER BY ...)
+    WindowFunction {
+        name: String,
+        args: Vec<ResolvedExpr>,
+        partition_by: Vec<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        result_type: DataType,
+    },
 }
 
 impl ResolvedExpr {
@@ -218,6 +258,10 @@ impl ResolvedExpr {
             ResolvedExpr::Cast { target_type, .. } => target_type.clone(),
             ResolvedExpr::UserVariable { .. } => DataType::Text,
             ResolvedExpr::Case { result_type, .. } => result_type.clone(),
+            ResolvedExpr::ScalarSubquery { result_type, .. } => result_type.clone(),
+            ResolvedExpr::InSubquery { .. } => DataType::Boolean,
+            ResolvedExpr::ExistsSubquery { .. } => DataType::Boolean,
+            ResolvedExpr::WindowFunction { result_type, .. } => result_type.clone(),
         }
     }
 
@@ -248,6 +292,10 @@ impl ResolvedExpr {
                 // Case is nullable if any result is nullable or there's no ELSE
                 else_result.is_none() || results.iter().any(|r| r.is_nullable())
             }
+            ResolvedExpr::ScalarSubquery { .. } => true, // Subquery may return NULL or no rows
+            ResolvedExpr::InSubquery { .. } => true,     // IN subquery can return NULL
+            ResolvedExpr::ExistsSubquery { .. } => false,
+            ResolvedExpr::WindowFunction { .. } => true,
         }
     }
 }
@@ -344,12 +392,17 @@ pub enum ResolvedStatement {
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
+        /// ON DUPLICATE KEY UPDATE assignments: (column_index, new_value_expr)
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
     /// INSERT ... SELECT with resolved source query
     InsertSelect {
         table: String,
         columns: Vec<ResolvedColumn>,
         source: Box<ResolvedStatement>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         ignore: bool,
     },
     /// UPDATE with resolved assignments
@@ -358,19 +411,23 @@ pub enum ResolvedStatement {
         table_columns: Vec<(String, DataType, bool)>,
         assignments: Vec<ResolvedAssignment>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        limit: Option<usize>,
     },
     /// DELETE with resolved filter
     Delete {
         table: String,
         table_columns: Vec<(String, DataType, bool)>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
+        limit: Option<usize>,
     },
     /// SELECT with resolved references
     Select(ResolvedSelect),
-    /// UNION of two SELECTs
+    /// UNION of two operands (right may be another Union for 3+ way chains)
     Union {
         left: Box<ResolvedSelect>,
-        right: Box<ResolvedSelect>,
+        right: Box<ResolvedStatement>,
         all: bool,
     },
     /// CREATE TABLE ... SELECT (CTAS) — source can be Select or Union
@@ -515,6 +572,12 @@ pub enum LogicalPlan {
         alias: String,
     },
 
+    /// Window function computation over input rows
+    Window {
+        input: Box<LogicalPlan>,
+        window_funcs: Vec<WindowFuncDesc>,
+    },
+
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
@@ -522,6 +585,7 @@ pub enum LogicalPlan {
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
+        on_duplicate: Vec<(usize, ResolvedExpr)>,
     },
 
     /// INSERT ... SELECT — insert rows from a source query
@@ -529,6 +593,9 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<ResolvedColumn>,
         source: Box<LogicalPlan>,
+        /// Maps source column index → target column index for partial column lists.
+        /// None when all columns are targeted (1:1 mapping).
+        column_map: Option<Vec<usize>>,
         ignore: bool,
     },
 
@@ -538,12 +605,16 @@ pub enum LogicalPlan {
         /// (column, new value)
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     /// DELETE rows from a table
     Delete {
         table: String,
         filter: Option<ResolvedExpr>,
+        order_by: Vec<(ResolvedExpr, bool)>,
+        limit: Option<usize>,
     },
 
     // ============ DDL Operations (passthrough) ============
@@ -713,6 +784,7 @@ impl LogicalPlan {
             }
 
             LogicalPlan::Sort { input, .. } => input.output_columns(),
+            LogicalPlan::Window { input, .. } => input.output_columns(),
             LogicalPlan::Limit { input, .. } => input.output_columns(),
             LogicalPlan::Distinct { input } => input.output_columns(),
             LogicalPlan::SingleRow => vec![],

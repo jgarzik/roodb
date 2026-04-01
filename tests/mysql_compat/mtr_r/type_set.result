@@ -1,0 +1,20 @@
+create table t1 (a set (' ','a','b') not null);
+drop table t1;
+create table t1 (s set ('a','b','c'));
+insert into t1 values ('a'),('a,b'),('b,c'),('a,b,c');
+select s from t1 order by s;
+s
+a
+a,b
+a,b,c
+b,c
+drop table t1;
+End of 5.0 tests
+CREATE TABLE bar(id set('red','green','blue'));
+INSERT INTO bar VALUES ("red");
+INSERT INTO bar VALUES ("green,blue");
+SELECT * FROM bar;
+id
+red
+green,blue
+DROP TABLE bar;

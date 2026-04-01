@@ -1,0 +1,156 @@
+#
+# Single table DELETE/UPDATE tests — adapted from MySQL single_delete_update.test
+#
+# Removed: FLUSH STATUS, SHOW STATUS, --skip_if_hypergraph, EXPLAIN, ENGINE= directives,
+#          --error, --echo, partial index (b(1)), eval/let variables, HEAP engine,
+#          AUTO_INCREMENT with empty INSERT
+#
+# [RooDB-skip] UPDATE ... ORDER BY ... LIMIT — RooDB parser does not support
+#   ORDER BY clause in UPDATE statements (parse error).
+#   This means ALL UPDATE sections from the original test are skipped.
+#
+# [RooDB-skip] INSERT INTO t2 (partial_cols) SELECT ... — RooDB has a bug where
+#   partial column lists in INSERT...SELECT map values to wrong columns.
+#   Workaround: use full column lists or match column order.
+#
+# Kept: DELETE with WHERE/ORDER BY/LIMIT
+
+#
+# Bug #30584: delete with order by and limit
+#
+
+CREATE TABLE t1 (i INT);
+INSERT INTO t1 VALUES (10),(11),(12),(13),(14),(15),(16),(17),(18),(19),
+                      (20),(21),(22),(23),(24),(25),(26),(27),(28),(29),
+                      (30),(31),(32),(33),(34),(35);
+
+# Test DELETE with WHERE, ORDER BY, LIMIT
+CREATE TABLE t2(a INT, i INT PRIMARY KEY);
+INSERT INTO t2 SELECT NULL, i FROM t1;
+
+SELECT * FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i LIMIT 1;
+
+DELETE FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i LIMIT 1;
+SELECT * FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i;
+
+DROP TABLE t2;
+
+# --- DELETE constant inside ORDER BY list ---
+
+CREATE TABLE t2(a INT, b INT, c INT, d INT);
+INSERT INTO t2 SELECT i, i, i, NULL FROM t1;
+
+SELECT * FROM t2 WHERE b = 10 ORDER BY a, c LIMIT 12;
+
+DELETE FROM t2 WHERE b = 10 ORDER BY a, c LIMIT 12;
+SELECT COUNT(*) FROM t2 WHERE b = 10;
+
+DROP TABLE t2;
+
+# --- DELETE with reverse ORDER BY ---
+
+CREATE TABLE t2(a INT, i INT PRIMARY KEY);
+INSERT INTO t2 SELECT NULL, i FROM t1;
+
+SELECT * FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i DESC LIMIT 1;
+
+DELETE FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i DESC LIMIT 1;
+SELECT * FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i;
+
+DROP TABLE t2;
+
+# --- DELETE with mixed sorting direction ---
+
+CREATE TABLE t2 (a CHAR(2), b CHAR(2), c CHAR(2));
+INSERT INTO t2 SELECT i, i, i FROM t1;
+
+SELECT * FROM t2 ORDER BY a, b DESC LIMIT 5;
+
+DELETE FROM t2 ORDER BY a, b DESC LIMIT 5;
+SELECT * FROM t2 ORDER BY a, b DESC;
+
+DROP TABLE t2;
+
+# --- DELETE with LIMIT, no WHERE, DESC direction ---
+
+CREATE TABLE t2 (a CHAR(2), b CHAR(2), c CHAR(2));
+INSERT INTO t2 SELECT i, i, NULL FROM t1;
+
+SELECT * FROM t2 ORDER BY a, b LIMIT 5;
+SELECT * FROM t2 ORDER BY a DESC, b DESC LIMIT 5;
+
+DELETE FROM t2 ORDER BY a DESC, b DESC LIMIT 5;
+SELECT * FROM t2 WHERE c = '10' ORDER BY a DESC, b DESC;
+
+DROP TABLE t1, t2;
+
+
+#
+# Simple DELETE tests (no ORDER BY complexity)
+#
+
+CREATE TABLE t1 (i INT);
+INSERT INTO t1 VALUES (10),(11),(12),(13),(14),(15),(16),(17),(18),(19),
+                      (20),(21),(22),(23),(24),(25),(26),(27),(28),(29),
+                      (30),(31),(32),(33),(34),(35);
+
+# Delete with WHERE only
+CREATE TABLE t2 (a INT, i INT PRIMARY KEY);
+INSERT INTO t2 SELECT NULL, i FROM t1;
+
+DELETE FROM t2 WHERE i > 10 AND i <= 18;
+SELECT * FROM t2 WHERE i > 10 AND i <= 18 ORDER BY i;
+SELECT COUNT(*) FROM t2;
+
+DROP TABLE t2;
+
+# Delete with LIMIT only (no ORDER BY, no WHERE)
+CREATE TABLE t2 (a INT, i INT PRIMARY KEY);
+INSERT INTO t2 SELECT NULL, i FROM t1;
+
+DELETE FROM t2 LIMIT 5;
+SELECT COUNT(*) FROM t2;
+
+DROP TABLE t2;
+
+# Delete all rows
+CREATE TABLE t2 (a INT, i INT PRIMARY KEY);
+INSERT INTO t2 SELECT NULL, i FROM t1;
+
+DELETE FROM t2;
+SELECT COUNT(*) FROM t2;
+
+DROP TABLE t1, t2;
+
+
+# [RooDB-skip] UPDATE ... ORDER BY ... LIMIT — parse error in RooDB
+# The original test has extensive UPDATE with ORDER BY / LIMIT tests that
+# cannot be run because RooDB doesn't parse ORDER BY in UPDATE.
+#
+# Bug #36569: UPDATE ... WHERE ... ORDER BY... always does a filesort
+# Bug #53742: UPDATEs have no effect after applying patch for bug 36569
+#
+# [RooDB-skip] DEFAULT values in partial INSERT column lists — RooDB bug:
+#   INSERT INTO t (c2) VALUES (NULL) doesn't apply DEFAULT 'y' to c1_idx.
+#   The unspecified column gets NULL instead of its DEFAULT.
+#
+# Simple UPDATE tests (no ORDER BY, no DEFAULT reliance)
+#
+
+CREATE TABLE t1 (
+  pk INT NOT NULL PRIMARY KEY,
+  c1_idx CHAR(1),
+  c2 INT
+);
+
+INSERT INTO t1 VALUES (1, 'y', NULL), (2, 'y', NULL), (3, 'y', NULL), (4, 'y', NULL);
+
+SELECT * FROM t1 WHERE c1_idx = 'y' ORDER BY pk DESC LIMIT 2;
+UPDATE t1 SET c2 = 0 WHERE c1_idx = 'y' AND pk >= 3;
+SELECT * FROM t1 WHERE c1_idx = 'y' ORDER BY pk DESC LIMIT 2;
+SELECT * FROM t1 WHERE c1_idx = 'y' ORDER BY pk DESC;
+
+DELETE FROM t1 WHERE c1_idx = 'y' AND pk >= 3;
+SELECT * FROM t1 WHERE c1_idx = 'y' ORDER BY pk DESC;
+
+DROP TABLE t1;

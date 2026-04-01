@@ -30,6 +30,8 @@ pub struct AggregateFunc {
     pub distinct: bool,
     /// Result type of the aggregate
     pub result_type: DataType,
+    /// Separator for GROUP_CONCAT (default ",")
+    pub separator: Option<String>,
 }
 
 impl AggregateFunc {
@@ -45,6 +47,7 @@ impl AggregateFunc {
             args,
             distinct,
             result_type,
+            separator: None,
         }
     }
 }

@@ -1,0 +1,46 @@
+drop table if exists t1, test;
+select datediff("1997-12-31 23:59:59.000001","1997-12-30");
+DATEDIFF('1997-12-31 23:59:59.000001','1997-12-30')
+1
+select datediff("1997-11-30 23:59:59.000001","1997-12-31");
+DATEDIFF('1997-11-30 23:59:59.000001','1997-12-31')
+-31
+select datediff("1997-11-30 23:59:59.000001",null);
+DATEDIFF('1997-11-30 23:59:59.000001',NULL)
+NULL
+select makedate(1997,1);
+MAKEDATE(1997,1)
+1997-01-01
+select makedate(1997,0);
+MAKEDATE(1997,0)
+NULL
+select makedate(9999,365);
+MAKEDATE(9999,365)
+9999-12-31
+select makedate(9999,366);
+MAKEDATE(9999,366)
+10000-01-01
+select makedate(100,1);
+MAKEDATE(100,1)
+0100-01-01
+select maketime(10,11,12);
+MAKETIME(10,11,12)
+10:11:12
+select maketime(25,11,12);
+MAKETIME(25,11,12)
+25:11:12
+select day("1997-12-31 23:59:59.000001");
+DAY('1997-12-31 23:59:59.000001')
+31
+select date("1997-12-31 23:59:59.000001");
+DATE('1997-12-31 23:59:59.000001')
+1997-12-31
+select time("1997-12-31 23:59:59.000001");
+TIME('1997-12-31 23:59:59.000001')
+23:59:59
+select microsecond("1997-12-31 23:59:59.000001");
+MICROSECOND('1997-12-31 23:59:59.000001')
+1
+select microsecond("1997-12-31 23:59:59.01") as a;
+a
+10000

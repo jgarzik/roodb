@@ -1,0 +1,55 @@
+#
+# Test HEX() and UNHEX() functions (trimmed for RooDB)
+#
+# [RooDB-skip] --source include/count_sessions.inc
+# [RooDB-skip] SHOW CREATE TABLE -- not supported
+# [RooDB-skip] --replace_column -- not supported
+# [RooDB-skip] --exec $MYSQL -- external client invocations
+# [RooDB-skip] --enable_metadata -- not supported
+# [RooDB-skip] CHARACTER SET = binary -- charset not supported
+# [RooDB-skip] GEOMETRY column type -- not basic SQL
+# [RooDB-skip] PREPARE/EXECUTE -- not supported
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+# Basic HEX/UNHEX tests
+SELECT HEX('abc');
+SELECT HEX(255);
+SELECT HEX(0);
+SELECT HEX(256);
+SELECT UNHEX('616263');
+SELECT UNHEX('FF');
+SELECT UNHEX(HEX('test string'));
+SELECT HEX(UNHEX('48454C4C4F'));
+
+# HEX with numeric values
+SELECT HEX(1), HEX(10), HEX(100), HEX(1000);
+SELECT HEX(-1);
+
+# UNHEX edge cases
+SELECT UNHEX('');
+SELECT UNHEX(NULL);
+SELECT HEX(NULL);
+
+# Roundtrip tests
+SELECT HEX(UNHEX('DEADBEEF'));
+SELECT UNHEX(HEX(12345));
+
+# Table-based tests with hex values
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'hello'), (2, 'world'), (3, 'test');
+SELECT id, HEX(val) FROM t1 ORDER BY id;
+SELECT id, UNHEX(HEX(val)) FROM t1 ORDER BY id;
+DROP TABLE t1;
+
+# Binary literal tests
+CREATE TABLE t2 (id INT, col1 VARCHAR(20));
+INSERT INTO t2 VALUES (1, X'AB1234'), (2, X'DE1234');
+SELECT id, HEX(col1) FROM t2 ORDER BY id;
+DROP TABLE t2;
+
+# HEX with expressions
+SELECT HEX(1 + 1);
+SELECT HEX(ASCII('A'));

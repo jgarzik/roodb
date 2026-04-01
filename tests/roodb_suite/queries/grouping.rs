@@ -279,3 +279,152 @@ async fn test_group_by_null_values() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_group_by_ordinal() {
+    let server = TestServer::start("group_ordinal").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE group_ord_tbl (a INT, b VARCHAR(10), c INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO group_ord_tbl (a, b, c) VALUES
+         (1, 'x', 10), (1, 'y', 20), (2, 'x', 30), (2, 'y', 40), (1, 'x', 50)",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // GROUP BY 1 — group by first select column (a)
+    let rows: Vec<(i64, i64)> = conn
+        .query("SELECT a, SUM(c) FROM group_ord_tbl GROUP BY 1 ORDER BY a")
+        .await
+        .expect("GROUP BY ordinal 1 failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, 80)); // 10 + 20 + 50
+    assert_eq!(rows[1], (2, 70)); // 30 + 40
+
+    // GROUP BY with multiple ordinals: GROUP BY 1, 2
+    let rows: Vec<(i64, String, i64)> = conn
+        .query("SELECT a, b, SUM(c) FROM group_ord_tbl GROUP BY 1, 2 ORDER BY a, b")
+        .await
+        .expect("GROUP BY ordinal 1, 2 failed");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], (1, "x".to_string(), 60)); // 10 + 50
+    assert_eq!(rows[1], (1, "y".to_string(), 20));
+    assert_eq!(rows[2], (2, "x".to_string(), 30));
+    assert_eq!(rows[3], (2, "y".to_string(), 40));
+
+    // GROUP BY mixing ordinal and column name: GROUP BY 1, b
+    let rows: Vec<(i64, String, i64)> = conn
+        .query("SELECT a, b, COUNT(*) FROM group_ord_tbl GROUP BY 1, b ORDER BY a, b")
+        .await
+        .expect("GROUP BY ordinal + name failed");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], (1, "x".to_string(), 2));
+    assert_eq!(rows[1], (1, "y".to_string(), 1));
+    assert_eq!(rows[2], (2, "x".to_string(), 1));
+    assert_eq!(rows[3], (2, "y".to_string(), 1));
+
+    // Out-of-range ordinal should error
+    let err = conn
+        .query_drop("SELECT a, SUM(c) FROM group_ord_tbl GROUP BY 3")
+        .await;
+    assert!(err.is_err(), "GROUP BY out-of-range ordinal should fail");
+
+    conn.query_drop("DROP TABLE group_ord_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_having_aggregate_is_not_null() {
+    let server = TestServer::start("having_agg_isnotnull").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE having_inn_tbl (a VARCHAR(50), b INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO having_inn_tbl (a, b) VALUES
+         ('x', 10), ('x', 20), ('y', NULL), ('y', NULL), ('z', 30)",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // HAVING SUM(b) IS NOT NULL — should return groups where SUM(b) is not null
+    let rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT a, SUM(b) FROM having_inn_tbl GROUP BY a HAVING SUM(b) IS NOT NULL ORDER BY a",
+        )
+        .await
+        .expect("HAVING SUM(b) IS NOT NULL failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], ("x".to_string(), 30));
+    assert_eq!(rows[1], ("z".to_string(), 30));
+
+    // HAVING SUM(b) IS NULL — should return groups where SUM(b) is null
+    let rows: Vec<(String, Option<i64>)> = conn
+        .query("SELECT a, SUM(b) FROM having_inn_tbl GROUP BY a HAVING SUM(b) IS NULL ORDER BY a")
+        .await
+        .expect("HAVING SUM(b) IS NULL failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "y".to_string());
+    assert_eq!(rows[0].1, None);
+
+    conn.query_drop("DROP TABLE having_inn_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_having_alias_is_null() {
+    let server = TestServer::start("having_alias_isnull").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE having_ain_tbl (a VARCHAR(50), b INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO having_ain_tbl (a, b) VALUES
+         ('x', 10), ('x', 20), ('y', NULL), ('y', NULL), ('z', 30)",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // HAVING alias IS NULL — using alias 's' for SUM(b)
+    let rows: Vec<(String, Option<i64>)> = conn
+        .query("SELECT a, SUM(b) AS s FROM having_ain_tbl GROUP BY a HAVING s IS NULL ORDER BY a")
+        .await
+        .expect("HAVING alias IS NULL failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "y".to_string());
+    assert_eq!(rows[0].1, None);
+
+    // HAVING alias IS NOT NULL — using alias 's' for SUM(b)
+    let rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT a, SUM(b) AS s FROM having_ain_tbl GROUP BY a HAVING s IS NOT NULL ORDER BY a",
+        )
+        .await
+        .expect("HAVING alias IS NOT NULL failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], ("x".to_string(), 30));
+    assert_eq!(rows[1], ("z".to_string(), 30));
+
+    conn.query_drop("DROP TABLE having_ain_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}

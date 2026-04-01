@@ -204,3 +204,72 @@ async fn test_update_no_matching_rows() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_update_limit() {
+    let server = TestServer::start("update_limit").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE upd_limit_tbl (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO upd_limit_tbl (id, val) VALUES (1, 0), (2, 0), (3, 0)")
+        .await
+        .expect("INSERT failed");
+
+    // UPDATE LIMIT 1 should update exactly 1 row
+    conn.query_drop("UPDATE upd_limit_tbl SET val = 99 LIMIT 1")
+        .await
+        .expect("UPDATE LIMIT 1 failed");
+
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, val FROM upd_limit_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    let updated_count = rows.iter().filter(|(_, v)| *v == 99).count();
+    assert_eq!(
+        updated_count, 1,
+        "UPDATE LIMIT 1 should update exactly 1 row"
+    );
+
+    conn.query_drop("DROP TABLE upd_limit_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_update_limit_zero_with_pk() {
+    let server = TestServer::start("update_limit0").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE upd_lim0_tbl (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO upd_lim0_tbl (id, val) VALUES (1, 10), (2, 20)")
+        .await
+        .expect("INSERT failed");
+
+    // UPDATE WHERE pk=X LIMIT 0 must update 0 rows (PointGet suppression)
+    conn.query_drop("UPDATE upd_lim0_tbl SET val = 99 WHERE id = 1 LIMIT 0")
+        .await
+        .expect("UPDATE LIMIT 0 failed");
+
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, val FROM upd_lim0_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows[0], (1, 10), "UPDATE LIMIT 0 should not change any row");
+    assert_eq!(rows[1], (2, 20));
+
+    conn.query_drop("DROP TABLE upd_lim0_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}

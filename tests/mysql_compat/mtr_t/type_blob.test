@@ -1,0 +1,168 @@
+#
+# Trimmed MySQL type_blob.test for RooDB compatibility testing.
+# Original: /usr/lib/mysql-test/t/type_blob.test (867 lines)
+#
+
+# [RooDB-skip] show columns / show full fields (lines 16, 20, 23, 83-86, etc.)
+# [RooDB-skip] show create table (lines 22, 23, 409, 435)
+# [RooDB-skip] LOCK/UNLOCK TABLES (lines 82-86)
+# [RooDB-skip] CHARACTER SET / COLLATE (lines 19, 338, 448)
+# [RooDB-skip] LOAD DATA (line 325)
+# [RooDB-skip] --source directives (lines 258, 262)
+# [RooDB-skip] GROUP BY on blob (lines 112-140, 260)
+# [RooDB-skip] set big_tables (lines 115, 130)
+# [RooDB-skip] eval / --replace_result directives
+# [RooDB-skip] load_file() (lines 316-331)
+# [RooDB-skip] ALTER TABLE (lines 343, 388, 407-429)
+# [RooDB-skip] ANALYZE TABLE (lines 368, 389)
+# [RooDB-skip] EXPLAIN (lines 369, 390-392)
+# [RooDB-skip] Complex multi-table join (lines 147-263)
+# [RooDB-skip] TEMPORARY TABLE
+# [RooDB-skip] CREATE TABLE ... SELECT (lines 329, 554-561)
+# [RooDB-skip] LEFT JOIN ... UPDATE (line 624)
+# [RooDB-skip] Stored functions (lines 632-640)
+# [RooDB-skip] Geometry/spatial types (lines 648-697)
+# [RooDB-skip] FOREIGN KEY
+# [RooDB-skip] --error ER_DUP_ENTRY with charset (lines 339-342)
+# [RooDB-skip] sql_mode TRADITIONAL (line 439)
+
+#
+# Basic BLOB/TEXT creation
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+CREATE TABLE t1 (a BLOB, b TEXT);
+INSERT INTO t1 VALUES ('hello', 'world');
+INSERT INTO t1 VALUES ('binary data', 'text data');
+INSERT INTO t1 VALUES (NULL, NULL);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# [RooDB-skip] AUTO_INCREMENT state leaks between tests
+
+#
+# TEXT update
+#
+
+CREATE TABLE t1 (a TEXT);
+INSERT INTO t1 VALUES ('where');
+UPDATE t1 SET a='Where';
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# BLOB, TEXT, CHAR, VARBINARY basic operations
+#
+
+CREATE TABLE t1 (t TEXT, c CHAR(10), b BLOB, d VARBINARY(10));
+INSERT INTO t1 VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO t1 VALUES ('', '', '', '');
+INSERT INTO t1 VALUES ('hello', 'hello', 'hello', 'hello');
+INSERT INTO t1 VALUES ('HELLO', 'HELLO', 'HELLO', 'HELLO');
+INSERT INTO t1 VALUES ('HELLO MY', 'HELLO MY', 'HELLO MY', 'HELLO MY');
+INSERT INTO t1 VALUES ('a', 'a', 'a', 'a');
+INSERT INTO t1 VALUES (1, 1, 1, 1);
+INSERT INTO t1 VALUES (NULL, NULL, NULL, NULL);
+
+SELECT t FROM t1 WHERE t LIKE 'hello';
+SELECT c FROM t1 WHERE c LIKE 'hello';
+SELECT b FROM t1 WHERE b LIKE 'hello';
+SELECT d FROM t1 WHERE d LIKE 'hello';
+SELECT t FROM t1 WHERE t LIKE '%HELLO%';
+SELECT c FROM t1 WHERE c LIKE '%HELLO%';
+SELECT b FROM t1 WHERE b LIKE '%HELLO%';
+SELECT d FROM t1 WHERE d LIKE '%HELLO%';
+SELECT t FROM t1 ORDER BY t;
+SELECT c FROM t1 ORDER BY c;
+SELECT b FROM t1 ORDER BY b;
+SELECT d FROM t1 ORDER BY d;
+SELECT DISTINCT t FROM t1 ORDER BY t;
+SELECT DISTINCT b FROM t1 ORDER BY b;
+DROP TABLE t1;
+
+#
+# Reverse with empty blob
+#
+
+CREATE TABLE t1 (a BLOB);
+INSERT INTO t1 VALUES ('empty'), ('');
+SELECT a, REVERSE(a) FROM t1;
+DROP TABLE t1;
+
+#
+# BLOB with key
+#
+
+CREATE TABLE t1 (a BLOB, KEY (a(10)));
+INSERT INTO t1 VALUES ('bye'), ('hello'), ('hello'), ('hello word');
+SELECT * FROM t1 WHERE a LIKE 'hello%';
+DROP TABLE t1;
+
+#
+# TEXT key with count
+#
+
+CREATE TABLE t1 (
+  f1 INT NOT NULL,
+  f2 VARCHAR(16) NOT NULL,
+  f5 TEXT,
+  KEY index_name (f1, f2, f5(16))
+);
+INSERT INTO t1 VALUES (0, 'traktor', '1111111111111');
+INSERT INTO t1 VALUES (1, 'traktor', '1111111111111111111111111');
+SELECT COUNT(*) FROM t1 WHERE f2 = 'traktor';
+DROP TABLE t1;
+
+#
+# Tinyblob with key
+#
+
+CREATE TABLE t1 (foobar TINYBLOB NOT NULL, boggle SMALLINT NOT NULL, KEY (foobar(32), boggle));
+INSERT INTO t1 VALUES ('fish', 10), ('bear', 20);
+SELECT foobar, boggle FROM t1 WHERE foobar = 'fish';
+SELECT foobar, boggle FROM t1 WHERE foobar = 'fish' AND boggle = 10;
+DROP TABLE t1;
+
+#
+# TEXT NOT NULL with default empty
+#
+
+CREATE TABLE t1 (a TEXT DEFAULT '');
+INSERT INTO t1 VALUES (DEFAULT);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# Integer with text column
+#
+
+CREATE TABLE t1 (i INT NOT NULL DEFAULT '0', c TEXT NOT NULL, d VARCHAR(1) NOT NULL DEFAULT ' ', PRIMARY KEY (i), KEY (c(1), d));
+INSERT INTO t1 (i, c) VALUES (1, ''), (2, ''), (3, 'asdfh'), (4, '');
+SELECT MAX(i) FROM t1 WHERE c = '';
+DROP TABLE t1;
+
+#
+# LONGBLOB column
+#
+
+CREATE TABLE t1 (id INTEGER NOT NULL, imagem LONGBLOB NOT NULL DEFAULT '');
+INSERT INTO t1 (id) VALUES (1);
+SELECT id FROM t1;
+DROP TABLE t1;
+
+#
+# Bug #33969: update text field
+#
+
+CREATE TABLE t1 (id INT NOT NULL);
+CREATE TABLE t2 (id INT NOT NULL, c TEXT NOT NULL);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (1, '');
+UPDATE t2 SET c = REPEAT('1', 70000);
+SELECT LENGTH(c) FROM t2;
+DROP TABLE t1, t2;
+
+--echo # End of type_blob tests

@@ -75,6 +75,13 @@ argon2 = "0.5"
 # Hex encoding
 hex = "0.4"
 
+# SQL function support
+sha2 = "0.10"
+md-5 = "0.10"
+base64 = "0.22"
+flate2 = "1"
+aes = "0.8"
+
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

@@ -1,0 +1,17 @@
+
+#
+# test of unsigned int
+#
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+create table t1 (this int unsigned);
+insert into t1 values (1);
+insert into t1 values (0);
+insert into t1 values (4294967295);
+select * from t1;
+drop table t1;
+
+# End of 4.1 tests

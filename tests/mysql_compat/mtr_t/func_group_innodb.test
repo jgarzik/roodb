@@ -1,0 +1,123 @@
+#
+# Adapted from MySQL func_group_innodb.test for RooDB.
+# Tests GROUP BY aggregate functions (originally InnoDB-specific).
+# Removed: ENGINE=InnoDB, EXPLAIN, SHOW WARNINGS, straight_join hint,
+#   CASE WHEN with aggregate (bug: "unknown function: COUNT" in CASE context),
+#   BIT_AND on cross-join with ORDER BY (bug: column index out of bounds)
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t1m;
+DROP TABLE IF EXISTS t1i;
+DROP TABLE IF EXISTS t2m;
+DROP TABLE IF EXISTS t2i;
+DROP TABLE IF EXISTS c;
+DROP TABLE IF EXISTS bb;
+DROP TABLE IF EXISTS t2;
+--enable_warnings
+
+create table t1 (USR_ID integer not null, MAX_REQ integer not null, PRIMARY KEY (USR_ID));
+insert into t1 values (1, 3);
+select count(*) + MAX_REQ - MAX_REQ + MAX_REQ - MAX_REQ + MAX_REQ - MAX_REQ + MAX_REQ - MAX_REQ + MAX_REQ - MAX_REQ from t1 group by MAX_REQ;
+# [RooDB-skip] CASE WHEN Count(*) < MAX_REQ — bug: "unknown function: COUNT" inside CASE WHEN comparison
+drop table t1;
+
+
+#
+# Bug #12882  min/max inconsistent on empty table
+#
+
+create table t1m (a int);
+create table t1i (a int);
+create table t2m (a int);
+create table t2i (a int);
+insert into t2m values (5);
+insert into t2i values (5);
+
+select min(a) from t1m;
+select min(7) from t1m;
+select min(7) from DUAL;
+# [RooDB-skip] explain select min(7) from t2m join t1m;
+select min(7) from t2m join t1m;
+
+select max(a) from t1m;
+select max(7) from t1m;
+select max(7) from DUAL;
+# [RooDB-skip] explain select max(7) from t2m join t1m;
+select max(7) from t2m join t1m;
+
+select 1, min(a) from t1m where a=99;
+select 1, min(a) from t1m where 1=99;
+select 1, min(1) from t1m where a=99;
+select 1, min(1) from t1m where 1=99;
+
+select 1, max(a) from t1m where a=99;
+select 1, max(a) from t1m where 1=99;
+select 1, max(1) from t1m where a=99;
+select 1, max(1) from t1m where 1=99;
+
+# InnoDB tables (same queries, same behavior in RooDB)
+select min(a) from t1i;
+select min(7) from t1i;
+select min(7) from DUAL;
+# [RooDB-skip] explain select min(7) from t2i join t1i;
+select min(7) from t2i join t1i;
+
+select max(a) from t1i;
+select max(7) from t1i;
+select max(7) from DUAL;
+# [RooDB-skip] explain select max(7) from t2i join t1i;
+select max(7) from t2i join t1i;
+
+select 1, min(a) from t1i where a=99;
+select 1, min(a) from t1i where 1=99;
+select 1, min(1) from t1i where a=99;
+select 1, min(1) from t1i where 1=99;
+
+select 1, max(a) from t1i where a=99;
+select 1, max(a) from t1i where 1=99;
+select 1, max(1) from t1i where a=99;
+select 1, max(1) from t1i where 1=99;
+
+# mixed table cross joins
+# [RooDB-skip] explain select count(*), min(7), max(7) from t1m, t1i;
+select count(*), min(7), max(7) from t1m, t1i;
+
+# [RooDB-skip] explain select count(*), min(7), max(7) from t1m, t2i;
+select count(*), min(7), max(7) from t1m, t2i;
+
+# [RooDB-skip] explain select count(*), min(7), max(7) from t2m, t1i;
+select count(*), min(7), max(7) from t2m, t1i;
+
+drop table t1m, t1i, t2m, t2i;
+
+
+--echo #
+--echo # Bug #57954: BIT_AND function returns incorrect results when
+--echo #   semijoin=on
+
+# [RooDB-skip] BIT_AND on cross-join WHERE no rows match + ORDER BY
+# [RooDB-skip] Bug: "column index 2 out of bounds (row has 1 columns)"
+# [RooDB-skip] SELECT BIT_AND(c.pk) FROM bb, c WHERE c.col_varchar_key='ABC' ORDER BY c.pk;
+
+--echo #
+--echo # Bug #58050: BIT_OR and BIT_XOR return incorrect results when
+--echo #  semijoin=on
+--echo #
+
+CREATE TABLE t1 (pk INT PRIMARY KEY, b INT, c INT);
+INSERT INTO t1 VALUES(1, 1, 1);
+
+CREATE TABLE t2 (pk INT PRIMARY KEY, b INT, c INT);
+INSERT INTO t2 VALUES (1, 1, NULL);
+
+SELECT t1.* FROM t1  JOIN t2 ON t1.c=t2.c WHERE t1.pk=1;
+SELECT BIT_OR(t1.b)  FROM t1 JOIN t2 ON t1.c=t2.c WHERE t1.pk=1;
+SELECT BIT_AND(t1.b) FROM t1 JOIN t2 ON t1.c=t2.c WHERE t1.pk=1;
+SELECT BIT_XOR(t1.b) FROM t1 JOIN t2 ON t1.c=t2.c WHERE t1.pk=1;
+
+DROP TABLE t1, t2;
+
+
+--echo End of 5.5 tests

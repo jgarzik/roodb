@@ -14,6 +14,7 @@ use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
 use parking_lot::RwLock;
 
+use crate::catalog::system_tables::is_system_table;
 use crate::raft::changes::ChangeOp;
 use crate::raft::types::{
     Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
@@ -21,8 +22,7 @@ use crate::raft::types::{
 };
 use crate::storage::StorageEngine;
 
-/// MVCC row header size: txn_id(8) + roll_ptr(8) + deleted(1) = 17 bytes
-const MVCC_HEADER_SIZE: usize = 17;
+use super::types::MVCC_HEADER_SIZE;
 
 /// Encode a row with MVCC header format (matches MvccStorage::encode_row)
 ///
@@ -214,37 +214,71 @@ impl RaftStateMachine<TypeConfig> for MemStorage {
                 EntryPayload::Normal(cmd) => {
                     let resp = match cmd {
                         Command::DataChange(changeset) => {
-                            // Apply changes to storage with MVCC format
-                            // This matches the format used by MvccStorage::put/delete,
-                            // making Raft apply idempotent with direct MVCC writes.
+                            // Apply changes to storage with MVCC format.
+                            // Two-phase: pre-scan for duplicate key conflicts, then apply.
+                            // This ensures atomicity — no partial writes on conflict.
                             if let Some(ref storage) = storage {
-                                for change in &changeset.changes {
-                                    let result = match change.op {
-                                        ChangeOp::Insert | ChangeOp::Update => {
-                                            let data = change.value.as_deref().unwrap_or(&[]);
-                                            let encoded =
-                                                encode_mvcc_row(changeset.txn_id, false, data);
-                                            storage.put(&change.key, &encoded).await
+                                // Phase 1: pre-scan inserts for duplicate keys
+                                let mut conflict_error: Option<String> = None;
+                                let mut skip_indices = Vec::new();
+                                for (idx, change) in changeset.changes.iter().enumerate() {
+                                    if change.op == ChangeOp::Insert
+                                        && !is_system_table(&change.table)
+                                    {
+                                        if let Ok(Some(existing)) = storage.get(&change.key).await {
+                                            let is_tombstone =
+                                                super::types::is_mvcc_tombstone(&existing);
+                                            if !is_tombstone {
+                                                if changeset.ignore_duplicates {
+                                                    skip_indices.push(idx);
+                                                } else {
+                                                    conflict_error = Some(format!(
+                                                        "Duplicate key: row in '{}' already exists",
+                                                        change.table
+                                                    ));
+                                                    break;
+                                                }
+                                            }
                                         }
-                                        ChangeOp::Delete => {
-                                            // MVCC deletes write a tombstone, not actual delete
-                                            let encoded =
-                                                encode_mvcc_row(changeset.txn_id, true, &[]);
-                                            storage.put(&change.key, &encoded).await
-                                        }
-                                    };
-
-                                    if let Err(e) = result {
-                                        tracing::error!("Failed to apply change to storage: {}", e);
-                                        // Continue applying other changes
                                     }
+                                }
+
+                                if let Some(err_msg) = conflict_error {
+                                    CommandResponse::Error(err_msg)
+                                } else {
+                                    // Phase 2: apply all changes (skipping duplicates if IGNORE)
+                                    for (idx, change) in changeset.changes.iter().enumerate() {
+                                        if skip_indices.contains(&idx) {
+                                            continue;
+                                        }
+                                        let result = match change.op {
+                                            ChangeOp::Insert | ChangeOp::Update => {
+                                                let data = change.value.as_deref().unwrap_or(&[]);
+                                                let encoded =
+                                                    encode_mvcc_row(changeset.txn_id, false, data);
+                                                storage.put(&change.key, &encoded).await
+                                            }
+                                            ChangeOp::Delete => {
+                                                let encoded =
+                                                    encode_mvcc_row(changeset.txn_id, true, &[]);
+                                                storage.put(&change.key, &encoded).await
+                                            }
+                                        };
+                                        if let Err(e) = result {
+                                            tracing::error!(
+                                                "Failed to apply change to storage: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    CommandResponse::Ok(None)
                                 }
                             } else {
                                 tracing::warn!(
                                     "No storage engine configured, changes not persisted"
                                 );
+                                CommandResponse::Ok(None)
                             }
-                            CommandResponse::Ok(None)
                         }
                         Command::Noop => CommandResponse::Ok(None),
                     };

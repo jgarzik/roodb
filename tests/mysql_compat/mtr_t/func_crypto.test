@@ -1,0 +1,20 @@
+--echo # RANDOM_BYTES and AES_ENCRYPT/AES_DECRYPT
+
+--echo # --- RANDOM_BYTES ---
+SELECT LENGTH(HEX(RANDOM_BYTES(16))) = 32;
+SELECT LENGTH(HEX(RANDOM_BYTES(1))) = 2;
+SELECT LENGTH(HEX(RANDOM_BYTES(32))) = 64;
+SELECT RANDOM_BYTES(NULL) IS NULL;
+
+--echo # --- AES_ENCRYPT / AES_DECRYPT round-trip ---
+SELECT AES_DECRYPT(AES_ENCRYPT('hello', 'secret'), 'secret');
+SELECT AES_DECRYPT(AES_ENCRYPT('', 'key'), 'key');
+SELECT AES_DECRYPT(AES_ENCRYPT('test data 12345', 'mykey'), 'mykey');
+
+--echo # --- AES with NULL ---
+SELECT AES_ENCRYPT(NULL, 'key') IS NULL;
+SELECT AES_DECRYPT(NULL, 'key') IS NULL;
+SELECT AES_ENCRYPT('hello', NULL) IS NULL;
+
+--echo # --- AES wrong key returns NULL ---
+SELECT AES_DECRYPT(AES_ENCRYPT('hello', 'key1'), 'key2') IS NULL;

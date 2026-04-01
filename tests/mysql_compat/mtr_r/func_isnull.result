@@ -1,0 +1,79 @@
+drop table if exists t1;
+create table t1 (id int auto_increment primary key not null, mydate date not null);
+insert into t1 values (0,"2002-05-01"),(0,"2002-05-01"),(0,"2002-05-01");
+select * from t1 where isnull(to_days(mydate));
+id	mydate
+drop table t1;
+#
+# Bug#53933 crash when using uncacheable subquery in the having clause of outer query
+#
+End of 5.0 tests
+CREATE TABLE t1 (id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id));
+INSERT INTO t1( id ) VALUES ( NULL );
+SELECT t1.id  FROM t1  WHERE (id  is not null and id is null );
+id
+DROP TABLE t1;
+#
+# Bug#29027883 INCORRECT RESULT OF LEFT JOIN
+#
+CREATE TABLE t1 (
+pk int NOT NULL,
+col_int_key INT NOT NULL,
+col_date_key date NOT NULL,
+PRIMARY KEY (pk),
+KEY col_int_key (col_int_key),
+KEY col_date_key (col_date_key)
+);
+INSERT INTO t1 VALUES (14,4,'2000-01-01'), (15,2,'2003-01-13'),
+(16,5,'2006-07-07'), (17,3,'2000-01-01');
+CREATE TABLE t2 (
+pk INT NOT NULL,
+PRIMARY KEY (pk)
+);
+INSERT INTO t2 VALUES (1), (2), (3);
+CREATE TABLE t3(pk INT NOT NULL);
+INSERT INTO t3 VALUES(3),(3);
+delete from t3;
+INSERT INTO t3 VALUES(3);
+select * from t3, t1 where t1.col_date_key is null;
+pk	pk	col_int_key	col_date_key
+select * from t3 join t1 on t1.col_date_key is null;
+pk	pk	col_int_key	col_date_key
+select * from t3 left join t1 on t1.col_date_key is null;
+pk	pk	col_int_key	col_date_key
+3	NULL	NULL	NULL
+select * from t3 left join t1 on t1.col_date_key is null
+where t1.col_date_key is null;
+pk	pk	col_int_key	col_date_key
+3	NULL	NULL	NULL
+select * from t3, t1 where t1.col_date_key is not null;
+pk	pk	col_int_key	col_date_key
+3	14	4	2000-01-01
+3	15	2	2003-01-13
+3	16	5	2006-07-07
+3	17	3	2000-01-01
+select * from t3, t1 where not (t1.col_date_key is null);
+pk	pk	col_int_key	col_date_key
+3	14	4	2000-01-01
+3	15	2	2003-01-13
+3	16	5	2006-07-07
+3	17	3	2000-01-01
+DROP TABLE t1,t2,t3;
+#
+# Bug #32171239: HYPERGRAPH: ASSERTION FAILED.
+#
+#
+# Bug#32231698: SETUP_FIELDS: ASSERTION FAILED
+#
+#
+# Bug#34808199: Assertion failed.
+#
+CREATE TABLE t(x INT NOT NULL);
+INSERT INTO t VALUES (0), (1);
+SELECT t1.x IS NULL = t2.x AS col FROM t AS t1, t AS t2 ORDER BY col;
+col
+0
+0
+0
+0
+DROP TABLE t;

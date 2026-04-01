@@ -1,0 +1,124 @@
+#
+# Custom test for RooDB: CROSS JOIN and implicit join syntax.
+# Tests CROSS JOIN, comma-separated implicit joins, self joins,
+# and cross join edge cases.
+#
+# [RooDB-skip] NATURAL JOIN (not implemented)
+# [RooDB-skip] JOIN ... USING (not implemented)
+#
+
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+DROP TABLE IF EXISTS t3;
+
+#
+# Setup
+#
+
+CREATE TABLE t1 (a INT, b VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+CREATE TABLE t2 (x INT, y VARCHAR(10));
+INSERT INTO t2 VALUES (10, 'ten'), (20, 'twenty');
+
+CREATE TABLE t3 (a INT, c VARCHAR(10));
+INSERT INTO t3 VALUES (1, 'alpha'), (2, 'beta'), (4, 'delta');
+
+#
+# CROSS JOIN (explicit)
+#
+
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x;
+SELECT COUNT(*) FROM t1 CROSS JOIN t2;
+
+#
+# Implicit cross join (comma syntax)
+#
+
+SELECT t1.a, t2.x FROM t1, t2 ORDER BY t1.a, t2.x;
+SELECT COUNT(*) FROM t1, t2;
+
+#
+# Cross join with WHERE (becomes an inner join conceptually)
+#
+
+SELECT t1.a, t1.b, t2.x, t2.y FROM t1, t2 WHERE t1.a * 10 = t2.x ORDER BY t1.a;
+
+#
+# Three-way cross join
+#
+
+SELECT COUNT(*) FROM t1 CROSS JOIN t2 CROSS JOIN t3;
+SELECT COUNT(*) FROM t1, t2, t3;
+
+#
+# Self cross join
+#
+
+SELECT a.a, b.a FROM t1 AS a CROSS JOIN t1 AS b WHERE a.a < b.a ORDER BY a.a, b.a;
+
+#
+# Self join with different conditions
+#
+
+SELECT a.a, a.b, b.a, b.b FROM t1 AS a, t1 AS b WHERE a.a + 1 = b.a ORDER BY a.a;
+
+#
+# Cross join with aggregates
+#
+
+SELECT t1.a, COUNT(*) AS cnt FROM t1 CROSS JOIN t2 GROUP BY t1.a ORDER BY t1.a;
+SELECT t2.x, SUM(t1.a) AS sum_a FROM t1 CROSS JOIN t2 GROUP BY t2.x ORDER BY t2.x;
+
+#
+# Cross join with HAVING
+#
+
+SELECT t1.a, COUNT(*) AS cnt FROM t1 CROSS JOIN t2 GROUP BY t1.a HAVING cnt > 1 ORDER BY t1.a;
+
+#
+# Cross join with empty table
+#
+
+CREATE TABLE t4 (z INT);
+SELECT COUNT(*) FROM t1 CROSS JOIN t4;
+SELECT * FROM t1 CROSS JOIN t4;
+DROP TABLE t4;
+
+#
+# Cross join combined with regular join
+#
+
+SELECT t1.a, t1.b, t3.c, t2.x
+FROM t1 JOIN t3 ON t1.a = t3.a CROSS JOIN t2
+ORDER BY t1.a, t2.x;
+
+#
+# Cross join with LIMIT
+#
+
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x LIMIT 3;
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x LIMIT 2 OFFSET 3;
+
+#
+# Cross join with DISTINCT
+#
+
+SELECT DISTINCT t1.b FROM t1, t2 ORDER BY t1.b;
+
+#
+# Cross join with subquery
+#
+
+SELECT * FROM (SELECT t1.a, t2.x FROM t1 CROSS JOIN t2) AS sub WHERE a = 1 ORDER BY x;
+
+#
+# Verify CROSS JOIN and comma produce same results
+#
+
+SELECT COUNT(*) AS cross_count FROM t1 CROSS JOIN t2;
+SELECT COUNT(*) AS comma_count FROM t1, t2;
+
+DROP TABLE t1, t2, t3;
+
+--echo # End of cross_join tests

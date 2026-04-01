@@ -1,0 +1,71 @@
+#
+# Adapted from MySQL func_op.test for RooDB.
+# Tests simple arithmetic operands, grouping, and bit operations.
+#
+# [RooDB-skip] EXPLAIN output format differs
+# [RooDB-skip] --sorted_result for LEFT JOIN with BIT_COUNT (complex)
+
+#
+# Simple operands and arithmetic grouping
+#
+
+SELECT 1+1, 1-1, 1+1*2, 8/5, 8%5, MOD(8,5), MOD(8,5)|0, -(1+1)*-2;
+
+SELECT 1 | (1+1), 5 & 3, BIT_COUNT(7);
+
+SELECT 1 << 32, 1 << 63, 1 << 64, 4 >> 2, 4 >> 63, 1 << 63 >> 60;
+
+#
+# Bug #1993: bit functions must be unsigned
+#
+
+SELECT -1 | 0, -1 ^ 0, -1 & 0;
+SELECT -1 | 1, -1 ^ 1, -1 & 1;
+SELECT  1 | -1,  1 ^ -1,  1 & -1;
+SELECT  0 | -1,  0 ^ -1,  0 & -1;
+SELECT -1 >> 0, -1 << 0;
+SELECT -1 >> 1, -1 << 1;
+
+#
+# Bug 13044: wrong bit_count() results with LEFT JOIN and NULLs
+#
+
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+
+CREATE TABLE t1(a INT);
+CREATE TABLE t2(a INT, b INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+INSERT INTO t2 VALUES (1, 7), (3, 7);
+
+SELECT t1.a, t2.a, t2.b, BIT_COUNT(t2.b) FROM t1 LEFT JOIN t2 ON t1.a=t2.a ORDER BY t1.a;
+
+DROP TABLE t1, t2;
+
+#
+# Additional arithmetic edge cases
+#
+
+SELECT 0 / 0;
+SELECT 1 / 0;
+SELECT -1 / 0;
+SELECT 0 % 0;
+SELECT 1 % 0;
+SELECT MOD(0, 0);
+SELECT MOD(1, 0);
+
+#
+# Operator precedence
+#
+
+SELECT 2 + 3 * 4;
+SELECT (2 + 3) * 4;
+SELECT 10 - 2 - 3;
+SELECT 10 - (2 - 3);
+SELECT 2 * 3 + 4 * 5;
+SELECT 100 / 10 / 2;
+SELECT 100 / (10 / 2);
+SELECT 7 % 3 + 1;
+SELECT 7 % (3 + 1);
+
+--echo # End of func_op tests

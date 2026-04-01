@@ -201,6 +201,15 @@ impl CostEstimator {
                 }
             }
 
+            PhysicalPlan::Window { input, .. } => {
+                let input_cost = Self::estimate_node(input);
+                Cost {
+                    rows: input_cost.rows,
+                    cpu: input_cost.cpu + input_cost.rows,
+                    io: input_cost.io,
+                }
+            }
+
             PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::CreateTableAs { .. }
             | PhysicalPlan::Materialize { .. }

@@ -1,0 +1,83 @@
+#
+# Problem with count(distinct) (trimmed for RooDB)
+#
+# [RooDB-skip] --source include/turn_off_only_full_group_by.inc
+# [RooDB-skip] --skip_if_hypergraph
+# [RooDB-skip] @bar:= user variables
+# [RooDB-skip] VIEWs
+# [RooDB-skip] SET SESSION big_tables
+# [RooDB-skip] GROUP_CONCAT / WITH ROLLUP
+# [RooDB-skip] Subqueries in FROM clause
+# [RooDB-skip] optimizer_switch
+# [RooDB-skip] BLOB primary key
+# [RooDB-skip] multi-table JOIN queries from original (too complex)
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# Problem with LEFT JOIN
+#
+CREATE TABLE t1 (f1 INT);
+INSERT INTO t1 VALUES (1);
+CREATE TABLE t2 (f1 INT, f2 INT);
+SELECT t1.f1, COUNT(DISTINCT t2.f2), COUNT(DISTINCT 1, NULL) FROM t1 LEFT JOIN t2 ON t1.f1=t2.f1 GROUP BY t1.f1 ORDER BY t1.f1;
+DROP TABLE t1, t2;
+
+# Empty tables
+CREATE TABLE t1 (f INT);
+SELECT COUNT(DISTINCT f) FROM t1;
+DROP TABLE t1;
+
+# Bug #6515
+CREATE TABLE t1 (a CHAR(3), b CHAR(20), PRIMARY KEY (a, b));
+INSERT INTO t1 VALUES ('ABW', 'Dutch'), ('ABW', 'English');
+# [RooDB-skip] COUNT(DISTINCT) with GROUP BY not fully supported
+SELECT COUNT(DISTINCT a) FROM t1;
+DROP TABLE t1;
+
+# Bug #9593 - COUNT, DISTINCT and CONCAT
+CREATE TABLE t1 (f1 INT, f2 INT);
+INSERT INTO t1 VALUES (0,1),(1,2);
+SELECT COUNT(DISTINCT IF(f1,3,f2)) FROM t1;
+DROP TABLE t1;
+
+# COUNT(DISTINCT) on small table
+CREATE TABLE t1 (i INT);
+INSERT INTO t1 VALUES (0), (1);
+SELECT COUNT(DISTINCT i) FROM t1;
+DROP TABLE t1;
+
+--echo #
+--echo # Bug#11760197: INCORRECT RESULTS WITH COUNT DISTINCT
+--echo #
+CREATE TABLE t1 (a INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1),(2);
+SELECT COUNT(DISTINCT t1.a) FROM t1, t1 t2 WHERE t1.a = 1;
+DROP TABLE t1;
+
+CREATE TABLE t1 (a CHAR PRIMARY KEY);
+INSERT INTO t1 VALUES (1),(2);
+SELECT COUNT(DISTINCT t1.a) FROM t1, t1 t2 WHERE t1.a = 1;
+SELECT COUNT(DISTINCT t1.a) FROM t1, t1 t2 WHERE t1.a = '1';
+DROP TABLE t1;
+
+# Bug #18853696 - COUNT DISTINCT with JOINs
+CREATE TABLE t1 (pk INT NOT NULL, col_varchar_key VARCHAR(1), PRIMARY KEY (pk));
+INSERT INTO t1 VALUES (10,'x'),(11,'d'),(12,'r'),(13,'f'),(14,'y');
+
+CREATE TABLE t2 (pk INT NOT NULL, col_int_nokey INT, col_varchar_key VARCHAR(1), PRIMARY KEY (pk));
+INSERT INTO t2 VALUES (1,7,'x');
+
+SELECT COUNT(DISTINCT table1.col_varchar_key)
+FROM t2 AS table1
+JOIN t1 AS table2 ON (table2.pk = table1.col_int_nokey)
+WHERE table1.pk = 1;
+
+SELECT COUNT(table1.col_varchar_key)
+FROM t2 AS table1
+JOIN t1 AS table2 ON (table2.pk = table1.col_int_nokey)
+WHERE table1.pk = 1;
+
+DROP TABLE t1, t2;

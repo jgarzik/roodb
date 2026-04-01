@@ -1,0 +1,105 @@
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+DROP TABLE IF EXISTS t3;
+CREATE TABLE t1 (a INT, b VARCHAR(10));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE t2 (x INT, y VARCHAR(10));
+INSERT INTO t2 VALUES (10, 'ten'), (20, 'twenty');
+CREATE TABLE t3 (a INT, c VARCHAR(10));
+INSERT INTO t3 VALUES (1, 'alpha'), (2, 'beta'), (4, 'delta');
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x;
+a	x
+1	10
+1	20
+2	10
+2	20
+3	10
+3	20
+SELECT COUNT(*) FROM t1 CROSS JOIN t2;
+COUNT(NULL)
+6
+SELECT t1.a, t2.x FROM t1, t2 ORDER BY t1.a, t2.x;
+a	x
+1	10
+1	20
+2	10
+2	20
+3	10
+3	20
+SELECT COUNT(*) FROM t1, t2;
+COUNT(NULL)
+6
+SELECT t1.a, t1.b, t2.x, t2.y FROM t1, t2 WHERE t1.a * 10 = t2.x ORDER BY t1.a;
+a	b	x	y
+1	one	10	ten
+2	two	20	twenty
+SELECT COUNT(*) FROM t1 CROSS JOIN t2 CROSS JOIN t3;
+COUNT(NULL)
+18
+SELECT COUNT(*) FROM t1, t2, t3;
+COUNT(NULL)
+18
+SELECT a.a, b.a FROM t1 AS a CROSS JOIN t1 AS b WHERE a.a < b.a ORDER BY a.a, b.a;
+a	a
+1	2
+1	3
+2	3
+SELECT a.a, a.b, b.a, b.b FROM t1 AS a, t1 AS b WHERE a.a + 1 = b.a ORDER BY a.a;
+a	b	a	b
+1	one	2	two
+2	two	3	three
+SELECT t1.a, COUNT(*) AS cnt FROM t1 CROSS JOIN t2 GROUP BY t1.a ORDER BY t1.a;
+a	cnt
+1	2
+2	2
+3	2
+SELECT t2.x, SUM(t1.a) AS sum_a FROM t1 CROSS JOIN t2 GROUP BY t2.x ORDER BY t2.x;
+x	sum_a
+10	6
+20	6
+SELECT t1.a, COUNT(*) AS cnt FROM t1 CROSS JOIN t2 GROUP BY t1.a HAVING cnt > 1 ORDER BY t1.a;
+a	cnt
+1	2
+2	2
+3	2
+CREATE TABLE t4 (z INT);
+SELECT COUNT(*) FROM t1 CROSS JOIN t4;
+COUNT(NULL)
+0
+SELECT * FROM t1 CROSS JOIN t4;
+a	b	z
+DROP TABLE t4;
+SELECT t1.a, t1.b, t3.c, t2.x
+FROM t1 JOIN t3 ON t1.a = t3.a CROSS JOIN t2
+ORDER BY t1.a, t2.x;
+a	b	c	x
+1	one	alpha	10
+1	one	alpha	20
+2	two	beta	10
+2	two	beta	20
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x LIMIT 3;
+a	x
+1	10
+1	20
+2	10
+SELECT t1.a, t2.x FROM t1 CROSS JOIN t2 ORDER BY t1.a, t2.x LIMIT 2 OFFSET 3;
+a	x
+2	20
+3	10
+SELECT DISTINCT t1.b FROM t1, t2 ORDER BY t1.b;
+b
+one
+three
+two
+SELECT * FROM (SELECT t1.a, t2.x FROM t1 CROSS JOIN t2) AS sub WHERE a = 1 ORDER BY x;
+a	x
+1	10
+1	20
+SELECT COUNT(*) AS cross_count FROM t1 CROSS JOIN t2;
+cross_count
+6
+SELECT COUNT(*) AS comma_count FROM t1, t2;
+comma_count
+6
+DROP TABLE t1, t2, t3;
+# End of cross_join tests

@@ -1,0 +1,43 @@
+# Adapted from MySQL func_default.test for RooDB compatibility testing.
+# Tests the DEFAULT keyword in INSERT VALUES for retrieving column default values.
+#
+# [RooDB-skip] DEFAULT() function expression — not supported
+# [RooDB-skip] EXPLAIN for default expressions
+# [RooDB-skip] HAVING DEFAULT() — MySQL-specific error
+
+--disable_warnings
+drop table if exists t1,t2;
+--enable_warnings
+
+# Test explicit DEFAULT keyword in VALUES clause
+create table t1(str varchar(10) default 'def',strnull varchar(10),intg int default '10',rel double default '3.14');
+
+# Explicit values
+insert into t1 values ('','',0,0.0);
+select * from t1;
+
+# DEFAULT keyword in VALUES should use column defaults
+insert into t1 values (DEFAULT, DEFAULT, DEFAULT, DEFAULT);
+select * from t1 order by intg;
+
+drop table t1;
+
+# Test DEFAULT with mixed values
+CREATE TABLE t1 (a INT DEFAULT 5, b VARCHAR(10) DEFAULT 'world', c INT);
+INSERT INTO t1 VALUES (DEFAULT, DEFAULT, 42);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# Test DEFAULT with NOT NULL column
+CREATE TABLE t1 (a INT NOT NULL DEFAULT 99);
+INSERT INTO t1 VALUES (DEFAULT);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# Test implicit defaults (omitting columns) still work
+CREATE TABLE t1 (a INT DEFAULT 5, b VARCHAR(10));
+INSERT INTO t1 (b) VALUES ('hello');
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# End of tests

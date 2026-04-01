@@ -1,0 +1,25 @@
+--echo # MD5, SHA1, SHA, SHA2 hash functions
+
+--echo # --- MD5 ---
+SELECT MD5('testing');
+SELECT MD5('');
+SELECT MD5('Hello, World!');
+SELECT MD5(NULL);
+
+--echo # --- SHA1 / SHA ---
+SELECT SHA1('abc');
+SELECT SHA('abc');
+SELECT SHA1('');
+SELECT SHA1(NULL);
+
+--echo # --- SHA2 with various lengths ---
+SELECT SHA2('abc', 256);
+SELECT SHA2('abc', 0);
+SELECT SHA2('abc', 224);
+SELECT SHA2('abc', 384);
+SELECT SHA2('abc', 512);
+
+--echo # --- SHA2 invalid length ---
+SELECT SHA2('abc', 999);
+SELECT SHA2('abc', 128);
+SELECT SHA2(NULL, 256);

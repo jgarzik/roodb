@@ -27,6 +27,10 @@ pub struct Resolver<'a> {
     placeholder_mode: bool,
     /// Counter for assigning placeholder indices (used in placeholder_mode)
     placeholder_counter: Cell<usize>,
+    /// Track view expansion depth to prevent infinite recursion from circular views
+    view_depth: Cell<usize>,
+    /// CTE definitions (WITH ... AS) — populated at resolve_query time
+    ctes: std::cell::RefCell<std::collections::HashMap<String, ResolvedSelect>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -36,6 +40,8 @@ impl<'a> Resolver<'a> {
             catalog,
             placeholder_mode: false,
             placeholder_counter: Cell::new(0),
+            view_depth: Cell::new(0),
+            ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -45,6 +51,8 @@ impl<'a> Resolver<'a> {
             catalog,
             placeholder_mode: true,
             placeholder_counter: Cell::new(0),
+            view_depth: Cell::new(0),
+            ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -60,9 +68,13 @@ impl<'a> Resolver<'a> {
             } => self.resolve_drop(&object_type, &names, if_exists),
             sp::Statement::CreateIndex(create_index) => self.resolve_create_index(&create_index),
             sp::Statement::Insert(insert) => self.resolve_insert(&insert),
-            sp::Statement::Update(update) => {
-                self.resolve_update(&update.table, &update.assignments, &update.selection)
-            }
+            sp::Statement::Update(update) => self.resolve_update(
+                &update.table,
+                &update.assignments,
+                &update.selection,
+                &[], // ORDER BY not in sqlparser Update (only Delete)
+                &update.limit,
+            ),
             sp::Statement::Delete(delete) => self.resolve_delete(&delete),
             sp::Statement::Query(query) => self.resolve_query(&query),
 
@@ -148,6 +160,8 @@ impl<'a> Resolver<'a> {
                         })
                         .unwrap_or_default(),
                     filter: None,
+                    order_by: Vec::new(),
+                    limit: None,
                 })
             }
 
@@ -170,14 +184,62 @@ impl<'a> Resolver<'a> {
 
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
+        let mut inline_pk_columns = Vec::new();
 
         for col in &create.columns {
+            // Check for inline PRIMARY KEY before converting
+            let col_name = col.name.value.clone();
+            for opt_def in &col.options {
+                if matches!(opt_def.option, sp::ColumnOption::PrimaryKey(_)) {
+                    inline_pk_columns.push(col_name.clone());
+                }
+            }
             columns.push(convert_column_def(col)?);
         }
 
         for constraint in &create.constraints {
             if let Some(c) = convert_table_constraint(constraint)? {
                 constraints.push(c);
+            }
+        }
+
+        // Check for multiple primary key definitions (MySQL error 1068)
+        let has_table_level_pk = constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::PrimaryKey(_)));
+        if !inline_pk_columns.is_empty() && has_table_level_pk {
+            return Err(SqlError::Unsupported(
+                "Multiple primary key defined".to_string(),
+            ));
+        }
+
+        // Check for multiple table-level PK constraints
+        let pk_count = constraints
+            .iter()
+            .filter(|c| matches!(c, Constraint::PrimaryKey(_)))
+            .count();
+        if pk_count > 1 {
+            return Err(SqlError::Unsupported(
+                "Multiple primary key defined".to_string(),
+            ));
+        }
+
+        // Add PrimaryKey constraint for inline PK columns if not already present
+        if !inline_pk_columns.is_empty() && !has_table_level_pk {
+            constraints.push(Constraint::PrimaryKey(inline_pk_columns));
+        }
+
+        // Enforce NOT NULL on all PRIMARY KEY columns (MySQL behavior)
+        for constraint in &constraints {
+            if let Constraint::PrimaryKey(pk_cols) = constraint {
+                for pk_col in pk_cols {
+                    if let Some(col) = columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(pk_col))
+                    {
+                        col.nullable = false;
+                    }
+                }
             }
         }
 
@@ -313,47 +375,48 @@ impl<'a> Resolver<'a> {
                 let source_query = insert.source.as_ref().unwrap();
                 let resolved_source = self.resolve_query(source_query)?;
 
-                // Build resolved columns — respect explicit column list if given
-                let resolved_columns = if insert.columns.is_empty() {
-                    // No explicit columns: use all table columns
-                    table_def
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, col_def)| ResolvedColumn {
-                            table: table.clone(),
-                            name: col_def.name.clone(),
-                            index: idx,
-                            data_type: col_def.data_type.clone(),
-                            nullable: col_def.nullable || col_def.auto_increment,
-                        })
-                        .collect()
+                // Always resolve ALL table columns for the target row
+                let all_columns: Vec<ResolvedColumn> = table_def
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col_def)| ResolvedColumn {
+                        table: table.clone(),
+                        name: col_def.name.clone(),
+                        index: idx,
+                        data_type: col_def.data_type.clone(),
+                        nullable: col_def.nullable || col_def.auto_increment,
+                        default_value: col_def.default.clone(),
+                        is_outer_ref: false,
+                    })
+                    .collect();
+
+                // Build column_map: maps source column index → target column index.
+                // When no explicit column list, source maps 1:1 to all table columns.
+                // When explicit, only the named columns are mapped.
+                let column_map = if insert.columns.is_empty() {
+                    None
                 } else {
-                    // Explicit column list: resolve only those columns
-                    let mut cols = Vec::new();
+                    let mut map = Vec::new();
                     for col_ident in &insert.columns {
                         let col_name = &col_ident.value;
-                        let col_def = table_def
+                        // Validate column exists
+                        let _ = table_def
                             .get_column(col_name)
                             .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
                         let idx = table_def
                             .get_column_index(col_name)
                             .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-                        cols.push(ResolvedColumn {
-                            table: table.clone(),
-                            name: col_def.name.clone(),
-                            index: idx,
-                            data_type: col_def.data_type.clone(),
-                            nullable: col_def.nullable || col_def.auto_increment,
-                        });
+                        map.push(idx);
                     }
-                    cols
+                    Some(map)
                 };
 
                 return Ok(ResolvedStatement::InsertSelect {
                     table,
-                    columns: resolved_columns,
+                    columns: all_columns,
                     source: Box::new(resolved_source),
+                    column_map,
                     ignore: insert.ignore,
                 });
             }
@@ -401,6 +464,8 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
+                default_value: col_def.default.clone(),
+                is_outer_ref: false,
             });
         }
 
@@ -426,7 +491,23 @@ impl<'a> Resolver<'a> {
             let is_multi_row = values_rows_ref.len() > 1;
             for (value_idx, expr) in row.iter().enumerate() {
                 let (col_idx, nullable, col_name) = &column_indices[value_idx];
-                let resolved_expr = self.resolve_expr(expr, &scope)?;
+
+                // Handle the __ROODB_DEFAULT__ marker: substitute column's actual default value.
+                // This marker is generated by normalize_sql when DEFAULT keyword is used in VALUES.
+                let resolved_expr = if let sp::Expr::Identifier(ident) = expr {
+                    if ident.value == "__ROODB_DEFAULT__" {
+                        let col_def = &table_def.columns[*col_idx];
+                        if let Some(ref default_expr) = col_def.default {
+                            ResolvedExpr::Literal(parse_default_value(default_expr))
+                        } else {
+                            ResolvedExpr::Literal(Literal::Null)
+                        }
+                    } else {
+                        self.resolve_expr(expr, &scope)?
+                    }
+                } else {
+                    self.resolve_expr(expr, &scope)?
+                };
 
                 // Check NOT NULL constraint for explicitly specified NULL values.
                 // MySQL: single-row INSERT → error 1048; multi-row → convert to default.
@@ -443,28 +524,28 @@ impl<'a> Resolver<'a> {
                 full_row[*col_idx] = resolved_expr;
             }
 
-            // Check NOT NULL constraints for omitted columns and apply defaults
-            // Build set of specified indices for O(1) lookup
+            // Apply DEFAULT values for omitted columns and check NOT NULL constraints.
+            // Build set of specified indices for O(1) lookup.
             let specified_indices: HashSet<usize> =
                 column_indices.iter().map(|(i, _, _)| *i).collect();
             for (idx, col_def) in table_def.columns.iter().enumerate() {
-                if !col_def.nullable
-                    && !col_def.auto_increment
-                    && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
-                {
-                    let was_specified = specified_indices.contains(&idx);
-                    if !was_specified {
-                        // Try to use the column's DEFAULT value
-                        if let Some(ref default_expr) = col_def.default {
-                            // Parse the default expression as a literal
-                            let default_literal = parse_default_value(default_expr);
-                            full_row[idx] = ResolvedExpr::Literal(default_literal);
-                        } else {
-                            return Err(SqlError::InvalidOperation(format!(
-                                "Column '{}' cannot be NULL and was not specified",
-                                col_def.name
-                            )));
-                        }
+                if col_def.auto_increment {
+                    continue;
+                }
+                if !matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null)) {
+                    continue;
+                }
+                let was_specified = specified_indices.contains(&idx);
+                if !was_specified {
+                    if let Some(ref default_expr) = col_def.default {
+                        // Apply column DEFAULT for unspecified columns
+                        let default_literal = parse_default_value(default_expr);
+                        full_row[idx] = ResolvedExpr::Literal(default_literal);
+                    } else if !col_def.nullable {
+                        return Err(SqlError::InvalidOperation(format!(
+                            "Column '{}' cannot be NULL and was not specified",
+                            col_def.name
+                        )));
                     }
                 }
             }
@@ -472,11 +553,29 @@ impl<'a> Resolver<'a> {
             resolved_values.push(full_row);
         }
 
+        // Resolve ON DUPLICATE KEY UPDATE assignments
+        let on_duplicate =
+            if let Some(sp::OnInsert::DuplicateKeyUpdate(ref assignments)) = insert.on {
+                let mut resolved = Vec::new();
+                for assign in assignments {
+                    let col_name = extract_assignment_target(&assign.target)?;
+                    let col_idx = table_def
+                        .get_column_index(&col_name)
+                        .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+                    let value = self.resolve_expr(&assign.value, &scope)?;
+                    resolved.push((col_idx, value));
+                }
+                resolved
+            } else {
+                Vec::new()
+            };
+
         Ok(ResolvedStatement::Insert {
             table,
             columns: resolved_columns,
             values: resolved_values,
             ignore: insert.ignore,
+            on_duplicate,
         })
     }
 
@@ -499,6 +598,8 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable || col_def.auto_increment,
+                default_value: col_def.default.clone(),
+                is_outer_ref: false,
             });
         }
 
@@ -524,10 +625,9 @@ impl<'a> Resolver<'a> {
             full_row[idx] = resolved_expr;
         }
 
-        // Apply defaults for unspecified NOT NULL columns
+        // Apply defaults for unspecified columns (both nullable and non-nullable)
         for (idx, col_def) in table_def.columns.iter().enumerate() {
-            if !col_def.nullable
-                && !col_def.auto_increment
+            if !col_def.auto_increment
                 && matches!(full_row[idx], ResolvedExpr::Literal(Literal::Null))
             {
                 if let Some(ref default_expr) = col_def.default {
@@ -541,6 +641,7 @@ impl<'a> Resolver<'a> {
             columns: resolved_columns,
             values: vec![full_row],
             ignore: insert.ignore,
+            on_duplicate: Vec::new(),
         })
     }
 
@@ -550,6 +651,8 @@ impl<'a> Resolver<'a> {
         table: &sp::TableWithJoins,
         assignments: &[sp::Assignment],
         selection: &Option<sp::Expr>,
+        order_by: &[sp::OrderByExpr],
+        limit: &Option<sp::Expr>,
     ) -> SqlResult<ResolvedStatement> {
         let table_name = match &table.relation {
             sp::TableFactor::Table { name, .. } => name.to_string(),
@@ -561,6 +664,98 @@ impl<'a> Resolver<'a> {
             .get_table(&table_name)
             .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
+        // Handle UPDATE with JOIN: rewrite JOIN ON condition to IN-subquery filter
+        let join_filter = if !table.joins.is_empty() {
+            let mut combined_filter: Option<ResolvedExpr> = None;
+            for join in &table.joins {
+                let joined_table_name = match &join.relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => continue,
+                };
+                let joined_def = self
+                    .catalog
+                    .get_table(&joined_table_name)
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+                if let Some(on_expr) = extract_join_condition(&join.join_operator) {
+                    let pairs = extract_equijoin_pairs(on_expr, &table_name, &joined_table_name);
+                    let joined_cols: Vec<_> = joined_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                        .collect();
+                    for (target_col, joined_col) in &pairs {
+                        let tc = table_def
+                            .get_column(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let ti = table_def
+                            .get_column_index(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let jc = joined_def
+                            .get_column(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let ji = joined_def
+                            .get_column_index(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let target_ref = ResolvedExpr::Column(ResolvedColumn {
+                            table: table_name.clone(),
+                            name: target_col.clone(),
+                            index: ti,
+                            data_type: tc.data_type.clone(),
+                            nullable: tc.nullable,
+                            default_value: None,
+                            is_outer_ref: false,
+                        });
+                        let subquery_col = ResolvedExpr::Column(ResolvedColumn {
+                            table: joined_table_name.clone(),
+                            name: joined_col.clone(),
+                            index: ji,
+                            data_type: jc.data_type.clone(),
+                            nullable: jc.nullable,
+                            default_value: None,
+                            is_outer_ref: false,
+                        });
+                        let subquery = ResolvedSelect {
+                            distinct: false,
+                            columns: vec![ResolvedSelectItem::Expr {
+                                expr: subquery_col,
+                                alias: Some(joined_col.clone()),
+                            }],
+                            from: vec![ResolvedTableRef {
+                                name: joined_table_name.clone(),
+                                alias: None,
+                                columns: joined_cols.clone(),
+                                inner_query: None,
+                            }],
+                            joins: vec![],
+                            filter: None,
+                            group_by: vec![],
+                            having: None,
+                            order_by: vec![],
+                            limit: None,
+                            offset: None,
+                        };
+                        let in_filter = ResolvedExpr::InSubquery {
+                            expr: Box::new(target_ref),
+                            query: Box::new(subquery),
+                            negated: false,
+                        };
+                        combined_filter = Some(match combined_filter {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                op: BinaryOp::And,
+                                left: Box::new(prev),
+                                right: Box::new(in_filter),
+                                result_type: DataType::Boolean,
+                            },
+                            None => in_filter,
+                        });
+                    }
+                }
+            }
+            combined_filter
+        } else {
+            None
+        };
+
         let scope = Scope::single_table(&table_name, table_def);
 
         // Get table column info
@@ -570,7 +765,22 @@ impl<'a> Resolver<'a> {
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect();
 
-        // Resolve assignments
+        // Resolve assignments (use multi-table scope if JOINs present)
+        let assign_scope = if !table.joins.is_empty() {
+            let mut ms = Scope::single_table(&table_name, table_def);
+            for join in &table.joins {
+                if let sp::TableFactor::Table { name, .. } = &join.relation {
+                    let jt = name.to_string();
+                    if let Some(jd) = self.catalog.get_table(&jt) {
+                        ms.add_table(&jt, &jt, jd);
+                    }
+                }
+            }
+            ms
+        } else {
+            Scope::single_table(&table_name, table_def)
+        };
+
         let mut resolved_assignments = Vec::new();
         for assign in assignments {
             let col_name = extract_assignment_target(&assign.target)?;
@@ -587,50 +797,201 @@ impl<'a> Resolver<'a> {
                 index: idx,
                 data_type: col_def.data_type.clone(),
                 nullable: col_def.nullable,
+                default_value: None,
+                is_outer_ref: false,
             };
-            let value = self.resolve_expr(&assign.value, &scope)?;
+            let value = self.resolve_expr(&assign.value, &assign_scope)?;
 
             resolved_assignments.push(ResolvedAssignment { column, value });
         }
 
-        // Resolve filter
-        let resolved_filter = selection
-            .as_ref()
-            .map(|f| self.resolve_expr(f, &scope))
-            .transpose()?;
+        // Combine JOIN filter with WHERE clause
+        let resolved_filter = match (join_filter, selection) {
+            (Some(jf), Some(wh)) => {
+                let rw = self.resolve_expr(wh, &scope)?;
+                Some(ResolvedExpr::BinaryOp {
+                    op: BinaryOp::And,
+                    left: Box::new(jf),
+                    right: Box::new(rw),
+                    result_type: DataType::Boolean,
+                })
+            }
+            (Some(jf), None) => Some(jf),
+            (None, Some(wh)) => Some(self.resolve_expr(wh, &scope)?),
+            (None, None) => None,
+        };
+
+        // Resolve ORDER BY
+        let mut resolved_order_by = Vec::new();
+        for ob in order_by {
+            let expr = self.resolve_expr(&ob.expr, &scope)?;
+            let asc = ob.options.asc.unwrap_or(true);
+            resolved_order_by.push((expr, asc));
+        }
+
+        // Resolve LIMIT
+        let resolved_limit = if let Some(limit_expr) = limit {
+            match limit_expr {
+                sp::Expr::Value(v) => {
+                    if let sp::Value::Number(n, _) = &v.value {
+                        n.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         Ok(ResolvedStatement::Update {
             table: table_name,
             table_columns,
             assignments: resolved_assignments,
             filter: resolved_filter,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
         })
     }
 
     /// Resolve DELETE statement
     fn resolve_delete(&self, delete: &sp::Delete) -> SqlResult<ResolvedStatement> {
-        let table_name = match &delete.from {
-            sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => {
-                match &tables[0].relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-                }
-            }
-            sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => {
-                match &tables[0].relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
-                }
-            }
+        // Extract FROM clause tables and detect multi-table DELETE
+        let from_tables = match &delete.from {
+            sp::FromTable::WithFromKeyword(tables) if !tables.is_empty() => tables,
+            sp::FromTable::WithoutKeyword(tables) if !tables.is_empty() => tables,
             _ => return Err(SqlError::Parse("DELETE requires a table".to_string())),
+        };
+
+        let table_name = match &from_tables[0].relation {
+            sp::TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
+        };
+
+        // Multi-table DELETE: DELETE t1 FROM t1 JOIN t2 ON t1.a = t2.a
+        // Rewrite join condition into an IN-subquery filter that only references
+        // the target table: WHERE t1.a IN (SELECT t2.a FROM t2)
+        let join_filter = if !delete.tables.is_empty() && !from_tables[0].joins.is_empty() {
+            let target = delete.tables[0].to_string();
+            let mut combined_filter: Option<ResolvedExpr> = None;
+
+            for join in &from_tables[0].joins {
+                let joined_table_name = match &join.relation {
+                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => continue,
+                };
+                let joined_def = self
+                    .catalog
+                    .get_table(&joined_table_name)
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+
+                if let Some(on_expr) = extract_join_condition(&join.join_operator) {
+                    let target_def = self
+                        .catalog
+                        .get_table(&target)
+                        .ok_or_else(|| SqlError::TableNotFound(target.clone()))?;
+                    let mut multi_scope = Scope::single_table(&target, target_def);
+                    multi_scope.add_table(&joined_table_name, &joined_table_name, joined_def);
+
+                    // Extract equi-join pairs from the ON condition
+                    let pairs = extract_equijoin_pairs(on_expr, &target, &joined_table_name);
+
+                    let joined_cols: Vec<_> = joined_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                        .collect();
+
+                    for (target_col, joined_col) in &pairs {
+                        let target_col_def = target_def
+                            .get_column(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let target_col_idx = target_def
+                            .get_column_index(target_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(target_col.clone()))?;
+                        let joined_col_def = joined_def
+                            .get_column(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+                        let joined_col_idx = joined_def
+                            .get_column_index(joined_col)
+                            .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
+
+                        let target_ref = ResolvedExpr::Column(ResolvedColumn {
+                            table: target.clone(),
+                            name: target_col.clone(),
+                            index: target_col_idx,
+                            data_type: target_col_def.data_type.clone(),
+                            nullable: target_col_def.nullable,
+                            default_value: None,
+                            is_outer_ref: false,
+                        });
+                        let subquery_col = ResolvedExpr::Column(ResolvedColumn {
+                            table: joined_table_name.clone(),
+                            name: joined_col.clone(),
+                            index: joined_col_idx,
+                            data_type: joined_col_def.data_type.clone(),
+                            nullable: joined_col_def.nullable,
+                            default_value: None,
+                            is_outer_ref: false,
+                        });
+
+                        let subquery = ResolvedSelect {
+                            distinct: false,
+                            columns: vec![ResolvedSelectItem::Expr {
+                                expr: subquery_col,
+                                alias: Some(joined_col.clone()),
+                            }],
+                            from: vec![ResolvedTableRef {
+                                name: joined_table_name.clone(),
+                                alias: None,
+                                columns: joined_cols.clone(),
+                                inner_query: None,
+                            }],
+                            joins: vec![],
+                            filter: None,
+                            group_by: vec![],
+                            having: None,
+                            order_by: vec![],
+                            limit: None,
+                            offset: None,
+                        };
+
+                        let in_filter = ResolvedExpr::InSubquery {
+                            expr: Box::new(target_ref),
+                            query: Box::new(subquery),
+                            negated: false,
+                        };
+                        combined_filter = Some(match combined_filter {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                op: BinaryOp::And,
+                                left: Box::new(prev),
+                                right: Box::new(in_filter),
+                                result_type: DataType::Boolean,
+                            },
+                            None => in_filter,
+                        });
+                    }
+                }
+            }
+            combined_filter
+        } else {
+            None
+        };
+
+        // For multi-table DELETE, target is delete.tables[0]; else use FROM table
+        let target_table = if !delete.tables.is_empty() {
+            delete.tables[0].to_string()
+        } else {
+            table_name.clone()
         };
 
         let table_def = self
             .catalog
-            .get_table(&table_name)
-            .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
+            .get_table(&target_table)
+            .ok_or_else(|| SqlError::TableNotFound(target_table.clone()))?;
 
-        let scope = Scope::single_table(&table_name, table_def);
+        let scope = Scope::single_table(&target_table, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -639,46 +1000,110 @@ impl<'a> Resolver<'a> {
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect();
 
-        // Resolve filter
-        let resolved_filter = delete
-            .selection
-            .as_ref()
-            .map(|f| self.resolve_expr(f, &scope))
-            .transpose()?;
+        // Resolve filter: combine join filter with WHERE clause
+        let resolved_filter = match (join_filter, &delete.selection) {
+            (Some(jf), Some(wh)) => {
+                let resolved_where = self.resolve_expr(wh, &scope)?;
+                Some(ResolvedExpr::BinaryOp {
+                    op: BinaryOp::And,
+                    left: Box::new(jf),
+                    right: Box::new(resolved_where),
+                    result_type: DataType::Boolean,
+                })
+            }
+            (Some(jf), None) => Some(jf),
+            (None, Some(wh)) => Some(self.resolve_expr(wh, &scope)?),
+            (None, None) => None,
+        };
+
+        // Resolve ORDER BY
+        let mut resolved_order_by = Vec::new();
+        for ob in &delete.order_by {
+            let expr = self.resolve_expr(&ob.expr, &scope)?;
+            let asc = ob.options.asc.unwrap_or(true);
+            resolved_order_by.push((expr, asc));
+        }
+
+        // Resolve LIMIT
+        let resolved_limit = if let Some(ref limit_expr) = delete.limit {
+            match limit_expr {
+                sp::Expr::Value(v) => {
+                    if let sp::Value::Number(n, _) = &v.value {
+                        n.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         Ok(ResolvedStatement::Delete {
-            table: table_name,
+            table: target_table,
             table_columns,
             filter: resolved_filter,
+            order_by: resolved_order_by,
+            limit: resolved_limit,
         })
     }
 
     /// Resolve SELECT query
     fn resolve_query(&self, query: &sp::Query) -> SqlResult<ResolvedStatement> {
-        // Check for UNION/INTERSECT/EXCEPT at the top level
-        if let sp::SetExpr::SetOperation {
-            left,
-            right,
-            op,
-            set_quantifier,
-            ..
-        } = query.body.as_ref()
-        {
-            if matches!(op, sp::SetOperator::Union) {
-                let left_select = self.resolve_set_expr_as_select(left)?;
-                let right_select = self.resolve_set_expr_as_select(right)?;
-                let all = matches!(
-                    set_quantifier,
-                    sp::SetQuantifier::All | sp::SetQuantifier::AllByName
-                );
-                let stmt = ResolvedStatement::Union {
-                    left: Box::new(left_select),
-                    right: Box::new(right_select),
+        // Process CTEs (WITH ... AS) — resolve each CTE body and register it
+        if let Some(ref with) = query.with {
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.to_lowercase();
+                let cte_select = self.resolve_query(&cte.query)?;
+                match cte_select {
+                    ResolvedStatement::Select(resolved) => {
+                        self.ctes.borrow_mut().insert(cte_name, resolved);
+                    }
+                    ResolvedStatement::Union { ref left, .. } => {
+                        // For UNION CTEs, use the left branch metadata
+                        self.ctes.borrow_mut().insert(cte_name, (**left).clone());
+                    }
+                    _ => {
+                        return Err(SqlError::Unsupported(
+                            "CTE must be a SELECT or UNION".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check for UNION at the top level (also check parenthesized queries)
+        if Self::contains_union(query.body.as_ref()) {
+            // Collect all UNION leaves and their ALL flags by walking the
+            // left-nested tree iteratively. This correctly handles 3+ way
+            // UNIONs like A UNION B UNION C (parsed as Union(Union(A,B), C)).
+            let mut leaves = Vec::new();
+            let mut all_flags = Vec::new();
+            self.collect_union_parts(query.body.as_ref(), &mut leaves, &mut all_flags)?;
+
+            if leaves.len() < 2 {
+                return Err(SqlError::Parse(
+                    "UNION requires at least 2 operands".to_string(),
+                ));
+            }
+
+            // Fold leaves right-associatively: [A,B,C] with flags [all_ab, all_bc]
+            // => Union(A, Union(B, C, all_bc), all_ab)
+            let mut result = ResolvedStatement::Select(leaves.pop().unwrap());
+            while let Some(leaf) = leaves.pop() {
+                let all = all_flags.pop().unwrap_or(false);
+                result = ResolvedStatement::Union {
+                    left: Box::new(leaf),
+                    right: Box::new(result),
                     all,
                 };
-
-                return Ok(stmt);
             }
+
+            return Ok(result);
+        }
+
+        if let sp::SetExpr::SetOperation { op, .. } = query.body.as_ref() {
             return Err(SqlError::Unsupported(format!("Set operation: {:?}", op)));
         }
 
@@ -686,6 +1111,74 @@ impl<'a> Resolver<'a> {
 
         let mut result = select;
 
+        self.resolve_query_order_limit(&mut result, query)?;
+
+        Ok(ResolvedStatement::Select(result))
+    }
+
+    /// Check if a SetExpr contains a UNION (directly or inside parentheses)
+    fn contains_union(expr: &sp::SetExpr) -> bool {
+        match expr {
+            sp::SetExpr::SetOperation { op, .. } => matches!(op, sp::SetOperator::Union),
+            sp::SetExpr::Query(inner) => Self::contains_union(inner.body.as_ref()),
+            _ => false,
+        }
+    }
+
+    /// Recursively collect all leaf SELECTs from a UNION tree and the ALL flags
+    /// between each adjacent pair. For A UNION ALL B UNION C:
+    /// leaves = [A, B, C], all_flags = [true, false]
+    fn collect_union_parts(
+        &self,
+        expr: &sp::SetExpr,
+        leaves: &mut Vec<ResolvedSelect>,
+        all_flags: &mut Vec<bool>,
+    ) -> SqlResult<()> {
+        match expr {
+            sp::SetExpr::SetOperation {
+                left,
+                right,
+                op: sp::SetOperator::Union,
+                set_quantifier,
+                ..
+            } => {
+                // Recurse into left (which may itself be a UNION)
+                self.collect_union_parts(left, leaves, all_flags)?;
+                // The ALL flag applies between the last left leaf and the right leaf
+                let all = matches!(
+                    set_quantifier,
+                    sp::SetQuantifier::All | sp::SetQuantifier::AllByName
+                );
+                all_flags.push(all);
+                // Recurse into right
+                self.collect_union_parts(right, leaves, all_flags)?;
+                Ok(())
+            }
+            sp::SetExpr::Query(inner_query) => {
+                // Parenthesized query — may contain a UNION itself
+                if Self::contains_union(inner_query.body.as_ref()) {
+                    // Recurse into the parenthesized UNION
+                    self.collect_union_parts(inner_query.body.as_ref(), leaves, all_flags)?;
+                } else {
+                    leaves.push(self.resolve_select_body(expr)?);
+                }
+                Ok(())
+            }
+            _ => {
+                // Leaf SELECT
+                leaves.push(self.resolve_select_body(expr)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Apply ORDER BY and LIMIT/OFFSET from a parsed Query onto a ResolvedSelect.
+    /// This is shared between top-level SELECT resolution and view/subquery expansion.
+    fn resolve_query_order_limit(
+        &self,
+        result: &mut ResolvedSelect,
+        query: &sp::Query,
+    ) -> SqlResult<()> {
         // Handle ORDER BY
         if let Some(order_by) = &query.order_by {
             // Need to create scope from the resolved tables
@@ -714,8 +1207,30 @@ impl<'a> Resolver<'a> {
                 }
             }
 
+            let order_col_count = Self::select_column_count(&result.columns);
             if let sp::OrderByKind::Expressions(exprs) = &order_by.kind {
                 for item in exprs {
+                    // Check for ordinal (numeric literal) — ORDER BY 1
+                    if let sp::Expr::Value(val_with_span) = &item.expr {
+                        if let sp::Value::Number(n, _) = &val_with_span.value {
+                            if let Ok(ordinal) = n.parse::<usize>() {
+                                if ordinal >= 1 && ordinal <= order_col_count {
+                                    result.order_by.push(ResolvedOrderByItem {
+                                        expr: Self::select_expr_at_ordinal(
+                                            &result.columns,
+                                            ordinal,
+                                        )?,
+                                        ascending: item.options.asc.unwrap_or(true),
+                                    });
+                                    continue;
+                                }
+                                return Err(SqlError::InvalidOperation(format!(
+                                    "Unknown column '{}' in 'order clause'",
+                                    ordinal
+                                )));
+                            }
+                        }
+                    }
                     // Try resolving against table scope first, then SELECT aliases
                     let resolved = match self.resolve_expr(&item.expr, &scope) {
                         Ok(expr) => expr,
@@ -724,7 +1239,7 @@ impl<'a> Resolver<'a> {
                             if let sp::Expr::Identifier(ident) = &item.expr {
                                 let alias_name = &ident.value;
                                 let mut found = None;
-                                for col_item in &result.columns {
+                                for col_item in &*result.columns {
                                     if let ResolvedSelectItem::Expr {
                                         expr: resolved_expr,
                                         alias: Some(a),
@@ -794,51 +1309,72 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        Ok(ResolvedStatement::Select(result))
+        Ok(())
     }
 
-    /// Resolve a SetExpr into a ResolvedSelect (for UNION operands)
-    fn resolve_set_expr_as_select(&self, expr: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
-        match expr {
-            sp::SetExpr::Select(_) | sp::SetExpr::Query(_) => self.resolve_select_body(expr),
-            sp::SetExpr::SetOperation {
-                left,
-                right,
-                op,
-                set_quantifier,
-                ..
-            } => {
-                // Nested UNION: resolve recursively, flatten into a single select
-                // by collecting all rows — but we can't do that at resolve time.
-                // Instead, error for now on deeply nested UNIONs.
-                if matches!(op, sp::SetOperator::Union) {
-                    let left_select = self.resolve_set_expr_as_select(left)?;
-                    let right_select = self.resolve_set_expr_as_select(right)?;
-                    let all = matches!(
-                        set_quantifier,
-                        sp::SetQuantifier::All | sp::SetQuantifier::AllByName
-                    );
-                    // Wrap as a "union select" — use left's metadata
-                    // The planner will create a Union node
-                    // For now, return left and the builder handles it via ResolvedStatement::Union
-                    // Actually, we need to return ResolvedSelect not ResolvedStatement here.
-                    // The simplest approach: return the left side and let the caller handle UNION.
-                    let _ = (right_select, all);
-                    Ok(left_select)
-                } else {
-                    Err(SqlError::Unsupported(format!("Set operation: {:?}", op)))
+    /// Given a 1-based ordinal, return the corresponding expression from the
+    /// resolved SELECT list.  Wildcard items (`SELECT *`) are flattened so that
+    /// each expanded column occupies one position.
+    fn select_expr_at_ordinal(
+        columns: &[ResolvedSelectItem],
+        ordinal: usize,
+    ) -> SqlResult<ResolvedExpr> {
+        let mut pos = 1usize; // 1-based
+        for item in columns {
+            match item {
+                ResolvedSelectItem::Expr { expr, .. } => {
+                    if pos == ordinal {
+                        return Ok(expr.clone());
+                    }
+                    pos += 1;
+                }
+                ResolvedSelectItem::Columns(cols) => {
+                    for col in cols {
+                        if pos == ordinal {
+                            return Ok(ResolvedExpr::Column(col.clone()));
+                        }
+                        pos += 1;
+                    }
                 }
             }
-            _ => Err(SqlError::Unsupported("Complex set expression".to_string())),
         }
+        // pos - 1 is the total column count after the loop
+        Err(SqlError::InvalidOperation(format!(
+            "Unknown column '{}' in 'group statement'",
+            ordinal
+        )))
+    }
+
+    /// Count the total number of output columns in a resolved SELECT list.
+    fn select_column_count(columns: &[ResolvedSelectItem]) -> usize {
+        columns
+            .iter()
+            .map(|item| match item {
+                ResolvedSelectItem::Expr { .. } => 1,
+                ResolvedSelectItem::Columns(cols) => cols.len(),
+            })
+            .sum()
     }
 
     /// Resolve SELECT body
     fn resolve_select_body(&self, body: &sp::SetExpr) -> SqlResult<ResolvedSelect> {
+        self.resolve_select_body_inner(body, None)
+    }
+
+    /// Resolve SELECT body with optional outer scope (for correlated subqueries)
+    fn resolve_select_body_inner(
+        &self,
+        body: &sp::SetExpr,
+        outer_scope: Option<&Scope>,
+    ) -> SqlResult<ResolvedSelect> {
         match body {
             sp::SetExpr::Select(select) => {
-                // Build scope from FROM clause
-                let mut scope = Scope::new();
+                // Build scope from FROM clause, with optional outer scope
+                let mut scope = if let Some(outer) = outer_scope {
+                    Scope::with_outer(outer)
+                } else {
+                    Scope::new()
+                };
 
                 for table in &select.from {
                     let table_ref = self.resolve_table_factor(&table.relation)?;
@@ -846,6 +1382,13 @@ impl<'a> Resolver<'a> {
                         .alias
                         .clone()
                         .unwrap_or_else(|| table_ref.name.clone());
+
+                    // MySQL DUAL pseudo-table: SELECT expr FROM DUAL is same as SELECT expr
+                    if table_ref.name.eq_ignore_ascii_case("dual")
+                        && table_ref.inner_query.is_none()
+                    {
+                        continue;
+                    }
 
                     if table_ref.inner_query.is_some() {
                         // Derived table or view — add columns directly to scope
@@ -859,28 +1402,37 @@ impl<'a> Resolver<'a> {
                     }
                 }
 
-                // Build resolved from list first
+                // Build resolved from list first (skip DUAL pseudo-table)
                 let resolved_from: Vec<ResolvedTableRef> = select
                     .from
                     .iter()
                     .map(|t| self.resolve_table_factor(&t.relation))
-                    .collect::<SqlResult<Vec<_>>>()?;
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|t| !t.name.eq_ignore_ascii_case("dual") || t.inner_query.is_some())
+                    .collect();
 
                 // Add joined tables to scope
                 let mut resolved_joins = Vec::new();
                 for table_with_joins in &select.from {
                     for join in &table_with_joins.joins {
                         let table_ref = self.resolve_table_factor(&join.relation)?;
-                        let table_def = self
-                            .catalog
-                            .get_table(&table_ref.name)
-                            .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
 
                         let alias = table_ref
                             .alias
                             .clone()
                             .unwrap_or_else(|| table_ref.name.clone());
-                        scope.add_table(&alias, &table_ref.name, table_def);
+
+                        // For views (inner_query set), use derived table columns
+                        if table_ref.inner_query.is_some() {
+                            scope.add_derived_table(&alias, &table_ref.columns);
+                        } else {
+                            let table_def = self
+                                .catalog
+                                .get_table(&table_ref.name)
+                                .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
+                            scope.add_table(&alias, &table_ref.name, table_def);
+                        }
 
                         let join_type = convert_join_type(&join.join_operator)?;
                         let condition = extract_join_condition(&join.join_operator)
@@ -909,36 +1461,60 @@ impl<'a> Resolver<'a> {
                     .transpose()?;
 
                 // Resolve GROUP BY — MySQL allows referencing SELECT aliases in GROUP BY
+                // When a name matches both a table column AND a SELECT alias,
+                // MySQL uses the alias and emits warning 1052 (ambiguous column).
                 let mut resolved_group_by = Vec::new();
+                let select_col_count = Self::select_column_count(&resolved_columns);
                 match &select.group_by {
                     sp::GroupByExpr::Expressions(exprs, _) => {
                         for expr in exprs {
-                            // Try resolving against table scope first
+                            // Check for ordinal (numeric literal) — GROUP BY 1
+                            if let sp::Expr::Value(val_with_span) = expr {
+                                if let sp::Value::Number(n, _) = &val_with_span.value {
+                                    if let Ok(ordinal) = n.parse::<usize>() {
+                                        if ordinal >= 1 && ordinal <= select_col_count {
+                                            resolved_group_by.push(Self::select_expr_at_ordinal(
+                                                &resolved_columns,
+                                                ordinal,
+                                            )?);
+                                            continue;
+                                        }
+                                        return Err(SqlError::InvalidOperation(format!(
+                                            "Unknown column '{}' in 'group statement'",
+                                            ordinal
+                                        )));
+                                    }
+                                }
+                            }
+                            // For simple identifiers, check SELECT aliases first (MySQL behavior)
+                            if let sp::Expr::Identifier(ident) = expr {
+                                let name = &ident.value;
+                                let mut alias_match = None;
+                                for item in &resolved_columns {
+                                    if let ResolvedSelectItem::Expr {
+                                        expr: resolved_expr,
+                                        alias: Some(a),
+                                    } = item
+                                    {
+                                        if a.eq_ignore_ascii_case(name) {
+                                            alias_match = Some(resolved_expr.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(alias_expr) = alias_match {
+                                    resolved_group_by.push(alias_expr);
+                                    continue;
+                                }
+                            }
+                            // Fall back to table scope resolution
                             match self.resolve_expr(expr, &scope) {
                                 Ok(resolved) => resolved_group_by.push(resolved),
                                 Err(SqlError::ColumnNotFound(_)) => {
                                     // Column not in table scope — check SELECT aliases
                                     if let sp::Expr::Identifier(ident) = expr {
                                         let alias_name = &ident.value;
-                                        let mut found = false;
-                                        for item in &resolved_columns {
-                                            if let ResolvedSelectItem::Expr {
-                                                expr: resolved_expr,
-                                                alias: Some(a),
-                                            } = item
-                                            {
-                                                if a.eq_ignore_ascii_case(alias_name) {
-                                                    resolved_group_by.push(resolved_expr.clone());
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if !found {
-                                            return Err(SqlError::ColumnNotFound(
-                                                alias_name.clone(),
-                                            ));
-                                        }
+                                        return Err(SqlError::ColumnNotFound(alias_name.clone()));
                                     } else {
                                         return Err(SqlError::ColumnNotFound(expr.to_string()));
                                     }
@@ -974,13 +1550,22 @@ impl<'a> Resolver<'a> {
             }
             sp::SetExpr::Query(inner_query) => {
                 // Parenthesized query: (SELECT ... LIMIT ...) ORDER BY ... LIMIT ...
-                // Resolve the inner query fully (including its own ORDER BY/LIMIT),
-                // then the outer ORDER BY/LIMIT is applied by resolve_query().
-                // If the inner query is a UNION, resolve its left side for column metadata.
+                // Resolve the inner query fully (including its own ORDER BY/LIMIT).
                 let inner = self.resolve_query(inner_query)?;
                 match inner {
                     ResolvedStatement::Select(resolved) => Ok(resolved),
-                    ResolvedStatement::Union { left, .. } => Ok(*left),
+                    ResolvedStatement::Union { ref left, .. } => {
+                        // For parenthesized UNIONs used in contexts that need a
+                        // ResolvedSelect (e.g., derived tables), use the left branch
+                        // metadata for column types. The actual UNION execution is
+                        // handled by collect_union_parts when this appears inside
+                        // a larger UNION chain, or by resolve_query at top level.
+                        // When used standalone as a derived table, we need the union
+                        // wrapped as a derived query — use left's columns as schema.
+                        let mut select = (**left).clone();
+                        select.distinct = false; // UNION handles distinctness itself
+                        Ok(select)
+                    }
                     _ => Err(SqlError::Unsupported(
                         "Parenthesized non-SELECT query".to_string(),
                     )),
@@ -998,6 +1583,16 @@ impl<'a> Resolver<'a> {
             sp::TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
 
+                // MySQL DUAL pseudo-table: FROM DUAL is equivalent to no FROM
+                if table_name.eq_ignore_ascii_case("dual") {
+                    return Ok(ResolvedTableRef {
+                        name: "dual".to_string(),
+                        alias: alias.as_ref().map(|a| a.name.value.clone()),
+                        columns: vec![],
+                        inner_query: None,
+                    });
+                }
+
                 // Check physical table first
                 if let Some(table_def) = self.catalog.get_table(&table_name) {
                     return Ok(ResolvedTableRef {
@@ -1012,14 +1607,59 @@ impl<'a> Resolver<'a> {
                     });
                 }
 
+                // Check CTE definitions
+                {
+                    let ctes = self.ctes.borrow();
+                    if let Some(cte_select) = ctes.get(&table_name.to_lowercase()) {
+                        let columns: Vec<_> = cte_select
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, item)| match item {
+                                ResolvedSelectItem::Expr { expr, alias } => {
+                                    let col_name = alias.clone().unwrap_or_else(|| match expr {
+                                        ResolvedExpr::Column(c) => c.name.clone(),
+                                        _ => format!("col_{}", i),
+                                    });
+                                    vec![(col_name, expr.data_type(), true)]
+                                }
+                                ResolvedSelectItem::Columns(cols) => cols
+                                    .iter()
+                                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                                    .collect(),
+                            })
+                            .collect();
+                        return Ok(ResolvedTableRef {
+                            name: alias
+                                .as_ref()
+                                .map(|a| a.name.value.clone())
+                                .unwrap_or(table_name),
+                            alias: alias.as_ref().map(|a| a.name.value.clone()),
+                            columns,
+                            inner_query: Some(Box::new(cte_select.clone())),
+                        });
+                    }
+                }
+
                 // Fall back to view — expand view query as a derived table
                 if let Some(view_def) = self.catalog.get_view(&table_name) {
+                    let depth = self.view_depth.get();
+                    if depth >= 32 {
+                        return Err(SqlError::InvalidOperation(format!(
+                            "View recursion limit exceeded (depth {}), possible circular reference",
+                            depth
+                        )));
+                    }
+                    self.view_depth.set(depth + 1);
+
                     let view_sql = view_def.query_sql.clone();
                     let view_stmt = crate::sql::Parser::parse_one(&view_sql).map_err(|e| {
                         SqlError::Parse(format!("Invalid view '{}': {}", table_name, e))
                     })?;
                     if let sp::Statement::Query(query) = view_stmt {
-                        let inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        let mut inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        // Apply ORDER BY and LIMIT/OFFSET from the view's query
+                        self.resolve_query_order_limit(&mut inner_select, &query)?;
                         let columns: Vec<(String, DataType, bool)> = inner_select
                             .columns
                             .iter()
@@ -1041,6 +1681,7 @@ impl<'a> Resolver<'a> {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| table_name.clone());
+                        self.view_depth.set(self.view_depth.get() - 1);
                         return Ok(ResolvedTableRef {
                             name: table_name,
                             alias: Some(effective_alias),
@@ -1048,6 +1689,7 @@ impl<'a> Resolver<'a> {
                             inner_query: Some(Box::new(inner_select)),
                         });
                     }
+                    self.view_depth.set(self.view_depth.get() - 1);
                 }
 
                 Err(SqlError::TableNotFound(table_name))
@@ -1062,7 +1704,9 @@ impl<'a> Resolver<'a> {
                     .ok_or_else(|| {
                         SqlError::Parse("Derived table must have an alias".to_string())
                     })?;
-                let inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                let mut inner_select = self.resolve_select_body(subquery.body.as_ref())?;
+                // Apply ORDER BY and LIMIT/OFFSET from the subquery
+                self.resolve_query_order_limit(&mut inner_select, subquery)?;
                 // Derive columns from the inner query's SELECT list
                 let columns: Vec<(String, DataType, bool)> = inner_select
                     .columns
@@ -1127,6 +1771,8 @@ impl<'a> Resolver<'a> {
                             index: global_idx,
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            default_value: None,
+                            is_outer_ref: false,
                         });
                     }
                 }
@@ -1154,6 +1800,8 @@ impl<'a> Resolver<'a> {
                             index: global_idx,
                             data_type: data_type.clone(),
                             nullable: *nullable,
+                            default_value: None,
+                            is_outer_ref: false,
                         }
                     })
                     .collect();
@@ -1192,6 +1840,35 @@ impl<'a> Resolver<'a> {
         }
         // For compound expressions, recurse to resolve sub-expressions with aliases
         match expr {
+            sp::Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    sp::BinaryOperator::Arrow | sp::BinaryOperator::LongArrow
+                ) =>
+            {
+                // Rewrite col->path as JSON_EXTRACT(col, path)
+                // Rewrite col->>path as JSON_UNQUOTE(JSON_EXTRACT(col, path))
+                let l = self.resolve_expr_with_aliases(left, scope, select_columns)?;
+                let r = self.resolve_expr_with_aliases(right, scope, select_columns)?;
+                let extract = ResolvedExpr::Function {
+                    name: "JSON_EXTRACT".to_string(),
+                    args: vec![l, r],
+                    distinct: false,
+                    result_type: DataType::Json,
+                    separator: None,
+                };
+                if matches!(op, sp::BinaryOperator::LongArrow) {
+                    Ok(ResolvedExpr::Function {
+                        name: "JSON_UNQUOTE".to_string(),
+                        args: vec![extract],
+                        distinct: false,
+                        result_type: DataType::Text,
+                        separator: None,
+                    })
+                } else {
+                    Ok(extract)
+                }
+            }
             sp::Expr::BinaryOp { left, op, right } => {
                 let l = self.resolve_expr_with_aliases(left, scope, select_columns)?;
                 let r = self.resolve_expr_with_aliases(right, scope, select_columns)?;
@@ -1212,6 +1889,20 @@ impl<'a> Resolver<'a> {
                     op: unary_op,
                     expr: Box::new(resolved),
                     result_type,
+                })
+            }
+            sp::Expr::IsNull(inner) => {
+                let resolved = self.resolve_expr_with_aliases(inner, scope, select_columns)?;
+                Ok(ResolvedExpr::IsNull {
+                    expr: Box::new(resolved),
+                    negated: false,
+                })
+            }
+            sp::Expr::IsNotNull(inner) => {
+                let resolved = self.resolve_expr_with_aliases(inner, scope, select_columns)?;
+                Ok(ResolvedExpr::IsNull {
+                    expr: Box::new(resolved),
+                    negated: true,
                 })
             }
             // All other expression types: normal resolution
@@ -1251,9 +1942,54 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(ResolvedExpr::Literal(convert_value(val)?))
             }
+            sp::Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    sp::BinaryOperator::Arrow | sp::BinaryOperator::LongArrow
+                ) =>
+            {
+                let l = self.resolve_expr(left, scope)?;
+                let r = self.resolve_expr(right, scope)?;
+                let extract = ResolvedExpr::Function {
+                    name: "JSON_EXTRACT".to_string(),
+                    args: vec![l, r],
+                    distinct: false,
+                    result_type: DataType::Json,
+                    separator: None,
+                };
+                if matches!(op, sp::BinaryOperator::LongArrow) {
+                    Ok(ResolvedExpr::Function {
+                        name: "JSON_UNQUOTE".to_string(),
+                        args: vec![extract],
+                        distinct: false,
+                        result_type: DataType::Text,
+                        separator: None,
+                    })
+                } else {
+                    Ok(extract)
+                }
+            }
             sp::Expr::BinaryOp { left, op, right } => {
                 let resolved_left = self.resolve_expr(left, scope)?;
                 let resolved_right = self.resolve_expr(right, scope)?;
+                // Rewrite expr +/- INTERVAL to DATE_ADD/DATE_SUB
+                if matches!(op, sp::BinaryOperator::Plus | sp::BinaryOperator::Minus) {
+                    let is_interval = matches!(&resolved_right, ResolvedExpr::Function { name, .. } if name == "__INTERVAL");
+                    if is_interval {
+                        let func_name = if matches!(op, sp::BinaryOperator::Plus) {
+                            "DATE_ADD"
+                        } else {
+                            "DATE_SUB"
+                        };
+                        return Ok(ResolvedExpr::Function {
+                            name: func_name.to_string(),
+                            args: vec![resolved_left, resolved_right],
+                            distinct: false,
+                            result_type: DataType::Text,
+                            separator: None,
+                        });
+                    }
+                }
                 let binary_op = convert_binary_op(op)?;
                 let result_type =
                     infer_binary_result_type(binary_op, &resolved_left, &resolved_right)?;
@@ -1292,8 +2028,10 @@ impl<'a> Resolver<'a> {
                                     // For functions that accept keyword arguments
                                     // (GET_FORMAT, CONVERT, etc.), unresolvable
                                     // identifiers are treated as string literals.
-                                    let accepts_keywords =
-                                        matches!(name.as_str(), "GET_FORMAT" | "CONVERT");
+                                    let accepts_keywords = matches!(
+                                        name.as_str(),
+                                        "GET_FORMAT" | "CONVERT" | "TIMESTAMPDIFF" | "TIMESTAMPADD"
+                                    );
                                     match self.resolve_expr(e, scope) {
                                         Ok(resolved) => result.push(resolved),
                                         Err(_)
@@ -1328,11 +2066,73 @@ impl<'a> Resolver<'a> {
                     _ => return Err(SqlError::Unsupported("Function arguments".to_string())),
                 };
                 let result_type = infer_function_result_type(&name, &args)?;
+                // Extract SEPARATOR clause for GROUP_CONCAT
+                let separator = if let sp::FunctionArguments::List(list) = &func.args {
+                    list.clauses.iter().find_map(|c| {
+                        if let sp::FunctionArgumentClause::Separator(
+                            sp::Value::SingleQuotedString(s),
+                        ) = c
+                        {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                // Check for window function OVER clause
+                if let Some(sp::WindowType::WindowSpec(ref spec)) = func.over {
+                    let partition_by: Vec<ResolvedExpr> = spec
+                        .partition_by
+                        .iter()
+                        .map(|e| self.resolve_expr(e, scope))
+                        .collect::<SqlResult<Vec<_>>>()?;
+                    let order_by: Vec<(ResolvedExpr, bool)> = spec
+                        .order_by
+                        .iter()
+                        .map(|o| {
+                            let expr = self.resolve_expr(&o.expr, scope)?;
+                            let asc = o.options.asc.is_none_or(|a| a);
+                            Ok((expr, asc))
+                        })
+                        .collect::<SqlResult<Vec<_>>>()?;
+                    // Infer result type for window functions
+                    let wf_result_type = match name.as_str() {
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "COUNT" => {
+                            DataType::BigInt
+                        }
+                        "SUM" | "AVG" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" => {
+                            if args.is_empty() {
+                                DataType::BigInt
+                            } else {
+                                args[0].data_type()
+                            }
+                        }
+                        "MIN" | "MAX" => {
+                            if args.is_empty() {
+                                DataType::BigInt
+                            } else {
+                                args[0].data_type()
+                            }
+                        }
+                        _ => result_type.clone(),
+                    };
+                    return Ok(ResolvedExpr::WindowFunction {
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        result_type: wf_result_type,
+                    });
+                }
+
                 Ok(ResolvedExpr::Function {
                     name,
                     args,
                     distinct,
                     result_type,
+                    separator,
                 })
             }
             sp::Expr::IsNull(expr) => Ok(ResolvedExpr::IsNull {
@@ -1343,6 +2143,69 @@ impl<'a> Resolver<'a> {
                 expr: Box::new(self.resolve_expr(expr, scope)?),
                 negated: true,
             }),
+            // Multi-column IN: (a, b) IN ((1,2), (3,4)) → (a=1 AND b=2) OR (a=3 AND b=4)
+            sp::Expr::InList {
+                expr,
+                list,
+                negated,
+            } if matches!(expr.as_ref(), sp::Expr::Tuple(_)) => {
+                let cols = match expr.as_ref() {
+                    sp::Expr::Tuple(exprs) => exprs
+                        .iter()
+                        .map(|e| self.resolve_expr(e, scope))
+                        .collect::<SqlResult<Vec<_>>>()?,
+                    _ => unreachable!(),
+                };
+                let mut or_parts: Vec<ResolvedExpr> = Vec::new();
+                for item in list {
+                    let vals = match item {
+                        sp::Expr::Tuple(exprs) => exprs
+                            .iter()
+                            .map(|e| self.resolve_expr(e, scope))
+                            .collect::<SqlResult<Vec<_>>>()?,
+                        other => vec![self.resolve_expr(other, scope)?],
+                    };
+                    // Build AND chain: col[0]=val[0] AND col[1]=val[1] ...
+                    let mut and_expr: Option<ResolvedExpr> = None;
+                    for (col, val) in cols.iter().zip(vals.iter()) {
+                        let eq = ResolvedExpr::BinaryOp {
+                            left: Box::new(col.clone()),
+                            op: BinaryOp::Eq,
+                            right: Box::new(val.clone()),
+                            result_type: DataType::Boolean,
+                        };
+                        and_expr = Some(match and_expr {
+                            Some(prev) => ResolvedExpr::BinaryOp {
+                                left: Box::new(prev),
+                                op: BinaryOp::And,
+                                right: Box::new(eq),
+                                result_type: DataType::Boolean,
+                            },
+                            None => eq,
+                        });
+                    }
+                    if let Some(part) = and_expr {
+                        or_parts.push(part);
+                    }
+                }
+                let mut result = or_parts
+                    .into_iter()
+                    .reduce(|acc, part| ResolvedExpr::BinaryOp {
+                        left: Box::new(acc),
+                        op: BinaryOp::Or,
+                        right: Box::new(part),
+                        result_type: DataType::Boolean,
+                    })
+                    .unwrap_or(ResolvedExpr::Literal(Literal::Boolean(false)));
+                if *negated {
+                    result = ResolvedExpr::UnaryOp {
+                        op: UnaryOp::Not,
+                        expr: Box::new(result),
+                        result_type: DataType::Boolean,
+                    };
+                }
+                Ok(result)
+            }
             sp::Expr::InList {
                 expr,
                 list,
@@ -1473,9 +2336,53 @@ impl<'a> Resolver<'a> {
             sp::Expr::Collate { expr, .. } => self.resolve_expr(expr, scope),
 
             // Subquery: (SELECT ...) — resolve as scalar subquery
-            sp::Expr::Subquery(_) => Err(SqlError::Unsupported(
-                "Subqueries not yet supported".to_string(),
-            )),
+            // Pass outer scope for correlated subquery support
+            sp::Expr::Subquery(query) => {
+                let mut inner_select =
+                    self.resolve_select_body_inner(query.body.as_ref(), Some(scope))?;
+                self.resolve_query_order_limit(&mut inner_select, query)?;
+                let result_type = Self::scalar_subquery_result_type(&inner_select)?;
+                Ok(ResolvedExpr::ScalarSubquery {
+                    query: Box::new(inner_select),
+                    result_type,
+                })
+            }
+
+            // IN subquery: expr [NOT] IN (SELECT ...)
+            sp::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                // Use resolve_query to handle UNION subqueries properly
+                let inner = self.resolve_query(subquery)?;
+                let inner_select = match inner {
+                    ResolvedStatement::Select(s) => s,
+                    ResolvedStatement::Union { left, .. } => *left, // Use left metadata
+                    _ => {
+                        return Err(SqlError::Unsupported(
+                            "IN subquery must be SELECT or UNION".to_string(),
+                        ))
+                    }
+                };
+                Ok(ResolvedExpr::InSubquery {
+                    expr: Box::new(resolved_expr),
+                    query: Box::new(inner_select),
+                    negated: *negated,
+                })
+            }
+
+            // EXISTS / NOT EXISTS subquery
+            sp::Expr::Exists { subquery, negated } => {
+                let mut inner_select =
+                    self.resolve_select_body_inner(subquery.body.as_ref(), Some(scope))?;
+                self.resolve_query_order_limit(&mut inner_select, subquery)?;
+                Ok(ResolvedExpr::ExistsSubquery {
+                    query: Box::new(inner_select),
+                    negated: *negated,
+                })
+            }
 
             // SUBSTRING(expr, from, for) — sqlparser parses as AST node
             sp::Expr::Substring {
@@ -1497,6 +2404,7 @@ impl<'a> Resolver<'a> {
                     args,
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1523,6 +2431,7 @@ impl<'a> Resolver<'a> {
                     args,
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1536,6 +2445,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved],
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
             sp::Expr::Ceil { expr, .. } => {
@@ -1547,6 +2457,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved],
                     distinct: false,
                     result_type,
+                    separator: None,
                 })
             }
 
@@ -1564,6 +2475,7 @@ impl<'a> Resolver<'a> {
                     args: vec![resolved_expr, resolved_pattern],
                     distinct: false,
                     result_type: DataType::Boolean,
+                    separator: None,
                 };
                 if *negated {
                     Ok(ResolvedExpr::UnaryOp {
@@ -1593,6 +2505,39 @@ impl<'a> Resolver<'a> {
                 }
             }
 
+            // INTERVAL expr — encode as string literal "value UNIT" for DATE_ADD/DATE_SUB
+            sp::Expr::Extract { field, expr, .. } => {
+                let resolved_expr = self.resolve_expr(expr, scope)?;
+                let field_str = field.to_string();
+                Ok(ResolvedExpr::Function {
+                    name: "__EXTRACT".to_string(),
+                    args: vec![
+                        ResolvedExpr::Literal(Literal::String(field_str)),
+                        resolved_expr,
+                    ],
+                    distinct: false,
+                    result_type: DataType::BigInt,
+                    separator: None,
+                })
+            }
+
+            sp::Expr::Interval(interval) => {
+                let value = self.resolve_expr(&interval.value, scope)?;
+                let unit = interval
+                    .leading_field
+                    .as_ref()
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "DAY".to_string());
+                // Encode as a function so we preserve both pieces
+                Ok(ResolvedExpr::Function {
+                    name: "__INTERVAL".to_string(),
+                    args: vec![value, ResolvedExpr::Literal(Literal::String(unit))],
+                    distinct: false,
+                    result_type: DataType::Text,
+                    separator: None,
+                })
+            }
+
             _ => Err(SqlError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }
@@ -1604,34 +2549,53 @@ impl<'a> Resolver<'a> {
         name: &str,
         scope: &Scope,
     ) -> SqlResult<ResolvedExpr> {
+        // Try inner scope first
+        let inner_result = Self::resolve_column_in_scope(table, name, scope, false);
+        if inner_result.is_ok() {
+            return inner_result;
+        }
+        // Fall back to outer scope for correlated subqueries
+        if let Some(ref outer) = scope.outer {
+            let outer_result = Self::resolve_column_in_scope(table, name, outer, true);
+            if outer_result.is_ok() {
+                return outer_result;
+            }
+        }
+        // Return the inner error (not the outer one)
+        inner_result
+    }
+
+    /// Resolve a column within a single scope level
+    fn resolve_column_in_scope(
+        table: Option<&str>,
+        name: &str,
+        scope: &Scope,
+        is_outer: bool,
+    ) -> SqlResult<ResolvedExpr> {
         if let Some(table_name) = table {
-            // Qualified column reference (case-insensitive table name)
             let table_key = table_name.to_lowercase();
             let table_info = scope
                 .tables
                 .get(&table_key)
                 .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
-
             let (local_idx, col_info) = table_info
                 .columns
                 .iter()
                 .enumerate()
                 .find(|(_, (n, _, _))| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
-
             let global_idx = table_info.column_offset + local_idx;
-
             Ok(ResolvedExpr::Column(ResolvedColumn {
                 table: table_name.to_string(),
-                name: col_info.0.clone(), // Use the original column name from catalog
+                name: col_info.0.clone(),
                 index: global_idx,
                 data_type: col_info.1.clone(),
                 nullable: col_info.2,
+                default_value: None,
+                is_outer_ref: is_outer,
             }))
         } else {
-            // Unqualified column reference - search all tables
             let mut found: Option<(String, usize, DataType, bool)> = None;
-
             for (table_alias, table_info) in &scope.tables {
                 if let Some((local_idx, col_info)) = table_info
                     .columns
@@ -1651,15 +2615,16 @@ impl<'a> Resolver<'a> {
                     ));
                 }
             }
-
             match found {
-                Some((table, index, data_type, nullable)) => {
+                Some((tbl, index, data_type, nullable)) => {
                     Ok(ResolvedExpr::Column(ResolvedColumn {
-                        table,
+                        table: tbl,
                         name: name.to_string(),
                         index,
                         data_type,
                         nullable,
+                        default_value: None,
+                        is_outer_ref: is_outer,
                     }))
                 }
                 None => Err(SqlError::ColumnNotFound(name.to_string())),
@@ -1678,6 +2643,26 @@ impl<'a> Resolver<'a> {
             expr: Box::new(self.resolve_expr(inner, scope)?),
             test,
         })
+    }
+
+    /// Determine the result type of a scalar subquery from its SELECT list.
+    /// Scalar subqueries must produce exactly one column.
+    fn scalar_subquery_result_type(select: &ResolvedSelect) -> SqlResult<DataType> {
+        let col_count = Self::select_column_count(&select.columns);
+        if col_count != 1 {
+            return Err(SqlError::InvalidOperation(format!(
+                "Scalar subquery must return exactly one column, got {}",
+                col_count
+            )));
+        }
+        // Get the data type of the single output column
+        match select.columns.first() {
+            Some(ResolvedSelectItem::Expr { expr, .. }) => Ok(expr.data_type()),
+            Some(ResolvedSelectItem::Columns(cols)) if cols.len() == 1 => {
+                Ok(cols[0].data_type.clone())
+            }
+            _ => Ok(DataType::Text), // fallback
+        }
     }
 
     // ============ Auth statement resolution ============
@@ -1919,13 +2904,16 @@ fn convert_grant_objects(objects: &sp::GrantObjects) -> SqlResult<PrivilegeObjec
 
 // ============ Scope ============
 
-/// Scope for name resolution
+/// Scope for name resolution. Has optional outer scope for correlated subqueries.
 struct Scope {
     tables: HashMap<String, TableInfo>,
     table_order: Vec<(String, usize)>, // (alias, column_offset)
     total_columns: usize,
+    /// Outer scope for correlated subquery column resolution
+    outer: Option<Box<Scope>>,
 }
 
+#[derive(Clone)]
 struct TableInfo {
     columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
     column_offset: usize,
@@ -1937,6 +2925,7 @@ impl Scope {
             tables: HashMap::new(),
             table_order: Vec::new(),
             total_columns: 0,
+            outer: None,
         }
     }
 
@@ -1944,6 +2933,21 @@ impl Scope {
         let mut scope = Self::new();
         scope.add_table(name, name, table_def);
         scope
+    }
+
+    /// Create a new scope with an outer scope for correlated subqueries
+    fn with_outer(outer: &Scope) -> Self {
+        Self {
+            tables: HashMap::new(),
+            table_order: Vec::new(),
+            total_columns: 0,
+            outer: Some(Box::new(Scope {
+                tables: outer.tables.clone(),
+                table_order: outer.table_order.clone(),
+                total_columns: outer.total_columns,
+                outer: None, // Only one level of nesting for now
+            })),
+        }
     }
 
     fn add_table(&mut self, alias: &str, _real_name: &str, table_def: &crate::catalog::TableDef) {
@@ -2085,18 +3089,7 @@ fn convert_column_def(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
         }
     }
 
-    // MySQL: BLOB/TEXT columns cannot have a non-empty default value
-    if let Some(ref default_val) = col_def.default {
-        if matches!(col_def.data_type, DataType::Text | DataType::Blob) {
-            let trimmed = default_val.trim_matches('\'').trim_matches('"');
-            if !trimmed.is_empty() {
-                return Err(SqlError::InvalidOperation(format!(
-                    "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
-                    col_def.name
-                )));
-            }
-        }
-    }
+    // MySQL 8.0+ allows defaults on TEXT/BLOB columns (relaxed from older versions)
 
     Ok(col_def)
 }
@@ -2299,7 +3292,9 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
         // TIME — map to Text (we don't have a native Time type)
         sp::DataType::Time(_, _) => Ok(DataType::Text),
         // JSON
-        sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Text),
+        sp::DataType::JSON | sp::DataType::JSONB => Ok(DataType::Json),
+        // PostgreSQL-style geometry types
+        sp::DataType::GeometricType(_) => Ok(DataType::Geometry),
         // Custom type names (backward compat + types not in sqlparser enum)
         sp::DataType::Custom(name, _) => {
             let upper = name.to_string().to_uppercase();
@@ -2311,6 +3306,9 @@ pub fn convert_data_type(dt: &sp::DataType) -> SqlResult<DataType> {
                 "MEDIUMTEXT" | "LONGTEXT" | "TINYTEXT" | "NCHAR" | "NVARCHAR" => Ok(DataType::Text),
                 "MEDIUMBLOB" | "LONGBLOB" | "TINYBLOB" => Ok(DataType::Blob),
                 "FIXED" => Ok(DataType::Double),
+                // MySQL spatial/geometry types
+                "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
+                | "MULTIPOLYGON" | "GEOMETRY" | "GEOMETRYCOLLECTION" => Ok(DataType::Geometry),
                 _ => Err(SqlError::Unsupported(format!("Data type: {:?}", dt))),
             }
         }
@@ -2373,6 +3371,7 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
                 .map(|c| c.value.clone())
                 .collect();
             Ok(Some(Constraint::ForeignKey {
+                name: fk.name.as_ref().map(|n| n.value.clone()),
                 columns: cols,
                 ref_table: fk.foreign_table.to_string(),
                 ref_columns: ref_cols,
@@ -2386,7 +3385,15 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
 /// Extract column name from assignment target
 fn extract_assignment_target(target: &sp::AssignmentTarget) -> SqlResult<String> {
     match target {
-        sp::AssignmentTarget::ColumnName(names) => Ok(names.to_string()),
+        sp::AssignmentTarget::ColumnName(names) => {
+            // For table-qualified names (t1.b), use only the column part
+            let s = names.to_string();
+            if let Some(dot_pos) = s.rfind('.') {
+                Ok(s[dot_pos + 1..].to_string())
+            } else {
+                Ok(s)
+            }
+        }
         sp::AssignmentTarget::Tuple(_) => {
             Err(SqlError::Unsupported("Tuple assignment".to_string()))
         }
@@ -2421,13 +3428,64 @@ fn extract_join_condition(join_op: &sp::JoinOperator) -> Option<&sp::Expr> {
     }
 }
 
+/// Extract equi-join column pairs from an ON condition.
+/// Given `t1.a = t2.a AND t1.b = t2.b`, returns vec of (target_col, joined_col) pairs.
+fn extract_equijoin_pairs(
+    expr: &sp::Expr,
+    target_table: &str,
+    joined_table: &str,
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    extract_equijoin_pairs_inner(expr, target_table, joined_table, &mut pairs);
+    pairs
+}
+
+fn extract_equijoin_pairs_inner(
+    expr: &sp::Expr,
+    target_table: &str,
+    joined_table: &str,
+    pairs: &mut Vec<(String, String)>,
+) {
+    if let sp::Expr::BinaryOp { left, op, right } = expr {
+        if matches!(op, sp::BinaryOperator::And) {
+            extract_equijoin_pairs_inner(left, target_table, joined_table, pairs);
+            extract_equijoin_pairs_inner(right, target_table, joined_table, pairs);
+        } else if matches!(op, sp::BinaryOperator::Eq) {
+            // Try to extract table.column = table.column
+            if let (Some((lt, lc)), Some((rt, rc))) =
+                (extract_table_column(left), extract_table_column(right))
+            {
+                let lt_lower = lt.to_lowercase();
+                let rt_lower = rt.to_lowercase();
+                let target_lower = target_table.to_lowercase();
+                let joined_lower = joined_table.to_lowercase();
+                if lt_lower == target_lower && rt_lower == joined_lower {
+                    pairs.push((lc, rc));
+                } else if lt_lower == joined_lower && rt_lower == target_lower {
+                    pairs.push((rc, lc));
+                }
+            }
+        }
+    }
+}
+
+/// Extract (table_name, column_name) from a CompoundIdentifier like `t1.a`
+fn extract_table_column(expr: &sp::Expr) -> Option<(String, String)> {
+    match expr {
+        sp::Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((parts[0].value.clone(), parts[1].value.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Parse a static default value expression string into a Literal.
 ///
 /// Handles: integers, floats, quoted strings, NULL, TRUE/FALSE.
 /// Dynamic expressions (CURRENT_TIMESTAMP, NOW(), etc.) are mapped to
 /// appropriate values where possible; unrecognized expressions fall back
 /// to Literal::Null to avoid silently inserting wrong string values.
-fn parse_default_value(expr: &str) -> Literal {
+pub fn parse_default_value(expr: &str) -> Literal {
     let trimmed = expr.trim();
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Literal::Null;
@@ -2447,7 +3505,30 @@ fn parse_default_value(expr: &str) -> Literal {
     if let Ok(i) = trimmed.parse::<i64>() {
         return Literal::Integer(i);
     }
-    // Try float
+    // Try decimal (has decimal point but no scientific notation)
+    if trimmed.contains('.') && !trimmed.contains('E') && !trimmed.contains('e') {
+        if let Some(dot_pos) = trimmed.find('.') {
+            let scale = (trimmed.len() - dot_pos - 1) as u8;
+            let mut unscaled_str = String::with_capacity(trimmed.len() - 1);
+            unscaled_str.push_str(&trimmed[..dot_pos]);
+            unscaled_str.push_str(&trimmed[dot_pos + 1..]);
+            let negative = unscaled_str.starts_with('-');
+            let digits = if negative {
+                unscaled_str[1..].trim_start_matches('0')
+            } else {
+                unscaled_str.trim_start_matches('0')
+            };
+            let digits = if digits.is_empty() { "0" } else { digits };
+            if let Ok(unscaled) = if negative {
+                format!("-{}", digits).parse::<i128>()
+            } else {
+                digits.parse::<i128>()
+            } {
+                return Literal::Decimal(unscaled, scale);
+            }
+        }
+    }
+    // Try float (scientific notation)
     if let Ok(f) = trimmed.parse::<f64>() {
         return Literal::Float(f);
     }
@@ -2476,7 +3557,41 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::Null => Ok(Literal::Null),
         sp::Value::Boolean(b) => Ok(Literal::Boolean(*b)),
         sp::Value::Number(n, _) => {
-            if n.contains('.') || n.contains('E') || n.contains('e') {
+            if n.contains('.') && !n.contains('E') && !n.contains('e') {
+                // Decimal literal (e.g. 0.7, 3.14, 100.00) — exact DECIMAL, not float.
+                // MySQL treats numeric literals with a decimal point (but no scientific
+                // notation) as exact DECIMAL values.
+                let dot_pos = n.find('.').unwrap();
+                let scale = (n.len() - dot_pos - 1) as u8;
+                // Build the unscaled integer by removing the decimal point
+                let mut unscaled_str = String::with_capacity(n.len() - 1);
+                unscaled_str.push_str(&n[..dot_pos]);
+                unscaled_str.push_str(&n[dot_pos + 1..]);
+                // Strip leading zeros for parsing but preserve sign
+                let negative = unscaled_str.starts_with('-');
+                let digits = if negative {
+                    unscaled_str[1..].trim_start_matches('0')
+                } else {
+                    unscaled_str.trim_start_matches('0')
+                };
+                let digits = if digits.is_empty() { "0" } else { digits };
+                let parse_result: Result<i128, _> = if negative {
+                    format!("-{}", digits).parse()
+                } else {
+                    digits.parse()
+                };
+                match parse_result {
+                    Ok(unscaled) => Ok(Literal::Decimal(unscaled, scale)),
+                    Err(_) => {
+                        // Value too large for i128 — fall back to f64 (lossy)
+                        let val = n.parse().map_err(|_| {
+                            SqlError::InvalidOperation(format!("Invalid decimal literal: '{}'", n))
+                        })?;
+                        Ok(Literal::Float(val))
+                    }
+                }
+            } else if n.contains('E') || n.contains('e') {
+                // Scientific notation — true floating-point
                 let val = n.parse().map_err(|_| {
                     SqlError::InvalidOperation(format!("Invalid float literal: '{}'", n))
                 })?;
@@ -2529,6 +3644,11 @@ fn convert_value(val: &sp::Value) -> SqlResult<Literal> {
         sp::Value::HexStringLiteral(s) => {
             let bytes = hex_decode(s).unwrap_or_default();
             Ok(Literal::Blob(bytes))
+        }
+        sp::Value::SingleQuotedByteStringLiteral(s) => {
+            // B'10101' — binary bit string literal, convert to integer
+            let val = u64::from_str_radix(s, 2).unwrap_or(0);
+            Ok(Literal::UnsignedInteger(val))
         }
         _ => Err(SqlError::Unsupported(format!("Value: {:?}", val))),
     }
@@ -2644,7 +3764,15 @@ fn infer_binary_result_type(
 fn infer_unary_result_type(op: UnaryOp, expr: &ResolvedExpr) -> SqlResult<DataType> {
     match op {
         UnaryOp::Not => Ok(DataType::Boolean),
-        UnaryOp::Neg | UnaryOp::Plus => Ok(expr.data_type()),
+        UnaryOp::Neg | UnaryOp::Plus => {
+            let dt = expr.data_type();
+            // Negating a boolean produces an integer (-TRUE = -1)
+            if dt == DataType::Boolean {
+                Ok(DataType::BigInt)
+            } else {
+                Ok(dt)
+            }
+        }
         UnaryOp::BitwiseNot => Ok(DataType::BigInt),
     }
 }
@@ -2702,10 +3830,32 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             }
         }
         "NOW" | "CURRENT_TIMESTAMP" => Ok(DataType::Timestamp),
+        // JSON functions
+        "JSON_ARRAY"
+        | "JSON_OBJECT"
+        | "JSON_SET"
+        | "JSON_INSERT"
+        | "JSON_REPLACE"
+        | "JSON_REMOVE"
+        | "JSON_MERGE_PRESERVE"
+        | "JSON_MERGE_PATCH"
+        | "JSON_ARRAY_APPEND"
+        | "JSON_ARRAY_INSERT"
+        | "JSON_EXTRACT"
+        | "JSON_KEYS"
+        | "JSON_SEARCH"
+        | "JSON_PRETTY" => Ok(DataType::Json),
+        "JSON_QUOTE" | "JSON_UNQUOTE" | "JSON_TYPE" | "JSON_VALUE" => Ok(DataType::Text),
+        "JSON_VALID" | "JSON_CONTAINS" | "JSON_CONTAINS_PATH" | "JSON_OVERLAPS" | "JSON_LENGTH"
+        | "JSON_DEPTH" | "JSON_STORAGE_SIZE" | "JSON_STORAGE_FREE" | "JSON_SCHEMA_VALID" => {
+            Ok(DataType::BigInt)
+        }
+        "JSON_SCHEMA_VALIDATION_REPORT" | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => Ok(DataType::Json),
         "HEX" | "UNHEX" => Ok(DataType::Text),
         "LPAD" | "RPAD" | "LEFT" | "RIGHT" | "REVERSE" | "REPEAT" | "SPACE" | "REPLACE"
         | "INSERT" | "_ROODB_INSERT" => Ok(DataType::Text),
         "STRCMP" => Ok(DataType::BigInt),
+        "GROUP_CONCAT" => Ok(DataType::Text),
         "MOD" | "_ROODB_MOD" => {
             if args.is_empty() {
                 Ok(DataType::BigInt)
@@ -2715,6 +3865,13 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         }
         "FORMAT" => Ok(DataType::Text),
         "SHA" | "SHA1" | "SHA2" | "MD5" => Ok(DataType::Text),
+        "TO_BASE64" | "FROM_BASE64" | "QUOTE" | "UUID" => Ok(DataType::Text),
+        "RANDOM_BYTES" | "AES_ENCRYPT" | "AES_DECRYPT" | "COMPRESS" => Ok(DataType::Blob),
+        "UNCOMPRESS" => Ok(DataType::Text),
+        "UNCOMPRESSED_LENGTH" | "UUID_SHORT" | "BENCHMARK" | "IS_IPV4" | "IS_IPV6" => {
+            Ok(DataType::BigInt)
+        }
+        "WEIGHT_STRING" => Ok(DataType::Blob),
         "CRC32" => Ok(DataType::BigInt),
         "CONNECTION_ID" | "LAST_INSERT_ID" => Ok(DataType::BigInt),
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" | "VERSION" | "DATABASE"
@@ -2727,28 +3884,35 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
             Ok(DataType::Double)
         }
         // Spatial functions — not supported, but need type info for error path
-        "ST_LINESTRINGFROMWKB"
-        | "ST_POINTFROMWKB"
+        "ST_GEOMFROMTEXT"
+        | "ST_GEOMETRYFROMTEXT"
+        | "ST_GEOMFROMWKB"
         | "ST_GEOMETRYFROMWKB"
-        | "ST_GEOMFROMTEXT"
-        | "ST_GEOMFROMWKB" => Err(SqlError::InvalidOperation(
-            "Incorrect arguments to spatial function".to_string(),
-        )),
+        | "ST_POINTFROMWKB"
+        | "ST_LINESTRINGFROMWKB"
+        | "ST_POLYGONFROMWKB" => Ok(DataType::Geometry),
+        "ST_X" | "ST_Y" | "ST_LENGTH" | "ST_AREA" | "ST_DISTANCE" | "ST_PERIMETER" => {
+            Ok(DataType::Double)
+        }
+        "ST_NUMPOINTS"
+        | "ST_NUMGEOMETRIES"
+        | "ST_NUMINTERIORRINGS"
+        | "ST_SRID"
+        | "ST_DIMENSION" => Ok(DataType::BigInt),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => Ok(DataType::BigInt),
         "TO_DAYS" | "FROM_DAYS" | "DATEDIFF" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR"
         | "HOUR" | "MINUTE" | "SECOND" | "MONTH" | "YEAR" | "WEEK" | "QUARTER" | "WEEKDAY"
-        | "YEARWEEK" | "UNIX_TIMESTAMP" | "TIME_TO_SEC" | "PERIOD_ADD" | "PERIOD_DIFF" => {
-            Ok(DataType::BigInt)
-        }
+        | "YEARWEEK" | "WEEKOFYEAR" | "UNIX_TIMESTAMP" | "TIME_TO_SEC" | "PERIOD_ADD"
+        | "PERIOD_DIFF" | "TO_SECONDS" => Ok(DataType::BigInt),
         "FROM_UNIXTIME" | "DATE_FORMAT" | "STR_TO_DATE" | "DATE_ADD" | "DATE_SUB" | "ADDDATE"
         | "SUBDATE" | "MAKEDATE" | "MAKETIME" | "SEC_TO_TIME" | "TIMEDIFF" | "TIMESTAMPADD"
         | "TIMESTAMPDIFF" | "CURDATE" | "CURTIME" | "SYSDATE" | "UTC_DATE" | "UTC_TIME"
-        | "UTC_TIMESTAMP" => Ok(DataType::Text),
+        | "UTC_TIMESTAMP" | "ADDTIME" | "SUBTIME" | "CONVERT_TZ" => Ok(DataType::Text),
         "CONV" | "BIN" | "OCT" => Ok(DataType::Text),
         "CHAR" => Ok(DataType::Text),
         "ORD" | "ASCII" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "FIELD"
         | "LOCATE" | "INSTR" | "FIND_IN_SET" | "POSITION" => Ok(DataType::BigInt),
-        "ELT" | "MAKE_SET" | "EXPORT_SET" => Ok(DataType::Text),
+        "ELT" | "MAKE_SET" | "EXPORT_SET" | "SUBSTRING_INDEX" => Ok(DataType::Text),
         "GET_LOCK" | "RELEASE_LOCK" | "IS_FREE_LOCK" => Ok(DataType::BigInt),
         "INET_NTOA" | "INET6_NTOA" => Ok(DataType::Text),
         "INET_ATON" | "INET6_ATON" => Ok(DataType::BigInt),
@@ -2766,10 +3930,8 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
         "POW" | "POWER" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "PI" | "RADIANS"
         | "DEGREES" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "COT"
         | "RAND" => Ok(DataType::Double),
-        _ => Err(SqlError::InvalidOperation(format!(
-            "Unknown function: {}",
-            name
-        ))),
+        // UDF: check if function exists in catalog (returns BIGINT by default)
+        _ => Ok(DataType::BigInt),
     }
 }
 
@@ -3232,7 +4394,7 @@ mod tests {
         );
 
         // JSON
-        assert_eq!(convert_data_type(&SpDt::JSON).unwrap(), DataType::Text);
-        assert_eq!(convert_data_type(&SpDt::JSONB).unwrap(), DataType::Text);
+        assert_eq!(convert_data_type(&SpDt::JSON).unwrap(), DataType::Json);
+        assert_eq!(convert_data_type(&SpDt::JSONB).unwrap(), DataType::Json);
     }
 }

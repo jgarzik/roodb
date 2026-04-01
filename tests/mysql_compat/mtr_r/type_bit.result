@@ -1,0 +1,436 @@
+select 0 + b'1';
+0 + 1
+1
+select 0 + b'0';
+0 + 0
+0
+select 0 + b'000001';
+0 + 1
+1
+select 0 + b'000011';
+0 + 3
+3
+select 0 + b'000101';
+0 + 5
+5
+select 0 + b'000000';
+0 + 0
+0
+select 0 + b'10000000';
+0 + 128
+128
+select 0 + b'11111111';
+0 + 255
+255
+select 0 + b'10000001';
+0 + 129
+129
+select 0 + b'1000000000000000';
+0 + 32768
+32768
+select 0 + b'1111111111111111';
+0 + 65535
+65535
+select 0 + b'1000000000000001';
+0 + 32769
+32769
+drop table if exists t1;
+create table t1 (a bit(64));
+insert into t1 values
+(b'1111111111111111111111111111111111111111111111111111111111111111'),
+(b'1000000000000000000000000000000000000000000000000000000000000000'),
+(b'0000000000000000000000000000000000000000000000000000000000000001'),
+(b'1010101010101010101010101010101010101010101010101010101010101010'),
+(b'0101010101010101010101010101010101010101010101010101010101010101');
+select hex(a) from t1;
+HEX(a)
+FFFFFFFFFFFFFFFF
+8000000000000000
+1
+AAAAAAAAAAAAAAAA
+5555555555555555
+drop table t1;
+create table t1 (a bit);
+insert into t1 values (b'0'), (b'1');
+select hex(a) from t1;
+HEX(a)
+0
+1
+drop table t1;
+create table t1 (a bit(2));
+insert into t1 values (b'00'), (b'01'), (b'10');
+select a+0 from t1;
+a + 0
+0
+1
+2
+drop table t1;
+create table t1 (a bit(7), b bit(9));
+insert into t1 values
+(94, 46), (31, 438), (61, 152), (78, 123), (88, 411), (122, 118), (0, 177),
+(75, 42), (108, 67), (79, 349), (59, 188), (68, 206), (49, 345), (118, 380),
+(111, 368), (94, 468), (56, 379), (77, 133), (29, 399), (9, 363), (23, 36),
+(116, 390), (119, 368), (87, 351), (123, 411), (24, 398), (34, 202), (28, 499),
+(30, 83), (5, 178), (60, 343), (4, 245), (104, 280), (106, 446), (127, 403),
+(44, 307), (68, 454), (57, 135);
+select a+0 from t1;
+a + 0
+0
+104
+106
+108
+111
+116
+118
+119
+122
+123
+127
+23
+24
+28
+29
+30
+31
+34
+4
+44
+49
+5
+56
+57
+59
+60
+61
+68
+68
+75
+77
+78
+79
+87
+88
+9
+94
+94
+select b+0 from t1;
+b + 0
+118
+123
+133
+135
+152
+177
+178
+188
+202
+206
+245
+280
+307
+343
+345
+349
+351
+36
+363
+368
+368
+379
+380
+390
+398
+399
+403
+411
+411
+42
+438
+446
+454
+46
+468
+499
+67
+83
+select a+0, b+0 from t1;
+a + 0	b + 0
+0	177
+104	280
+106	446
+108	67
+111	368
+116	390
+118	380
+119	368
+122	118
+123	411
+127	403
+23	36
+24	398
+28	499
+29	399
+30	83
+31	438
+34	202
+4	245
+44	307
+49	345
+5	178
+56	379
+57	135
+59	188
+60	343
+61	152
+68	206
+68	454
+75	42
+77	133
+78	123
+79	349
+87	351
+88	411
+9	363
+94	46
+94	468
+select a+0, b+0 from t1 where a > 40 and b > 200 order by 1;
+a + 0	b + 0
+44	307
+49	345
+56	379
+60	343
+68	206
+68	454
+79	349
+87	351
+88	411
+94	468
+104	280
+106	446
+111	368
+116	390
+118	380
+119	368
+123	411
+127	403
+select a+0, b+0 from t1 where a > 40 and a < 70 order by 2;
+a + 0	b + 0
+57	135
+61	152
+59	188
+68	206
+44	307
+60	343
+49	345
+56	379
+68	454
+select hex(min(a)) from t1;
+HEX(MIN(a))
+0
+select hex(min(b)) from t1;
+HEX(MIN(b))
+24
+select hex(min(a)), hex(max(a)), hex(min(b)), hex(max(b)) from t1;
+HEX(MIN(a))	HEX(MAX(a))	HEX(MIN(b))	HEX(MAX(b))
+0	7F	24	1F3
+drop table t1;
+create table t1 (a int not null, b bit, c bit(9));
+insert into t1 values
+(4, NULL, 1), (4, 0, 3), (2, 1, 4), (1, 1, 100), (4, 0, 23), (4, 0, 54),
+(56, 0, 22), (4, 1, 100), (23, 0, 1), (4, 0, 34);
+select a+0, b+0, c+0 from t1;
+a + 0	b + 0	c + 0
+1	1	100
+2	1	4
+23	0	1
+4	0	23
+4	0	3
+4	0	34
+4	0	54
+4	1	100
+4	NULL	1
+56	0	22
+select hex(min(b)) from t1 where a = 4;
+HEX(MIN(b))
+0
+select hex(min(c)) from t1 where a = 4 and b = 0;
+HEX(MIN(c))
+3
+select hex(max(b)) from t1;
+HEX(MAX(b))
+1
+select a+0, b+0, c+0 from t1 where a = 4 and b = 0 limit 2;
+a + 0	b + 0	c + 0
+4	0	3
+4	0	23
+select a+0, b+0, c+0 from t1 where a = 4 and b = 1;
+a + 0	b + 0	c + 0
+4	1	100
+select a+0, b+0, c+0 from t1 where a = 4 and b = 1 and c=100;
+a + 0	b + 0	c + 0
+4	1	100
+drop table t1;
+create table t1(a bit(2), b bit(2));
+insert into t1 (a) values (0x01), (0x03), (0x02);
+update t1 set b= concat(a);
+select a+0, b+0 from t1;
+a + 0	b + 0
+1	1
+2	2
+3	3
+drop table t1;
+create table t1 (a bit(7));
+insert into t1 values (44), (57);
+select a+0 from t1;
+a + 0
+44
+57
+drop table t1;
+create table t1 (a bit(3), b bit(12));
+insert into t1 values (7,(1<<12)-2), (0x01,0x01ff);
+select hex(a),hex(b) from t1;
+HEX(a)	HEX(b)
+7	FFE
+1	1FF
+select hex(concat(a)),hex(concat(b)) from t1;
+HEX(CONCAT(a))	HEX(CONCAT(b))
+37	34303934
+31	353131
+drop table t1;
+create table t1(a int, b bit not null);
+alter table t1 add primary key (a);
+drop table t1;
+CREATE TABLE t1 (a BIT(64));
+INSERT INTO t1 VALUES
+(b'1111111111111111111111111111111111111111111111111111111111111111');
+SELECT HEX(a) FROM t1 WHERE a =
+b'1111111111111111111111111111111111111111111111111111111111111111';
+HEX(a)
+FFFFFFFFFFFFFFFF
+DROP TABLE t1;
+CREATE TABLE t1 (b BIT(2), a VARCHAR(5));
+INSERT INTO t1 (b, a) VALUES (1, 'x'), (3, 'zz'), (0, 'y'), (3, 'z');
+SELECT b+0, COUNT(DISTINCT a) FROM t1 GROUP BY b;
+b + 0	COUNT(a)
+0	1
+1	1
+3	2
+DROP TABLE t1;
+CREATE TABLE t1 (a CHAR(5), b BIT(2));
+INSERT INTO t1 (b, a) VALUES (1, 'x'), (3, 'zz'), (0, 'y'), (3, 'z');
+SELECT b+0, COUNT(DISTINCT a) FROM t1 GROUP BY b;
+b + 0	COUNT(a)
+1	1
+1	1
+2	2
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b BIT(2));
+INSERT INTO t1 (b, a) VALUES (1, 1), (3, 2), (0, 3), (3, 4);
+SELECT b+0, COUNT(DISTINCT a) FROM t1 GROUP BY b;
+b + 0	COUNT(a)
+1	1
+1	1
+2	2
+DROP TABLE t1;
+CREATE TABLE t1 (a int, b bit(2));
+INSERT INTO t1 VALUES (3, 2), (2, 3), (2, 0), (3, 2), (3, 1);
+SELECT COUNT(DISTINCT b) FROM t1 GROUP BY a;
+COUNT(b)
+2
+2
+DROP TABLE t1;
+CREATE TABLE t1 (b BIT NOT NULL, i2 INTEGER NOT NULL, s VARCHAR(255) NOT NULL);
+INSERT INTO t1 VALUES(0x01,100,''), (0x00,300,''), (0x01,200,''), (0x00,100,'');
+SELECT HEX(b), i2 FROM t1 WHERE (i2>=100 AND i2<201) AND b=TRUE;
+HEX(b)	i2
+1	100
+1	200
+CREATE TABLE t2 (b1 BIT NOT NULL, b2 BIT NOT NULL, i2 INTEGER NOT NULL,
+s VARCHAR(255) NOT NULL);
+INSERT INTO t2 VALUES (0x01,0x00,100,''), (0x00,0x01,300,''),
+(0x01,0x00,200,''), (0x00,0x01,100,'');
+SELECT HEX(b1), i2 FROM t2 WHERE (i2>=100 AND i2<201) AND b1=TRUE;
+HEX(b1)	i2
+1	100
+1	200
+SELECT HEX(b2), i2 FROM t2 WHERE (i2>=100 AND i2<201) AND b2=FALSE;
+HEX(b2)	i2
+0	100
+0	200
+SELECT HEX(b1), HEX(b2), i2 FROM t2
+WHERE (i2>=100 AND i2<201) AND b1=TRUE AND b2=FALSE;
+HEX(b1)	HEX(b2)	i2
+1	0	100
+1	0	200
+DROP TABLE t1, t2;
+create table t1 (a1 int, b1 bit(2));
+create table t2 (a2 int, b2 bit(2));
+insert into t1 values (1, 1), (2, 0), (3, 1), (4, 2);
+insert into t2 values (2, 1), (3, 0), (4, 1), (5, 2);
+select a1, a2, b1+0, b2+0 from t1 join t2 on a1 = a2;
+a1	a2	b1 + 0	b2 + 0
+2	2	0	1
+3	3	1	0
+4	4	2	1
+select a1, a2, b1+0, b2+0 from t1 join t2 on a1 = a2 order by a1;
+a1	a2	b1 + 0	b2 + 0
+2	2	0	1
+3	3	1	0
+4	4	2	1
+select a1, a2, b1+0, b2+0 from t1 join t2 on b1 = b2;
+a1	a2	b1 + 0	b2 + 0
+1	2	1	1
+1	4	1	1
+2	3	0	0
+3	2	1	1
+3	4	1	1
+4	5	2	2
+drop table t1, t2;
+CREATE TABLE t1(a INT, b BIT(7) NOT NULL);
+INSERT INTO t1 VALUES (NULL, 0),(NULL, 0);
+SELECT SUM(a) FROM t1 GROUP BY b, a;
+SUM(a)
+NULL
+DROP TABLE t1;
+CREATE TABLE t1(a INT, b BIT(7) NOT NULL, c BIT(8) NOT NULL);
+INSERT INTO t1 VALUES (NULL, 0, 0),(NULL, 0, 0);
+SELECT SUM(a) FROM t1 GROUP BY c, b, a;
+SUM(a)
+NULL
+DROP TABLE t1;
+create table bug15583(b BIT(8), n INT);
+insert into bug15583 values(128, 128);
+insert into bug15583 values(null, null);
+insert into bug15583 values(0, 0);
+insert into bug15583 values(255, 255);
+select hex(b), bin(b), oct(b), hex(n), bin(n), oct(n) from bug15583;
+HEX(b)	BIN(b)	OCT(b)	HEX(n)	BIN(n)	OCT(n)
+80	10000000	200	80	10000000	200
+NULL	NULL	NULL	NULL	NULL	NULL
+0	0	0	0	0	0
+FF	11111111	377	FF	11111111	377
+select hex(b)=hex(n) as should_be_onetrue, bin(b)=bin(n) as should_be_onetrue, oct(b)=oct(n) as should_be_onetrue from bug15583;
+should_be_onetrue	should_be_onetrue	should_be_onetrue
+1	1	1
+NULL	NULL	NULL
+1	1	1
+1	1	1
+drop table bug15583;
+create table t1bit7 (a1 bit(7) not null);
+create table t2bit7 (b1 bit(7));
+insert into t1bit7 values (b'1100000');
+insert into t1bit7 values (b'1100001');
+insert into t1bit7 values (b'1100010');
+insert into t2bit7 values (b'1100001');
+insert into t2bit7 values (b'1100010');
+insert into t2bit7 values (b'1100110');
+select bin(a1) from t1bit7, t2bit7 where t1bit7.a1=t2bit7.b1;
+BIN(a1)
+1100001
+1100010
+drop table t1bit7, t2bit7;
+select bin(255), oct(255), hex(255),
+bin(0xFF), oct(0xFF), hex(0xFF);
+BIN(255)	OCT(255)	HEX(255)	BIN(blob)	OCT(blob)	HEX(blob)
+11111111	377	FF	0	0	FF
+# End of type_bit tests

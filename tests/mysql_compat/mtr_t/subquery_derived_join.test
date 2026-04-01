@@ -1,0 +1,214 @@
+#
+# Subqueries used as derived tables in JOIN clauses.
+# Tests JOIN (SELECT ...) AS derived patterns, multi-way derived joins,
+# correlated-like patterns via derived tables, and aggregates in derived tables.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS employees, departments, projects, assignments;
+--enable_warnings
+
+CREATE TABLE departments (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    budget DECIMAL(12,2) NOT NULL
+);
+INSERT INTO departments VALUES
+    (1, 'Engineering', 500000.00),
+    (2, 'Marketing', 200000.00),
+    (3, 'Sales', 300000.00),
+    (4, 'Support', 150000.00);
+
+CREATE TABLE employees (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    dept_id INT NOT NULL,
+    salary DECIMAL(10,2) NOT NULL,
+    hire_year INT NOT NULL
+);
+INSERT INTO employees VALUES
+    (1, 'Alice',   1, 120000.00, 2018),
+    (2, 'Bob',     1, 95000.00,  2020),
+    (3, 'Charlie', 1, 110000.00, 2019),
+    (4, 'Diana',   2, 80000.00,  2021),
+    (5, 'Eve',     2, 75000.00,  2022),
+    (6, 'Frank',   3, 85000.00,  2020),
+    (7, 'Grace',   3, 90000.00,  2019),
+    (8, 'Henry',   3, 70000.00,  2023),
+    (9, 'Irene',   4, 65000.00,  2021),
+    (10,'Jack',    4, 68000.00,  2022);
+
+CREATE TABLE projects (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    dept_id INT NOT NULL,
+    priority INT NOT NULL
+);
+INSERT INTO projects VALUES
+    (1, 'Backend Rewrite', 1, 1),
+    (2, 'Mobile App', 1, 2),
+    (3, 'Ad Campaign', 2, 1),
+    (4, 'Q4 Push', 3, 1),
+    (5, 'Help Desk v2', 4, 1);
+
+CREATE TABLE assignments (
+    emp_id INT NOT NULL,
+    project_id INT NOT NULL,
+    hours INT NOT NULL,
+    PRIMARY KEY (emp_id, project_id)
+);
+INSERT INTO assignments VALUES
+    (1, 1, 100), (1, 2, 40),
+    (2, 1, 80),  (2, 2, 60),
+    (3, 2, 120),
+    (4, 3, 90),
+    (6, 4, 110), (7, 4, 95),
+    (8, 4, 50),
+    (9, 5, 130), (10, 5, 80);
+
+--echo # --- Basic derived table in JOIN ---
+
+SELECT e.name, d.dept_name, d.avg_sal
+FROM employees e
+JOIN (
+    SELECT dept_id, AVG(salary) AS avg_sal, MAX(salary) AS max_sal,
+           MIN(name) AS dept_name
+    FROM employees
+    GROUP BY dept_id
+) d ON e.dept_id = d.dept_id
+WHERE e.salary > d.avg_sal
+ORDER BY e.id;
+
+--echo # --- Multiple derived tables in JOIN ---
+
+SELECT ds.dept_name, ds.emp_count, dp.proj_count
+FROM (
+    SELECT dept_id, COUNT(*) AS emp_count,
+           MIN(name) AS dept_name
+    FROM employees
+    GROUP BY dept_id
+) ds
+JOIN (
+    SELECT dept_id, COUNT(*) AS proj_count
+    FROM projects
+    GROUP BY dept_id
+) dp ON ds.dept_id = dp.dept_id
+ORDER BY ds.dept_id;
+
+--echo # --- Derived table with regular table in JOIN ---
+
+SELECT d.name AS dept, sub.total_hours
+FROM departments d
+JOIN (
+    SELECT p.dept_id, SUM(a.hours) AS total_hours
+    FROM assignments a
+    JOIN projects p ON a.project_id = p.id
+    GROUP BY p.dept_id
+) sub ON d.id = sub.dept_id
+ORDER BY d.id;
+
+--echo # --- LEFT JOIN with derived table ---
+
+SELECT d.name AS dept, COALESCE(sub.total_hours, 0) AS total_hours
+FROM departments d
+LEFT JOIN (
+    SELECT p.dept_id, SUM(a.hours) AS total_hours
+    FROM assignments a
+    JOIN projects p ON a.project_id = p.id
+    GROUP BY p.dept_id
+) sub ON d.id = sub.dept_id
+ORDER BY d.id;
+
+--echo # --- Derived table with WHERE filter ---
+
+SELECT e.name, e.salary, top_d.max_sal
+FROM employees e
+JOIN (
+    SELECT dept_id, MAX(salary) AS max_sal
+    FROM employees
+    WHERE hire_year >= 2020
+    GROUP BY dept_id
+) top_d ON e.dept_id = top_d.dept_id AND e.salary = top_d.max_sal
+ORDER BY e.id;
+
+--echo # --- Nested derived tables ---
+
+SELECT outer_d.dept_id, outer_d.senior_count
+FROM (
+    SELECT dept_id, COUNT(*) AS senior_count
+    FROM (
+        SELECT id, dept_id, salary, hire_year
+        FROM employees
+        WHERE hire_year <= 2020
+    ) seniors
+    GROUP BY dept_id
+) outer_d
+ORDER BY outer_d.dept_id;
+
+--echo # --- Derived table joining with another derived table and real table ---
+
+SELECT d.name AS department,
+       emp_stats.avg_salary,
+       proj_stats.total_hours
+FROM departments d
+JOIN (
+    SELECT dept_id, ROUND(AVG(salary), 2) AS avg_salary
+    FROM employees
+    GROUP BY dept_id
+) emp_stats ON d.id = emp_stats.dept_id
+LEFT JOIN (
+    SELECT p.dept_id, SUM(a.hours) AS total_hours
+    FROM projects p
+    JOIN assignments a ON p.id = a.project_id
+    GROUP BY p.dept_id
+) proj_stats ON d.id = proj_stats.dept_id
+ORDER BY d.id;
+
+--echo # --- Derived table with HAVING ---
+
+SELECT d.name, sub.high_earners
+FROM departments d
+JOIN (
+    SELECT dept_id, COUNT(*) AS high_earners
+    FROM employees
+    WHERE salary >= 80000.00
+    GROUP BY dept_id
+    HAVING COUNT(*) >= 2
+) sub ON d.id = sub.dept_id
+ORDER BY d.id;
+
+--echo # --- Derived table with WHERE filter (top 2 budgets) ---
+
+SELECT e.name, e.salary
+FROM employees e
+JOIN (
+    SELECT id AS dept_id FROM departments WHERE budget >= 300000.00
+) big_depts ON e.dept_id = big_depts.dept_id
+ORDER BY e.salary DESC;
+
+--echo # --- Scalar subquery alongside derived table JOIN ---
+
+SELECT e.name, e.salary,
+    e.salary - (SELECT AVG(salary) FROM employees) AS diff_from_avg,
+    ds.dept_avg
+FROM employees e
+JOIN (
+    SELECT dept_id, ROUND(AVG(salary), 2) AS dept_avg
+    FROM employees
+    GROUP BY dept_id
+) ds ON e.dept_id = ds.dept_id
+WHERE e.salary > ds.dept_avg
+ORDER BY e.id;
+
+--echo # --- Derived table with DISTINCT ---
+
+SELECT DISTINCT sub.dept_id, sub.project_name
+FROM (
+    SELECT p.dept_id, p.name AS project_name, a.emp_id
+    FROM projects p
+    JOIN assignments a ON p.id = a.project_id
+) sub
+ORDER BY sub.dept_id, sub.project_name;
+
+--echo # --- Cleanup ---
+DROP TABLE assignments, projects, employees, departments;

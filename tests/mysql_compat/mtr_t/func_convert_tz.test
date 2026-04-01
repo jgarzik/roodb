@@ -1,0 +1,23 @@
+--echo # CONVERT_TZ tests
+
+--echo # --- UTC to positive offset ---
+SELECT CONVERT_TZ('2024-01-15 12:00:00', '+00:00', '+05:30');
+SELECT CONVERT_TZ('2024-01-15 12:00:00', '+00:00', '+09:00');
+
+--echo # --- UTC to negative offset ---
+SELECT CONVERT_TZ('2024-01-15 12:00:00', '+00:00', '-05:00');
+SELECT CONVERT_TZ('2024-01-15 12:00:00', '+00:00', '-08:00');
+
+--echo # --- Named timezone UTC ---
+SELECT CONVERT_TZ('2024-01-15 12:00:00', 'UTC', '+03:00');
+
+--echo # --- Cross-midnight conversion ---
+SELECT CONVERT_TZ('2024-01-15 23:00:00', '+00:00', '+05:00');
+SELECT CONVERT_TZ('2024-01-15 02:00:00', '+00:00', '-05:00');
+
+--echo # --- Between two offsets ---
+SELECT CONVERT_TZ('2024-06-15 12:00:00', '+05:30', '-05:00');
+
+--echo # --- NULL handling ---
+SELECT CONVERT_TZ(NULL, '+00:00', '+05:00');
+SELECT CONVERT_TZ('2024-01-15 12:00:00', NULL, '+05:00');

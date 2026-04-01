@@ -1,0 +1,180 @@
+#
+# Stored procedure tests — nested CALL, single-statement bodies,
+# multi-variable DECLARE, variable scoping
+#
+
+--disable_warnings
+drop table if exists t1, t2;
+drop procedure if exists p1;
+drop procedure if exists p2;
+drop procedure if exists p3;
+--enable_warnings
+
+--echo #
+--echo # Single-statement body (no BEGIN/END)
+--echo #
+create table t1 (id char(16) not null default '', data int not null);
+
+delimiter |;
+create procedure p1()
+  insert into t1 values ("foo", 42)|
+delimiter ;|
+call p1();
+select * from t1;
+delete from t1;
+drop procedure p1;
+
+--echo #
+--echo # Single-statement body with IN params
+--echo #
+delimiter |;
+create procedure p1(x char(16), y int)
+  insert into t1 values (x, y)|
+delimiter ;|
+call p1("bar", 666);
+select * from t1;
+delete from t1;
+drop procedure p1;
+
+--echo #
+--echo # Two statements in body
+--echo #
+delimiter |;
+create procedure p1(x1 char(16), x2 char(16), y int)
+begin
+  insert into t1 values (x1, y);
+  insert into t1 values (x2, y);
+end|
+delimiter ;|
+call p1("one", "two", 3);
+select * from t1;
+delete from t1;
+drop procedure p1;
+
+--echo #
+--echo # Multi-variable DECLARE
+--echo #
+delimiter |;
+create procedure p1(x char(16), y int)
+begin
+  declare z1, z2 int;
+  set z1 = y;
+  set z2 = z1+2;
+  insert into t1 values (x, z2);
+end|
+delimiter ;|
+call p1("locset", 19);
+select * from t1;
+delete from t1;
+drop procedure p1;
+
+--echo #
+--echo # Multi-var DECLARE with DEFAULT
+--echo #
+delimiter |;
+create procedure p1()
+begin
+  declare a, b, c int default 10;
+  set @r = a + b + c;
+end|
+delimiter ;|
+call p1();
+select @r;
+drop procedure p1;
+
+--echo #
+--echo # Nested CALL — procedure calling procedure
+--echo #
+delimiter |;
+create procedure p1(IN v INT)
+begin
+  insert into t1 values ('inner', v);
+end|
+
+create procedure p2()
+begin
+  call p1(1);
+  call p1(2);
+  call p1(3);
+end|
+delimiter ;|
+
+call p2();
+select * from t1 order by data;
+delete from t1;
+drop procedure p2;
+drop procedure p1;
+
+--echo #
+--echo # Nested CALL with parameters passed through
+--echo #
+delimiter |;
+create procedure p1(IN val INT, OUT result INT)
+begin
+  set result = val * val;
+end|
+
+create procedure p2(IN n INT)
+begin
+  call p1(n, @squared);
+end|
+delimiter ;|
+
+call p2(7);
+select @squared;
+drop procedure p2;
+drop procedure p1;
+
+--echo #
+--echo # Three levels of nesting
+--echo #
+delimiter |;
+create procedure p1(IN v INT)
+begin
+  insert into t1 values ('level3', v);
+end|
+
+create procedure p2(IN v INT)
+begin
+  call p1(v * 10);
+end|
+
+create procedure p3(IN v INT)
+begin
+  call p2(v + 1);
+end|
+delimiter ;|
+
+call p3(5);
+select * from t1;
+delete from t1;
+drop procedure p3;
+drop procedure p2;
+drop procedure p1;
+
+--echo #
+--echo # Nested BEGIN blocks in IF
+--echo #
+delimiter |;
+create procedure p1(IN n INT)
+begin
+  if n > 0 then
+    begin
+      declare msg varchar(50) default 'positive';
+      set @result = msg;
+    end;
+  else
+    begin
+      declare msg varchar(50) default 'non-positive';
+      set @result = msg;
+    end;
+  end if;
+end|
+delimiter ;|
+call p1(5);
+select @result;
+call p1(-1);
+select @result;
+drop procedure p1;
+
+drop table t1;

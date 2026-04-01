@@ -1,0 +1,18 @@
+#
+# Test of ansi mode (trimmed for RooDB)
+#
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+# [RooDB-skip] set @@sql_mode="ANSI" -- session variables not supported
+
+# Test string concatenation via CONCAT (ANSI || is concat)
+SELECT CONCAT('A', 'B');
+
+# Test GROUP BY behaviour
+CREATE TABLE t1 (id INT, id2 INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+SELECT id, NULL, 1, 1.1, 'a' FROM t1 GROUP BY id ORDER BY id;
+DROP TABLE t1;

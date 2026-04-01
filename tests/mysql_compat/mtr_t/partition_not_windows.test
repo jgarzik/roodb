@@ -1,0 +1,64 @@
+#
+# Adapted from MySQL partition_not_windows.test
+# Original tests PARTITION syntax and long identifiers.
+# RooDB does not support PARTITION syntax, so we test the long identifier
+# portion: CREATE/DROP DATABASE with long names, CREATE TABLE with long names,
+# and basic operations on tables with long column names.
+# Removed: --source, --disable_query_log, CALL mtr.*, --error, PARTITION,
+#          SHOW WARNINGS, DATA DIRECTORY
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t_longname_test;
+DROP DATABASE IF EXISTS MC5NOGLQ9OFY7YM76Z1T758ZTPTJ6IPLVSLDHMSEXT63MLVHCPEW4DNU2OPQDRRE;
+--enable_warnings
+
+#
+# Test long database names (from Bug#29053560)
+#
+
+CREATE DATABASE MC5NOGLQ9OFY7YM76Z1T758ZTPTJ6IPLVSLDHMSEXT63MLVHCPEW4DNU2OPQDRRE;
+# [RooDB-bug] DROP DATABASE (without IF EXISTS) fails even after CREATE
+# Using IF EXISTS as workaround
+DROP DATABASE IF EXISTS MC5NOGLQ9OFY7YM76Z1T758ZTPTJ6IPLVSLDHMSEXT63MLVHCPEW4DNU2OPQDRRE;
+
+#
+# Test long table names
+#
+CREATE TABLE t_longname_test (a INT NOT NULL, b INT);
+INSERT INTO t_longname_test VALUES (1, 10), (2, 20), (3, 30);
+SELECT * FROM t_longname_test ORDER BY a;
+SELECT a, b, a + b AS total FROM t_longname_test WHERE a > 1 ORDER BY a;
+DROP TABLE t_longname_test;
+
+#
+# Test table with long column names
+#
+CREATE TABLE t1 (
+  short_col INT NOT NULL PRIMARY KEY,
+  a_very_long_column_name_that_tests_identifier_limits VARCHAR(50),
+  another_long_column_name_for_testing INT
+);
+INSERT INTO t1 VALUES (1, 'hello', 100);
+INSERT INTO t1 VALUES (2, 'world', 200);
+INSERT INTO t1 VALUES (3, 'test', 300);
+SELECT short_col, a_very_long_column_name_that_tests_identifier_limits,
+       another_long_column_name_for_testing
+FROM t1 ORDER BY short_col;
+SELECT short_col, a_very_long_column_name_that_tests_identifier_limits AS name
+FROM t1 WHERE another_long_column_name_for_testing > 150 ORDER BY short_col;
+DROP TABLE t1;
+
+#
+# Test operations with multiple tables
+#
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT);
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, val INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200), (4, 400);
+
+SELECT t1.id, t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+SELECT t1.id, COALESCE(t2.val, 0) AS t2_val
+FROM t1 LEFT JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+
+DROP TABLE t1, t2;

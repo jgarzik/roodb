@@ -1,0 +1,174 @@
+#
+# Test complex SQL expressions and patterns
+# [RooDB-note] Scalar subqueries and IN subqueries supported. EXISTS not yet supported.
+# This test covers expression evaluation, CASE, COALESCE, IF, NULLIF,
+# and complex WHERE/SELECT patterns instead.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2;
+--enable_warnings
+
+#
+# Complex expressions in SELECT
+#
+
+CREATE TABLE t1 (
+  id INT NOT NULL PRIMARY KEY,
+  a INT,
+  b INT,
+  name VARCHAR(30)
+);
+
+INSERT INTO t1 VALUES (1, 10, 100, 'alpha');
+INSERT INTO t1 VALUES (2, 20, 200, 'beta');
+INSERT INTO t1 VALUES (3, NULL, 300, 'gamma');
+INSERT INTO t1 VALUES (4, 40, NULL, 'delta');
+INSERT INTO t1 VALUES (5, 50, 500, NULL);
+
+--echo # Arithmetic expressions
+SELECT id, a + b, a - b, a * b, a / b FROM t1 WHERE a IS NOT NULL AND b IS NOT NULL;
+
+--echo # CASE expression
+SELECT id, CASE WHEN a > 30 THEN 'high' WHEN a > 10 THEN 'medium' ELSE 'low' END AS category FROM t1;
+
+--echo # CASE with NULL
+SELECT id, CASE WHEN a IS NULL THEN 'unknown' ELSE CAST(a AS CHAR) END AS a_str FROM t1;
+
+--echo # Simple CASE
+SELECT id, CASE a WHEN 10 THEN 'ten' WHEN 20 THEN 'twenty' WHEN 50 THEN 'fifty' ELSE 'other' END FROM t1;
+
+--echo # COALESCE
+SELECT id, COALESCE(a, 0) AS a_safe, COALESCE(b, 0) AS b_safe, COALESCE(name, 'N/A') AS name_safe FROM t1;
+
+--echo # COALESCE with multiple args
+SELECT id, COALESCE(NULL, a, b) FROM t1;
+
+--echo # IF function
+SELECT id, IF(a > 20, 'yes', 'no') AS big FROM t1;
+SELECT id, IF(a IS NULL, 'null_a', IF(b IS NULL, 'null_b', 'both_set')) AS status FROM t1;
+
+--echo # IFNULL
+SELECT id, IFNULL(a, -1), IFNULL(b, -1), IFNULL(name, 'unnamed') FROM t1;
+
+--echo # NULLIF
+SELECT id, NULLIF(a, 10), NULLIF(a, 20) FROM t1;
+
+--echo # Nested expressions
+SELECT id, (a + COALESCE(b, 0)) * 2 AS doubled FROM t1;
+SELECT id, CASE WHEN COALESCE(a, 0) + COALESCE(b, 0) > 200 THEN 'large' ELSE 'small' END FROM t1;
+
+DROP TABLE t1;
+
+#
+# String expressions
+#
+
+CREATE TABLE t1 (id INT PRIMARY KEY, s VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'hello'), (2, 'WORLD'), (3, NULL), (4, '  spaces  '), (5, '');
+
+--echo # String functions in expressions
+SELECT id, UPPER(s), LOWER(s), LENGTH(s) FROM t1;
+SELECT id, CONCAT(s, '_end') FROM t1;
+SELECT id, TRIM(s), LTRIM(s), RTRIM(s) FROM t1;
+SELECT id, SUBSTRING(s, 1, 3) FROM t1;
+SELECT id, REPLACE(s, 'l', 'L') FROM t1;
+
+--echo # String comparisons
+SELECT id, s FROM t1 WHERE s > '' ORDER BY s;
+SELECT id, s FROM t1 WHERE s LIKE '%o%';
+SELECT id, s FROM t1 WHERE s LIKE 'h%';
+SELECT id, s FROM t1 WHERE UPPER(s) = 'HELLO';
+
+DROP TABLE t1;
+
+#
+# Date/time expressions
+#
+
+CREATE TABLE t1 (id INT PRIMARY KEY, d DATE, dt DATETIME);
+INSERT INTO t1 VALUES (1, '2024-01-15', '2024-01-15 10:30:00');
+INSERT INTO t1 VALUES (2, '2024-06-20', '2024-06-20 14:45:30');
+INSERT INTO t1 VALUES (3, '2024-12-31', '2024-12-31 23:59:59');
+INSERT INTO t1 VALUES (4, NULL, NULL);
+
+--echo # Date functions
+SELECT id, YEAR(d), MONTH(d), DAY(d) FROM t1;
+SELECT id, HOUR(dt), MINUTE(dt), SECOND(dt) FROM t1;
+SELECT id, DATE(dt) FROM t1;
+
+--echo # Date comparisons
+SELECT * FROM t1 WHERE d > '2024-06-01' ORDER BY d;
+SELECT * FROM t1 WHERE d BETWEEN '2024-01-01' AND '2024-06-30' ORDER BY d;
+
+DROP TABLE t1;
+
+#
+# Expressions with GROUP BY
+#
+
+CREATE TABLE t1 (
+  dept VARCHAR(20),
+  emp VARCHAR(30),
+  salary INT
+);
+
+INSERT INTO t1 VALUES ('eng', 'alice', 90000);
+INSERT INTO t1 VALUES ('eng', 'bob', 85000);
+INSERT INTO t1 VALUES ('eng', 'carol', 95000);
+INSERT INTO t1 VALUES ('sales', 'dave', 70000);
+INSERT INTO t1 VALUES ('sales', 'eve', 75000);
+INSERT INTO t1 VALUES ('hr', 'frank', 65000);
+
+--echo # Aggregate with CASE
+SELECT dept,
+  COUNT(*) AS cnt,
+  SUM(CASE WHEN salary > 80000 THEN 1 ELSE 0 END) AS high_earners
+FROM t1 GROUP BY dept ORDER BY dept;
+
+--echo # Aggregate with IF
+SELECT dept,
+  AVG(salary) AS avg_salary,
+  IF(AVG(salary) > 80000, 'high', 'normal') AS dept_level
+FROM t1 GROUP BY dept ORDER BY dept;
+
+--echo # COALESCE in aggregation
+SELECT dept, COALESCE(SUM(salary), 0) FROM t1 GROUP BY dept ORDER BY dept;
+
+--echo # GROUP BY with expression
+# [RooDB-skip] GROUP BY with IF() expression not yet supported
+# SELECT IF(salary > 80000, 'high', 'low') AS bracket, COUNT(*) FROM t1
+# GROUP BY IF(salary > 80000, 'high', 'low') ORDER BY bracket;
+
+DROP TABLE t1;
+
+#
+# Multi-table expressions
+#
+
+CREATE TABLE t1 (id INT PRIMARY KEY, val INT);
+CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, label VARCHAR(10));
+
+INSERT INTO t1 VALUES (1, 100), (2, 200), (3, 300);
+INSERT INTO t2 VALUES (1, 1, 'x'), (2, 1, 'y'), (3, 2, 'z'), (4, NULL, 'w');
+
+--echo # Expression in JOIN condition
+SELECT t1.id, t1.val, t2.label
+FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id
+WHERE t1.val + 50 > 200
+ORDER BY t1.id, t2.id;
+
+--echo # CASE on join result
+SELECT t1.id,
+  CASE WHEN t2.label IS NULL THEN 'no match' ELSE t2.label END AS lbl
+FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id
+ORDER BY t1.id, t2.id;
+
+--echo # Aggregate on join
+SELECT t1.id, t1.val, COUNT(t2.id) AS ref_count
+FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id
+GROUP BY t1.id, t1.val
+ORDER BY t1.id;
+
+DROP TABLE t2;
+DROP TABLE t1;

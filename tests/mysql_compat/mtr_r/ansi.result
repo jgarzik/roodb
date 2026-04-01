@@ -1,0 +1,12 @@
+drop table if exists t1;
+SELECT CONCAT('A', 'B');
+CONCAT('A','B')
+AB
+CREATE TABLE t1 (id INT, id2 INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+SELECT id, NULL, 1, 1.1, 'a' FROM t1 GROUP BY id ORDER BY id;
+id	NULL	1	1.1	'a'
+1	NULL	1	1.1	a
+2	NULL	1	1.1	a
+3	NULL	1	1.1	a
+DROP TABLE t1;

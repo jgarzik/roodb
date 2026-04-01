@@ -1,0 +1,169 @@
+DROP TABLE IF EXISTS t1, t2;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT, c INT);
+INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+UPDATE t1 SET b = b + 5 WHERE a = 1;
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	15	100
+2	20	200
+3	30	300
+UPDATE t1 SET c = b * 2 WHERE a = 2;
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	15	100
+2	20	40
+3	30	300
+UPDATE t1 SET b = b - 10, c = c + 50 WHERE a = 3;
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	15	100
+2	20	40
+3	20	350
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT, c DECIMAL(10,2));
+INSERT INTO t1 VALUES (1, 100, 0.00), (2, 200, 0.00), (3, 75, 0.00);
+UPDATE t1 SET c = b / 3;
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	100	33.33
+2	200	66.67
+3	75	25.00
+UPDATE t1 SET b = b % 7;
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	2	33.33
+2	4	66.67
+3	5	25.00
+DROP TABLE t1;
+CREATE TABLE t1 (a VARCHAR(50), b VARCHAR(50));
+INSERT INTO t1 VALUES ('hello', 'world');
+UPDATE t1 SET b = a, a = 'changed';
+SELECT a, b FROM t1;
+a	b
+changed	hello
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, name VARCHAR(100));
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+UPDATE t1 SET name = CONCAT(name, '_updated') WHERE a = 1;
+SELECT * FROM t1 ORDER BY a;
+a	name
+1	Alice_updated
+2	Bob
+3	Charlie
+UPDATE t1 SET name = UPPER(name) WHERE a = 2;
+SELECT * FROM t1 ORDER BY a;
+a	name
+1	Alice_updated
+2	BOB
+3	Charlie
+UPDATE t1 SET name = CONCAT(SUBSTRING(name, 1, 3), '...') WHERE a = 3;
+SELECT * FROM t1 ORDER BY a;
+a	name
+1	Alice_updated
+2	BOB
+3	Cha...
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, grade CHAR(1), score INT);
+INSERT INTO t1 VALUES (1, NULL, 95), (2, NULL, 82), (3, NULL, 67),
+(4, NULL, 45), (5, NULL, 55);
+UPDATE t1 SET grade = CASE
+WHEN score >= 90 THEN 'A'
+  WHEN score >= 80 THEN 'B'
+  WHEN score >= 70 THEN 'C'
+  WHEN score >= 60 THEN 'D'
+  ELSE 'F'
+END;
+SELECT * FROM t1 ORDER BY a;
+a	grade	score
+1	A	95
+2	B	82
+3	D	67
+4	F	45
+5	F	55
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT, c VARCHAR(10));
+INSERT INTO t1 VALUES (1, 10, ''), (2, -5, ''), (3, 0, '');
+UPDATE t1 SET c = IF(b > 0, 'positive', 'non-pos');
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	10	positive
+2	-5	non-pos
+3	0	non-pos
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, name VARCHAR(100));
+INSERT INTO t1 VALUES (1, 'foo_bar_baz'), (2, 'hello_world');
+UPDATE t1 SET name = REPLACE(name, '_', '-');
+SELECT * FROM t1 ORDER BY a;
+a	name
+1	foo-bar-baz
+2	hello-world
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT, c INT, d INT);
+INSERT INTO t1 VALUES (1, 10, 100, 1000);
+UPDATE t1 SET b = b + 1, c = c + 1, d = d + 1 WHERE a = 1;
+SELECT * FROM t1;
+a	b	c	d
+1	11	101	1001
+UPDATE t1 SET b = c, c = d, d = b WHERE a = 1;
+SELECT * FROM t1;
+a	b	c	d
+1	101	1001	101
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+UPDATE t1 SET b = 99 WHERE a = 1 AND a = 2;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+UPDATE t1 SET b = 99 WHERE 1 = 0;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	10
+2	20
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, NULL), (3, 30);
+UPDATE t1 SET b = b + 5;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	15
+2	NULL
+3	35
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT, c INT DEFAULT 0);
+INSERT INTO t1 VALUES (1, NULL, 0), (2, 20, 0), (3, NULL, 0);
+UPDATE t1 SET c = COALESCE(b, -1);
+SELECT * FROM t1 ORDER BY a;
+a	b	c
+1	NULL	-1
+2	20	20
+3	NULL	-1
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT);
+INSERT INTO t1 VALUES (1, -5), (2, 10), (3, -15);
+UPDATE t1 SET b = ABS(b);
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	5
+2	10
+3	15
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+UPDATE t1 SET b = 0;
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	0
+2	0
+3	0
+DROP TABLE t1;
+CREATE TABLE t1 (a INT PRIMARY KEY, name VARCHAR(50), name_len INT DEFAULT 0);
+INSERT INTO t1 VALUES (1, 'short', 0), (2, 'a medium string', 0), (3, 'x', 0);
+UPDATE t1 SET name_len = LENGTH(name);
+SELECT * FROM t1 ORDER BY a;
+a	name	name_len
+1	short	5
+2	a medium string	15
+3	x	1
+DROP TABLE t1;

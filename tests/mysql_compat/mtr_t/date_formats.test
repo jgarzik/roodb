@@ -1,0 +1,100 @@
+#
+# Test of date_format and str_to_date (trimmed for RooDB)
+#
+# [RooDB-skip] PREPARE/EXECUTE -- not supported
+# [RooDB-skip] SET lc_time_names -- locale not supported
+# [RooDB-skip] SET NAMES / charset -- not supported
+# [RooDB-skip] SHOW CREATE TABLE -- not supported
+# [RooDB-skip] CREATE TABLE ... SELECT -- not supported
+# [RooDB-skip] EXPLAIN -- not supported
+# [RooDB-skip] ANALYZE TABLE -- not supported
+# [RooDB-skip] --let / --eval -- not supported
+# [RooDB-skip] TRUNCATE TABLE -- using DELETE instead where needed
+
+#
+# Test of str_to_date
+#
+SELECT STR_TO_DATE(CONCAT('15-01-2001',' 2:59:58.999'),
+                   CONCAT('%d-%m-%Y',' ','%H:%i:%s.%f'));
+
+#
+# Test of date_format()
+#
+CREATE TABLE t1 (d DATE);
+INSERT INTO t1 VALUES ('2004-07-14'),('2005-07-14');
+SELECT DATE_FORMAT(d,'%d') FROM t1 ORDER BY 1;
+DROP TABLE t1;
+
+# Bug #14016
+CREATE TABLE t1 (f1 DATETIME);
+INSERT INTO t1 (f1) VALUES ('2005-01-01');
+INSERT INTO t1 (f1) VALUES ('2005-02-01');
+SELECT DATE_FORMAT(f1, '%m') AS d1, DATE_FORMAT(f1, '%M') AS d2 FROM t1 ORDER BY DATE_FORMAT(f1, '%M');
+DROP TABLE t1;
+
+#
+# Bug #15828 - str_to_date with NULL
+#
+SELECT STR_TO_DATE(1, NULL);
+SELECT STR_TO_DATE(NULL, 1);
+
+#
+# TIME_FORMAT tests
+#
+SELECT TIME_FORMAT('24:00:00', '%r');
+SELECT TIME_FORMAT('00:00:00', '%r');
+SELECT TIME_FORMAT('12:00:00', '%r');
+SELECT TIME_FORMAT('15:00:00', '%r');
+SELECT TIME_FORMAT('01:00:00', '%r');
+SELECT TIME_FORMAT('25:00:00', '%r');
+
+SELECT TIME_FORMAT('00:00:00', '%l %p');
+SELECT TIME_FORMAT('01:00:00', '%l %p');
+SELECT TIME_FORMAT('12:00:00', '%l %p');
+SELECT TIME_FORMAT('23:00:00', '%l %p');
+SELECT TIME_FORMAT('24:00:00', '%l %p');
+SELECT TIME_FORMAT('25:00:00', '%l %p');
+
+#
+# Bug#20729: Bad date_format() call
+#
+SELECT DATE_FORMAT('%Y-%m-%d %H:%i:%s', 1151414896);
+
+#
+# Bug #22029: str_to_date returning NULL
+#
+SELECT STR_TO_DATE('04 /30/2004', '%m /%d/%Y');
+SELECT STR_TO_DATE('04/30 /2004', '%m /%d /%Y');
+SELECT STR_TO_DATE('04/30/2004 ', '%m/%d/%Y ');
+
+--echo "End of 4.1 tests"
+
+#
+# Bug #41470: DATE_FORMAT() with valid dates
+#
+SELECT DATE_FORMAT('0000-01-01','%W %d %M %Y') AS valid_date;
+SELECT DATE_FORMAT('0000-02-28','%W %d %M %Y') AS valid_date;
+SELECT DATE_FORMAT('2009-01-01','%W %d %M %Y') AS valid_date;
+
+--echo "End of 5.0 tests"
+
+#
+# Test get_format
+#
+SELECT GET_FORMAT(DATE, 'USA') AS a;
+SELECT GET_FORMAT(TIME, 'internal') AS a;
+SELECT GET_FORMAT(DATETIME, 'eur') AS a;
+SELECT GET_FORMAT(TIMESTAMP, 'eur') AS a;
+SELECT GET_FORMAT(DATE, 'TEST') AS a;
+SELECT STR_TO_DATE('15-01-2001 12:59:59', GET_FORMAT(DATE,'USA'));
+
+#
+# WL#946 - TIME_FORMAT with NULL
+#
+SELECT CAST(TIME_FORMAT(NULL, '%s') AS CHAR);
+
+#
+# Bug#34704094: str_to_date edge cases
+#
+SELECT STR_TO_DATE('31/11/22', '%d/%m/%Y');
+SELECT STR_TO_DATE('2023-02-31','%Y-%m-%d');

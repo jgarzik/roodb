@@ -1,0 +1,118 @@
+#
+# Custom test for RooDB: SELECT with various LIMIT and ORDER BY patterns.
+# Tests LIMIT with OFFSET, ORDER BY with expressions, multiple sort keys,
+# ORDER BY with NULL values, and edge cases.
+#
+
+DROP TABLE IF EXISTS t1;
+
+CREATE TABLE t1 (
+  id INT,
+  name VARCHAR(20),
+  score DECIMAL(5,2),
+  grade CHAR(1)
+);
+
+INSERT INTO t1 VALUES (1, 'Alice', 95.50, 'A');
+INSERT INTO t1 VALUES (2, 'Bob', 87.25, 'B');
+INSERT INTO t1 VALUES (3, 'Carol', 87.25, 'B');
+INSERT INTO t1 VALUES (4, 'David', 72.00, 'C');
+INSERT INTO t1 VALUES (5, 'Eve', NULL, NULL);
+INSERT INTO t1 VALUES (6, 'Frank', 92.75, 'A');
+INSERT INTO t1 VALUES (7, 'Grace', 68.50, 'D');
+INSERT INTO t1 VALUES (8, 'Henry', 72.00, 'C');
+
+#
+# Basic LIMIT
+#
+
+SELECT * FROM t1 ORDER BY id LIMIT 3;
+SELECT * FROM t1 ORDER BY id LIMIT 0;
+SELECT * FROM t1 ORDER BY id LIMIT 100;
+
+#
+# LIMIT with OFFSET
+#
+
+SELECT * FROM t1 ORDER BY id LIMIT 3 OFFSET 2;
+SELECT * FROM t1 ORDER BY id LIMIT 3, 3;
+SELECT * FROM t1 ORDER BY id LIMIT 2 OFFSET 6;
+SELECT * FROM t1 ORDER BY id LIMIT 2 OFFSET 10;
+
+#
+# ORDER BY expression
+#
+
+SELECT id, name, score FROM t1 ORDER BY score DESC, id ASC LIMIT 5;
+SELECT id, name, score FROM t1 WHERE score IS NOT NULL ORDER BY -score LIMIT 3;
+SELECT id, name, score, score * 2 AS doubled FROM t1 WHERE score IS NOT NULL ORDER BY score * 2 DESC LIMIT 3;
+
+#
+# ORDER BY with NULLs
+#
+
+SELECT id, name, score FROM t1 ORDER BY score ASC, id;
+SELECT id, name, score FROM t1 ORDER BY score DESC, id;
+
+#
+# Multiple ORDER BY keys
+#
+
+SELECT id, name, score, grade FROM t1 ORDER BY grade ASC, score DESC, id;
+SELECT id, name, score, grade FROM t1 ORDER BY grade DESC, score ASC, id;
+
+#
+# ORDER BY column position
+#
+
+SELECT id, name, score FROM t1 ORDER BY 3, 1 LIMIT 5;
+
+#
+# LIMIT in subquery
+#
+
+SELECT * FROM (SELECT * FROM t1 ORDER BY score DESC LIMIT 3) AS top3 ORDER BY id;
+
+#
+# ORDER BY with GROUP BY
+#
+
+SELECT grade, COUNT(*) AS cnt, AVG(score) AS avg_score
+FROM t1
+WHERE score IS NOT NULL
+GROUP BY grade
+ORDER BY avg_score DESC;
+
+SELECT grade, MIN(score), MAX(score)
+FROM t1
+WHERE score IS NOT NULL
+GROUP BY grade
+ORDER BY grade;
+
+#
+# LIMIT 1 (single row retrieval)
+#
+
+SELECT MAX(score) FROM t1;
+SELECT * FROM t1 WHERE score IS NOT NULL ORDER BY score DESC LIMIT 1;
+SELECT * FROM t1 WHERE score IS NOT NULL ORDER BY score ASC LIMIT 1;
+
+#
+# ORDER BY with CASE
+#
+
+SELECT id, name, score,
+  CASE WHEN score >= 90 THEN 'excellent'
+       WHEN score >= 80 THEN 'good'
+       WHEN score >= 70 THEN 'average'
+       ELSE 'below' END AS rating
+FROM t1
+WHERE score IS NOT NULL
+ORDER BY CASE WHEN score >= 90 THEN 1
+              WHEN score >= 80 THEN 2
+              WHEN score >= 70 THEN 3
+              ELSE 4 END, name;
+
+DROP TABLE t1;
+
+--echo # End of select_limit_order tests

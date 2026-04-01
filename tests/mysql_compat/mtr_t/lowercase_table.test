@@ -1,0 +1,81 @@
+#
+# Test of table name handling and alias case sensitivity
+# (adapted from MySQL lowercase_table.test)
+# [RooDB-note] RooDB uses case-sensitive table names (like default Linux MySQL).
+# This test focuses on: consistent table name usage, alias case-insensitivity,
+# column reference case-insensitivity, and joins with aliases.
+# Removed: RENAME TABLE, ALTER TABLE, SHOW CREATE TABLE, SET NAMES, --error,
+#          Turkish I tests, SHOW WARNINGS, SET GLOBAL, multi-table DELETE/UPDATE,
+#          CREATE TABLE ... LIKE, CREATE/DROP DATABASE, USE, SHOW TABLES
+#
+
+--disable_warnings
+drop table if exists t1,t2,t3,t4;
+--enable_warnings
+
+# Basic table operations with consistent casing
+create table t1 (id int primary key, Word varchar(40) not null);
+create table t4 (id int primary key, Word varchar(40) not null);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO t4 VALUES(1,'match');
+SELECT * FROM t1;
+SELECT t1.id from t1 LIMIT 1;
+
+# Alias with different case
+SELECT T2.id from t1 as T2 LIMIT 1;
+
+# JOIN with aliases
+SELECT * from t1 left join t4 on (t1.id= t4.id) where t1.id >= t4.id;
+
+# Alias where alias name differs from table name case
+SELECT T2.id from t1 as t2 LIMIT 1;
+drop table t1, t4;
+
+#
+# Test alias case insensitivity
+#
+create table t1 (a int);
+select count(*) from t1;
+# Alias with mixed case
+select count(bags.a) from t1 as Bags;
+drop table t1;
+
+#
+# Column reference case insensitivity
+#
+create table t1 (MyCol int, AnotherCol varchar(20));
+INSERT INTO t1 VALUES (1, 'hello'), (2, 'world');
+SELECT mycol, anothercol FROM t1 ORDER BY mycol;
+SELECT MYCOL, ANOTHERCOL FROM t1 ORDER BY mycol;
+SELECT MyCol, AnotherCol FROM t1 ORDER BY MyCol;
+drop table t1;
+
+#
+# Aliases with JOINs
+#
+create table t1 (a int, b int);
+create table t2 (a int, c int);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+
+# Cross join with aliases
+SELECT X.a, Y.c FROM t1 AS X, t2 AS Y WHERE X.a = Y.a ORDER BY X.a;
+SELECT x.a, y.c FROM t1 AS x, t2 AS y WHERE x.a = y.a ORDER BY x.a;
+
+# LEFT JOIN with aliases
+SELECT P.a, P.b, Q.c FROM t1 AS P LEFT JOIN t2 AS Q ON P.a = Q.a ORDER BY P.a;
+
+drop table t1, t2;
+
+#
+# Expressions with mixed-case column references
+#
+create table t1 (Val1 int, Val2 int, Name varchar(20));
+INSERT INTO t1 VALUES (10, 20, 'alpha'), (30, 40, 'beta'), (50, 60, 'gamma');
+
+SELECT val1 + val2 AS total FROM t1 ORDER BY total;
+SELECT VAL1 * VAL2 AS product FROM t1 ORDER BY product;
+SELECT CONCAT(name, ':', CAST(val1 AS CHAR)) AS labeled FROM t1 ORDER BY val1;
+SELECT name, val1 FROM t1 WHERE val1 > 10 AND val2 < 60 ORDER BY name;
+
+drop table t1;

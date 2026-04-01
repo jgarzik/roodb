@@ -1,0 +1,142 @@
+DROP TABLE IF EXISTS t1, t2, t3, products, orders, inventory;
+CREATE TABLE t1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(20));
+INSERT INTO t1 VALUES (1,'one'), (2,'two'), (3,'three'), (4,'four'), (5,'five');
+CREATE TABLE t2 (a INT NOT NULL PRIMARY KEY, b VARCHAR(20));
+INSERT INTO t2 VALUES (3,'tres'), (4,'cuatro'), (5,'cinco'), (6,'seis'), (7,'siete');
+CREATE TABLE t3 (a INT NOT NULL PRIMARY KEY, b VARCHAR(20));
+INSERT INTO t3 VALUES (5,'funf'), (6,'sechs'), (7,'sieben'), (8,'acht'), (9,'neun');
+# --- UNION of two queries, each with IN subqueries ---
+SELECT a, b FROM t1 WHERE a IN (SELECT a FROM t2)
+UNION
+SELECT a, b FROM t3 WHERE a IN (SELECT a FROM t2)
+ORDER BY a;
+# --- UNION ALL of queries with scalar subqueries ---
+SELECT a, b FROM t1 WHERE a > (SELECT MIN(a) FROM t2)
+UNION ALL
+SELECT a, b FROM t3 WHERE a < (SELECT MAX(a) FROM t2)
+ORDER BY a;
+# --- UNION of queries filtering by subquery with aggregate ---
+SELECT a, b FROM t1 WHERE a >= (SELECT AVG(a) FROM t1)
+UNION
+SELECT a, b FROM t2 WHERE a <= (SELECT AVG(a) FROM t2)
+ORDER BY a;
+# --- UNION ALL with scalar subquery in SELECT list ---
+SELECT a, b, (SELECT MAX(a) FROM t2) AS max_t2 FROM t1 WHERE a <= 2
+UNION ALL
+SELECT a, b, (SELECT MIN(a) FROM t1) AS min_t1 FROM t3 WHERE a >= 8
+ORDER BY a;
+# --- UNION with NOT IN subquery ---
+SELECT a, b FROM t1 WHERE a NOT IN (SELECT a FROM t2)
+UNION
+SELECT a, b FROM t3 WHERE a NOT IN (SELECT a FROM t2)
+ORDER BY a;
+# --- UNION of three queries with subqueries ---
+SELECT a, 't1' AS src FROM t1 WHERE a IN (SELECT a FROM t2)
+UNION
+SELECT a, 't2' AS src FROM t2 WHERE a IN (SELECT a FROM t3)
+UNION
+SELECT a, 't3' AS src FROM t3 WHERE a NOT IN (SELECT a FROM t1)
+ORDER BY a, src;
+DROP TABLE t1, t2, t3;
+# --- Real-world scenario: product reports ---
+CREATE TABLE products (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(50) NOT NULL,
+price DECIMAL(10,2) NOT NULL,
+category VARCHAR(20) NOT NULL
+);
+INSERT INTO products VALUES
+(1, 'Widget A', 10.00, 'hardware'),
+(2, 'Widget B', 25.00, 'hardware'),
+(3, 'Service X', 100.00, 'service'),
+(4, 'Service Y', 200.00, 'service'),
+(5, 'Gadget Z', 50.00, 'hardware');
+CREATE TABLE orders (
+id INT NOT NULL PRIMARY KEY,
+product_id INT NOT NULL,
+qty INT NOT NULL
+);
+INSERT INTO orders VALUES
+(1, 1, 10), (2, 1, 5), (3, 2, 3),
+(4, 3, 1), (5, 5, 7);
+CREATE TABLE inventory (
+product_id INT NOT NULL PRIMARY KEY,
+stock INT NOT NULL
+);
+INSERT INTO inventory VALUES
+(1, 100), (2, 50), (3, 10), (4, 5), (5, 75);
+# --- UNION: ordered products vs low stock products ---
+SELECT id, name, 'ordered' AS reason FROM products
+WHERE id IN (SELECT product_id FROM orders)
+UNION
+SELECT id, name, 'low stock' AS reason FROM products
+WHERE id IN (SELECT product_id FROM inventory WHERE stock < 20)
+ORDER BY id, reason;
+# --- UNION ALL of aggregates from derived subqueries ---
+SELECT 'orders' AS source, SUM(sub.total) AS value FROM (
+SELECT o.product_id, SUM(o.qty * p.price) AS total
+FROM orders o
+JOIN products p ON o.product_id = p.id
+GROUP BY o.product_id
+) sub
+UNION ALL
+SELECT 'inventory' AS source, SUM(i.stock * p.price) AS value FROM
+inventory i
+JOIN products p ON i.product_id = p.id;
+# --- UNION with GROUP BY in each branch ---
+SELECT category, SUM(price) AS total_price
+FROM products
+WHERE id IN (SELECT product_id FROM orders)
+GROUP BY category
+UNION
+SELECT category, AVG(price) AS total_price
+FROM products
+WHERE id NOT IN (SELECT product_id FROM orders)
+GROUP BY category
+ORDER BY category, total_price;
+# --- UNION with different WHERE subquery patterns ---
+SELECT id, name, price FROM products
+WHERE price > (SELECT AVG(price) FROM products)
+UNION
+SELECT id, name, price FROM products
+WHERE id NOT IN (SELECT product_id FROM orders)
+ORDER BY id;
+# --- UNION ALL counting: ordered vs not ordered ---
+SELECT 'ordered' AS status, COUNT(*) AS cnt FROM products
+WHERE id IN (SELECT product_id FROM orders)
+UNION ALL
+SELECT 'not_ordered' AS status, COUNT(*) AS cnt FROM products
+WHERE id NOT IN (SELECT product_id FROM orders);
+# --- UNION with HAVING in each branch ---
+SELECT category, COUNT(*) AS cnt, SUM(price) AS total
+FROM products
+WHERE id IN (SELECT product_id FROM orders)
+GROUP BY category
+HAVING SUM(price) > 50
+UNION
+SELECT category, COUNT(*) AS cnt, SUM(price) AS total
+FROM products
+WHERE id NOT IN (SELECT product_id FROM orders)
+GROUP BY category
+HAVING COUNT(*) >= 1
+ORDER BY category;
+# --- UNION of derived table aggregates ---
+SELECT sub1.category, sub1.order_cnt
+FROM (
+SELECT p.category, COUNT(*) AS order_cnt
+FROM products p
+JOIN orders o ON p.id = o.product_id
+GROUP BY p.category
+) sub1
+UNION ALL
+SELECT sub2.category, sub2.inv_cnt
+FROM (
+SELECT p.category, COUNT(*) AS inv_cnt
+FROM products p
+JOIN inventory i ON p.id = i.product_id
+WHERE i.stock > 20
+GROUP BY p.category
+) sub2
+ORDER BY category;
+# --- Cleanup ---
+DROP TABLE products, orders, inventory;

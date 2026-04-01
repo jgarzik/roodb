@@ -1,0 +1,149 @@
+drop table if exists t1, t2;
+select null,isnull(null),isnull(1/0),isnull(1/0 = null),ifnull(null,1),ifnull(null,"TRUE"),ifnull("TRUE","ERROR"),1/0 is null,1 is not null;
+NULL	ISNULL(NULL)	ISNULL(1 / 0)	ISNULL(1 / 0 = NULL)	IFNULL(NULL,1)	IFNULL(NULL,'TRUE')	IFNULL('TRUE','ERROR')	1 / 0 IS NULL	1 IS NOT NULL
+NULL	1	1	1	1	TRUE	TRUE	1	1
+explain select null,isnull(null),isnull(1/0),isnull(1/0 = null),ifnull(null,1),ifnull(null,"TRUE"),ifnull("TRUE","ERROR"),1/0 is null,1 is not null;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	No tables used
+select 1 | NULL,1 & NULL,1+NULL,1-NULL;
+1 | NULL	1 & NULL	1 + NULL	1 - NULL
+NULL	NULL	NULL	NULL
+select NULL=NULL,NULL<>NULL,IFNULL(NULL,1.1)+0,IFNULL(NULL,1) | 0;
+NULL = NULL	NULL <> NULL	IFNULL(NULL,1.1) + 0	IFNULL(NULL,1) | 0
+NULL	NULL	1.1	1
+select concat("a",NULL),replace(NULL,"a","b"),replace("string","i",NULL),replace("string",NULL,"i"),insert("abc",1,1,NULL),left(NULL,1);
+CONCAT('a',NULL)	REPLACE(NULL,'a','b')	REPLACE('string','i',NULL)	REPLACE('string',NULL,'i')	INSERT('abc',1,1,NULL)	LEFT(NULL,1)
+NULL	NULL	strNULLng	string	NULL	NULL
+select repeat("a",0),repeat("ab",5+5),repeat("ab",-1),reverse(NULL);
+REPEAT('a',0)	REPEAT('ab',5 + 5)	REPEAT('ab',-1)	REVERSE(NULL)
+	abababababababababab		NULL
+select field(NULL,"a","b","c");
+FIELD(NULL,'a','b','c')
+0
+select 2 between null and 1,2 between 3 AND NULL,NULL between 1 and 2,2 between NULL and 3, 2 between 1 AND null;
+2 BETWEEN NULL AND 1	2 BETWEEN 3 AND NULL	NULL BETWEEN 1 AND 2	2 BETWEEN NULL AND 3	2 BETWEEN 1 AND NULL
+NULL	NULL	NULL	NULL	NULL
+explain select 2 between null and 1,2 between 3 AND NULL,NULL between 1 and 2,2 between NULL and 3, 2 between 1 AND null;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	No tables used
+SELECT NULL AND NULL, 1 AND NULL, NULL AND 1, NULL OR NULL, 0 OR NULL, NULL OR 0;
+NULL AND NULL	1 AND NULL	NULL AND 1	NULL OR NULL	0 OR NULL	NULL OR 0
+NULL	NULL	NULL	NULL	NULL	NULL
+SELECT (NULL OR NULL) IS NULL;
+NULL OR NULL IS NULL
+1
+select NULL AND 0, 0 and NULL;
+NULL AND 0	0 AND NULL
+0	0
+create table t1 (x int);
+insert into t1 values (null);
+select * from t1 where x != 0;
+x
+drop table t1;
+CREATE TABLE t1 (
+indexed_field int default NULL,
+KEY indexed_field (indexed_field)
+);
+INSERT INTO t1 VALUES (NULL),(NULL);
+SELECT * FROM t1 WHERE indexed_field=NULL;
+indexed_field
+SELECT * FROM t1 WHERE indexed_field IS NULL;
+indexed_field
+NULL
+NULL
+SELECT * FROM t1 WHERE indexed_field<=>NULL;
+indexed_field
+NULL
+NULL
+DROP TABLE t1;
+create table t1 (a int, b int);
+insert into t1 values(20,null);
+select t2.b, ifnull(t2.b,"this is null") from t1 as t2 left join t1 as t3 on
+t2.b=t3.a;
+b	IFNULL(b,'this is null')
+NULL	this is null
+select t2.b, ifnull(t2.b,"this is null") from t1 as t2 left join t1 as t3 on
+t2.b=t3.a order by 1;
+b	IFNULL(b,'this is null')
+NULL	this is null
+insert into t1 values(10,null);
+select t2.b, ifnull(t2.b,"this is null") from t1 as t2 left join t1 as t3 on
+t2.b=t3.a order by 1;
+b	IFNULL(b,'this is null')
+NULL	this is null
+NULL	this is null
+drop table t1;
+SET sql_mode = 'NO_ENGINE_SUBSTITUTION';
+CREATE TABLE t1 (a varchar(16) NOT NULL default '', b smallint(6) NOT NULL default 0, c datetime NOT NULL default '0000-00-00 00:00:00', d smallint(6) NOT NULL default 0);
+INSERT INTO t1 SET a = "", d= "2003-01-14 03:54:55";
+UPDATE t1 SET d=1/NULL;
+UPDATE t1 SET d=NULL;
+INSERT INTO t1 (a) values (null);
+ERROR 23000: Invalid operation: Column 'a' cannot be NULL
+INSERT INTO t1 (a) values (1/null);
+ERROR 23000: Invalid operation: Column 'a' cannot be NULL
+INSERT INTO t1 (a) values (null),(null);
+INSERT INTO t1 (b) values (null);
+ERROR 23000: Invalid operation: Column 'b' cannot be NULL
+INSERT INTO t1 (b) values (1/null);
+ERROR 23000: Invalid operation: Column 'b' cannot be NULL
+INSERT INTO t1 (b) values (null),(null);
+INSERT INTO t1 (c) values (null);
+ERROR 23000: Invalid operation: Column 'c' cannot be NULL
+INSERT INTO t1 (c) values (1/null);
+ERROR 23000: Invalid operation: Column 'c' cannot be NULL
+INSERT INTO t1 (c) values (null),(null);
+INSERT INTO t1 (d) values (null);
+ERROR 23000: Invalid operation: Column 'd' cannot be NULL
+INSERT INTO t1 (d) values (1/null);
+ERROR 23000: Invalid operation: Column 'd' cannot be NULL
+INSERT INTO t1 (d) values (null),(null);
+select * from t1;
+a	b	c	d
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+	0	0000-00-00 00:00:00	0
+drop table t1;
+SET sql_mode = default;
+create table t1 (a int not null, b int not null, index idx(a));
+insert into t1 values
+(1,1), (2,2), (3,3), (4,4), (5,5), (6,6),
+(7,7), (8,8), (9,9), (10,10), (11,11), (12,12);
+explain select * from t1 where a between 2 and 3;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t1	NULL	ALL	NULL	NULL	NULL	NULL	1000	10.00	Using where
+explain select * from t1 where a between 2 and 3 or b is null;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t1	NULL	ALL	NULL	NULL	NULL	NULL	1000	10.00	Using where
+drop table t1;
+select cast(NULL as signed);
+CAST(NULL AS BIGINT)
+NULL
+select
+case 'str' when 'STR' then 'str' when null then 'null' end as c01,
+case 'str' when null then 'null' when 'STR' then 'str' end as c02,
+field(null, 'str1', 'str2') as c03,
+field('str1','STR1', null) as c04,
+field('str1', null, 'STR1') as c05,
+'string' in ('STRING', null) as c08,
+'string' in (null, 'STRING') as c09;
+c01	c02	c03	c04	c05	c08	c09
+NULL	NULL	0	0	0	NULL	NULL
+# End of 4.1 tests
+#
+# Bug #31471: decimal_bin_size: Assertion `scale >= 0 &&
+#             precision > 0 && scale <= precision'
+#
+# End of 5.0 tests
+#
+# Bug#33630225: Bad caching of converted constants in NULL-safe compare
+#
+SELECT NULL <=> (0 <=> NULL);
+NULL <=> 0 <=> NULL
+0

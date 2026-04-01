@@ -209,3 +209,232 @@ async fn test_insert_boolean_values() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// Regression test: INSERT INTO t2 (i) SELECT i FROM t1 with partial column list
+/// must map the selected value to column `i`, not positionally to the first column.
+#[tokio::test]
+async fn test_insert_select_partial_column_list() {
+    let server = TestServer::start("ins_sel_partial").await;
+    let mut conn = server.connect().await;
+
+    // Source table
+    conn.query_drop("CREATE TABLE t1_isp (i INT)")
+        .await
+        .expect("CREATE TABLE t1 failed");
+    conn.query_drop("INSERT INTO t1_isp (i) VALUES (42), (99)")
+        .await
+        .expect("INSERT INTO t1 failed");
+
+    // Target table has two columns (a, i); we only insert into column i
+    conn.query_drop("CREATE TABLE t2_isp (a INT, i INT)")
+        .await
+        .expect("CREATE TABLE t2 failed");
+
+    conn.query_drop("INSERT INTO t2_isp (i) SELECT i FROM t1_isp")
+        .await
+        .expect("INSERT...SELECT with partial columns failed");
+
+    // Verify: column `a` should be NULL, column `i` should have the selected values
+    let rows: Vec<(Option<i32>, i32)> = conn
+        .query("SELECT a, i FROM t2_isp ORDER BY i")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0].0.is_none(),
+        "column a should be NULL, got {:?}",
+        rows[0].0
+    );
+    assert_eq!(rows[0].1, 42);
+    assert!(
+        rows[1].0.is_none(),
+        "column a should be NULL, got {:?}",
+        rows[1].0
+    );
+    assert_eq!(rows[1].1, 99);
+
+    conn.query_drop("DROP TABLE t1_isp, t2_isp")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+/// Regression test: INSERT IGNORE INTO t1 SELECT * FROM t2
+/// must silently skip rows that would cause a duplicate key error.
+#[tokio::test]
+async fn test_insert_ignore_select_duplicate_key() {
+    let server = TestServer::start("ins_ign_sel_dup").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE t1_iisd (a INT PRIMARY KEY)")
+        .await
+        .expect("CREATE TABLE t1 failed");
+    conn.query_drop("INSERT INTO t1_iisd VALUES (1), (2)")
+        .await
+        .expect("INSERT INTO t1 failed");
+
+    conn.query_drop("CREATE TABLE t2_iisd (a INT PRIMARY KEY)")
+        .await
+        .expect("CREATE TABLE t2 failed");
+    conn.query_drop("INSERT INTO t2_iisd VALUES (2), (3)")
+        .await
+        .expect("INSERT INTO t2 failed");
+
+    // This should skip the duplicate (2) and insert (3)
+    conn.query_drop("INSERT IGNORE INTO t1_iisd SELECT * FROM t2_iisd")
+        .await
+        .expect("INSERT IGNORE ... SELECT should not error on duplicate key");
+
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT a FROM t1_iisd ORDER BY a")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 3, "expected 3 rows: 1, 2, 3");
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[2].0, 3);
+
+    conn.query_drop("DROP TABLE t1_iisd, t2_iisd")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+/// Regression test: INSERT with partial column list must apply DEFAULT values
+/// for unspecified columns, not leave them as NULL.
+/// Bug: INSERT INTO t (c2) VALUES (NULL) with c1 DEFAULT 'y' left c1 as NULL.
+#[tokio::test]
+async fn test_insert_partial_columns_default_values() {
+    let server = TestServer::start("ins_partial_def").await;
+    let mut conn = server.connect().await;
+
+    // Create table where c1 has a DEFAULT value
+    conn.query_drop(
+        "CREATE TABLE t_ipd (pk INT NOT NULL PRIMARY KEY, c1 VARCHAR(10) DEFAULT 'y', c2 INT)",
+    )
+    .await
+    .expect("CREATE TABLE failed");
+
+    // Insert specifying only c2 and pk — c1 should get DEFAULT 'y'
+    conn.query_drop("INSERT INTO t_ipd (pk, c2) VALUES (1, NULL)")
+        .await
+        .expect("INSERT with partial columns failed");
+
+    // Verify c1 got DEFAULT 'y', not NULL
+    let rows: Vec<(i32, Option<String>, Option<i32>)> = conn
+        .query("SELECT pk, c1, c2 FROM t_ipd WHERE pk = 1")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(
+        rows[0].1,
+        Some("y".to_string()),
+        "c1 should be DEFAULT 'y', not NULL"
+    );
+    assert_eq!(rows[0].2, None, "c2 should be NULL");
+
+    // Also test with INSERT ... SELECT
+    conn.query_drop("CREATE TABLE t_ipd_src (pk INT NOT NULL PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE failed");
+    conn.query_drop("INSERT INTO t_ipd_src VALUES (10, 42)")
+        .await
+        .expect("INSERT failed");
+
+    conn.query_drop("INSERT INTO t_ipd (pk, c2) SELECT pk, val FROM t_ipd_src")
+        .await
+        .expect("INSERT...SELECT with partial columns failed");
+
+    let rows: Vec<(i32, Option<String>, Option<i32>)> = conn
+        .query("SELECT pk, c1, c2 FROM t_ipd WHERE pk = 10")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(
+        rows[0].1,
+        Some("y".to_string()),
+        "c1 should be DEFAULT 'y' via INSERT...SELECT"
+    );
+    assert_eq!(rows[0].2, Some(42));
+
+    conn.query_drop("DROP TABLE t_ipd, t_ipd_src")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_insert_select_intra_batch_duplicate_error() {
+    let server = TestServer::start("ins_sel_dup_err").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE isde_src (id INT NOT NULL)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE isde_dst (id INT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    // Source has duplicate values
+    conn.query_drop("INSERT INTO isde_src VALUES (1), (2), (1)")
+        .await
+        .unwrap();
+
+    // INSERT...SELECT should fail on intra-batch duplicate (id=1 appears twice)
+    let result: Result<(), _> = conn
+        .query_drop("INSERT INTO isde_dst SELECT id FROM isde_src")
+        .await;
+    assert!(result.is_err(), "Expected duplicate key error");
+
+    conn.query_drop("DROP TABLE isde_src, isde_dst")
+        .await
+        .unwrap();
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_insert_ignore_select_intra_batch_duplicate_skip() {
+    let server = TestServer::start("ins_ign_sel_dup").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE isds_src (id INT NOT NULL)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE isds_dst (id INT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    // Source has duplicate values
+    conn.query_drop("INSERT INTO isds_src VALUES (1), (2), (1), (3), (2)")
+        .await
+        .unwrap();
+
+    // INSERT IGNORE...SELECT should skip duplicates silently
+    conn.query_drop("INSERT IGNORE INTO isds_dst SELECT id FROM isds_src")
+        .await
+        .expect("INSERT IGNORE...SELECT should not fail on duplicates");
+
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM isds_dst ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "Should have 3 unique rows");
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[2].0, 3);
+
+    conn.query_drop("DROP TABLE isds_src, isds_dst")
+        .await
+        .unwrap();
+
+    drop(conn);
+    server.shutdown().await;
+}

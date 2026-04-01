@@ -1,0 +1,209 @@
+DROP TABLE IF EXISTS t1, t2;
+DROP PROCEDURE IF EXISTS p1;
+#
+# Basic CREATE and CALL — no parameters
+#
+CREATE PROCEDURE p1()
+BEGIN
+SET @x = 42;
+END|
+CALL p1();
+SELECT @x;
+@x
+42
+DROP PROCEDURE p1;
+#
+# DROP PROCEDURE IF EXISTS on non-existent — should succeed silently
+#
+DROP PROCEDURE IF EXISTS no_such_proc;
+#
+# IN parameter
+#
+CREATE PROCEDURE p1(IN val INT)
+BEGIN
+SET @out_val = val;
+END|
+CALL p1(99);
+SELECT @out_val;
+@out_val
+99
+DROP PROCEDURE p1;
+#
+# OUT parameter
+#
+CREATE PROCEDURE p1(IN a INT, IN b INT, OUT result INT)
+BEGIN
+SET result = a + b;
+END|
+SET @answer = 0;
+CALL p1(3, 7, @answer);
+SELECT @answer;
+@answer
+10
+DROP PROCEDURE p1;
+#
+# INOUT parameter
+#
+CREATE PROCEDURE p1(INOUT x INT)
+BEGIN
+SET x = x * 2;
+END|
+SET @val = 5;
+CALL p1(@val);
+SELECT @val;
+@val
+10
+DROP PROCEDURE p1;
+#
+# DECLARE with DEFAULT
+#
+CREATE PROCEDURE p1()
+BEGIN
+DECLARE msg VARCHAR(50) DEFAULT 'hello';
+SET @out_msg = msg;
+END|
+CALL p1();
+SELECT @out_msg;
+@out_msg
+hello
+DROP PROCEDURE p1;
+#
+# IF / ELSEIF / ELSE
+#
+CREATE PROCEDURE p1(IN n INT)
+BEGIN
+IF n > 0 THEN
+SET @sign = 'positive';
+ELSEIF n < 0 THEN
+SET @sign = 'negative';
+ELSE
+SET @sign = 'zero';
+END IF;
+END|
+CALL p1(5);
+SELECT @sign;
+@sign
+positive
+CALL p1(-3);
+SELECT @sign;
+@sign
+negative
+CALL p1(0);
+SELECT @sign;
+@sign
+zero
+DROP PROCEDURE p1;
+#
+# WHILE loop
+#
+CREATE PROCEDURE p1(IN n INT)
+BEGIN
+DECLARE i INT DEFAULT 0;
+DECLARE total INT DEFAULT 0;
+WHILE i < n DO
+SET i = i + 1;
+SET total = total + i;
+END WHILE;
+SET @result = total;
+END|
+CALL p1(10);
+SELECT @result;
+@result
+55
+DROP PROCEDURE p1;
+#
+# CASE statement (searched form)
+#
+CREATE PROCEDURE p1(IN d INT)
+BEGIN
+CASE
+WHEN d = 1 THEN SET @dtype = 'Monday';
+WHEN d = 7 THEN SET @dtype = 'Sunday';
+ELSE SET @dtype = 'other';
+END CASE;
+END|
+CALL p1(1);
+SELECT @dtype;
+@dtype
+Monday
+CALL p1(7);
+SELECT @dtype;
+@dtype
+Sunday
+CALL p1(3);
+SELECT @dtype;
+@dtype
+other
+DROP PROCEDURE p1;
+#
+# Procedure with DML — INSERT
+#
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+CREATE PROCEDURE p1()
+BEGIN
+INSERT INTO t1 VALUES (1, 'hello');
+INSERT INTO t1 VALUES (2, 'world');
+END|
+CALL p1();
+SELECT * FROM t1 ORDER BY id;
+id	val
+1	hello
+2	world
+DROP PROCEDURE p1;
+#
+# Procedure with DML — UPDATE and DELETE
+#
+CREATE PROCEDURE p1()
+BEGIN
+UPDATE t1 SET val = 'updated' WHERE id = 1;
+DELETE FROM t1 WHERE id = 2;
+END|
+CALL p1();
+SELECT * FROM t1 ORDER BY id;
+id	val
+1	updated
+DROP PROCEDURE p1;
+DROP TABLE t1;
+#
+# DECLARE local var + use in DML
+#
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+CREATE PROCEDURE p1(IN p_id INT, IN p_val TEXT)
+BEGIN
+DECLARE local_id INT DEFAULT 0;
+SET local_id = p_id;
+INSERT INTO t1 VALUES (local_id, p_val);
+END|
+CALL p1(42, 'test');
+SELECT * FROM t1;
+id	val
+42	test
+DROP PROCEDURE p1;
+DROP TABLE t1;
+#
+# SELECT ... INTO variable
+#
+CREATE TABLE t1 (id INT NOT NULL, val VARCHAR(100), PRIMARY KEY (id));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta');
+CREATE PROCEDURE p1(IN p_id INT)
+BEGIN
+SELECT val INTO @fetched FROM t1 WHERE id = p_id;
+END|
+CALL p1(2);
+SELECT @fetched;
+@fetched
+beta
+DROP PROCEDURE p1;
+DROP TABLE t1;
+#
+# Multiple parameters with mixed types
+#
+CREATE PROCEDURE p1(IN a INT, IN b VARCHAR(50), OUT c VARCHAR(100))
+BEGIN
+SET c = CONCAT(b, ': ', a);
+END|
+CALL p1(42, 'answer', @msg);
+SELECT @msg;
+@msg
+answer: 42
+DROP PROCEDURE p1;

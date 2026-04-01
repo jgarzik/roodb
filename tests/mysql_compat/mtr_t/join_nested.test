@@ -1,0 +1,179 @@
+#
+# Nested JOIN tests for RooDB
+# Adapted from MySQL join_nested.test
+#
+# [RooDB-skip] MySQL comma-join syntax with LEFT JOIN (t3, t4)
+# [RooDB-skip] Parenthesized nested joins: LEFT JOIN (a LEFT JOIN b ON ...)
+# [RooDB-skip] EXPLAIN, ANALYZE TABLE
+# [RooDB-skip] --sorted_result (we use ORDER BY instead)
+#
+# Uses flat chained joins and pre-computed cross-join tables for standard equivalents
+
+--disable_warnings
+DROP TABLE IF EXISTS t0,t1,t2,t3,t4,t5,t6,t7,t8,t9;
+DROP TABLE IF EXISTS t34,t67;
+--enable_warnings
+
+CREATE TABLE t0 (a INT, b INT, c INT);
+CREATE TABLE t1 (a INT, b INT, c INT);
+CREATE TABLE t2 (a INT, b INT, c INT);
+CREATE TABLE t3 (a INT, b INT, c INT);
+CREATE TABLE t4 (a INT, b INT, c INT);
+CREATE TABLE t5 (a INT, b INT, c INT);
+CREATE TABLE t6 (a INT, b INT, c INT);
+CREATE TABLE t7 (a INT, b INT, c INT);
+CREATE TABLE t8 (a INT, b INT, c INT);
+CREATE TABLE t9 (a INT, b INT, c INT);
+
+INSERT INTO t0 VALUES (1,1,0), (1,2,0), (2,2,0);
+INSERT INTO t1 VALUES (1,3,0), (2,2,0), (3,2,0);
+INSERT INTO t2 VALUES (3,3,0), (4,2,0), (5,3,0);
+INSERT INTO t3 VALUES (1,2,0), (2,2,0);
+INSERT INTO t4 VALUES (3,2,0), (4,2,0);
+INSERT INTO t5 VALUES (3,1,0), (2,2,0), (3,3,0);
+INSERT INTO t6 VALUES (3,2,0), (6,2,0), (6,1,0);
+INSERT INTO t7 VALUES (1,1,0), (2,2,0);
+INSERT INTO t8 VALUES (0,2,0), (1,2,0);
+INSERT INTO t9 VALUES (1,1,0), (1,2,0), (3,3,0);
+
+# Precomputed cross join tables for standard-compliant equivalents
+CREATE TABLE t34 (a3 INT, b3 INT, c3 INT, a4 INT, b4 INT, c4 INT);
+INSERT INTO t34 VALUES (1,2,0,3,2,0),(1,2,0,4,2,0),(2,2,0,3,2,0),(2,2,0,4,2,0);
+
+CREATE TABLE t67 (a6 INT, b6 INT, c6 INT, a7 INT, b7 INT, c7 INT);
+INSERT INTO t67 VALUES (3,2,0,1,1,0),(3,2,0,2,2,0),(6,2,0,1,1,0),(6,2,0,2,2,0),(6,1,0,1,1,0),(6,1,0,2,2,0);
+
+# Simple selects
+SELECT t2.a, t2.b FROM t2 ORDER BY t2.a, t2.b;
+SELECT t3.a, t3.b FROM t3 ORDER BY t3.a;
+SELECT t4.a, t4.b FROM t4 ORDER BY t4.a;
+
+# Cross join t3, t4
+SELECT t3.a, t3.b, t4.a, t4.b FROM t3 CROSS JOIN t4 ORDER BY t3.a, t3.b, t4.a, t4.b;
+
+# Standard compliant LEFT JOIN with pre-joined table
+SELECT t2.a, t2.b, t34.a3, t34.b3, t34.a4, t34.b4
+  FROM t2
+       LEFT JOIN t34
+       ON t2.b = t34.b4
+ORDER BY t2.a, t2.b, t34.a3, t34.a4;
+
+# Standard compliant LEFT JOIN with extra condition
+SELECT t2.a, t2.b, t34.a3, t34.b3, t34.a4, t34.b4
+  FROM t2
+       LEFT JOIN t34
+       ON t34.a3 = 1 AND t2.b = t34.b4
+ORDER BY t2.a, t2.b, t34.a3, t34.a4;
+
+# Standard compliant LEFT JOIN with WHERE filter
+SELECT t2.a, t2.b, t34.a3, t34.b3, t34.a4, t34.b4
+  FROM t2
+       LEFT JOIN t34
+       ON t2.b = t34.b4
+    WHERE t34.a3 = 1 OR t34.c3 IS NULL
+ORDER BY t2.a, t2.b, t34.a3, t34.a4;
+
+# Standard compliant LEFT JOIN with WHERE > filter
+SELECT t2.a, t2.b, t34.a3, t34.b3, t34.a4, t34.b4
+  FROM t2
+       LEFT JOIN t34
+       ON t2.b = t34.b4
+    WHERE t34.a3 > 1 OR t34.c3 IS NULL
+ORDER BY t2.a, t2.b, t34.a3, t34.a4;
+
+# Basic selects from t5, t6, t7, t8
+SELECT t5.a, t5.b FROM t5 ORDER BY t5.a, t5.b;
+SELECT t6.a, t6.b FROM t6 ORDER BY t6.a, t6.b;
+SELECT t7.a, t7.b FROM t7 ORDER BY t7.a, t7.b;
+SELECT t8.a, t8.b FROM t8 ORDER BY t8.a, t8.b;
+
+# Cross join
+SELECT t6.a, t6.b, t7.a, t7.b FROM t6 CROSS JOIN t7 ORDER BY t6.a, t6.b, t7.a, t7.b;
+
+# Standard compliant: t67 LEFT JOIN t8
+SELECT t67.a6, t67.b6, t67.a7, t67.b7, t8.a, t8.b
+  FROM t67
+       LEFT JOIN t8
+       ON t67.b7 = t8.b AND t67.b6 < 10
+ORDER BY t67.a6, t67.b6, t67.a7, t67.b7, t8.a;
+
+# INNER JOIN basics
+SELECT t1.a, t1.b FROM t1 ORDER BY t1.a, t1.b;
+
+SELECT t0.a, t0.b, t1.a, t1.b
+  FROM t0 INNER JOIN t1 ON t0.a = t1.a
+ORDER BY t0.a, t0.b, t1.a, t1.b;
+
+# LEFT JOIN with NULL result
+SELECT t0.a, t0.b, t9.a, t9.b
+  FROM t0 LEFT JOIN t9 ON t0.a = t9.a AND t0.b = t9.b
+ORDER BY t0.a, t0.b, t9.a;
+
+# RIGHT JOIN
+SELECT t0.a, t0.b, t9.a, t9.b
+  FROM t0 RIGHT JOIN t9 ON t0.a = t9.a AND t0.b = t9.b
+ORDER BY t9.a, t9.b, t0.a;
+
+# Chained LEFT JOINs (flat, no nesting with parens)
+SELECT t0.a, t0.b, t1.a AS t1a, t1.b AS t1b, t2.a AS t2a, t2.b AS t2b
+  FROM t0
+  LEFT JOIN t1 ON t0.a = t1.a
+  LEFT JOIN t2 ON t1.a = t2.a
+ORDER BY t0.a, t0.b, t1a, t1b, t2a, t2b;
+
+# Chained INNER + LEFT JOINs
+SELECT t0.a, t0.b, t3.a AS t3a, t3.b AS t3b, t4.a AS t4a, t4.b AS t4b
+  FROM t0
+  INNER JOIN t3 ON t0.b = t3.b
+  LEFT JOIN t4 ON t3.a = t4.a
+ORDER BY t0.a, t0.b, t3a, t3b, t4a;
+
+# Multiple JOINs with WHERE filter
+SELECT t5.a, t5.b, t6.a AS t6a, t6.b AS t6b
+  FROM t5
+  INNER JOIN t6 ON t5.b = t6.b
+  WHERE t5.a > 2
+ORDER BY t5.a, t5.b, t6a, t6b;
+
+# LEFT JOIN preserving NULL rows
+SELECT t7.a, t7.b, t8.a AS t8a, t8.b AS t8b
+  FROM t7
+  LEFT JOIN t8 ON t7.a = t8.a
+ORDER BY t7.a, t7.b, t8a;
+
+# CROSS JOIN
+SELECT t3.a, t3.b, t5.a AS t5a, t5.b AS t5b
+  FROM t3 CROSS JOIN t5
+ORDER BY t3.a, t3.b, t5a, t5b;
+
+# Three-way LEFT JOIN chain
+SELECT t0.a, t0.b,
+       t3.a AS t3a, t3.b AS t3b,
+       t5.a AS t5a, t5.b AS t5b
+  FROM t0
+  LEFT JOIN t3 ON t0.b = t3.b
+  LEFT JOIN t5 ON t3.a = t5.a
+ORDER BY t0.a, t0.b, t3a, t3b, t5a, t5b;
+
+# INNER JOIN with multiple conditions
+SELECT t1.a, t1.b, t9.a AS t9a, t9.b AS t9b
+  FROM t1
+  INNER JOIN t9 ON t1.a = t9.a AND t1.b = t9.b
+ORDER BY t1.a, t1.b;
+
+# LEFT JOIN with IS NULL filter (anti-join pattern)
+SELECT t0.a, t0.b
+  FROM t0
+  LEFT JOIN t9 ON t0.a = t9.a AND t0.b = t9.b
+  WHERE t9.a IS NULL
+ORDER BY t0.a, t0.b;
+
+# CROSS JOIN with LEFT JOIN
+SELECT t34.a3, t34.b3, t5.a AS t5a, t5.b AS t5b, t8.a AS t8a, t8.b AS t8b
+  FROM t34
+  CROSS JOIN t5
+  LEFT JOIN t8 ON t5.b = t8.b
+  WHERE t34.a3 = 1
+ORDER BY t34.a3, t34.a4, t5a, t5b, t8a;
+
+DROP TABLE t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t34, t67;

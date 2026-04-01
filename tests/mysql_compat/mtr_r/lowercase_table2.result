@@ -1,0 +1,199 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+CREATE TABLE t1 (MyCol INT, ANOTHERCOL VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'hello');
+INSERT INTO t1 VALUES (2, 'world');
+SELECT mycol FROM t1 ORDER BY MYCOL;
+mycol
+1
+2
+SELECT MYCOL FROM t1 ORDER BY mycol;
+MYCOL
+1
+2
+SELECT MyCol, AnotherCol FROM t1 ORDER BY MyCol;
+MyCol	AnotherCol
+1	hello
+2	world
+SELECT MYCOL, ANOTHERCOL FROM t1 ORDER BY MYCOL;
+MYCOL	ANOTHERCOL
+1	hello
+2	world
+SELECT mycol, anothercol FROM t1 ORDER BY mycol;
+mycol	anothercol
+1	hello
+2	world
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+SELECT a, b FROM t1 WHERE a > 1 ORDER BY a;
+a	b
+2	beta
+3	gamma
+SELECT A, B FROM t1 WHERE A < 3 ORDER BY A;
+A	B
+1	alpha
+2	beta
+SELECT a, B FROM t1 WHERE A = 2;
+a	B
+2	beta
+DROP TABLE t1;
+CREATE TABLE t1 (col1 INT);
+CREATE TABLE t2 (col1 INT);
+INSERT INTO t1 VALUES (10), (30);
+INSERT INTO t2 VALUES (10), (20);
+SELECT t1.col1 FROM t1, t2 WHERE t1.col1 = t2.col1 ORDER BY t1.col1;
+col1
+10
+SELECT A.col1 FROM t1 AS a, t2 AS B WHERE A.col1 = B.col1 ORDER BY A.col1;
+col1
+10
+DROP TABLE t1, t2;
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+SELECT T.id, T.val FROM t1 AS T WHERE T.id > 1 ORDER BY T.id;
+id	val
+2	two
+3	three
+SELECT t.ID, t.VAL FROM t1 AS t ORDER BY t.id;
+id	val
+1	one
+2	two
+3	three
+DROP TABLE t1;
+CREATE TABLE t1 (id INT, val VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'first');
+CREATE TABLE t2 (id INT, val VARCHAR(20));
+INSERT INTO t2 VALUES (2, 'second');
+SELECT id, val FROM t1 UNION SELECT id, val FROM t2 ORDER BY id;
+id	val
+1	first
+2	second
+SELECT ID, VAL FROM t1 UNION SELECT ID, VAL FROM t2 ORDER BY id;
+ID	VAL
+1	first
+2	second
+DROP TABLE t1, t2;
+CREATE TABLE t1 (category VARCHAR(20), amount INT);
+INSERT INTO t1 VALUES ('A', 10), ('B', 20), ('A', 30), ('B', 40);
+SELECT category, SUM(amount) AS total FROM t1 GROUP BY category ORDER BY category;
+category	total
+A	40
+B	60
+SELECT CATEGORY, SUM(AMOUNT) AS TOTAL FROM t1 GROUP BY CATEGORY ORDER BY CATEGORY;
+CATEGORY	TOTAL
+A	40
+B	60
+DROP TABLE t1;
+CREATE TABLE t1 (name VARCHAR(20), score INT);
+INSERT INTO t1 VALUES ('Alice', 90), ('Bob', 85), ('Carol', 95);
+SELECT name, score FROM t1 ORDER BY SCORE DESC;
+name	score
+Carol	95
+Alice	90
+Bob	85
+SELECT NAME, SCORE FROM t1 ORDER BY score;
+NAME	SCORE
+Bob	85
+Alice	90
+Carol	95
+DROP TABLE t1;
+CREATE TABLE t1 (a INT, b VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'Hello'), (2, 'World'), (3, 'Test');
+SELECT upper(b) FROM t1 ORDER BY a;
+UPPER(b)
+HELLO
+WORLD
+TEST
+SELECT UPPER(b) FROM t1 ORDER BY a;
+UPPER(b)
+HELLO
+WORLD
+TEST
+SELECT Upper(B) FROM t1 ORDER BY a;
+UPPER(B)
+HELLO
+WORLD
+TEST
+SELECT lower(b) FROM t1 ORDER BY a;
+LOWER(b)
+hello
+world
+test
+SELECT LOWER(b) FROM t1 ORDER BY a;
+LOWER(b)
+hello
+world
+test
+SELECT length(b) FROM t1 ORDER BY a;
+LENGTH(b)
+5
+5
+4
+SELECT LENGTH(b) FROM t1 ORDER BY a;
+LENGTH(b)
+5
+5
+4
+SELECT concat(b, '!') FROM t1 ORDER BY a;
+CONCAT(b,'!')
+Hello!
+World!
+Test!
+SELECT CONCAT(b, '!') FROM t1 ORDER BY a;
+CONCAT(b,'!')
+Hello!
+World!
+Test!
+DROP TABLE t1;
+CREATE TABLE t1 (grp VARCHAR(10), val INT);
+INSERT INTO t1 VALUES ('x', 1), ('x', 2), ('y', 3), ('y', 4), ('y', 5);
+SELECT grp, SUM(val) AS s FROM t1 GROUP BY grp HAVING s > 3 ORDER BY grp;
+grp	s
+y	12
+SELECT GRP, SUM(VAL) AS S FROM t1 GROUP BY GRP HAVING S > 3 ORDER BY GRP;
+GRP	S
+y	12
+DROP TABLE t1;
+CREATE TABLE t1 (x INT, y INT);
+INSERT INTO t1 VALUES (10, 20), (30, 40), (50, 60);
+SELECT X + Y AS total FROM t1 ORDER BY TOTAL;
+total
+30
+70
+110
+SELECT x * y AS product FROM t1 WHERE X > 10 ORDER BY product;
+product
+1200
+3000
+SELECT CASE WHEN x < 30 THEN 'low' WHEN X < 50 THEN 'mid' ELSE 'high' END AS level FROM t1 ORDER BY x;
+level
+low
+mid
+high
+DROP TABLE t1;
+CREATE TABLE t1 (id INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE t2 (id INT, score INT);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+SELECT A.name, B.score FROM t1 AS A LEFT JOIN t2 AS B ON A.ID = B.ID ORDER BY A.id;
+name	score
+alpha	100
+beta	200
+gamma	NULL
+SELECT a.NAME, b.SCORE FROM t1 AS a LEFT JOIN t2 AS b ON a.id = b.id ORDER BY a.ID;
+name	score
+alpha	100
+beta	200
+gamma	NULL
+DROP TABLE t1, t2;
+CREATE TABLE t1 (id INT, val INT);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+SELECT D.id, D.val FROM (SELECT ID, VAL FROM t1 WHERE val > 10) AS D ORDER BY D.id;
+ID	VAL
+2	20
+3	30
+SELECT d.ID, d.VAL FROM (SELECT id, val FROM t1) AS d WHERE d.val > 10 ORDER BY d.id;
+id	val
+2	20
+3	30
+DROP TABLE t1;

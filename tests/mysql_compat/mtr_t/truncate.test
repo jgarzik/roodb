@@ -1,0 +1,59 @@
+#
+# Trimmed from MySQL truncate.test for RooDB compatibility testing.
+# Tests: basic TRUNCATE TABLE behavior.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+#
+# Basic TRUNCATE
+#
+CREATE TABLE t1 (a integer, b integer, c1 CHAR(10));
+INSERT INTO t1 (a) VALUES (1),(2);
+TRUNCATE TABLE t1;
+SELECT count(*) FROM t1;
+INSERT INTO t1 VALUES(1,2,"test");
+SELECT count(*) FROM t1;
+DELETE FROM t1;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# The following should fail
+--error 1146
+SELECT count(*) FROM t1;
+
+# [RooDB-skip] TEMPORARY TABLE skipped
+
+--error 1146
+TRUNCATE non_existing_table;
+
+#
+# Test autoincrement with TRUNCATE; verifying difference with DELETE
+#
+CREATE TABLE t1 (a integer NOT NULL PRIMARY KEY);
+INSERT INTO t1 (a) VALUES (1),(2);
+TRUNCATE TABLE t1;
+INSERT INTO t1 (a) VALUES (1),(2);
+SELECT * FROM t1;
+DELETE FROM t1;
+INSERT INTO t1 (a) VALUES (1),(2);
+SELECT * FROM t1;
+DROP TABLE t1;
+
+# [RooDB-skip] TEMPORARY TABLE autoincrement test skipped
+# [RooDB-skip] VIEW truncate test skipped (VIEWs)
+# [RooDB-skip] LOCK/UNLOCK TABLE tests skipped
+# [RooDB-skip] stored procedures tests skipped
+# [RooDB-skip] HANDLER tests skipped
+
+#
+# Basic TRUNCATE on a second table
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT * FROM t1;
+TRUNCATE TABLE t1;
+SELECT * FROM t1;
+DROP TABLE t1;

@@ -338,6 +338,11 @@ impl ExplainOutput {
                 writeln!(out, "{}AnalyzeTable: {}", prefix, table).unwrap();
             }
 
+            PhysicalPlan::Window { input, .. } => {
+                writeln!(out, "{}Window", prefix).unwrap();
+                Self::format_node(input, indent + 1, out);
+            }
+
             PhysicalPlan::Explain { inner } => {
                 writeln!(out, "{}Explain:", prefix).unwrap();
                 Self::format_node(inner, indent + 1, out);

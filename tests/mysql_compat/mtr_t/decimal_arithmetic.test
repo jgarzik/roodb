@@ -1,0 +1,71 @@
+# RooDB-specific test for decimal literal arithmetic precision.
+# Verifies that numeric literals with decimal points are handled as
+# exact DECIMAL values (not floating-point), matching MySQL behavior.
+
+#
+# Basic decimal literal equality
+#
+SELECT 0.8 = 0.7 + 0.1;
+SELECT 0.7 + 0.1;
+SELECT 0.3 = 0.1 + 0.2;
+SELECT 0.1 + 0.2;
+SELECT 1.0 = 0.1 + 0.9;
+SELECT 0.1 + 0.9;
+
+#
+# Decimal arithmetic operations
+#
+SELECT 0.07 + 0.07;
+SELECT 0.07 - 0.07;
+SELECT 0.07 * 0.07;
+SELECT 0.07 / 0.07;
+
+#
+# Decimal comparison with table data
+#
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (col1 INT);
+INSERT INTO t1 VALUES (10);
+SELECT * FROM t1 WHERE 0.8 = 0.7 + 0.1;
+SELECT 0.07 + 0.07 FROM t1;
+SELECT 0.07 - 0.07 FROM t1;
+SELECT 0.07 * 0.07 FROM t1;
+SELECT 0.07 / 0.07 FROM t1;
+DROP TABLE t1;
+
+#
+# Decimal precision in expressions
+#
+SELECT 1.5 + 2.5;
+SELECT 1.5 - 2.5;
+SELECT 1.5 * 2.5;
+SELECT 10.0 / 3.0;
+
+#
+# Decimal in WHERE clause
+#
+CREATE TABLE t2 (id INT PRIMARY KEY, price DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 9.99), (2, 19.99), (3, 29.99);
+SELECT * FROM t2 WHERE price = 19.99;
+SELECT * FROM t2 WHERE price > 10.00 AND price < 25.00;
+SELECT * FROM t2 WHERE price + 0.01 = 20.00;
+SELECT SUM(price) FROM t2;
+DROP TABLE t2;
+
+#
+# Decimal with different scales
+#
+SELECT 1.1 + 2.22;
+SELECT 1.1 - 2.22;
+SELECT 100.5 + 0.005;
+SELECT 0.1 + 0.01 + 0.001;
+
+#
+# Negative decimal values
+#
+SELECT -0.5 + 1.0;
+SELECT -0.5 * -0.5;
+SELECT -1.5 + 2.5;

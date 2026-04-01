@@ -272,13 +272,16 @@ fn datum_to_sqlparser_expr(datum: &Datum) -> Expr {
         }
         Datum::UnsignedInt(u) => val(Value::Number(u.to_string(), false)),
         Datum::String(s) => val(Value::SingleQuotedString(s.clone())),
-        Datum::Bytes(b) => val(Value::HexStringLiteral(hex::encode(b))),
+        Datum::Bytes(b) | Datum::Geometry(b) => val(Value::HexStringLiteral(hex::encode(b))),
         Datum::Bit { value, .. } => val(Value::Number(value.to_string(), false)),
         Datum::Timestamp(ts) => val(Value::Number(ts.to_string(), false)),
         Datum::Decimal { value, scale } => {
             let s = crate::executor::datum::format_decimal(*value, *scale);
             val(Value::Number(s, false))
         }
+        Datum::Json(v) => val(Value::SingleQuotedString(
+            serde_json::to_string(v).unwrap_or_default(),
+        )),
     }
 }
 

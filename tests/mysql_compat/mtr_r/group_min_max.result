@@ -1,0 +1,478 @@
+drop table if exists t1;
+create table t1 (
+a1 char(64), a2 char(64), b char(16), c char(16) not null, d char(16), dummy char(248) default ' '
+);
+insert into t1 (a1, a2, b, c, d) values
+('a','a','a','a111','xy1'),('a','a','a','b111','xy2'),('a','a','a','c111','xy3'),('a','a','a','d111','xy4'),
+('a','a','b','e112','xy1'),('a','a','b','f112','xy2'),('a','a','b','g112','xy3'),('a','a','b','h112','xy4'),
+('a','b','a','i121','xy1'),('a','b','a','j121','xy2'),('a','b','a','k121','xy3'),('a','b','a','l121','xy4'),
+('a','b','b','m122','xy1'),('a','b','b','n122','xy2'),('a','b','b','o122','xy3'),('a','b','b','p122','xy4'),
+('b','a','a','a211','xy1'),('b','a','a','b211','xy2'),('b','a','a','c211','xy3'),('b','a','a','d211','xy4'),
+('b','a','b','e212','xy1'),('b','a','b','f212','xy2'),('b','a','b','g212','xy3'),('b','a','b','h212','xy4'),
+('b','b','a','i221','xy1'),('b','b','a','j221','xy2'),('b','b','a','k221','xy3'),('b','b','a','l221','xy4'),
+('b','b','b','m222','xy1'),('b','b','b','n222','xy2'),('b','b','b','o222','xy3'),('b','b','b','p222','xy4'),
+('c','a','a','a311','xy1'),('c','a','a','b311','xy2'),('c','a','a','c311','xy3'),('c','a','a','d311','xy4'),
+('c','a','b','e312','xy1'),('c','a','b','f312','xy2'),('c','a','b','g312','xy3'),('c','a','b','h312','xy4'),
+('c','b','a','i321','xy1'),('c','b','a','j321','xy2'),('c','b','a','k321','xy3'),('c','b','a','l321','xy4'),
+('c','b','b','m322','xy1'),('c','b','b','n322','xy2'),('c','b','b','o322','xy3'),('c','b','b','p322','xy4'),
+('d','a','a','a411','xy1'),('d','a','a','b411','xy2'),('d','a','a','c411','xy3'),('d','a','a','d411','xy4'),
+('d','a','b','e412','xy1'),('d','a','b','f412','xy2'),('d','a','b','g412','xy3'),('d','a','b','h412','xy4'),
+('d','b','a','i421','xy1'),('d','b','a','j421','xy2'),('d','b','a','k421','xy3'),('d','b','a','l421','xy4'),
+('d','b','b','m422','xy1'),('d','b','b','n422','xy2'),('d','b','b','o422','xy3'),('d','b','b','p422','xy4');
+insert into t1 (a1, a2, b, c, d) values
+('a','a','a','a111','xy1'),('a','a','a','b111','xy2'),('a','a','a','c111','xy3'),('a','a','a','d111','xy4'),
+('a','a','b','e112','xy1'),('a','a','b','f112','xy2'),('a','a','b','g112','xy3'),('a','a','b','h112','xy4'),
+('a','b','a','i121','xy1'),('a','b','a','j121','xy2'),('a','b','a','k121','xy3'),('a','b','a','l121','xy4'),
+('a','b','b','m122','xy1'),('a','b','b','n122','xy2'),('a','b','b','o122','xy3'),('a','b','b','p122','xy4'),
+('b','a','a','a211','xy1'),('b','a','a','b211','xy2'),('b','a','a','c211','xy3'),('b','a','a','d211','xy4'),
+('b','a','b','e212','xy1'),('b','a','b','f212','xy2'),('b','a','b','g212','xy3'),('b','a','b','h212','xy4'),
+('b','b','a','i221','xy1'),('b','b','a','j221','xy2'),('b','b','a','k221','xy3'),('b','b','a','l221','xy4'),
+('b','b','b','m222','xy1'),('b','b','b','n222','xy2'),('b','b','b','o222','xy3'),('b','b','b','p222','xy4'),
+('c','a','a','a311','xy1'),('c','a','a','b311','xy2'),('c','a','a','c311','xy3'),('c','a','a','d311','xy4'),
+('c','a','b','e312','xy1'),('c','a','b','f312','xy2'),('c','a','b','g312','xy3'),('c','a','b','h312','xy4'),
+('c','b','a','i321','xy1'),('c','b','a','j321','xy2'),('c','b','a','k321','xy3'),('c','b','a','l321','xy4'),
+('c','b','b','m322','xy1'),('c','b','b','n322','xy2'),('c','b','b','o322','xy3'),('c','b','b','p322','xy4'),
+('d','a','a','a411','xy1'),('d','a','a','b411','xy2'),('d','a','a','c411','xy3'),('d','a','a','d411','xy4'),
+('d','a','b','e412','xy1'),('d','a','b','f412','xy2'),('d','a','b','g412','xy3'),('d','a','b','h412','xy4'),
+('d','b','a','i421','xy1'),('d','b','a','j421','xy2'),('d','b','a','k421','xy3'),('d','b','a','l421','xy4'),
+('d','b','b','m422','xy1'),('d','b','b','n422','xy2'),('d','b','b','o422','xy3'),('d','b','b','p422','xy4');
+select a1, min(a2) from t1 group by a1;
+a1	MIN(a2)
+a	a
+b	a
+c	a
+d	a
+select a1, max(a2) from t1 group by a1;
+a1	MAX(a2)
+a	b
+b	b
+c	b
+d	b
+select a1, min(a2), max(a2) from t1 group by a1;
+a1	MIN(a2)	MAX(a2)
+a	a	b
+b	a	b
+c	a	b
+d	a	b
+select a1, a2, b, min(c), max(c) from t1 group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+a	a	a	a111	d111
+a	a	b	e112	h112
+a	b	a	i121	l121
+a	b	b	m122	p122
+b	a	a	a211	d211
+b	a	b	e212	h212
+b	b	a	i221	l221
+b	b	b	m222	p222
+c	a	a	a311	d311
+c	a	b	e312	h312
+c	b	a	i321	l321
+c	b	b	m322	p322
+d	a	a	a411	d411
+d	a	b	e412	h412
+d	b	a	i421	l421
+d	b	b	m422	p422
+select a1,a2,b,max(c),min(c) from t1 group by a1,a2,b;
+a1	a2	b	MAX(c)	MIN(c)
+a	a	a	d111	a111
+a	a	b	h112	e112
+a	b	a	l121	i121
+a	b	b	p122	m122
+b	a	a	d211	a211
+b	a	b	h212	e212
+b	b	a	l221	i221
+b	b	b	p222	m222
+c	a	a	d311	a311
+c	a	b	h312	e312
+c	b	a	l321	i321
+c	b	b	p322	m322
+d	a	a	d411	a411
+d	a	b	h412	e412
+d	b	a	l421	i421
+d	b	b	p422	m422
+select min(a2), a1, max(a2), min(a2), a1 from t1 group by a1;
+MIN(a2)	a1	MAX(a2)	MIN(a2)	a1
+a	a	b	a	a
+a	b	b	a	b
+a	c	b	a	c
+a	d	b	a	d
+select a1, b, min(c), a1, max(c), b, a2, max(c), max(c) from t1 group by a1, a2, b;
+a1	b	MIN(c)	a1	MAX(c)	b	a2	MAX(c)	MAX(c)
+a	a	a111	a	d111	a	a	d111	d111
+a	a	i121	a	l121	a	b	l121	l121
+a	b	e112	a	h112	b	a	h112	h112
+a	b	m122	a	p122	b	b	p122	p122
+b	a	a211	b	d211	a	a	d211	d211
+b	a	i221	b	l221	a	b	l221	l221
+b	b	e212	b	h212	b	a	h212	h212
+b	b	m222	b	p222	b	b	p222	p222
+c	a	a311	c	d311	a	a	d311	d311
+c	a	i321	c	l321	a	b	l321	l321
+c	b	e312	c	h312	b	a	h312	h312
+c	b	m322	c	p322	b	b	p322	p322
+d	a	a411	d	d411	a	a	d411	d411
+d	a	i421	d	l421	a	b	l421	l421
+d	b	e412	d	h412	b	a	h412	h412
+d	b	m422	d	p422	b	b	p422	p422
+select min(a2) from t1 group by a1;
+MIN(a2)
+a
+a
+a
+a
+select a2, min(c), max(c) from t1 group by a1,a2,b;
+a2	MIN(c)	MAX(c)
+a	a111	d111
+a	a211	d211
+a	a311	d311
+a	a411	d411
+a	e112	h112
+a	e212	h212
+a	e312	h312
+a	e412	h412
+b	i121	l121
+b	i221	l221
+b	i321	l321
+b	i421	l421
+b	m122	p122
+b	m222	p222
+b	m322	p322
+b	m422	p422
+select a1,a2,b,min(c),max(c) from t1 where a1 < 'd' group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+a	a	a	a111	d111
+a	a	b	e112	h112
+a	b	a	i121	l121
+a	b	b	m122	p122
+b	a	a	a211	d211
+b	a	b	e212	h212
+b	b	a	i221	l221
+b	b	b	m222	p222
+c	a	a	a311	d311
+c	a	b	e312	h312
+c	b	a	i321	l321
+c	b	b	m322	p322
+select a1,a2,b,min(c),max(c) from t1 where a1 >= 'b' group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+b	a	a	a211	d211
+b	a	b	e212	h212
+b	b	a	i221	l221
+b	b	b	m222	p222
+c	a	a	a311	d311
+c	a	b	e312	h312
+c	b	a	i321	l321
+c	b	b	m322	p322
+d	a	a	a411	d411
+d	a	b	e412	h412
+d	b	a	i421	l421
+d	b	b	m422	p422
+select a1,a2,b,       max(c) from t1 where a1 >= 'c' or a1 < 'b' group by a1,a2,b;
+a1	a2	b	MAX(c)
+a	a	a	d111
+a	a	b	h112
+a	b	a	l121
+a	b	b	p122
+c	a	a	d311
+c	a	b	h312
+c	b	a	l321
+c	b	b	p322
+d	a	a	d411
+d	a	b	h412
+d	b	a	l421
+d	b	b	p422
+select a1, max(c)            from t1 where a1 >= 'c' or a1 < 'b' group by a1,a2,b;
+a1	MAX(c)
+a	d111
+a	h112
+a	l121
+a	p122
+c	d311
+c	h312
+c	l321
+c	p322
+d	d411
+d	h412
+d	l421
+d	p422
+select a1,a2,b,min(c),max(c) from t1 where a1 >= 'c' or a2 < 'b' group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+a	a	a	a111	d111
+a	a	b	e112	h112
+b	a	a	a211	d211
+b	a	b	e212	h212
+c	a	a	a311	d311
+c	a	b	e312	h312
+c	b	a	i321	l321
+c	b	b	m322	p322
+d	a	a	a411	d411
+d	a	b	e412	h412
+d	b	a	i421	l421
+d	b	b	m422	p422
+select a1,a2,b,       max(c) from t1 where a1 = 'z' or a1 = 'b' or a1 = 'd' group by a1,a2,b;
+a1	a2	b	MAX(c)
+b	a	a	d211
+b	a	b	h212
+b	b	a	l221
+b	b	b	p222
+d	a	a	d411
+d	a	b	h412
+d	b	a	l421
+d	b	b	p422
+select a1,a2,b,min(c),max(c) from t1 where a1 = 'z' or a1 = 'b' or a1 = 'd' group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+b	a	a	a211	d211
+b	a	b	e212	h212
+b	b	a	i221	l221
+b	b	b	m222	p222
+d	a	a	a411	d411
+d	a	b	e412	h412
+d	b	a	i421	l421
+d	b	b	m422	p422
+select a1,a2,b,       max(c) from t1 where (a1 = 'b' or a1 = 'd' or a1 = 'a' or a1 = 'c') and (a2 > 'a') group by a1,a2,b;
+a1	a2	b	MAX(c)
+a	b	a	l121
+a	b	b	p122
+b	b	a	l221
+b	b	b	p222
+c	b	a	l321
+c	b	b	p322
+d	b	a	l421
+d	b	b	p422
+select a1,a2,b,min(c),max(c) from t1 where (a1 = 'b' or a1 = 'd' or a1 = 'a' or a1 = 'c') and (a2 > 'a') group by a1,a2,b;
+a1	a2	b	MIN(c)	MAX(c)
+a	b	a	i121	l121
+a	b	b	m122	p122
+b	b	a	i221	l221
+b	b	b	m222	p222
+c	b	a	i321	l321
+c	b	b	m322	p322
+d	b	a	i421	l421
+d	b	b	m422	p422
+select a1,min(c),max(c)      from t1 where a1 >= 'b' group by a1,a2,b;
+a1	MIN(c)	MAX(c)
+b	a211	d211
+b	e212	h212
+b	i221	l221
+b	m222	p222
+c	a311	d311
+c	e312	h312
+c	i321	l321
+c	m322	p322
+d	a411	d411
+d	e412	h412
+d	i421	l421
+d	m422	p422
+select a1,  max(c)           from t1 where a1 in ('a','b','d') group by a1,a2,b;
+a1	MAX(c)
+a	d111
+a	h112
+a	l121
+a	p122
+b	d211
+b	h212
+b	l221
+b	p222
+d	d411
+d	h412
+d	l421
+d	p422
+select a1,a2,b,max(c),min(c) from t1 where (a2 = 'a') and (b = 'b') group by a1;
+a1	a2	b	MAX(c)	MIN(c)
+a	h112	e112	h112	e112
+b	h212	e212	h212	e212
+c	h312	e312	h312	e312
+d	h412	e412	h412	e412
+select a1,max(c),min(c)      from t1 where (a2 = 'a') and (b = 'b') group by a1;
+a1	MAX(c)	MIN(c)
+a	h112	e112
+b	h212	e212
+c	h312	e312
+d	h412	e412
+select a1,a2,b,       max(c) from t1 where (b = 'b') group by a1,a2;
+a1	a2	b	MAX(c)
+a	a	h112	h112
+a	b	p122	p122
+b	a	h212	h212
+b	b	p222	p222
+c	a	h312	h312
+c	b	p322	p322
+d	a	h412	h412
+d	b	p422	p422
+select a1,a2,b,min(c),max(c) from t1 where (b = 'b') group by a1,a2;
+a1	a2	b	MIN(c)	MAX(c)
+a	a	e112	e112	h112
+a	b	m122	m122	p122
+b	a	e212	e212	h212
+b	b	m222	m222	p222
+c	a	e312	e312	h312
+c	b	m322	m322	p322
+d	a	e412	e412	h412
+d	b	m422	m422	p422
+select a1,a2, max(c)         from t1 where (b = 'b') group by a1,a2;
+a1	a2	MAX(c)
+a	a	h112
+a	b	p122
+b	a	h212
+b	b	p222
+c	a	h312
+c	b	p322
+d	a	h412
+d	b	p422
+select a1,a2,b,min(c),max(c) from t1 where a1 = 'a' and (a2 = 'a') and (b = 'b') group by a1;
+a1	a2	b	MIN(c)	MAX(c)
+a	e112	h112	e112	h112
+select a1,a2,b,min(c),max(c) from t1 where (a1 = 'b' or a1 = 'd' or a1 = 'a' or a1 = 'c') and (a2 > 'a') and (b = 'b') group by a1;
+a1	a2	b	MIN(c)	MAX(c)
+a	m122	p122	m122	p122
+b	m222	p222	m222	p222
+c	m322	p322	m322	p322
+d	m422	p422	m422	p422
+select a1,min(c),max(c) from t1 where a1 = 'a' group by a1,a2,b;
+a1	MIN(c)	MAX(c)
+a	a111	d111
+a	e112	h112
+a	i121	l121
+a	m122	p122
+select a1, count(a1) from t1 group by a1;
+a1	COUNT(a1)
+a	32
+b	32
+c	32
+d	32
+select a1, a2, count(a1) from t1 group by a1, a2;
+a1	a2	COUNT(a1)
+a	a	16
+a	b	16
+b	a	16
+b	b	16
+c	a	16
+c	b	16
+d	a	16
+d	b	16
+select a1, a2, b, count(a1) from t1 group by a1, a2, b;
+a1	a2	b	COUNT(a1)
+a	a	a	8
+a	a	b	8
+a	b	a	8
+a	b	b	8
+b	a	a	8
+b	a	b	8
+b	b	a	8
+b	b	b	8
+c	a	a	8
+c	a	b	8
+c	b	a	8
+c	b	b	8
+d	a	a	8
+d	a	b	8
+d	b	a	8
+d	b	b	8
+select a1, min(c), max(c), count(c) from t1 group by a1;
+a1	MIN(c)	MAX(c)	COUNT(c)
+a	a111	p122	32
+b	a211	p222	32
+c	a311	p322	32
+d	a411	p422	32
+select a1, a2, min(c), max(c), count(c) from t1 group by a1, a2;
+a1	a2	MIN(c)	MAX(c)	COUNT(c)
+a	a	a111	h112	16
+a	b	i121	p122	16
+b	a	a211	h212	16
+b	b	i221	p222	16
+c	a	a311	h312	16
+c	b	i321	p322	16
+d	a	a411	h412	16
+d	b	i421	p422	16
+select a1, max(c) from t1 group by a1 having a1 > 'b';
+a1	MAX(c)
+c	p322
+d	p422
+select a1, min(c) from t1 group by a1 having min(c) < 'e112';
+a1	MIN(c)
+a	a111
+b	a211
+c	a311
+d	a411
+select a1, a2, max(c) from t1 group by a1, a2 having max(c) > 'p122';
+a1	a2	MAX(c)
+b	b	p222
+c	b	p322
+d	b	p422
+select a1, min(c) from t1 group by a1 order by a1;
+a1	MIN(c)
+a	a111
+b	a211
+c	a311
+d	a411
+select a1, min(c) from t1 group by a1 order by a1 desc;
+a1	MIN(c)
+d	a411
+c	a311
+b	a211
+a	a111
+select a1, min(c) from t1 group by a1 order by min(c);
+a1	MIN(c)
+a	a111
+b	a211
+c	a311
+d	a411
+select distinct a1 from t1;
+a1
+a
+b
+c
+d
+select distinct a1, a2 from t1;
+a1	a2
+a	a
+a	b
+b	a
+b	b
+c	a
+c	b
+d	a
+d	b
+drop table t1;
+create table t1 (a int, b int, c int);
+insert into t1 values
+(1, 10, 100), (1, 10, 200), (1, 20, 300),
+(2, 10, 400), (2, 20, 500), (2, 20, 600),
+(3, 30, 700), (3, 30, 800), (3, 30, 900);
+select a, min(b), max(b) from t1 group by a;
+a	MIN(b)	MAX(b)
+1	10	20
+2	10	20
+3	30	30
+select a, min(c), max(c) from t1 group by a;
+a	MIN(c)	MAX(c)
+1	100	300
+2	400	600
+3	700	900
+select a, b, min(c), max(c) from t1 group by a, b;
+a	b	MIN(c)	MAX(c)
+1	10	100	200
+1	20	300	300
+2	10	400	400
+2	20	500	600
+3	30	700	900
+select a, min(b), max(b), min(c), max(c) from t1 group by a;
+a	MIN(b)	MAX(b)	MIN(c)	MAX(c)
+1	10	20	100	300
+2	10	20	400	600
+3	30	30	700	900
+select a, min(b), max(c) from t1 where a > 1 group by a;
+a	MIN(b)	MAX(c)
+2	10	600
+3	30	900
+select a, min(b), max(c) from t1 where b > 10 group by a;
+a	MIN(b)	MAX(c)
+1	20	300
+2	20	600
+3	30	900
+select a, count(*), min(b), max(c) from t1 group by a;
+a	COUNT(NULL)	MIN(b)	MAX(c)
+1	3	10	300
+2	3	10	600
+3	3	30	900
+drop table t1;
+# End of group_min_max tests

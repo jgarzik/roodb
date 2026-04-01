@@ -1,0 +1,51 @@
+CREATE TABLE t1 (a int NOT NULL, b int NOT NULL);
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+UPDATE t1 SET a = a + 10 WHERE a > 3;
+SELECT * FROM t1;
+a	b
+1	1
+2	2
+3	3
+14	4
+15	5
+UPDATE t1 SET a = a + 100 WHERE a > 0;
+SELECT * FROM t1;
+a	b
+101	1
+102	2
+103	3
+114	4
+115	5
+DROP TABLE t1;
+CREATE TABLE t1 (a int NOT NULL, b int NOT NULL);
+INSERT INTO t1 VALUES (1,10),(2,20),(3,30);
+UPDATE t1 SET a = 99 WHERE a = 1 AND a = 2;
+SELECT * FROM t1;
+a	b
+1	10
+2	20
+3	30
+DROP TABLE t1;
+CREATE TABLE t1 (
+place_id int NOT NULL,
+shows int DEFAULT 0 NOT NULL,
+clicks int DEFAULT 0 NOT NULL,
+PRIMARY KEY (place_id)
+);
+INSERT INTO t1 (place_id, shows, clicks) VALUES (1, 0, 0);
+UPDATE t1 SET shows = shows + 1, clicks = clicks + 1 WHERE place_id = 1;
+SELECT place_id, shows, clicks FROM t1;
+place_id	shows	clicks
+1	1	1
+DROP TABLE t1;
+CREATE TABLE t1 (a VARCHAR(50), b TEXT, c CHAR(50));
+INSERT INTO t1 (a, b, c) VALUES ('start trail', '', 'even longer string');
+UPDATE t1 SET b = a, a = 'inject';
+SELECT a, b FROM t1;
+a	b
+inject	start trail
+UPDATE t1 SET b = c, c = 'inject';
+SELECT c, b FROM t1;
+c	b
+inject	even longer string
+DROP TABLE t1;

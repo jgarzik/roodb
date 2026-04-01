@@ -1,0 +1,136 @@
+# Trimmed from MySQL func_str.test for RooDB compatibility testing.
+# Tests basic string functions supported by RooDB.
+
+#
+# CONCAT
+#
+SELECT CONCAT('monty', ' was here ', 'again');
+SELECT CONCAT('a', 'b', 'c', 'd');
+SELECT CONCAT('hello', NULL);
+SELECT CONCAT('', 'notempty');
+
+#
+# LENGTH, CHAR_LENGTH
+#
+SELECT LENGTH('hello');
+SELECT LENGTH('');
+SELECT LENGTH(NULL);
+SELECT CHAR_LENGTH('hello');
+
+#
+# UPPER, LOWER (UCASE, LCASE)
+#
+SELECT UPPER('hello');
+SELECT LOWER('HELLO');
+# [RooDB-skip] UCASE/LCASE aliases (sqlparser doesn't parse them as functions)
+
+#
+# SUBSTRING / SUBSTR / MID
+#
+SELECT SUBSTRING('hello', 2);
+SELECT SUBSTRING('hello', 2, 3);
+SELECT SUBSTR('abcdefg', 3, 2);
+SELECT SUBSTR('abcdefg', -3, 2);
+# [RooDB-skip] MID() alias not supported by sqlparser
+
+#
+# LEFT, RIGHT
+#
+SELECT LEFT('hello', 2);
+SELECT RIGHT('hello', 2);
+SELECT LEFT('hello', 0);
+SELECT RIGHT('hello', 0);
+SELECT LEFT('hello', NULL);
+SELECT RIGHT('hello', NULL);
+
+#
+# REPLACE
+#
+SELECT REPLACE('aaaa', 'a', 'b');
+SELECT REPLACE('aaaa', 'aa', 'b');
+SELECT REPLACE('aaaa', 'a', 'bb');
+SELECT REPLACE('aaaa', '', 'b');
+SELECT REPLACE('bbbb', 'a', 'c');
+
+#
+# TRIM, LTRIM, RTRIM
+#
+SELECT CONCAT(':', LTRIM('  left  '), ':');
+SELECT CONCAT(':', RTRIM('  right  '), ':');
+SELECT CONCAT(':', TRIM(' m '), ':');
+# [RooDB-skip] TRIM(BOTH/LEADING/TRAILING FROM ...) extended syntax
+
+#
+# REPEAT
+#
+SELECT REPEAT('monty', 5);
+SELECT REPEAT('ab', 3);
+SELECT REPEAT('a', 0);
+SELECT CONCAT('*', SPACE(5), '*');
+
+#
+# REVERSE
+#
+SELECT REVERSE('abc');
+SELECT REVERSE('abcd');
+SELECT REVERSE('');
+
+#
+# LPAD, RPAD
+#
+SELECT RPAD('a', 4, '1');
+SELECT RPAD('abcd', 3, '12');
+SELECT LPAD('a', 4, '1');
+SELECT LPAD('abcd', 3, '12');
+SELECT RPAD('abcd', 7, 'ab');
+SELECT LPAD('abcd', 7, 'ab');
+SELECT RPAD('abcd', 1, 'ab');
+SELECT LPAD('abcd', 1, 'ab');
+SELECT LPAD(12345, 5, '#');
+
+#
+# HEX, UNHEX
+#
+SELECT HEX(255);
+SELECT HEX('abc');
+# [RooDB-skip] UNHEX function not implemented
+
+#
+# CONV
+#
+SELECT CONV(71, 10, 36);
+SELECT CONV('1Z', 36, 10);
+SELECT CONV(130, 16, 10);
+SELECT CONV(255, 10, 16);
+
+#
+# CONCAT_WS
+#
+SELECT CONCAT_WS(', ', 'monty', 'was here', 'again');
+SELECT CONCAT_WS(NULL, 'a');
+SELECT CONCAT_WS(',', NULL, '');
+SELECT CONCAT_WS(',', '', NULL, 'a');
+
+#
+# INSERT (string function)
+#
+SELECT INSERT('txs', 2, 1, 'hi');
+SELECT INSERT('txxxxt', 2, 4, 'es');
+
+#
+# LOCATE, INSTR
+#
+SELECT LOCATE('he', 'hello');
+SELECT LOCATE('he', 'hello', 2);
+SELECT LOCATE('lo', 'hello', 2);
+SELECT INSTR('hello', 'HE');
+
+#
+# SUBSTRING_INDEX
+#
+# [RooDB-skip] SUBSTRING_INDEX not implemented
+
+#
+# String functions with table data
+#
+# [RooDB-skip] TRIM(LEADING ... FROM ...) extended syntax in WHERE

@@ -1,0 +1,12 @@
+--echo # UUID, UUID_SHORT, BENCHMARK
+
+--echo # --- UUID format ---
+SELECT LENGTH(UUID()) = 36;
+SELECT UUID() <> UUID();
+
+--echo # --- UUID_SHORT ---
+SELECT UUID_SHORT() IS NOT NULL;
+
+--echo # --- BENCHMARK ---
+SELECT BENCHMARK(1, 1+1);
+SELECT BENCHMARK(100, 1+1);

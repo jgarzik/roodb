@@ -196,3 +196,105 @@ async fn test_delete_from_empty_table() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_delete_limit() {
+    let server = TestServer::start("delete_limit").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE del_limit_tbl (id INT PRIMARY KEY, val VARCHAR(20))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop(
+        "INSERT INTO del_limit_tbl (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .await
+    .expect("INSERT failed");
+
+    // DELETE LIMIT 1 should delete exactly 1 row
+    conn.query_drop("DELETE FROM del_limit_tbl LIMIT 1")
+        .await
+        .expect("DELETE LIMIT 1 failed");
+
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM del_limit_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 3, "DELETE LIMIT 1 should leave 3 rows");
+
+    conn.query_drop("DROP TABLE del_limit_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_delete_limit_zero_with_pk() {
+    let server = TestServer::start("delete_limit0").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE del_lim0_tbl (id INT PRIMARY KEY, val VARCHAR(20))")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO del_lim0_tbl (id, val) VALUES (1, 'a'), (2, 'b')")
+        .await
+        .expect("INSERT failed");
+
+    // DELETE WHERE pk=X LIMIT 0 must delete 0 rows (PointGet suppression)
+    conn.query_drop("DELETE FROM del_lim0_tbl WHERE id = 1 LIMIT 0")
+        .await
+        .expect("DELETE LIMIT 0 failed");
+
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM del_lim0_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2, "DELETE LIMIT 0 should delete nothing");
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+
+    conn.query_drop("DROP TABLE del_lim0_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_delete_order_by_limit() {
+    let server = TestServer::start("delete_ob_lim").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE del_ob_tbl (id INT PRIMARY KEY, val INT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    conn.query_drop("INSERT INTO del_ob_tbl (id, val) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("INSERT failed");
+
+    // DELETE ORDER BY id DESC LIMIT 1 should delete row with highest id (3)
+    conn.query_drop("DELETE FROM del_ob_tbl ORDER BY id DESC LIMIT 1")
+        .await
+        .expect("DELETE ORDER BY DESC LIMIT failed");
+
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, val FROM del_ob_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, 10));
+    assert_eq!(rows[1], (2, 20));
+
+    conn.query_drop("DROP TABLE del_ob_tbl")
+        .await
+        .expect("DROP TABLE failed");
+
+    drop(conn);
+    server.shutdown().await;
+}

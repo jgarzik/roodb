@@ -1,0 +1,19 @@
+#
+# Test overflow — arithmetic and type overflow behavior
+# Adapted from MySQL overflow concepts — trimmed for RooDB compatibility
+#
+
+# Test integer overflow in SELECT expressions
+select 9223372036854775807 + 0;
+select -9223372036854775808 + 0;
+
+# Test unsigned bigint max value
+select 18446744073709551615 + 0;
+
+# Test basic overflow detection with CAST
+select cast(999 as signed);
+select cast(-999 as signed);
+
+# Test arithmetic near boundaries
+select 2147483647 + 0;
+select -2147483648 + 0;

@@ -17,10 +17,12 @@ pub mod error;
 pub mod eval;
 pub mod explain_exec;
 pub mod filter;
+pub mod geometry;
 pub mod hash_join;
 pub mod insert;
 pub mod insert_select;
 pub mod join;
+pub mod json;
 pub mod limit;
 pub mod multi_exec;
 pub mod point_get;
@@ -31,8 +33,10 @@ pub mod row;
 pub mod scan;
 pub mod single_row;
 pub mod sort;
+pub mod trigger;
 pub mod union;
 pub mod update;
+pub mod window;
 
 pub use context::TransactionContext;
 pub use datum::Datum;
@@ -71,6 +75,14 @@ pub trait Executor: Send {
     /// Default implementation returns empty vec (read-only operators).
     fn take_changes(&mut self) -> Vec<RowChange> {
         Vec::new()
+    }
+
+    /// Whether this executor uses IGNORE semantics (duplicate keys silently skipped).
+    ///
+    /// Used by the protocol layer to set `ignore_duplicates` on the ChangeSet
+    /// so the Raft apply skips duplicate-key conflicts instead of erroring.
+    fn is_ignore_duplicates(&self) -> bool {
+        false
     }
 }
 

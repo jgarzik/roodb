@@ -1,0 +1,168 @@
+#
+# Test of VIEWs — adapted from MySQL view.test for RooDB
+#
+# [RooDB-skip] TEMPTABLE algorithm, updatable views, information_schema.views,
+#   temporary tables, EXPLAIN of views, ANALYZE TABLE, PREPARE/EXECUTE,
+#   CHECK OPTION, multi-table update/delete through views,
+#   view with subqueries containing =ALL/IN predicates,
+#   character set / collation, sql_mode, ALGORITHM= keyword,
+#   ALTER VIEW, SHOW CREATE VIEW, view column rename via (col) syntax
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+DROP VIEW IF EXISTS v1, v2, v3;
+--enable_warnings
+
+#
+# Simple view creation and SELECT
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1,2), (1,3), (2,4), (2,5), (3,10);
+
+CREATE VIEW v1 AS SELECT b+1 AS c FROM t1;
+SELECT c FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# View with WHERE clause
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1,10), (2,20), (3,30), (4,40), (5,50);
+
+CREATE VIEW v1 AS SELECT a, b FROM t1 WHERE a > 2;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# VIEW on VIEW
+#
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1), (2), (3), (200);
+
+CREATE VIEW v1 AS SELECT a AS x FROM t1 WHERE a > 1;
+CREATE VIEW v2 AS SELECT x AS y FROM v1 WHERE x < 100;
+SELECT * FROM v2;
+DROP VIEW v2;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# DISTINCT in view
+#
+CREATE TABLE t1 (a int);
+INSERT INTO t1 VALUES (1), (2), (3), (1), (2), (3);
+
+CREATE VIEW v1 AS SELECT DISTINCT a FROM t1;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# CREATE OR REPLACE VIEW
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+
+CREATE VIEW v1 AS SELECT a FROM t1;
+SELECT * FROM v1;
+
+# Replace with a different definition
+CREATE OR REPLACE VIEW v1 AS SELECT a, b FROM t1 WHERE a > 1;
+SELECT * FROM v1;
+
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# DROP VIEW IF EXISTS — should not error
+#
+DROP VIEW IF EXISTS no_such_view;
+
+#
+# View with aggregation
+#
+CREATE TABLE t1 (dept int, salary int);
+INSERT INTO t1 VALUES (1, 1000), (1, 2000), (2, 3000), (2, 4000), (3, 5000);
+
+CREATE VIEW v1 AS SELECT dept, SUM(salary) AS total FROM t1 GROUP BY dept;
+SELECT * FROM v1 ORDER BY dept;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# View with JOIN
+#
+CREATE TABLE t1 (id int, name varchar(20));
+INSERT INTO t1 VALUES (1, 'alice'), (2, 'bob');
+CREATE TABLE t2 (id int, city varchar(20));
+INSERT INTO t2 VALUES (1, 'NYC'), (2, 'LA');
+
+CREATE VIEW v1 AS SELECT t1.name, t2.city FROM t1 JOIN t2 ON t1.id = t2.id;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1, t2;
+
+#
+# View used in JOIN
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1,100), (2,200), (3,300);
+CREATE TABLE t2 (a int, c int);
+INSERT INTO t2 VALUES (1,10), (2,20);
+
+CREATE VIEW v1 AS SELECT a, b FROM t1 WHERE b > 100;
+SELECT v1.a, v1.b, t2.c FROM v1 JOIN t2 ON v1.a = t2.a;
+DROP VIEW v1;
+DROP TABLE t1, t2;
+
+#
+# View without tables (constant SELECT)
+#
+CREATE VIEW v1 AS SELECT 1 AS x, 'hello' AS y;
+SELECT * FROM v1;
+DROP VIEW v1;
+
+#
+# Multiple views dropped at once
+#
+CREATE TABLE t1 (a int);
+CREATE VIEW v1 AS SELECT a FROM t1;
+CREATE VIEW v2 AS SELECT a+1 AS b FROM t1;
+CREATE VIEW v3 AS SELECT a+2 AS c FROM t1;
+DROP VIEW v1, v2, v3;
+DROP TABLE t1;
+
+#
+# View with star (SELECT *)
+#
+CREATE TABLE t1 (a int, b varchar(10), c int);
+INSERT INTO t1 VALUES (1, 'x', 100), (2, 'y', 200);
+CREATE VIEW v1 AS SELECT * FROM t1;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;
+
+#
+# View with WHERE on joined tables
+#
+CREATE TABLE t1 (id int, val int);
+CREATE TABLE t2 (id int, label varchar(10));
+INSERT INTO t1 VALUES (1,10),(2,20),(3,30);
+INSERT INTO t2 VALUES (1,'a'),(2,'b'),(3,'c');
+CREATE VIEW v1 AS SELECT t1.id, t1.val, t2.label FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.val > 10;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1, t2;
+
+#
+# View with ORDER BY + LIMIT
+#
+CREATE TABLE t1 (a int, b int);
+INSERT INTO t1 VALUES (1,10), (2,20), (3,30), (4,40), (5,50);
+
+CREATE VIEW v1 AS SELECT a, b FROM t1 ORDER BY b DESC LIMIT 2;
+SELECT * FROM v1;
+DROP VIEW v1;
+DROP TABLE t1;

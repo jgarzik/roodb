@@ -40,6 +40,8 @@ pub struct ProcedureContext {
     pub found: bool,
     /// Total rows affected by DML within the procedure
     pub rows_affected: u64,
+    /// Top-level DECLARE HANDLERs: (handler_type, sqlstate, handler_sql)
+    pub handlers: Vec<(String, String, String)>,
 }
 
 impl Default for ProcedureContext {
@@ -49,6 +51,7 @@ impl Default for ProcedureContext {
             cursors: HashMap::new(),
             found: true,
             rows_affected: 0,
+            handlers: Vec::new(),
         }
     }
 }
@@ -252,14 +255,23 @@ pub fn eval_sp_expr(
                 return Ok(Datum::Null);
             }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = eval_sp_expr(item, ctx, user_vars)?;
+                if item_val.is_null() {
+                    has_null = true;
+                    continue;
+                }
                 if let Ok(Datum::Bool(true)) = eval_binary_op(&BinaryOp::Eq, &val, &item_val) {
                     found = true;
                     break;
                 }
             }
-            Ok(Datum::Bool(if *negated { !found } else { found }))
+            if !found && has_null {
+                Ok(Datum::Null)
+            } else {
+                Ok(Datum::Bool(if *negated { !found } else { found }))
+            }
         }
 
         // CASE expression
@@ -343,6 +355,30 @@ pub fn build_procedure_context(
         match param.mode {
             ParamMode::In | ParamMode::InOut => {
                 let val = eval_sp_expr(arg_expr, &eval_ctx, user_vars)?;
+                // Check BIGINT overflow: if param type is BIGINT and value is Float
+                // that exceeds i64 range, the literal overflowed during parsing
+                let param_type_upper = param.data_type.to_uppercase();
+                if param_type_upper.contains("BIGINT") && !param_type_upper.contains("UNSIGNED") {
+                    if let Datum::Float(f) = &val {
+                        // 2^63 exactly — values >= this overflow BIGINT
+                        const MAX_BIGINT_F64: f64 = 9_223_372_036_854_775_808.0;
+                        if *f >= MAX_BIGINT_F64 || *f < i64::MIN as f64 {
+                            return Err(format!(
+                                "Out of range value for column '{}' at row 1",
+                                param.name
+                            ));
+                        }
+                    }
+                    // Also check UnsignedInt values that exceed i64::MAX
+                    if let Datum::UnsignedInt(u) = &val {
+                        if *u > i64::MAX as u64 {
+                            return Err(format!(
+                                "Out of range value for column '{}' at row 1",
+                                param.name
+                            ));
+                        }
+                    }
+                }
                 ctx.locals.insert(param_name, val);
             }
             ParamMode::Out => {

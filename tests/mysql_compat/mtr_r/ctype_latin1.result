@@ -1,0 +1,190 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (a CHAR(20));
+INSERT INTO t1 VALUES ('hello'), ('world'), ('foo'), ('bar');
+SELECT * FROM t1 ORDER BY a;
+a
+bar
+foo
+hello
+world
+SELECT CHAR_LENGTH(a) FROM t1 ORDER BY a;
+CHAR_LENGTH(a)
+3
+3
+5
+5
+SELECT UPPER(a) FROM t1 ORDER BY a;
+UPPER(a)
+BAR
+FOO
+HELLO
+WORLD
+SELECT LOWER(a) FROM t1 ORDER BY a;
+LOWER(a)
+bar
+foo
+hello
+world
+DROP TABLE t1;
+SELECT HEX('A');
+HEX('A')
+41
+SELECT HEX('AB');
+HEX('AB')
+4142
+SELECT HEX('ABC');
+HEX('ABC')
+414243
+SELECT HEX(65);
+HEX(65)
+41
+SELECT HEX(255);
+HEX(255)
+FF
+SELECT HEX(256);
+HEX(256)
+100
+SELECT CONCAT('hello', ' ', 'world');
+CONCAT('hello',' ','world')
+hello world
+SELECT CONCAT('A', 'B', 'C', 'D');
+CONCAT('A','B','C','D')
+ABCD
+SELECT LENGTH('hello');
+LENGTH('hello')
+5
+SELECT LENGTH('');
+LENGTH('')
+0
+SELECT LENGTH(NULL);
+LENGTH(NULL)
+NULL
+SELECT 'a' = 'A';
+'a' = 'A'
+0
+SELECT 'a' < 'b';
+'a' < 'b'
+1
+SELECT 'z' > 'a';
+'z' > 'a'
+1
+SELECT 'abc' = 'ABC';
+'abc' = 'ABC'
+0
+SELECT 'abc' < 'abd';
+'abc' < 'abd'
+1
+SELECT 'hello' LIKE 'hello';
+'hello' LIKE 'hello'
+1
+SELECT 'hello' LIKE 'HELLO';
+'hello' LIKE 'HELLO'
+0
+SELECT 'hello' LIKE 'h%';
+'hello' LIKE 'h%'
+1
+SELECT 'hello' LIKE '%lo';
+'hello' LIKE '%lo'
+1
+SELECT 'hello' LIKE '%ell%';
+'hello' LIKE '%ell%'
+1
+SELECT 'hello' LIKE 'h_llo';
+'hello' LIKE 'h_llo'
+1
+SELECT 'hello' LIKE '____o';
+'hello' LIKE '____o'
+1
+SELECT LEFT('hello', 3);
+LEFT('hello',3)
+hel
+SELECT RIGHT('hello', 3);
+RIGHT('hello',3)
+llo
+SELECT SUBSTRING('hello', 2, 3);
+SUBSTRING('hello',2,3)
+ell
+SELECT SUBSTRING('hello', 2);
+SUBSTRING('hello',2)
+ello
+SELECT TRIM('  hello  ');
+TRIM('  hello  ')
+hello
+SELECT LTRIM('  hello  ');
+LTRIM('  hello  ')
+hello  
+SELECT RTRIM('  hello  ');
+RTRIM('  hello  ')
+  hello
+SELECT REPLACE('hello world', 'world', 'there');
+REPLACE('hello world','world','there')
+hello there
+SELECT REPLACE('aaa', 'a', 'bb');
+REPLACE('aaa','a','bb')
+bbbbbb
+SELECT REPEAT('ab', 3);
+REPEAT('ab',3)
+ababab
+SELECT REPEAT('x', 5);
+REPEAT('x',5)
+xxxxx
+SELECT REVERSE('hello');
+REVERSE('hello')
+olleh
+SELECT REVERSE('abcdef');
+REVERSE('abcdef')
+fedcba
+SELECT LPAD('hi', 5, '0');
+LPAD('hi',5,'0')
+000hi
+SELECT RPAD('hi', 5, '0');
+RPAD('hi',5,'0')
+hi000
+SELECT LPAD('hello', 3, '0');
+LPAD('hello',3,'0')
+hel
+SELECT RPAD('hello', 3, '0');
+RPAD('hello',3,'0')
+hel
+CREATE TABLE t1 (id INT, name CHAR(20));
+INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'Dave');
+SELECT * FROM t1 WHERE name = 'Alice';
+id	name
+1	Alice
+SELECT * FROM t1 WHERE name LIKE 'B%';
+id	name
+2	Bob
+SELECT * FROM t1 WHERE name > 'C' ORDER BY name;
+id	name
+3	Charlie
+4	Dave
+SELECT * FROM t1 WHERE name IN ('Alice', 'Charlie') ORDER BY id;
+id	name
+1	Alice
+3	Charlie
+SELECT * FROM t1 WHERE CHAR_LENGTH(name) > 4 ORDER BY name;
+id	name
+1	Alice
+3	Charlie
+DROP TABLE t1;
+SELECT CONCAT_WS(',', 'a', 'b', 'c');
+CONCAT_WS(',','a','b','c')
+a,b,c
+SELECT CONCAT_WS('-', 'hello', 'world');
+CONCAT_WS('-','hello','world')
+hello-world
+SELECT CONCAT_WS(',', 'a', NULL, 'b');
+CONCAT_WS(',','a',NULL,'b')
+a,b
+SELECT CONCAT_WS(NULL, 'a', 'b');
+CONCAT_WS(NULL,'a','b')
+NULL
+SELECT LOCATE('lo', 'hello');
+LOCATE('lo','hello')
+4
+SELECT LOCATE('lo', 'hello world', 5);
+LOCATE('lo','hello world',5)
+0
+SELECT INSTR('hello', 'ell');
+INSTR('hello','ell')
+2

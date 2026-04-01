@@ -1,0 +1,173 @@
+# Adapted from MySQL type_date.test for RooDB compatibility testing.
+# Tests DATE type operations, comparisons, and date functions.
+
+# [RooDB-skip] User variables with := assignment syntax
+# [RooDB-skip] INSERT IGNORE with bad data (0000-00-00, 9912101, etc.)
+# [RooDB-skip] SET sql_mode / SQL_MODE changes
+# [RooDB-skip] ANALYZE TABLE / EXPLAIN
+# [RooDB-skip] ALTER TABLE
+# [RooDB-skip] YEAR type
+# [RooDB-skip] 0000-00-00 dates (ALLOW_INVALID_DATES)
+# [RooDB-skip] CREATE TABLE AS SELECT
+# [RooDB-skip] SET timestamp
+# [RooDB-skip] prepared statements
+# [RooDB-skip] CREATE INDEX
+# [RooDB-skip] CREATE VIEW / DROP VIEW
+# [RooDB-skip] --source includes
+# [RooDB-skip] --sorted_result (we use ORDER BY instead)
+# [RooDB-skip] NAME_CONST function
+# [RooDB-skip] CURRENT_TIME / CURRENT_TIMESTAMP / CURRENT_DATE (time-dependent)
+# [RooDB-skip] DESCRIBE table
+
+#
+# test of problem with date fields
+#
+create table t1 (a char(16), b date, c datetime);
+insert into t1 SET a='test 2000-01-01', b='2000-01-01', c='2000-01-01';
+select * from t1 where c = '2000-01-01';
+select * from t1 where b = '2000-01-01';
+drop table t1;
+
+#
+# problem with date conversions
+#
+CREATE TABLE t1 (name char(6),cdate date);
+INSERT INTO t1 VALUES ('name1','1998-01-01');
+INSERT INTO t1 VALUES ('name2','1998-01-01');
+INSERT INTO t1 VALUES ('name1','1998-01-02');
+INSERT INTO t1 VALUES ('name2','1998-01-02');
+CREATE TABLE t2 (cdate date, note char(6));
+INSERT INTO t2 VALUES ('1998-01-01','note01');
+INSERT INTO t2 VALUES ('1998-01-02','note02');
+select name,t1.cdate,note from t1,t2 where t1.cdate=t2.cdate and t1.cdate='1998-01-01' ORDER BY name;
+drop table t1,t2;
+
+#
+# Date and BETWEEN
+#
+CREATE TABLE t1 ( datum DATE );
+INSERT INTO t1 VALUES ( '2000-1-1' );
+INSERT INTO t1 VALUES ( '2000-1-2' );
+INSERT INTO t1 VALUES ( '2000-1-3' );
+INSERT INTO t1 VALUES ( '2000-1-4' );
+INSERT INTO t1 VALUES ( '2000-1-5' );
+SELECT * FROM t1 WHERE datum BETWEEN cast('2000-1-2' as date) AND cast('2000-1-4' as date);
+# [RooDB-skip] datum - INTERVAL expression in BETWEEN -- requires column arithmetic with INTERVAL
+DROP TABLE t1;
+
+#
+# test of max(date) and having
+#
+CREATE TABLE t1 (
+  user_id char(10),
+  summa int,
+  rdate date
+);
+INSERT INTO t1 VALUES ('aaa',100,'1998-01-01');
+INSERT INTO t1 VALUES ('aaa',200,'1998-01-03');
+INSERT INTO t1 VALUES ('bbb',50,'1998-01-02');
+INSERT INTO t1 VALUES ('bbb',200,'1998-01-04');
+select max(rdate) as s from t1 where rdate < '1998-01-03' having s> '1998-01-01';
+select max(rdate) as s from t1 having s='1998-01-04';
+drop table t1;
+
+#
+# Test of date and not null
+#
+# [RooDB-skip] DATE_ADD/DATE_SUB -- not implemented in eval engine
+
+#
+# Multiple SELECT DATE_FORMAT gave incorrect results (Bug #4036)
+#
+CREATE TABLE t1 (f1 TIME, f2 TIME);
+INSERT INTO t1 (f1, f2) VALUES ('09:00', '12:00');
+SELECT DATE_FORMAT(f1, '%l.%i %p') , DATE_FORMAT(f2, '%l.%i %p') FROM t1;
+DROP TABLE t1;
+
+#
+# Date -> string conversion with SELECT and UNION
+#
+CREATE TABLE t1 (f1 DATE);
+CREATE TABLE t2 (f2 VARCHAR(8));
+CREATE TABLE t3 (f2 CHAR(8));
+
+INSERT INTO t1 VALUES ('1978-11-26');
+INSERT INTO t2 SELECT f1+0 FROM t1;
+INSERT INTO t2 SELECT f1+0 FROM t1 UNION SELECT f1+0 FROM t1;
+INSERT INTO t3 SELECT f1+0 FROM t1;
+INSERT INTO t3 SELECT f1+0 FROM t1 UNION SELECT f1+0 FROM t1;
+SELECT * FROM t2;
+SELECT * FROM t3;
+
+DROP TABLE t1, t2, t3;
+
+#
+# Bug#21677: Wrong result when comparing a DATE and a DATETIME in BETWEEN
+#
+create table t1(start_date date, end_date date);
+insert into t1 values ('2000-01-01','2000-01-02');
+select 1 from t1 where cast('2000-01-01 12:01:01' as datetime) between start_date and end_date;
+drop table t1;
+
+#
+# Testing cast from DECIMAL to DATE
+#
+CREATE TABLE t1 (a DECIMAL(23,4));
+INSERT INTO t1 VALUES (NULL),(101010.9999),(-101010.9999);
+SELECT a, CAST(a AS DATE) FROM t1;
+DROP TABLE t1;
+
+#
+# Testing CASE with DATE type without a found item
+#
+SELECT CAST(CASE WHEN 0 THEN '2001-01-01' END AS DATE);
+
+#
+# Testing DATE field with NULL value with NOT IN
+#
+CREATE TABLE t1 (a DATE);
+INSERT INTO t1 VALUES (NULL);
+SELECT * FROM t1 WHERE a NOT IN ('2001-01-01','2002-02-02');
+DROP TABLE t1;
+
+#
+# Testing COALESCE with DATE type without a found item
+#
+SELECT COALESCE(DATE(NULL));
+
+#
+# Testing Item_func_min_max::val_str when DATE type and NULL
+#
+SELECT CAST(LEAST(DATE(NULL), DATE(NULL)) AS CHAR);
+
+#
+# Testing Item_func_min_max::get_date with non-temporal arguments
+#
+SELECT CAST(LEAST(20010101,20020202) AS DATE);
+
+#
+# Item::get_date_from_numeric
+#
+SELECT CAST(SUM(0) AS DATETIME);
+
+#
+# Item::get_date_from_non_temporal
+#
+SELECT DATE(20110512154559.6 + 0e0);
+
+#
+# Bug #33629: last_day function can return null
+#
+SELECT 1 FROM (SELECT LAST_DAY('0')) a;
+SELECT 1 FROM (SELECT MAKEDATE(2011,0)) a;
+
+CREATE TABLE t1 AS
+  SELECT LAST_DAY('1970-01-01') AS f1,
+         MAKEDATE(1970, 1)      AS f2;
+SELECT * FROM t1;
+DROP TABLE t1;
+
+#
+# LAST_DAY with 0000-00-00 input
+#
+SELECT LAST_DAY('0000-00-00 00:00:00') IS NULL;

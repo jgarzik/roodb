@@ -1,0 +1,28 @@
+# ANY_VALUE aggregate function tests
+CREATE TABLE t1 (grp INT, val INT, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (1, 20, 'beta'), (1, 30, 'gamma');
+INSERT INTO t1 VALUES (2, 40, 'delta'), (2, 50, 'epsilon');
+# --- Basic ANY_VALUE ---
+SELECT grp, ANY_VALUE(val), ANY_VALUE(name) FROM t1 GROUP BY grp ORDER BY grp;
+grp	ANY_VALUE(val)	ANY_VALUE(name)
+1	10	alpha
+2	40	delta
+# --- ANY_VALUE with all NULLs in group ---
+DROP TABLE t1;
+CREATE TABLE t1 (grp INT, val INT);
+INSERT INTO t1 VALUES (1, NULL), (1, NULL);
+INSERT INTO t1 VALUES (2, 10), (2, NULL);
+SELECT grp, ANY_VALUE(val) FROM t1 GROUP BY grp ORDER BY grp;
+grp	ANY_VALUE(val)
+1	NULL
+2	10
+# --- ANY_VALUE in mixed aggregate query ---
+DROP TABLE t1;
+CREATE TABLE t1 (dept INT, emp VARCHAR(20), salary INT);
+INSERT INTO t1 VALUES (1, 'Alice', 50000), (1, 'Bob', 60000);
+INSERT INTO t1 VALUES (2, 'Carol', 70000), (2, 'Dave', 55000);
+SELECT dept, ANY_VALUE(emp), MAX(salary), MIN(salary) FROM t1 GROUP BY dept ORDER BY dept;
+dept	ANY_VALUE(emp)	MAX(salary)	MIN(salary)
+1	Alice	60000	50000
+2	Carol	70000	55000
+DROP TABLE t1;

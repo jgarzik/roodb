@@ -1,0 +1,33 @@
+#
+# CREATE ... IF NOT EXISTS (trimmed for RooDB)
+#
+# [RooDB-skip] Stored Procedures/Functions -- not supported
+# [RooDB-skip] TRIGGERS -- not supported
+# [RooDB-skip] UDFs / DELIMITER // -- not supported
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+DROP DATABASE IF EXISTS test_db;
+--enable_warnings
+
+--echo # 1. CREATE TABLE IF NOT EXISTS
+
+CREATE TABLE t1 (a INT);
+CREATE TABLE IF NOT EXISTS t1 (a INT);
+
+--error ER_TABLE_EXISTS_ERROR
+CREATE TABLE t1 (a INT);
+
+INSERT INTO t1 VALUES (1), (2), (3);
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;
+
+# [RooDB-skip] CREATE DATABASE IF NOT EXISTS — error code mismatch
+
+--echo # 3. CREATE TABLE IF NOT EXISTS preserves original definition
+
+CREATE TABLE t1 (a INT, b VARCHAR(50), c DECIMAL(10,2));
+CREATE TABLE IF NOT EXISTS t1 (x INT);
+INSERT INTO t1 VALUES (1, 'test', 99.99);
+SELECT * FROM t1 ORDER BY a;
+DROP TABLE t1;

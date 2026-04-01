@@ -1,0 +1,131 @@
+#
+# Subquery comparison operator tests for RooDB.
+# Tests subqueries with =, <, >, <=, >=, <> comparison operators.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val INT NOT NULL, name VARCHAR(20));
+INSERT INTO t1 VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma'),
+                      (4, 40, 'delta'), (5, 50, 'epsilon');
+
+CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, amount DECIMAL(10,2));
+INSERT INTO t2 VALUES (1, 25.50), (2, 35.75), (3, 45.00), (4, 15.25), (5, 55.00);
+
+CREATE TABLE t3 (id INT NOT NULL PRIMARY KEY, score INT);
+INSERT INTO t3 VALUES (1, 100), (2, 200), (3, 300);
+
+--echo # --- Equality (=) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1);
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1);
+SELECT id, val FROM t1 WHERE val = (SELECT val FROM t1 WHERE id = 3);
+
+--echo # --- Not equal (<>) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val <> (SELECT MIN(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val <> (SELECT MAX(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val != (SELECT val FROM t1 WHERE id = 3) ORDER BY id;
+
+--echo # --- Less than (<) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val < (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val < (SELECT MAX(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val < (SELECT MIN(val) FROM t1) ORDER BY id;
+
+--echo # --- Greater than (>) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val > (SELECT MIN(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(val) FROM t1) ORDER BY id;
+
+--echo # --- Less than or equal (<=) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val <= (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val <= (SELECT MIN(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val <= (SELECT MAX(val) FROM t1) ORDER BY id;
+
+--echo # --- Greater than or equal (>=) with scalar subquery ---
+
+SELECT id, val FROM t1 WHERE val >= (SELECT AVG(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val >= (SELECT MIN(val) FROM t1) ORDER BY id;
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(val) FROM t1) ORDER BY id;
+
+--echo # --- Comparison with subquery from different table ---
+
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE val < (SELECT MIN(amount) FROM t2) ORDER BY id;
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(amount) FROM t2) ORDER BY id;
+
+--echo # --- Comparison with subquery returning single row ---
+
+SELECT id, val FROM t1 WHERE val = (SELECT amount FROM t2 WHERE id = 1);
+SELECT id, val FROM t1 WHERE val > (SELECT amount FROM t2 WHERE id = 4) ORDER BY id;
+SELECT id, val FROM t1 WHERE val <= (SELECT amount FROM t2 WHERE id = 2) ORDER BY id;
+
+--echo # --- Comparison with NULL result ---
+
+# Subquery returning NULL from empty table
+CREATE TABLE t_empty (a INT NOT NULL PRIMARY KEY);
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(a) FROM t_empty);
+SELECT id, val FROM t1 WHERE val > (SELECT MAX(a) FROM t_empty);
+SELECT id, val FROM t1 WHERE val < (SELECT MAX(a) FROM t_empty);
+SELECT id, val FROM t1 WHERE val <> (SELECT MAX(a) FROM t_empty);
+SELECT id, val FROM t1 WHERE val <= (SELECT MAX(a) FROM t_empty);
+SELECT id, val FROM t1 WHERE val >= (SELECT MAX(a) FROM t_empty);
+DROP TABLE t_empty;
+
+--echo # --- Comparison with type coercion ---
+
+# INT compared to DECIMAL subquery
+SELECT id, val FROM t1 WHERE val > (SELECT AVG(amount) FROM t2) ORDER BY id;
+
+# INT compared to BIGINT (COUNT)
+SELECT id, val FROM t1 WHERE val > (SELECT COUNT(*) FROM t2) ORDER BY id;
+
+--echo # --- Multiple comparisons with subqueries ---
+
+SELECT id, val FROM t1
+WHERE val > (SELECT MIN(val) FROM t1)
+  AND val < (SELECT MAX(val) FROM t1)
+ORDER BY id;
+
+SELECT id, val FROM t1
+WHERE val >= (SELECT AVG(val) FROM t1)
+  AND val <= (SELECT MAX(val) FROM t1) - 5
+ORDER BY id;
+
+SELECT id, val FROM t1
+WHERE val > (SELECT MIN(val) FROM t1)
+   OR val = (SELECT MIN(val) FROM t1)
+ORDER BY id;
+
+--echo # --- Comparison in different clauses ---
+
+# Comparison in HAVING
+SELECT COUNT(*) AS cnt, MIN(val) AS min_v FROM t1
+GROUP BY val
+HAVING MIN(val) > (SELECT AVG(val) FROM t1)
+ORDER BY min_v;
+
+# Comparison in ORDER BY (sort by distance from average)
+SELECT id, val FROM t1 ORDER BY ABS(val - (SELECT AVG(val) FROM t1)), id;
+
+--echo # --- Comparison with aggregate subquery on same table ---
+
+# [RooDB-skip] nested subqueries not yet supported
+# Find second-largest value using derived table instead
+SELECT id, val FROM t1 WHERE val = (SELECT MAX(val) FROM t1 WHERE val < 50);
+SELECT id, val FROM t1 WHERE val = (SELECT MIN(val) FROM t1 WHERE val > 10);
+
+--echo # --- Edge case: comparison both sides are subqueries ---
+
+SELECT (SELECT MIN(val) FROM t1) < (SELECT MAX(val) FROM t1);
+SELECT (SELECT MIN(val) FROM t1) = (SELECT MAX(val) FROM t1);
+SELECT (SELECT COUNT(*) FROM t1) >= (SELECT COUNT(*) FROM t2);
+SELECT (SELECT AVG(val) FROM t1) <> (SELECT AVG(amount) FROM t2);
+
+--echo # --- Cleanup ---
+DROP TABLE t1, t2, t3;

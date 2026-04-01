@@ -1,0 +1,189 @@
+#
+# Complex aggregate expressions: SUM(CASE...), conditional aggregates,
+# aggregates with arithmetic, nested function calls inside aggregates,
+# and aggregate edge cases with NULL and empty sets.
+#
+
+--disable_warnings
+DROP TABLE IF EXISTS sales, products, regions;
+--enable_warnings
+
+CREATE TABLE regions (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(20) NOT NULL
+);
+INSERT INTO regions VALUES (1, 'North'), (2, 'South'), (3, 'East'), (4, 'West');
+
+CREATE TABLE products (
+    id INT NOT NULL PRIMARY KEY,
+    name VARCHAR(30) NOT NULL,
+    category VARCHAR(20) NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL
+);
+INSERT INTO products VALUES
+    (1, 'Alpha', 'electronics', 100.00),
+    (2, 'Beta', 'electronics', 250.00),
+    (3, 'Gamma', 'clothing', 45.00),
+    (4, 'Delta', 'clothing', 80.00),
+    (5, 'Epsilon', 'food', 12.50),
+    (6, 'Zeta', 'food', 8.75);
+
+CREATE TABLE sales (
+    id INT NOT NULL PRIMARY KEY,
+    product_id INT NOT NULL,
+    region_id INT NOT NULL,
+    qty INT NOT NULL,
+    discount DECIMAL(5,2),
+    sale_date DATE NOT NULL
+);
+INSERT INTO sales VALUES
+    (1,  1, 1, 10, 0.00,  '2025-01-15'),
+    (2,  1, 2, 5,  5.00,  '2025-01-20'),
+    (3,  2, 1, 3,  NULL,  '2025-02-01'),
+    (4,  2, 3, 8,  10.00, '2025-02-10'),
+    (5,  3, 1, 20, 2.50,  '2025-02-15'),
+    (6,  3, 4, 15, NULL,  '2025-03-01'),
+    (7,  4, 2, 12, 5.00,  '2025-03-05'),
+    (8,  4, 3, 7,  0.00,  '2025-03-10'),
+    (9,  5, 1, 50, 1.00,  '2025-03-15'),
+    (10, 5, 4, 30, NULL,  '2025-03-20'),
+    (11, 6, 2, 40, 0.50,  '2025-04-01'),
+    (12, 6, 3, 25, NULL,  '2025-04-05');
+
+--echo # --- SUM with CASE expression ---
+
+SELECT p.category,
+    SUM(CASE WHEN s.region_id = 1 THEN s.qty ELSE 0 END) AS north_qty,
+    SUM(CASE WHEN s.region_id = 2 THEN s.qty ELSE 0 END) AS south_qty,
+    SUM(CASE WHEN s.region_id = 3 THEN s.qty ELSE 0 END) AS east_qty,
+    SUM(CASE WHEN s.region_id = 4 THEN s.qty ELSE 0 END) AS west_qty,
+    SUM(s.qty) AS total_qty
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+
+--echo # --- COUNT with CASE (conditional counting) ---
+
+SELECT p.category,
+    COUNT(*) AS total_sales,
+    COUNT(CASE WHEN s.discount IS NOT NULL AND s.discount > 0 THEN 1 END) AS discounted_sales,
+    COUNT(CASE WHEN s.discount IS NULL THEN 1 END) AS no_discount_sales
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+
+--echo # --- AVG with arithmetic inside ---
+
+SELECT p.category,
+    ROUND(AVG(s.qty * p.unit_price), 2) AS avg_revenue_per_sale,
+    ROUND(AVG(s.qty * p.unit_price - COALESCE(s.discount, 0) * s.qty), 2) AS avg_net_per_sale
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+
+--echo # --- MIN/MAX of computed expressions ---
+
+SELECT p.category,
+    MIN(s.qty * p.unit_price) AS min_sale_value,
+    MAX(s.qty * p.unit_price) AS max_sale_value,
+    MAX(s.qty * p.unit_price) - MIN(s.qty * p.unit_price) AS value_range
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+
+--echo # --- SUM of COALESCE (handling NULLs in aggregates) ---
+
+SELECT r.name AS region,
+    SUM(s.qty) AS total_qty,
+    SUM(COALESCE(s.discount, 0)) AS total_discount_given,
+    SUM(s.qty * p.unit_price) AS gross_revenue,
+    SUM(s.qty * p.unit_price - COALESCE(s.discount, 0) * s.qty) AS net_revenue
+FROM regions r
+JOIN sales s ON r.id = s.region_id
+JOIN products p ON s.product_id = p.id
+GROUP BY r.name
+ORDER BY r.name;
+
+--echo # --- Aggregate with IF-like CASE and NULL ---
+
+SELECT
+    COUNT(*) AS total_rows,
+    SUM(CASE WHEN discount IS NULL THEN 1 ELSE 0 END) AS null_discounts,
+    SUM(CASE WHEN discount IS NOT NULL THEN 1 ELSE 0 END) AS non_null_discounts,
+    SUM(CASE WHEN discount > 0 THEN 1 ELSE 0 END) AS positive_discounts,
+    SUM(CASE WHEN discount = 0 THEN 1 ELSE 0 END) AS zero_discounts
+FROM sales;
+
+--echo # --- Nested aggregate: aggregate over aggregate via derived table ---
+
+SELECT
+    MAX(dept_total) AS highest_dept_revenue,
+    MIN(dept_total) AS lowest_dept_revenue,
+    ROUND(AVG(dept_total), 2) AS avg_dept_revenue
+FROM (
+    SELECT p.category, SUM(s.qty * p.unit_price) AS dept_total
+    FROM products p
+    JOIN sales s ON p.id = s.product_id
+    GROUP BY p.category
+) sub;
+
+--echo # --- HAVING with complex aggregate expressions ---
+
+SELECT p.category,
+    COUNT(*) AS num_sales,
+    SUM(s.qty) AS total_qty,
+    ROUND(SUM(s.qty * p.unit_price), 2) AS revenue
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+HAVING SUM(s.qty * p.unit_price) > 1000
+ORDER BY revenue DESC;
+
+--echo # --- Multiple aggregates of same column with different filters ---
+
+SELECT
+    SUM(qty) AS all_qty,
+    SUM(CASE WHEN qty >= 20 THEN qty ELSE 0 END) AS large_order_qty,
+    SUM(CASE WHEN qty < 20 THEN qty ELSE 0 END) AS small_order_qty,
+    ROUND(AVG(CASE WHEN qty >= 20 THEN qty END), 2) AS avg_large_order,
+    ROUND(AVG(CASE WHEN qty < 20 THEN qty END), 2) AS avg_small_order
+FROM sales;
+
+--echo # --- Aggregate over ROUND/ABS expressions ---
+
+SELECT p.category,
+    SUM(ABS(s.qty - 15)) AS total_deviation_from_15,
+    ROUND(AVG(ABS(s.qty - 15)), 2) AS avg_deviation
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+ORDER BY p.category;
+
+--echo # --- Empty group aggregate ---
+
+SELECT COUNT(*) AS cnt, SUM(qty) AS total, AVG(qty) AS avg_qty, MIN(qty) AS mn, MAX(qty) AS mx
+FROM sales
+WHERE qty > 9999;
+
+--echo # --- Aggregate with subquery in HAVING ---
+
+SELECT p.category, SUM(s.qty) AS total_qty
+FROM products p
+JOIN sales s ON p.id = s.product_id
+GROUP BY p.category
+HAVING SUM(s.qty) > (SELECT AVG(qty) * 5 FROM sales)
+ORDER BY p.category;
+
+--echo # --- COUNT DISTINCT with expression ---
+
+SELECT COUNT(DISTINCT region_id) AS num_regions,
+       COUNT(DISTINCT product_id) AS num_products,
+       COUNT(DISTINCT CASE WHEN qty >= 10 THEN product_id END) AS products_with_large_orders
+FROM sales;
+
+--echo # --- Cleanup ---
+DROP TABLE sales, products, regions;

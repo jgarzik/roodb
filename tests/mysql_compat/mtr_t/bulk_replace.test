@@ -1,0 +1,30 @@
+# Adapted from MySQL bulk_replace.test for RooDB compatibility testing.
+# Tests REPLACE INTO with unique constraints and bulk inserts.
+#
+# [RooDB-skip] CHECK TABLE (line 11) — not supported
+
+--disable_warnings
+drop table if exists t1;
+--enable_warnings
+
+CREATE TABLE t1 (a int, unique (a), b int not null, unique(b), c int not null, index(c));
+replace into t1 values (1,1,1),(2,2,2),(3,1,3);
+select * from t1;
+drop table t1;
+
+# Additional REPLACE tests with various conflict patterns
+
+# REPLACE with single unique key
+CREATE TABLE t2 (id int PRIMARY KEY, val varchar(20));
+REPLACE INTO t2 VALUES (1, 'first');
+REPLACE INTO t2 VALUES (2, 'second');
+REPLACE INTO t2 VALUES (1, 'replaced');
+SELECT * FROM t2 ORDER BY id;
+DROP TABLE t2;
+
+# REPLACE with multiple rows, some conflicting
+CREATE TABLE t4 (a int PRIMARY KEY, b int);
+INSERT INTO t4 VALUES (1, 10), (2, 20), (3, 30);
+REPLACE INTO t4 VALUES (2, 200), (4, 40), (3, 300);
+SELECT * FROM t4 ORDER BY a;
+DROP TABLE t4;
