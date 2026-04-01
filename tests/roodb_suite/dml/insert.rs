@@ -370,3 +370,67 @@ async fn test_insert_partial_columns_default_values() {
     drop(conn);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_insert_select_intra_batch_duplicate_error() {
+    let server = TestServer::start("ins_sel_dup_err").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE t_src (id INT NOT NULL)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE t_dst (id INT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    // Source has duplicate values
+    conn.query_drop("INSERT INTO t_src VALUES (1), (2), (1)")
+        .await
+        .unwrap();
+
+    // INSERT...SELECT should fail on intra-batch duplicate (id=1 appears twice)
+    let result: Result<(), _> = conn
+        .query_drop("INSERT INTO t_dst SELECT id FROM t_src")
+        .await;
+    assert!(result.is_err(), "Expected duplicate key error");
+
+    conn.query_drop("DROP TABLE t_src, t_dst").await.unwrap();
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_insert_ignore_select_intra_batch_duplicate_skip() {
+    let server = TestServer::start("ins_ign_sel_dup").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("CREATE TABLE t_src (id INT NOT NULL)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE t_dst (id INT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    // Source has duplicate values
+    conn.query_drop("INSERT INTO t_src VALUES (1), (2), (1), (3), (2)")
+        .await
+        .unwrap();
+
+    // INSERT IGNORE...SELECT should skip duplicates silently
+    conn.query_drop("INSERT IGNORE INTO t_dst SELECT id FROM t_src")
+        .await
+        .expect("INSERT IGNORE...SELECT should not fail on duplicates");
+
+    let rows: Vec<(i32,)> = conn
+        .query("SELECT id FROM t_dst ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "Should have 3 unique rows");
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[2].0, 3);
+
+    conn.query_drop("DROP TABLE t_src, t_dst").await.unwrap();
+
+    drop(conn);
+    server.shutdown().await;
+}
