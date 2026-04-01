@@ -153,11 +153,20 @@ impl TypeChecker {
     /// Check if expression is definitely NULL or will evaluate to NULL at runtime
     /// (e.g. `1/NULL`, `NULL + 5`, `COALESCE(NULL)`)
     fn is_definitely_null(expr: &ResolvedExpr) -> bool {
+        use crate::planner::logical::BinaryOp;
         match expr {
             ResolvedExpr::Literal(Literal::Null) => true,
-            ResolvedExpr::BinaryOp { left, right, .. } => {
-                // Arithmetic with any NULL operand evaluates to NULL
-                Self::is_definitely_null(left) || Self::is_definitely_null(right)
+            ResolvedExpr::BinaryOp {
+                op, left, right, ..
+            } => {
+                // AND/OR use SQL three-valued logic where NULL doesn't always propagate:
+                //   NULL OR TRUE = TRUE,  NULL AND FALSE = FALSE
+                // Only arithmetic, comparison, bitwise, and string ops guarantee
+                // NULL propagation when either operand is NULL.
+                match op {
+                    BinaryOp::And | BinaryOp::Or => false,
+                    _ => Self::is_definitely_null(left) || Self::is_definitely_null(right),
+                }
             }
             ResolvedExpr::UnaryOp { expr: inner, .. } => Self::is_definitely_null(inner),
             _ => false,
