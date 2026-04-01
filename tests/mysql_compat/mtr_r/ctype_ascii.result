@@ -21,6 +21,7 @@ COUNT(NULL)
 select t1a.a, t1b.a from t1 as t1a, t1 as t1b where t1a.a=t1b.a order by t1a.a, t1b.a;
 a	a
  	 
+!	!
 "	"
 #	#
 $	$
@@ -63,7 +64,6 @@ K	K
 L	L
 M	M
 N	N
-NOT 	NOT 
 O	O
 P	P
 Q	Q

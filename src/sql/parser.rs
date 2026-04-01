@@ -153,9 +153,9 @@ impl Parser {
         let result = re_insert_fn.replace_all(&result, "_ROODB_INSERT(");
 
         // MySQL `!expr` is NOT — sqlparser doesn't parse `!` as unary NOT in MySQL dialect.
-        // Replace `!` (when used as unary prefix, not !=) with NOT
-        let re_bang = Regex::new(r"!([^=])").unwrap();
-        let result = re_bang.replace_all(&result, "NOT $1");
+        // Replace `!` (when used as unary prefix, not !=) with NOT.
+        // Only replace outside string literals to avoid corrupting strings like 'Hello!'.
+        let result = Self::replace_bang_outside_strings(&result);
 
         // MySQL `DEFAULT` keyword in VALUES context → special marker for resolver
         // to substitute with the column's actual default value.
@@ -229,6 +229,47 @@ impl Parser {
         // sqlparser's MySQL dialect only supports DECLARE ... CURSOR FOR ...,
         // not DECLARE var TYPE [DEFAULT expr]. Convert to SET statements.
         Self::normalize_declare_in_body(&result)
+    }
+
+    /// Replace `!` with `NOT` only outside single-quoted string literals.
+    fn replace_bang_outside_strings(sql: &str) -> String {
+        let bytes = sql.as_bytes();
+        let mut result = String::with_capacity(sql.len() + 16);
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            if in_string {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        result.push('\'');
+                        result.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+                result.push(bytes[i] as char);
+                i += 1;
+            } else if bytes[i] == b'\'' {
+                in_string = true;
+                result.push('\'');
+                i += 1;
+            } else if bytes[i] == b'!' {
+                // Replace ! with NOT, but not != (keep as-is)
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    result.push('!');
+                    result.push('=');
+                    i += 2;
+                } else {
+                    result.push_str("NOT ");
+                    i += 1;
+                }
+            } else {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        result
     }
 
     /// Normalize single-statement procedure bodies (no BEGIN/END) to AS BEGIN...END.

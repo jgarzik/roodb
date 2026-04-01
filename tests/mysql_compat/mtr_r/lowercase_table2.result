@@ -135,15 +135,15 @@ LENGTH(b)
 5
 4
 SELECT concat(b, '!') FROM t1 ORDER BY a;
-CONCAT(b,'NOT ')
-HelloNOT 
-WorldNOT 
-TestNOT 
+CONCAT(b,'!')
+Hello!
+World!
+Test!
 SELECT CONCAT(b, '!') FROM t1 ORDER BY a;
-CONCAT(b,'NOT ')
-HelloNOT 
-WorldNOT 
-TestNOT 
+CONCAT(b,'!')
+Hello!
+World!
+Test!
 DROP TABLE t1;
 CREATE TABLE t1 (grp VARCHAR(10), val INT);
 INSERT INTO t1 VALUES ('x', 1), ('x', 2), ('y', 3), ('y', 4), ('y', 5);

@@ -7,8 +7,8 @@ SELECT MD5('');
 MD5('')
 d41d8cd98f00b204e9800998ecf8427e
 SELECT MD5('Hello, World!');
-MD5('Hello, WorldNOT ')
-e27e038000a16a6fc68ff9f14dd4bda4
+MD5('Hello, World!')
+65a8e27d8879283831b664bd8b7f0ad4
 SELECT MD5(NULL);
 MD5(NULL)
 NULL
