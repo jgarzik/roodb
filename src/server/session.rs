@@ -252,23 +252,6 @@ impl Session {
         self.isolation_level = level;
     }
 
-    /// Get the protocol status flags for this session
-    pub fn status_flags(&self) -> u16 {
-        use crate::protocol::roodb::status_flags;
-
-        let mut flags = 0u16;
-
-        if self.autocommit {
-            flags |= status_flags::SERVER_STATUS_AUTOCOMMIT;
-        }
-
-        if self.in_transaction() {
-            flags |= status_flags::SERVER_STATUS_IN_TRANS;
-        }
-
-        flags
-    }
-
     /// Add changes to the pending transaction (for explicit transactions)
     pub fn add_pending_changes(&mut self, changes: Vec<RowChange>) {
         self.pending_changes.extend(changes);

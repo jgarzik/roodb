@@ -438,7 +438,8 @@ impl QueryEngine {
                 };
             self.out.error(&QueryError::new(code, state, msg));
         } else {
-            self.out.end_result_set(Status::AUTOCOMMIT);
+            let status = self.status();
+            self.out.end_result_set(status);
         }
 
         executor.close().await?;
@@ -1227,7 +1228,8 @@ impl QueryEngine {
         for row in &rows {
             self.out.row(row);
         }
-        self.out.end_result_set(Status::AUTOCOMMIT);
+        let status = self.status();
+        self.out.end_result_set(status);
         Ok(())
     }
 
@@ -1354,7 +1356,7 @@ impl QueryEngine {
             }
         }
 
-        self.send_ok_with_status(0, 0).await
+        self.send_ok(0, 0).await
     }
 
     /// Handle COMMIT
@@ -1405,7 +1407,7 @@ impl QueryEngine {
             }
         }
         // COMMIT without BEGIN is a no-op
-        self.send_ok_with_status(0, 0).await
+        self.send_ok(0, 0).await
     }
 
     /// Handle ROLLBACK
@@ -1436,7 +1438,7 @@ impl QueryEngine {
             }
         }
         // ROLLBACK without BEGIN is a no-op
-        self.send_ok_with_status(0, 0).await
+        self.send_ok(0, 0).await
     }
 
     /// Handle SET autocommit = value
@@ -1465,7 +1467,7 @@ impl QueryEngine {
             autocommit = value,
             "Set autocommit"
         );
-        self.send_ok_with_status(0, 0).await
+        self.send_ok(0, 0).await
     }
 
     /// Handle SET TRANSACTION ISOLATION LEVEL
@@ -1487,27 +1489,7 @@ impl QueryEngine {
             isolation_level = ?level,
             "Set isolation level"
         );
-        self.send_ok_with_status(0, 0).await
-    }
-
-    /// Send OK with session-aware status flags
-    async fn send_ok_with_status(
-        &mut self,
-        affected_rows: u64,
-        last_insert_id: u64,
-    ) -> ProtocolResult<()> {
-        let status = Status {
-            in_transaction: self.session.in_transaction(),
-            autocommit: self.session.autocommit,
-        };
-        self.out.ok(
-            OkInfo {
-                affected_rows,
-                last_insert_id,
-            },
-            status,
-        );
-        Ok(())
+        self.send_ok(0, 0).await
     }
 
     /// Try to handle DROP DATABASE command via text intercept
@@ -2583,7 +2565,8 @@ impl QueryEngine {
             );
             self.out.row(&row);
         }
-        self.out.end_result_set(Status::AUTOCOMMIT);
+        let status = self.status();
+        self.out.end_result_set(status);
         Ok(())
     }
 
@@ -5703,18 +5686,27 @@ impl QueryEngine {
         Ok(affected)
     }
 
+    /// Transaction status of the session, reported with every result.
+    fn status(&self) -> Status {
+        Status {
+            in_transaction: self.session.in_transaction(),
+            autocommit: self.session.autocommit,
+        }
+    }
+
     /// Send an OK
     pub(crate) async fn send_ok(
         &mut self,
         affected_rows: u64,
         last_insert_id: u64,
     ) -> ProtocolResult<()> {
+        let status = self.status();
         self.out.ok(
             OkInfo {
                 affected_rows,
                 last_insert_id,
             },
-            Status::AUTOCOMMIT,
+            status,
         );
         Ok(())
     }
