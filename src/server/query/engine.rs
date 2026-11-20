@@ -69,6 +69,10 @@ pub struct QueryEngine {
     pub(crate) prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
     mvcc: Arc<MvccStorage>,
+    /// Implicit transactions of the autocommit statements now executing
+    /// (a trigger body nests inside its statement); rolled back if the
+    /// statement fails before committing them
+    implicit_txns: Vec<u64>,
     /// Where results are reported
     pub(crate) out: Box<dyn ResponseSink>,
 }
@@ -97,6 +101,7 @@ impl QueryEngine {
             raft_node: ctx.raft_node.clone(),
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
+            implicit_txns: Vec::new(),
             out,
         }
     }
@@ -109,7 +114,7 @@ impl QueryEngine {
         statement_id: u32,
         params: &[Datum],
     ) -> ProtocolResult<()> {
-        let Some(ps) = self.prepared_stmts.get(statement_id).cloned() else {
+        let Some(ps) = self.prepared_stmts.get(statement_id) else {
             return self
                 .send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -119,38 +124,36 @@ impl QueryEngine {
                 .await;
         };
 
-        // Try the plan cache: if we have a cached plan and schema hasn't changed, reuse it
-        let cached = ps.cached_plan.as_ref().and_then(|cp| {
-            let current_version = self.catalog.read().schema_version();
-            if cp.schema_version == current_version {
-                Some(cp.clone())
-            } else {
-                None // Schema changed, invalidate cache
+        // Plan cache: reuse the cached plan unless the schema changed since.
+        // Only what this execution needs is copied out of the statement.
+        let cached = match &ps.cached_plan {
+            Some(cp) if cp.schema_version == self.catalog.read().schema_version() => {
+                Some((cp.physical.clone(), cp.required_privileges.clone()))
             }
-        });
+            _ => None,
+        };
 
-        if let Some(cached) = cached {
-            // Cache hit: clone plan and substitute params directly
-            let mut physical = cached.physical.clone();
-            if let Err(e) = physical.substitute_params(params) {
-                return self.send_error_from_protocol_error(&e.into()).await;
-            }
+        let Some((mut physical, required_privileges)) = cached else {
+            // Cache miss: build the plan from the AST with placeholders kept
+            let parsed_stmt = ps.parsed_stmt.clone();
+            return self
+                .handle_prepared_query(statement_id, &parsed_stmt, params)
+                .await;
+        };
 
-            // Check authorization
-            if !cached.required_privileges.is_empty() {
-                if let Err(e) = self.check_authorization(&cached.required_privileges).await {
-                    return self
-                        .send_error(codes::ER_ACCESS_DENIED, states::GENERAL_ERROR, &e)
-                        .await;
-                }
-            }
-
-            return self.run_plan(physical).await;
+        if let Err(e) = physical.substitute_params(params) {
+            return self.send_error_from_protocol_error(&e.into()).await;
         }
 
-        // Cache miss: build plan from the unsubstituted AST with placeholder mode
-        self.handle_prepared_query(statement_id, &ps.parsed_stmt, params)
-            .await
+        if !required_privileges.is_empty() {
+            if let Err(e) = self.check_authorization(&required_privileges).await {
+                return self
+                    .send_error(codes::ER_ACCESS_DENIED, states::GENERAL_ERROR, &e)
+                    .await;
+            }
+        }
+
+        self.run_plan(physical).await
     }
 
     /// Build and cache a plan for a prepared statement, then execute it.
@@ -174,7 +177,21 @@ impl QueryEngine {
             sqlparser::ast::Statement::Set(_) => {
                 // Handle SET statements via the text path
                 let sql = parsed_stmt.to_string();
-                return self.try_handle_transaction_command(&sql).await.map(|_| ());
+                if self.try_handle_transaction_command(&sql).await?.is_some() {
+                    return Ok(());
+                }
+                // Other SET forms (user variables, sql_mode, ...) only exist
+                // on the text path, which cannot bind parameters.
+                if params.is_empty() {
+                    return self.handle_query(&sql).await;
+                }
+                return self
+                    .send_error(
+                        codes::ER_UNSUPPORTED_PS,
+                        states::GENERAL_ERROR,
+                        "This SET statement cannot take parameters in a prepared statement",
+                    )
+                    .await;
             }
             _ => {}
         }
@@ -688,6 +705,16 @@ impl QueryEngine {
         self.run_plan(physical).await
     }
 
+    /// Roll back the implicit transactions of an autocommit statement that
+    /// failed before committing, so they do not stay active forever.
+    async fn abandon_implicit_txn(&mut self) {
+        for txn_id in std::mem::take(&mut self.implicit_txns) {
+            if let Err(e) = self.txn_manager.rollback(txn_id).await {
+                warn!(txn_id, error = %e, "Failed to roll back implicit transaction");
+            }
+        }
+    }
+
     /// Execute a plan, reporting an execution failure to the client as a
     /// statement error. The session stays usable.
     async fn run_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
@@ -696,6 +723,7 @@ impl QueryEngine {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!("Query execution error: {}", e);
+                self.abandon_implicit_txn().await;
                 self.send_error_from_protocol_error(&e).await
             }
         };
@@ -961,6 +989,7 @@ impl QueryEngine {
             let txn = self
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)?;
+            self.implicit_txns.push(txn.txn_id);
             let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
             (
                 Some(TransactionContext::new(txn.txn_id, read_view)),
@@ -1049,6 +1078,7 @@ impl QueryEngine {
             // Commit implicit transaction if we created one
             if let Some(txn_id) = implicit_txn_id {
                 self.txn_manager.commit(txn_id).await?;
+                self.implicit_txns.retain(|id| *id != txn_id);
             }
 
             // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
@@ -5427,6 +5457,14 @@ impl QueryEngine {
     /// Used for executing DML/DDL within procedure bodies and trigger bodies.
     /// Returns the number of rows affected.
     async fn execute_sql_silent(&mut self, sql: &str) -> Result<u64, String> {
+        let result = self.execute_sql_silent_inner(sql).await;
+        if result.is_err() {
+            self.abandon_implicit_txn().await;
+        }
+        result
+    }
+
+    async fn execute_sql_silent_inner(&mut self, sql: &str) -> Result<u64, String> {
         // Handle SET @var = expr (user variable assignment) — not handled by the planner
         {
             let upper = sql.trim().to_uppercase();
@@ -5475,6 +5513,7 @@ impl QueryEngine {
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)
                 .map_err(|e| e.to_string())?;
+            self.implicit_txns.push(txn.txn_id);
             let read_view = self
                 .txn_manager
                 .create_read_view(txn.txn_id)
@@ -5535,6 +5574,7 @@ impl QueryEngine {
                 .commit(txn_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            self.implicit_txns.retain(|id| *id != txn_id);
         }
 
         Ok(affected)

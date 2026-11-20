@@ -36,6 +36,11 @@ impl TestServer {
         ServerManager::global().connect().await
     }
 
+    /// Connect as a specific user. Returns the driver error if login fails.
+    pub async fn connect_as(&self, user: &str, password: &str) -> mysql_async::Result<Conn> {
+        ServerManager::global().connect_as(user, password).await
+    }
+
     /// Get the server port.
     pub fn port(&self) -> u16 {
         ServerManager::global().port()

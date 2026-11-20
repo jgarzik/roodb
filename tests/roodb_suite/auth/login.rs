@@ -102,3 +102,32 @@ async fn test_login_unknown_user() {
     pool.disconnect().await.unwrap();
     server.shutdown().await;
 }
+
+/// A rejected login must arrive as a proper server error (1045), not as a
+/// protocol-level failure, and must look the same for a wrong password and
+/// an unknown user.
+#[tokio::test]
+async fn test_login_failure_is_access_denied() {
+    let server = TestServer::start("auth_denied_error").await;
+
+    let mut messages = Vec::new();
+    for (user, password) in [("root", "definitely-wrong"), ("no_such_user", "x")] {
+        let err = match server.connect_as(user, password).await {
+            Ok(_) => panic!("login as {user} with a bad credential must fail"),
+            Err(e) => e,
+        };
+        match err {
+            mysql_async::Error::Server(e) => {
+                assert_eq!(e.code, 1045, "expected ER_ACCESS_DENIED, got: {e}");
+                messages.push(e.message);
+            }
+            other => panic!("expected server error 1045 for {user}, got: {other}"),
+        }
+    }
+    assert_eq!(
+        messages[0], messages[1],
+        "wrong password and unknown user must be indistinguishable"
+    );
+
+    server.shutdown().await;
+}

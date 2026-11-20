@@ -172,7 +172,7 @@ node1.bootstrap_cluster(members).await?;
 tokio::time::sleep(Duration::from_millis(1000)).await;
 ```
 
-See `tests/raft_cluster.rs` for complete working example.
+See `tests/roodb_suite/raft_cluster.rs` for complete working example.
 
 **Cluster behavior:**
 - Writes must go to leader (followers return "not leader" error)

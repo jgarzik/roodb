@@ -71,6 +71,19 @@ impl ServerManager {
         pool.get_conn().await.expect("Failed to connect to server")
     }
 
+    /// Connect as a specific user. Returns the driver error if login fails.
+    pub async fn connect_as(&self, user: &str, password: &str) -> mysql_async::Result<Conn> {
+        let base = {
+            let state = self.inner.lock().unwrap();
+            state.opts.clone().expect("Server not initialized")
+        };
+        let opts: Opts = OptsBuilder::from_opts(base)
+            .user(Some(user))
+            .pass(Some(password))
+            .into();
+        Pool::new(opts).get_conn().await
+    }
+
     /// Get the server port.
     pub fn port(&self) -> u16 {
         let state = self.inner.lock().unwrap();

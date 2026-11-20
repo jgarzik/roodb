@@ -151,7 +151,8 @@ where
 
     /// Send authentication error and return error
     async fn send_auth_error(&mut self, message: &str) -> ProtocolResult<()> {
-        self.out().set_sequence(2);
+        // The client's handshake response over TLS was sequence 2.
+        self.out().set_sequence(3);
         self.out().packet(&encode_err_packet(
             codes::ER_ACCESS_DENIED,
             states::ACCESS_DENIED,
@@ -356,7 +357,7 @@ where
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
-                self.engine.session.set_database(None);
+                // Session state is reset; the selected database is kept.
                 self.engine.prepared_stmts.clear();
                 self.param_types.clear();
                 self.engine.send_ok(0, 0).await?;
@@ -461,8 +462,8 @@ where
         raw_payload: &[u8],
     ) -> ProtocolResult<()> {
         // Look up statement
-        let ps = match self.engine.prepared_stmts.get(statement_id) {
-            Some(ps) => ps.clone(),
+        let param_count = match self.engine.prepared_stmts.get(statement_id) {
+            Some(ps) => ps.param_count,
             None => {
                 return self
                     .engine
@@ -477,19 +478,19 @@ where
 
         // Decode binary parameters from payload
         let prev_types = self.param_types.get(&statement_id).map(Vec::as_slice);
-        let (params, used_types) =
-            match decode_execute_params(raw_payload, ps.param_count, prev_types) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        statement_id,
-                        error = %e,
-                        "COM_STMT_EXECUTE parameter decode failed"
-                    );
-                    return self.engine.send_error_from_protocol_error(&e).await;
-                }
-            };
+        let (params, used_types) = match decode_execute_params(raw_payload, param_count, prev_types)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    connection_id = self.connection_id,
+                    statement_id,
+                    error = %e,
+                    "COM_STMT_EXECUTE parameter decode failed"
+                );
+                return self.engine.send_error_from_protocol_error(&e).await;
+            }
+        };
 
         // Store the used types for subsequent executions with new_params_bound=0
         self.param_types.insert(statement_id, used_types);

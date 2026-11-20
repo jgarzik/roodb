@@ -87,3 +87,68 @@ async fn test_prepared_insert_fires_trigger() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// A prepared SET must always be answered; it used to leave the client
+/// waiting forever for user variables and sql_mode.
+#[tokio::test]
+async fn test_prepared_set_is_answered() {
+    use std::time::Duration;
+
+    let server = TestServer::start("prep_set").await;
+    let mut conn = server.connect().await;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        conn.exec_drop("SET @prep_set_a = 5", ()),
+    )
+    .await
+    .expect("prepared SET @var must get a response")
+    .expect("prepared SET @var without parameters must succeed");
+
+    let value: Option<i64> = conn
+        .query_first("SELECT @prep_set_a")
+        .await
+        .expect("read user variable");
+    assert_eq!(value, Some(5));
+
+    // With a bound parameter: either works or is refused, but is answered.
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        conn.exec_drop("SET @prep_set_b = ?", (7,)),
+    )
+    .await
+    .expect("prepared SET @var = ? must get a response");
+    if let Err(e) = answered {
+        assert!(
+            matches!(e, mysql_async::Error::Server(_)),
+            "expected a server error packet, got: {e}"
+        );
+    }
+
+    // Connection still in sync.
+    let one: Option<i64> = conn.query_first("SELECT 1").await.expect("still usable");
+    assert_eq!(one, Some(1));
+
+    drop(conn);
+    server.shutdown().await;
+}
+
+/// COM_RESET_CONNECTION clears prepared statements but keeps the selected
+/// database.
+#[tokio::test]
+async fn test_reset_connection_keeps_database() {
+    let server = TestServer::start("prep_reset").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("USE test").await.expect("USE test");
+    let before: Option<String> = conn.query_first("SELECT DATABASE()").await.unwrap();
+    assert_eq!(before.as_deref(), Some("test"));
+
+    conn.reset().await.expect("COM_RESET_CONNECTION");
+
+    let after: Option<String> = conn.query_first("SELECT DATABASE()").await.unwrap();
+    assert_eq!(after.as_deref(), Some("test"));
+
+    drop(conn);
+    server.shutdown().await;
+}

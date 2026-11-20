@@ -174,8 +174,11 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for RooDbSink<W
             self.packet(&eof);
         }
 
+        // Only binary rows need the column types again.
         self.columns.clear();
-        self.columns.extend_from_slice(columns);
+        if self.format == RowFormat::Binary {
+            self.columns.extend_from_slice(columns);
+        }
     }
 
     fn row(&mut self, row: &Row) {
