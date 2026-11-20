@@ -1,5 +1,6 @@
 //! Response sink: how the query layer reports results to a client.
 
+use std::any::Any;
 use std::io;
 
 use async_trait::async_trait;
@@ -47,7 +48,12 @@ pub struct OkInfo {
 /// layer calls `flush` when `buffered_bytes` grows large, and the protocol
 /// front-end flushes once the request is complete.
 #[async_trait]
-pub trait ResponseSink: Send {
+pub trait ResponseSink: Send + Sync + 'static {
+    /// Whether the client can receive more than one result per request.
+    /// When it cannot, statements nested in a stored procedure do not send
+    /// their result sets.
+    fn accepts_multiple_results(&self) -> bool;
+
     /// Start a result set with the given columns. `schema` is the current
     /// database, for protocols that report it in column metadata.
     fn begin_result_set(&mut self, columns: &[OutputColumn], schema: &str);
@@ -69,4 +75,8 @@ pub trait ResponseSink: Send {
 
     /// Write buffered output to the client.
     async fn flush(&mut self) -> io::Result<()>;
+
+    /// The concrete sink, so the protocol front-end that created it can
+    /// reach its protocol-specific controls.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

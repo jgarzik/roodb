@@ -75,23 +75,33 @@ struct InsertTriggerInfo {
     values: Vec<Vec<crate::planner::logical::ResolvedExpr>>,
 }
 
-/// RooDB connection handler
+/// RooDB protocol connection: packet framing, handshake, authentication and
+/// command decoding. Statement execution is delegated to [`QueryEngine`].
 pub struct RooDbConnection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
     /// Packet reader (buffered to reduce syscalls)
     reader: PacketReader<BufReader<ReadHalf<S>>>,
-    /// Response encoder (buffers packets, flushed per command)
-    out: RooDbSink<WriteHalf<S>>,
     /// Connection ID
     connection_id: u32,
-    /// Client IP address for authentication
-    client_ip: IpAddr,
     /// Scramble from handshake
     scramble: [u8; 20],
     /// Client capabilities
     client_capabilities: u32,
+    /// Statement execution and session state
+    engine: QueryEngine,
+}
+
+/// Protocol-neutral statement execution for one client session.
+///
+/// Owns the session state and reports every result through its
+/// [`ResponseSink`].
+pub struct QueryEngine {
+    /// Connection ID
+    connection_id: u32,
+    /// Client IP address, for host-based authentication and grants
+    client_ip: IpAddr,
     /// Storage engine
     storage: Arc<dyn StorageEngine>,
     /// Catalog
@@ -106,11 +116,42 @@ where
     prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
     mvcc: Arc<MvccStorage>,
+    /// Where results are reported
+    out: Box<dyn ResponseSink>,
+}
+
+impl QueryEngine {
+    /// Create the engine for a new session, reporting results to `out`.
+    pub fn new(
+        connection_id: u32,
+        client_ip: IpAddr,
+        ctx: &ServerContext,
+        out: Box<dyn ResponseSink>,
+    ) -> Self {
+        let mvcc = Arc::new(MvccStorage::new(
+            ctx.storage.clone(),
+            ctx.txn_manager.clone(),
+        ));
+        let session = Session::new(connection_id);
+        session.init_eval_flags();
+        Self {
+            connection_id,
+            client_ip,
+            storage: ctx.storage.clone(),
+            catalog: ctx.catalog.clone(),
+            session,
+            txn_manager: ctx.txn_manager.clone(),
+            raft_node: ctx.raft_node.clone(),
+            prepared_stmts: PreparedStatementManager::new(),
+            mvcc,
+            out,
+        }
+    }
 }
 
 impl<S> RooDbConnection<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
     /// Create a RooDB connection on a TLS stream.
     ///
@@ -124,28 +165,27 @@ where
         ctx: &ServerContext,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
-
-        let mvcc = Arc::new(MvccStorage::new(
-            ctx.storage.clone(),
-            ctx.txn_manager.clone(),
-        ));
-        let conn = RooDbConnection {
+        RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
-            out: RooDbSink::new(write_half),
             connection_id,
-            client_ip,
             scramble,
             client_capabilities: 0,
-            storage: ctx.storage.clone(),
-            catalog: ctx.catalog.clone(),
-            session: Session::new(connection_id),
-            txn_manager: ctx.txn_manager.clone(),
-            raft_node: ctx.raft_node.clone(),
-            prepared_stmts: PreparedStatementManager::new(),
-            mvcc,
-        };
-        conn.session.init_eval_flags();
-        conn
+            engine: QueryEngine::new(
+                connection_id,
+                client_ip,
+                ctx,
+                Box::new(RooDbSink::new(write_half)),
+            ),
+        }
+    }
+
+    /// The RooDB protocol encoder this connection installed in the engine.
+    fn out(&mut self) -> &mut RooDbSink<WriteHalf<S>> {
+        self.engine
+            .out
+            .as_any_mut()
+            .downcast_mut()
+            .expect("engine sink is the RooDbSink this connection created")
     }
 
     /// Complete handshake after STARTTLS upgrade
@@ -166,7 +206,7 @@ where
         let response = HandshakeResponse41::parse(&response_packet)?;
         self.client_capabilities = response.capability_flags;
         let deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
-        self.out.set_client_capabilities(
+        self.out().set_client_capabilities(
             deprecate_eof,
             response.has_capability(capabilities::CLIENT_MULTI_RESULTS),
         );
@@ -182,14 +222,14 @@ where
         self.verify_auth(&response).await?;
 
         // Send OK
-        self.out.set_sequence(3);
-        self.out
+        self.out().set_sequence(3);
+        self.out()
             .packet(&encode_ok_packet(0, 0, default_status(), 0));
-        self.out.flush().await?;
+        self.out().flush().await?;
 
         info!(
             connection_id = self.connection_id,
-            username = %self.session.user,
+            username = %self.engine.session.user,
             "Handshake completed over TLS"
         );
 
@@ -198,13 +238,13 @@ where
 
     /// Send authentication error and return error
     async fn send_auth_error(&mut self, message: &str) -> ProtocolResult<()> {
-        self.out.set_sequence(2);
-        self.out.packet(&encode_err_packet(
+        self.out().set_sequence(2);
+        self.out().packet(&encode_err_packet(
             codes::ER_ACCESS_DENIED,
             states::ACCESS_DENIED,
             message,
         ));
-        self.out.flush().await?;
+        self.out().flush().await?;
         Err(ProtocolError::AuthFailed(message.to_string()))
     }
 
@@ -223,7 +263,7 @@ where
         }
 
         // Look up user in system.users table using the actual client IP
-        let client_host = self.client_ip.to_string();
+        let client_host = self.engine.client_ip.to_string();
         let user_info = self
             .lookup_user(&response.username, &client_host)
             .await
@@ -259,10 +299,10 @@ where
         }
 
         // Set authenticated user in session
-        self.session.set_user(response.username.clone());
+        self.engine.session.set_user(response.username.clone());
 
         if let Some(ref db) = response.database {
-            self.session.set_database(Some(db.clone()));
+            self.engine.session.set_database(Some(db.clone()));
         }
 
         Ok(())
@@ -282,6 +322,7 @@ where
         let end = table_key_end(SYSTEM_USERS);
 
         let rows = self
+            .engine
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
@@ -360,7 +401,7 @@ where
                 Ok(p) => p,
                 Err(ProtocolError::ConnectionClosed) => {
                     debug!(connection_id = self.connection_id, "Client disconnected");
-                    self.cleanup_temp_tables().await;
+                    self.engine.cleanup_temp_tables().await;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -375,11 +416,11 @@ where
                 ParsedCommand::StmtExecute { .. } => RowFormat::Binary,
                 _ => RowFormat::Text,
             };
-            self.out.start_command(format);
+            self.out().start_command(format);
 
             match self.handle_command(cmd).await {
                 Ok(true) => {
-                    self.out.finish().await?;
+                    self.out().finish().await?;
                     let cmd_ns = metrics::elapsed_ns(cmd_start);
                     tracing::debug!(
                         target: "roodb::perf",
@@ -391,14 +432,14 @@ where
                     continue;
                 }
                 Ok(false) => {
-                    self.cleanup_temp_tables().await;
+                    self.engine.cleanup_temp_tables().await;
                     return Ok(()); // Client quit
                 }
                 Err(e) => {
                     // Try to send error to client
                     warn!(error = %e, "Command error");
-                    let _ = self.send_error_from_protocol_error(&e).await;
-                    let _ = self.out.finish().await;
+                    let _ = self.engine.send_error_from_protocol_error(&e).await;
+                    let _ = self.out().finish().await;
                     return Err(e);
                 }
             }
@@ -415,7 +456,7 @@ where
 
             ParsedCommand::Ping => {
                 debug!(connection_id = self.connection_id, "COM_PING");
-                self.send_ok(0, 0).await?;
+                self.engine.send_ok(0, 0).await?;
                 Ok(true)
             }
 
@@ -423,26 +464,27 @@ where
                 debug!(connection_id = self.connection_id, database = %db, "COM_INIT_DB");
                 // Validate database exists
                 let exists = {
-                    let catalog = self.catalog.read();
+                    let catalog = self.engine.catalog.read();
                     catalog.database_exists(&db)
                 };
                 if exists {
-                    self.session.set_database(Some(db));
-                    self.send_ok(0, 0).await?;
+                    self.engine.session.set_database(Some(db));
+                    self.engine.send_ok(0, 0).await?;
                 } else {
-                    self.send_error(
-                        codes::ER_BAD_DB_ERROR,
-                        states::GENERAL_ERROR,
-                        &format!("Unknown database '{}'", db),
-                    )
-                    .await?;
+                    self.engine
+                        .send_error(
+                            codes::ER_BAD_DB_ERROR,
+                            states::GENERAL_ERROR,
+                            &format!("Unknown database '{}'", db),
+                        )
+                        .await?;
                 }
                 Ok(true)
             }
 
             ParsedCommand::Query(sql) => {
                 debug!(connection_id = self.connection_id, sql = %sql, "COM_QUERY");
-                self.handle_query(&sql).await?;
+                self.engine.handle_query(&sql).await?;
                 debug!(connection_id = self.connection_id, "Query completed");
                 Ok(true)
             }
@@ -470,7 +512,7 @@ where
                     connection_id = self.connection_id,
                     statement_id, "COM_STMT_CLOSE"
                 );
-                self.prepared_stmts.close(statement_id);
+                self.engine.prepared_stmts.close(statement_id);
                 // No response needed for STMT_CLOSE per MySQL protocol
                 Ok(true)
             }
@@ -481,26 +523,27 @@ where
                     statement_id, "COM_STMT_RESET"
                 );
                 // No cursor state to reset; just return OK
-                self.send_ok(0, 0).await?;
+                self.engine.send_ok(0, 0).await?;
                 Ok(true)
             }
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
-                self.session.set_database(None);
-                self.prepared_stmts.clear();
-                self.send_ok(0, 0).await?;
+                self.engine.session.set_database(None);
+                self.engine.prepared_stmts.clear();
+                self.engine.send_ok(0, 0).await?;
                 Ok(true)
             }
 
             ParsedCommand::Unsupported(cmd) => {
                 warn!(connection_id = self.connection_id, command = ?cmd, "Unsupported command");
-                self.send_error(
-                    codes::ER_UNKNOWN_COM_ERROR,
-                    states::GENERAL_ERROR,
-                    &format!("Unsupported command: {:?}", cmd),
-                )
-                .await?;
+                self.engine
+                    .send_error(
+                        codes::ER_UNKNOWN_COM_ERROR,
+                        states::GENERAL_ERROR,
+                        &format!("Unsupported command: {:?}", cmd),
+                    )
+                    .await?;
                 Ok(true)
             }
         }
@@ -508,10 +551,10 @@ where
 
     /// Handle COM_STMT_PREPARE: parse SQL, store AST, send COM_STMT_PREPARE_OK.
     async fn handle_stmt_prepare(&mut self, sql: &str) -> ProtocolResult<()> {
-        let ps = match self.prepared_stmts.prepare(sql) {
+        let ps = match self.engine.prepared_stmts.prepare(sql) {
             Ok(ps) => ps,
             Err(e) => {
-                return self.send_error_from_protocol_error(&e).await;
+                return self.engine.send_error_from_protocol_error(&e).await;
             }
         };
 
@@ -526,11 +569,16 @@ where
 
         // Send COM_STMT_PREPARE_OK
         let ok_packet = encode_prepare_ok(stmt_id, num_columns, num_params);
-        self.out.packet(&ok_packet);
+        self.out().packet(&ok_packet);
 
         // Send parameter column definitions (type=VARCHAR as placeholder)
         if num_params > 0 {
-            let schema = self.session.database.as_deref().unwrap_or("default");
+            let schema = self
+                .engine
+                .session
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
             for i in 0..num_params {
                 let col = crate::planner::logical::OutputColumn {
                     id: i as usize,
@@ -538,20 +586,25 @@ where
                     data_type: crate::catalog::DataType::Varchar(255),
                     nullable: true,
                 };
-                let def = ColumnDefinition41::from_output_column(&col, "", schema);
-                self.out.packet(&def.encode());
+                let def = ColumnDefinition41::from_output_column(&col, "", &schema);
+                self.out().packet(&def.encode());
             }
 
             // EOF after parameter definitions
-            if !self.out.deprecate_eof() {
+            if !self.out().deprecate_eof() {
                 let eof = encode_eof_packet(0, default_status());
-                self.out.packet(&eof);
+                self.out().packet(&eof);
             }
         }
 
         // Send result column definitions (placeholder types for SELECT)
         if num_columns > 0 {
-            let schema = self.session.database.as_deref().unwrap_or("default");
+            let schema = self
+                .engine
+                .session
+                .database
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
             for (i, name) in col_names.iter().enumerate() {
                 let col = crate::planner::logical::OutputColumn {
                     id: i,
@@ -559,14 +612,14 @@ where
                     data_type: crate::catalog::DataType::Varchar(255),
                     nullable: true,
                 };
-                let def = ColumnDefinition41::from_output_column(&col, "", schema);
-                self.out.packet(&def.encode());
+                let def = ColumnDefinition41::from_output_column(&col, "", &schema);
+                self.out().packet(&def.encode());
             }
 
             // EOF after column definitions
-            if !self.out.deprecate_eof() {
+            if !self.out().deprecate_eof() {
                 let eof = encode_eof_packet(0, default_status());
-                self.out.packet(&eof);
+                self.out().packet(&eof);
             }
         }
 
@@ -580,10 +633,11 @@ where
         raw_payload: &[u8],
     ) -> ProtocolResult<()> {
         // Look up statement
-        let ps = match self.prepared_stmts.get(statement_id) {
+        let ps = match self.engine.prepared_stmts.get(statement_id) {
             Some(ps) => ps.clone(),
             None => {
                 return self
+                    .engine
                     .send_error(
                         codes::ER_UNKNOWN_ERROR,
                         states::GENERAL_ERROR,
@@ -605,14 +659,35 @@ where
                         error = %e,
                         "COM_STMT_EXECUTE parameter decode failed"
                     );
-                    return self.send_error_from_protocol_error(&e).await;
+                    return self.engine.send_error_from_protocol_error(&e).await;
                 }
             };
 
         // Store the used types for subsequent executions with new_params_bound=0
-        if let Some(ps_mut) = self.prepared_stmts.get_mut(statement_id) {
+        if let Some(ps_mut) = self.engine.prepared_stmts.get_mut(statement_id) {
             ps_mut.last_param_types = Some(used_types);
         }
+
+        self.engine.execute_prepared(statement_id, &params).await
+    }
+}
+
+impl QueryEngine {
+    /// Execute a prepared statement with bound parameter values.
+    async fn execute_prepared(
+        &mut self,
+        statement_id: u32,
+        params: &[Datum],
+    ) -> ProtocolResult<()> {
+        let Some(ps) = self.prepared_stmts.get(statement_id).cloned() else {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Unknown prepared statement id: {}", statement_id),
+                )
+                .await;
+        };
 
         // Try the plan cache: if we have a cached plan and schema hasn't changed, reuse it
         let cached = ps.cached_plan.as_ref().and_then(|cp| {
@@ -627,7 +702,7 @@ where
         if let Some(cached) = cached {
             // Cache hit: clone plan and substitute params directly
             let mut physical = cached.physical.clone();
-            physical.substitute_params(&params)?;
+            physical.substitute_params(params)?;
 
             // Check authorization
             if !cached.required_privileges.is_empty() {
@@ -642,7 +717,7 @@ where
         }
 
         // Cache miss: build plan from the unsubstituted AST with placeholder mode
-        self.handle_prepared_query(statement_id, &ps.parsed_stmt, &params)
+        self.handle_prepared_query(statement_id, &ps.parsed_stmt, params)
             .await
     }
 
@@ -5826,8 +5901,7 @@ where
                 // SELECT and SHOW statements in SP body send results to client
                 // (only if client supports CLIENT_MULTI_RESULTS protocol flag)
                 let upper = substituted.trim().to_uppercase();
-                let client_multi =
-                    self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
+                let client_multi = self.out.accepts_multiple_results();
                 if client_multi && (upper.starts_with("SELECT ") || upper.starts_with("SHOW ")) {
                     self.execute_sp_select(&substituted)
                         .await

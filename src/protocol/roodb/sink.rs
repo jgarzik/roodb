@@ -1,5 +1,6 @@
 //! RooDB-protocol encoder for query results.
 
+use std::any::Any;
 use std::io;
 
 use async_trait::async_trait;
@@ -52,7 +53,7 @@ pub struct RooDbSink<W> {
     pending: Option<Terminator>,
 }
 
-impl<W: AsyncWrite + Unpin + Send> RooDbSink<W> {
+impl<W: AsyncWrite + Unpin + Send + Sync + 'static> RooDbSink<W> {
     /// Create a sink writing to `writer`.
     pub fn new(writer: W) -> Self {
         Self {
@@ -155,7 +156,11 @@ impl<W: AsyncWrite + Unpin + Send> RooDbSink<W> {
 }
 
 #[async_trait]
-impl<W: AsyncWrite + Unpin + Send> ResponseSink for RooDbSink<W> {
+impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for RooDbSink<W> {
+    fn accepts_multiple_results(&self) -> bool {
+        self.multi_results
+    }
+
     fn begin_result_set(&mut self, columns: &[OutputColumn], schema: &str) {
         self.emit_pending(true);
 
@@ -209,5 +214,9 @@ impl<W: AsyncWrite + Unpin + Send> ResponseSink for RooDbSink<W> {
             self.buf.clear();
         }
         self.writer.flush().await
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
