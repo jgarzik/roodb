@@ -2,6 +2,7 @@
 //!
 //! Handles the initial plaintext handshake and TLS upgrade sequence.
 
+use crate::server::limits::MAX_PREAUTH_MESSAGE;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
@@ -43,7 +44,7 @@ pub async fn starttls_handshake(
     );
 
     // Read client's SSL request (plaintext)
-    let (packet, _seq) = read_packet_raw(&mut stream).await?;
+    let (packet, _seq) = read_packet_raw(&mut stream, MAX_PREAUTH_MESSAGE).await?;
 
     // Parse as SSL request (first 32 bytes)
     let ssl_request = SslRequest::parse(&packet)?;

@@ -26,13 +26,14 @@ use tracing::{debug, info, warn};
 
 use crate::server::auth::AuthError;
 use crate::server::context::ServerContext;
+use crate::server::limits::MAX_PREAUTH_MESSAGE;
 use crate::server::query::{metrics, QueryEngine, ResponseSink};
 
 use self::auth::{verify_native_password_with_hash, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, AUTH_PLUGIN_NAME};
-use self::packet::PacketReader;
+use self::packet::{PacketReader, MAX_TOTAL_PAYLOAD_SIZE};
 use self::prepared::{decode_execute_params, encode_prepare_ok, select_column_names};
 use self::resultset::{
     default_status, encode_eof_packet, encode_err_packet, encode_ok_packet, ColumnDefinition41,
@@ -77,8 +78,10 @@ where
         ctx: &ServerContext,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
+        let mut reader = PacketReader::new(BufReader::with_capacity(8192, read_half));
+        reader.set_max_payload(MAX_PREAUTH_MESSAGE);
         RooDbConnection {
-            reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
+            reader,
             connection_id,
             scramble,
             client_capabilities: 0,
@@ -203,6 +206,7 @@ where
 
         // Set authenticated user in session
         self.engine.session.set_user(response.username.clone());
+        self.reader.set_max_payload(MAX_TOTAL_PAYLOAD_SIZE);
 
         if let Some(ref db) = response.database {
             self.engine.session.set_database(Some(db.clone()));

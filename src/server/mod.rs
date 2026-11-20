@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod context;
 pub mod handler;
+pub mod limits;
 pub mod listener;
 pub mod locks;
 pub mod query;

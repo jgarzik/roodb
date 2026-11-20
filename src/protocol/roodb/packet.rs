@@ -22,6 +22,8 @@ pub const MAX_TOTAL_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
 pub struct PacketReader<R> {
     reader: R,
     sequence_id: u8,
+    /// Largest total payload accepted for one (possibly multi-packet) message
+    max_payload: usize,
 }
 
 impl<R: AsyncRead + Unpin> PacketReader<R> {
@@ -30,7 +32,13 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         PacketReader {
             reader,
             sequence_id: 0,
+            max_payload: MAX_TOTAL_PAYLOAD_SIZE,
         }
+    }
+
+    /// Set the largest message this reader accepts.
+    pub fn set_max_payload(&mut self, max_payload: usize) {
+        self.max_payload = max_payload;
     }
 
     /// Reset sequence ID (for new command)
@@ -78,10 +86,10 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             // Read payload
             if length > 0 {
                 let new_size = payload.len().saturating_add(length);
-                if new_size > MAX_TOTAL_PAYLOAD_SIZE {
+                if new_size > self.max_payload {
                     return Err(ProtocolError::InvalidPacket(format!(
                         "Payload exceeds maximum size of {} bytes",
-                        MAX_TOTAL_PAYLOAD_SIZE
+                        self.max_payload
                     )));
                 }
                 let start = payload.len();
@@ -319,9 +327,13 @@ pub fn encode_null_terminated_string(s: &str) -> Vec<u8> {
 
 /// Read a single packet directly from a stream (for STARTTLS)
 ///
+/// The length comes from an unauthenticated peer, so anything above
+/// `max_len` is refused before any payload is read or allocated.
+///
 /// Returns (payload, sequence_id)
 pub async fn read_packet_raw<R: AsyncRead + Unpin>(
     reader: &mut R,
+    max_len: usize,
 ) -> ProtocolResult<(Vec<u8>, u8)> {
     // Read 4-byte header
     let mut header = [0u8; 4];
@@ -335,6 +347,13 @@ pub async fn read_packet_raw<R: AsyncRead + Unpin>(
 
     let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     let seq = header[3];
+
+    if length > max_len {
+        return Err(ProtocolError::InvalidPacket(format!(
+            "Packet of {} bytes exceeds the {} byte limit",
+            length, max_len
+        )));
+    }
 
     // Read payload
     let mut payload = vec![0u8; length];

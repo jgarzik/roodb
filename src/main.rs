@@ -1,6 +1,6 @@
 //! RooDB server binary
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,6 +20,9 @@ use roodb::tls::{RaftTlsConfig, TlsConfig};
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "RooDB distributed SQL database server")]
 struct Cli {
+    /// Address to listen on (client and Raft ports)
+    #[arg(long, default_value = "0.0.0.0", env = "ROODB_BIND")]
+    bind: IpAddr,
     #[arg(long, default_value = "3307", env = "ROODB_PORT")]
     port: u16,
     #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
@@ -46,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse CLI args
     let Cli {
+        bind,
         port,
         data_dir,
         cert_path,
@@ -83,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Raft node (single-node mode)
     // Raft RPC uses port + 1000 by convention
     let raft_port = port + 1000;
-    let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
+    let raft_addr = SocketAddr::new(bind, raft_port);
 
     let node_id = 1;
     let mut raft_node = RaftNode::new(
@@ -106,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(raft_port, "Raft node bootstrapped (single-node mode)");
 
     // Start RooDB server
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let addr = SocketAddr::new(bind, port);
     let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
     server.run().await?;
 
