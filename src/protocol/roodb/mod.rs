@@ -34,6 +34,7 @@ use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
 use crate::raft::{ChangeSet, RaftNode};
+use crate::server::context::ServerContext;
 use crate::server::session::Session;
 use crate::sql::privileges::{
     check_privilege, GrantEntry, HostPattern, Privilege, PrivilegeObject, RequiredPrivilege,
@@ -45,7 +46,7 @@ use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
 use self::auth::{verify_native_password_with_hash, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
-use self::handshake::{capabilities, HandshakeV10, AUTH_PLUGIN_NAME};
+use self::handshake::{capabilities, AUTH_PLUGIN_NAME};
 use self::packet::{PacketReader, PacketWriter};
 use self::prepared::{
     decode_execute_params, encode_prepare_ok, select_column_names, CachedPlan,
@@ -114,60 +115,23 @@ impl<S> RooDbConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
-    /// Create a new RooDB connection from a TLS stream
+    /// Create a RooDB connection on a TLS stream.
+    ///
+    /// `scramble` is the challenge already sent in the plaintext greeting
+    /// during the STARTTLS exchange.
     pub fn new(
         stream: S,
         connection_id: u32,
         client_ip: IpAddr,
-        storage: Arc<dyn StorageEngine>,
-        catalog: Arc<RwLock<Catalog>>,
-        txn_manager: Arc<TransactionManager>,
-        raft_node: Arc<RaftNode>,
-    ) -> Self {
-        let (read_half, write_half) = tokio::io::split(stream);
-
-        let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
-        let conn = RooDbConnection {
-            reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
-            writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
-            connection_id,
-            client_ip,
-            scramble: [0u8; 20],
-            client_capabilities: 0,
-            database: None,
-            storage,
-            catalog,
-            deprecate_eof: false,
-            session: Session::new(connection_id),
-            txn_manager,
-            raft_node,
-            in_multi_result: false,
-            sp_sent_results: false,
-            prepared_stmts: PreparedStatementManager::new(),
-            mvcc,
-        };
-        conn.session.init_eval_flags();
-        conn
-    }
-
-    /// Create a new RooDB connection with pre-established scramble (for STARTTLS)
-    ///
-    /// Used after STARTTLS handshake where the scramble was already sent in the
-    /// plaintext greeting.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_scramble(
-        stream: S,
-        connection_id: u32,
-        client_ip: IpAddr,
         scramble: [u8; 20],
-        storage: Arc<dyn StorageEngine>,
-        catalog: Arc<RwLock<Catalog>>,
-        txn_manager: Arc<TransactionManager>,
-        raft_node: Arc<RaftNode>,
+        ctx: &ServerContext,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
+        let mvcc = Arc::new(MvccStorage::new(
+            ctx.storage.clone(),
+            ctx.txn_manager.clone(),
+        ));
         let conn = RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
             writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
@@ -176,12 +140,12 @@ where
             scramble,
             client_capabilities: 0,
             database: None,
-            storage,
-            catalog,
+            storage: ctx.storage.clone(),
+            catalog: ctx.catalog.clone(),
             deprecate_eof: false,
             session: Session::new(connection_id),
-            txn_manager,
-            raft_node,
+            txn_manager: ctx.txn_manager.clone(),
+            raft_node: ctx.raft_node.clone(),
             in_multi_result: false,
             sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
@@ -230,47 +194,6 @@ where
             connection_id = self.connection_id,
             username = %self.session.user,
             "Handshake completed over TLS"
-        );
-
-        Ok(())
-    }
-
-    /// Perform the RooDB handshake (non-STARTTLS, for testing)
-    pub async fn handshake(&mut self) -> ProtocolResult<()> {
-        info!(
-            connection_id = self.connection_id,
-            "Starting RooDB handshake"
-        );
-
-        // Send server greeting
-        let greeting = HandshakeV10::new(self.connection_id);
-        self.scramble = greeting.scramble();
-
-        let greeting_packet = greeting.encode();
-        self.writer.write_packet(&greeting_packet).await?;
-        self.writer.flush().await?;
-
-        // Read client response
-        self.reader.set_sequence(1);
-        let response_packet = self.reader.read_packet().await?;
-
-        let response = HandshakeResponse41::parse(&response_packet)?;
-        self.client_capabilities = response.capability_flags;
-        self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
-
-        // Verify authentication
-        self.verify_auth(&response).await?;
-
-        // Send OK
-        self.writer.set_sequence(2);
-        let ok_packet = encode_ok_packet(0, 0, default_status(), 0);
-        self.writer.write_packet(&ok_packet).await?;
-        self.writer.flush().await?;
-
-        info!(
-            connection_id = self.connection_id,
-            username = %self.session.user,
-            "Handshake completed"
         );
 
         Ok(())

@@ -1,34 +1,24 @@
 //! Connection handler for RooDB client protocol
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-
-use parking_lot::RwLock;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
-use crate::catalog::Catalog;
 use crate::protocol::roodb::starttls::starttls_handshake;
 use crate::protocol::roodb::RooDbConnection;
-use crate::raft::RaftNode;
-use crate::storage::StorageEngine;
-use crate::txn::TransactionManager;
+use crate::server::context::ServerContext;
 
 /// Handle a RooDB client connection with STARTTLS
 ///
 /// Performs STARTTLS handshake, then runs authentication and command loop.
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    connection_id: u32,
     acceptor: TlsAcceptor,
-    storage: Arc<dyn StorageEngine>,
-    catalog: Arc<RwLock<Catalog>>,
-    txn_manager: Arc<TransactionManager>,
-    raft_node: Arc<RaftNode>,
+    ctx: ServerContext,
 ) {
+    let connection_id = ctx.next_connection_id();
     info!(%peer_addr, connection_id, "Client connected");
 
     // Disable Nagle's algorithm for low-latency request-response
@@ -46,16 +36,7 @@ pub async fn handle_connection(
     };
 
     // Create RooDB connection on TLS stream
-    let mut conn = RooDbConnection::new_with_scramble(
-        tls_stream,
-        connection_id,
-        peer_addr.ip(),
-        scramble,
-        storage,
-        catalog,
-        txn_manager,
-        raft_node,
-    );
+    let mut conn = RooDbConnection::new(tls_stream, connection_id, peer_addr.ip(), scramble, &ctx);
 
     // Complete authentication (handshake response comes over TLS)
     if let Err(e) = conn.complete_handshake().await {

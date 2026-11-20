@@ -1,7 +1,6 @@
 //! TCP listener and RooDB server
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -12,6 +11,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
 use crate::raft::RaftNode;
+use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
 use crate::storage::{set_node_id, StorageEngine};
 use crate::tls::{RaftTlsConfig, TlsConfig};
@@ -31,11 +31,7 @@ pub enum ServerError {
 pub struct RooDbServer {
     addr: SocketAddr,
     tls_acceptor: TlsAcceptor,
-    storage: Arc<dyn StorageEngine>,
-    catalog: Arc<RwLock<Catalog>>,
-    txn_manager: Arc<TransactionManager>,
-    raft_node: Arc<RaftNode>,
-    next_conn_id: AtomicU32,
+    ctx: ServerContext,
 }
 
 impl RooDbServer {
@@ -51,31 +47,7 @@ impl RooDbServer {
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
-            storage,
-            catalog,
-            txn_manager,
-            raft_node,
-            next_conn_id: AtomicU32::new(1),
-        }
-    }
-
-    /// Create a new RooDB server with custom transaction manager
-    pub fn with_txn_manager(
-        addr: SocketAddr,
-        tls_config: TlsConfig,
-        storage: Arc<dyn StorageEngine>,
-        catalog: Arc<RwLock<Catalog>>,
-        txn_manager: Arc<TransactionManager>,
-        raft_node: Arc<RaftNode>,
-    ) -> Self {
-        Self {
-            addr,
-            tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
-            storage,
-            catalog,
-            txn_manager,
-            raft_node,
-            next_conn_id: AtomicU32::new(1),
+            ctx: ServerContext::new(storage, catalog, txn_manager, raft_node),
         }
     }
 
@@ -84,56 +56,10 @@ impl RooDbServer {
         self.addr
     }
 
-    /// Get the transaction manager
-    pub fn txn_manager(&self) -> &Arc<TransactionManager> {
-        &self.txn_manager
-    }
-
-    /// Run the server (blocking)
+    /// Run the server until the process exits
     pub async fn run(self) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
-        let storage = self.storage;
-        let catalog = self.catalog;
-        let txn_manager = self.txn_manager;
-        let raft_node = self.raft_node;
-        let acceptor = self.tls_acceptor;
-        let next_conn_id = Arc::new(self.next_conn_id);
-
-        tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
-
-        loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let acceptor = acceptor.clone();
-            let storage = storage.clone();
-            let catalog = catalog.clone();
-            let txn_manager = txn_manager.clone();
-            let raft_node = raft_node.clone();
-            let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-
-            // Handle connection with STARTTLS (TLS upgrade happens in handler)
-            tokio::spawn(async move {
-                handle_connection(
-                    stream,
-                    peer_addr,
-                    connection_id,
-                    acceptor,
-                    storage,
-                    catalog,
-                    txn_manager,
-                    raft_node,
-                )
-                .await;
-            });
-        }
-    }
-
-    /// Run the server with shutdown signal
-    pub async fn run_with_shutdown(
-        self,
-        shutdown_rx: oneshot::Receiver<()>,
-    ) -> Result<(), ServerError> {
-        let listener = TcpListener::bind(self.addr).await?;
-        self.run_with_listener(listener, shutdown_rx).await
+        self.accept_loop(listener, std::future::pending()).await
     }
 
     /// Run the server with a pre-bound listener and shutdown signal
@@ -143,49 +69,42 @@ impl RooDbServer {
     pub async fn run_with_listener(
         self,
         listener: TcpListener,
-        mut shutdown_rx: oneshot::Receiver<()>,
+        shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), ServerError> {
-        let storage = self.storage;
-        let catalog = self.catalog;
-        let txn_manager = self.txn_manager;
-        let raft_node = self.raft_node;
-        let acceptor = self.tls_acceptor;
-        let next_conn_id = Arc::new(self.next_conn_id);
+        self.accept_loop(listener, async {
+            // A dropped sender also means shutdown.
+            let _ = shutdown_rx.await;
+        })
+        .await
+    }
 
+    /// Accept connections until `shutdown` resolves.
+    async fn accept_loop(
+        self,
+        listener: TcpListener,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), ServerError> {
         tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
 
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, peer_addr) = result?;
-                    let acceptor = acceptor.clone();
-                    let storage = storage.clone();
-                    let catalog = catalog.clone();
-                    let txn_manager = txn_manager.clone();
-                    let raft_node = raft_node.clone();
-                    let connection_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-
-                    tokio::spawn(async move {
-                        handle_connection(
-                            stream,
-                            peer_addr,
-                            connection_id,
-                            acceptor,
-                            storage,
-                            catalog,
-                            txn_manager,
-                            raft_node,
-                        ).await;
-                    });
+                    // Handle connection with STARTTLS (TLS upgrade happens in handler)
+                    tokio::spawn(handle_connection(
+                        stream,
+                        peer_addr,
+                        self.tls_acceptor.clone(),
+                        self.ctx.clone(),
+                    ));
                 }
-                _ = &mut shutdown_rx => {
+                _ = &mut shutdown => {
                     tracing::info!("RooDB server shutting down");
-                    break;
+                    return Ok(());
                 }
             }
         }
-
-        Ok(())
     }
 }
 

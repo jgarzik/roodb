@@ -1,8 +1,10 @@
 //! Server module for RooDB
 
+pub mod context;
 pub mod handler;
 pub mod listener;
 pub mod locks;
 pub mod session;
 
+pub use context::ServerContext;
 pub use listener::RooDbServer;
