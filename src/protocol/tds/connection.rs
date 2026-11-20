@@ -46,6 +46,7 @@ use super::prelogin::{
     encode_prelogin_response, negotiate_encryption, parse_prelogin, Encryption, SERVER_VERSION,
 };
 use super::rpc::{bind_parameters, declared_names, parse_rpc, Procedure, RpcCall};
+use super::shims::{split_batch, translate, Action, ShimContext};
 use super::sink::TdsSink;
 use super::token::{
     put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
@@ -66,13 +67,23 @@ const MAX_LOGIN: usize = 64 * 1024;
 const MAX_REQUEST: usize = 64 * 1024 * 1024;
 /// Most statements a session may hold prepared at once
 const MAX_PREPARED_STATEMENTS: usize = 4096;
+/// Most statement text, in bytes, a session may hold prepared at once
+const MAX_PREPARED_BYTES: usize = 16 * 1024 * 1024;
 /// Statements remembered for sp_executesql before the cache is cleared
 const STATEMENT_CACHE_SIZE: usize = 256;
+/// Statement text, in bytes, remembered for sp_executesql before the
+/// cache is cleared
+const STATEMENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// Largest statement worth remembering for sp_executesql
+const MAX_CACHED_STATEMENT: usize = 64 * 1024;
 /// Largest packet size the server agrees to
 const MAX_NEGOTIATED_PACKET_SIZE: usize = 16 * 1024;
 
 /// Database reported to clients that did not select one
 const DEFAULT_DATABASE: &str = "default";
+
+/// Product version reported to probes, matching PRELOGIN and LOGINACK
+const PRODUCT_VERSION: &str = "16.0.1000";
 
 /// SQL Server error: login failed
 const ERROR_LOGIN_FAILED: i32 = 18456;
@@ -346,8 +357,10 @@ async fn establish(
         reader,
         login_database,
         prepared: HashMap::new(),
+        prepared_bytes: 0,
         next_handle: 1,
         statement_cache: HashMap::new(),
+        statement_cache_bytes: 0,
     };
     conn.send_login_response(&login).await?;
 
@@ -390,12 +403,17 @@ struct TdsConnection {
     reader: JoinHandle<()>,
     /// Database selected at login, restored by a connection reset
     login_database: Option<String>,
-    /// Statements prepared with sp_prepare / sp_prepexec, by handle
-    prepared: HashMap<i32, Prepared>,
+    /// Statements prepared with sp_prepare / sp_prepexec, by handle,
+    /// each with the size of its text
+    prepared: HashMap<i32, (Prepared, usize)>,
+    /// Total text size of `prepared`
+    prepared_bytes: usize,
     next_handle: i32,
     /// Statements seen by sp_executesql, keyed by text and parameter
     /// declaration, so repeated executions reuse the cached plan
     statement_cache: HashMap<(String, String), Prepared>,
+    /// Total key size of `statement_cache`
+    statement_cache_bytes: usize,
 }
 
 /// A statement ready to be executed with parameter values.
@@ -565,7 +583,9 @@ impl TdsConnection {
                     .set_database(self.login_database.clone());
                 // The engine dropped its prepared statements.
                 self.prepared.clear();
+                self.prepared_bytes = 0;
                 self.statement_cache.clear();
+                self.statement_cache_bytes = 0;
                 put_envchange_binary(self.sink().tokens(), ENV_RESET_CONNECTION, &[], &[]);
             }
             match message.packet_type {
@@ -580,8 +600,7 @@ impl TdsConnection {
                     let before = self.environment();
                     let sql = self.sql_batch(&message.payload)?;
                     debug!(connection_id = self.connection_id, sql = %sql, "SQL batch");
-                    self.execute(&sql).await?;
-                    let rolled_back = sql.trim_start().to_uppercase().starts_with("ROLLBACK");
+                    let rolled_back = self.run_sql(&sql).await?;
                     self.finish_request(before, rolled_back).await?;
                 }
                 PacketType::TransactionManager => {
@@ -610,6 +629,45 @@ impl TdsConnection {
             return Err(e.into());
         }
         Ok(())
+    }
+
+    /// Run SQL text as a client sent it: split into statements, apply
+    /// the driver shims, and stop at the first statement that fails.
+    /// Returns whether a rollback was the last transaction statement run.
+    async fn run_sql(&mut self, sql: &str) -> Result<bool, TdsError> {
+        let mut rolled_back = false;
+        for statement in split_batch(sql) {
+            let errors_before = self.sink().error_count();
+            let action = {
+                let session = &self.engine.session;
+                translate(
+                    &statement,
+                    &ShimContext {
+                        connection_id: self.connection_id,
+                        in_transaction: session.in_transaction(),
+                        database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
+                        user: &session.user,
+                        product_version: PRODUCT_VERSION,
+                    },
+                )
+            };
+            match action {
+                Action::Run(sql) => {
+                    let was_in_transaction = self.engine.session.in_transaction();
+                    self.execute(&sql).await?;
+                    if was_in_transaction && !self.engine.session.in_transaction() {
+                        rolled_back = sql == "ROLLBACK"
+                            || sql.trim_start().to_uppercase().starts_with("ROLLBACK");
+                    }
+                }
+                Action::Accept => self.engine.send_ok(0, 0).await?,
+                Action::Refuse(message) => self.refuse(codes::ER_UNKNOWN_COM_ERROR, message),
+            }
+            if self.sink().error_count() != errors_before {
+                break;
+            }
+        }
+        Ok(rolled_back)
     }
 
     /// The SQL text of a batch request.
@@ -677,11 +735,26 @@ impl TdsConnection {
                         let Some(prepared) = self.prepare(&key.0, &key.1).await? else {
                             return Ok(None);
                         };
-                        if self.statement_cache.len() >= STATEMENT_CACHE_SIZE {
-                            self.clear_statement_cache();
+                        let size = key.0.len() + key.1.len();
+                        if size <= MAX_CACHED_STATEMENT {
+                            if self.statement_cache.len() >= STATEMENT_CACHE_SIZE
+                                || self.statement_cache_bytes + size > STATEMENT_CACHE_BYTES
+                            {
+                                self.clear_statement_cache();
+                            }
+                            self.statement_cache_bytes += size;
+                            self.statement_cache.insert(key, prepared.clone());
+                            self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
+                                .await?;
+                            return Ok(None);
                         }
-                        self.statement_cache.insert(key, prepared.clone());
-                        prepared
+                        // Too large to remember: run it and release it.
+                        self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
+                            .await?;
+                        if let Prepared::Bound { statement_id, .. } = prepared {
+                            self.engine.prepared_stmts.close(statement_id);
+                        }
+                        return Ok(None);
                     }
                 };
                 self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
@@ -696,20 +769,24 @@ impl TdsConnection {
                     self.refuse(codes::ER_WRONG_ARGUMENTS, "Expected a statement to prepare");
                     return Ok(None);
                 };
-                if self.prepared.len() >= MAX_PREPARED_STATEMENTS {
+                let declaration = text(params.get(1)).unwrap_or_default();
+                let size = sql.len() + declaration.len();
+                if self.prepared.len() >= MAX_PREPARED_STATEMENTS
+                    || self.prepared_bytes + size > MAX_PREPARED_BYTES
+                {
                     self.refuse(
                         codes::ER_UNKNOWN_ERROR,
                         "Too many prepared statements on this connection",
                     );
                     return Ok(None);
                 }
-                let declaration = text(params.get(1)).unwrap_or_default();
                 let Some(prepared) = self.prepare(&sql, &declaration).await? else {
                     return Ok(None);
                 };
                 let handle = self.next_handle;
                 self.next_handle = self.next_handle.wrapping_add(1).max(1);
-                self.prepared.insert(handle, prepared.clone());
+                self.prepared.insert(handle, (prepared.clone(), size));
+                self.prepared_bytes += size;
 
                 if call.procedure == Procedure::PrepExec {
                     self.execute_prepared(&prepared, params.get(3..).unwrap_or(&[]))
@@ -728,7 +805,8 @@ impl TdsConnection {
                     Some(Datum::Int(h)) => i32::try_from(*h).ok(),
                     _ => None,
                 };
-                let Some(prepared) = handle.and_then(|h| self.prepared.get(&h)).cloned() else {
+                let Some((prepared, _)) = handle.and_then(|h| self.prepared.get(&h)).cloned()
+                else {
                     self.refuse(
                         codes::ER_WRONG_ARGUMENTS,
                         "Could not find the prepared statement for this handle",
@@ -747,10 +825,12 @@ impl TdsConnection {
                     _ => None,
                 };
                 match handle.and_then(|h| self.prepared.remove(&h)) {
-                    Some(Prepared::Bound { statement_id, .. }) => {
-                        self.engine.prepared_stmts.close(statement_id);
+                    Some((prepared, size)) => {
+                        self.prepared_bytes -= size;
+                        if let Prepared::Bound { statement_id, .. } = prepared {
+                            self.engine.prepared_stmts.close(statement_id);
+                        }
                     }
-                    Some(Prepared::Text(_)) => {}
                     None => self.refuse(
                         codes::ER_WRONG_ARGUMENTS,
                         "Could not find the prepared statement for this handle",
@@ -781,7 +861,28 @@ impl TdsConnection {
         if names.is_empty() {
             return Ok(Some(Prepared::Text(sql.to_string())));
         }
-        let (bound_sql, order) = bind_parameters(sql, &names);
+        // Apply the driver shims to the statement text. A statement the
+        // shims answer themselves takes no parameters.
+        let sql = {
+            let session = &self.engine.session;
+            let action = translate(
+                sql,
+                &ShimContext {
+                    connection_id: self.connection_id,
+                    in_transaction: session.in_transaction(),
+                    database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
+                    user: &session.user,
+                    product_version: PRODUCT_VERSION,
+                },
+            );
+            match action {
+                Action::Run(sql) => sql,
+                Action::Accept | Action::Refuse(_) => {
+                    return Ok(Some(Prepared::Text(sql.to_string())))
+                }
+            }
+        };
+        let (bound_sql, order) = bind_parameters(&sql, &names);
         match self.engine.prepared_stmts.prepare(&bound_sql) {
             Ok(statement) => Ok(Some(Prepared::Bound {
                 statement_id: statement.id,
@@ -804,7 +905,7 @@ impl TdsConnection {
         values: &[RpcParam],
     ) -> Result<(), TdsError> {
         let (statement_id, names, order) = match prepared {
-            Prepared::Text(sql) => return self.execute(sql).await,
+            Prepared::Text(sql) => return self.run_sql(sql).await.map(|_| ()),
             Prepared::Bound {
                 statement_id,
                 names,
@@ -871,6 +972,7 @@ impl TdsConnection {
                 self.engine.prepared_stmts.close(statement_id);
             }
         }
+        self.statement_cache_bytes = 0;
     }
 
     /// Run a transaction manager request. Returns whether it was a

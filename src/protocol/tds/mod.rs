@@ -11,6 +11,7 @@ pub mod login;
 pub mod params;
 pub mod prelogin;
 pub mod rpc;
+pub mod shims;
 pub mod sink;
 pub mod token;
 pub mod tunnel;

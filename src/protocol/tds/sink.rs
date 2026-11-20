@@ -55,6 +55,8 @@ pub struct TdsSink<W> {
     in_procedure: bool,
     /// A statement of the current procedure call failed
     procedure_failed: bool,
+    /// Errors reported since the sink was created
+    errors: u64,
     /// Set by the connection's reader when the client cancels the request
     cancel: Arc<AtomicBool>,
 }
@@ -81,6 +83,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             pending: None,
             in_procedure: false,
             procedure_failed: false,
+            errors: 0,
             cancel,
         }
     }
@@ -122,6 +125,12 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             },
             row_count: 0,
         });
+    }
+
+    /// Number of errors reported so far; compare before and after a
+    /// statement to learn whether it failed.
+    pub fn error_count(&self) -> u64 {
+        self.errors
     }
 
     /// Whether the request produced any result yet.
@@ -224,6 +233,8 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
             // result set stops here.
             put_error(&mut self.buf, ERROR_UNENCODABLE_VALUE, 1, 16, &message);
             status |= DONE_ERROR;
+            self.procedure_failed = true;
+            self.errors += 1;
         }
         self.pending = Some(PendingDone {
             token: self.statement_done(),
@@ -248,6 +259,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         let (number, class, state) = sql_server_error(error.code);
         put_error(&mut self.buf, number, state, class, &error.message);
         self.procedure_failed = true;
+        self.errors += 1;
         self.pending = Some(PendingDone {
             token: self.statement_done(),
             status: DONE_ERROR,

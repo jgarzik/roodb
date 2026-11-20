@@ -9,6 +9,7 @@ mod query;
 mod raw;
 mod requests;
 mod rpc;
+mod shims;
 mod types;
 
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
