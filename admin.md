@@ -28,7 +28,9 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 
 | Argument | Default | Description |
 |----------|---------|-------------|
+| bind | 0.0.0.0 | Address to listen on (client, TDS and Raft ports) |
 | port | 3307 | Client connection port |
+| tds_port | (off) | Also accept SQL Server protocol (TDS) clients on this port |
 | data_dir | ./data | Data directory path |
 | cert_path | ./certs/server.crt | TLS certificate |
 | key_path | ./certs/server.key | TLS private key |
@@ -93,6 +95,7 @@ A node with a certificate signed by a different CA will be rejected by the clust
 |------|---------|
 | 3307 (default) | Client connections (MySQL protocol over TLS) |
 | 4307 (port + 1000) | Raft RPC (inter-node replication) |
+| `--tds-port` (off by default) | SQL Server protocol (TDS) clients, always encrypted |
 
 ### Environment Variables
 
@@ -100,8 +103,94 @@ A node with a certificate signed by a different CA will be rejected by the clust
 |----------|-------------|
 | `ROODB_ROOT_PASSWORD` | Set root password on first boot |
 | `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
+| `ROODB_BIND` | Listen address (same as `--bind`) |
+| `ROODB_TDS_PORT` | Enable the TDS listener on this port (same as `--tds-port`) |
 
 Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
+
+## SQL Server Protocol (TDS)
+
+RooDB can accept clients that speak TDS, the SQL Server wire protocol, on
+a second port. It is off unless `--tds-port` (or `ROODB_TDS_PORT`) is set:
+
+```
+./roodb --port 3307 --tds-port 1433 --data-dir ./data --cert-path ./certs/server.crt --key-path ./certs/server.key
+```
+
+The TDS port must differ from the client port and the Raft port. Accounts,
+databases and data are the same as on the main port.
+
+### Transports and encryption
+
+Both TDS transports are accepted on the one port, and both are always
+encrypted with the server certificate:
+
+| Client setting | Transport | Notes |
+|----------------|-----------|-------|
+| `Encrypt=Strict` | TDS 8.0: TLS first (TLS 1.2 or 1.3, ALPN `tds/8.0`) | Nothing is sent in cleartext. Microsoft drivers require a certificate they can validate in this mode. |
+| `Encrypt=True` / `Mandatory` | TDS 7.x: PRELOGIN in cleartext, then TLS 1.2 for the whole session | PRELOGIN carries driver version and flags only, never credentials or SQL. |
+| `Encrypt=False` / `Optional` | TDS 7.x | The server still requires encryption for the whole session. |
+| No encryption support | refused | The client is told encryption is required and disconnected before login. |
+
+Login-only encryption is not offered. The server reports TDS 7.4 and
+product version 16.0 to clients on either transport.
+
+### What works
+
+- SQL authentication (user name and password). Windows/SSPI and Entra
+  (federated) authentication are refused.
+- SQL batches, including several statements per batch.
+- Parameterised statements: `sp_executesql`, `sp_prepare`, `sp_execute`,
+  `sp_prepexec`, `sp_unprepare`. Parameter values are bound as typed
+  values.
+- Transactions through SQL or through the driver's transaction API.
+- Query cancellation (attention signal) and connection-pool reset.
+
+### SQL dialect
+
+The SQL accepted is RooDB's own (MySQL dialect), exactly as on the main
+port; see [SQL.md](SQL.md). T-SQL is not translated. Only the statements
+drivers issue by themselves are understood in addition:
+
+- `BEGIN TRAN`, `COMMIT TRAN`, `ROLLBACK TRAN`, `IF @@TRANCOUNT > 0 ...`,
+  `SET IMPLICIT_TRANSACTIONS ON|OFF`
+- connect-time session options such as `SET ANSI_NULLS ON`,
+  `SET QUOTED_IDENTIFIER ON`, `SET NOCOUNT ON`, which are accepted without
+  effect (double quotes still delimit strings, as in MySQL)
+- probes: `@@SPID`, `@@TRANCOUNT`, `@@VERSION`, `DB_NAME()`,
+  `SUSER_SNAME()`, `SERVERPROPERTY('...')`
+
+### Limitations
+
+- No savepoints: a named `ROLLBACK TRAN name` or `SAVE TRAN` is refused.
+- No MARS (multiple active result sets), bulk load, or table-valued,
+  XML and `sql_variant` parameters.
+- No SQL Server catalog views (`sys.*`), so tools that browse the catalog,
+  such as the SSMS object explorer, will not work.
+- Cancellation takes effect between result rows; a statement that works
+  for a long time before returning its first row finishes that work first.
+- Tested with the `tiberius` client on both transports. Microsoft's ODBC,
+  .NET and JDBC drivers have not been verified yet.
+
+### Type mapping
+
+| RooDB type | Sent as |
+|------------|---------|
+| BOOLEAN, BIT(1) | bit |
+| TINYINT, SMALLINT | smallint |
+| INT / BIGINT | int / bigint |
+| BIGINT UNSIGNED | decimal(20,0) |
+| FLOAT / DOUBLE | real / float |
+| VARCHAR(n ≤ 4000) | nvarchar(4000) |
+| longer VARCHAR, TEXT, JSON | nvarchar(max) |
+| BLOB, GEOMETRY | varbinary(max) |
+| BIT(n) | binary(8) |
+| TIMESTAMP / DATETIME | datetime2(3) |
+| DECIMAL(p ≤ 38, s) | decimal(p,s) |
+
+Column types of expressions are settled from the first row, so a computed
+column may be reported with the type of its values rather than the type
+listed here.
 
 ## Data Directory Layout
 

@@ -29,14 +29,21 @@ cargo fmt --check
 RooDB is a distributed SQL database in Rust with these key design decisions:
 
 - **TLS-Only**: All network communication requires TLS (no plaintext)
-- **RooDB Client Protocol**: Clients connect via RooDB protocol over TLS
+- **RooDB Client Protocol**: Clients connect via RooDB protocol (MySQL-compatible) over TLS
+- **TDS Protocol**: Optional second listener (`--tds-port`) for SQL Server clients; TDS 8.0 (TLS first) and TDS 7.x (TLS tunnelled after PRELOGIN), always encrypted
+- **Protocol-neutral query engine**: Both protocols are thin front-ends over `QueryEngine`; they differ only in framing, login and result encoding
 - **Raft Consensus**: OpenRaft for distributed replication
 - **Volcano Executor**: Iterator-based query execution model
 
 ### Key Types
 
-- `RooDbServer` (`src/server/listener.rs`) - Main server entry point
-- `handle_connection()` (`src/server/handler.rs`) - Per-connection handling
+- `RooDbServer` (`src/server/listener.rs`) - Main server entry point; accept loop for both listeners
+- `ServerContext` (`src/server/context.rs`) - Shared state handed to every connection
+- `handle_connection()` (`src/server/handler.rs`) - RooDB protocol connection handling
+- `tds::connection::serve()` (`src/protocol/tds/connection.rs`) - TDS connection handling
+- `QueryEngine` (`src/server/query/engine.rs`) - Session state and statement execution for one client
+- `ResponseSink` (`src/server/query/sink.rs`) - How the engine reports results; implemented by `RooDbSink` and `TdsSink`
+- `server::auth` (`src/server/auth.rs`) - Authentication shared by both protocols
 - `ExecutorEngine` (`src/executor/engine.rs`) - Query execution
 - `LsmEngine` (`src/storage/lsm/engine.rs`) - LSM storage backend
 - `Catalog` (`src/catalog/mod.rs`) - Schema metadata
@@ -45,13 +52,15 @@ RooDB is a distributed SQL database in Rust with these key design decisions:
 ### Query Execution Flow
 
 ```
-SQL string
+protocol front-end (RooDbConnection / TdsConnection)
+  → QueryEngine::handle_query() / execute_prepared() (src/server/query/engine.rs)
   → Parser::parse_one() (src/sql/parser.rs)
   → LogicalPlanBuilder::build() (src/planner/logical/builder.rs)
   → Optimizer::optimize() (src/planner/optimizer.rs)
   → PhysicalPlanner::plan() (src/planner/physical.rs)
   → ExecutorEngine::build() (src/executor/engine.rs)
   → executor.open() / .next() / .close()
+  → ResponseSink (rows, OK, errors) → protocol encoder
 ```
 
 ## Test Suite
@@ -67,7 +76,9 @@ The primary test infrastructure runs SQL tests via client CLI across 4 configura
 | cluster_uring | 3 | io_uring (Linux) |
 | cluster_posix | 3 | POSIX |
 
-Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`, `cluster/`
+Test categories: `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`, `cluster/`, `auth/`, `prepared/`, `tds/`
+
+All integration tests build into the single `suite` test binary. TDS tests use the `tiberius` client over both transports; `tests/roodb_suite/tds/raw.rs` is a hand-rolled TDS client for sending exact bytes.
 
 ## Known Limitations
 

@@ -29,6 +29,7 @@ that keeps the hardware busy instead of waiting on locks and syscalls.
 - **Raft consensus** — distributed replication via OpenRaft for high availability
 - **Full SQL** — parser, query planner with optimizer, Volcano-style executor
 - **MySQL-compatible protocol** — connect with `mysql` CLI or any MySQL client library (TLS required)
+- **SQL Server protocol (TDS)** — optional second port for TDS clients, over TDS 8.0 or TDS 7.x, always encrypted (see [admin.md](admin.md#sql-server-protocol-tds))
 
 ## Quick Start
 
@@ -80,9 +81,9 @@ src/
 ├── executor/      # Volcano-style query executor
 ├── io/            # Cross-platform async I/O (io_uring / POSIX)
 ├── planner/       # Query planner and optimizer
-├── protocol/      # MySQL wire protocol implementation
+├── protocol/      # Wire protocols: roodb/ (MySQL-compatible) and tds/ (SQL Server)
 ├── raft/          # Raft consensus layer (OpenRaft)
-├── server/        # TCP listener, connection handling
+├── server/        # Listeners, authentication, session, query engine (server/query/)
 ├── sql/           # SQL parsing and AST
 ├── storage/       # LSM storage engine
 ├── tls.rs         # TLS configuration
@@ -106,7 +107,7 @@ RooDB includes a comprehensive integration test suite that validates the full SQ
 | `cluster_uring` | 3-node Raft | io_uring (Linux only) |
 | `cluster_posix` | 3-node Raft | POSIX |
 
-Tests use the `mysql` CLI to execute SQL against RooDB's client protocol.
+Tests drive the server through real client libraries: `mysql_async` for the RooDB (MySQL-compatible) protocol and `tiberius` for TDS, plus hand-built packets for malformed and adversarial input.
 
 ## Known Limitations
 

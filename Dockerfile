@@ -62,6 +62,8 @@ USER roodb
 # Expose ports
 # 3307 - Client connections (MySQL protocol over TLS)
 # 4307 - Raft consensus (internal cluster communication)
+# The optional SQL Server protocol (TDS) listener uses the port given in
+# ROODB_TDS_PORT; publish it with -p when enabled.
 EXPOSE 3307 4307
 
 # Mount points
