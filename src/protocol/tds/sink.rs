@@ -17,7 +17,7 @@ use super::token::{
     put_done, put_error, sql_server_error, DONE_ATTN, DONE_COUNT, DONE_ERROR, DONE_FINAL,
     DONE_MORE, TOKEN_DONE,
 };
-use super::types::{put_colmetadata, put_row, WireType};
+use super::types::{declared_wire_types, put_colmetadata, put_row, reconcile_wire_types, WireType};
 
 /// Error number for a value the server could not encode for the client
 const ERROR_UNENCODABLE_VALUE: i32 = 50000;
@@ -36,8 +36,13 @@ struct PendingDone {
 pub struct TdsSink<W> {
     writer: TdsWriter<W>,
     buf: Vec<u8>,
+    /// Columns of the result set being sent
+    columns: Vec<OutputColumn>,
     /// Wire types of the result set being sent
     wire_types: Vec<WireType>,
+    /// Column metadata is held back until the first row, so it can
+    /// describe what the executor actually produces
+    metadata_sent: bool,
     /// Rows sent in the current result set
     rows: u64,
     /// First value that could not be encoded in the current result set
@@ -61,7 +66,9 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
         Self {
             writer: TdsWriter::new(writer),
             buf: Vec::with_capacity(8192),
+            columns: Vec::new(),
             wire_types: Vec::new(),
+            metadata_sent: true,
             rows: 0,
             row_error: None,
             pending: None,
@@ -136,7 +143,9 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
 
     fn begin_result_set(&mut self, columns: &[OutputColumn], _schema: &str) {
         self.emit_pending(true);
-        self.wire_types = put_colmetadata(&mut self.buf, columns);
+        self.columns.clear();
+        self.columns.extend_from_slice(columns);
+        self.metadata_sent = false;
         self.rows = 0;
         self.row_error = None;
     }
@@ -145,6 +154,11 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         if self.row_error.is_some() {
             return;
         }
+        if !self.metadata_sent {
+            self.wire_types = reconcile_wire_types(&self.columns, row.values());
+            put_colmetadata(&mut self.buf, &self.columns, &self.wire_types);
+            self.metadata_sent = true;
+        }
         match put_row(&mut self.buf, &self.wire_types, row.values()) {
             Ok(()) => self.rows += 1,
             Err(e) => self.row_error = Some(e.to_string()),
@@ -152,6 +166,12 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
     }
 
     fn end_result_set(&mut self, _status: Status) {
+        if !self.metadata_sent {
+            // No rows: describe the columns as declared.
+            self.wire_types = declared_wire_types(&self.columns);
+            put_colmetadata(&mut self.buf, &self.columns, &self.wire_types);
+            self.metadata_sent = true;
+        }
         let mut status = DONE_COUNT;
         if let Some(message) = self.row_error.take() {
             // The rows before the bad value were sent; report why the
@@ -175,6 +195,8 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
 
     fn error(&mut self, error: &QueryError) {
         self.emit_pending(true);
+        // An error before the first row replaces the result set.
+        self.metadata_sent = true;
         let (number, class, state) = sql_server_error(error.code);
         put_error(&mut self.buf, number, state, class, &error.message);
         self.pending = Some(PendingDone {

@@ -5,10 +5,16 @@
 //! is self-describing. Character data is always UTF-16 (NVARCHAR), which
 //! every driver handles without relying on a code page.
 //!
-//! The executor's values do not always have exactly the type the planner
-//! declared for the column, so values are converted to the column's wire
-//! type where that is lossless and refused otherwise. A row is never sent
-//! with bytes that disagree with the column metadata.
+//! The planner's declared column types are approximate for expressions
+//! and functions: the executor may produce, say, text where an integer was
+//! declared. Two rules keep the stream valid regardless:
+//!
+//! - column metadata is settled against the first row
+//!   ([`reconcile_wire_types`]): a column whose first value does not fit
+//!   its declared type is described by the type of that value instead;
+//! - after that, a value is converted to its column's wire type where
+//!   that is lossless and refused otherwise. A row is never sent with
+//!   bytes that disagree with the column metadata.
 
 use crate::catalog::DataType;
 use crate::executor::datum::{format_decimal, Datum};
@@ -149,24 +155,75 @@ fn put_type_info(buf: &mut Vec<u8>, wire: WireType) {
     }
 }
 
-/// Append a COLMETADATA token describing `columns` and return the wire
-/// type chosen for each.
-pub fn put_colmetadata(buf: &mut Vec<u8>, columns: &[OutputColumn]) -> Vec<WireType> {
+/// The wire type each column would have from its declared type alone.
+pub fn declared_wire_types(columns: &[OutputColumn]) -> Vec<WireType> {
+    columns.iter().map(|c| wire_type(&c.data_type)).collect()
+}
+
+/// The wire type that represents `value` itself, whatever was declared.
+fn natural_wire_type(value: &Datum) -> Option<WireType> {
+    Some(match value {
+        Datum::Null => return None,
+        Datum::Bool(_) => WireType::Bit,
+        Datum::Int(_) => WireType::Int(8),
+        Datum::UnsignedInt(_) => WireType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        Datum::Float(_) => WireType::Float(8),
+        // Length is not known for later rows, so use the unbounded types.
+        Datum::String(_) | Datum::Json(_) => WireType::NVarcharMax,
+        Datum::Bytes(_) | Datum::Geometry(_) => WireType::VarBinaryMax,
+        Datum::Bit { .. } => WireType::Binary(8),
+        Datum::Timestamp(_) => WireType::DateTime2,
+        Datum::Decimal { scale, .. } if *scale <= MAX_DECIMAL_PRECISION => WireType::Decimal {
+            precision: MAX_DECIMAL_PRECISION,
+            scale: *scale,
+        },
+        Datum::Decimal { .. } => WireType::NVarcharMax,
+    })
+}
+
+/// Settle the wire types of a result set against its first row: a column
+/// keeps its declared type if the first value can be sent as that type,
+/// and otherwise takes the type of the value.
+pub fn reconcile_wire_types(columns: &[OutputColumn], first_row: &[Datum]) -> Vec<WireType> {
+    let mut scratch = Vec::new();
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let declared = wire_type(&column.data_type);
+            let Some(value) = first_row.get(index) else {
+                return declared;
+            };
+            scratch.clear();
+            if put_value(&mut scratch, declared, value).is_ok() {
+                declared
+            } else {
+                natural_wire_type(value).unwrap_or(declared)
+            }
+        })
+        .collect()
+}
+
+/// Append a COLMETADATA token describing `columns` with the given wire
+/// types.
+pub fn put_colmetadata(buf: &mut Vec<u8>, columns: &[OutputColumn], wire_types: &[WireType]) {
     // The column count is 16 bits; result sets are far narrower.
-    let count = columns.len().min(u16::MAX as usize - 1);
+    let count = columns
+        .len()
+        .min(wire_types.len())
+        .min(u16::MAX as usize - 1);
     buf.push(TOKEN_COLMETADATA);
     buf.extend_from_slice(&(count as u16).to_le_bytes());
 
-    let mut wire_types = Vec::with_capacity(count);
-    for column in &columns[..count] {
-        let wire = wire_type(&column.data_type);
+    for (column, wire) in columns.iter().zip(wire_types).take(count) {
         buf.extend_from_slice(&0u32.to_le_bytes()); // user type
         buf.extend_from_slice(&1u16.to_le_bytes()); // flags: nullable
-        put_type_info(buf, wire);
+        put_type_info(buf, *wire);
         put_b_varchar(buf, &column.name);
-        wire_types.push(wire);
     }
-    wire_types
 }
 
 /// Append a ROW token for `values`, one per wire type.
@@ -299,8 +356,13 @@ fn put_value(buf: &mut Vec<u8>, wire: WireType, value: &Datum) -> Result<(), Val
             buf.extend_from_slice(&magnitude.to_le_bytes()[..len as usize - 1]);
         }
         WireType::DateTime2 => {
-            let Datum::Timestamp(ms) = value else {
-                return Err(mismatch(value, wire));
+            // Timestamp columns may hold their value as text.
+            let ms = match value {
+                Datum::Timestamp(ms) => *ms,
+                Datum::String(text) => {
+                    parse_timestamp(text).ok_or_else(|| mismatch(value, wire))?
+                }
+                _ => return Err(mismatch(value, wire)),
             };
             let day = ms.div_euclid(MS_PER_DAY) + UNIX_EPOCH_DAY;
             let ms_of_day = ms.rem_euclid(MS_PER_DAY) as u32;
@@ -414,6 +476,71 @@ fn text_value(value: &Datum) -> String {
         }
         other => other.to_display_string(),
     }
+}
+
+/// Parse "YYYY-MM-DD[ HH:MM[:SS[.fraction]]]" (space or `T` separator)
+/// into unix milliseconds. Fractions beyond milliseconds are truncated.
+fn parse_timestamp(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (date, time) = match text.split_once([' ', 'T']) {
+        Some((date, time)) => (date, time.trim()),
+        None => (text, ""),
+    };
+
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=month_days).contains(&day) {
+        return None;
+    }
+
+    let mut ms_of_day = 0i64;
+    if !time.is_empty() {
+        let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+        let mut fields = clock.split(':');
+        let hour: i64 = fields.next()?.parse().ok()?;
+        let minute: i64 = fields.next()?.parse().ok()?;
+        let second: i64 = match fields.next() {
+            Some(s) => s.parse().ok()?,
+            None => 0,
+        };
+        if fields.next().is_some()
+            || !(0..24).contains(&hour)
+            || !(0..60).contains(&minute)
+            || !(0..60).contains(&second)
+        {
+            return None;
+        }
+        if !fraction.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let millis: i64 = format!("{:0<3}", fraction)[..3].parse().ok()?;
+        ms_of_day = ((hour * 60 + minute) * 60 + second) * 1000 + millis;
+    }
+
+    Some(days_from_civil(year, month, day) * MS_PER_DAY + ms_of_day)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Format unix milliseconds as "YYYY-MM-DD HH:MM:SS[.mmm]".
@@ -724,6 +851,61 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_stored_as_text_are_parsed() {
+        assert_eq!(parse_timestamp("1970-01-01"), Some(0));
+        assert_eq!(parse_timestamp("1970-01-01 00:00:01"), Some(1000));
+        assert_eq!(
+            parse_timestamp("2000-02-29T00:00:00.123"),
+            Some(951_782_400_123)
+        );
+        assert_eq!(
+            parse_timestamp("2000-02-29 00:00:00.1239"),
+            Some(951_782_400_123)
+        );
+        assert_eq!(parse_timestamp("1969-12-31 23:59"), Some(-60_000));
+        assert_eq!(
+            parse_timestamp(" 9999-12-31 23:59:59.999 "),
+            Some(253_402_300_799_999)
+        );
+        for bad in [
+            "",
+            "x",
+            "2024-13-01",
+            "2023-02-29",
+            "2024-02-30",
+            "0000-01-01",
+            "2024-01-01 24:00:00",
+            "2024-01-01 10:60:00",
+            "2024-01-01 10:00:61",
+            "2024-01-01 10",
+            "2024-01-01 1:2:3:4",
+            "2024-01-01 10:00:00.x",
+            "2024-1-1-1",
+            "10000-01-01",
+        ] {
+            assert_eq!(parse_timestamp(bad), None, "{bad:?}");
+        }
+        // Round trip through the formatter and the wire encoding
+        for ms in [
+            0,
+            1,
+            -1,
+            951_782_400_123,
+            253_402_300_799_999,
+            -62_135_596_800_000,
+        ] {
+            assert_eq!(parse_timestamp(&format_timestamp(ms)), Some(ms));
+        }
+        let text = encode(
+            WireType::DateTime2,
+            Datum::String("2024-02-29 13:14:15".into()),
+        );
+        let native = encode(WireType::DateTime2, Datum::Timestamp(1_709_212_455_000));
+        assert_eq!(text, native);
+        assert!(encode(WireType::DateTime2, Datum::String("not a date".into())).is_err());
+    }
+
+    #[test]
     fn timestamp_text_and_calendar() {
         assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
         assert_eq!(format_timestamp(951_782_400_123), "2000-02-29 00:00:00.123");
@@ -749,8 +931,9 @@ mod tests {
             },
         ];
         let mut buf = Vec::new();
-        let wire = put_colmetadata(&mut buf, &columns);
+        let wire = declared_wire_types(&columns);
         assert_eq!(wire, vec![WireType::Int(4), WireType::NVarchar]);
+        put_colmetadata(&mut buf, &columns, &wire);
 
         let mut want = vec![TOKEN_COLMETADATA, 2, 0];
         // id: usertype, flags, INTN(4), name
@@ -760,6 +943,59 @@ mod tests {
         want.extend_from_slice(&DEFAULT_COLLATION);
         want.extend_from_slice(&[4, b'n', 0, b'a', 0, b'm', 0, b'e', 0]);
         assert_eq!(buf, want);
+    }
+
+    #[test]
+    fn first_row_settles_mistyped_columns() {
+        let column = |name: &str, data_type: DataType| OutputColumn {
+            id: 0,
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+        };
+        let columns = [
+            column("ok", DataType::Int),
+            column("date_as_int", DataType::BigInt),
+            column("fraction_as_int", DataType::BigInt),
+            column("null_first", DataType::BigInt),
+            column("int_as_text", DataType::Text),
+            column("wide_decimal", DataType::Int),
+        ];
+        let first_row = [
+            Datum::Int(1),
+            Datum::String("2024-02-29".into()),
+            Datum::Float(1.5),
+            Datum::Null,
+            Datum::Int(7),
+            Datum::Decimal {
+                value: 12345,
+                scale: 3,
+            },
+        ];
+        let wire = reconcile_wire_types(&columns, &first_row);
+        assert_eq!(
+            wire,
+            vec![
+                WireType::Int(4),      // fits as declared
+                WireType::NVarcharMax, // text where an integer was declared
+                WireType::Float(8),    // fraction where an integer was declared
+                WireType::Int(8),      // NULL tells nothing: keep the declaration
+                WireType::NVarcharMax, // an integer is sendable as text
+                WireType::Decimal {
+                    precision: 38,
+                    scale: 3
+                },
+            ]
+        );
+        // The row encodes under the settled types.
+        let mut buf = Vec::new();
+        put_row(&mut buf, &wire, &first_row).unwrap();
+
+        // A short first row leaves the remaining columns as declared.
+        assert_eq!(
+            reconcile_wire_types(&columns[..2], &[Datum::Int(1)]),
+            vec![WireType::Int(4), WireType::Int(8)]
+        );
     }
 
     #[test]

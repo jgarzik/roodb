@@ -6,6 +6,7 @@
 
 mod login;
 mod query;
+mod types;
 
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
