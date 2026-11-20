@@ -231,25 +231,32 @@ impl Parser {
         Self::normalize_declare_in_body(&result)
     }
 
-    /// Replace `!` with `NOT` only outside single-quoted string literals.
+    /// Replace `!` with `NOT` outside quoted text: single- and
+    /// double-quoted strings and backtick-quoted identifiers.
     fn replace_bang_outside_strings(sql: &str) -> String {
         let mut result = String::with_capacity(sql.len() + 16);
-        let mut in_string = false;
+        // The quote character of the literal being scanned, if any
+        let mut quote: Option<char> = None;
         let mut chars = sql.chars().peekable();
         while let Some(c) = chars.next() {
-            if in_string {
+            if let Some(q) = quote {
                 result.push(c);
-                if c == '\'' {
+                if c == '\\' && q != '`' {
+                    // Backslash escapes the next character in a string
+                    if let Some(escaped) = chars.next() {
+                        result.push(escaped);
+                    }
+                } else if c == q {
                     // A doubled quote is an escaped quote, not the end.
-                    if chars.peek() == Some(&'\'') {
-                        result.push('\'');
+                    if chars.peek() == Some(&q) {
+                        result.push(q);
                         chars.next();
                     } else {
-                        in_string = false;
+                        quote = None;
                     }
                 }
-            } else if c == '\'' {
-                in_string = true;
+            } else if matches!(c, '\'' | '"' | '`') {
+                quote = Some(c);
                 result.push(c);
             } else if c == '!' {
                 // Replace ! with NOT, but not != (keep as-is)
@@ -934,6 +941,17 @@ mod tests {
         // Inside a string literal nothing is rewritten
         assert_eq!(f("SELECT 'hi!'"), "SELECT 'hi!'");
         assert_eq!(f("SELECT 'it''s !' , !x"), "SELECT 'it''s !' , NOT x");
+        // Double-quoted strings and backtick identifiers are quoted text too
+        assert_eq!(f("SELECT \"wow!\", !x"), "SELECT \"wow!\", NOT x");
+        assert_eq!(f("SELECT `odd!name`, !x"), "SELECT `odd!name`, NOT x");
+        // A backslash-escaped quote does not end the string
+        assert_eq!(
+            f(r"SELECT 'it\'s great!', !x"),
+            r"SELECT 'it\'s great!', NOT x"
+        );
+        assert_eq!(f(r"SELECT 'a\\', !x"), r"SELECT 'a\\', NOT x");
+        // The other quote character inside a string is ordinary text
+        assert_eq!(f("SELECT 'say \"hi!\"', !x"), "SELECT 'say \"hi!\"', NOT x");
         // Non-ASCII text survives, inside and outside literals
         assert_eq!(
             f("SELECT 'b\u{f6}b \u{65e5}\u{672c} \u{1F600}' AS \u{e9}"),
