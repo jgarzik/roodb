@@ -3733,10 +3733,26 @@ fn infer_binary_result_type(
         BinaryOp::And | BinaryOp::Or => Ok(DataType::Boolean),
 
         // Arithmetic operators - use wider type
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Mod => {
             let left_type = left.data_type();
             let right_type = right.data_type();
             Ok(wider_numeric_type(&left_type, &right_type))
+        }
+
+        // Division of integers is not an integer: `7 / 2` evaluates to 3.5.
+        // (Integer division is the separate DIV operator.)
+        BinaryOp::Div => {
+            let wider = wider_numeric_type(&left.data_type(), &right.data_type());
+            Ok(match wider {
+                DataType::Boolean
+                | DataType::TinyInt
+                | DataType::SmallInt
+                | DataType::Int
+                | DataType::BigInt
+                | DataType::BigIntUnsigned
+                | DataType::Bit(_) => DataType::Double,
+                other => other,
+            })
         }
 
         // Bitwise operators return BigInt
@@ -3782,11 +3798,24 @@ fn infer_function_result_type(name: &str, args: &[ResolvedExpr]) -> SqlResult<Da
     match name.to_uppercase().as_str() {
         "COUNT" => Ok(DataType::BigInt),
         "SUM" => {
-            if args.is_empty() {
-                Ok(DataType::BigInt)
-            } else {
-                Ok(args[0].data_type())
-            }
+            // A sum outgrows its argument's type: integers widen to 64
+            // bits and decimals to full precision.
+            Ok(match args.first().map(|a| a.data_type()) {
+                None
+                | Some(
+                    DataType::Boolean
+                    | DataType::TinyInt
+                    | DataType::SmallInt
+                    | DataType::Int
+                    | DataType::BigInt
+                    | DataType::Bit(_),
+                ) => DataType::BigInt,
+                Some(DataType::Decimal { scale, .. }) => DataType::Decimal {
+                    precision: 38,
+                    scale,
+                },
+                Some(other) => other,
+            })
         }
         "AVG" => Ok(DataType::Double),
         "MIN" | "MAX" => {
@@ -3962,6 +3991,19 @@ fn wider_numeric_type(a: &DataType, b: &DataType) -> DataType {
     match (a, b) {
         (DataType::Double, _) | (_, DataType::Double) => DataType::Double,
         (DataType::Float, _) | (_, DataType::Float) => DataType::Float,
+        // Decimal arithmetic stays decimal; the result needs room to grow.
+        (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) => {
+            DataType::Decimal {
+                precision: 38,
+                scale: (*s1).max(*s2),
+            }
+        }
+        (DataType::Decimal { scale, .. }, _) | (_, DataType::Decimal { scale, .. }) => {
+            DataType::Decimal {
+                precision: 38,
+                scale: *scale,
+            }
+        }
         (DataType::BigIntUnsigned, _) | (_, DataType::BigIntUnsigned) => DataType::BigIntUnsigned,
         (DataType::BigInt, _) | (_, DataType::BigInt) => DataType::BigInt,
         (DataType::Bit(_), _) | (_, DataType::Bit(_)) => DataType::BigInt,
@@ -3993,6 +4035,23 @@ mod tests {
         catalog.create_table(orders).unwrap();
 
         catalog
+    }
+
+    #[test]
+    fn arithmetic_result_types_have_room_for_the_result() {
+        let int = ResolvedExpr::Literal(Literal::Integer(1));
+        let ty = |op| infer_binary_result_type(op, &int, &int).unwrap();
+        // 7 / 2 is 3.5, not an integer; DIV is the integer division
+        assert_eq!(ty(BinaryOp::Div), DataType::Double);
+        assert_eq!(ty(BinaryOp::IntDiv), DataType::BigInt);
+
+        let dec = |precision, scale| DataType::Decimal { precision, scale };
+        assert_eq!(wider_numeric_type(&dec(5, 2), &DataType::Int), dec(38, 2));
+        assert_eq!(wider_numeric_type(&dec(5, 2), &dec(10, 4)), dec(38, 4));
+        assert_eq!(
+            wider_numeric_type(&dec(5, 2), &DataType::Double),
+            DataType::Double
+        );
     }
 
     #[test]
