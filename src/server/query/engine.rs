@@ -5583,6 +5583,25 @@ impl QueryEngine {
         Ok(affected)
     }
 
+    /// Reset the session for the next user of a pooled connection:
+    /// roll back the open transaction (unless `keep_transaction`), drop
+    /// temporary tables and prepared statements, and restore session
+    /// settings. The caller decides which database is selected afterwards.
+    pub(crate) async fn reset_session(&mut self, keep_transaction: bool) {
+        if !keep_transaction {
+            self.session.clear_pending_changes();
+            if let Some(txn_id) = self.session.current_txn {
+                if let Err(e) = self.txn_manager.rollback(txn_id).await {
+                    warn!(txn_id, error = %e, "Rollback on session reset failed");
+                }
+                self.session.end_transaction();
+            }
+        }
+        self.cleanup_temp_tables().await;
+        self.prepared_stmts.clear();
+        self.session.reset();
+    }
+
     /// Transaction status of the session, reported with every result.
     fn status(&self) -> Status {
         Status {

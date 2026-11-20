@@ -129,13 +129,20 @@ pub fn put_done(buf: &mut Vec<u8>, token: u8, status: u16, row_count: u64) {
     buf.extend_from_slice(&row_count.to_le_bytes());
 }
 
+/// Longest message text, in UTF-16 units, of an ERROR or INFO token. The
+/// token's length field is 16 bits and counts bytes, so the text must
+/// leave room for the other fields.
+const MAX_MESSAGE_CHARS: usize = 8000;
+
 /// Append an ERROR or INFO token.
 fn put_message(buf: &mut Vec<u8>, token: u8, number: i32, state: u8, class: u8, message: &str) {
     let mut body = Vec::with_capacity(32 + message.len() * 2);
     body.extend_from_slice(&number.to_le_bytes());
     body.push(state);
     body.push(class);
-    put_us_varchar(&mut body, message);
+    let text = ucs2_prefix(message, MAX_MESSAGE_CHARS);
+    body.extend_from_slice(&((text.len() / 2) as u16).to_le_bytes());
+    body.extend_from_slice(&text);
     put_b_varchar(&mut body, SERVER_NAME);
     put_b_varchar(&mut body, ""); // procedure name
     body.extend_from_slice(&1i32.to_le_bytes()); // line number
@@ -221,6 +228,18 @@ mod tests {
         assert_eq!(i32::from_le_bytes(buf[3..7].try_into().unwrap()), 208);
         assert_eq!((buf[7], buf[8]), (1, 16));
         assert_eq!(u16::from_le_bytes([buf[9], buf[10]]), 23);
+    }
+
+    #[test]
+    fn long_messages_cannot_overflow_the_token_length() {
+        let mut buf = Vec::new();
+        put_error(&mut buf, 102, 1, 15, &"e".repeat(100_000));
+        let len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+        assert_eq!(buf.len(), 3 + len, "length field covers the whole token");
+        assert_eq!(
+            u16::from_le_bytes([buf[9], buf[10]]) as usize,
+            MAX_MESSAGE_CHARS
+        );
     }
 
     #[test]

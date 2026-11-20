@@ -140,10 +140,24 @@ impl<S: AsyncWrite + Unpin> PreloginTlsStream<S> {
     /// Frame everything written since the last flush as one PRELOGIN
     /// message, then write it out.
     fn poll_flush_tunnel(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.pending.is_empty() && self.framed_written == self.framed.len() {
+        loop {
+            // Finish the frame in progress before framing more: bytes
+            // written after a partial flush wait in `pending`.
+            while self.framed_written < self.framed.len() {
+                let n =
+                    ready!(Pin::new(&mut self.inner)
+                        .poll_write(cx, &self.framed[self.framed_written..]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                self.framed_written += n;
+            }
+            if self.pending.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+
             self.framed.clear();
             self.framed_written = 0;
-
             let body_size = DEFAULT_PACKET_SIZE - HEADER_SIZE;
             let mut chunks = self.pending.chunks(body_size).peekable();
             let mut packet_number = 1u8;
@@ -169,17 +183,6 @@ impl<S: AsyncWrite + Unpin> PreloginTlsStream<S> {
             }
             self.pending.clear();
         }
-
-        while self.framed_written < self.framed.len() {
-            let n = ready!(
-                Pin::new(&mut self.inner).poll_write(cx, &self.framed[self.framed_written..])
-            )?;
-            if n == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            self.framed_written += n;
-        }
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -327,6 +330,37 @@ mod tests {
         let mut second = vec![0u8; HEADER_SIZE + (big.len() - body)];
         client.read_exact(&mut second).await.unwrap();
         assert_eq!((second[0], second[1], second[6]), (0x12, STATUS_EOM, 2));
+    }
+
+    /// A flush interrupted by a full socket must still send what was
+    /// written in the meantime.
+    #[tokio::test]
+    async fn flush_after_partial_write_sends_everything() {
+        use std::future::poll_fn;
+
+        // Room for only part of the first flight.
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut stream = PreloginTlsStream::new(server);
+
+        stream.write_all(&[1u8; 200]).await.unwrap();
+        // First flush cannot complete: the pipe is full.
+        let first = poll_fn(|cx| Poll::Ready(Pin::new(&mut stream).poll_flush(cx))).await;
+        assert!(first.is_pending());
+        // More handshake bytes arrive before the flush is retried.
+        stream.write_all(&[2u8; 50]).await.unwrap();
+
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; (HEADER_SIZE + 200) + (HEADER_SIZE + 50)];
+            client.read_exact(&mut got).await.unwrap();
+            got
+        });
+        stream.flush().await.unwrap();
+        let got = reader.await.unwrap();
+
+        let mut want = packet(0x12, STATUS_EOM, &[1u8; 200]);
+        want.extend(packet(0x12, STATUS_EOM, &[2u8; 50]));
+        assert_eq!(got, want);
+        stream.finish_handshake().unwrap();
     }
 
     #[tokio::test]

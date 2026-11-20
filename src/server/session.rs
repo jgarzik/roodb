@@ -201,6 +201,20 @@ impl Session {
         }
     }
 
+    /// Return the session to its state at login: variables, SQL modes,
+    /// autocommit, isolation level, warnings and SQL-level prepared
+    /// statements. The user, the selected database and any open
+    /// transaction are left to the caller.
+    pub fn reset(&mut self) {
+        self.autocommit = true;
+        self.isolation_level = IsolationLevel::default();
+        self.warnings.clear();
+        self.sql_prepared_stmts.clear();
+        self.sql_modes = default_sql_modes();
+        self.user_variables.write().clear();
+        self.init_eval_flags();
+    }
+
     /// Create a new session for a replica (read-only)
     pub fn new_read_only(connection_id: u32) -> Self {
         let mut session = Self::new(connection_id);

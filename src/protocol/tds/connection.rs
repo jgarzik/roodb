@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -45,7 +46,8 @@ use super::sink::TdsSink;
 use super::token::{
     put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
     put_info, put_loginack, DEFAULT_COLLATION, DONE_ERROR, ENV_BEGIN_TRAN, ENV_COLLATION,
-    ENV_COMMIT_TRAN, ENV_DATABASE, ENV_LANGUAGE, ENV_PACKET_SIZE, ENV_ROLLBACK_TRAN, TOKEN_DONE,
+    ENV_COMMIT_TRAN, ENV_DATABASE, ENV_LANGUAGE, ENV_PACKET_SIZE, ENV_RESET_CONNECTION,
+    ENV_ROLLBACK_TRAN, TOKEN_DONE,
 };
 use super::tunnel::PreloginTlsStream;
 
@@ -326,11 +328,15 @@ async fn establish(
         engine.session.set_database(Some(login.database.clone()));
     }
 
+    let login_database = engine.session.database.clone();
+    let (requests, reader) = spawn_reader(read_half, cancel.clone());
     let mut conn = TdsConnection {
         connection_id,
         engine,
-        cancel: cancel.clone(),
-        requests: spawn_reader(read_half, cancel),
+        cancel,
+        requests,
+        reader,
+        login_database,
     };
     conn.send_login_response(&login).await?;
 
@@ -343,9 +349,9 @@ async fn establish(
 fn spawn_reader(
     read_half: ReadHalf<BoxedStream>,
     cancel: Arc<AtomicBool>,
-) -> mpsc::Receiver<Result<Message, PacketError>> {
+) -> (mpsc::Receiver<Result<Message, PacketError>>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut reader = TdsReader::new(BufReader::with_capacity(8192, read_half));
         loop {
             let result = reader.read_message(MAX_REQUEST).await;
@@ -358,7 +364,7 @@ fn spawn_reader(
             }
         }
     });
-    rx
+    (rx, task)
 }
 
 /// A logged-in TDS session.
@@ -368,12 +374,60 @@ struct TdsConnection {
     /// Raised by the reader when the client cancels the running request
     cancel: Arc<AtomicBool>,
     requests: mpsc::Receiver<Result<Message, PacketError>>,
+    /// The task reading from the socket. It owns the read half, so the
+    /// socket only closes once it has stopped.
+    reader: JoinHandle<()>,
+    /// Database selected at login, restored by a connection reset
+    login_database: Option<String>,
+}
+
+impl Drop for TdsConnection {
+    fn drop(&mut self) {
+        // Without this the reader would keep the socket open, blocked on
+        // a read, after the server has given up on the session.
+        self.reader.abort();
+    }
 }
 
 /// Session facts the client tracks through ENVCHANGE tokens.
 struct Environment {
     database: Option<String>,
     transaction: Option<u64>,
+}
+
+/// Arguments of a transaction manager commit or rollback request.
+#[derive(Debug, PartialEq, Eq)]
+struct EndTransaction {
+    /// A transaction (savepoint) name was given
+    named: bool,
+    /// Start another transaction afterwards, at this isolation level
+    begin_next: Option<u8>,
+}
+
+/// Parse the arguments of a commit or rollback request: a name (length
+/// byte in UTF-16 units, then the text), a flags byte, and, when the
+/// flags ask for a follow-on transaction, its isolation level and name.
+fn parse_end_transaction(args: &[u8]) -> Result<EndTransaction, TdsError> {
+    let bad = || TdsError::Protocol("malformed transaction request");
+    // Old clients send no arguments at all.
+    let Some(&name_chars) = args.first() else {
+        return Ok(EndTransaction {
+            named: false,
+            begin_next: None,
+        });
+    };
+    let after_name = 1 + usize::from(name_chars) * 2;
+    let rest = args.get(after_name..).ok_or_else(bad)?;
+    let flags = rest.first().copied().unwrap_or(0);
+    let begin_next = if flags & 0x01 != 0 {
+        Some(*rest.get(1).ok_or_else(bad)?)
+    } else {
+        None
+    };
+    Ok(EndTransaction {
+        named: name_chars != 0,
+        begin_next,
+    })
 }
 
 /// Skip the ALL_HEADERS block that starts every request: a total length
@@ -465,6 +519,18 @@ impl TdsConnection {
     async fn run(&mut self) -> Result<(), TdsError> {
         while let Some(message) = self.requests.recv().await {
             let message = message?;
+            // A pooled connection's next user asks for a clean session
+            // before its first request runs.
+            let reset = message.packet_type != PacketType::Attention && message.resets_connection();
+            if reset {
+                self.engine
+                    .reset_session(message.reset_keeps_transaction())
+                    .await;
+                self.engine
+                    .session
+                    .set_database(self.login_database.clone());
+                put_envchange_binary(self.sink().tokens(), ENV_RESET_CONNECTION, &[], &[]);
+            }
             match message.packet_type {
                 PacketType::Attention => {
                     // Acknowledge unless the request it interrupted
@@ -533,27 +599,30 @@ impl TdsConnection {
 
         match u16::from_le_bytes([kind[0], kind[1]]) {
             TM_BEGIN_XACT => {
-                // Isolation level byte; 0 keeps the session's level.
-                let level = match args.first() {
-                    Some(1) => Some(IsolationLevel::ReadUncommitted),
-                    Some(2) => Some(IsolationLevel::ReadCommitted),
-                    Some(3) | Some(5) => Some(IsolationLevel::RepeatableRead),
-                    Some(4) => Some(IsolationLevel::Serializable),
-                    _ => None,
-                };
-                if let Some(level) = level {
-                    self.engine.session.set_isolation_level(level);
+                self.begin_transaction(args.first().copied().unwrap_or(0))
+                    .await?;
+                Ok(false)
+            }
+            kind @ (TM_COMMIT_XACT | TM_ROLLBACK_XACT) => {
+                let rollback = kind == TM_ROLLBACK_XACT;
+                let end = parse_end_transaction(args)?;
+                if end.named {
+                    // A named commit or rollback targets a savepoint.
+                    // Ending the whole transaction instead would silently
+                    // discard or keep more than the client asked for.
+                    self.engine.out.error(&QueryError::new(
+                        codes::ER_UNKNOWN_COM_ERROR,
+                        states::GENERAL_ERROR,
+                        "Savepoints are not supported",
+                    ));
+                    return Ok(false);
                 }
-                self.execute("BEGIN").await?;
-                Ok(false)
-            }
-            TM_COMMIT_XACT => {
-                self.execute("COMMIT").await?;
-                Ok(false)
-            }
-            TM_ROLLBACK_XACT => {
-                self.execute("ROLLBACK").await?;
-                Ok(true)
+                self.execute(if rollback { "ROLLBACK" } else { "COMMIT" })
+                    .await?;
+                if let Some(isolation) = end.begin_next {
+                    self.begin_transaction(isolation).await?;
+                }
+                Ok(rollback)
             }
             _ => {
                 self.engine.out.error(&QueryError::new(
@@ -564,6 +633,23 @@ impl TdsConnection {
                 Ok(false)
             }
         }
+    }
+
+    /// Start a transaction at the isolation level a transaction manager
+    /// request names (0 keeps the session's level).
+    async fn begin_transaction(&mut self, isolation: u8) -> Result<(), TdsError> {
+        let level = match isolation {
+            1 => Some(IsolationLevel::ReadUncommitted),
+            2 => Some(IsolationLevel::ReadCommitted),
+            // Snapshot (5) is served by the repeatable-read snapshot.
+            3 | 5 => Some(IsolationLevel::RepeatableRead),
+            4 => Some(IsolationLevel::Serializable),
+            _ => None,
+        };
+        if let Some(level) = level {
+            self.engine.session.set_isolation_level(level);
+        }
+        self.execute("BEGIN").await
     }
 
     /// Complete the response: report what changed in the session, then
@@ -586,11 +672,9 @@ impl TdsConnection {
                 before.database.as_deref().unwrap_or(DEFAULT_DATABASE),
             );
         }
-        match (before.transaction, after.transaction) {
-            (None, Some(new)) => {
-                put_envchange_binary(tokens, ENV_BEGIN_TRAN, &new.to_le_bytes(), &[]);
-            }
-            (Some(old), None) => {
+        if before.transaction != after.transaction {
+            // The old transaction ended, a new one began, or both.
+            if let Some(old) = before.transaction {
                 let kind = if rolled_back {
                     ENV_ROLLBACK_TRAN
                 } else {
@@ -598,7 +682,9 @@ impl TdsConnection {
                 };
                 put_envchange_binary(tokens, kind, &[], &old.to_le_bytes());
             }
-            _ => {}
+            if let Some(new) = after.transaction {
+                put_envchange_binary(tokens, ENV_BEGIN_TRAN, &new.to_le_bytes(), &[]);
+            }
         }
 
         sink.finish(cancelled).await?;
@@ -627,6 +713,37 @@ mod tests {
         assert_eq!(negotiate_packet_size(8000), 8000);
         assert_eq!(negotiate_packet_size(1), MIN_PACKET_SIZE);
         assert_eq!(negotiate_packet_size(u32::MAX), MAX_NEGOTIATED_PACKET_SIZE);
+    }
+
+    #[test]
+    fn end_transaction_arguments() {
+        let parsed = |args: &[u8]| parse_end_transaction(args).unwrap();
+        let plain = EndTransaction {
+            named: false,
+            begin_next: None,
+        };
+        assert_eq!(parsed(&[]), plain);
+        assert_eq!(parsed(&[0]), plain);
+        assert_eq!(parsed(&[0, 0]), plain);
+        // fBeginXact with isolation level 2 and an empty name
+        assert_eq!(
+            parsed(&[0, 1, 2, 0]),
+            EndTransaction {
+                named: false,
+                begin_next: Some(2)
+            }
+        );
+        // Named: "sp" then flags
+        assert_eq!(
+            parsed(&[2, b's', 0, b'p', 0, 0]),
+            EndTransaction {
+                named: true,
+                begin_next: None
+            }
+        );
+        // Name longer than the message, and a begin flag with no level
+        assert!(parse_end_transaction(&[5, b's', 0]).is_err());
+        assert!(parse_end_transaction(&[0, 1]).is_err());
     }
 
     #[test]
