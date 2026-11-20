@@ -87,8 +87,6 @@ where
     scramble: [u8; 20],
     /// Client capabilities
     client_capabilities: u32,
-    /// Current database (if any)
-    database: Option<String>,
     /// Storage engine
     storage: Arc<dyn StorageEngine>,
     /// Catalog
@@ -139,7 +137,6 @@ where
             client_ip,
             scramble,
             client_capabilities: 0,
-            database: None,
             storage: ctx.storage.clone(),
             catalog: ctx.catalog.clone(),
             deprecate_eof: false,
@@ -262,7 +259,6 @@ where
         self.session.set_user(response.username.clone());
 
         if let Some(ref db) = response.database {
-            self.database = Some(db.clone());
             self.session.set_database(Some(db.clone()));
         }
 
@@ -422,7 +418,6 @@ where
                     catalog.database_exists(&db)
                 };
                 if exists {
-                    self.database = Some(db.clone());
                     self.session.set_database(Some(db));
                     self.send_ok(0, 0).await?;
                 } else {
@@ -483,7 +478,7 @@ where
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
-                self.database = None;
+                self.session.set_database(None);
                 self.prepared_stmts.clear();
                 self.send_ok(0, 0).await?;
                 Ok(true)
@@ -527,7 +522,7 @@ where
 
         // Send parameter column definitions (type=VARCHAR as placeholder)
         if num_params > 0 {
-            let schema = self.database.as_deref().unwrap_or("default");
+            let schema = self.session.database.as_deref().unwrap_or("default");
             for i in 0..num_params {
                 let col = crate::planner::logical::OutputColumn {
                     id: i as usize,
@@ -548,7 +543,7 @@ where
 
         // Send result column definitions (placeholder types for SELECT)
         if num_columns > 0 {
-            let schema = self.database.as_deref().unwrap_or("default");
+            let schema = self.session.database.as_deref().unwrap_or("default");
             for (i, name) in col_names.iter().enumerate() {
                 let col = crate::planner::logical::OutputColumn {
                     id: i,
@@ -897,7 +892,7 @@ where
         self.writer.write_packet(&count_packet).await?;
 
         // Send column definitions
-        let schema = self.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("default");
         for col in columns {
             let def = ColumnDefinition41::from_output_column(col, "", schema);
             let def_packet = def.encode();
@@ -1116,7 +1111,7 @@ where
                         .map(|m| m.as_str().to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 };
-                let db = self.database.as_deref().unwrap_or("test");
+                let db = self.session.database.as_deref().unwrap_or("test");
                 let qualified = format!("{}.{}", db, table_name);
                 return self
                     .send_custom_result_set(
@@ -1343,7 +1338,7 @@ where
         use crate::planner::logical::ResolvedStatement;
 
         // Use "default" database for privilege checks - tables don't have explicit db prefix
-        let db = self.database.as_deref().unwrap_or("default");
+        let db = self.session.database.as_deref().unwrap_or("default");
 
         match stmt {
             ResolvedStatement::Select(select) => {
@@ -1708,7 +1703,7 @@ where
         self.writer.write_packet(&count_packet).await?;
 
         // Send column definitions
-        let schema = self.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("default");
         for col in columns {
             let def = ColumnDefinition41::from_output_column(col, "", schema);
             let def_packet = def.encode();
@@ -1792,7 +1787,7 @@ where
         let count_packet = encode_column_count(columns.len() as u64);
         self.writer.write_packet(&count_packet).await?;
 
-        let schema = self.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("default");
         for col in columns {
             let def = ColumnDefinition41::from_output_column(col, "", schema);
             let def_packet = def.encode();
@@ -3132,7 +3127,6 @@ where
                 .map(|_| Some(()));
         }
 
-        self.database = Some(db_name.clone());
         self.session.set_database(Some(db_name));
         self.send_ok(0, 0).await.map(Some)
     }
@@ -3153,7 +3147,7 @@ where
         self.writer.write_packet(&count_packet).await?;
 
         // Column definitions
-        let schema = self.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("default");
         for (i, name) in col_names.iter().enumerate() {
             let col = OutputColumn {
                 id: i,
@@ -6124,7 +6118,7 @@ where
         self.writer.write_packet(&count_packet).await?;
 
         // Send column definitions (minimal — name from SELECT expression)
-        let schema = self.database.as_deref().unwrap_or("test");
+        let schema = self.session.database.as_deref().unwrap_or("test");
         for name in &col_names {
             let def = ColumnDefinition41 {
                 catalog: "def".to_string(),
