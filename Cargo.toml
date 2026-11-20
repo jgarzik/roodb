@@ -38,7 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TLS (required - no plaintext networking)
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
 rustls-pemfile = "2"
 
 # Bytes handling
@@ -50,14 +49,8 @@ parking_lot = "0.12"
 # Lock-free concurrent skip list (memtable)
 crossbeam-skiplist = "0.1"
 
-# Compression
-lz4_flex = "0.11"
-
 # SQL parsing
 sqlparser = { version = "0.61", features = ["visitor"] }
-
-# Ordered floats for sorting
-ordered-float = "4"
 
 # LRU cache for block cache
 lru = "0.12"
@@ -68,9 +61,6 @@ rand = "0.8"
 bitflags = "2"
 regex = "1"
 lazy_static = "1"
-
-# Password hashing
-argon2 = "0.5"
 
 # Hex encoding
 hex = "0.4"

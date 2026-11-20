@@ -1,5 +1,9 @@
 //! Raft network implementation over TLS
 
+// openraft dictates these error types; they are large by its design, and the
+// functions here feed directly into openraft trait methods that return them.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -749,9 +749,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
             None => 0,
         };
 
-        for i in start_idx..self.index.len() {
-            let entry = &self.index[i];
-
+        for entry in self.index.iter().skip(start_idx) {
             // Check if we've passed the end key
             if let Some(e) = end {
                 if entry.first_key.as_slice() >= e {
@@ -798,8 +796,7 @@ impl<IO: AsyncIO> SstableReader<IO> {
 
         // Determine which blocks we need (and which are cache misses)
         let mut needed_blocks: Vec<(usize, u64)> = Vec::new(); // (block_index, offset)
-        for i in start_idx..self.index.len() {
-            let entry = &self.index[i];
+        for (i, entry) in self.index.iter().enumerate().skip(start_idx) {
             if let Some(e) = end {
                 if entry.first_key.as_slice() >= e {
                     break;

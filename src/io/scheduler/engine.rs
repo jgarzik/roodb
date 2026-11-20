@@ -904,7 +904,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
                 reads.iter().map(|(_, off, sz, _)| (*off, *sz)).collect();
             let results = io.read_batch(&requests).await;
 
-            for ((_, _, size, tx), result) in reads.into_iter().zip(results.into_iter()) {
+            for ((_, _, size, tx), result) in reads.into_iter().zip(results) {
                 self.throughput.record(Urgency::Background, size);
                 let batch_result = match result {
                     Ok(buf) => {
@@ -962,9 +962,8 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> IoEngine<IO, F
 
             let results = io.write_batch(&requests).await;
 
-            for ((_idx, tx), (result, size)) in senders
-                .into_iter()
-                .zip(results.into_iter().zip(sizes.into_iter()))
+            for ((_idx, tx), (result, size)) in
+                senders.into_iter().zip(results.into_iter().zip(sizes))
             {
                 self.throughput.record(Urgency::Background, size);
                 let batch_result = match result {

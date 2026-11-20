@@ -842,10 +842,7 @@ impl Parser {
 
         let mut result = sql.to_string();
         // Keep replacing until no more multi-var DECLAREs exist
-        loop {
-            let Some(caps) = RE.captures(&result) else {
-                break;
-            };
+        while let Some(caps) = RE.captures(&result) {
             let full_match = caps.get(0).unwrap();
             let names_str = &caps[1];
             let type_keyword = &caps[3];

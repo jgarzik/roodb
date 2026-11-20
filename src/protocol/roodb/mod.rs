@@ -4186,10 +4186,9 @@ where
     fn extract_sql_mode_value(sql: &str) -> Option<String> {
         let upper = sql.trim().to_uppercase();
         // Match: SET SQL_MODE, SET @@SQL_MODE, SET @@SESSION.SQL_MODE, SET SESSION SQL_MODE
-        let rest = if let Some(r) = upper.strip_prefix("SET ") {
+        let rest = {
+            let r = upper.strip_prefix("SET ")?;
             r.trim()
-        } else {
-            return None;
         };
         let rest = if let Some(r) = rest.strip_prefix("@@SESSION.") {
             r.trim()
@@ -6122,7 +6121,7 @@ where
         let mut result = sql.to_string();
         // Sort by name length descending to avoid partial matches
         let mut vars: Vec<(&String, &Datum)> = ctx.locals.iter().collect();
-        vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        vars.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         for (name, val) in vars {
             result = result.replace(name, &val.to_sql_literal());
         }

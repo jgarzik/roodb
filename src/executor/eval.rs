@@ -6447,7 +6447,7 @@ fn substitute_locals_in_sql(
 ) -> String {
     let mut result = sql.to_string();
     let mut vars: Vec<(&String, &Datum)> = ctx.locals.iter().collect();
-    vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    vars.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
     for (name, val) in vars {
         result = result.replace(name.as_str(), &val.to_sql_literal());
     }

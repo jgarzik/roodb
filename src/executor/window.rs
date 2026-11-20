@@ -301,14 +301,12 @@ impl Executor for Window {
                             }
                         }
                     }
-                    "LAST_VALUE" => {
-                        if !partition.is_empty() && !args.is_empty() {
-                            let last_row = *partition.last().unwrap();
-                            let val = evaluate(&args[0], &rows[last_row], &self.user_variables)
-                                .unwrap_or(Datum::Null);
-                            for &row_idx in partition {
-                                result_rows[row_idx][col_offset] = val.clone();
-                            }
+                    "LAST_VALUE" if !partition.is_empty() && !args.is_empty() => {
+                        let last_row = *partition.last().unwrap();
+                        let val = evaluate(&args[0], &rows[last_row], &self.user_variables)
+                            .unwrap_or(Datum::Null);
+                        for &row_idx in partition {
+                            result_rows[row_idx][col_offset] = val.clone();
                         }
                     }
                     _ => {
