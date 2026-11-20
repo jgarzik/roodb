@@ -5,8 +5,12 @@
 //! happened through a [`ResponseSink`], which each protocol implements as
 //! its encoder.
 
+pub mod engine;
 pub mod error;
+pub mod metrics;
+pub mod prepared;
 pub mod sink;
 
+pub use engine::QueryEngine;
 pub use error::QueryError;
 pub use sink::{OkInfo, ResponseSink, Status};
