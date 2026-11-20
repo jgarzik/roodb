@@ -233,40 +233,34 @@ impl Parser {
 
     /// Replace `!` with `NOT` only outside single-quoted string literals.
     fn replace_bang_outside_strings(sql: &str) -> String {
-        let bytes = sql.as_bytes();
         let mut result = String::with_capacity(sql.len() + 16);
         let mut in_string = false;
-        let mut i = 0;
-        while i < bytes.len() {
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
             if in_string {
-                if bytes[i] == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                result.push(c);
+                if c == '\'' {
+                    // A doubled quote is an escaped quote, not the end.
+                    if chars.peek() == Some(&'\'') {
                         result.push('\'');
-                        result.push('\'');
-                        i += 2;
-                        continue;
+                        chars.next();
+                    } else {
+                        in_string = false;
                     }
-                    in_string = false;
                 }
-                result.push(bytes[i] as char);
-                i += 1;
-            } else if bytes[i] == b'\'' {
+            } else if c == '\'' {
                 in_string = true;
-                result.push('\'');
-                i += 1;
-            } else if bytes[i] == b'!' {
+                result.push(c);
+            } else if c == '!' {
                 // Replace ! with NOT, but not != (keep as-is)
-                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
-                    result.push('!');
-                    result.push('=');
-                    i += 2;
+                if chars.peek() == Some(&'=') {
+                    result.push_str("!=");
+                    chars.next();
                 } else {
                     result.push_str("NOT ");
-                    i += 1;
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                result.push(c);
             }
         }
         result
@@ -931,6 +925,21 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bang_replacement_keeps_text_intact() {
+        let f = Parser::replace_bang_outside_strings;
+        assert_eq!(f("SELECT !a"), "SELECT NOT a");
+        assert_eq!(f("a != b"), "a != b");
+        // Inside a string literal nothing is rewritten
+        assert_eq!(f("SELECT 'hi!'"), "SELECT 'hi!'");
+        assert_eq!(f("SELECT 'it''s !' , !x"), "SELECT 'it''s !' , NOT x");
+        // Non-ASCII text survives, inside and outside literals
+        assert_eq!(
+            f("SELECT 'b\u{f6}b \u{65e5}\u{672c} \u{1F600}' AS \u{e9}"),
+            "SELECT 'b\u{f6}b \u{65e5}\u{672c} \u{1F600}' AS \u{e9}"
+        );
+    }
     use sqlparser::ast as sp;
 
     #[test]
