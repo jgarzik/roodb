@@ -112,7 +112,9 @@ impl RooDbServer {
         loop {
             tokio::select! {
                 result = listener.accept() => {
-                    let (stream, peer_addr) = result?;
+                    let Some((stream, peer_addr)) = accepted(result).await else {
+                        continue;
+                    };
                     // Handle connection with STARTTLS (TLS upgrade happens in handler)
                     tokio::spawn(handle_connection(
                         stream,
@@ -122,7 +124,9 @@ impl RooDbServer {
                     ));
                 }
                 result = accept_optional(&tds_listener) => {
-                    let (stream, peer_addr) = result?;
+                    let Some((stream, peer_addr)) = accepted(result).await else {
+                        continue;
+                    };
                     tokio::spawn(tds::connection::serve(
                         stream,
                         peer_addr,
@@ -135,6 +139,26 @@ impl RooDbServer {
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Pause after a failed accept, so a persistent failure (such as running
+/// out of file descriptors) does not spin.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Unwrap an accepted connection. A failed accept is logged and skipped:
+/// it concerns one incoming connection (or a temporary resource
+/// shortage), not the listener, and must not stop the server.
+async fn accepted(
+    result: std::io::Result<(tokio::net::TcpStream, SocketAddr)>,
+) -> Option<(tokio::net::TcpStream, SocketAddr)> {
+    match result {
+        Ok(connection) => Some(connection),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to accept a connection");
+            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            None
         }
     }
 }
