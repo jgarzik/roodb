@@ -5,3 +5,4 @@
 
 mod auto_increment;
 mod basic;
+mod errors;

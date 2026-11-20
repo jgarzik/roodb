@@ -132,7 +132,9 @@ impl QueryEngine {
         if let Some(cached) = cached {
             // Cache hit: clone plan and substitute params directly
             let mut physical = cached.physical.clone();
-            physical.substitute_params(params)?;
+            if let Err(e) = physical.substitute_params(params) {
+                return self.send_error_from_protocol_error(&e.into()).await;
+            }
 
             // Check authorization
             if !cached.required_privileges.is_empty() {
@@ -143,7 +145,7 @@ impl QueryEngine {
                 }
             }
 
-            return self.execute_plan_binary(physical).await;
+            return self.run_plan(physical).await;
         }
 
         // Cache miss: build plan from the unsubstituted AST with placeholder mode
@@ -219,7 +221,9 @@ impl QueryEngine {
 
         // Substitute params into a copy of the plan for this execution
         let mut physical = plan_template;
-        physical.substitute_params(params)?;
+        if let Err(e) = physical.substitute_params(params) {
+            return self.send_error_from_protocol_error(&e.into()).await;
+        }
 
         // Check authorization
         if !required_privileges.is_empty() {
@@ -230,166 +234,7 @@ impl QueryEngine {
             }
         }
 
-        // Execute with binary result sets
-        self.execute_plan_binary(physical).await
-    }
-
-    /// Execute a physical plan and send results in binary format (for prepared statements).
-    async fn execute_plan_binary(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
-        let query_start = Instant::now();
-
-        let returns_rows = matches!(
-            plan,
-            PhysicalPlan::TableScan { .. }
-                | PhysicalPlan::PointGet { .. }
-                | PhysicalPlan::RangeScan { .. }
-                | PhysicalPlan::Filter { .. }
-                | PhysicalPlan::Project { .. }
-                | PhysicalPlan::Sort { .. }
-                | PhysicalPlan::Limit { .. }
-                | PhysicalPlan::HashDistinct { .. }
-                | PhysicalPlan::HashAggregate { .. }
-                | PhysicalPlan::NestedLoopJoin { .. }
-                | PhysicalPlan::AnalyzeTable { .. }
-                | PhysicalPlan::Explain { .. }
-        );
-
-        let is_ddl = matches!(
-            plan,
-            PhysicalPlan::CreateTable { .. }
-                | PhysicalPlan::DropTable { .. }
-                | PhysicalPlan::CreateIndex { .. }
-                | PhysicalPlan::DropIndex { .. }
-        );
-
-        let mvcc = self.mvcc.clone();
-
-        let (txn_context, implicit_txn_id) = if is_ddl {
-            (None, None)
-        } else if let Some(txn_id) = self.session.current_txn {
-            let read_view = self.txn_manager.create_read_view(txn_id)?;
-            let pending = self.session.get_pending_changes();
-            (
-                Some(TransactionContext::with_pending_changes(
-                    txn_id, read_view, pending,
-                )),
-                None,
-            )
-        } else if !returns_rows && self.session.autocommit {
-            let txn = self
-                .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)?;
-            let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
-            (
-                Some(TransactionContext::new(txn.txn_id, read_view)),
-                Some(txn.txn_id),
-            )
-        } else {
-            let read_view = self.txn_manager.create_read_view(0)?;
-            (Some(TransactionContext::new(0, read_view)), None)
-        };
-
-        let plan_ns = metrics::elapsed_ns(query_start);
-
-        if returns_rows {
-            let columns = plan.output_columns();
-
-            let engine = ExecutorEngine::with_raft(
-                mvcc,
-                self.catalog.clone(),
-                txn_context,
-                self.raft_node.clone(),
-                self.session.user_variables(),
-            );
-            let mut executor = engine.build_async(plan).await?;
-
-            let t_open = Instant::now();
-            executor.open().await?;
-            let exec_open_ns = metrics::elapsed_ns(t_open);
-
-            let t_iter = Instant::now();
-            let result = self.stream_rows(&columns, &mut *executor).await;
-            let exec_iter_ns = metrics::elapsed_ns(t_iter);
-
-            let m = metrics::QueryMetrics {
-                total: query_start.elapsed(),
-                plan_ns,
-                exec_open_ns,
-                exec_iter_ns,
-                send_ns: 0,
-            };
-            m.log("binary_select");
-
-            result
-        } else {
-            let engine = ExecutorEngine::with_raft(
-                mvcc,
-                self.catalog.clone(),
-                txn_context,
-                self.raft_node.clone(),
-                self.session.user_variables(),
-            );
-            let mut executor = engine.build_async(plan).await?;
-
-            let t_open = Instant::now();
-            executor.open().await?;
-            let exec_open_ns = metrics::elapsed_ns(t_open);
-
-            let t_iter = Instant::now();
-            let mut affected = 0u64;
-            let mut last_insert_id = 0u64;
-            while let Some(row) = executor.next().await? {
-                if let Some(Datum::Int(n)) = row.get_opt(0) {
-                    affected += *n as u64;
-                } else {
-                    affected += 1;
-                }
-                if let Some(Datum::Int(id)) = row.get_opt(1) {
-                    last_insert_id = *id as u64;
-                }
-            }
-            executor.close().await?;
-            let exec_iter_ns = metrics::elapsed_ns(t_iter);
-
-            let ignore_dups = executor.is_ignore_duplicates();
-            let changes = executor.take_changes();
-            if !changes.is_empty() {
-                if self.session.in_transaction() {
-                    self.session.add_pending_changes(changes);
-                } else {
-                    let changeset = ChangeSet::new_with_changes_ignore(
-                        implicit_txn_id.unwrap_or(0),
-                        changes,
-                        ignore_dups,
-                    );
-                    self.raft_node
-                        .propose_changes(changeset)
-                        .await
-                        .map_err(|e| ProtocolError::Raft(e.to_string()))?;
-                }
-            }
-
-            if let Some(txn_id) = implicit_txn_id {
-                self.txn_manager.commit(txn_id).await?;
-            }
-
-            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
-            self.session
-                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
-            self.session
-                .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
-
-            let m = metrics::QueryMetrics {
-                total: query_start.elapsed(),
-                plan_ns,
-                exec_open_ns,
-                exec_iter_ns,
-                send_ns: 0,
-            };
-            m.log("binary_dml");
-
-            self.send_ok(affected, last_insert_id).await
-        }
+        self.run_plan(physical).await
     }
 
     /// Stream an opened executor's rows to the client as one result set.
@@ -840,13 +685,22 @@ impl QueryEngine {
         }
 
         // Execute — catch executor errors so they don't kill the connection
-        match self.execute_plan(physical).await {
+        self.run_plan(physical).await
+    }
+
+    /// Execute a plan, reporting an execution failure to the client as a
+    /// statement error. The session stays usable.
+    async fn run_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+        let start = Instant::now();
+        let result = match self.execute_plan(plan).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!("Query execution error: {}", e);
                 self.send_error_from_protocol_error(&e).await
             }
-        }
+        };
+        metrics::log_query(start);
+        result
     }
 
     /// Extract required privileges from a resolved statement
