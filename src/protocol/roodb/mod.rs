@@ -24,12 +24,9 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
 use tracing::{debug, info, warn};
 
-use crate::catalog::system_tables::SYSTEM_USERS;
-use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
-use crate::executor::Datum;
+use crate::server::auth::AuthError;
 use crate::server::context::ServerContext;
 use crate::server::query::{metrics, QueryEngine, ResponseSink};
-use crate::sql::privileges::HostPattern;
 
 use self::auth::{verify_native_password_with_hash, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
@@ -178,40 +175,29 @@ where
                 .await;
         }
 
-        // Look up user in system.users table using the actual client IP
-        let client_host = self.engine.client_ip.to_string();
-        let user_info = self
-            .lookup_user(&response.username, &client_host)
-            .await
-            .map_err(|e| {
+        let authenticated = crate::server::auth::authenticate(
+            &self.engine.storage,
+            &response.username,
+            self.engine.client_ip,
+            |stored_hash| {
+                verify_native_password_with_hash(
+                    &self.scramble,
+                    stored_hash,
+                    &response.auth_response,
+                )
+            },
+        )
+        .await;
+
+        match authenticated {
+            Ok(()) => {}
+            Err(AuthError::Denied) => return self.send_auth_error("Access denied").await,
+            Err(AuthError::Internal(e)) => {
                 warn!(error = %e, "User lookup failed");
-                ProtocolError::AuthFailed("Internal error during authentication".to_string())
-            })?;
-
-        let Some((password_hash, account_locked, password_expired)) = user_info else {
-            warn!(username = %response.username, "Unknown user");
-            return self.send_auth_error("Access denied").await;
-        };
-
-        // Check account status
-        if account_locked {
-            warn!(username = %response.username, "Account is locked");
-            return self.send_auth_error("Account is locked").await;
-        }
-
-        if password_expired {
-            warn!(username = %response.username, "Password has expired");
-            return self.send_auth_error("Password has expired").await;
-        }
-
-        // Verify password
-        if !verify_native_password_with_hash(
-            &self.scramble,
-            &password_hash,
-            &response.auth_response,
-        ) {
-            warn!(username = %response.username, "Password verification failed");
-            return self.send_auth_error("Access denied").await;
+                return Err(ProtocolError::AuthFailed(
+                    "Internal error during authentication".to_string(),
+                ));
+            }
         }
 
         // Set authenticated user in session
@@ -222,82 +208,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Look up a user in system.users table
-    ///
-    /// Returns Some((password_hash, account_locked, password_expired)) if found, None otherwise.
-    /// Matches user by username and host pattern.
-    async fn lookup_user(
-        &self,
-        username: &str,
-        client_host: &str,
-    ) -> Result<Option<(String, bool, bool)>, ProtocolError> {
-        // Scan system.users table
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .engine
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
-
-        // Find matching user row
-        // system.users schema: username, host, password_hash, auth_plugin,
-        //   ssl_subject, ssl_issuer, account_locked, password_expired, created_at, updated_at
-        for (_key, value) in rows {
-            let row = match decode_row(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            // Get username from row (column 0)
-            let row_username = match row.get_opt(0) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
-            };
-
-            if row_username != username {
-                continue;
-            }
-
-            // Get host pattern from row (column 1)
-            let row_host = match row.get_opt(1) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
-            };
-
-            // Check if client host matches the host pattern
-            let host_pattern = HostPattern::new(row_host);
-            if !host_pattern.matches(client_host, None) {
-                continue;
-            }
-
-            // Get password_hash (column 2)
-            let password_hash = match row.get_opt(2) {
-                Some(Datum::String(s)) => s.clone(),
-                Some(Datum::Null) | None => String::new(),
-                _ => continue,
-            };
-
-            // Get account_locked (column 6)
-            let account_locked = match row.get_opt(6) {
-                Some(Datum::Bool(b)) => *b,
-                _ => false,
-            };
-
-            // Get password_expired (column 7)
-            let password_expired = match row.get_opt(7) {
-                Some(Datum::Bool(b)) => *b,
-                _ => false,
-            };
-
-            return Ok(Some((password_hash, account_locked, password_expired)));
-        }
-
-        Ok(None)
     }
 
     /// Run the command loop

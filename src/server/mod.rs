@@ -1,5 +1,6 @@
 //! Server module for RooDB
 
+pub mod auth;
 pub mod context;
 pub mod handler;
 pub mod listener;

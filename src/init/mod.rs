@@ -91,17 +91,7 @@ pub fn hash_password(password: &str) -> String {
 ///
 /// For mysql_native_password, the stored hash is SHA1(SHA1(password)) in hex.
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    // Empty password check
-    if password.is_empty() && stored_hash.is_empty() {
-        return true;
-    }
-    if password.is_empty() || stored_hash.is_empty() {
-        return false;
-    }
-
-    // Compute hash of provided password and compare
-    let computed_hash = compute_password_hash(password);
-    computed_hash == stored_hash
+    crate::server::auth::verify_cleartext_password(password, stored_hash)
 }
 
 /// Initialize the database with root user and schema version marker
