@@ -1,1041 +1,651 @@
-//! TDS connection handler - manages the lifecycle of a single TDS client connection.
+//! TDS connection handling: transport setup, login and the request loop.
+//!
+//! Two transports are accepted on the TDS port, told apart by the first
+//! byte the client sends:
+//!
+//! - `0x16`, a TLS ClientHello: TDS 8.0 ("strict"). TLS is established
+//!   first and everything, PRELOGIN included, travels inside it.
+//! - `0x12`, a PRELOGIN packet: TDS 7.x. PRELOGIN is exchanged in
+//!   cleartext, then the TLS handshake is tunnelled in PRELOGIN packets
+//!   and the rest of the session is encrypted. A client that cannot
+//!   encrypt is refused.
+//!
+//! Anything else is not TDS and the connection is closed. After login
+//! both transports carry the same TDS 7.4 token stream; statement
+//! execution is delegated to [`QueryEngine`].
 
-use parking_lot::RwLock;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadHalf, WriteHalf};
+
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info, warn};
 
-use crate::catalog::system_tables::SYSTEM_USERS;
-use crate::catalog::Catalog;
-use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
-use crate::executor::engine::ExecutorEngine;
-use crate::executor::{Datum, TransactionContext};
-use crate::planner::logical::builder::LogicalPlanBuilder;
-use crate::planner::optimizer::Optimizer;
-use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
-use crate::raft::{ChangeSet, RaftNode};
-use crate::server::session::Session;
-use crate::sql::{Parser, Resolver, TypeChecker};
-use crate::storage::StorageEngine;
-use crate::txn::{IsolationLevel, MvccStorage, TransactionManager};
+use crate::server::auth::{self, AuthError};
+use crate::server::context::ServerContext;
+use crate::server::limits::HANDSHAKE_TIMEOUT;
+use crate::server::query::error::{codes, states, ProtocolError};
+use crate::server::query::{QueryEngine, QueryError};
+use crate::tls::TlsConfig;
+use crate::txn::IsolationLevel;
 
-use super::codec::{PacketError, PacketType, TdsReader, TdsWriter};
-use super::login::{self, Login7};
-use super::prelogin;
-use super::token;
-use super::types;
+use super::codec::{
+    Message, PacketError, PacketType, TdsReader, TdsWriter, DEFAULT_PACKET_SIZE, MIN_PACKET_SIZE,
+};
+use super::login::{
+    decode_ucs2, parse_login7, Login7, FEATURE_FEDAUTH, TDS_VERSION_7_4, TDS_VERSION_8_0,
+};
+use super::prelogin::{
+    encode_prelogin_response, negotiate_encryption, parse_prelogin, Encryption, SERVER_VERSION,
+};
+use super::sink::TdsSink;
+use super::token::{
+    put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
+    put_info, put_loginack, DEFAULT_COLLATION, DONE_ERROR, ENV_BEGIN_TRAN, ENV_COLLATION,
+    ENV_COMMIT_TRAN, ENV_DATABASE, ENV_LANGUAGE, ENV_PACKET_SIZE, ENV_ROLLBACK_TRAN, TOKEN_DONE,
+};
+use super::tunnel::PreloginTlsStream;
 
-/// TDS connection handler
-pub struct TdsConnection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    /// Direct reader for pre-login/login phase (before reader task starts).
-    reader: Option<TdsReader<BufReader<ReadHalf<S>>>>,
-    /// Channel for receiving messages from the reader task (post-login).
-    msg_rx: Option<mpsc::Receiver<Result<(PacketType, Vec<u8>), PacketError>>>,
-    /// Cancellation flag set by the reader task when Attention arrives.
-    cancelled: Arc<AtomicBool>,
-    writer: TdsWriter<BufWriter<WriteHalf<S>>>,
-    connection_id: u32,
-    client_ip: IpAddr,
-    storage: Arc<dyn StorageEngine>,
-    catalog: Arc<RwLock<Catalog>>,
-    session: Session,
-    txn_manager: Arc<TransactionManager>,
-    raft_node: Arc<RaftNode>,
-    mvcc: Arc<MvccStorage>,
-    /// Current transaction descriptor (8-byte value sent in ENVCHANGE)
-    transaction_descriptor: u64,
-    /// Next transaction descriptor to assign
-    next_tran_descriptor: u64,
+/// First byte of a TLS ClientHello record
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// Largest PRELOGIN message accepted
+const MAX_PRELOGIN: usize = 4096;
+/// Largest LOGIN7 message accepted
+const MAX_LOGIN: usize = 64 * 1024;
+/// Largest request (SQL batch, RPC) accepted after login
+const MAX_REQUEST: usize = 64 * 1024 * 1024;
+/// Largest packet size the server agrees to
+const MAX_NEGOTIATED_PACKET_SIZE: usize = 16 * 1024;
+
+/// Database reported to clients that did not select one
+const DEFAULT_DATABASE: &str = "default";
+
+/// SQL Server error: login failed
+const ERROR_LOGIN_FAILED: i32 = 18456;
+/// SQL Server error: cannot open the database requested by the login
+const ERROR_CANNOT_OPEN_DATABASE: i32 = 4060;
+
+// Transaction manager request types
+const TM_BEGIN_XACT: u16 = 5;
+const TM_COMMIT_XACT: u16 = 7;
+const TM_ROLLBACK_XACT: u16 = 8;
+
+/// TLS acceptors for the two TDS transports.
+#[derive(Clone)]
+pub struct TdsAcceptors {
+    /// TDS 8.0: TLS first, ALPN `tds/8.0`
+    strict: TlsAcceptor,
+    /// TDS 7.x: TLS 1.2 tunnelled after PRELOGIN
+    legacy: TlsAcceptor,
 }
 
-impl<S> TdsConnection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    pub fn new(
-        stream: S,
-        connection_id: u32,
-        client_ip: IpAddr,
-        storage: Arc<dyn StorageEngine>,
-        catalog: Arc<RwLock<Catalog>>,
-        txn_manager: Arc<TransactionManager>,
-        raft_node: Arc<RaftNode>,
-    ) -> Self {
-        let (read_half, write_half) = tokio::io::split(stream);
-        let mvcc = Arc::new(MvccStorage::new(storage.clone(), txn_manager.clone()));
-
+impl TdsAcceptors {
+    /// Build the acceptors from the server's TLS configuration.
+    pub fn new(tls_config: &TlsConfig) -> Self {
         Self {
-            reader: Some(TdsReader::new(BufReader::with_capacity(8192, read_half))),
-            msg_rx: None,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            writer: TdsWriter::new(BufWriter::with_capacity(8192, write_half)),
+            strict: TlsAcceptor::from(tls_config.tds_strict_config()),
+            legacy: TlsAcceptor::from(tls_config.tds_legacy_config()),
+        }
+    }
+}
+
+/// An encrypted client stream of either transport.
+trait ClientStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> ClientStream for T {}
+type BoxedStream = Box<dyn ClientStream>;
+type Sink = TdsSink<WriteHalf<BoxedStream>>;
+
+/// Why a connection ended before or during the request loop.
+#[derive(Debug, thiserror::Error)]
+enum TdsError {
+    #[error(transparent)]
+    Packet(#[from] PacketError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("protocol violation: {0}")]
+    Protocol(&'static str),
+    #[error(transparent)]
+    Engine(#[from] ProtocolError),
+}
+
+/// Serve one client connection on the TDS port.
+pub async fn serve(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    acceptors: TdsAcceptors,
+    ctx: ServerContext,
+) {
+    let connection_id = ctx.next_connection_id();
+    info!(%peer_addr, connection_id, "TDS client connected");
+
+    if let Err(e) = stream.set_nodelay(true) {
+        error!(%peer_addr, connection_id, error = %e, "Failed to set TCP_NODELAY");
+    }
+
+    // Transport setup and login must finish within the handshake timeout.
+    let login = establish(stream, peer_addr.ip(), connection_id, &acceptors, &ctx);
+    let mut conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, login).await {
+        Ok(Ok(Some(conn))) => conn,
+        Ok(Ok(None)) => {
+            info!(%peer_addr, connection_id, "TDS client refused");
+            return;
+        }
+        Ok(Err(e)) => {
+            warn!(%peer_addr, connection_id, error = %e, "TDS handshake failed");
+            return;
+        }
+        Err(_) => {
+            warn!(%peer_addr, connection_id, "TDS handshake timed out");
+            return;
+        }
+    };
+
+    match conn.run().await {
+        Ok(()) | Err(TdsError::Packet(PacketError::ConnectionClosed)) => {}
+        Err(e) => warn!(%peer_addr, connection_id, error = %e, "TDS connection error"),
+    }
+    conn.close().await;
+
+    crate::server::locks::global_lock_manager().release_all_for_connection(connection_id);
+    info!(%peer_addr, connection_id, "TDS client disconnected");
+}
+
+/// Read one message of the expected type.
+async fn expect_message<R: AsyncRead + Unpin>(
+    reader: R,
+    expected: PacketType,
+    max_len: usize,
+) -> Result<Vec<u8>, TdsError> {
+    let message = TdsReader::new(reader).read_message(max_len).await?;
+    if message.packet_type != expected {
+        return Err(TdsError::Packet(PacketError::UnexpectedType {
+            expected,
+            got: message.packet_type,
+        }));
+    }
+    Ok(message.payload)
+}
+
+/// Set up the encrypted transport. Returns `None` when the client was
+/// refused (not TDS, or unable to encrypt).
+async fn secure_transport(
+    mut stream: TcpStream,
+    acceptors: &TdsAcceptors,
+) -> Result<Option<BoxedStream>, TdsError> {
+    let mut first = [0u8; 1];
+    if stream.peek(&mut first).await? == 0 {
+        return Err(TdsError::Packet(PacketError::ConnectionClosed));
+    }
+
+    if first[0] == TLS_HANDSHAKE_RECORD {
+        // TDS 8.0: TLS first, then PRELOGIN inside it. The encryption
+        // option of that PRELOGIN is meaningless and ignored.
+        let mut tls = acceptors.strict.accept(stream).await?;
+        let prelogin = expect_message(&mut tls, PacketType::PreLogin, MAX_PRELOGIN).await?;
+        parse_prelogin(&prelogin).map_err(|_| TdsError::Protocol("malformed PRELOGIN"))?;
+        TdsWriter::new(&mut tls)
+            .write_message(
+                PacketType::TabularResult,
+                &encode_prelogin_response(Encryption::On),
+            )
+            .await?;
+        return Ok(Some(Box::new(tls)));
+    }
+
+    if first[0] != PacketType::PreLogin as u8 {
+        return Ok(None);
+    }
+
+    // TDS 7.x: cleartext PRELOGIN negotiates encryption.
+    let prelogin = expect_message(&mut stream, PacketType::PreLogin, MAX_PRELOGIN).await?;
+    let request =
+        parse_prelogin(&prelogin).map_err(|_| TdsError::Protocol("malformed PRELOGIN"))?;
+    let Some(encryption) = negotiate_encryption(request.encryption) else {
+        // Tell the client encryption is required, then close.
+        TdsWriter::new(&mut stream)
+            .write_message(
+                PacketType::TabularResult,
+                &encode_prelogin_response(Encryption::Required),
+            )
+            .await?;
+        return Ok(None);
+    };
+    TdsWriter::new(&mut stream)
+        .write_message(
+            PacketType::TabularResult,
+            &encode_prelogin_response(encryption),
+        )
+        .await?;
+
+    // TLS handshake tunnelled in PRELOGIN packets, then TLS on the socket.
+    let mut tls = acceptors
+        .legacy
+        .accept(PreloginTlsStream::new(stream))
+        .await?;
+    tls.get_mut().0.finish_handshake()?;
+    Ok(Some(Box::new(tls)))
+}
+
+/// Send a login failure and end the response.
+async fn refuse_login<W: AsyncWrite + Unpin>(
+    writer: W,
+    number: i32,
+    class: u8,
+    message: &str,
+) -> Result<(), TdsError> {
+    let mut tokens = Vec::new();
+    put_error(&mut tokens, number, 1, class, message);
+    put_done(&mut tokens, TOKEN_DONE, DONE_ERROR, 0);
+    TdsWriter::new(writer)
+        .write_message(PacketType::TabularResult, &tokens)
+        .await?;
+    Ok(())
+}
+
+/// Packet size to use for a client that asked for `requested` bytes.
+fn negotiate_packet_size(requested: u32) -> usize {
+    if requested == 0 {
+        DEFAULT_PACKET_SIZE
+    } else {
+        (requested as usize).clamp(MIN_PACKET_SIZE, MAX_NEGOTIATED_PACKET_SIZE)
+    }
+}
+
+/// Secure the transport and log the client in. Returns `None` when the
+/// client was refused.
+async fn establish(
+    stream: TcpStream,
+    client_ip: IpAddr,
+    connection_id: u32,
+    acceptors: &TdsAcceptors,
+    ctx: &ServerContext,
+) -> Result<Option<TdsConnection>, TdsError> {
+    let Some(mut tls) = secure_transport(stream, acceptors).await? else {
+        return Ok(None);
+    };
+
+    let payload = expect_message(&mut tls, PacketType::Tds7Login, MAX_LOGIN).await?;
+    let login = parse_login7(&payload).map_err(|_| TdsError::Protocol("malformed LOGIN7"))?;
+    debug!(connection_id, ?login, "LOGIN7 received");
+
+    // Every refusal an unauthenticated client can provoke reads the same.
+    let login_failed = format!("Login failed for user '{}'.", login.username);
+
+    if login.tds_version != TDS_VERSION_7_4 && login.tds_version != TDS_VERSION_8_0 {
+        warn!(
             connection_id,
-            client_ip,
-            storage,
-            catalog,
-            session: Session::new(connection_id),
-            txn_manager,
-            raft_node,
-            mvcc,
-            transaction_descriptor: 0,
-            next_tran_descriptor: 1,
-        }
-    }
-
-    /// Run the PRELOGIN + LOGIN7 handshake, then enter the command loop.
-    pub async fn run(&mut self) -> Result<(), PacketError> {
-        // Phase 1: PRELOGIN (direct reader)
-        self.handle_prelogin().await?;
-
-        // Phase 2: LOGIN7 (direct reader)
-        let login = self.handle_login7().await?;
-
-        // Phase 3: Authenticate and send login response
-        self.authenticate_and_respond(login).await?;
-
-        // Phase 4: Start reader task and enter command loop
-        self.start_reader_task();
-        self.command_loop().await
-    }
-
-    /// Read a message using the direct reader (pre-login/login phase).
-    async fn read_direct(&mut self) -> Result<(PacketType, Vec<u8>), PacketError> {
-        self.reader
-            .as_mut()
-            .expect("direct reader not available")
-            .read_message()
-            .await
-    }
-
-    async fn handle_prelogin(&mut self) -> Result<(), PacketError> {
-        let (pkt_type, payload) = self.read_direct().await?;
-        if pkt_type != PacketType::PreLogin {
-            return Err(PacketError::UnexpectedType {
-                expected: PacketType::PreLogin,
-                got: pkt_type,
-            });
-        }
-
-        let _prelogin = prelogin::parse_prelogin(&payload);
-        debug!(
-            connection_id = self.connection_id,
-            "Received PRELOGIN from client"
+            tds_version = format_args!("{:#010x}", login.tds_version),
+            "Unsupported TDS version"
         );
-
-        // Send PRELOGIN response
-        let response = prelogin::encode_prelogin_response();
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await?;
-
-        debug!(connection_id = self.connection_id, "Sent PRELOGIN response");
-        Ok(())
+        refuse_login(&mut tls, ERROR_LOGIN_FAILED, 14, &login_failed).await?;
+        return Ok(None);
+    }
+    if login.integrated_security || login.features.contains(&FEATURE_FEDAUTH) {
+        warn!(connection_id, "Client requested SSPI or federated login");
+        refuse_login(&mut tls, ERROR_LOGIN_FAILED, 14, &login_failed).await?;
+        return Ok(None);
     }
 
-    async fn handle_login7(&mut self) -> Result<Login7, PacketError> {
-        let (pkt_type, payload) = self.read_direct().await?;
-        if pkt_type != PacketType::Tds7Login {
-            return Err(PacketError::UnexpectedType {
-                expected: PacketType::Tds7Login,
-                got: pkt_type,
-            });
+    let authenticated =
+        auth::authenticate(&ctx.storage, &login.username, client_ip, |stored_hash| {
+            auth::verify_cleartext_password(&login.password, stored_hash)
+        })
+        .await;
+    match authenticated {
+        Ok(()) => {}
+        Err(AuthError::Denied) => {
+            refuse_login(&mut tls, ERROR_LOGIN_FAILED, 14, &login_failed).await?;
+            return Ok(None);
         }
+        Err(AuthError::Internal(e)) => {
+            warn!(connection_id, error = %e, "User lookup failed");
+            refuse_login(&mut tls, ERROR_LOGIN_FAILED, 14, &login_failed).await?;
+            return Ok(None);
+        }
+    }
 
-        let login = login::parse_login7(&payload).map_err(|e| {
-            PacketError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
-
-        debug!(
-            connection_id = self.connection_id,
-            username = %login.username,
-            database = %login.database,
-            tds_version = format!("0x{:08X}", login.tds_version),
-            "Received LOGIN7"
+    if !login.database.is_empty() && !ctx.catalog.read().database_exists(&login.database) {
+        let message = format!(
+            "Cannot open database \"{}\" requested by the login. The login failed.",
+            login.database
         );
-
-        Ok(login)
+        refuse_login(&mut tls, ERROR_CANNOT_OPEN_DATABASE, 11, &message).await?;
+        return Ok(None);
     }
 
-    /// Spawn a dedicated reader task that forwards messages via channel
-    /// and signals cancellation on Attention packets.
-    fn start_reader_task(&mut self) {
-        let mut reader = self.reader.take().expect("reader already taken");
-        let cancelled = self.cancelled.clone();
-        let conn_id = self.connection_id;
-
-        let (msg_tx, msg_rx) = mpsc::channel(4);
-        self.msg_rx = Some(msg_rx);
-
-        tokio::spawn(async move {
-            loop {
-                match reader.read_message().await {
-                    Ok((PacketType::Attention, _)) => {
-                        debug!(connection_id = conn_id, "Reader task: received ATTENTION");
-                        cancelled.store(true, Ordering::Release);
-                        // Don't forward Attention as a message — it's a signal only.
-                        // The command handler will check the cancelled flag.
-                    }
-                    Ok(msg) => {
-                        if msg_tx.send(Ok(msg)).await.is_err() {
-                            break; // Handler dropped, connection closing
-                        }
-                    }
-                    Err(PacketError::ConnectionClosed) => {
-                        let _ = msg_tx.send(Err(PacketError::ConnectionClosed)).await;
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = msg_tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-        });
+    let (read_half, write_half) = tokio::io::split(tls);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink: Sink = TdsSink::new(write_half, cancel.clone());
+    let mut engine = QueryEngine::new(connection_id, client_ip, ctx, Box::new(sink));
+    engine.session.set_user(login.username.clone());
+    if !login.database.is_empty() {
+        engine.session.set_database(Some(login.database.clone()));
     }
 
-    /// Read the next message from the reader task channel.
-    async fn recv_message(&mut self) -> Result<(PacketType, Vec<u8>), PacketError> {
-        match self
-            .msg_rx
-            .as_mut()
-            .expect("reader task not started")
-            .recv()
-            .await
-        {
-            Some(Ok(msg)) => Ok(msg),
-            Some(Err(e)) => Err(e),
-            None => Err(PacketError::ConnectionClosed),
-        }
-    }
+    let mut conn = TdsConnection {
+        connection_id,
+        engine,
+        cancel: cancel.clone(),
+        requests: spawn_reader(read_half, cancel),
+    };
+    conn.send_login_response(&login).await?;
 
-    /// Check if cancellation was requested (Attention received).
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
+    info!(connection_id, username = %login.username, "TDS login succeeded");
+    Ok(Some(conn))
+}
 
-    /// Clear the cancellation flag.
-    fn clear_cancelled(&self) {
-        self.cancelled.store(false, Ordering::Release);
-    }
-
-    async fn authenticate_and_respond(&mut self, login: Login7) -> Result<(), PacketError> {
-        let client_host = self.client_ip.to_string();
-
-        // Look up user
-        let user_info = self
-            .lookup_user(&login.username, &client_host)
-            .await
-            .map_err(|e| PacketError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // Verify password
-        match user_info {
-            Some((password_hash, account_locked, password_expired)) => {
-                if account_locked {
-                    return self.send_login_error("Account is locked").await;
-                }
-                if password_expired {
-                    return self.send_login_error("Password has expired").await;
-                }
-
-                // For TDS, the password comes in cleartext (decoded from LOGIN7 obfuscation).
-                // Verify it against the stored argon2 hash.
-                if !self.verify_password(&login.password, &password_hash) {
-                    return self.send_login_error("Login failed").await;
-                }
-            }
-            None => {
-                return self
-                    .send_login_error(&format!("Login failed for user '{}'", login.username))
-                    .await;
-            }
-        }
-
-        // Set session state
-        self.session.set_user(login.username.clone());
-        let db = if login.database.is_empty() {
-            "default".to_string()
-        } else {
-            login.database.clone()
-        };
-        self.session.set_database(Some(db.clone()));
-
-        // Send success response
-        let response = token::build_login_response(&db);
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await?;
-
-        info!(
-            connection_id = self.connection_id,
-            username = %self.session.user,
-            database = %db,
-            "TDS login successful"
-        );
-
-        Ok(())
-    }
-
-    /// Verify a plaintext password against a stored SHA1(SHA1(password)) hex hash.
-    fn verify_password(&self, password: &str, stored_hash: &str) -> bool {
-        crate::init::verify_password(password, stored_hash)
-    }
-
-    async fn send_login_error(&mut self, message: &str) -> Result<(), PacketError> {
-        let response = token::build_login_error_response(message);
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await?;
-        Err(PacketError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            message.to_string(),
-        )))
-    }
-
-    /// Look up user in system.users table (same as MySQL protocol handler)
-    async fn lookup_user(
-        &self,
-        username: &str,
-        client_host: &str,
-    ) -> Result<Option<(String, bool, bool)>, String> {
-        use crate::sql::privileges::HostPattern;
-
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(|e| format!("Storage error: {}", e))?;
-
-        for (_key, value) in rows {
-            let row = match decode_row(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            let row_username = match row.get_opt(0) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
-            };
-
-            if row_username != username {
-                continue;
-            }
-
-            let row_host = match row.get_opt(1) {
-                Some(Datum::String(s)) => s,
-                _ => continue,
-            };
-
-            let host_pattern = HostPattern::new(row_host);
-            if !host_pattern.matches(client_host, None) {
-                continue;
-            }
-
-            let password_hash = match row.get_opt(2) {
-                Some(Datum::String(s)) => s.clone(),
-                Some(Datum::Null) | None => String::new(),
-                _ => continue,
-            };
-
-            let account_locked = match row.get_opt(6) {
-                Some(Datum::Bool(b)) => *b,
-                _ => false,
-            };
-
-            let password_expired = match row.get_opt(7) {
-                Some(Datum::Bool(b)) => *b,
-                _ => false,
-            };
-
-            return Ok(Some((password_hash, account_locked, password_expired)));
-        }
-
-        Ok(None)
-    }
-
-    /// Main command loop after successful login.
-    async fn command_loop(&mut self) -> Result<(), PacketError> {
+/// Read requests on their own task, so an attention signal is seen while
+/// a statement is still executing.
+fn spawn_reader(
+    read_half: ReadHalf<BoxedStream>,
+    cancel: Arc<AtomicBool>,
+) -> mpsc::Receiver<Result<Message, PacketError>> {
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut reader = TdsReader::new(BufReader::with_capacity(8192, read_half));
         loop {
-            // Clear any stale cancellation before reading next command
-            self.clear_cancelled();
+            let result = reader.read_message(MAX_REQUEST).await;
+            let last = result.is_err();
+            if matches!(&result, Ok(m) if m.packet_type == PacketType::Attention) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            if tx.send(result).await.is_err() || last {
+                break;
+            }
+        }
+    });
+    rx
+}
 
-            let (pkt_type, payload) = match self.recv_message().await {
-                Ok(msg) => msg,
-                Err(PacketError::ConnectionClosed) => {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "TDS client disconnected"
-                    );
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            };
+/// A logged-in TDS session.
+struct TdsConnection {
+    connection_id: u32,
+    engine: QueryEngine,
+    /// Raised by the reader when the client cancels the running request
+    cancel: Arc<AtomicBool>,
+    requests: mpsc::Receiver<Result<Message, PacketError>>,
+}
 
-            match pkt_type {
-                PacketType::SqlBatch => {
-                    let r = self.handle_sql_batch(&payload).await;
-                    if let Err(ref e) = r {
-                        warn!(connection_id = self.connection_id, error = %e, "SQL batch failed");
+/// Session facts the client tracks through ENVCHANGE tokens.
+struct Environment {
+    database: Option<String>,
+    transaction: Option<u64>,
+}
+
+/// Skip the ALL_HEADERS block that starts every request: a total length
+/// (u32, counting itself) followed by headers.
+fn skip_all_headers(payload: &[u8]) -> Result<&[u8], TdsError> {
+    let bad = TdsError::Protocol("malformed ALL_HEADERS");
+    let Some(len) = payload.get(..4) else {
+        return Err(bad);
+    };
+    let total = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+    if total < 4 {
+        return Err(bad);
+    }
+    payload.get(total..).ok_or(bad)
+}
+
+impl TdsConnection {
+    /// The TDS encoder this connection installed in the engine.
+    fn sink(&mut self) -> &mut Sink {
+        self.engine
+            .out
+            .as_any_mut()
+            .downcast_mut()
+            .expect("engine sink is the TdsSink this connection created")
+    }
+
+    fn environment(&self) -> Environment {
+        Environment {
+            database: self.engine.session.database.clone(),
+            transaction: self.engine.session.current_txn,
+        }
+    }
+
+    /// Tell the client it is logged in and describe the session.
+    async fn send_login_response(&mut self, login: &Login7) -> Result<(), TdsError> {
+        let database = self
+            .engine
+            .session
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
+        let packet_size = negotiate_packet_size(login.packet_size);
+        let acknowledge_features = !login.features.is_empty();
+
+        let sink = self.sink();
+        let tokens = sink.tokens();
+        put_envchange_string(tokens, ENV_DATABASE, &database, "master");
+        put_info(
+            tokens,
+            5701,
+            2,
+            0,
+            &format!("Changed database context to '{}'.", database),
+        );
+        put_envchange_binary(tokens, ENV_COLLATION, &DEFAULT_COLLATION, &[]);
+        put_envchange_string(tokens, ENV_LANGUAGE, "us_english", "");
+        put_info(
+            tokens,
+            5703,
+            1,
+            0,
+            "Changed language setting to us_english.",
+        );
+        put_loginack(
+            tokens,
+            [
+                SERVER_VERSION[0],
+                SERVER_VERSION[1],
+                SERVER_VERSION[2],
+                SERVER_VERSION[3],
+            ],
+        );
+        if acknowledge_features {
+            put_featureextack_none(tokens);
+        }
+        put_envchange_string(
+            tokens,
+            ENV_PACKET_SIZE,
+            &packet_size.to_string(),
+            &DEFAULT_PACKET_SIZE.to_string(),
+        );
+        sink.finish(false).await?;
+        // The new size applies from the next message on.
+        sink.writer().set_packet_size(packet_size);
+        Ok(())
+    }
+
+    /// Serve requests until the client disconnects.
+    async fn run(&mut self) -> Result<(), TdsError> {
+        while let Some(message) = self.requests.recv().await {
+            let message = message?;
+            match message.packet_type {
+                PacketType::Attention => {
+                    // Acknowledge unless the request it interrupted
+                    // already did.
+                    if self.cancel.swap(false, Ordering::Relaxed) {
+                        self.sink().finish(true).await?;
                     }
-                    r?;
+                }
+                PacketType::SqlBatch => {
+                    let before = self.environment();
+                    let sql = self.sql_batch(&message.payload)?;
+                    debug!(connection_id = self.connection_id, sql = %sql, "SQL batch");
+                    self.execute(&sql).await?;
+                    let rolled_back = sql.trim_start().to_uppercase().starts_with("ROLLBACK");
+                    self.finish_request(before, rolled_back).await?;
                 }
                 PacketType::TransactionManager => {
-                    self.handle_transaction_manager(&payload).await?;
+                    let before = self.environment();
+                    let rolled_back = self.transaction_request(&message.payload).await?;
+                    self.finish_request(before, rolled_back).await?;
                 }
                 PacketType::Rpc => {
-                    self.handle_rpc(&payload).await?;
+                    let before = self.environment();
+                    self.engine.out.error(&QueryError::new(
+                        codes::ER_UNKNOWN_COM_ERROR,
+                        states::GENERAL_ERROR,
+                        "Remote procedure calls are not supported",
+                    ));
+                    self.finish_request(before, false).await?;
                 }
-                other => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        packet_type = ?other,
-                        "Unsupported TDS packet type"
-                    );
-                    let err = token::encode_error(
-                        0,
-                        1,
-                        16,
-                        &format!("Unsupported packet type: {:?}", other),
-                        "RooDB",
-                    );
-                    let done = token::encode_done(token::DONE_ERROR, 0, 0);
-                    let mut response = err;
-                    response.extend_from_slice(&done);
-                    self.writer
-                        .write_message(PacketType::TabularResult, &response)
-                        .await?;
-                }
-            }
-
-            // If Attention arrived after the command already completed and sent its
-            // response, just clear the flag. The client's asyncWaitCancel unblocks
-            // when scan() finishes reading the normal response (via onDone), so
-            // sending an extra DONE_ATTN would corrupt the protocol stream.
-            if self.is_cancelled() {
-                self.clear_cancelled();
-                debug!(
-                    connection_id = self.connection_id,
-                    "Cleared late ATTENTION (command already completed)"
-                );
+                _ => return Err(TdsError::Protocol("unexpected message type")),
             }
         }
-    }
-
-    /// Handle an SQL Batch message.
-    ///
-    /// Format: ALL_HEADERS + UCS-2LE SQL text
-    async fn handle_sql_batch(&mut self, payload: &[u8]) -> Result<(), PacketError> {
-        // Skip ALL_HEADERS
-        if payload.len() < 4 {
-            return self.send_tds_error("Invalid SQL batch: too short").await;
-        }
-
-        let total_header_len =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-
-        if total_header_len > payload.len() {
-            return self
-                .send_tds_error("Invalid SQL batch: header length exceeds payload")
-                .await;
-        }
-
-        // Extract transaction descriptor from ALL_HEADERS if present
-        // (client sends its current transaction descriptor)
-
-        // The SQL text starts after ALL_HEADERS, encoded as UCS-2LE
-        let sql_data = &payload[total_header_len..];
-        let sql = decode_ucs2_str(sql_data);
-        let sql = sql.trim();
-
-        debug!(
-            connection_id = self.connection_id,
-            sql = %sql,
-            "TDS SQL Batch"
-        );
-
-        if sql.is_empty() {
-            let done = token::encode_done(token::DONE_FINAL, 0, 0);
-            self.writer
-                .write_message(PacketType::TabularResult, &done)
-                .await?;
-            return Ok(());
-        }
-
-        // Check for transaction commands
-        let sql_upper = sql.to_uppercase();
-        if sql_upper.starts_with("BEGIN TRANSACTION")
-            || sql_upper.starts_with("BEGIN TRAN")
-            || sql_upper == "BEGIN"
-        {
-            return self.handle_begin_transaction().await;
-        }
-        if sql_upper.starts_with("COMMIT") {
-            return self.handle_commit_transaction().await;
-        }
-        if sql_upper.starts_with("ROLLBACK") {
-            return self.handle_rollback_transaction().await;
-        }
-
-        // Handle SET statements
-        if sql_upper.starts_with("SET ") {
-            // Accept SET statements silently
-            let done = token::encode_done(token::DONE_FINAL, 0, 0);
-            self.writer
-                .write_message(PacketType::TabularResult, &done)
-                .await?;
-            return Ok(());
-        }
-
-        // Parse and execute SQL
-        self.execute_sql(sql).await
-    }
-
-    /// Execute a SQL statement and send the result as TDS tokens.
-    async fn execute_sql(&mut self, sql: &str) -> Result<(), PacketError> {
-        // Parse
-        let stmt = match Parser::parse_one(sql) {
-            Ok(s) => s,
-            Err(e) => {
-                return self.send_tds_error(&e.to_string()).await;
-            }
-        };
-
-        debug!(connection_id = self.connection_id, "SQL parsed");
-
-        // Resolve, type check, and plan
-        enum PlanError {
-            Sql(crate::sql::SqlError),
-            Planner(crate::planner::PlannerError),
-        }
-
-        let plan_result: Result<PhysicalPlan, PlanError> = (|| {
-            let catalog_guard = self.catalog.read();
-            let resolved = Resolver::new(&catalog_guard)
-                .resolve(stmt)
-                .map_err(PlanError::Sql)?;
-            TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
-            let logical = LogicalPlanBuilder::build(resolved).map_err(PlanError::Planner)?;
-            let optimized = Optimizer::new().optimize(logical);
-            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)
-        })();
-
-        let physical = match plan_result {
-            Ok(p) => p,
-            Err(PlanError::Sql(e)) => {
-                return self.send_tds_error(&e.to_string()).await;
-            }
-            Err(PlanError::Planner(e)) => {
-                return self.send_tds_error(&e.to_string()).await;
-            }
-        };
-
-        debug!(connection_id = self.connection_id, plan = ?physical, "Plan ready");
-        let result = self.execute_plan(physical).await;
-        debug!(
-            connection_id = self.connection_id,
-            ok = result.is_ok(),
-            err = ?result.as_ref().err(),
-            "execute_plan returned"
-        );
-        result
-    }
-
-    /// Execute a physical plan and send TDS result tokens.
-    async fn execute_plan(&mut self, plan: PhysicalPlan) -> Result<(), PacketError> {
-        let returns_rows = matches!(
-            plan,
-            PhysicalPlan::TableScan { .. }
-                | PhysicalPlan::PointGet { .. }
-                | PhysicalPlan::RangeScan { .. }
-                | PhysicalPlan::Filter { .. }
-                | PhysicalPlan::Project { .. }
-                | PhysicalPlan::Sort { .. }
-                | PhysicalPlan::Limit { .. }
-                | PhysicalPlan::HashDistinct { .. }
-                | PhysicalPlan::HashAggregate { .. }
-                | PhysicalPlan::NestedLoopJoin { .. }
-        );
-
-        let is_ddl = matches!(
-            plan,
-            PhysicalPlan::CreateTable { .. }
-                | PhysicalPlan::DropTable { .. }
-                | PhysicalPlan::CreateIndex { .. }
-                | PhysicalPlan::DropIndex { .. }
-        );
-
-        let mvcc = self.mvcc.clone();
-
-        let (txn_context, implicit_txn_id) = if is_ddl {
-            (None, None)
-        } else if let Some(txn_id) = self.session.current_txn {
-            let read_view = self.txn_manager.create_read_view(txn_id).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            let pending = self.session.get_pending_changes();
-            (
-                Some(TransactionContext::with_pending_changes(
-                    txn_id, read_view, pending,
-                )),
-                None,
-            )
-        } else if !returns_rows && self.session.autocommit {
-            let txn = self
-                .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)
-                .map_err(|e| {
-                    PacketError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-            let read_view = self.txn_manager.create_read_view(txn.txn_id).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            (
-                Some(TransactionContext::new(txn.txn_id, read_view)),
-                Some(txn.txn_id),
-            )
-        } else {
-            let read_view = self.txn_manager.create_read_view(0).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            (Some(TransactionContext::new(0, read_view)), None)
-        };
-
-        if returns_rows {
-            let columns = plan.output_columns();
-            let engine = ExecutorEngine::with_raft(
-                mvcc,
-                self.catalog.clone(),
-                txn_context,
-                self.raft_node.clone(),
-            );
-            debug!(connection_id = self.connection_id, "Building executor");
-            let mut executor = engine.build(plan).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            debug!(
-                connection_id = self.connection_id,
-                "Calling executor.open()"
-            );
-            executor.open().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-            debug!(
-                connection_id = self.connection_id,
-                "executor.open() returned"
-            );
-
-            // Build complete response
-            let mut response = Vec::with_capacity(4096);
-
-            // COLMETADATA
-            response.extend_from_slice(&types::encode_colmetadata(&columns));
-
-            // ROW tokens — check for cancellation between rows
-            let mut row_count: u64 = 0;
-            let mut cancelled = false;
-            while let Some(row) = executor.next().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })? {
-                if self.is_cancelled() {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "Query cancelled by ATTENTION after {} rows", row_count
-                    );
-                    cancelled = true;
-                    break;
-                }
-                response.extend_from_slice(&types::encode_row(row.values(), &columns));
-                row_count += 1;
-            }
-
-            executor.close().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            if cancelled {
-                // Discard buffered response and send DONE with ATTN flag
-                self.clear_cancelled();
-                let done = token::encode_done(token::DONE_ATTN, 0, 0);
-                self.writer
-                    .write_message(PacketType::TabularResult, &done)
-                    .await?;
-            } else {
-                // Check for late Attention (arrived after all rows iterated).
-                // If the cancel flag is set, use DONE_ATTN so the client's
-                // scan() returns MsgCancel → done() → signals onDone.
-                let done_status = if self.is_cancelled() {
-                    self.clear_cancelled();
-                    token::DONE_ATTN | token::DONE_COUNT
-                } else {
-                    token::DONE_COUNT
-                };
-                response.extend_from_slice(&token::encode_done(
-                    done_status,
-                    0x00C1, // SELECT command
-                    row_count,
-                ));
-
-                debug!(
-                    connection_id = self.connection_id,
-                    response_len = response.len(),
-                    first_bytes = ?&response[..response.len().min(64)],
-                    last_bytes = ?&response[response.len().saturating_sub(16)..],
-                    "Sending SELECT response"
-                );
-                self.writer
-                    .write_message(PacketType::TabularResult, &response)
-                    .await?;
-            }
-        } else {
-            // DML/DDL
-            let engine = ExecutorEngine::with_raft(
-                mvcc,
-                self.catalog.clone(),
-                txn_context,
-                self.raft_node.clone(),
-            );
-            let mut executor = engine.build(plan).map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            executor.open().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            let mut affected = 0u64;
-            while let Some(row) = executor.next().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })? {
-                if let Some(Datum::Int(n)) = row.get_opt(0) {
-                    affected += *n as u64;
-                } else {
-                    affected += 1;
-                }
-            }
-            executor.close().await.map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            // Commit changes
-            let changes = executor.take_changes();
-            if !changes.is_empty() {
-                if self.session.in_transaction() {
-                    self.session.add_pending_changes(changes);
-                } else {
-                    let changeset =
-                        ChangeSet::new_with_changes(implicit_txn_id.unwrap_or(0), changes);
-                    self.raft_node
-                        .propose_changes(changeset)
-                        .await
-                        .map_err(|e| {
-                            PacketError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        })?;
-                }
-            }
-
-            if let Some(txn_id) = implicit_txn_id {
-                self.txn_manager.commit(txn_id).await.map_err(|e| {
-                    PacketError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-            }
-
-            // Send DONE with count
-            let done = token::encode_done(token::DONE_COUNT, 0x00C1, affected);
-            self.writer
-                .write_message(PacketType::TabularResult, &done)
-                .await?;
-        }
-
         Ok(())
     }
 
-    /// Handle Transaction Manager request.
-    async fn handle_transaction_manager(&mut self, payload: &[u8]) -> Result<(), PacketError> {
-        // Skip ALL_HEADERS
-        if payload.len() < 4 {
-            return self.send_tds_error("Invalid transaction request").await;
+    /// Execute SQL, reporting results through the sink. An error here is
+    /// one the engine could not turn into a statement error; the client is
+    /// told before the connection is given up.
+    async fn execute(&mut self, sql: &str) -> Result<(), TdsError> {
+        if let Err(e) = self.engine.handle_query(sql).await {
+            let _ = self.engine.send_error_from_protocol_error(&e).await;
+            let _ = self.sink().finish(false).await;
+            return Err(e.into());
         }
+        Ok(())
+    }
 
-        let total_header_len =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-
-        if total_header_len + 2 > payload.len() {
-            return self.send_tds_error("Invalid transaction request").await;
+    /// The SQL text of a batch request.
+    fn sql_batch(&self, payload: &[u8]) -> Result<String, TdsError> {
+        let text = skip_all_headers(payload)?;
+        if text.len() % 2 != 0 {
+            return Err(TdsError::Protocol("SQL text is not UTF-16"));
         }
+        Ok(decode_ucs2(text))
+    }
 
-        let request_type =
-            u16::from_le_bytes([payload[total_header_len], payload[total_header_len + 1]]);
+    /// Run a transaction manager request. Returns whether it was a
+    /// rollback.
+    async fn transaction_request(&mut self, payload: &[u8]) -> Result<bool, TdsError> {
+        let body = skip_all_headers(payload)?;
+        let Some(kind) = body.get(..2) else {
+            return Err(TdsError::Protocol("malformed transaction request"));
+        };
+        let args = &body[2..];
 
-        match request_type {
-            5 => {
-                // TM_BEGIN_XACT
-                let iso_level = if total_header_len + 3 <= payload.len() {
-                    payload[total_header_len + 2]
-                } else {
-                    0 // default
+        match u16::from_le_bytes([kind[0], kind[1]]) {
+            TM_BEGIN_XACT => {
+                // Isolation level byte; 0 keeps the session's level.
+                let level = match args.first() {
+                    Some(1) => Some(IsolationLevel::ReadUncommitted),
+                    Some(2) => Some(IsolationLevel::ReadCommitted),
+                    Some(3) | Some(5) => Some(IsolationLevel::RepeatableRead),
+                    Some(4) => Some(IsolationLevel::Serializable),
+                    _ => None,
                 };
-                self.handle_begin_transaction_with_iso(iso_level).await
+                if let Some(level) = level {
+                    self.engine.session.set_isolation_level(level);
+                }
+                self.execute("BEGIN").await?;
+                Ok(false)
             }
-            7 => {
-                // TM_COMMIT_XACT
-                self.handle_commit_transaction().await
+            TM_COMMIT_XACT => {
+                self.execute("COMMIT").await?;
+                Ok(false)
             }
-            8 => {
-                // TM_ROLLBACK_XACT
-                self.handle_rollback_transaction().await
+            TM_ROLLBACK_XACT => {
+                self.execute("ROLLBACK").await?;
+                Ok(true)
             }
             _ => {
-                self.send_tds_error(&format!(
-                    "Unsupported transaction manager request: {}",
-                    request_type
-                ))
-                .await
+                self.engine.out.error(&QueryError::new(
+                    codes::ER_UNKNOWN_COM_ERROR,
+                    states::GENERAL_ERROR,
+                    "This transaction manager request is not supported",
+                ));
+                Ok(false)
             }
         }
     }
 
-    /// Handle BEGIN TRANSACTION (via SQL or transaction manager).
-    async fn handle_begin_transaction(&mut self) -> Result<(), PacketError> {
-        self.handle_begin_transaction_with_iso(0).await
-    }
-
-    async fn handle_begin_transaction_with_iso(
+    /// Complete the response: report what changed in the session, then
+    /// the final DONE, acknowledging a cancellation if one arrived.
+    async fn finish_request(
         &mut self,
-        iso_level: u8,
-    ) -> Result<(), PacketError> {
-        let isolation = match iso_level {
-            1 => IsolationLevel::ReadUncommitted,
-            2 => IsolationLevel::ReadCommitted,
-            3 => IsolationLevel::RepeatableRead,
-            _ => self.session.isolation_level,
-        };
+        before: Environment,
+        rolled_back: bool,
+    ) -> Result<(), TdsError> {
+        let after = self.environment();
+        let cancelled = self.cancel.swap(false, Ordering::Relaxed);
+        let sink = self.sink();
+        let tokens = sink.tokens();
 
-        let txn = self
-            .txn_manager
-            .begin(isolation, self.session.is_read_only)
-            .map_err(|e| {
-                PacketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-        self.session.begin_transaction(txn.txn_id);
-
-        // Assign a transaction descriptor
-        let tran_desc = self.next_tran_descriptor;
-        self.next_tran_descriptor += 1;
-        self.transaction_descriptor = tran_desc;
-
-        // Send ENVCHANGE (begin transaction) + DONE
-        let mut response = Vec::with_capacity(64);
-        let desc_bytes = tran_desc.to_le_bytes();
-        response.extend_from_slice(&token::encode_envchange_binary(
-            token::ENV_BEGIN_TRAN,
-            &desc_bytes,
-            &[],
-        ));
-        response.extend_from_slice(&token::encode_done(token::DONE_FINAL, 0, 0));
-
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await
-    }
-
-    /// Handle COMMIT TRANSACTION.
-    async fn handle_commit_transaction(&mut self) -> Result<(), PacketError> {
-        if let Some(txn_id) = self.session.current_txn {
-            let changes = self.session.take_pending_changes();
-            if !changes.is_empty() {
-                let changeset = ChangeSet::new_with_changes(txn_id, changes);
-                self.raft_node
-                    .propose_changes(changeset)
-                    .await
-                    .map_err(|e| {
-                        PacketError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?;
+        if before.database != after.database {
+            put_envchange_string(
+                tokens,
+                ENV_DATABASE,
+                after.database.as_deref().unwrap_or(DEFAULT_DATABASE),
+                before.database.as_deref().unwrap_or(DEFAULT_DATABASE),
+            );
+        }
+        match (before.transaction, after.transaction) {
+            (None, Some(new)) => {
+                put_envchange_binary(tokens, ENV_BEGIN_TRAN, &new.to_le_bytes(), &[]);
             }
-
-            let _ = self.txn_manager.commit(txn_id).await;
-            self.session.end_transaction();
+            (Some(old), None) => {
+                let kind = if rolled_back {
+                    ENV_ROLLBACK_TRAN
+                } else {
+                    ENV_COMMIT_TRAN
+                };
+                put_envchange_binary(tokens, kind, &[], &old.to_le_bytes());
+            }
+            _ => {}
         }
 
-        let old_desc = self.transaction_descriptor.to_le_bytes();
-        self.transaction_descriptor = 0;
-
-        let mut response = Vec::with_capacity(64);
-        response.extend_from_slice(&token::encode_envchange_binary(
-            token::ENV_COMMIT_TRAN,
-            &[0; 0], // no new transaction
-            &old_desc,
-        ));
-        response.extend_from_slice(&token::encode_done(token::DONE_FINAL, 0, 0));
-
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await
+        sink.finish(cancelled).await?;
+        Ok(())
     }
 
-    /// Handle ROLLBACK TRANSACTION.
-    async fn handle_rollback_transaction(&mut self) -> Result<(), PacketError> {
-        self.session.clear_pending_changes();
-
-        if let Some(txn_id) = self.session.current_txn {
-            let _ = self.txn_manager.rollback(txn_id).await;
-            self.session.end_transaction();
-        }
-
-        let old_desc = self.transaction_descriptor.to_le_bytes();
-        self.transaction_descriptor = 0;
-
-        let mut response = Vec::with_capacity(64);
-        response.extend_from_slice(&token::encode_envchange_binary(
-            token::ENV_ROLLBACK_TRAN,
-            &[0; 0],
-            &old_desc,
-        ));
-        response.extend_from_slice(&token::encode_done(token::DONE_FINAL, 0, 0));
-
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await
-    }
-
-    /// Handle RPC request.
-    async fn handle_rpc(&mut self, payload: &[u8]) -> Result<(), PacketError> {
-        // Skip ALL_HEADERS
-        if payload.len() < 4 {
-            return self.send_tds_error("Invalid RPC request").await;
-        }
-
-        let total_header_len =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-
-        if total_header_len >= payload.len() {
-            return self.send_tds_error("Invalid RPC request").await;
-        }
-
-        let rpc_data = &payload[total_header_len..];
-
-        // Check if this is a well-known proc (ProcIDSwitch = 0xFFFF)
-        if rpc_data.len() >= 4 {
-            let proc_id_switch = u16::from_le_bytes([rpc_data[0], rpc_data[1]]);
-
-            if proc_id_switch == 0xFFFF {
-                let proc_id = u16::from_le_bytes([rpc_data[2], rpc_data[3]]);
-                // let _options = u16::from_le_bytes([rpc_data[4], rpc_data[5]]);
-
-                match proc_id {
-                    10 => {
-                        // sp_executesql - extract SQL from first NTEXT parameter
-                        return self.handle_sp_executesql(&rpc_data[6..]).await;
-                    }
-                    _ => {
-                        return self
-                            .send_tds_error(&format!("Unsupported RPC proc ID: {}", proc_id))
-                            .await;
-                    }
-                }
+    /// Release what the session holds once the client is gone.
+    async fn close(&mut self) {
+        if self.engine.session.in_transaction() {
+            if let Err(e) = self.engine.handle_query("ROLLBACK").await {
+                warn!(connection_id = self.connection_id, error = %e, "Rollback on disconnect failed");
             }
         }
-
-        self.send_tds_error("Unsupported RPC format").await
-    }
-
-    /// Handle sp_executesql RPC: extract the SQL and parameters, substitute, and execute.
-    async fn handle_sp_executesql(&mut self, param_data: &[u8]) -> Result<(), PacketError> {
-        let sql = match super::params::parse_and_substitute(param_data) {
-            Some(s) => s,
-            None => {
-                return self
-                    .send_tds_error("Could not parse sp_executesql parameters")
-                    .await;
-            }
-        };
-
-        let sql = sql.trim();
-        if sql.is_empty() {
-            let done = token::encode_done(token::DONE_FINAL, 0, 0);
-            self.writer
-                .write_message(PacketType::TabularResult, &done)
-                .await?;
-            return Ok(());
-        }
-
-        self.execute_sql(sql).await
-    }
-
-    /// Send a TDS error response.
-    async fn send_tds_error(&mut self, message: &str) -> Result<(), PacketError> {
-        let mut response = Vec::with_capacity(256);
-        response.extend_from_slice(&token::encode_error(0, 1, 16, message, "RooDB"));
-        response.extend_from_slice(&token::encode_done(token::DONE_ERROR, 0, 0));
-
-        self.writer
-            .write_message(PacketType::TabularResult, &response)
-            .await
+        self.engine.cleanup_temp_tables().await;
     }
 }
 
-/// Decode a UCS-2LE byte slice to a String.
-pub fn decode_ucs2_str(data: &[u8]) -> String {
-    let chars: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&chars)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_size_negotiation_is_clamped() {
+        assert_eq!(negotiate_packet_size(0), DEFAULT_PACKET_SIZE);
+        assert_eq!(negotiate_packet_size(4096), 4096);
+        assert_eq!(negotiate_packet_size(8000), 8000);
+        assert_eq!(negotiate_packet_size(1), MIN_PACKET_SIZE);
+        assert_eq!(negotiate_packet_size(u32::MAX), MAX_NEGOTIATED_PACKET_SIZE);
+    }
+
+    #[test]
+    fn all_headers_are_skipped_with_bounds_checks() {
+        // Total length 4: no headers, the rest is the request body
+        assert_eq!(skip_all_headers(&[4, 0, 0, 0, 9, 9]).unwrap(), &[9, 9]);
+        // One 18-byte transaction descriptor header (total 22)
+        let mut payload = vec![22, 0, 0, 0, 18, 0, 0, 0, 2, 0];
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(b"body");
+        assert_eq!(skip_all_headers(&payload).unwrap(), b"body");
+        // Exactly the headers, empty body
+        assert_eq!(skip_all_headers(&[4, 0, 0, 0]).unwrap(), b"");
+
+        // Too short, total below its own size, total past the end
+        assert!(skip_all_headers(&[]).is_err());
+        assert!(skip_all_headers(&[4, 0, 0]).is_err());
+        assert!(skip_all_headers(&[3, 0, 0, 0, 1]).is_err());
+        assert!(skip_all_headers(&[9, 0, 0, 0, 1]).is_err());
+        assert!(skip_all_headers(&[0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+    }
 }

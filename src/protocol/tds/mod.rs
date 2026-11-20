@@ -6,6 +6,7 @@
 //! mandatory on both.
 
 pub mod codec;
+pub mod connection;
 pub mod login;
 pub mod prelogin;
 pub mod sink;

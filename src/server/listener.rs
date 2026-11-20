@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
+use crate::protocol::tds::{self, connection::TdsAcceptors};
 use crate::raft::RaftNode;
 use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
@@ -31,6 +32,10 @@ pub enum ServerError {
 pub struct RooDbServer {
     addr: SocketAddr,
     tls_acceptor: TlsAcceptor,
+    /// TLS acceptors for the TDS listener
+    tds_acceptors: TdsAcceptors,
+    /// Address of the TDS listener, if enabled
+    tds_addr: Option<SocketAddr>,
     ctx: ServerContext,
 }
 
@@ -47,8 +52,16 @@ impl RooDbServer {
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
+            tds_acceptors: TdsAcceptors::new(&tls_config),
+            tds_addr: None,
             ctx: ServerContext::new(storage, catalog, txn_manager, raft_node),
         }
+    }
+
+    /// Also accept TDS (SQL Server protocol) clients on `addr`.
+    pub fn enable_tds(mut self, addr: SocketAddr) -> Self {
+        self.tds_addr = Some(addr);
+        self
     }
 
     /// Get the listen address
@@ -86,6 +99,15 @@ impl RooDbServer {
     ) -> Result<(), ServerError> {
         tracing::info!(addr = %self.addr, "RooDB server listening (STARTTLS enabled)");
 
+        let tds_listener = match self.tds_addr {
+            Some(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                tracing::info!(%addr, "TDS listener enabled (TLS required)");
+                Some(listener)
+            }
+            None => None,
+        };
+
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
@@ -99,12 +121,32 @@ impl RooDbServer {
                         self.ctx.clone(),
                     ));
                 }
+                result = accept_optional(&tds_listener) => {
+                    let (stream, peer_addr) = result?;
+                    tokio::spawn(tds::connection::serve(
+                        stream,
+                        peer_addr,
+                        self.tds_acceptors.clone(),
+                        self.ctx.clone(),
+                    ));
+                }
                 _ = &mut shutdown => {
                     tracing::info!("RooDB server shutting down");
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Accept on a listener that may not be configured; without one this
+/// never resolves.
+async fn accept_optional(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
     }
 }
 

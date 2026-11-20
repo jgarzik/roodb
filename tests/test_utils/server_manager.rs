@@ -17,6 +17,7 @@ use super::certs::{write_raft_cluster_certs, RaftCertFiles};
 use super::cleanup::register_cleanup_handler;
 
 const TEST_PORT: u16 = 13307;
+const TDS_TEST_PORT: u16 = 13308;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KILL_WAIT: Duration = Duration::from_millis(500);
@@ -90,6 +91,11 @@ impl ServerManager {
         state.port
     }
 
+    /// Get the TDS (SQL Server protocol) port.
+    pub fn tds_port(&self) -> u16 {
+        TDS_TEST_PORT
+    }
+
     /// Initialize the server (called once on first access).
     fn initialize_once(&self) {
         let mut state = self.inner.lock().unwrap();
@@ -102,6 +108,7 @@ impl ServerManager {
 
         // Kill any existing server on our port
         Self::kill_existing_server_cross_platform(state.port);
+        Self::kill_existing_server_cross_platform(TDS_TEST_PORT);
 
         // Initialize tracing (only first call succeeds)
         let _ = tracing_subscriber::fmt()
@@ -130,6 +137,8 @@ impl ServerManager {
         let server_process = Command::new(env!("CARGO_BIN_EXE_roodb"))
             .arg("--port")
             .arg(state.port.to_string())
+            .arg("--tds-port")
+            .arg(TDS_TEST_PORT.to_string())
             .arg("--data-dir")
             .arg(data_dir.path())
             .arg("--cert-path")

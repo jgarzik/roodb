@@ -22,6 +22,7 @@ pub mod prepared;
 pub mod protocol_tests;
 pub mod queries;
 pub mod raft_cluster;
+pub mod tds;
 pub mod types;
 
 pub use harness::TestServer;

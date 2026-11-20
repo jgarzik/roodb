@@ -93,8 +93,9 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             self.emit_pending(true);
             put_done(&mut self.buf, TOKEN_DONE, DONE_ATTN, 0);
         } else {
-            if self.pending.is_none() && self.buf.is_empty() {
-                // Every response ends with a DONE.
+            if self.pending.is_none() {
+                // Every response ends with a DONE, including one that
+                // carries only informational tokens.
                 self.pending = Some(PendingDone {
                     status: DONE_FINAL,
                     row_count: 0,

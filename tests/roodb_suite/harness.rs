@@ -46,6 +46,11 @@ impl TestServer {
         ServerManager::global().port()
     }
 
+    /// Get the TDS (SQL Server protocol) port.
+    pub fn tds_port(&self) -> u16 {
+        ServerManager::global().tds_port()
+    }
+
     /// Shutdown (no-op: shared server stays alive for other tests).
     pub async fn shutdown(self) {
         // No-op: the shared server persists for all tests
