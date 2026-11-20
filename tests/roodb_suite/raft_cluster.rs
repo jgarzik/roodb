@@ -1,6 +1,6 @@
 //! Integration tests for Raft cluster functionality
 
-mod test_utils;
+use crate::test_utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -625,13 +625,11 @@ pub struct BatchSubmitter {
     /// Maximum batch size
     max_batch: usize,
     /// Notify when batch should be submitted
-    #[allow(dead_code)]
     submit_notify: Notify,
 }
 
 /// A pending I/O operation in the batch
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub struct PendingOp {
     /// The I/O operation
     pub op: super::IoOp,

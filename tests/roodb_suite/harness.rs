@@ -10,19 +10,14 @@ use crate::test_utils::server_manager::ServerManager;
 ///
 /// Wraps the shared server manager. Each test gets unique table names
 /// for isolation while sharing the same server instance.
-pub struct TestServer {
-    #[allow(dead_code)]
-    test_name: String,
-}
+pub struct TestServer;
 
 impl TestServer {
     /// Start a test session (connects to shared server).
-    pub async fn start(name: &str) -> Self {
+    pub async fn start(_name: &str) -> Self {
         // Ensure server is running (lazy init on first call)
         let _ = ServerManager::global();
-        Self {
-            test_name: name.to_string(),
-        }
+        Self
     }
 
     /// Start with password - incompatible with shared server.
@@ -42,7 +37,6 @@ impl TestServer {
     }
 
     /// Get the server port.
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         ServerManager::global().port()
     }

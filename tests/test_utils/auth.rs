@@ -14,7 +14,6 @@ use roodb::storage::StorageEngine;
 ///
 /// This creates the root user with the given password and grants ALL PRIVILEGES.
 /// Should be called after creating storage but before starting the server.
-#[allow(dead_code)]
 pub async fn initialize_root_user(storage: &Arc<dyn StorageEngine>, password: &str) {
     initialize_database(storage, password)
         .await

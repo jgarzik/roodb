@@ -44,8 +44,6 @@ pub struct RaftNode {
     id: NodeId,
     addr: SocketAddr,
     raft: Raft,
-    #[allow(dead_code)]
-    storage: LsmRaftStorage,
     network: RaftNetworkFactoryImpl,
     tls_config: RaftTlsConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -101,7 +99,7 @@ impl RaftNode {
             config,
             network.clone(),
             lsm_storage.clone(),
-            lsm_storage.clone(),
+            lsm_storage,
         )
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
@@ -110,7 +108,6 @@ impl RaftNode {
             id,
             addr,
             raft,
-            storage: lsm_storage,
             network,
             tls_config,
             shutdown_tx: None,

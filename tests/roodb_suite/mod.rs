@@ -19,7 +19,9 @@ pub mod dml;
 pub mod edge_cases;
 pub mod errors;
 pub mod prepared;
+pub mod protocol_tests;
 pub mod queries;
+pub mod raft_cluster;
 pub mod types;
 
 pub use harness::TestServer;
