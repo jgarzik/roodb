@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod packet;
 pub mod prepared;
 pub mod resultset;
+pub mod sink;
 pub mod starttls;
 pub mod types;
 
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
 use tracing::{debug, info, warn};
 
 use crate::catalog::system_tables::{SYSTEM_PROCEDURES, SYSTEM_USERS};
@@ -35,6 +36,7 @@ use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
 use crate::raft::{ChangeSet, RaftNode};
 use crate::server::context::ServerContext;
+use crate::server::query::{OkInfo, QueryError, ResponseSink, Status};
 use crate::server::session::Session;
 use crate::sql::privileges::{
     check_privilege, GrantEntry, HostPattern, Privilege, PrivilegeObject, RequiredPrivilege,
@@ -47,15 +49,18 @@ use self::auth::{verify_native_password_with_hash, HandshakeResponse41};
 use self::command::{parse_command, ParsedCommand};
 use self::error::{codes, states, ProtocolError, ProtocolResult};
 use self::handshake::{capabilities, AUTH_PLUGIN_NAME};
-use self::packet::{PacketReader, PacketWriter};
+use self::packet::PacketReader;
 use self::prepared::{
     decode_execute_params, encode_prepare_ok, select_column_names, CachedPlan,
     PreparedStatementManager,
 };
 use self::resultset::{
-    default_status, encode_column_count, encode_eof_ok_packet, encode_eof_packet,
-    encode_err_packet, encode_ok_packet, encode_text_row, ColumnDefinition41,
+    default_status, encode_eof_packet, encode_err_packet, encode_ok_packet, ColumnDefinition41,
 };
+use self::sink::{RooDbSink, RowFormat};
+
+/// Flush buffered result rows to the client once this many bytes are pending.
+const ROW_FLUSH_BYTES: usize = 64 * 1024;
 
 /// Internal enum for planning errors (used to avoid holding guard across await)
 enum PlanError {
@@ -77,8 +82,8 @@ where
 {
     /// Packet reader (buffered to reduce syscalls)
     reader: PacketReader<BufReader<ReadHalf<S>>>,
-    /// Packet writer (buffered to reduce syscalls)
-    writer: PacketWriter<BufWriter<WriteHalf<S>>>,
+    /// Response encoder (buffers packets, flushed per command)
+    out: RooDbSink<WriteHalf<S>>,
     /// Connection ID
     connection_id: u32,
     /// Client IP address for authentication
@@ -91,18 +96,12 @@ where
     storage: Arc<dyn StorageEngine>,
     /// Catalog
     catalog: Arc<RwLock<Catalog>>,
-    /// Whether client requested DEPRECATE_EOF
-    deprecate_eof: bool,
     /// Session state (transactions, autocommit, isolation level)
     session: Session,
     /// Transaction manager
     txn_manager: Arc<TransactionManager>,
     /// Raft node for consensus
     raft_node: Arc<RaftNode>,
-    /// Whether we're inside a stored procedure (multi-result-set mode)
-    in_multi_result: bool,
-    /// Whether any result sets were sent during current SP execution
-    sp_sent_results: bool,
     /// Prepared statement manager (per-connection)
     prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
@@ -132,19 +131,16 @@ where
         ));
         let conn = RooDbConnection {
             reader: PacketReader::new(BufReader::with_capacity(8192, read_half)),
-            writer: PacketWriter::new(BufWriter::with_capacity(8192, write_half)),
+            out: RooDbSink::new(write_half),
             connection_id,
             client_ip,
             scramble,
             client_capabilities: 0,
             storage: ctx.storage.clone(),
             catalog: ctx.catalog.clone(),
-            deprecate_eof: false,
             session: Session::new(connection_id),
             txn_manager: ctx.txn_manager.clone(),
             raft_node: ctx.raft_node.clone(),
-            in_multi_result: false,
-            sp_sent_results: false,
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
         };
@@ -169,12 +165,16 @@ where
 
         let response = HandshakeResponse41::parse(&response_packet)?;
         self.client_capabilities = response.capability_flags;
-        self.deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
+        let deprecate_eof = response.has_capability(capabilities::CLIENT_DEPRECATE_EOF);
+        self.out.set_client_capabilities(
+            deprecate_eof,
+            response.has_capability(capabilities::CLIENT_MULTI_RESULTS),
+        );
 
         debug!(
             connection_id = self.connection_id,
             client_capabilities = format!("{:#010x}", self.client_capabilities),
-            deprecate_eof = self.deprecate_eof,
+            deprecate_eof,
             "Client capabilities parsed"
         );
 
@@ -182,10 +182,10 @@ where
         self.verify_auth(&response).await?;
 
         // Send OK
-        self.writer.set_sequence(3);
-        let ok_packet = encode_ok_packet(0, 0, default_status(), 0);
-        self.writer.write_packet(&ok_packet).await?;
-        self.writer.flush().await?;
+        self.out.set_sequence(3);
+        self.out
+            .packet(&encode_ok_packet(0, 0, default_status(), 0));
+        self.out.flush().await?;
 
         info!(
             connection_id = self.connection_id,
@@ -198,10 +198,13 @@ where
 
     /// Send authentication error and return error
     async fn send_auth_error(&mut self, message: &str) -> ProtocolResult<()> {
-        self.writer.set_sequence(2);
-        let err_packet = encode_err_packet(codes::ER_ACCESS_DENIED, states::ACCESS_DENIED, message);
-        self.writer.write_packet(&err_packet).await?;
-        self.writer.flush().await?;
+        self.out.set_sequence(2);
+        self.out.packet(&encode_err_packet(
+            codes::ER_ACCESS_DENIED,
+            states::ACCESS_DENIED,
+            message,
+        ));
+        self.out.flush().await?;
         Err(ProtocolError::AuthFailed(message.to_string()))
     }
 
@@ -346,7 +349,6 @@ where
         loop {
             // Reset sequence for each command
             self.reader.reset_sequence();
-            self.writer.reset_sequence();
 
             debug!(
                 connection_id = self.connection_id,
@@ -369,9 +371,15 @@ where
             // Parse and handle command
             let cmd_start = Instant::now();
             let cmd = parse_command(&packet)?;
+            let format = match cmd {
+                ParsedCommand::StmtExecute { .. } => RowFormat::Binary,
+                _ => RowFormat::Text,
+            };
+            self.out.start_command(format);
 
             match self.handle_command(cmd).await {
                 Ok(true) => {
+                    self.out.finish().await?;
                     let cmd_ns = metrics::elapsed_ns(cmd_start);
                     tracing::debug!(
                         target: "roodb::perf",
@@ -390,6 +398,7 @@ where
                     // Try to send error to client
                     warn!(error = %e, "Command error");
                     let _ = self.send_error_from_protocol_error(&e).await;
+                    let _ = self.out.finish().await;
                     return Err(e);
                 }
             }
@@ -516,9 +525,8 @@ where
         let num_columns = col_names.len() as u16;
 
         // Send COM_STMT_PREPARE_OK
-        self.writer.set_sequence(1);
         let ok_packet = encode_prepare_ok(stmt_id, num_columns, num_params);
-        self.writer.write_packet(&ok_packet).await?;
+        self.out.packet(&ok_packet);
 
         // Send parameter column definitions (type=VARCHAR as placeholder)
         if num_params > 0 {
@@ -531,13 +539,13 @@ where
                     nullable: true,
                 };
                 let def = ColumnDefinition41::from_output_column(&col, "", schema);
-                self.writer.write_packet(&def.encode()).await?;
+                self.out.packet(&def.encode());
             }
 
             // EOF after parameter definitions
-            if !self.deprecate_eof {
+            if !self.out.deprecate_eof() {
                 let eof = encode_eof_packet(0, default_status());
-                self.writer.write_packet(&eof).await?;
+                self.out.packet(&eof);
             }
         }
 
@@ -552,17 +560,16 @@ where
                     nullable: true,
                 };
                 let def = ColumnDefinition41::from_output_column(&col, "", schema);
-                self.writer.write_packet(&def.encode()).await?;
+                self.out.packet(&def.encode());
             }
 
             // EOF after column definitions
-            if !self.deprecate_eof {
+            if !self.out.deprecate_eof() {
                 let eof = encode_eof_packet(0, default_status());
-                self.writer.write_packet(&eof).await?;
+                self.out.packet(&eof);
             }
         }
 
-        self.writer.flush().await?;
         Ok(())
     }
 
@@ -796,7 +803,7 @@ where
             let exec_open_ns = metrics::elapsed_ns(t_open);
 
             let t_iter = Instant::now();
-            let result = self.send_binary_result_set(&columns, &mut *executor).await;
+            let result = self.stream_rows(&columns, &mut *executor).await;
             let exec_iter_ns = metrics::elapsed_ns(t_iter);
 
             let m = metrics::QueryMetrics {
@@ -880,50 +887,56 @@ where
         }
     }
 
-    /// Send a result set in binary format (for prepared statement execution).
-    async fn send_binary_result_set(
+    /// Stream an opened executor's rows to the client as one result set.
+    ///
+    /// An executor error part-way through is reported to the client in
+    /// place of the end-of-rows marker; the connection stays usable.
+    async fn stream_rows(
         &mut self,
         columns: &[crate::planner::logical::OutputColumn],
         executor: &mut dyn Executor,
     ) -> ProtocolResult<()> {
-        // Send column count
-        self.writer.set_sequence(1);
-        let count_packet = encode_column_count(columns.len() as u64);
-        self.writer.write_packet(&count_packet).await?;
-
-        // Send column definitions
         let schema = self.session.database.as_deref().unwrap_or("default");
-        for col in columns {
-            let def = ColumnDefinition41::from_output_column(col, "", schema);
-            let def_packet = def.encode();
-            self.writer.write_packet(&def_packet).await?;
-        }
+        self.out.begin_result_set(columns, schema);
 
-        // Send EOF after columns (unless DEPRECATE_EOF)
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
+        let mut row_error = None;
+        let mut row_count = 0u64;
+        loop {
+            match executor.next().await {
+                Ok(Some(row)) => {
+                    row_count += 1;
+                    self.out.row(&row);
+                    if self.out.buffered_bytes() >= ROW_FLUSH_BYTES {
+                        self.out.flush().await?;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    row_error = Some(e);
+                    break;
+                }
+            }
         }
+        // Track row count for FOUND_ROWS()
+        self.session
+            .set_user_variable("__sys_found_rows", Datum::Int(row_count as i64));
 
-        // Send rows in binary format
-        while let Some(row) = executor.next().await? {
-            let row_packet = binary::encode_binary_row(&row, columns);
-            self.writer.write_packet(&row_packet).await?;
-        }
-
-        // Send final EOF/OK
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
-            self.writer.write_packet(&ok).await?;
+        if let Some(e) = row_error {
+            let msg = e.to_string();
+            let (code, state) =
+                if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
+                    (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
+                } else if msg.contains("Truncated incorrect") {
+                    (codes::ER_TRUNCATED_WRONG_VALUE, "22007")
+                } else {
+                    (codes::ER_DATA_OUT_OF_RANGE, "22003")
+                };
+            self.out.error(&QueryError::new(code, state, msg));
         } else {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
+            self.out.end_result_set(Status::AUTOCOMMIT);
         }
-
-        self.writer.flush().await?;
 
         executor.close().await?;
-
         Ok(())
     }
 
@@ -1688,93 +1701,14 @@ where
         }
     }
 
-    /// Send a result set to the client
+    /// Open an executor and send its rows to the client
     async fn send_result_set(
         &mut self,
         columns: &[crate::planner::logical::OutputColumn],
         executor: &mut dyn Executor,
     ) -> ProtocolResult<()> {
-        // Open executor
         executor.open().await?;
-
-        // Send column count
-        self.writer.set_sequence(1);
-        let count_packet = encode_column_count(columns.len() as u64);
-        self.writer.write_packet(&count_packet).await?;
-
-        // Send column definitions
-        let schema = self.session.database.as_deref().unwrap_or("default");
-        for col in columns {
-            let def = ColumnDefinition41::from_output_column(col, "", schema);
-            let def_packet = def.encode();
-            self.writer.write_packet(&def_packet).await?;
-        }
-
-        // Send EOF after columns (unless DEPRECATE_EOF)
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        // Send rows — catch executor errors mid-stream and send ERR packet
-        let mut row_error = None;
-        let mut row_count = 0u64;
-        loop {
-            match executor.next().await {
-                Ok(Some(row)) => {
-                    row_count += 1;
-                    let row_packet = encode_text_row(&row);
-                    self.writer.write_packet(&row_packet).await?;
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    row_error = Some(e);
-                    break;
-                }
-            }
-        }
-        // Track row count for FOUND_ROWS()
-        self.session
-            .set_user_variable("__sys_found_rows", Datum::Int(row_count as i64));
-
-        // If an error occurred during row streaming, send ERR packet instead of EOF
-        if let Some(e) = row_error {
-            let msg = e.to_string();
-            let (code, state) =
-                if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
-                    (codes::ER_WRONG_ARGUMENTS, states::GENERAL_ERROR)
-                } else if msg.contains("Truncated incorrect") {
-                    (codes::ER_TRUNCATED_WRONG_VALUE, "22007")
-                } else {
-                    (codes::ER_DATA_OUT_OF_RANGE, "22003")
-                };
-            let err_packet = encode_err_packet(code, state, &msg);
-            self.writer.write_packet(&err_packet).await?;
-            self.writer.flush().await?;
-            executor.close().await?;
-            return Ok(());
-        }
-
-        // Send final EOF/OK — with SERVER_MORE_RESULTS_EXISTS if in multi-result-set
-        let status = if self.in_multi_result {
-            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
-        } else {
-            default_status()
-        };
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(status, 0);
-            self.writer.write_packet(&ok).await?;
-        } else {
-            let eof = encode_eof_packet(0, status);
-            self.writer.write_packet(&eof).await?;
-        }
-
-        self.writer.flush().await?;
-
-        // Close executor
-        executor.close().await?;
-
-        Ok(())
+        self.stream_rows(columns, executor).await
     }
 
     /// Send a result set from pre-collected rows (used for UNION)
@@ -1783,36 +1717,12 @@ where
         columns: &[crate::planner::logical::OutputColumn],
         rows: Vec<crate::executor::row::Row>,
     ) -> ProtocolResult<()> {
-        self.writer.set_sequence(1);
-        let count_packet = encode_column_count(columns.len() as u64);
-        self.writer.write_packet(&count_packet).await?;
-
         let schema = self.session.database.as_deref().unwrap_or("default");
-        for col in columns {
-            let def = ColumnDefinition41::from_output_column(col, "", schema);
-            let def_packet = def.encode();
-            self.writer.write_packet(&def_packet).await?;
-        }
-
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
+        self.out.begin_result_set(columns, schema);
         for row in &rows {
-            let row_packet = encode_text_row(row);
-            self.writer.write_packet(&row_packet).await?;
+            self.out.row(row);
         }
-
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
-            self.writer.write_packet(&ok).await?;
-        } else {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        self.writer.flush().await?;
+        self.out.end_result_set(Status::AUTOCOMMIT);
         Ok(())
     }
 
@@ -2075,17 +1985,23 @@ where
         self.send_ok_with_status(0, 0).await
     }
 
-    /// Send OK packet with session-aware status flags
+    /// Send OK with session-aware status flags
     async fn send_ok_with_status(
         &mut self,
         affected_rows: u64,
         last_insert_id: u64,
     ) -> ProtocolResult<()> {
-        let status = self.session.status_flags();
-        self.writer.set_sequence(1);
-        let ok = encode_ok_packet(affected_rows, last_insert_id, status, 0);
-        self.writer.write_packet(&ok).await?;
-        self.writer.flush().await?;
+        let status = Status {
+            in_transaction: self.session.in_transaction(),
+            autocommit: self.session.autocommit,
+        };
+        self.out.ok(
+            OkInfo {
+                affected_rows,
+                last_insert_id,
+            },
+            status,
+        );
         Ok(())
     }
 
@@ -3140,32 +3056,19 @@ where
         use crate::catalog::DataType;
         use crate::planner::logical::OutputColumn;
 
-        self.writer.set_sequence(1);
-
-        // Column count
-        let count_packet = encode_column_count(col_names.len() as u64);
-        self.writer.write_packet(&count_packet).await?;
-
-        // Column definitions
-        let schema = self.session.database.as_deref().unwrap_or("default");
-        for (i, name) in col_names.iter().enumerate() {
-            let col = OutputColumn {
+        let columns: Vec<OutputColumn> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| OutputColumn {
                 id: i,
                 name: (*name).to_string(),
                 data_type: DataType::Varchar(255),
                 nullable: true,
-            };
-            let def = ColumnDefinition41::from_output_column(&col, "", schema);
-            self.writer.write_packet(&def.encode()).await?;
-        }
+            })
+            .collect();
 
-        // EOF after columns
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        // Send rows
+        let schema = self.session.database.as_deref().unwrap_or("default");
+        self.out.begin_result_set(&columns, schema);
         for row_data in rows {
             let row = crate::executor::row::Row::new(
                 row_data
@@ -3173,20 +3076,9 @@ where
                     .map(|v| crate::executor::datum::Datum::String(v.clone()))
                     .collect(),
             );
-            let row_packet = encode_text_row(&row);
-            self.writer.write_packet(&row_packet).await?;
+            self.out.row(&row);
         }
-
-        // Final EOF/OK
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
-            self.writer.write_packet(&ok).await?;
-        } else {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        self.writer.flush().await?;
+        self.out.end_result_set(Status::AUTOCOMMIT);
         Ok(())
     }
 
@@ -4207,53 +4099,8 @@ where
         }
 
         // Send result set with one row
-        self.writer.set_sequence(1);
-
-        // Column count
-        let count_packet = encode_column_count(values.len() as u64);
-        self.writer.write_packet(&count_packet).await?;
-
-        // Column definitions
-        for name in &col_names {
-            use crate::catalog::DataType;
-            use crate::planner::logical::OutputColumn;
-
-            let col = OutputColumn {
-                id: 0,
-                name: name.clone(),
-                data_type: DataType::Varchar(255),
-                nullable: true,
-            };
-            let def = ColumnDefinition41::from_output_column(&col, "", "");
-            self.writer.write_packet(&def.encode()).await?;
-        }
-
-        // EOF after columns (unless DEPRECATE_EOF)
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        // Send single row with values
-        let row = crate::executor::row::Row::new(
-            values
-                .iter()
-                .map(|v| crate::executor::datum::Datum::String(v.clone()))
-                .collect(),
-        );
-        let row_packet = encode_text_row(&row);
-        self.writer.write_packet(&row_packet).await?;
-
-        // Final EOF/OK
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(default_status(), 0);
-            self.writer.write_packet(&ok).await?;
-        } else {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        self.writer.flush().await?;
+        let names: Vec<&str> = col_names.iter().map(String::as_str).collect();
+        self.send_custom_result_set(&names, &[values]).await?;
 
         debug!(
             connection_id = self.connection_id,
@@ -5315,10 +5162,6 @@ where
                     .await;
             }
         };
-        // Execute the body with multi-result-set mode if client supports it
-        let client_multi =
-            self.client_capabilities & handshake::capabilities::CLIENT_MULTI_RESULTS != 0;
-        self.in_multi_result = client_multi;
         let body_result = self
             .execute_procedure_body_with_handlers(&body_stmts, &mut ctx, &handlers)
             .await;
@@ -5326,7 +5169,6 @@ where
         match body_result {
             Ok(_) => {}
             Err(e) => {
-                self.in_multi_result = false;
                 return self
                     .send_error(
                         codes::ER_UNKNOWN_ERROR,
@@ -5340,20 +5182,8 @@ where
         // Propagate OUT/INOUT params back to user variables
         propagate_out_params(&proc_def, call_args, &ctx, &user_vars);
 
-        // Send final OK
-        let sent_results = self.sp_sent_results;
-        self.in_multi_result = false;
-        self.sp_sent_results = false;
-        if sent_results {
-            // Multi-result: continue sequence from result set, write final OK
-            let packet = encode_ok_packet(ctx.rows_affected, 0, default_status(), 0);
-            self.writer.write_packet(&packet).await?;
-            self.writer.flush().await?;
-            Ok(())
-        } else {
-            // No result sets sent: standard OK with sequence reset
-            self.send_ok(ctx.rows_affected, 0).await
-        }
+        // Final OK; any result sets the body produced precede it
+        self.send_ok(ctx.rows_affected, 0).await
     }
 
     /// Parse procedure body SQL into Vec<Statement>.
@@ -6097,18 +5927,9 @@ where
     }
 
     /// Execute a SELECT inside a stored procedure and send the result set to the client.
-    /// Uses execute_select_buffered to get rows, then manually sends the result set
-    /// with SERVER_MORE_RESULTS_EXISTS flag (in_multi_result is set by handle_call).
     async fn execute_sp_select(&mut self, sql: &str) -> ProtocolResult<()> {
-        // First result set starts at sequence 1 (command was 0);
-        // subsequent result sets continue from where the previous left off
-        if !self.sp_sent_results {
-            self.writer.set_sequence(1);
-        }
-        self.sp_sent_results = true;
         // Extract column names first (works even when result is empty)
         let col_names = Self::extract_select_column_names(sql, 100);
-        let col_count = col_names.len();
 
         // Buffer all rows
         let rows = self
@@ -6116,58 +5937,17 @@ where
             .await
             .map_err(|e| ProtocolError::Unsupported(format!("SP SELECT failed: {}", e)))?;
 
-        // Send column count
-        let count_packet = encode_column_count(col_count as u64);
-        self.writer.write_packet(&count_packet).await?;
-
-        // Send column definitions (minimal — name from SELECT expression)
-        let schema = self.session.database.as_deref().unwrap_or("test");
-        for name in &col_names {
-            let def = ColumnDefinition41 {
-                catalog: "def".to_string(),
-                schema: schema.to_string(),
-                table: String::new(),
-                org_table: String::new(),
-                name: name.clone(),
-                org_name: name.clone(),
-                character_set: 63,
-                column_length: 255,
-                column_type: types::ColumnType::Varchar,
-                flags: 0,
-                decimals: 0,
-            };
-            let def_packet = def.encode();
-            self.writer.write_packet(&def_packet).await?;
-        }
-
-        // Send EOF after columns
-        if !self.deprecate_eof {
-            let eof = encode_eof_packet(0, default_status());
-            self.writer.write_packet(&eof).await?;
-        }
-
-        // Send rows
-        for row in &rows {
-            let row_packet = encode_text_row(row);
-            self.writer.write_packet(&row_packet).await?;
-        }
-
-        // Send final EOF with SERVER_MORE_RESULTS_EXISTS
-        let status = if self.in_multi_result {
-            default_status() | status_flags::SERVER_MORE_RESULTS_EXISTS
-        } else {
-            default_status()
-        };
-        if self.deprecate_eof {
-            let ok = encode_eof_ok_packet(status, 0);
-            self.writer.write_packet(&ok).await?;
-        } else {
-            let eof = encode_eof_packet(0, status);
-            self.writer.write_packet(&eof).await?;
-        }
-
-        self.writer.flush().await?;
-        Ok(())
+        let columns: Vec<crate::planner::logical::OutputColumn> = col_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| crate::planner::logical::OutputColumn {
+                id: i,
+                name,
+                data_type: crate::catalog::DataType::Varchar(255),
+                nullable: true,
+            })
+            .collect();
+        self.send_collected_result_set(&columns, rows).await
     }
 
     /// Extract column names from a SELECT statement (best-effort)
@@ -6419,21 +6199,22 @@ where
         Ok(affected)
     }
 
-    /// Send an OK packet
+    /// Send an OK
     async fn send_ok(&mut self, affected_rows: u64, last_insert_id: u64) -> ProtocolResult<()> {
-        self.writer.set_sequence(1);
-        let packet = encode_ok_packet(affected_rows, last_insert_id, default_status(), 0);
-        self.writer.write_packet(&packet).await?;
-        self.writer.flush().await?;
+        self.out.ok(
+            OkInfo {
+                affected_rows,
+                last_insert_id,
+            },
+            Status::AUTOCOMMIT,
+        );
         Ok(())
     }
 
-    /// Send an error packet
+    /// Send an error
     async fn send_error(&mut self, code: u16, state: &str, message: &str) -> ProtocolResult<()> {
-        self.writer.set_sequence(1);
-        let packet = encode_err_packet(code, state, message);
-        self.writer.write_packet(&packet).await?;
-        self.writer.flush().await?;
+        self.out
+            .error(&QueryError::new(code, state.to_string(), message));
         Ok(())
     }
 

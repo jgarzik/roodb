@@ -4,6 +4,7 @@ pub mod context;
 pub mod handler;
 pub mod listener;
 pub mod locks;
+pub mod query;
 pub mod session;
 
 pub use context::ServerContext;
