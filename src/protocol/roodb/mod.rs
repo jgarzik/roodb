@@ -3243,6 +3243,7 @@ where
             || sql_upper.starts_with("SHOW FULL TABLES")
         {
             let db = self
+                .session
                 .database
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
@@ -3574,6 +3575,7 @@ where
                 None
             };
             let db = self
+                .session
                 .database
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
@@ -3804,6 +3806,7 @@ where
         // INFORMATION_SCHEMA.TABLES
         if upper.contains("INFORMATION_SCHEMA.TABLES") {
             let db = self
+                .session
                 .database
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
