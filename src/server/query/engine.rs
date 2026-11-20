@@ -269,6 +269,9 @@ impl QueryEngine {
         let mut row_error = None;
         let mut row_count = 0u64;
         loop {
+            if self.out.cancelled() {
+                break;
+            }
             match executor.next().await {
                 Ok(Some(row)) => {
                     row_count += 1;

@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod login;
 pub mod prelogin;
+pub mod sink;
 pub mod token;
 pub mod tunnel;
 pub mod types;

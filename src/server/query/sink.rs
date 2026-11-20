@@ -54,6 +54,12 @@ pub trait ResponseSink: Send + Sync + 'static {
     /// their result sets.
     fn accepts_multiple_results(&self) -> bool;
 
+    /// Whether the client asked to cancel the request in progress. The
+    /// query layer stops producing rows when it sees this.
+    fn cancelled(&self) -> bool {
+        false
+    }
+
     /// Start a result set with the given columns. `schema` is the current
     /// database, for protocols that report it in column metadata.
     fn begin_result_set(&mut self, columns: &[OutputColumn], schema: &str);
