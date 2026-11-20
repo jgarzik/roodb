@@ -27,28 +27,16 @@ async fn test_ddl_dml_and_rows() {
             .await
             .unwrap();
 
-        let inserted = client
-            .execute(
-                format!(
-                    "INSERT INTO {table} VALUES (1, 'alice', 1.5), (2, 'b\u{f6}b', NULL), \
-                     (3, NULL, -2.25)"
-                ),
-                &[],
-            )
-            .await;
-        // `execute` uses an RPC, which may be refused; fall back to a batch.
-        if inserted.is_err() {
-            client
-                .simple_query(format!(
-                    "INSERT INTO {table} VALUES (1, 'alice', 1.5), (2, 'b\u{f6}b', NULL), \
-                     (3, NULL, -2.25)"
-                ))
-                .await
-                .unwrap()
-                .into_results()
-                .await
-                .unwrap();
-        }
+        client
+            .simple_query(format!(
+                "INSERT INTO {table} VALUES (1, 'alice', 1.5), (2, 'b\u{f6}b', NULL), \
+                 (3, NULL, -2.25)"
+            ))
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
 
         let rows = client
             .simple_query(format!("SELECT id, name, score FROM {table} ORDER BY id"))

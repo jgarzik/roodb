@@ -8,7 +8,9 @@
 pub mod codec;
 pub mod connection;
 pub mod login;
+pub mod params;
 pub mod prelogin;
+pub mod rpc;
 pub mod sink;
 pub mod token;
 pub mod tunnel;

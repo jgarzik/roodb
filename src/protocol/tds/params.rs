@@ -1,961 +1,760 @@
-//! RPC parameter parsing and SQL parameter substitution for sp_executesql.
+//! RPC request parameters: decoding TDS typed values into RooDB values.
 //!
-//! When the Go rdb/ms client sends a parameterized query, it uses the RPC
-//! packet type with sp_executesql (proc ID 10). The parameters are:
-//!   1. SQL text (unnamed, NVARCHAR max/PLP)
-//!   2. Parameter declarations string (unnamed, NVARCHAR max/PLP)
-//!   3+ Named parameter values (various types)
+//! Every length and type byte here comes from the client. Decoding goes
+//! through a bounds-checked reader and returns an error for anything
+//! malformed or unsupported; it never indexes past the data.
 //!
-//! This module parses those parameters from the wire format and substitutes
-//! @name references in the SQL with their literal values.
+//! Parameter values become [`Datum`]s that are bound to the statement by
+//! the query engine. They are never formatted into SQL text.
 
-use super::connection::decode_ucs2_str;
+use crate::executor::datum::{format_decimal, Datum};
 
-/// A decoded named parameter with its SQL literal representation.
-struct Param {
-    /// Parameter name without '@' prefix.
-    name: String,
-    /// SQL literal representation (e.g. "42", "'hello'", "NULL").
-    literal: String,
+use super::login::decode_ucs2;
+
+// TDS type tokens (MS-TDS 2.2.5.4)
+const TYPE_NULL: u8 = 0x1F;
+const TYPE_GUID: u8 = 0x24;
+const TYPE_INTN: u8 = 0x26;
+const TYPE_DATEN: u8 = 0x28;
+const TYPE_TIMEN: u8 = 0x29;
+const TYPE_DATETIME2N: u8 = 0x2A;
+const TYPE_DATETIMEOFFSETN: u8 = 0x2B;
+const TYPE_INT1: u8 = 0x30;
+const TYPE_BIT: u8 = 0x32;
+const TYPE_INT2: u8 = 0x34;
+const TYPE_INT4: u8 = 0x38;
+const TYPE_DATETIM4: u8 = 0x3A;
+const TYPE_FLT4: u8 = 0x3B;
+const TYPE_MONEY: u8 = 0x3C;
+const TYPE_DATETIME: u8 = 0x3D;
+const TYPE_FLT8: u8 = 0x3E;
+const TYPE_BITN: u8 = 0x68;
+const TYPE_DECIMALN: u8 = 0x6A;
+const TYPE_NUMERICN: u8 = 0x6C;
+const TYPE_FLTN: u8 = 0x6D;
+const TYPE_MONEYN: u8 = 0x6E;
+const TYPE_DATETIMN: u8 = 0x6F;
+const TYPE_MONEY4: u8 = 0x7A;
+const TYPE_INT8: u8 = 0x7F;
+const TYPE_BIGVARBINARY: u8 = 0xA5;
+const TYPE_BIGVARCHAR: u8 = 0xA7;
+const TYPE_BIGBINARY: u8 = 0xAD;
+const TYPE_BIGCHAR: u8 = 0xAF;
+const TYPE_NVARCHAR: u8 = 0xE7;
+const TYPE_NCHAR: u8 = 0xEF;
+
+/// Length marker of the (max) types
+const MAX_TYPE_LENGTH: u16 = 0xFFFF;
+/// PLP NULL and "length unknown" markers
+const PLP_NULL: u64 = u64::MAX;
+const PLP_UNKNOWN_LENGTH: u64 = u64::MAX - 1;
+/// Days from 0001-01-01 to 1900-01-01 (the legacy DATETIME epoch)
+const DAYS_TO_1900: i64 = 693_595;
+/// Days from 0001-01-01 to 1970-01-01
+const DAYS_TO_1970: i64 = 719_162;
+/// Last day number a date can hold (9999-12-31)
+const MAX_DAY: i64 = 3_652_058;
+
+/// A request the server cannot decode or does not support.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ParamError {
+    #[error("malformed RPC request")]
+    Malformed,
+    #[error("parameter type 0x{0:02X} is not supported")]
+    UnsupportedType(u8),
 }
 
-/// Parse sp_executesql RPC parameters and return the SQL with parameters substituted.
-///
-/// `data` starts at the first parameter (after ProcIDSwitch + ProcID + Options).
-/// Returns the final SQL string with @param references replaced by literal values.
-pub fn parse_and_substitute(data: &[u8]) -> Option<String> {
-    let mut pos = 0;
-
-    // Param 1: SQL text (unnamed, NVARCHAR max PLP)
-    let sql = parse_nvarchar_param(data, &mut pos)?;
-
-    // Param 2: declarations string (unnamed, NVARCHAR max PLP) — skip it
-    let _declarations = parse_nvarchar_param(data, &mut pos)?;
-
-    // Params 3+: named parameters
-    let mut params = Vec::new();
-    while pos < data.len() {
-        // 0xFF = tokenDoneInProc, marks end of parameters
-        if data[pos] == 0xFF {
-            break;
-        }
-        if let Some(param) = parse_typed_param(data, &mut pos) {
-            params.push(param);
-        } else {
-            break;
-        }
-    }
-
-    if params.is_empty() {
-        return Some(sql);
-    }
-
-    Some(substitute_params(&sql, &params))
+/// One parameter of an RPC request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcParam {
+    /// Parameter name including its `@`, or empty for a positional one
+    pub name: String,
+    /// The client wants the value returned (output parameter)
+    pub output: bool,
+    /// The value
+    pub value: Datum,
 }
 
-/// Parse an unnamed NVARCHAR parameter (used for SQL text and declarations).
-///
-/// Wire format:
-///   name_len(1, =0) + status(1) + type_id(1, =0xE7) + max_len(2) + collation(5)
-///   + PLP value (if max_len == 0xFFFF) or u16 len + data
-fn parse_nvarchar_param(data: &[u8], pos: &mut usize) -> Option<String> {
-    if *pos >= data.len() {
-        return None;
-    }
-
-    // Name length (0 for unnamed)
-    let name_len = data[*pos] as usize;
-    *pos += 1;
-    *pos += name_len * 2; // skip UCS-2 name
-
-    check_remaining(data, *pos, 2)?; // status + type_id
-    *pos += 1; // status
-
-    let type_id = data[*pos];
-    *pos += 1;
-
-    if type_id != 0xE7 && type_id != 0xA7 {
-        // Not NVARCHAR or VARCHAR — try to skip this param as generic
-        return None;
-    }
-
-    let is_nchar = type_id == 0xE7;
-
-    check_remaining(data, *pos, 2)?;
-    let max_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
-
-    // Collation (5 bytes) for text types
-    check_remaining(data, *pos, 5)?;
-    *pos += 5;
-
-    if max_len == 0xFFFF {
-        // PLP (Partially Length-Prefixed) format
-        read_plp_string(data, pos, is_nchar)
-    } else {
-        // Regular: u16 actual_len + data
-        check_remaining(data, *pos, 2)?;
-        let val_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-        *pos += 2;
-        if val_len == 0xFFFF {
-            return Some(String::new()); // NULL
-        }
-        check_remaining(data, *pos, val_len)?;
-        let text_data = &data[*pos..*pos + val_len];
-        *pos += val_len;
-        if is_nchar {
-            Some(decode_ucs2_str(text_data))
-        } else {
-            Some(String::from_utf8_lossy(text_data).into_owned())
-        }
-    }
+/// Bounds-checked reader over request bytes.
+pub struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
 }
 
-/// Read a PLP (Partially Length-Prefixed) value and decode as string.
-///
-/// Format: u64 total_size + chunks(u32 len + data)* + u32(0)
-fn read_plp_string(data: &[u8], pos: &mut usize, is_nchar: bool) -> Option<String> {
-    check_remaining(data, *pos, 8)?;
-    let total_size = u64::from_le_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-        data[*pos + 4],
-        data[*pos + 5],
-        data[*pos + 6],
-        data[*pos + 7],
-    ]);
-    *pos += 8;
-
-    // NULL
-    if total_size == 0xFFFFFFFFFFFFFFFF {
-        return Some(String::new());
+impl<'a> Reader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
     }
 
-    // Collect chunks
-    let mut all_bytes = Vec::new();
-    loop {
-        check_remaining(data, *pos, 4)?;
-        let chunk_len =
-            u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
-                as usize;
-        *pos += 4;
-        if chunk_len == 0 {
-            break; // End of PLP
-        }
-        check_remaining(data, *pos, chunk_len)?;
-        all_bytes.extend_from_slice(&data[*pos..*pos + chunk_len]);
-        *pos += chunk_len;
+    /// Whether all data has been consumed.
+    pub fn is_empty(&self) -> bool {
+        self.pos >= self.data.len()
     }
 
-    if is_nchar {
-        Some(decode_ucs2_str(&all_bytes))
-    } else {
-        Some(String::from_utf8_lossy(&all_bytes).into_owned())
+    /// The next byte, without consuming it.
+    pub fn peek(&self) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+
+    pub fn bytes(&mut self, len: usize) -> Result<&'a [u8], ParamError> {
+        let end = self.pos.checked_add(len).ok_or(ParamError::Malformed)?;
+        let slice = self.data.get(self.pos..end).ok_or(ParamError::Malformed)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    pub fn u8(&mut self) -> Result<u8, ParamError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    pub fn u16(&mut self) -> Result<u16, ParamError> {
+        let b = self.bytes(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    pub fn u32(&mut self) -> Result<u32, ParamError> {
+        let b = self.bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn u64(&mut self) -> Result<u64, ParamError> {
+        let b = self.bytes(8)?;
+        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    }
+
+    /// A string with a 1-byte length in UTF-16 units.
+    pub fn b_varchar(&mut self) -> Result<String, ParamError> {
+        let chars = usize::from(self.u8()?);
+        Ok(decode_ucs2(self.bytes(chars * 2)?))
+    }
+
+    /// A string with a 2-byte length in UTF-16 units.
+    pub fn us_varchar(&mut self) -> Result<String, ParamError> {
+        let chars = usize::from(self.u16()?);
+        Ok(decode_ucs2(self.bytes(chars * 2)?))
     }
 }
 
-/// Read raw PLP bytes (for binary data).
-fn read_plp_bytes(data: &[u8], pos: &mut usize) -> Option<Option<Vec<u8>>> {
-    check_remaining(data, *pos, 8)?;
-    let total_size = u64::from_le_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-        data[*pos + 4],
-        data[*pos + 5],
-        data[*pos + 6],
-        data[*pos + 7],
-    ]);
-    *pos += 8;
-
-    if total_size == 0xFFFFFFFFFFFFFFFF {
-        return Some(None); // NULL
-    }
-
-    let mut all_bytes = Vec::new();
-    loop {
-        check_remaining(data, *pos, 4)?;
-        let chunk_len =
-            u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
-                as usize;
-        *pos += 4;
-        if chunk_len == 0 {
-            break;
-        }
-        check_remaining(data, *pos, chunk_len)?;
-        all_bytes.extend_from_slice(&data[*pos..*pos + chunk_len]);
-        *pos += chunk_len;
-    }
-
-    Some(Some(all_bytes))
+/// Little-endian unsigned integer of up to 16 bytes.
+fn le_uint(bytes: &[u8]) -> u128 {
+    bytes
+        .iter()
+        .rev()
+        .fold(0u128, |acc, b| (acc << 8) | u128::from(*b))
 }
 
-/// Parse a single typed parameter (named, with value).
-fn parse_typed_param(data: &[u8], pos: &mut usize) -> Option<Param> {
-    check_remaining(data, *pos, 1)?;
-
-    // Parameter name
-    let name_len = data[*pos] as usize; // in UCS-2 chars
-    *pos += 1;
-
-    let name = if name_len > 0 {
-        check_remaining(data, *pos, name_len * 2)?;
-        let name_str = decode_ucs2_str(&data[*pos..*pos + name_len * 2]);
-        *pos += name_len * 2;
-        // Strip leading '@'
-        name_str.strip_prefix('@').unwrap_or(&name_str).to_string()
-    } else {
-        String::new()
-    };
-
-    check_remaining(data, *pos, 2)?; // status + type_id
-    *pos += 1; // status byte
-
-    let type_id = data[*pos];
-    *pos += 1;
-
-    let literal = match type_id {
-        // INTNTYPE
-        0x26 => parse_int_value(data, pos)?,
-        // BITNTYPE
-        0x68 => parse_bit_value(data, pos)?,
-        // FLTNTYPE
-        0x6D => parse_float_value(data, pos)?,
-        // DECIMALNTYPE / NUMERICNTYPE
-        0x6A | 0x6C => parse_decimal_value(data, pos)?,
-        // NVARCHARTYPE
-        0xE7 => parse_nvarchar_value(data, pos, true)?,
-        // BIGVARCHRTYPE (VARCHAR)
-        0xA7 => parse_nvarchar_value(data, pos, false)?,
-        // BIGVARBINTYPE (VARBINARY)
-        0xA5 => parse_varbinary_value(data, pos)?,
-        // DATETIME2NTYPE
-        0x2A => parse_datetime2_value(data, pos)?,
-        // DATENTYPE
-        0x28 => parse_date_value(data, pos)?,
-        // TIMENTYPE
-        0x29 => parse_time_value(data, pos)?,
-        // DATETIMEOFFSETNTYPE
-        0x2B => parse_datetimeoffset_value(data, pos)?,
-        // DATETIMNTYPE (old datetime)
-        0x6F => parse_datetimen_value(data, pos)?,
-        // GUIDTYPE
-        0x24 => parse_guid_value(data, pos)?,
-        // MONEYNTYPE
-        0x6E => parse_money_value(data, pos)?,
-        _ => return None, // Unknown type — stop parsing
-    };
-
-    Some(Param { name, literal })
-}
-
-// ---------------------------------------------------------------------------
-// Individual type value parsers
-// ---------------------------------------------------------------------------
-
-/// INTNTYPE (0x26): type_width(1) then value_len(1) + LE integer bytes.
-fn parse_int_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let _type_width = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let val = match val_len {
-        1 => data[*pos] as i64,
-        2 => i16::from_le_bytes([data[*pos], data[*pos + 1]]) as i64,
-        4 => {
-            i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as i64
-        }
-        8 => i64::from_le_bytes([
-            data[*pos],
-            data[*pos + 1],
-            data[*pos + 2],
-            data[*pos + 3],
-            data[*pos + 4],
-            data[*pos + 5],
-            data[*pos + 6],
-            data[*pos + 7],
-        ]),
-        _ => {
-            *pos += val_len;
-            return Some("NULL".to_string());
-        }
-    };
-    *pos += val_len;
-    Some(val.to_string())
-}
-
-/// BITNTYPE (0x68): type_width(1) then value_len(1) + 1 byte.
-fn parse_bit_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    *pos += 1; // type_width (always 1)
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, 1)?;
-    let val = data[*pos];
-    *pos += 1;
-    Some(if val != 0 { "1" } else { "0" }.to_string())
-}
-
-/// FLTNTYPE (0x6D): type_width(1) then value_len(1) + float bytes.
-fn parse_float_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let _type_width = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let literal = match val_len {
-        4 => {
-            let bits =
-                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-            format!("{}", f32::from_bits(bits))
-        }
-        8 => {
-            let bits = u64::from_le_bytes([
-                data[*pos],
-                data[*pos + 1],
-                data[*pos + 2],
-                data[*pos + 3],
-                data[*pos + 4],
-                data[*pos + 5],
-                data[*pos + 6],
-                data[*pos + 7],
-            ]);
-            format!("{}", f64::from_bits(bits))
-        }
-        _ => "NULL".to_string(),
-    };
-    *pos += val_len;
-    Some(literal)
-}
-
-/// DECIMALNTYPE (0x6A) / NUMERICNTYPE (0x6C):
-/// type_width(1) + precision(1) + scale(1) then value_len(1) + sign(1) + magnitude(LE).
-fn parse_decimal_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 3)?;
-    let _max_width = data[*pos];
-    let _precision = data[*pos + 1];
-    let scale = data[*pos + 2] as u32;
-    *pos += 3;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let sign = data[*pos]; // 0 = negative, 1 = positive
-    let magnitude_bytes = &data[*pos + 1..*pos + val_len];
-
-    // magnitude is LE unsigned integer
-    let mut magnitude: u128 = 0;
-    for (i, &b) in magnitude_bytes.iter().enumerate() {
-        magnitude |= (b as u128) << (i * 8);
-    }
-    *pos += val_len;
-
-    // Format as decimal string with proper scale
-    if scale == 0 {
-        let s = magnitude.to_string();
-        return Some(if sign == 0 { format!("-{}", s) } else { s });
-    }
-
-    let s = magnitude.to_string();
-    let literal = if s.len() as u32 <= scale {
-        // Need leading zeros: e.g. magnitude=5, scale=3 → "0.005"
-        let zeros = scale as usize - s.len();
-        format!("0.{}{}", "0".repeat(zeros), s)
-    } else {
-        let split = s.len() - scale as usize;
-        format!("{}.{}", &s[..split], &s[split..])
-    };
-
-    Some(if sign == 0 {
-        format!("-{}", literal)
-    } else {
-        literal
+/// Sign-extended little-endian integer of 1, 2, 4 or 8 bytes.
+fn le_int(bytes: &[u8]) -> Result<i64, ParamError> {
+    Ok(match bytes.len() {
+        // TDS TINYINT is unsigned
+        1 => i64::from(bytes[0]),
+        2 => i64::from(i16::from_le_bytes([bytes[0], bytes[1]])),
+        4 => i64::from(i32::from_le_bytes(bytes.try_into().expect("4 bytes"))),
+        8 => i64::from_le_bytes(bytes.try_into().expect("8 bytes")),
+        _ => return Err(ParamError::Malformed),
     })
 }
 
-/// NVARCHAR (0xE7) or VARCHAR (0xA7) parameter value.
-/// TYPE_INFO: max_len(2) + collation(5). Then PLP or u16+data.
-fn parse_nvarchar_value(data: &[u8], pos: &mut usize, is_nchar: bool) -> Option<String> {
-    check_remaining(data, *pos, 2)?;
-    let max_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
-
-    // Collation (5 bytes)
-    check_remaining(data, *pos, 5)?;
-    *pos += 5;
-
-    let raw_str = if max_len == 0xFFFF {
-        // PLP format
-        read_plp_string(data, pos, is_nchar)?
-    } else {
-        // Regular: u16 len + data
-        check_remaining(data, *pos, 2)?;
-        let val_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-        *pos += 2;
-        if val_len == 0xFFFF {
-            return Some("NULL".to_string());
-        }
-        check_remaining(data, *pos, val_len)?;
-        let text_data = &data[*pos..*pos + val_len];
-        *pos += val_len;
-        if is_nchar {
-            decode_ucs2_str(text_data)
-        } else {
-            String::from_utf8_lossy(text_data).into_owned()
-        }
-    };
-
-    // Escape for SQL literal: replace ' with ''
-    let escaped = raw_str.replace('\'', "''");
-    Some(format!("'{}'", escaped))
+fn float(bytes: &[u8]) -> Result<Datum, ParamError> {
+    Ok(Datum::Float(match bytes.len() {
+        4 => f64::from(f32::from_le_bytes(bytes.try_into().expect("4 bytes"))),
+        8 => f64::from_le_bytes(bytes.try_into().expect("8 bytes")),
+        _ => return Err(ParamError::Malformed),
+    }))
 }
 
-/// VARBINARY (0xA5) parameter value.
-/// TYPE_INFO: max_len(2). Then PLP or u16+data.
-fn parse_varbinary_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 2)?;
-    let max_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
-
-    // No collation for binary types
-
-    if max_len == 0xFFFF {
-        let bytes = read_plp_bytes(data, pos)?;
-        match bytes {
-            None => Some("NULL".to_string()),
-            Some(b) => Some(format!("X'{}'", hex_encode(&b))),
-        }
-    } else {
-        check_remaining(data, *pos, 2)?;
-        let val_len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
-        *pos += 2;
-        if val_len == 0xFFFF {
-            return Some("NULL".to_string());
-        }
-        check_remaining(data, *pos, val_len)?;
-        let bytes = &data[*pos..*pos + val_len];
-        *pos += val_len;
-        Some(format!("X'{}'", hex_encode(bytes)))
+/// Calendar date of a day number counted from 0001-01-01.
+fn date_text(day: i64) -> Result<String, ParamError> {
+    if !(0..=MAX_DAY).contains(&day) {
+        return Err(ParamError::Malformed);
     }
-}
-
-/// DATETIME2NTYPE (0x2A): scale(1) then value_len(1) + time(3-5 bytes) + date(3 bytes).
-fn parse_datetime2_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let scale = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let val_data = &data[*pos..*pos + val_len];
-    *pos += val_len;
-
-    // time bytes = val_len - 3, date bytes = 3
-    let time_len = val_len - 3;
-    let (time_str, date_str) = decode_time_date(val_data, time_len, scale);
-    Some(format!("'{} {}'", date_str, time_str))
-}
-
-/// DATENTYPE (0x28): no scale byte, value_len(1) + 3 bytes date.
-fn parse_date_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let days = read_le_uint(&data[*pos..*pos + 3]) as i64;
-    *pos += val_len;
-
-    let date_str = days_to_date(days);
-    Some(format!("'{}'", date_str))
-}
-
-/// TIMENTYPE (0x29): scale(1) then value_len(1) + time bytes.
-fn parse_time_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let scale = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let time_str = decode_time_only(&data[*pos..*pos + val_len], scale);
-    *pos += val_len;
-    Some(format!("'{}'", time_str))
-}
-
-/// DATETIMEOFFSETNTYPE (0x2B): scale(1) then value_len(1) + time + date + offset(2).
-fn parse_datetimeoffset_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let scale = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let val_data = &data[*pos..*pos + val_len];
-    *pos += val_len;
-
-    // time bytes = val_len - 5, date = 3 bytes, offset = 2 bytes
-    let time_len = val_len - 5;
-    let (time_str, date_str) = decode_time_date(val_data, time_len, scale);
-    let offset_minutes = i16::from_le_bytes([val_data[val_len - 2], val_data[val_len - 1]]) as i32;
-    let off_h = offset_minutes / 60;
-    let off_m = (offset_minutes % 60).abs();
-    Some(format!(
-        "'{} {}{:+03}:{:02}'",
-        date_str, time_str, off_h, off_m
-    ))
-}
-
-/// DATETIMNTYPE (0x6F): width(1) then value_len(1) + value.
-fn parse_datetimen_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    let _type_width = data[*pos];
-    *pos += 1;
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let val_data = &data[*pos..*pos + val_len];
-    *pos += val_len;
-
-    match val_len {
-        8 => {
-            // datetime: 4 bytes days since 1900-01-01 + 4 bytes 1/300 seconds
-            let days = i32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]);
-            let ticks =
-                u32::from_le_bytes([val_data[4], val_data[5], val_data[6], val_data[7]]) as u64;
-
-            // days since 1900-01-01
-            let total_days = 693595 + days as i64; // 1900-01-01 is day 693595 from 0001-01-01
-            let date_str = days_to_date(total_days);
-
-            let total_ms = ticks * 10 / 3; // 1/300 sec to milliseconds
-            let secs = total_ms / 1000;
-            let ms = total_ms % 1000;
-            let h = secs / 3600;
-            let m = (secs % 3600) / 60;
-            let s = secs % 60;
-            Some(format!(
-                "'{} {:02}:{:02}:{:02}.{:03}'",
-                date_str, h, m, s, ms
-            ))
-        }
-        4 => {
-            // smalldatetime: 2 bytes days since 1900-01-01 + 2 bytes minutes
-            let days = u16::from_le_bytes([val_data[0], val_data[1]]) as i64;
-            let mins = u16::from_le_bytes([val_data[2], val_data[3]]) as u64;
-            let total_days = 693595 + days;
-            let date_str = days_to_date(total_days);
-            let h = mins / 60;
-            let m = mins % 60;
-            Some(format!("'{} {:02}:{:02}:00'", date_str, h, m))
-        }
-        _ => Some("NULL".to_string()),
-    }
-}
-
-/// GUIDTYPE (0x24): width(1, =16) then value_len(1) + 16 bytes.
-fn parse_guid_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    *pos += 1; // width (16)
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let b = &data[*pos..*pos + val_len];
-    *pos += val_len;
-
-    if val_len == 16 {
-        // SQL Server GUID byte order: first 3 groups are LE, last 2 are BE
-        Some(format!(
-            "'{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}'",
-            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
-            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
-        ))
-    } else {
-        Some("NULL".to_string())
-    }
-}
-
-/// MONEYNTYPE (0x6E): width(1) then value_len(1) + value.
-fn parse_money_value(data: &[u8], pos: &mut usize) -> Option<String> {
-    check_remaining(data, *pos, 1)?;
-    *pos += 1; // type width
-
-    check_remaining(data, *pos, 1)?;
-    let val_len = data[*pos] as usize;
-    *pos += 1;
-
-    if val_len == 0 {
-        return Some("NULL".to_string());
-    }
-
-    check_remaining(data, *pos, val_len)?;
-    let val_data = &data[*pos..*pos + val_len];
-    *pos += val_len;
-
-    match val_len {
-        8 => {
-            // money: high 4 bytes + low 4 bytes = i64 in units of 1/10000
-            let hi = i32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]);
-            let lo = u32::from_le_bytes([val_data[4], val_data[5], val_data[6], val_data[7]]);
-            let raw = ((hi as i64) << 32) | lo as i64;
-            let whole = raw / 10000;
-            let frac = (raw % 10000).unsigned_abs();
-            Some(format!("{}.{:04}", whole, frac))
-        }
-        4 => {
-            // smallmoney: i32 in units of 1/10000
-            let raw =
-                i32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as i64;
-            let whole = raw / 10000;
-            let frac = (raw % 10000).unsigned_abs();
-            Some(format!("{}.{:04}", whole, frac))
-        }
-        _ => Some("NULL".to_string()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Date/time helpers
-// ---------------------------------------------------------------------------
-
-/// Decode time bytes + date bytes into formatted strings.
-fn decode_time_date(val_data: &[u8], time_len: usize, scale: u8) -> (String, String) {
-    let time_val = read_le_uint(&val_data[..time_len]);
-    let date_bytes = &val_data[time_len..time_len + 3];
-    let days = read_le_uint(date_bytes) as i64;
-
-    let time_str = format_time(time_val, scale);
-    let date_str = days_to_date(days);
-    (time_str, date_str)
-}
-
-/// Decode time-only bytes.
-fn decode_time_only(val_data: &[u8], scale: u8) -> String {
-    let time_val = read_le_uint(val_data);
-    format_time(time_val, scale)
-}
-
-/// Format a time integer value with given scale into HH:MM:SS.fractional.
-fn format_time(time_val: u64, scale: u8) -> String {
-    let divisor = 10u64.pow(scale as u32);
-    let total_seconds = time_val / divisor;
-    let fractional = time_val % divisor;
-
-    let h = total_seconds / 3600;
-    let m = (total_seconds % 3600) / 60;
-    let s = total_seconds % 60;
-
-    if scale == 0 {
-        format!("{:02}:{:02}:{:02}", h, m, s)
-    } else {
-        format!(
-            "{:02}:{:02}:{:02}.{:0width$}",
-            h,
-            m,
-            s,
-            fractional,
-            width = scale as usize
-        )
-    }
-}
-
-/// Convert days since 0001-01-01 to YYYY-MM-DD string.
-fn days_to_date(days: i64) -> String {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    // TDS epoch is 0001-01-01; Hinnant internal epoch is 0000-03-01 (306 days earlier)
-    let z = days + 306;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
+    // Days since 1970-01-01 to civil date (proleptic Gregorian)
+    let z = day - DAYS_TO_1970 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Ok(format!("{y:04}-{m:02}-{d:02}"))
 }
 
-/// Read up to 8 bytes as a little-endian unsigned integer.
-fn read_le_uint(data: &[u8]) -> u64 {
-    let mut val: u64 = 0;
-    for (i, &b) in data.iter().enumerate() {
-        val |= (b as u64) << (i * 8);
+/// Time of day from a count of 10^-scale second units since midnight.
+fn time_text(units: u64, scale: u8) -> Result<String, ParamError> {
+    if scale > 7 {
+        return Err(ParamError::Malformed);
     }
-    val
-}
-
-/// Simple hex encoding.
-fn hex_encode(data: &[u8]) -> String {
-    let mut s = String::with_capacity(data.len() * 2);
-    for &b in data {
-        s.push_str(&format!("{:02X}", b));
+    let per_second = 10u64.pow(u32::from(scale));
+    let seconds = units / per_second;
+    if seconds >= 86_400 {
+        return Err(ParamError::Malformed);
     }
-    s
-}
-
-// ---------------------------------------------------------------------------
-// Parameter substitution
-// ---------------------------------------------------------------------------
-
-/// Replace @name references in SQL with their literal values.
-///
-/// This preserves the line structure of the SQL so that error line numbers
-/// remain correct. It handles:
-/// - Not replacing inside string literals ('...')
-/// - Longest-match-first for parameter names
-/// - Word boundary checks (won't replace @param when @paramX exists)
-fn substitute_params(sql: &str, params: &[Param]) -> String {
-    if params.is_empty() {
-        return sql.to_string();
-    }
-
-    // Sort by name length descending for longest-match-first
-    let mut sorted: Vec<(&str, &str)> = params
-        .iter()
-        .map(|p| (p.name.as_str(), p.literal.as_str()))
-        .collect();
-    sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-    let chars: Vec<char> = sql.chars().collect();
-    let mut result = String::with_capacity(sql.len() + sql.len() / 4);
-    let mut i = 0;
-
-    while i < chars.len() {
-        // Skip string literals
-        if chars[i] == '\'' {
-            result.push('\'');
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\'' {
-                    result.push('\'');
-                    i += 1;
-                    // Escaped quote ''
-                    if i < chars.len() && chars[i] == '\'' {
-                        result.push('\'');
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                result.push(chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-
-        // Check for @param reference
-        if chars[i] == '@' {
-            let mut matched = false;
-            for &(name, literal) in &sorted {
-                let name_chars: Vec<char> = name.chars().collect();
-                let end = i + 1 + name_chars.len();
-                if end <= chars.len() {
-                    let matches = chars[i + 1..end]
-                        .iter()
-                        .zip(name_chars.iter())
-                        .all(|(a, b)| a.eq_ignore_ascii_case(b));
-                    if matches && (end >= chars.len() || !is_ident_char(chars[end])) {
-                        result.push_str(literal);
-                        i = end;
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if !matched {
-                result.push(chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    result
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-fn check_remaining(data: &[u8], pos: usize, need: usize) -> Option<()> {
-    if pos + need <= data.len() {
-        Some(())
+    let fraction = units % per_second;
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    Ok(if scale == 0 || fraction == 0 {
+        format!("{h:02}:{m:02}:{s:02}")
     } else {
-        None
+        format!(
+            "{h:02}:{m:02}:{s:02}.{fraction:0width$}",
+            width = usize::from(scale)
+        )
+    })
+}
+
+/// Bytes a time of the given scale occupies.
+fn time_len(scale: u8) -> Result<usize, ParamError> {
+    match scale {
+        0..=2 => Ok(3),
+        3..=4 => Ok(4),
+        5..=7 => Ok(5),
+        _ => Err(ParamError::Malformed),
     }
+}
+
+/// Text of the single-byte code page characters clients send for VARCHAR
+/// parameters: UTF-8 if the bytes are valid UTF-8, otherwise Latin-1.
+fn code_page_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.iter().map(|b| char::from(*b)).collect(),
+    }
+}
+
+/// Read a partially-length-prefixed value: `None` for NULL.
+fn plp(r: &mut Reader<'_>, max_len: usize) -> Result<Option<Vec<u8>>, ParamError> {
+    let total = r.u64()?;
+    if total == PLP_NULL {
+        return Ok(None);
+    }
+    if total != PLP_UNKNOWN_LENGTH && total > max_len as u64 {
+        return Err(ParamError::Malformed);
+    }
+    let mut value = Vec::new();
+    loop {
+        let chunk = r.u32()? as usize;
+        if chunk == 0 {
+            return Ok(Some(value));
+        }
+        if value.len() + chunk > max_len {
+            return Err(ParamError::Malformed);
+        }
+        value.extend_from_slice(r.bytes(chunk)?);
+    }
+}
+
+/// Read a value with a 2-byte length, or a PLP value for a (max) type.
+fn long_value(
+    r: &mut Reader<'_>,
+    declared_len: u16,
+    max_len: usize,
+) -> Result<Option<Vec<u8>>, ParamError> {
+    if declared_len == MAX_TYPE_LENGTH {
+        return plp(r, max_len);
+    }
+    let len = r.u16()?;
+    if len == u16::MAX {
+        return Ok(None);
+    }
+    Ok(Some(r.bytes(usize::from(len))?.to_vec()))
+}
+
+/// Legacy DATETIME (days since 1900 and 1/300 s ticks) or SMALLDATETIME
+/// (days and minutes) as text.
+fn legacy_datetime(bytes: &[u8]) -> Result<Datum, ParamError> {
+    let (days, seconds, millis) = match bytes.len() {
+        4 => {
+            let days = i64::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let minutes = u64::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+            (days, minutes * 60, 0)
+        }
+        8 => {
+            let days = i64::from(i32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")));
+            let ticks = u64::from(u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes")));
+            // 300 ticks per second
+            (days, ticks / 300, ticks % 300 * 1000 / 300)
+        }
+        _ => return Err(ParamError::Malformed),
+    };
+    let date = date_text(days + DAYS_TO_1900)?;
+    let time = time_text(seconds * 1000 + millis, 3)?;
+    Ok(Datum::String(format!("{date} {time}")))
+}
+
+/// MONEY: a scaled integer with 4 decimal places.
+fn money(bytes: &[u8]) -> Result<Datum, ParamError> {
+    let value = match bytes.len() {
+        4 => i64::from(i32::from_le_bytes(bytes.try_into().expect("4 bytes"))),
+        8 => {
+            // High 4 bytes first, then low 4 bytes, each little-endian
+            let high = i64::from(i32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")));
+            let low = i64::from(u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes")));
+            (high << 32) | low
+        }
+        _ => return Err(ParamError::Malformed),
+    };
+    Ok(Datum::String(format_decimal(i128::from(value), 4)))
+}
+
+/// Decode one TYPE_INFO and its value.
+///
+/// `max_len` bounds any single value. Numbers become `Int`/`Float`; text
+/// becomes `String`; binary becomes `Bytes`; decimals, dates and times
+/// become their text form, which is how the engine takes them from the
+/// RooDB protocol as well.
+pub fn read_typed_value(r: &mut Reader<'_>, max_len: usize) -> Result<Datum, ParamError> {
+    let type_id = r.u8()?;
+    Ok(match type_id {
+        TYPE_NULL => Datum::Null,
+
+        // Fixed-length types: no length byte
+        TYPE_INT1 => Datum::Int(le_int(r.bytes(1)?)?),
+        TYPE_INT2 => Datum::Int(le_int(r.bytes(2)?)?),
+        TYPE_INT4 => Datum::Int(le_int(r.bytes(4)?)?),
+        TYPE_INT8 => Datum::Int(le_int(r.bytes(8)?)?),
+        TYPE_BIT => Datum::Bool(r.u8()? != 0),
+        TYPE_FLT4 => float(r.bytes(4)?)?,
+        TYPE_FLT8 => float(r.bytes(8)?)?,
+        TYPE_DATETIME => legacy_datetime(r.bytes(8)?)?,
+        TYPE_DATETIM4 => legacy_datetime(r.bytes(4)?)?,
+        TYPE_MONEY => money(r.bytes(8)?)?,
+        TYPE_MONEY4 => money(r.bytes(4)?)?,
+
+        // Nullable fixed-size types: declared size, then a length byte
+        TYPE_INTN | TYPE_BITN | TYPE_FLTN | TYPE_MONEYN | TYPE_DATETIMN | TYPE_GUID => {
+            let _declared = r.u8()?;
+            let len = usize::from(r.u8()?);
+            if len == 0 {
+                return Ok(Datum::Null);
+            }
+            let value = r.bytes(len)?;
+            match type_id {
+                TYPE_INTN => Datum::Int(le_int(value)?),
+                TYPE_BITN => match value {
+                    [b] => Datum::Bool(*b != 0),
+                    _ => return Err(ParamError::Malformed),
+                },
+                TYPE_FLTN => float(value)?,
+                TYPE_MONEYN => money(value)?,
+                TYPE_DATETIMN => legacy_datetime(value)?,
+                _ => {
+                    let g: [u8; 16] = value.try_into().map_err(|_| ParamError::Malformed)?;
+                    // The first three groups are little-endian
+                    Datum::String(format!(
+                        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+                        u16::from_le_bytes([g[4], g[5]]),
+                        u16::from_le_bytes([g[6], g[7]]),
+                        g[8],
+                        g[9],
+                        g[10],
+                        g[11],
+                        g[12],
+                        g[13],
+                        g[14],
+                        g[15]
+                    ))
+                }
+            }
+        }
+
+        TYPE_DECIMALN | TYPE_NUMERICN => {
+            let _declared = r.u8()?;
+            let _precision = r.u8()?;
+            let scale = r.u8()?;
+            let len = usize::from(r.u8()?);
+            if len == 0 {
+                return Ok(Datum::Null);
+            }
+            // Sign byte plus a 4, 8, 12 or 16 byte magnitude
+            if !matches!(len, 5 | 9 | 13 | 17) || scale > 38 {
+                return Err(ParamError::Malformed);
+            }
+            let value = r.bytes(len)?;
+            let magnitude =
+                i128::try_from(le_uint(&value[1..])).map_err(|_| ParamError::Malformed)?;
+            let signed = if value[0] == 0 { -magnitude } else { magnitude };
+            Datum::String(format_decimal(signed, scale))
+        }
+
+        TYPE_DATEN => {
+            let len = usize::from(r.u8()?);
+            match len {
+                0 => Datum::Null,
+                3 => Datum::String(date_text(le_uint(r.bytes(3)?) as i64)?),
+                _ => return Err(ParamError::Malformed),
+            }
+        }
+
+        TYPE_TIMEN | TYPE_DATETIME2N | TYPE_DATETIMEOFFSETN => {
+            let scale = r.u8()?;
+            let time_bytes = time_len(scale)?;
+            let len = usize::from(r.u8()?);
+            if len == 0 {
+                return Ok(Datum::Null);
+            }
+            let expected = match type_id {
+                TYPE_TIMEN => time_bytes,
+                TYPE_DATETIME2N => time_bytes + 3,
+                _ => time_bytes + 5,
+            };
+            if len != expected {
+                return Err(ParamError::Malformed);
+            }
+            let value = r.bytes(len)?;
+            let time = time_text(le_uint(&value[..time_bytes]) as u64, scale)?;
+            if type_id == TYPE_TIMEN {
+                Datum::String(time)
+            } else {
+                // DATETIMEOFFSET carries UTC time plus an offset; the
+                // UTC value is what is stored.
+                let date = date_text(le_uint(&value[time_bytes..time_bytes + 3]) as i64)?;
+                Datum::String(format!("{date} {time}"))
+            }
+        }
+
+        TYPE_NVARCHAR | TYPE_NCHAR => {
+            let declared = r.u16()?;
+            let _collation = r.bytes(5)?;
+            match long_value(r, declared, max_len)? {
+                None => Datum::Null,
+                Some(bytes) if bytes.len() % 2 == 0 => Datum::String(decode_ucs2(&bytes)),
+                Some(_) => return Err(ParamError::Malformed),
+            }
+        }
+
+        TYPE_BIGVARCHAR | TYPE_BIGCHAR => {
+            let declared = r.u16()?;
+            let _collation = r.bytes(5)?;
+            match long_value(r, declared, max_len)? {
+                None => Datum::Null,
+                Some(bytes) => Datum::String(code_page_text(&bytes)),
+            }
+        }
+
+        TYPE_BIGVARBINARY | TYPE_BIGBINARY => {
+            let declared = r.u16()?;
+            match long_value(r, declared, max_len)? {
+                None => Datum::Null,
+                Some(bytes) => Datum::Bytes(bytes),
+            }
+        }
+
+        other => return Err(ParamError::UnsupportedType(other)),
+    })
+}
+
+/// Read one RPC parameter: name, status flags, type and value.
+pub fn read_param(r: &mut Reader<'_>, max_len: usize) -> Result<RpcParam, ParamError> {
+    let name = r.b_varchar()?;
+    let status = r.u8()?;
+    let value = read_typed_value(r, max_len)?;
+    Ok(RpcParam {
+        name,
+        output: status & 0x01 != 0,
+        value,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const MAX: usize = 1 << 20;
+
+    fn decode(bytes: &[u8]) -> Result<Datum, ParamError> {
+        let mut r = Reader::new(bytes);
+        let value = read_typed_value(&mut r, MAX)?;
+        assert!(r.is_empty(), "trailing bytes after the value");
+        Ok(value)
+    }
+
+    fn text(s: &str) -> Datum {
+        Datum::String(s.to_string())
+    }
+
     #[test]
-    fn test_substitute_simple() {
-        let params = vec![
-            Param {
-                name: "id".to_string(),
-                literal: "42".to_string(),
-            },
-            Param {
-                name: "name".to_string(),
-                literal: "'hello'".to_string(),
-            },
+    fn integers_bits_and_floats() {
+        assert_eq!(
+            decode(&[TYPE_INTN, 4, 4, 0xFE, 0xFF, 0xFF, 0xFF]),
+            Ok(Datum::Int(-2))
+        );
+        assert_eq!(decode(&[TYPE_INTN, 8, 0]), Ok(Datum::Null));
+        assert_eq!(decode(&[TYPE_INTN, 1, 1, 200]), Ok(Datum::Int(200)));
+        assert_eq!(decode(&[TYPE_INT2, 0x00, 0x80]), Ok(Datum::Int(-32768)));
+        let mut big = vec![TYPE_INT8];
+        big.extend_from_slice(&i64::MIN.to_le_bytes());
+        assert_eq!(decode(&big), Ok(Datum::Int(i64::MIN)));
+        assert_eq!(decode(&[TYPE_BITN, 1, 1, 1]), Ok(Datum::Bool(true)));
+        assert_eq!(decode(&[TYPE_BIT, 0]), Ok(Datum::Bool(false)));
+        let mut f = vec![TYPE_FLTN, 8, 8];
+        f.extend_from_slice(&1.5f64.to_le_bytes());
+        assert_eq!(decode(&f), Ok(Datum::Float(1.5)));
+        let mut f = vec![TYPE_FLTN, 4, 4];
+        f.extend_from_slice(&2.5f32.to_le_bytes());
+        assert_eq!(decode(&f), Ok(Datum::Float(2.5)));
+        // A 3-byte integer does not exist
+        assert_eq!(
+            decode(&[TYPE_INTN, 4, 3, 1, 2, 3]),
+            Err(ParamError::Malformed)
+        );
+        assert_eq!(decode(&[TYPE_BITN, 1, 2, 1, 1]), Err(ParamError::Malformed));
+    }
+
+    #[test]
+    fn strings_and_binary() {
+        let mut v = vec![TYPE_NVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 4, 0];
+        v.extend_from_slice(&[b'h', 0, 0xE9, 0]);
+        assert_eq!(decode(&v), Ok(text("h\u{e9}")));
+
+        // NULL and empty are different
+        let null = [TYPE_NVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 0xFF, 0xFF];
+        assert_eq!(decode(&null), Ok(Datum::Null));
+        let empty = [TYPE_NVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 0, 0];
+        assert_eq!(decode(&empty), Ok(text("")));
+
+        // Odd byte count is not UTF-16
+        let odd = [TYPE_NVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 1, 0, b'x'];
+        assert_eq!(decode(&odd), Err(ParamError::Malformed));
+
+        // VARCHAR: UTF-8 if valid, otherwise Latin-1
+        let v = [TYPE_BIGVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 2, 0, 0xC3, 0xA9];
+        assert_eq!(decode(&v), Ok(text("\u{e9}")));
+        let v = [TYPE_BIGVARCHAR, 8, 0, 9, 4, 0xD0, 0, 0x34, 1, 0, 0xE9];
+        assert_eq!(decode(&v), Ok(text("\u{e9}")));
+
+        let v = [TYPE_BIGVARBINARY, 8, 0, 3, 0, 0, 0xFF, 0x10];
+        assert_eq!(decode(&v), Ok(Datum::Bytes(vec![0, 0xFF, 0x10])));
+    }
+
+    #[test]
+    fn plp_values() {
+        // NVARCHAR(max) "ab" in two chunks
+        let mut v = vec![TYPE_NVARCHAR, 0xFF, 0xFF, 9, 4, 0xD0, 0, 0x34];
+        v.extend_from_slice(&4u64.to_le_bytes());
+        v.extend_from_slice(&2u32.to_le_bytes());
+        v.extend_from_slice(&[b'a', 0]);
+        v.extend_from_slice(&2u32.to_le_bytes());
+        v.extend_from_slice(&[b'b', 0]);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&v), Ok(text("ab")));
+
+        // NULL, and unknown total length
+        let mut v = vec![TYPE_BIGVARBINARY, 0xFF, 0xFF];
+        v.extend_from_slice(&PLP_NULL.to_le_bytes());
+        assert_eq!(decode(&v), Ok(Datum::Null));
+        let mut v = vec![TYPE_BIGVARBINARY, 0xFF, 0xFF];
+        v.extend_from_slice(&PLP_UNKNOWN_LENGTH.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.push(7);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&v), Ok(Datum::Bytes(vec![7])));
+
+        // Declared or actual size above the cap is refused before reading
+        let mut v = vec![TYPE_BIGVARBINARY, 0xFF, 0xFF];
+        v.extend_from_slice(&(MAX as u64 + 1).to_le_bytes());
+        assert_eq!(decode(&v), Err(ParamError::Malformed));
+        let mut v = vec![TYPE_BIGVARBINARY, 0xFF, 0xFF];
+        v.extend_from_slice(&PLP_UNKNOWN_LENGTH.to_le_bytes());
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode(&v), Err(ParamError::Malformed));
+    }
+
+    #[test]
+    fn decimals_and_money() {
+        // DECIMAL(10,2) -12.34
+        let mut v = vec![TYPE_DECIMALN, 9, 10, 2, 9, 0];
+        v.extend_from_slice(&1234u64.to_le_bytes());
+        assert_eq!(decode(&v), Ok(text("-12.34")));
+        let mut v = vec![TYPE_NUMERICN, 5, 5, 0, 5, 1];
+        v.extend_from_slice(&42u32.to_le_bytes());
+        assert_eq!(decode(&v), Ok(text("42")));
+        assert_eq!(decode(&[TYPE_DECIMALN, 9, 10, 2, 0]), Ok(Datum::Null));
+        // Bad length and bad scale
+        assert_eq!(
+            decode(&[TYPE_DECIMALN, 9, 10, 2, 3, 1, 1, 0]),
+            Err(ParamError::Malformed)
+        );
+        let mut v = vec![TYPE_DECIMALN, 5, 5, 255, 5, 1];
+        v.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode(&v), Err(ParamError::Malformed));
+
+        // MONEY 12.3456 = 123456 scaled by 10^4
+        let mut v = vec![TYPE_MONEYN, 8, 8];
+        v.extend_from_slice(&0i32.to_le_bytes());
+        v.extend_from_slice(&123_456u32.to_le_bytes());
+        assert_eq!(decode(&v), Ok(text("12.3456")));
+    }
+
+    #[test]
+    fn dates_and_times() {
+        // DATE: 2024-02-29 is day 738944
+        let day = 738_944u32.to_le_bytes();
+        assert_eq!(
+            decode(&[TYPE_DATEN, 3, day[0], day[1], day[2]]),
+            Ok(text("2024-02-29"))
+        );
+        assert_eq!(decode(&[TYPE_DATEN, 0]), Ok(Datum::Null));
+        assert_eq!(decode(&[TYPE_DATEN, 2, 1, 2]), Err(ParamError::Malformed));
+
+        // DATETIME2(3) 2024-02-29 13:14:15.250
+        let ms = ((13 * 3600 + 14 * 60 + 15) * 1000 + 250u32).to_le_bytes();
+        let v = [
+            TYPE_DATETIME2N,
+            3,
+            7,
+            ms[0],
+            ms[1],
+            ms[2],
+            ms[3],
+            day[0],
+            day[1],
+            day[2],
         ];
-        let sql = "SELECT * FROM t WHERE id = @id AND name = @name";
-        let result = substitute_params(sql, &params);
-        assert_eq!(result, "SELECT * FROM t WHERE id = 42 AND name = 'hello'");
+        assert_eq!(decode(&v), Ok(text("2024-02-29 13:14:15.250")));
+
+        // TIME(0) 23:59:59
+        let secs = 86_399u32.to_le_bytes();
+        assert_eq!(
+            decode(&[TYPE_TIMEN, 0, 3, secs[0], secs[1], secs[2]]),
+            Ok(text("23:59:59"))
+        );
+
+        // Scale above 7, wrong length for the scale, time past midnight
+        assert_eq!(
+            decode(&[TYPE_TIMEN, 255, 3, 0, 0, 0]),
+            Err(ParamError::Malformed)
+        );
+        assert_eq!(
+            decode(&[TYPE_DATETIME2N, 3, 1, 0]),
+            Err(ParamError::Malformed)
+        );
+        assert_eq!(
+            decode(&[TYPE_TIMEN, 0, 3, 0xFF, 0xFF, 0xFF]),
+            Err(ParamError::Malformed)
+        );
+        // Day number past 9999-12-31
+        assert_eq!(
+            decode(&[TYPE_DATEN, 3, 0xFF, 0xFF, 0xFF]),
+            Err(ParamError::Malformed)
+        );
+
+        // Legacy DATETIME: 1900-01-02 00:00:01
+        let mut v = vec![TYPE_DATETIMN, 8, 8];
+        v.extend_from_slice(&1i32.to_le_bytes());
+        v.extend_from_slice(&300u32.to_le_bytes());
+        assert_eq!(decode(&v), Ok(text("1900-01-02 00:00:01")));
     }
 
     #[test]
-    fn test_substitute_inside_string_literal() {
-        let params = vec![Param {
-            name: "x".to_string(),
-            literal: "42".to_string(),
-        }];
-        let sql = "SELECT '@x is not replaced', @x";
-        let result = substitute_params(sql, &params);
-        assert_eq!(result, "SELECT '@x is not replaced', 42");
+    fn guid_and_unsupported_types() {
+        let mut v = vec![TYPE_GUID, 16, 16];
+        v.extend_from_slice(&[
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ]);
+        assert_eq!(decode(&v), Ok(text("00112233-4455-6677-8899-aabbccddeeff")));
+
+        // XML, UDT, table-valued and sql_variant parameters
+        for type_id in [0xF1u8, 0xF0, 0xF3, 0x62] {
+            let bytes = [type_id, 0, 0, 0, 0];
+            let mut r = Reader::new(&bytes);
+            assert_eq!(
+                read_typed_value(&mut r, MAX),
+                Err(ParamError::UnsupportedType(type_id))
+            );
+        }
     }
 
     #[test]
-    fn test_substitute_prefix_safety() {
-        let params = vec![
-            Param {
-                name: "p".to_string(),
-                literal: "1".to_string(),
-            },
-            Param {
-                name: "prefix".to_string(),
-                literal: "2".to_string(),
-            },
-        ];
-        let sql = "SELECT @p, @prefix";
-        let result = substitute_params(sql, &params);
-        assert_eq!(result, "SELECT 1, 2");
+    fn parameter_header() {
+        // "@P1", output flag, INTN 5
+        let mut v = vec![3, b'@', 0, b'P', 0, b'1', 0, 0x01, TYPE_INTN, 4, 4];
+        v.extend_from_slice(&5i32.to_le_bytes());
+        let mut r = Reader::new(&v);
+        let p = read_param(&mut r, MAX).unwrap();
+        assert_eq!(p.name, "@P1");
+        assert!(p.output);
+        assert_eq!(p.value, Datum::Int(5));
+        assert!(r.is_empty());
+
+        // Unnamed, input
+        let v = [0, 0x00, TYPE_BIT, 1];
+        let p = read_param(&mut Reader::new(&v), MAX).unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.output, p.value),
+            ("", false, Datum::Bool(true))
+        );
     }
 
+    /// No input may panic: every truncation of valid values, and every
+    /// single-byte corruption, must come back as Ok or Err.
     #[test]
-    fn test_substitute_case_insensitive() {
-        let params = vec![Param {
-            name: "MyParam".to_string(),
-            literal: "99".to_string(),
-        }];
-        let sql = "SELECT @myparam, @MYPARAM, @MyParam";
-        let result = substitute_params(sql, &params);
-        assert_eq!(result, "SELECT 99, 99, 99");
-    }
+    fn truncation_and_corruption_never_panic() {
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        samples.push(vec![TYPE_INTN, 4, 4, 1, 2, 3, 4]);
+        let mut v = vec![TYPE_NVARCHAR, 0xFF, 0xFF, 9, 4, 0xD0, 0, 0x34];
+        v.extend_from_slice(&4u64.to_le_bytes());
+        v.extend_from_slice(&4u32.to_le_bytes());
+        v.extend_from_slice(&[b'a', 0, b'b', 0]);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        samples.push(v);
+        let mut v = vec![TYPE_DECIMALN, 17, 38, 10, 17, 1];
+        v.extend_from_slice(&[0xFF; 16]);
+        samples.push(v);
+        samples.push(vec![TYPE_DATETIME2N, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+        samples.push(vec![
+            TYPE_DATETIMEOFFSETN,
+            7,
+            10,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+        ]);
+        samples.push(vec![
+            TYPE_GUID, 16, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        ]);
+        samples.push(vec![
+            TYPE_DATETIMN,
+            8,
+            8,
+            0xFF,
+            0xFF,
+            0xFF,
+            0x7F,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+        ]);
 
-    #[test]
-    fn test_substitute_preserves_lines() {
-        let params = vec![
-            Param {
-                name: "a".to_string(),
-                literal: "1".to_string(),
-            },
-            Param {
-                name: "b".to_string(),
-                literal: "2".to_string(),
-            },
-        ];
-        let sql = "SELECT\n  @a,\n  @b\nFROM t";
-        let result = substitute_params(sql, &params);
-        assert_eq!(result, "SELECT\n  1,\n  2\nFROM t");
-        // Same number of newlines
-        assert_eq!(sql.matches('\n').count(), result.matches('\n').count());
-    }
-
-    #[test]
-    fn test_days_to_date() {
-        // 2000-01-01 is day 730119 from 0001-01-01
-        assert_eq!(days_to_date(730119), "2000-01-01");
-        // 1970-01-01 is day 719162
-        assert_eq!(days_to_date(719162), "1970-01-01");
-    }
-
-    #[test]
-    fn test_decimal_formatting() {
-        // Simulate parsing a decimal: magnitude=12345, scale=2 → "123.45"
-        let magnitude: u128 = 12345;
-        let scale: u32 = 2;
-        let s = magnitude.to_string();
-        let split = s.len() - scale as usize;
-        let formatted = format!("{}.{}", &s[..split], &s[split..]);
-        assert_eq!(formatted, "123.45");
+        for sample in &samples {
+            for len in 0..sample.len() {
+                let _ = read_typed_value(&mut Reader::new(&sample[..len]), MAX);
+            }
+            for pos in 0..sample.len() {
+                for value in [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF] {
+                    let mut corrupt = sample.clone();
+                    corrupt[pos] = value;
+                    let _ = read_typed_value(&mut Reader::new(&corrupt), MAX);
+                }
+            }
+        }
+        // Every type byte with a short tail
+        for type_id in 0..=255u8 {
+            for tail in [&[][..], &[0xFF; 3], &[0x00; 12], &[0xFF; 24]] {
+                let mut bytes = vec![type_id];
+                bytes.extend_from_slice(tail);
+                let _ = read_typed_value(&mut Reader::new(&bytes), MAX);
+            }
+        }
     }
 }

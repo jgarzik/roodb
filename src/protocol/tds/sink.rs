@@ -14,8 +14,8 @@ use crate::server::query::{OkInfo, QueryError, ResponseSink, Status};
 
 use super::codec::{PacketError, PacketType, TdsWriter};
 use super::token::{
-    put_done, put_error, sql_server_error, DONE_ATTN, DONE_COUNT, DONE_ERROR, DONE_FINAL,
-    DONE_MORE, TOKEN_DONE,
+    put_done, put_error, put_return_status, put_return_value_int, sql_server_error, DONE_ATTN,
+    DONE_COUNT, DONE_ERROR, DONE_FINAL, DONE_MORE, TOKEN_DONE, TOKEN_DONEINPROC, TOKEN_DONEPROC,
 };
 use super::types::{declared_wire_types, put_colmetadata, put_row, reconcile_wire_types, WireType};
 
@@ -25,6 +25,8 @@ const ERROR_UNENCODABLE_VALUE: i32 = 50000;
 /// A DONE token held back until it is known whether another result
 /// follows (which sets DONE_MORE).
 struct PendingDone {
+    /// DONE, DONEINPROC or DONEPROC
+    token: u8,
     status: u16,
     row_count: u64,
 }
@@ -48,6 +50,11 @@ pub struct TdsSink<W> {
     /// First value that could not be encoded in the current result set
     row_error: Option<String>,
     pending: Option<PendingDone>,
+    /// Results are being produced by a procedure call (RPC): statements
+    /// end with DONEINPROC and the call with DONEPROC
+    in_procedure: bool,
+    /// A statement of the current procedure call failed
+    procedure_failed: bool,
     /// Set by the connection's reader when the client cancels the request
     cancel: Arc<AtomicBool>,
 }
@@ -72,6 +79,8 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             rows: 0,
             row_error: None,
             pending: None,
+            in_procedure: false,
+            procedure_failed: false,
             cancel,
         }
     }
@@ -86,6 +95,33 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
     /// the DONE that is still held back.
     pub fn tokens(&mut self) -> &mut Vec<u8> {
         &mut self.buf
+    }
+
+    /// Start reporting the results of a procedure call (RPC).
+    pub fn begin_procedure(&mut self) {
+        self.emit_pending(true);
+        self.in_procedure = true;
+        self.procedure_failed = false;
+    }
+
+    /// Finish a procedure call: return status, integer output parameters
+    /// (name, value), and the DONEPROC that closes it.
+    pub fn end_procedure(&mut self, return_values: &[(&str, i32)]) {
+        self.emit_pending(true);
+        put_return_status(&mut self.buf, 0);
+        for (name, value) in return_values {
+            put_return_value_int(&mut self.buf, name, *value);
+        }
+        self.in_procedure = false;
+        self.pending = Some(PendingDone {
+            token: TOKEN_DONEPROC,
+            status: if self.procedure_failed {
+                DONE_ERROR
+            } else {
+                DONE_FINAL
+            },
+            row_count: 0,
+        });
     }
 
     /// Whether the request produced any result yet.
@@ -104,6 +140,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
                 // Every response ends with a DONE, including one that
                 // carries only informational tokens.
                 self.pending = Some(PendingDone {
+                    token: TOKEN_DONE,
                     status: DONE_FINAL,
                     row_count: 0,
                 });
@@ -126,7 +163,16 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             } else {
                 done.status
             };
-            put_done(&mut self.buf, TOKEN_DONE, status, done.row_count);
+            put_done(&mut self.buf, done.token, status, done.row_count);
+        }
+    }
+
+    /// The token that ends a statement's result.
+    fn statement_done(&self) -> u8 {
+        if self.in_procedure {
+            TOKEN_DONEINPROC
+        } else {
+            TOKEN_DONE
         }
     }
 }
@@ -180,6 +226,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
             status |= DONE_ERROR;
         }
         self.pending = Some(PendingDone {
+            token: self.statement_done(),
             status,
             row_count: self.rows,
         });
@@ -188,6 +235,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
     fn ok(&mut self, info: OkInfo, _status: Status) {
         self.emit_pending(true);
         self.pending = Some(PendingDone {
+            token: self.statement_done(),
             status: DONE_COUNT,
             row_count: info.affected_rows,
         });
@@ -199,7 +247,9 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         self.metadata_sent = true;
         let (number, class, state) = sql_server_error(error.code);
         put_error(&mut self.buf, number, state, class, &error.message);
+        self.procedure_failed = true;
         self.pending = Some(PendingDone {
+            token: self.statement_done(),
             status: DONE_ERROR,
             row_count: 0,
         });
@@ -321,6 +371,49 @@ mod tests {
         let done = tokens.len() - 13;
         assert_eq!(done_at(&tokens, done), (DONE_COUNT | DONE_ERROR, 1));
         assert!(tokens[..done].contains(&TOKEN_ERROR));
+    }
+
+    #[tokio::test]
+    async fn procedure_results_use_doneinproc_and_doneproc() {
+        use crate::protocol::tds::token::{TOKEN_RETURNSTATUS, TOKEN_RETURNVALUE};
+
+        let (mut sink, mut client, _) = sink();
+        sink.begin_procedure();
+        sink.ok(
+            OkInfo {
+                affected_rows: 2,
+                last_insert_id: 0,
+            },
+            Status::AUTOCOMMIT,
+        );
+        sink.end_procedure(&[("@handle", 5)]);
+        sink.finish(false).await.unwrap();
+
+        let tokens = response(&mut client).await;
+        // DONEINPROC(count, more) RETURNSTATUS RETURNVALUE DONEPROC(final)
+        assert_eq!(tokens[0], TOKEN_DONEINPROC);
+        assert_eq!(
+            u16::from_le_bytes([tokens[1], tokens[2]]),
+            DONE_COUNT | DONE_MORE
+        );
+        assert_eq!(tokens[13], TOKEN_RETURNSTATUS);
+        assert_eq!(tokens[18], TOKEN_RETURNVALUE);
+        let last = tokens.len() - 13;
+        assert_eq!(tokens[last], TOKEN_DONEPROC);
+        assert_eq!(u16::from_le_bytes([tokens[last + 1], tokens[last + 2]]), 0);
+
+        // A failed statement marks the procedure's DONEPROC as an error.
+        sink.begin_procedure();
+        sink.error(&QueryError::new(1146, "42S02", "no such table"));
+        sink.end_procedure(&[]);
+        sink.finish(false).await.unwrap();
+        let tokens = response(&mut client).await;
+        let last = tokens.len() - 13;
+        assert_eq!(tokens[last], TOKEN_DONEPROC);
+        assert_eq!(
+            u16::from_le_bytes([tokens[last + 1], tokens[last + 2]]),
+            DONE_ERROR
+        );
     }
 
     #[tokio::test]

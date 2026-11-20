@@ -14,6 +14,7 @@
 //! both transports carry the same TDS 7.4 token stream; statement
 //! execution is delegated to [`QueryEngine`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
+use crate::executor::Datum;
 use crate::server::auth::{self, AuthError};
 use crate::server::context::ServerContext;
 use crate::server::limits::HANDSHAKE_TIMEOUT;
@@ -39,9 +41,11 @@ use super::codec::{
 use super::login::{
     decode_ucs2, parse_login7, Login7, FEATURE_FEDAUTH, TDS_VERSION_7_4, TDS_VERSION_8_0,
 };
+use super::params::RpcParam;
 use super::prelogin::{
     encode_prelogin_response, negotiate_encryption, parse_prelogin, Encryption, SERVER_VERSION,
 };
+use super::rpc::{bind_parameters, declared_names, parse_rpc, Procedure, RpcCall};
 use super::sink::TdsSink;
 use super::token::{
     put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
@@ -60,6 +64,10 @@ const MAX_PRELOGIN: usize = 4096;
 const MAX_LOGIN: usize = 64 * 1024;
 /// Largest request (SQL batch, RPC) accepted after login
 const MAX_REQUEST: usize = 64 * 1024 * 1024;
+/// Most statements a session may hold prepared at once
+const MAX_PREPARED_STATEMENTS: usize = 4096;
+/// Statements remembered for sp_executesql before the cache is cleared
+const STATEMENT_CACHE_SIZE: usize = 256;
 /// Largest packet size the server agrees to
 const MAX_NEGOTIATED_PACKET_SIZE: usize = 16 * 1024;
 
@@ -337,6 +345,9 @@ async fn establish(
         requests,
         reader,
         login_database,
+        prepared: HashMap::new(),
+        next_handle: 1,
+        statement_cache: HashMap::new(),
     };
     conn.send_login_response(&login).await?;
 
@@ -379,6 +390,29 @@ struct TdsConnection {
     reader: JoinHandle<()>,
     /// Database selected at login, restored by a connection reset
     login_database: Option<String>,
+    /// Statements prepared with sp_prepare / sp_prepexec, by handle
+    prepared: HashMap<i32, Prepared>,
+    next_handle: i32,
+    /// Statements seen by sp_executesql, keyed by text and parameter
+    /// declaration, so repeated executions reuse the cached plan
+    statement_cache: HashMap<(String, String), Prepared>,
+}
+
+/// A statement ready to be executed with parameter values.
+#[derive(Debug, Clone)]
+enum Prepared {
+    /// No parameters: runs as plain SQL text
+    Text(String),
+    /// Parameter references rewritten to placeholders and prepared in the
+    /// engine
+    Bound {
+        /// Engine prepared-statement ID
+        statement_id: u32,
+        /// Declared parameter names, lower-case
+        names: Vec<String>,
+        /// For each placeholder, the index of its parameter in `names`
+        order: Vec<usize>,
+    },
 }
 
 impl Drop for TdsConnection {
@@ -529,6 +563,9 @@ impl TdsConnection {
                 self.engine
                     .session
                     .set_database(self.login_database.clone());
+                // The engine dropped its prepared statements.
+                self.prepared.clear();
+                self.statement_cache.clear();
                 put_envchange_binary(self.sink().tokens(), ENV_RESET_CONNECTION, &[], &[]);
             }
             match message.packet_type {
@@ -554,11 +591,7 @@ impl TdsConnection {
                 }
                 PacketType::Rpc => {
                     let before = self.environment();
-                    self.engine.out.error(&QueryError::new(
-                        codes::ER_UNKNOWN_COM_ERROR,
-                        states::GENERAL_ERROR,
-                        "Remote procedure calls are not supported",
-                    ));
+                    self.rpc_request(&message.payload).await?;
                     self.finish_request(before, false).await?;
                 }
                 _ => return Err(TdsError::Protocol("unexpected message type")),
@@ -586,6 +619,258 @@ impl TdsConnection {
             return Err(TdsError::Protocol("SQL text is not UTF-16"));
         }
         Ok(decode_ucs2(text))
+    }
+
+    /// Report a request the server will not carry out. The session
+    /// continues.
+    fn refuse(&mut self, code: u16, message: &str) {
+        self.engine
+            .out
+            .error(&QueryError::new(code, states::GENERAL_ERROR, message));
+    }
+
+    /// Run the procedure calls of an RPC request.
+    async fn rpc_request(&mut self, payload: &[u8]) -> Result<(), TdsError> {
+        let body = skip_all_headers(payload)?;
+        let calls = match parse_rpc(body, MAX_REQUEST) {
+            Ok(calls) => calls,
+            Err(e) => {
+                self.refuse(codes::ER_UNKNOWN_COM_ERROR, &e.to_string());
+                return Ok(());
+            }
+        };
+        for call in calls {
+            self.sink().begin_procedure();
+            let handle = self.procedure_call(call).await?;
+            match handle {
+                Some((name, value)) => self.sink().end_procedure(&[(name.as_str(), value)]),
+                None => self.sink().end_procedure(&[]),
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one procedure call. Returns the statement handle to report as
+    /// an output parameter, if the procedure produces one.
+    async fn procedure_call(&mut self, call: RpcCall) -> Result<Option<(String, i32)>, TdsError> {
+        let text = |param: Option<&RpcParam>| match param.map(|p| &p.value) {
+            Some(Datum::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let params = &call.params;
+
+        match call.procedure {
+            // sp_executesql @stmt, @params, values...
+            Procedure::ExecuteSql => {
+                let Some(sql) = text(params.first()) else {
+                    self.refuse(
+                        codes::ER_WRONG_ARGUMENTS,
+                        "sp_executesql expects a statement",
+                    );
+                    return Ok(None);
+                };
+                let declaration = text(params.get(1)).unwrap_or_default();
+                let key = (sql, declaration);
+                let prepared = match self.statement_cache.get(&key) {
+                    Some(prepared) => prepared.clone(),
+                    None => {
+                        let Some(prepared) = self.prepare(&key.0, &key.1).await? else {
+                            return Ok(None);
+                        };
+                        if self.statement_cache.len() >= STATEMENT_CACHE_SIZE {
+                            self.clear_statement_cache();
+                        }
+                        self.statement_cache.insert(key, prepared.clone());
+                        prepared
+                    }
+                };
+                self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
+                    .await?;
+                Ok(None)
+            }
+
+            // sp_prepare @handle OUTPUT, @params, @stmt
+            // sp_prepexec @handle OUTPUT, @params, @stmt, values...
+            Procedure::Prepare | Procedure::PrepExec => {
+                let Some(sql) = text(params.get(2)) else {
+                    self.refuse(codes::ER_WRONG_ARGUMENTS, "Expected a statement to prepare");
+                    return Ok(None);
+                };
+                if self.prepared.len() >= MAX_PREPARED_STATEMENTS {
+                    self.refuse(
+                        codes::ER_UNKNOWN_ERROR,
+                        "Too many prepared statements on this connection",
+                    );
+                    return Ok(None);
+                }
+                let declaration = text(params.get(1)).unwrap_or_default();
+                let Some(prepared) = self.prepare(&sql, &declaration).await? else {
+                    return Ok(None);
+                };
+                let handle = self.next_handle;
+                self.next_handle = self.next_handle.wrapping_add(1).max(1);
+                self.prepared.insert(handle, prepared.clone());
+
+                if call.procedure == Procedure::PrepExec {
+                    self.execute_prepared(&prepared, params.get(3..).unwrap_or(&[]))
+                        .await?;
+                }
+                let name = match params.first() {
+                    Some(p) if !p.name.is_empty() => p.name.clone(),
+                    _ => "@handle".to_string(),
+                };
+                Ok(Some((name, handle)))
+            }
+
+            // sp_execute @handle, values...
+            Procedure::Execute => {
+                let handle = match params.first().map(|p| &p.value) {
+                    Some(Datum::Int(h)) => i32::try_from(*h).ok(),
+                    _ => None,
+                };
+                let Some(prepared) = handle.and_then(|h| self.prepared.get(&h)).cloned() else {
+                    self.refuse(
+                        codes::ER_WRONG_ARGUMENTS,
+                        "Could not find the prepared statement for this handle",
+                    );
+                    return Ok(None);
+                };
+                self.execute_prepared(&prepared, params.get(1..).unwrap_or(&[]))
+                    .await?;
+                Ok(None)
+            }
+
+            // sp_unprepare @handle
+            Procedure::Unprepare => {
+                let handle = match params.first().map(|p| &p.value) {
+                    Some(Datum::Int(h)) => i32::try_from(*h).ok(),
+                    _ => None,
+                };
+                match handle.and_then(|h| self.prepared.remove(&h)) {
+                    Some(Prepared::Bound { statement_id, .. }) => {
+                        self.engine.prepared_stmts.close(statement_id);
+                    }
+                    Some(Prepared::Text(_)) => {}
+                    None => self.refuse(
+                        codes::ER_WRONG_ARGUMENTS,
+                        "Could not find the prepared statement for this handle",
+                    ),
+                }
+                Ok(None)
+            }
+
+            Procedure::Other(name) => {
+                self.refuse(
+                    codes::ER_SP_DOES_NOT_EXIST,
+                    &format!("Could not find stored procedure '{}'.", name),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Prepare a statement whose parameters are declared in `declaration`.
+    /// Returns `None` if the statement was refused (the error is already
+    /// reported).
+    async fn prepare(
+        &mut self,
+        sql: &str,
+        declaration: &str,
+    ) -> Result<Option<Prepared>, TdsError> {
+        let names = declared_names(declaration);
+        if names.is_empty() {
+            return Ok(Some(Prepared::Text(sql.to_string())));
+        }
+        let (bound_sql, order) = bind_parameters(sql, &names);
+        match self.engine.prepared_stmts.prepare(&bound_sql) {
+            Ok(statement) => Ok(Some(Prepared::Bound {
+                statement_id: statement.id,
+                names,
+                order,
+            })),
+            Err(e) => {
+                self.engine.send_error_from_protocol_error(&e).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Execute a prepared statement with the parameter values of a call.
+    /// Values are matched to parameters by name, or by position when
+    /// unnamed, and bound as typed values.
+    async fn execute_prepared(
+        &mut self,
+        prepared: &Prepared,
+        values: &[RpcParam],
+    ) -> Result<(), TdsError> {
+        let (statement_id, names, order) = match prepared {
+            Prepared::Text(sql) => return self.execute(sql).await,
+            Prepared::Bound {
+                statement_id,
+                names,
+                order,
+            } => (*statement_id, names, order),
+        };
+
+        let mut bound: Vec<Option<Datum>> = vec![None; names.len()];
+        let mut next_position = 0;
+        for param in values {
+            let index = if param.name.is_empty() {
+                let index = next_position;
+                next_position += 1;
+                index
+            } else {
+                let lower = param.name.to_lowercase();
+                match names.iter().position(|n| *n == lower) {
+                    Some(index) => index,
+                    None => {
+                        self.refuse(
+                            codes::ER_WRONG_ARGUMENTS,
+                            &format!("{} is not a parameter of this statement", param.name),
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            match bound.get_mut(index) {
+                Some(slot) => *slot = Some(param.value.clone()),
+                None => {
+                    self.refuse(
+                        codes::ER_WRONG_ARGUMENTS,
+                        "Too many parameter values for this statement",
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(missing) = bound.iter().position(Option::is_none) {
+            self.refuse(
+                codes::ER_WRONG_ARGUMENTS,
+                &format!("Parameter {} was not supplied", names[missing]),
+            );
+            return Ok(());
+        }
+
+        // One value per placeholder, in placeholder order
+        let args: Vec<Datum> = order
+            .iter()
+            .map(|index| bound[*index].clone().unwrap_or(Datum::Null))
+            .collect();
+        if let Err(e) = self.engine.execute_prepared(statement_id, &args).await {
+            let _ = self.engine.send_error_from_protocol_error(&e).await;
+            let _ = self.sink().finish(false).await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Forget the sp_executesql statement cache, releasing its statements.
+    fn clear_statement_cache(&mut self) {
+        for (_, prepared) in self.statement_cache.drain() {
+            if let Prepared::Bound { statement_id, .. } = prepared {
+                self.engine.prepared_stmts.close(statement_id);
+            }
+        }
     }
 
     /// Run a transaction manager request. Returns whether it was a

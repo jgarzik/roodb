@@ -159,6 +159,19 @@ pub fn put_info(buf: &mut Vec<u8>, number: i32, state: u8, class: u8, message: &
     put_message(buf, TOKEN_INFO, number, state, class, message);
 }
 
+/// Append a RETURNVALUE token carrying an integer output parameter.
+pub fn put_return_value_int(buf: &mut Vec<u8>, name: &str, value: i32) {
+    buf.push(TOKEN_RETURNVALUE);
+    buf.extend_from_slice(&0u16.to_le_bytes()); // parameter ordinal
+    put_b_varchar(buf, name);
+    buf.push(0x01); // status: output parameter
+    buf.extend_from_slice(&0u32.to_le_bytes()); // user type
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&[0x26, 4]); // TYPE_INFO: INTN(4)
+    buf.push(4);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
 /// Append a RETURNSTATUS token.
 pub fn put_return_status(buf: &mut Vec<u8>, value: i32) {
     buf.push(TOKEN_RETURNSTATUS);
@@ -187,6 +200,7 @@ pub fn sql_server_error(code: u16) -> (i32, u8, u8) {
         1292 => (245, 16, 1),          // conversion failed
         1210 => (8116, 16, 1),         // invalid argument
         1295 | 1047 => (40517, 16, 1), // unsupported
+        1305 => (2812, 16, 62),        // stored procedure not found
         _ => (50000, 16, 1),
     }
 }
@@ -240,6 +254,16 @@ mod tests {
             u16::from_le_bytes([buf[9], buf[10]]) as usize,
             MAX_MESSAGE_CHARS
         );
+    }
+
+    #[test]
+    fn return_value_layout() {
+        let mut buf = Vec::new();
+        put_return_value_int(&mut buf, "@handle", 7);
+        assert_eq!(buf[0], TOKEN_RETURNVALUE);
+        assert_eq!(buf[3], 7, "name length in characters");
+        let tail = &buf[4 + 14..];
+        assert_eq!(tail, [0x01, 0, 0, 0, 0, 0, 0, 0x26, 4, 4, 7, 0, 0, 0]);
     }
 
     #[test]

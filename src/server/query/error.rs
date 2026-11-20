@@ -174,6 +174,7 @@ pub mod codes {
     pub const ER_WRONG_VALUE_COUNT_ON_ROW: u16 = 1136;
     pub const ER_CANT_CHANGE_TX_CHARACTERISTICS: u16 = 1568;
     pub const ER_UNSUPPORTED_PS: u16 = 1295;
+    pub const ER_SP_DOES_NOT_EXIST: u16 = 1305;
 }
 
 /// SQL state codes

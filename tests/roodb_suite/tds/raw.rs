@@ -17,6 +17,7 @@ use tokio_rustls::TlsConnector;
 use crate::roodb_suite::harness::TestServer;
 
 pub const PKT_SQL_BATCH: u8 = 0x01;
+pub const PKT_RPC: u8 = 0x03;
 pub const PKT_TABULAR_RESULT: u8 = 0x04;
 pub const PKT_ATTENTION: u8 = 0x06;
 pub const PKT_BULK_LOAD: u8 = 0x07;
@@ -107,6 +108,12 @@ pub enum Token {
         status: u16,
         row_count: u64,
     },
+    ReturnStatus(i32),
+    /// Integer output parameter
+    ReturnValue {
+        name: String,
+        value: i32,
+    },
     /// First byte of a token this parser does not decode (result sets)
     Other(u8),
 }
@@ -161,6 +168,27 @@ pub fn parse_tokens(mut data: &[u8]) -> Vec<Token> {
                 tokens.push(Token::FeatureExtAck);
                 data = &data[pos + 1..];
             }
+            0x79 => {
+                tokens.push(Token::ReturnStatus(i32::from_le_bytes(
+                    data[1..5].try_into().unwrap(),
+                )));
+                data = &data[5..];
+            }
+            0xAC => {
+                // ordinal, name, status, user type, flags, INTN(4), value
+                let chars = data[3] as usize;
+                let units: Vec<u16> = data[4..4 + chars * 2]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let rest = &data[4 + chars * 2..];
+                assert_eq!(&rest[7..10], &[0x26, 4, 4], "integer return value");
+                tokens.push(Token::ReturnValue {
+                    name: String::from_utf16_lossy(&units),
+                    value: i32::from_le_bytes(rest[10..14].try_into().unwrap()),
+                });
+                data = &rest[14..];
+            }
             0xFD..=0xFF => {
                 tokens.push(Token::Done {
                     status: u16::from_le_bytes([data[1], data[2]]),
@@ -209,6 +237,37 @@ pub fn final_done(tokens: &[Token]) -> u16 {
 
 pub fn ucs2(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// An RPC parameter: name, status flags, then TYPE_INFO and value bytes.
+pub fn rpc_param(name: &str, output: bool, typed_value: &[u8]) -> Vec<u8> {
+    let mut p = vec![name.encode_utf16().count() as u8];
+    p.extend(ucs2(name));
+    p.push(output as u8);
+    p.extend_from_slice(typed_value);
+    p
+}
+
+/// TYPE_INFO and value of an INT parameter (`None` for NULL).
+pub fn int_value(value: Option<i32>) -> Vec<u8> {
+    let mut v = vec![0x26, 4];
+    match value {
+        Some(n) => {
+            v.push(4);
+            v.extend_from_slice(&n.to_le_bytes());
+        }
+        None => v.push(0),
+    }
+    v
+}
+
+/// TYPE_INFO and value of an NVARCHAR(4000) parameter.
+pub fn nvarchar_value(text: &str) -> Vec<u8> {
+    let mut v = vec![0xE7, 0x40, 0x1F, 0x09, 0x04, 0xD0, 0x00, 0x34];
+    let bytes = ucs2(text);
+    v.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    v.extend_from_slice(&bytes);
+    v
 }
 
 /// ALL_HEADERS with one transaction descriptor header.
@@ -367,6 +426,19 @@ impl RawTds {
         let mut payload = all_headers();
         payload.extend_from_slice(&ucs2(sql));
         self.send(PKT_SQL_BATCH, status, &payload).await;
+        self.response().await
+    }
+
+    /// Call a system procedure by number and return the response tokens.
+    pub async fn rpc(&mut self, proc_id: u16, params: &[Vec<u8>]) -> Vec<Token> {
+        let mut payload = all_headers();
+        payload.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        payload.extend_from_slice(&proc_id.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes()); // option flags
+        for param in params {
+            payload.extend_from_slice(param);
+        }
+        self.send(PKT_RPC, STATUS_EOM, &payload).await;
         self.response().await
     }
 
