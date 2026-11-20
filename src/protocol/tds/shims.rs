@@ -209,6 +209,39 @@ fn server_property(name: &str, ctx: &ShimContext<'_>) -> String {
     }
 }
 
+/// Parse `'name' )` starting at `start`: optional whitespace, one string
+/// literal without escapes or embedded quotes, optional whitespace and a
+/// closing parenthesis. Returns the name and the position after the `)`.
+fn property_argument(marked: &[(char, Region)], start: usize) -> Option<(String, usize)> {
+    let skip_space = |mut at: usize| {
+        while matches!(marked.get(at), Some((c, Region::Code)) if c.is_whitespace()) {
+            at += 1;
+        }
+        at
+    };
+
+    let open = skip_space(start);
+    if marked.get(open) != Some(&('\'', Region::Quoted)) {
+        return None;
+    }
+    // The literal is the whole run of quoted characters.
+    let mut close = open + 1;
+    while matches!(marked.get(close), Some((_, Region::Quoted))) {
+        close += 1;
+    }
+    let literal: String = marked[open..close].iter().map(|(c, _)| *c).collect();
+    let name = literal.strip_prefix('\'')?.strip_suffix('\'')?;
+    if literal.len() < 2 || name.contains(['\'', '\\']) {
+        return None;
+    }
+
+    let paren = skip_space(close);
+    if marked.get(paren) != Some(&(')', Region::Code)) {
+        return None;
+    }
+    Some((name.to_string(), paren + 1))
+}
+
 /// Replace SQL Server probes that RooDB has no equivalent for with their
 /// values. Only code is rewritten; strings, quoted identifiers and
 /// comments are left alone.
@@ -257,20 +290,13 @@ fn rewrite_probes(sql: &str, ctx: &ShimContext<'_>) -> String {
                     continue 'scan;
                 }
             }
-            // SERVERPROPERTY('name')
+            // SERVERPROPERTY('name'): the argument must be exactly one
+            // plain string literal, as the lexical scan sees it.
             if matches_at(i, "SERVERPROPERTY(") {
-                let rest: String = marked[i + 15..].iter().map(|(c, _)| *c).collect();
-                if let Some(close) = rest.find(')') {
-                    let arg = rest[..close].trim();
-                    let quoted = arg.len() >= 2
-                        && arg.starts_with('\'')
-                        && arg.ends_with('\'')
-                        && !arg[1..arg.len() - 1].contains('\'');
-                    if quoted {
-                        out.push_str(&server_property(&arg[1..arg.len() - 1], ctx));
-                        i += 15 + rest[..close].chars().count() + 1;
-                        continue 'scan;
-                    }
+                if let Some((name, end)) = property_argument(&marked, i + 15) {
+                    out.push_str(&server_property(&name, ctx));
+                    i = end;
+                    continue 'scan;
                 }
             }
         }
@@ -494,6 +520,26 @@ mod tests {
             translate("SELECT SERVERPROPERTY('NoSuchProperty')", &c),
             run("SELECT NULL")
         );
+        // The argument must be one plain literal as the SQL lexer sees it.
+        // An escaped quote keeps the string open, so these are not
+        // rewritten and nothing inside them turns into code.
+        for sql in [
+            r"SELECT SERVERPROPERTY('a\') , 'x'",
+            "SELECT SERVERPROPERTY('a''b')",
+            "SELECT SERVERPROPERTY('a' 'b')",
+            "SELECT SERVERPROPERTY('a'), 1) FROM t",
+            "SELECT SERVERPROPERTY(\"ProductVersion\")",
+            "SELECT SERVERPROPERTY('Edition' /* c */ )",
+        ] {
+            let Action::Run(out) = translate(sql, &c) else {
+                panic!("{sql}");
+            };
+            if sql.contains("'a'), 1)") {
+                assert_eq!(out, "SELECT NULL, 1) FROM t");
+            } else {
+                assert_eq!(out, sql, "{sql}");
+            }
+        }
         // Inside strings, identifiers and comments nothing changes
         for sql in [
             "SELECT '@@SPID', \"DB_NAME()\", `@@TRANCOUNT`",
