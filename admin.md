@@ -368,6 +368,13 @@ System tables (`system.tables`, `system.columns`, etc.) are created by the catal
 
 ## User Management
 
+> **Status:** account management through SQL does not work yet. `CREATE USER`,
+> `ALTER USER`, `DROP USER`, `SET PASSWORD` and `SHOW GRANTS` are not
+> functional, and an account created any other way cannot log in; `root`, set
+> up by `roodb_init`, is the only usable account. This section describes the
+> intended interface. [SQL.md](SQL.md#users-and-privileges) states what is
+> accepted today.
+
 ### Creating Users
 
 ```sql
@@ -411,6 +418,11 @@ DROP USER IF EXISTS 'username'@'host';
 ```
 
 ## Privilege System
+
+> **Status:** see the note under User Management. `GRANT` and `REVOKE` accept
+> only `ALL`, `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE`, and since
+> only `root` can log in, and `root` bypasses the checks, they have no
+> practical effect yet.
 
 RooDB implements MySQL-compatible privileges at multiple levels.
 
