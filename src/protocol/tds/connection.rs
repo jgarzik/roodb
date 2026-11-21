@@ -656,6 +656,7 @@ impl TdsConnection {
         ShimContext {
             connection_id: self.connection_id,
             in_transaction: session.in_transaction(),
+            transaction_depth: self.engine.transaction_depth(),
             database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
             user: &session.user,
             product_version: PRODUCT_VERSION,

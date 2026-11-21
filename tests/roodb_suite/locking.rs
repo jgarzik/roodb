@@ -957,6 +957,25 @@ async fn for_update_of_resolves_aliases() {
     assert_eq!(error_code(&err), 3572, "{err}");
     a.query_drop("COMMIT").await.unwrap();
 
+    // Several names: both tables are locked.
+    a.query_drop("BEGIN").await.unwrap();
+    let rows: Vec<(i32, i32)> = a
+        .query(
+            "SELECT o.id, i.id FROM ord o JOIN itm i ON i.ord_id = o.id \
+             WHERE o.id = 7 FOR UPDATE OF o, i",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(7, 1)]);
+    for table in ["ord", "itm"] {
+        let err = b
+            .query_drop(format!("SELECT id FROM {table} FOR UPDATE NOWAIT"))
+            .await
+            .expect_err("a table named in the list was not locked");
+        assert_eq!(error_code(&err), 3572, "{table}: {err}");
+    }
+    a.query_drop("COMMIT").await.unwrap();
+
     let err = a
         .query_drop("SELECT id FROM ord o WHERE id = 7 FOR UPDATE OF nosuch")
         .await

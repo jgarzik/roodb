@@ -266,3 +266,60 @@ async fn test_attention_cancels_a_running_query() {
     assert_eq!(final_done(&tokens) & DONE_ATTN, 0);
     server.shutdown().await;
 }
+
+/// T-SQL transactions nest: an inner BEGIN TRAN adds a level, its COMMIT
+/// takes the level away, only the outermost COMMIT commits, and a ROLLBACK
+/// at any level undoes everything.
+#[tokio::test]
+async fn test_nested_transactions() {
+    let server = TestServer::start("tds_shim_nest").await;
+    for (encryption, name) in TRANSPORTS {
+        let mut client = connect(&server, encryption).await;
+        let mut other = connect(&server, encryption).await;
+        let table = format!("tds_shim_n_{name}");
+        run(&mut client, &format!("DROP TABLE IF EXISTS {table}")).await;
+        run(
+            &mut client,
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY)"),
+        )
+        .await;
+        let trancount =
+            |rows: Vec<tiberius::Row>| format!("{:?}", rows[0].cells().next().unwrap().1);
+        async fn depth(client: &mut TdsClient) -> Vec<tiberius::Row> {
+            client
+                .simple_query("SELECT @@TRANCOUNT".to_string())
+                .await
+                .unwrap()
+                .into_first_result()
+                .await
+                .unwrap()
+        }
+
+        assert!(trancount(depth(&mut client).await).contains('0'), "{name}");
+        run(&mut client, "BEGIN TRAN").await;
+        run(&mut client, &format!("INSERT INTO {table} VALUES (1)")).await;
+        run(&mut client, "BEGIN TRAN").await;
+        assert!(trancount(depth(&mut client).await).contains('2'), "{name}");
+        run(&mut client, &format!("INSERT INTO {table} VALUES (2)")).await;
+        // The inner COMMIT commits nothing.
+        run(&mut client, "COMMIT TRAN").await;
+        assert!(trancount(depth(&mut client).await).contains('1'), "{name}");
+        assert_eq!(count(&mut other, &table).await, 0, "{name}");
+        // The outer one commits both rows.
+        run(&mut client, "COMMIT TRAN").await;
+        assert!(trancount(depth(&mut client).await).contains('0'), "{name}");
+        assert_eq!(count(&mut other, &table).await, 2, "{name}");
+
+        // A ROLLBACK inside a nested level undoes the outer work too.
+        run(&mut client, "BEGIN TRAN").await;
+        run(&mut client, &format!("INSERT INTO {table} VALUES (3)")).await;
+        run(&mut client, "BEGIN TRAN").await;
+        run(&mut client, &format!("INSERT INTO {table} VALUES (4)")).await;
+        run(&mut client, "ROLLBACK TRAN").await;
+        assert!(trancount(depth(&mut client).await).contains('0'), "{name}");
+        assert_eq!(count(&mut client, &table).await, 2, "{name}");
+
+        run(&mut client, &format!("DROP TABLE {table}")).await;
+    }
+    server.shutdown().await;
+}

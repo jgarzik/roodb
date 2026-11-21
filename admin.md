@@ -183,7 +183,8 @@ The SQL accepted is RooDB's own (MySQL dialect), exactly as on the main
 port; see [SQL.md](SQL.md). T-SQL is not translated. Only the statements
 drivers issue by themselves are understood in addition:
 
-- `BEGIN TRAN`, `COMMIT TRAN`, `ROLLBACK TRAN`, `IF @@TRANCOUNT > 0 ...`,
+- `BEGIN TRAN`, `COMMIT TRAN`, `ROLLBACK TRAN`, nested as in T-SQL (only
+  the outermost `COMMIT` commits), `IF @@TRANCOUNT > 0 ...`,
   `SET IMPLICIT_TRANSACTIONS ON|OFF`
 - connect-time session options such as `SET ANSI_NULLS ON`,
   `SET QUOTED_IDENTIFIER ON`, `SET NOCOUNT ON`, which are accepted without

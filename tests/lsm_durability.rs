@@ -763,6 +763,10 @@ async fn check_nearest(engine: &LsmEngine) {
         engine.prev_key(&key(5000), &low).await.unwrap(),
         Some(key(1998))
     );
+    // A search stops at its bound: nothing beyond a deleted run is
+    // reported when the bound lies inside the run.
+    assert_eq!(engine.next_key(&key(998), &key(1050)).await.unwrap(), None);
+    assert_eq!(engine.prev_key(&key(1100), &key(1050)).await.unwrap(), None);
     // The bounds: `high` is excluded, `low` included.
     assert_eq!(engine.next_key(&key(10), &key(12)).await.unwrap(), None);
     assert_eq!(

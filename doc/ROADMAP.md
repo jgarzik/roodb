@@ -27,15 +27,10 @@ multi-core machines.
 
 Row, gap and locking-read locks are in and reviewed.
 
-- T-SQL transaction nesting over TDS: a nested `BEGIN TRAN` is refused
-  today; it should count levels, with only the outermost commit committing.
-- `FOR UPDATE OF` takes one table name; MySQL allows a list.
-- Finding the neighbour of a key still steps over storage-level deletions
-  one at a time (it now stops at its bound); make it a merge over the
-  sources.
-
-Benchmark at 1, 16 and 64 threads on a quiet machine, both durability
-modes, against MySQL; confirm single-thread throughput did not regress.
+Benchmark at 1, 16 and 64 threads, both durability modes, against MySQL.
+Other work shares the machine, so compare builds run back to back in the
+same window (before and after, alternating) and judge by their ratio:
+confirm single-thread throughput did not regress with locking.
 
 ## CLU — Cluster mode in the server binary
 

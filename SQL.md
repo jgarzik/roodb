@@ -387,9 +387,9 @@ enforced.
   parsed and ignored.
 - `FOR UPDATE` and `FOR SHARE` (or `LOCK IN SHARE MODE`) make the query a
   locking read: see [How transactions behave](#how-transactions-behave).
-  `OF name` limits the locking to one table, named as the query names it
+  `OF name` limits the locking to the table named, as the query names it
   (its alias, if it has one); a name the query does not have is error
-  3568. A list of names after `OF` is not accepted. `NOWAIT` and
+  3568. Several names may be given (`OF a, b`). `NOWAIT` and
   `SKIP LOCKED` are supported.
 - `SQL_CALC_FOUND_ROWS` and index hints (`USE INDEX`, `FORCE INDEX`) are
   accepted and ignored. `FOUND_ROWS()` returns the number of rows the
@@ -673,7 +673,7 @@ supported. Other window functions (`PERCENT_RANK`, `CUME_DIST`,
 
 | Statement | Description |
 |-----------|-------------|
-| `BEGIN`, `START TRANSACTION` | Start a transaction. If one is open it is committed first (over the TDS endpoint it is refused with error 1568 instead: T-SQL transactions nest, and nesting is not implemented). Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
+| `BEGIN`, `START TRANSACTION` | Start a transaction. If one is open it is committed first. (Over the TDS endpoint transactions nest instead, as in T-SQL: see [TDS driver shims](#tds-driver-shims).) Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
 | `COMMIT` | Commit. Without an open transaction, no effect |
 | `ROLLBACK` | Discard the transaction's changes |
 | `SET autocommit = {0 \| 1 \| ON \| OFF}` | See below |
@@ -935,6 +935,7 @@ by themselves is understood in addition:
 | `ROLLBACK [TRAN[SACTION] \| WORK]` | `ROLLBACK` |
 | `SAVE TRAN[SACTION] name`, `ROLLBACK TRAN[SACTION] name` | Refused: savepoints are not supported |
 | `IF @@TRANCOUNT > 0 statement` | Runs the statement only inside a transaction |
+| Nested `BEGIN TRAN` | Adds a level (`@@TRANCOUNT` counts them). An inner `COMMIT` only closes its level; the outermost commits. `ROLLBACK` at any level undoes the whole transaction |
 | `SET IMPLICIT_TRANSACTIONS {ON \| OFF}` | `SET autocommit = 0` / `1` |
 | `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` | `REPEATABLE READ` |
 | `SET ANSI_DEFAULTS`, `ANSI_NULLS`, `ANSI_NULL_DFLT_ON`, `ANSI_NULL_DFLT_OFF`, `ANSI_PADDING`, `ANSI_WARNINGS`, `ARITHABORT`, `ARITHIGNORE`, `CONCAT_NULL_YIELDS_NULL`, `CURSOR_CLOSE_ON_COMMIT`, `DATEFIRST`, `DATEFORMAT`, `DEADLOCK_PRIORITY`, `LANGUAGE`, `LOCK_TIMEOUT`, `NOCOUNT`, `NO_BROWSETABLE`, `NUMERIC_ROUNDABORT`, `QUERY_GOVERNOR_COST_LIMIT`, `QUOTED_IDENTIFIER`, `TEXTSIZE`, `XACT_ABORT` | Accepted, no effect |
@@ -984,7 +985,7 @@ returns most often:
 | 1295 | HY000 | Statement cannot be prepared with parameters |
 | 3568 | HY000 | `FOR UPDATE OF` / `FOR SHARE OF` names a table the query does not have |
 | 3572 | HY000 | A row was locked and the statement said `NOWAIT` |
-| 1568 | HY000 | Isolation level changed inside a transaction; over TDS, `BEGIN` inside a transaction |
+| 1568 | HY000 | Isolation level changed inside a transaction |
 | 1063, 1074, 1425, 1427 | 42000 | Invalid column type specification |
 
 Several conditions that have a dedicated code in MySQL (unknown procedure,

@@ -790,14 +790,56 @@ impl Inner {
         bound: &[u8],
     ) -> StorageResult<Option<Vec<u8>>> {
         let sources = self.read_sources()?;
-        let mut from = key.to_vec();
+        let within = |found: &[u8]| {
+            if forward {
+                found < bound
+            } else {
+                found >= bound
+            }
+        };
+
+        // One cursor per source, newest source first: its nearest entry
+        // beyond `key`. This is a merge of the sources: at each step the
+        // nearest of the cursors is the next key overall, and only the
+        // cursors standing on that key move on.
+        #[derive(Clone, Copy)]
+        enum Source<'a> {
+            Memory(&'a Memtable),
+            Table(&'a SstableReader),
+        }
+        /// A key and whether it is deleted.
+        type Found = (Vec<u8>, bool);
+        async fn step(
+            source: Source<'_>,
+            from: &[u8],
+            forward: bool,
+        ) -> StorageResult<Option<Found>> {
+            match (source, forward) {
+                (Source::Memory(memtable), true) => Ok(memtable.next_after(from)),
+                (Source::Memory(memtable), false) => Ok(memtable.prev_before(from)),
+                (Source::Table(table), true) => table.next_after(from).await,
+                (Source::Table(table), false) => table.prev_before(from).await,
+            }
+        }
+        let mut cursors: Vec<(Source<'_>, Option<Found>)> = Vec::new();
+        cursors.push((Source::Memory(&sources.active), None));
+        for memtable in sources.frozen.iter().rev() {
+            cursors.push((Source::Memory(memtable), None));
+        }
+        for table in &sources.tables {
+            cursors.push((Source::Table(table), None));
+        }
+        for (source, at) in &mut cursors {
+            *at = step(*source, key, forward).await?;
+        }
+
         loop {
-            // Newest source first, so that of two entries for one key the
-            // first one seen is the one that counts.
-            let mut nearest: Option<(Vec<u8>, bool)> = None;
-            let mut consider = |candidate: Option<(Vec<u8>, bool)>| {
-                let Some(candidate) = candidate else { return };
-                let closer = match &nearest {
+            // The first cursor (newest source) among those on the nearest
+            // key decides whether that key is live.
+            let mut nearest: Option<&Found> = None;
+            for (_, at) in &cursors {
+                let Some(candidate) = at else { continue };
+                let closer = match nearest {
                     None => true,
                     Some((best, _)) if forward => candidate.0 < *best,
                     Some((best, _)) => candidate.0 > *best,
@@ -805,35 +847,21 @@ impl Inner {
                 if closer {
                     nearest = Some(candidate);
                 }
+            }
+            let Some((found, deleted)) = nearest.cloned() else {
+                return Ok(None);
             };
-            let memtables = std::iter::once(&sources.active).chain(sources.frozen.iter().rev());
-            for memtable in memtables {
-                consider(if forward {
-                    memtable.next_after(&from)
-                } else {
-                    memtable.prev_before(&from)
-                });
+            if !within(&found) {
+                return Ok(None);
             }
-            for table in &sources.tables {
-                consider(if forward {
-                    table.next_after(&from).await?
-                } else {
-                    table.prev_before(&from).await?
-                });
+            if !deleted {
+                return Ok(Some(found));
             }
-            let within = |found: &[u8]| {
-                if forward {
-                    found < bound
-                } else {
-                    found >= bound
+            // Deleted: every source that has this key moves past it.
+            for (source, at) in &mut cursors {
+                if at.as_ref().is_some_and(|(k, _)| *k == found) {
+                    *at = step(*source, &found, forward).await?;
                 }
-            };
-            match nearest {
-                None => return Ok(None),
-                Some((found, _)) if !within(&found) => return Ok(None),
-                Some((found, false)) => return Ok(Some(found)),
-                // Deleted: look past it.
-                Some((found, true)) => from = found,
             }
         }
     }

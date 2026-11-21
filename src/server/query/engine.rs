@@ -77,8 +77,12 @@ pub struct QueryEngine {
     /// at (see `sync_functions`).
     functions_version: Option<u64>,
     /// Whether BEGIN inside a transaction commits it and starts another
-    /// (MySQL) or is refused (the TDS front-end, where transactions nest).
+    /// (MySQL), or opens a nested level (the TDS front-end: in T-SQL only
+    /// the outermost COMMIT commits).
     pub(crate) begin_commits_open: bool,
+    /// How many BEGINs are open, where transactions nest. Meaningful only
+    /// while a transaction is open; see `transaction_depth`.
+    nested_begins: u32,
     /// The locking the statement now being run asked for with FOR UPDATE /
     /// FOR SHARE, if it did. Set when the statement is parsed, used when it
     /// is executed.
@@ -243,6 +247,7 @@ impl QueryEngine {
             temp,
             functions_version: None,
             begin_commits_open: true,
+            nested_begins: 0,
             read_lock: None,
             implicit_txns: Vec::new(),
             out,
@@ -1404,17 +1409,13 @@ impl QueryEngine {
     /// Handle BEGIN / START TRANSACTION
     async fn handle_begin(&mut self) -> ProtocolResult<()> {
         if self.session.in_transaction() {
-            // T-SQL transactions nest: a second BEGIN TRAN must leave the
-            // first uncommitted. Nesting is not implemented, so over TDS it
-            // is refused rather than done wrongly.
+            // T-SQL transactions nest: a second BEGIN TRAN leaves the first
+            // uncommitted and only adds a level, which its COMMIT takes
+            // away again. Nothing is committed until the outermost COMMIT;
+            // a ROLLBACK at any level undoes everything.
             if !self.begin_commits_open {
-                return self
-                    .send_error(
-                        codes::ER_CANT_CHANGE_TX_CHARACTERISTICS,
-                        states::GENERAL_ERROR,
-                        "Transaction already in progress",
-                    )
-                    .await;
+                self.nested_begins = self.transaction_depth() + 1;
+                return self.send_ok(0, 0).await;
             }
             // In MySQL, starting a transaction ends the one that is open
             // by committing it. Clients rely on it: after a statement fails
@@ -1432,6 +1433,7 @@ impl QueryEngine {
         {
             Ok(txn) => {
                 self.session.begin_transaction(txn.txn_id);
+                self.nested_begins = 1;
                 debug!(
                     connection_id = self.connection_id,
                     txn_id = txn.txn_id,
@@ -1731,8 +1733,25 @@ impl QueryEngine {
         }
     }
 
+    /// How many BEGINs deep the session is: 0 outside a transaction, 1 in
+    /// one, more where transactions nest and BEGIN was repeated.
+    pub(crate) fn transaction_depth(&self) -> u32 {
+        if self.session.in_transaction() {
+            // A transaction opened by a statement (autocommit off) was
+            // never begun explicitly; it is one level all the same.
+            self.nested_begins.max(1)
+        } else {
+            0
+        }
+    }
+
     /// Handle COMMIT
     async fn handle_commit(&mut self) -> ProtocolResult<()> {
+        // The COMMIT of an inner level only closes that level.
+        if !self.begin_commits_open && self.transaction_depth() > 1 {
+            self.nested_begins = self.transaction_depth() - 1;
+            return self.send_ok(0, 0).await;
+        }
         // COMMIT without BEGIN is a no-op
         match self.commit_open_transaction().await {
             Ok(()) => self.send_ok(0, 0).await,
