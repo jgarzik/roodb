@@ -21,7 +21,14 @@ pub struct ServerProcess {
     env: Vec<(String, String)>,
 }
 
-/// Find a port whose Raft companion port (port + 1000) is free too.
+/// Ports already handed to a server of this test process. A port is only
+/// probed, not held, between being chosen and the server binding it, so two
+/// tests starting at once could be given the same one; each would then take
+/// the other's server for its own.
+static TAKEN_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+/// Find a port whose Raft companion port (port + 1000) is free too, and
+/// that no other server of this process has been given.
 fn free_port() -> u16 {
     for _ in 0..200 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -29,7 +36,15 @@ fn free_port() -> u16 {
         if port > 64_000 {
             continue;
         }
-        if std::net::TcpListener::bind(("127.0.0.1", port + 1000)).is_ok() {
+        if std::net::TcpListener::bind(("127.0.0.1", port + 1000)).is_err() {
+            continue;
+        }
+        let mut taken = TAKEN_PORTS.lock().unwrap();
+        let clash = taken
+            .iter()
+            .any(|&t| t == port || t + 1000 == port || t == port + 1000);
+        if !clash {
+            taken.push(port);
             return port;
         }
     }
@@ -114,6 +129,14 @@ impl ServerProcess {
                 self.log_tail()
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // Something answered on the port. If our server has exited, it was
+        // not ours.
+        if let Some(status) = child.try_wait().expect("poll server") {
+            panic!(
+                "server exited during startup with {status}:\n{}",
+                self.log_tail()
+            );
         }
         self.child = Some(child);
     }

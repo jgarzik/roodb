@@ -33,8 +33,6 @@ Row, gap and locking-read locks are in and reviewed.
 - Finding the neighbour of a key still steps over storage-level deletions
   one at a time (it now stops at its bound); make it a merge over the
   sources.
-- The test server helper occasionally reports the server as started before
-  it accepts connections ("connection refused" in a locking test, once).
 
 Benchmark at 1, 16 and 64 threads on a quiet machine, both durability
 modes, against MySQL; confirm single-thread throughput did not regress.
