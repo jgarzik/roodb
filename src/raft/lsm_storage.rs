@@ -23,11 +23,12 @@ use crate::catalog::system_tables::{
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
-use crate::raft::changes::ChangeOp;
+use crate::raft::changes::{ChangeOp, ChangeSet};
 use crate::raft::types::{
     Command, CommandResponse, LogId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership,
     TypeConfig,
 };
+use crate::storage::traits::WriteOp;
 use crate::storage::StorageEngine;
 
 use super::types::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
@@ -110,6 +111,24 @@ pub struct LsmRaftStorage {
     catalog: Arc<RwLock<Catalog>>,
     cached_last_applied: Arc<RwLock<Option<LogId>>>,
     cached_membership: Arc<RwLock<StoredMembership>>,
+}
+
+/// A change to a system table, noted so the catalog can follow once the
+/// change has been written.
+struct TrackedChange {
+    table: String,
+    value: Vec<u8>,
+    is_delete: bool,
+}
+
+/// What an accepted changeset does.
+#[derive(Default)]
+struct ChangesetPlan {
+    writes: Vec<WriteOp>,
+    tracked: Vec<TrackedChange>,
+    /// Tables and indexes this changeset creates.
+    new_tables: Vec<String>,
+    new_indexes: Vec<String>,
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -590,6 +609,149 @@ impl LsmRaftStorage {
         Ok(())
     }
 
+    /// Work out what a changeset writes, without writing anything.
+    ///
+    /// Every check runs first: the version checks against what is stored now,
+    /// then the duplicate-key checks, which also see the changeset's own
+    /// earlier changes (a DELETE followed by an INSERT of the same key is not
+    /// a duplicate). If any check fails the changeset writes nothing at all;
+    /// the inner `Err` carries the message for the client.
+    async fn plan_changeset(
+        &self,
+        changeset: &ChangeSet,
+        existing_tables: &std::collections::HashSet<String>,
+        existing_indexes: &std::collections::HashSet<String>,
+    ) -> Result<Result<ChangesetPlan, String>, StorageError> {
+        // Version checks see storage as it was before this changeset, which
+        // is what the executors saw when they read the rows.
+        for change in &changeset.changes {
+            let Some(expected_version) = change.expected_version else {
+                continue;
+            };
+            match self.storage.get(&change.key).await.map_err(read_err)? {
+                Some(current) => {
+                    let current_version = extract_row_version(&current).unwrap_or(0);
+                    if current_version != expected_version {
+                        tracing::warn!(
+                            table = %change.table,
+                            expected = expected_version,
+                            actual = current_version,
+                            "OCC conflict: row was modified by another transaction"
+                        );
+                        return Ok(Err(format!(
+                            "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
+                            change.table, expected_version, current_version
+                        )));
+                    }
+                }
+                // A row that is already gone is fine to delete, not to update.
+                None if change.op == ChangeOp::Update => {
+                    tracing::warn!(table = %change.table, "OCC conflict: row no longer exists");
+                    return Ok(Err(format!(
+                        "Write conflict: row in '{}' no longer exists",
+                        change.table
+                    )));
+                }
+                None => {}
+            }
+        }
+
+        let mut plan = ChangesetPlan::default();
+        // Whether each key touched so far holds a live row after those changes.
+        let mut live: std::collections::HashMap<&[u8], bool> = std::collections::HashMap::new();
+        for change in &changeset.changes {
+            match (&change.op, &change.value) {
+                (ChangeOp::Insert | ChangeOp::Update, Some(value)) => {
+                    if change.op == ChangeOp::Insert && !is_system_table(&change.table) {
+                        let exists = match live.get(change.key.as_slice()) {
+                            Some(live) => *live,
+                            None => self
+                                .storage
+                                .get(&change.key)
+                                .await
+                                .map_err(read_err)?
+                                .is_some_and(|row| !is_mvcc_tombstone(&row)),
+                        };
+                        if exists {
+                            if changeset.ignore_duplicates {
+                                // INSERT IGNORE: skip this row.
+                                continue;
+                            }
+                            tracing::warn!(
+                                table = %change.table,
+                                "INSERT conflict: row already exists with this key"
+                            );
+                            return Ok(Err(format!(
+                                "Duplicate key: row in '{}' already exists",
+                                change.table
+                            )));
+                        }
+                    }
+
+                    // Two sessions can race to create the same table or
+                    // index; the second creation is dropped.
+                    if change.op == ChangeOp::Insert
+                        && (change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES)
+                    {
+                        let name =
+                            decode_row(value)
+                                .ok()
+                                .and_then(|row| match row.values().first() {
+                                    Some(crate::executor::Datum::String(name)) => {
+                                        Some(name.clone())
+                                    }
+                                    _ => None,
+                                });
+                        if let Some(name) = name {
+                            let (existing, new) = if change.table == SYSTEM_TABLES {
+                                (existing_tables, &mut plan.new_tables)
+                            } else {
+                                (existing_indexes, &mut plan.new_indexes)
+                            };
+                            if existing.contains(&name) || new.contains(&name) {
+                                tracing::debug!(
+                                    table = %change.table,
+                                    name = %name,
+                                    "Skipping duplicate CREATE in apply()"
+                                );
+                                continue;
+                            }
+                            new.push(name);
+                        }
+                    }
+
+                    plan.writes.push((
+                        change.key.clone(),
+                        Some(encode_mvcc_row(changeset.txn_id, false, value)),
+                    ));
+                    live.insert(change.key.as_slice(), true);
+                    plan.tracked.push(TrackedChange {
+                        table: change.table.clone(),
+                        value: value.clone(),
+                        is_delete: false,
+                    });
+                }
+                // An insert or update with no value changes nothing.
+                (ChangeOp::Insert | ChangeOp::Update, None) => {}
+                (ChangeOp::Delete, value) => {
+                    plan.writes.push((
+                        change.key.clone(),
+                        Some(encode_mvcc_row(changeset.txn_id, true, &[])),
+                    ));
+                    live.insert(change.key.as_slice(), false);
+                    if let Some(value) = value {
+                        plan.tracked.push(TrackedChange {
+                            table: change.table.clone(),
+                            value: value.clone(),
+                            is_delete: true,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Ok(plan))
+    }
+
     /// Helper to track system table changes for catalog rebuild
     #[allow(clippy::too_many_arguments)]
     fn track_system_table_change(
@@ -723,236 +885,76 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         for entry in entries {
             let log_id = entry.log_id();
 
-            match &entry.payload {
-                EntryPayload::Blank => {
-                    results.push(CommandResponse::Ok(None));
-                }
-                EntryPayload::Normal(cmd) => {
-                    let resp = match cmd {
-                        Command::DataChange(changeset) => {
-                            // Apply each row change to storage with MVCC headers.
-                            // This is the unified write path for both leader and follower:
-                            // - Leader: collected changes during execution, now persisting after Raft commit
-                            // - Follower: received changes via AppendEntries, now persisting locally
-                            //
-                            // Two-pass approach: OCC checks first, then applies.
-                            // This prevents false conflicts when multiple changes in
-                            // the same changeset target the same key (e.g., UPDATE + DELETE
-                            // on the same row). All OCC checks see the pre-changeset
-                            // storage state, matching what executors saw during scan.
-                            let mut conflict_error: Option<String> = None;
+            // Everything an entry changes goes to storage as one batch,
+            // together with the entry's position. Storage keeps a batch whole,
+            // so what is on disk is always the result of applying the log up
+            // to exactly the position recorded with it - which is what lets a
+            // restart resume from that position by replaying the log.
+            let mut batch: Vec<WriteOp> = Vec::new();
+            let mut tracked: Vec<TrackedChange> = Vec::new();
+            let mut membership_change = None;
 
-                            // Pass 1: OCC version checks (before any writes)
-                            for change in &changeset.changes {
-                                if let Some(expected_version) = change.expected_version {
-                                    if let Ok(Some(current_data)) =
-                                        self.storage.get(&change.key).await
-                                    {
-                                        let current_version =
-                                            extract_row_version(&current_data).unwrap_or(0);
-                                        if current_version != expected_version {
-                                            tracing::warn!(
-                                                table = %change.table,
-                                                expected = expected_version,
-                                                actual = current_version,
-                                                "OCC conflict: row was modified by another transaction"
-                                            );
-                                            conflict_error = Some(format!(
-                                                "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
-                                                change.table, expected_version, current_version
-                                            ));
-                                            break;
-                                        }
-                                    } else if change.op == ChangeOp::Update {
-                                        tracing::warn!(
-                                            table = %change.table,
-                                            "OCC conflict: row no longer exists"
-                                        );
-                                        conflict_error = Some(format!(
-                                            "Write conflict: row in '{}' no longer exists",
-                                            change.table
-                                        ));
-                                        break;
-                                    }
-                                    // For DELETE, if row doesn't exist, that's ok (idempotent)
-                                }
-                            }
-
-                            // Pass 2: Apply changes (only if no OCC conflict)
-                            if conflict_error.is_none() {
-                                for change in &changeset.changes {
-                                    match change.op {
-                                        ChangeOp::Insert | ChangeOp::Update => {
-                                            if let Some(ref value) = change.value {
-                                                // Check for duplicate key on INSERT for user tables
-                                                if change.op == ChangeOp::Insert
-                                                    && !is_system_table(&change.table)
-                                                {
-                                                    if let Ok(Some(existing_data)) =
-                                                        self.storage.get(&change.key).await
-                                                    {
-                                                        // Skip tombstones (deleted rows)
-                                                        let is_tombstone =
-                                                            is_mvcc_tombstone(&existing_data);
-                                                        if !is_tombstone {
-                                                            if changeset.ignore_duplicates {
-                                                                // IGNORE: silently skip this row
-                                                                continue;
-                                                            }
-                                                            tracing::warn!(
-                                                                table = %change.table,
-                                                                "INSERT conflict: row already exists with this key"
-                                                            );
-                                                            conflict_error = Some(format!(
-                                                                "Duplicate key: row in '{}' already exists",
-                                                                change.table
-                                                            ));
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-
-                                                // Check for duplicate table creation (race condition fix)
-                                                if change.table == SYSTEM_TABLES
-                                                    && change.op == ChangeOp::Insert
-                                                {
-                                                    if let Ok(row) = decode_row(value) {
-                                                        if let Some(
-                                                            crate::executor::Datum::String(
-                                                                table_name,
-                                                            ),
-                                                        ) = row.values().first()
-                                                        {
-                                                            if existing_tables.contains(table_name)
-                                                            {
-                                                                tracing::debug!(
-                                                                    table = %table_name,
-                                                                    "Skipping duplicate CREATE TABLE in apply()"
-                                                                );
-                                                                continue;
-                                                            }
-                                                            existing_tables
-                                                                .insert(table_name.clone());
-                                                        }
-                                                    }
-                                                }
-
-                                                // Check for duplicate index creation
-                                                if change.table == SYSTEM_INDEXES
-                                                    && change.op == ChangeOp::Insert
-                                                {
-                                                    if let Ok(row) = decode_row(value) {
-                                                        if let Some(
-                                                            crate::executor::Datum::String(
-                                                                index_name,
-                                                            ),
-                                                        ) = row.values().first()
-                                                        {
-                                                            if existing_indexes.contains(index_name)
-                                                            {
-                                                                tracing::debug!(
-                                                                    index = %index_name,
-                                                                    "Skipping duplicate CREATE INDEX in apply()"
-                                                                );
-                                                                continue;
-                                                            }
-                                                            existing_indexes
-                                                                .insert(index_name.clone());
-                                                        }
-                                                    }
-                                                }
-
-                                                let encoded =
-                                                    encode_mvcc_row(changeset.txn_id, false, value);
-
-                                                self.storage
-                                                    .put(&change.key, &encoded)
-                                                    .await
-                                                    .map_err(write_err)?;
-
-                                                self.track_system_table_change(
-                                                    &change.table,
-                                                    value,
-                                                    false,
-                                                    &mut affected_tables,
-                                                    &mut dropped_tables,
-                                                    &mut affected_indexes,
-                                                    &mut dropped_indexes,
-                                                );
-                                            }
-                                        }
-                                        ChangeOp::Delete => {
-                                            let encoded =
-                                                encode_mvcc_row(changeset.txn_id, true, &[]);
-                                            self.storage
-                                                .put(&change.key, &encoded)
-                                                .await
-                                                .map_err(write_err)?;
-
-                                            if let Some(ref value) = change.value {
-                                                self.track_system_table_change(
-                                                    &change.table,
-                                                    value,
-                                                    true,
-                                                    &mut affected_tables,
-                                                    &mut dropped_tables,
-                                                    &mut affected_indexes,
-                                                    &mut dropped_indexes,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            } // end pass 2
-
-                            // Return conflict error or success
-                            if let Some(err_msg) = conflict_error {
-                                tracing::debug!(
-                                    txn_id = changeset.txn_id,
-                                    "RAFT APPLY: OCC conflict detected"
-                                );
-                                CommandResponse::Error(err_msg)
-                            } else {
-                                tracing::debug!(
-                                    txn_id = changeset.txn_id,
-                                    changes = changeset.changes.len(),
-                                    "RAFT APPLY: wrote {} changes to storage",
-                                    changeset.changes.len()
-                                );
-                                CommandResponse::Ok(None)
-                            }
+            let response = match &entry.payload {
+                EntryPayload::Blank => CommandResponse::Ok(None),
+                EntryPayload::Normal(Command::Noop) => CommandResponse::Ok(None),
+                EntryPayload::Normal(Command::DataChange(changeset)) => {
+                    match self
+                        .plan_changeset(changeset, &existing_tables, &existing_indexes)
+                        .await?
+                    {
+                        Ok(plan) => {
+                            tracing::debug!(
+                                txn_id = changeset.txn_id,
+                                changes = changeset.changes.len(),
+                                writes = plan.writes.len(),
+                                "RAFT APPLY: changeset accepted"
+                            );
+                            batch = plan.writes;
+                            tracked = plan.tracked;
+                            existing_tables.extend(plan.new_tables);
+                            existing_indexes.extend(plan.new_indexes);
+                            CommandResponse::Ok(None)
                         }
-                        Command::Noop => CommandResponse::Ok(None),
-                    };
-                    results.push(resp);
+                        Err(message) => {
+                            tracing::debug!(
+                                txn_id = changeset.txn_id,
+                                error = %message,
+                                "RAFT APPLY: changeset rejected, nothing written"
+                            );
+                            CommandResponse::Error(message)
+                        }
+                    }
                 }
-                EntryPayload::Membership(ref m) => {
+                EntryPayload::Membership(m) => {
                     let membership = StoredMembership::new(Some(log_id), m.clone());
-
-                    // Persist membership
                     let data = bincode::serialize(&membership).map_err(write_err)?;
-                    self.storage
-                        .put(MEMBERSHIP_KEY, &data)
-                        .await
-                        .map_err(write_err)?;
-
-                    *self.cached_membership.write() = membership;
-                    results.push(CommandResponse::Ok(None));
+                    batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+                    membership_change = Some(membership);
+                    CommandResponse::Ok(None)
                 }
-            }
+            };
 
-            // Track last applied log_id (persisted once after all entries)
+            let position = bincode::serialize(&log_id).map_err(write_err)?;
+            batch.push((LAST_APPLIED_KEY.to_vec(), Some(position)));
+            self.storage.write_batch(batch).await.map_err(write_err)?;
+
+            // Memory follows storage.
             *self.cached_last_applied.write() = Some(log_id);
-        }
-
-        // Persist last applied once after the entire batch
-        let last_applied_snapshot = *self.cached_last_applied.read();
-        if let Some(last_applied) = last_applied_snapshot {
-            let data = bincode::serialize(&last_applied).map_err(write_err)?;
-            self.storage
-                .put(LAST_APPLIED_KEY, &data)
-                .await
-                .map_err(write_err)?;
+            if let Some(membership) = membership_change {
+                *self.cached_membership.write() = membership;
+            }
+            for change in tracked {
+                self.track_system_table_change(
+                    &change.table,
+                    &change.value,
+                    change.is_delete,
+                    &mut affected_tables,
+                    &mut dropped_tables,
+                    &mut affected_indexes,
+                    &mut dropped_indexes,
+                );
+            }
+            results.push(response);
         }
 
         tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, entries = results.len(), "raft_apply");
