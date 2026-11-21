@@ -2,117 +2,153 @@
 //!
 //! Caches raw block data keyed by (sstable_name, block_offset) to avoid
 //! redundant disk I/O for hot data. Self-tuning via LRU eviction.
+//!
+//! The cache is split into shards, each with its own lock and its own LRU
+//! order, so readers on different cores rarely meet on a lock. A block lives
+//! in the shard its key hashes to and each shard gets an equal share of the
+//! byte budget.
 
-use std::num::NonZeroUsize;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use lru::LruCache;
 use parking_lot::Mutex;
 
-/// Cache key: (sstable_name, block_offset)
+/// Cache key: (SSTable name, block offset)
 type CacheKey = (Arc<str>, u64);
 
-/// Default cache capacity: 64MB (enough for typical benchmark datasets)
+/// Default block cache capacity: 64MB
 pub const DEFAULT_CACHE_CAPACITY: usize = 64 * 1024 * 1024;
 
-/// LRU block cache shared across SSTable readers.
+/// Most shards a cache is split into.
+const MAX_SHARDS: usize = 16;
+
+/// A shard is only worth having if it can hold a useful number of blocks;
+/// small caches get fewer shards.
+const MIN_SHARD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Thread-safe LRU block cache with byte-based capacity.
 pub struct BlockCache {
-    inner: Mutex<CacheInner>,
+    shards: Box<[Mutex<Shard>]>,
+    /// Total capacity as last set; each shard holds an equal share.
+    capacity_bytes: AtomicUsize,
 }
 
-struct CacheInner {
+struct Shard {
     cache: LruCache<CacheKey, Arc<Vec<u8>>>,
     capacity_bytes: usize,
     current_bytes: usize,
 }
 
+impl Shard {
+    fn evict_to(&mut self, limit: usize) {
+        while self.current_bytes > limit {
+            match self.cache.pop_lru() {
+                Some((_, evicted)) => self.current_bytes -= evicted.len(),
+                None => break,
+            }
+        }
+    }
+}
+
 impl BlockCache {
     /// Create a new block cache with the given byte capacity.
     pub fn new(capacity_bytes: usize) -> Self {
-        // Use a large entry count limit; we enforce size via bytes
-        let max_entries = NonZeroUsize::new(capacity_bytes / 64).unwrap_or(NonZeroUsize::MIN);
+        let shard_count = (capacity_bytes / MIN_SHARD_BYTES).clamp(1, MAX_SHARDS);
+        let shard_capacity = capacity_bytes / shard_count;
+        // Entry counts are not the limit; bytes are.
+        let shards = (0..shard_count)
+            .map(|_| {
+                Mutex::new(Shard {
+                    cache: LruCache::unbounded(),
+                    capacity_bytes: shard_capacity,
+                    current_bytes: 0,
+                })
+            })
+            .collect();
         Self {
-            inner: Mutex::new(CacheInner {
-                cache: LruCache::new(max_entries),
-                capacity_bytes,
-                current_bytes: 0,
-            }),
+            shards,
+            capacity_bytes: AtomicUsize::new(capacity_bytes),
         }
     }
 
-    /// Look up a cached block. Returns None on miss.
-    pub fn get(&self, sstable: &Arc<str>, offset: u64) -> Option<Arc<Vec<u8>>> {
-        let key = (sstable.clone(), offset);
-        let mut inner = self.inner.lock();
-        inner.cache.get(&key).cloned()
+    fn shard(&self, sstable: &str, offset: u64) -> &Mutex<Shard> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sstable.hash(&mut hasher);
+        offset.hash(&mut hasher);
+        &self.shards[(hasher.finish() % self.shards.len() as u64) as usize]
     }
 
-    /// Insert a block into the cache. Evicts LRU entries if over capacity.
+    /// Look up a cached block. Promotes to MRU on hit.
+    pub fn get(&self, sstable: &Arc<str>, offset: u64) -> Option<Arc<Vec<u8>>> {
+        let key = (sstable.clone(), offset);
+        self.shard(sstable, offset).lock().cache.get(&key).cloned()
+    }
+
+    /// Insert a block into the cache, evicting LRU entries if over capacity.
     pub fn insert(&self, sstable: &Arc<str>, offset: u64, block: Vec<u8>) {
         let block_size = block.len();
         let key = (sstable.clone(), offset);
         let value = Arc::new(block);
 
-        let mut inner = self.inner.lock();
-
-        // Evict until we have room
-        while inner.current_bytes + block_size > inner.capacity_bytes {
-            if let Some((_, evicted)) = inner.cache.pop_lru() {
-                inner.current_bytes -= evicted.len();
-            } else {
-                break; // Cache is empty
-            }
-        }
-
-        // Don't cache blocks larger than the total capacity
-        if block_size > inner.capacity_bytes {
+        let mut shard = self.shard(sstable, offset).lock();
+        // A block larger than a shard's share is not cached at all.
+        if block_size > shard.capacity_bytes {
             return;
         }
+        let limit = shard.capacity_bytes - block_size;
+        shard.evict_to(limit);
 
-        if let Some((_old_key, old_value)) = inner.cache.push(key, value) {
+        if let Some((_old_key, old_value)) = shard.cache.push(key, value) {
             // Key already existed, subtract old size
-            inner.current_bytes -= old_value.len();
+            shard.current_bytes -= old_value.len();
         }
-        inner.current_bytes += block_size;
+        shard.current_bytes += block_size;
     }
 
-    /// Dynamically resize the cache capacity, evicting LRU entries if over budget.
+    /// Dynamically resize the cache. Evicts LRU entries if shrinking.
     pub fn set_capacity(&self, new_capacity_bytes: usize) {
-        let mut inner = self.inner.lock();
-        inner.capacity_bytes = new_capacity_bytes;
-        while inner.current_bytes > inner.capacity_bytes {
-            if let Some((_, evicted)) = inner.cache.pop_lru() {
-                inner.current_bytes -= evicted.len();
-            } else {
-                break;
-            }
+        if self
+            .capacity_bytes
+            .swap(new_capacity_bytes, Ordering::Relaxed)
+            == new_capacity_bytes
+        {
+            return;
+        }
+        let shard_capacity = new_capacity_bytes / self.shards.len();
+        for shard in self.shards.iter() {
+            let mut shard = shard.lock();
+            shard.capacity_bytes = shard_capacity;
+            shard.evict_to(shard_capacity);
         }
     }
 
-    /// Current bytes used by cached blocks.
+    /// Current memory usage in bytes.
     pub fn current_bytes(&self) -> usize {
-        self.inner.lock().current_bytes
+        self.shards.iter().map(|s| s.lock().current_bytes).sum()
     }
 
-    /// Current capacity in bytes.
+    /// Configured capacity in bytes.
     pub fn capacity(&self) -> usize {
-        self.inner.lock().capacity_bytes
+        self.capacity_bytes.load(Ordering::Relaxed)
     }
 
-    /// Invalidate all entries for a given SSTable (e.g., after compaction removes it).
+    /// Remove all cached blocks for a given SSTable (called on compaction/deletion).
     pub fn invalidate_sstable(&self, sstable: &str) {
-        let mut inner = self.inner.lock();
-        // Collect keys to remove (can't mutate while iterating)
-        let keys_to_remove: Vec<CacheKey> = inner
-            .cache
-            .iter()
-            .filter(|(k, _)| k.0.as_ref() == sstable)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        for key in keys_to_remove {
-            if let Some(evicted) = inner.cache.pop(&key) {
-                inner.current_bytes -= evicted.len();
+        for shard in self.shards.iter() {
+            let mut shard = shard.lock();
+            // Collect keys to remove (can't mutate while iterating)
+            let keys_to_remove: Vec<CacheKey> = shard
+                .cache
+                .iter()
+                .filter(|(k, _)| k.0.as_ref() == sstable)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys_to_remove {
+                if let Some(evicted) = shard.cache.pop(&key) {
+                    shard.current_bytes -= evicted.len();
+                }
             }
         }
     }
@@ -229,5 +265,54 @@ mod tests {
 
         assert!(cache.get(&name1, 0).is_none());
         assert!(cache.get(&name2, 0).is_some());
+    }
+
+    #[test]
+    fn large_caches_are_sharded_and_keep_to_their_budget() {
+        let capacity = 64 * 1024 * 1024;
+        let cache = BlockCache::new(capacity);
+        assert_eq!(cache.shards.len(), MAX_SHARDS);
+        assert_eq!(cache.capacity(), capacity);
+
+        // Twice the budget in 4 KiB blocks across several tables.
+        let names: Vec<Arc<str>> = (0..8).map(|i| Arc::from(format!("{i:06}.sst"))).collect();
+        for i in 0..(2 * capacity / 4096) as u64 {
+            cache.insert(&names[(i % 8) as usize], i * 4096, vec![0u8; 4096]);
+        }
+        assert!(cache.current_bytes() <= capacity);
+        // Every shard took its share: the cache is close to full.
+        assert!(cache.current_bytes() > capacity / 2);
+
+        cache.set_capacity(capacity / 4);
+        assert!(cache.current_bytes() <= capacity / 4);
+
+        cache.invalidate_sstable("000003.sst");
+        for i in 0..1024u64 {
+            assert!(cache.get(&names[3], i * 4096).is_none());
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers() {
+        let cache = Arc::new(BlockCache::new(32 * 1024 * 1024));
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    let name: Arc<str> = Arc::from(format!("{t:06}.sst"));
+                    for i in 0..20_000u64 {
+                        let offset = (i % 512) * 4096;
+                        cache.insert(&name, offset, vec![t as u8; 4096]);
+                        if let Some(block) = cache.get(&name, offset) {
+                            assert!(block.iter().all(|b| *b == t as u8));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(cache.current_bytes() <= cache.capacity());
     }
 }
