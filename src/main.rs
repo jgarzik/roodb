@@ -243,7 +243,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tds_port) = tds_port {
         server = server.enable_tds(SocketAddr::new(bind, tds_port));
     }
-    server.run_until(shutdown_signal()).await?;
+    // A node that is taken out of its cluster stops, as if asked to.
+    let removed = Arc::new(tokio::sync::Notify::new());
+    {
+        let removed = removed.clone();
+        raft_node.watch_removal(move || {
+            tracing::warn!("This node has been removed from its cluster: stopping");
+            removed.notify_one();
+        });
+    }
+    server
+        .run_until(async {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = removed.notified() => {}
+            }
+        })
+        .await?;
 
     // Asked to stop. Nothing here is needed for correctness - a killed
     // server recovers from its log - but stopping in order writes memory out

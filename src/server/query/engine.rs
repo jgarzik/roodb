@@ -567,6 +567,11 @@ impl QueryEngine {
             return Ok(());
         }
 
+        // Handle ALTER CLUSTER
+        if let Some(()) = self.try_handle_alter_cluster(sql).await? {
+            return Ok(());
+        }
+
         // Handle ALTER TABLE
         if let Some(()) = self.try_handle_alter_table(sql).await? {
             return Ok(());
@@ -1664,6 +1669,52 @@ impl QueryEngine {
         }
         self.temp.apply(txn_id, temporary, ignore_duplicates);
         Ok(())
+    }
+
+    /// `ALTER CLUSTER REMOVE NODE id`: take a node out of the cluster.
+    async fn try_handle_alter_cluster(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        let statement = sql.trim().trim_end_matches(';').trim();
+        let upper = statement.to_uppercase();
+        let mut words = upper.split_whitespace();
+        if (words.next(), words.next()) != (Some("ALTER"), Some("CLUSTER")) {
+            return Ok(None);
+        }
+        let id = match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("REMOVE"), Some("NODE"), Some(id), None) => id.parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(id) = id else {
+            return self
+                .send_error(
+                    codes::ER_PARSE_ERROR,
+                    states::SYNTAX_ERROR,
+                    "Expected: ALTER CLUSTER REMOVE NODE <node id>",
+                )
+                .await
+                .map(Some);
+        };
+        // Who is in the cluster is the administrator's to decide.
+        if self.session.user != "root" {
+            return self
+                .send_error(
+                    1227,
+                    "42000",
+                    "Access denied; you need (at least one of) the SUPER privilege(s) for this operation",
+                )
+                .await
+                .map(Some);
+        }
+        match self.raft_node.remove_member(id).await {
+            Ok(()) => self.send_ok(0, 0).await.map(Some),
+            Err(e) => self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &e.to_string(),
+                )
+                .await
+                .map(Some),
+        }
     }
 
     /// Whether this session may only read: it is on a node that is not the
@@ -3397,6 +3448,18 @@ impl QueryEngine {
                 .map(|(name, value)| vec![name.to_string(), value.to_string()])
                 .collect();
             self.send_custom_result_set(&["Variable_name", "Value"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW CLUSTER MEMBERS
+        else if sql_upper.trim_end_matches(';').trim() == "SHOW CLUSTER MEMBERS" {
+            let rows: Vec<Vec<String>> = self
+                .raft_node
+                .members()
+                .into_iter()
+                .map(|(id, addr, role)| vec![id.to_string(), addr, role.to_string()])
+                .collect();
+            self.send_custom_result_set(&["Node_id", "Address", "Role"], &rows)
                 .await
                 .map(Some)
         }

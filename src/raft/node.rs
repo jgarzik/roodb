@@ -56,6 +56,9 @@ pub struct RaftNode {
     storage: Arc<dyn StorageEngine>,
     /// What other nodes dial to reach this one, if not `addr`.
     advertised_addr: Option<String>,
+    /// Signalled when this node learns it has been removed from its
+    /// cluster.
+    removed: Arc<tokio::sync::Notify>,
     /// Whether this node is the only member of its cluster. Alone, it runs
     /// without timers, heartbeats or elections; they are switched on when a
     /// second node is admitted.
@@ -287,6 +290,7 @@ impl RaftNode {
             log_store,
             storage,
             advertised_addr: None,
+            removed: Arc::new(tokio::sync::Notify::new()),
             alone,
             applied_txn_floor,
             log_budget,
@@ -405,6 +409,110 @@ impl RaftNode {
                 if metrics.changed().await.is_err() {
                     return;
                 }
+            }
+        });
+    }
+
+    /// The nodes of the cluster as this node knows them: ID, address, and
+    /// role (`PRIMARY`, `SECONDARY`, or `LEARNER` for a node still being
+    /// brought up to date).
+    pub fn members(&self) -> Vec<(NodeId, String, &'static str)> {
+        use openraft::async_runtime::WatchReceiver;
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let voters: Vec<NodeId> = metrics.membership_config.voter_ids().collect();
+        metrics
+            .membership_config
+            .nodes()
+            .map(|(id, node)| {
+                let role = if metrics.current_leader == Some(*id) {
+                    "PRIMARY"
+                } else if voters.contains(id) {
+                    "SECONDARY"
+                } else {
+                    "LEARNER"
+                };
+                (*id, node.addr.clone(), role)
+            })
+            .collect()
+    }
+
+    /// Take a node out of the cluster. Only the primary can. The node
+    /// itself stops serving when it learns of it.
+    pub async fn remove_member(&self, id: NodeId) -> Result<(), RaftNodeError> {
+        use openraft::ChangeMembers;
+        if !self.raft.is_leader() {
+            return Err(RaftNodeError::Raft(NOT_PRIMARY.to_string()));
+        }
+        let members = self.members();
+        let Some((_, addr, role)) = members.iter().find(|(member, _, _)| *member == id) else {
+            return Err(RaftNodeError::Raft(format!(
+                "Node {id} is not a member of the cluster"
+            )));
+        };
+        let ids = std::collections::BTreeSet::from([id]);
+        let change = if *role == "LEARNER" {
+            ChangeMembers::RemoveNodes(ids)
+        } else {
+            let voters = members.iter().filter(|(_, _, r)| *r != "LEARNER").count();
+            if voters <= 1 {
+                return Err(RaftNodeError::Raft(
+                    "Cannot remove the only voting node of the cluster".to_string(),
+                ));
+            }
+            ChangeMembers::RemoveVoters(ids)
+        };
+        self.raft
+            .change_membership(change, false)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        tracing::info!(node_id = id, "A node was removed from the cluster");
+        // The node is told, so that it stops instead of calling elections
+        // nobody will answer.
+        if id != self.id {
+            let tls_config = self.tls_config.clone();
+            let addr = addr.clone();
+            tokio::spawn(
+                async move { crate::raft::network::notify_removed(&tls_config, &addr).await },
+            );
+        }
+        Ok(())
+    }
+
+    /// Call `removed` once, if this node finds that it has been taken out
+    /// of its cluster: it is told so by the leader, or sees a membership
+    /// it is no longer part of.
+    pub fn watch_removal(self: &Arc<Self>, removed: impl FnOnce() + Send + 'static) {
+        use openraft::async_runtime::WatchReceiver;
+        let id = self.id;
+        let mut metrics = self.raft.metrics();
+        let told = self.removed.clone();
+        tokio::spawn(async move {
+            let seen = async {
+                let mut was_member = false;
+                loop {
+                    let (is_member, any) = {
+                        let metrics = metrics.borrow_watched();
+                        let mut nodes = metrics.membership_config.nodes();
+                        let any = metrics.membership_config.nodes().next().is_some();
+                        (nodes.any(|(member, _)| *member == id), any)
+                    };
+                    if is_member {
+                        was_member = true;
+                    } else if was_member && any {
+                        return true;
+                    }
+                    if metrics.changed().await.is_err() {
+                        return false;
+                    }
+                }
+            };
+            let out = tokio::select! {
+                out = seen => out,
+                () = told.notified() => true,
+            };
+            if out {
+                removed();
             }
         });
     }
@@ -537,7 +645,11 @@ impl RaftNode {
         self.addr = listener.local_addr()?;
 
         let acceptor = TlsAcceptor::from(self.tls_config.server_config());
-        let handler = Arc::new(RaftRpcHandler::new(self.raft.clone(), self.alone.clone()));
+        let handler = Arc::new(RaftRpcHandler::new(
+            self.raft.clone(),
+            self.alone.clone(),
+            self.removed.clone(),
+        ));
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         *self.shutdown_tx.lock() = Some(shutdown_tx);

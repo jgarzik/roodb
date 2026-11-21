@@ -270,3 +270,143 @@ async fn a_secondary_catches_up_after_a_restart() {
     )
     .await;
 }
+
+async fn members(conn: &mut Conn) -> Vec<(u64, String, String)> {
+    let mut rows: Vec<(u64, String, String)> = conn.query("SHOW CLUSTER MEMBERS").await.unwrap();
+    rows.sort();
+    rows
+}
+
+/// Every node can say who is in the cluster and who the primary is; the
+/// primary can take a node out, and that node then stops by itself.
+#[tokio::test]
+async fn members_are_listed_and_a_node_can_be_removed() {
+    let [first, second, mut third] = cluster_of_three().await;
+    let mut primary = connect(&first).await;
+    let mut secondary = connect(&second).await;
+
+    // Wait until both joiners are voting members, then compare the views.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let seen = members(&mut primary).await;
+        let roles: Vec<&str> = seen.iter().map(|(_, _, role)| role.as_str()).collect();
+        if roles == ["PRIMARY", "SECONDARY", "SECONDARY"] {
+            assert_eq!(
+                seen.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(seen[0].1, first.raft_addr());
+            break;
+        }
+        assert!(Instant::now() < deadline, "members never settled: {seen:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut secondary).await != members(&mut primary).await {
+        assert!(Instant::now() < deadline, "the secondary's view differs");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Only the primary changes the membership, and only for a member.
+    let err = secondary
+        .query_drop("ALTER CLUSTER REMOVE NODE 3")
+        .await
+        .expect_err("a secondary removed a node");
+    assert_eq!(error_code(&err), 1290, "{err}");
+    assert!(primary
+        .query_drop("ALTER CLUSTER REMOVE NODE 9")
+        .await
+        .is_err());
+    assert!(primary.query_drop("ALTER CLUSTER REMOVE").await.is_err());
+
+    // Which of the joiners is node 3?
+    let third_is_3 = members(&mut primary)
+        .await
+        .iter()
+        .any(|(id, addr, _)| *id == 3 && *addr == third.raft_addr());
+    let (mut removed, kept) = if third_is_3 {
+        (third, second)
+    } else {
+        drop(secondary);
+        third = second;
+        (third, first.joiner())
+    };
+    let _ = &kept;
+    primary
+        .query_drop("ALTER CLUSTER REMOVE NODE 3")
+        .await
+        .unwrap();
+    let ids: Vec<u64> = members(&mut primary)
+        .await
+        .iter()
+        .map(|(id, _, _)| *id)
+        .collect();
+    assert_eq!(ids, [1, 2]);
+
+    // The removed node learns of it and stops.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !removed.has_exited() {
+        assert!(
+            Instant::now() < deadline,
+            "the removed node is still running\n{}",
+            removed.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The cluster goes on with two.
+    primary
+        .query_drop("INSERT INTO formed VALUES (5)")
+        .await
+        .unwrap();
+}
+
+/// Rows of a table without a primary key get their keys from the node that
+/// inserts them. A node that becomes primary must give out keys no node
+/// gave out before: no row may be overwritten.
+#[tokio::test]
+async fn generated_row_keys_stay_unique_across_a_failover() {
+    let [mut first, second, third] = cluster_of_three().await;
+    let mut primary = connect(&first).await;
+    primary
+        .query_drop("CREATE TABLE nokey (n INT)")
+        .await
+        .unwrap();
+    for n in 0..30 {
+        primary
+            .query_drop(format!("INSERT INTO nokey VALUES ({n})"))
+            .await
+            .unwrap();
+    }
+    drop(primary);
+    first.kill();
+
+    let survivors = [&second, &third];
+    let leader = find_primary(&survivors).await;
+    let mut primary = connect(survivors[leader]).await;
+    for n in 30..60 {
+        primary
+            .query_drop(format!("INSERT INTO nokey VALUES ({n})"))
+            .await
+            .unwrap();
+    }
+    // The old primary comes back and leads again or not; either way more
+    // rows are added, by whoever is primary then.
+    first.start();
+    let all = [&first, &second, &third];
+    let leader = find_primary(&all).await;
+    let mut primary = connect(all[leader]).await;
+    for n in 60..90 {
+        primary
+            .query_drop(format!("INSERT INTO nokey VALUES ({n})"))
+            .await
+            .unwrap();
+    }
+    let expected: Vec<i32> = (0..90).collect();
+    until_rows(
+        &mut primary,
+        all[leader],
+        "SELECT n FROM nokey ORDER BY n",
+        &expected,
+    )
+    .await;
+}

@@ -183,6 +183,14 @@ impl ServerProcess {
         log[log.ceil_char_boundary(start)..].to_string()
     }
 
+    /// Whether the server has exited by itself.
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().expect("poll server").is_some(),
+            None => true,
+        }
+    }
+
     /// Kill the server without warning, as a crash or `kill -9` would.
     pub fn kill(&mut self) {
         let mut child = self.child.take().expect("server not running");

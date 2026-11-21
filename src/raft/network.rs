@@ -54,6 +54,28 @@ enum MessageType {
     Snapshot = 5,
     SnapshotResponse = 6,
     Join = 7,
+    Removed = 8,
+}
+
+/// Tell the node at `addr` that it has been taken out of the cluster. The
+/// leader stops sending to a node once it is out, so without this the node
+/// would never hear of it. Tried a few times; a node that cannot be reached
+/// is down, and has nothing to stop.
+pub async fn notify_removed(tls_config: &RaftTlsConfig, addr: &str) {
+    let connection = RaftNetworkConnection {
+        target: 0,
+        addr: Some(addr.to_string()),
+        tls_config: tls_config.clone(),
+    };
+    for _ in 0..5 {
+        let sent: Result<bool, String> = connection
+            .send_request(MessageType::Removed, &(), std::time::Duration::from_secs(5))
+            .await;
+        if sent.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// A node asking to be admitted to the cluster.
@@ -111,6 +133,7 @@ impl TryFrom<u8> for MessageType {
             5 => Ok(Self::Snapshot),
             6 => Ok(Self::SnapshotResponse),
             7 => Ok(Self::Join),
+            8 => Ok(Self::Removed),
             _ => Err(()),
         }
     }
@@ -312,11 +335,21 @@ pub struct RaftRpcHandler {
     /// Set while this node is the only member of its cluster (see
     /// `RaftNode`); cleared here when a second node is admitted.
     alone: Arc<std::sync::atomic::AtomicBool>,
+    /// Signalled when this node is told it has been removed.
+    removed: Arc<tokio::sync::Notify>,
 }
 
 impl RaftRpcHandler {
-    pub fn new(raft: crate::raft::types::Raft, alone: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        Self { raft, alone }
+    pub fn new(
+        raft: crate::raft::types::Raft,
+        alone: Arc<std::sync::atomic::AtomicBool>,
+        removed: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            raft,
+            alone,
+            removed,
+        }
     }
 
     /// Admit a node that asks to join: give it a node ID, add it as a
@@ -430,6 +463,23 @@ impl RaftRpcHandler {
                     .await
                     .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
+                Ok(Bytes::from(encoded))
+            }
+            MessageType::Removed => {
+                // Only a node that is really out acts on it: a stray or
+                // forged message must not stop a member. The leader sends
+                // this after the removal is committed, so by the time it is
+                // believed here the cluster no longer counts on this node.
+                use openraft::async_runtime::WatchReceiver;
+                let still_led = {
+                    let metrics = self.raft.metrics();
+                    let metrics = metrics.borrow_watched();
+                    metrics.state.is_leader()
+                };
+                if !still_led {
+                    self.removed.notify_one();
+                }
+                let encoded = bincode::serialize(&true).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }
             MessageType::Join => {

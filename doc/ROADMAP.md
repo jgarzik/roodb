@@ -46,18 +46,16 @@ In order:
   files, held open for the transfer) streamed in chunks of any total size,
   installed atomically on the receiver. Today a snapshot is the whole
   keyspace in one message, limited to 4 GiB.
-- A test that a node which becomes primary gives out row IDs no node gave
-  out before (a table without a primary key, written before and after a
-  failover).
-- Leaving: `ALTER CLUSTER REMOVE NODE id` on the primary; the removed node
-  stops serving. `SHOW CLUSTER MEMBERS` on any node: ID, address, role
-  (primary, secondary, learner), so that clients and routers can find the
-  primary.
+- A node that was down when it was removed never hears of it and, when
+  started again, calls elections nobody answers: at start, a node asks the
+  members whether it still belongs, and stops if not.
+- Moving the primary role to another node on request (today the only way
+  is to stop the primary).
 - Persistent RPC connections between nodes (today one connection per
   request).
 - Tests through the real binary still to write: the cluster tests on the
   posix backend too; a secondary too far behind for the log caught up by
-  snapshot; a node removed.
+  snapshot.
 - Documents: admin.md (deployment modes, cluster operations, new flags,
   troubleshooting) rewritten from what the binary does; SQL.md (the two
   statements, error 1290, read-only sessions); design.md and LOCKING.md

@@ -466,6 +466,7 @@ not interpreted; lines that cannot be inserted are skipped.
 | `ANALYZE TABLE t` | Collects row statistics; returns a status row |
 | `CHECK TABLE t`, `CHECKSUM TABLE t` | Return a fixed `OK` status row; nothing is checked |
 | `FLUSH ...` | Accepted, no effect |
+| `ALTER CLUSTER REMOVE NODE id` | Takes a node out of the cluster. On the primary, as `root`. The node stops by itself. See [admin.md](admin.md#deployment-modes) |
 | `LOCK TABLES ...`, `UNLOCK TABLES` | Accepted, no effect |
 | `OPTIMIZE TABLE`, `REPAIR TABLE`, `HANDLER`, `KILL`, `XA` | Not supported |
 
@@ -796,6 +797,7 @@ other statements (views, procedures, functions, triggers, `ALTER TABLE`,
 | Statement | Result |
 |-----------|--------|
 | `SHOW DATABASES`, `SHOW SCHEMAS` | Database names |
+| `SHOW CLUSTER MEMBERS` | The nodes of the cluster: `Node_id`, `Address` (of its Raft port), `Role` (`PRIMARY`, `SECONDARY`, or `LEARNER` for a node still being brought up to date). Works on any node |
 | `SHOW TABLES`, `SHOW FULL TABLES` | All tables and views (one column) |
 | `SHOW TABLES {FROM \| IN} db` | All tables |
 | `SHOW CREATE TABLE name` | Reconstructed `CREATE TABLE` (stored types, primary key), or the view definition |

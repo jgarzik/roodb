@@ -303,8 +303,27 @@ no `--join`, and the option is ignored if given.
 - A node that was down restarts on its data directory with no special
   options, follows the current primary and catches up.
 - Still to come (see `doc/ROADMAP.md`): catching up a node that has fallen
-  too far behind for the log by snapshot, removing a node, and a statement
-  that shows the members and which is the primary.
+  too far behind for the log by snapshot.
+
+**Operating a cluster:**
+
+```sql
+-- on any node: who is in the cluster, and which node is the primary
+SHOW CLUSTER MEMBERS;
+-- Node_id  Address         Role
+-- 1        10.0.0.1:4307   PRIMARY
+-- 2        10.0.0.2:4307   SECONDARY
+-- 3        10.0.0.3:4307   SECONDARY
+
+-- on the primary, as root: take node 3 out of the cluster
+ALTER CLUSTER REMOVE NODE 3;
+```
+
+A removed node is told, and stops. Its data directory is of no further use
+to the cluster: to bring the machine back, empty the directory and start
+the node with `--join` again (it gets a new node ID). Remove a failed node
+that is not coming back, so that it no longer counts towards the majority
+the cluster needs.
 
 ## First-Time Initialization
 
