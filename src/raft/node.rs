@@ -62,6 +62,9 @@ pub struct RaftNode {
     checkpointer: tokio::task::JoinHandle<()>,
     /// The task that keeps row IDs reserved ahead of use.
     row_id_reserver: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Held while a commit makes a reservation of its own, so that a burst
+    /// of commits makes one reservation rather than one each.
+    row_id_gate: tokio::sync::Mutex<()>,
 }
 
 /// How much log may accumulate before the state machine is checkpointed so
@@ -89,10 +92,10 @@ const ROW_ID_MAX_BLOCK: u64 = 1 << 24;
 const ROW_ID_POLL: Duration = Duration::from_millis(20);
 
 /// Reserve `block` more row IDs for this node, past both what is reserved
-/// and what any waiting allocation needs.
+/// and what has been handed out.
 async fn reserve_row_ids(raft: &Raft, node_id: NodeId, block: u64) -> Result<(), RaftNodeError> {
-    let (next, limit, wanted) = crate::storage::row_id::generator().demand();
-    let upto = next.max(limit.unwrap_or(0)).max(wanted) + block;
+    let (next, limit) = crate::storage::row_id::generator().demand();
+    let upto = next.max(limit.unwrap_or(0)) + block;
     let response = raft
         .client_write(Command::ReserveRowIds { node_id, upto })
         .await
@@ -103,34 +106,31 @@ async fn reserve_row_ids(raft: &Raft, node_id: NodeId, block: u64) -> Result<(),
     }
 }
 
-/// Keep row IDs reserved ahead of use.
+/// Keep row IDs reserved ahead of use, so that commits rarely have to wait
+/// for a reservation.
 ///
-/// A new range is reserved when less than half of the last one is left, or
-/// when an allocation is waiting. Each range is twice what was used since the
-/// previous reservation, so a bulk load quickly gets ranges to match while an
-/// idle server wastes few IDs on a restart.
+/// A new range is reserved when less than half of the last one is left. Each
+/// range is twice what was used since the previous reservation, so a bulk
+/// load quickly gets ranges to match while an idle server wastes few IDs on
+/// a restart. Runs until the node shuts down; a failed attempt (this node is
+/// not the leader, say) is simply tried again.
 async fn row_id_task(raft: Raft, node_id: NodeId) {
     let generator = crate::storage::row_id::generator();
     let mut block = ROW_ID_MIN_BLOCK;
     let mut last_next = generator.demand().0;
     loop {
         tokio::time::sleep(ROW_ID_POLL).await;
-        let (next, limit, wanted) = generator.demand();
-        let Some(limit) = limit else {
+        let (next, Some(limit)) = generator.demand() else {
             continue;
         };
-        if limit.saturating_sub(next) >= block / 2 && wanted <= limit {
+        if limit.saturating_sub(next) >= block / 2 {
             continue;
         }
         let used = next.saturating_sub(last_next);
         block = (used * 2).clamp(ROW_ID_MIN_BLOCK, ROW_ID_MAX_BLOCK);
         last_next = next;
-        match reserve_row_ids(&raft, node_id, block).await {
-            Ok(()) => {}
-            // Not the leader, or shutting down. A follower hands out no row
-            // IDs; if this node becomes leader the next round succeeds.
-            Err(_) if raft.is_leader() => return,
-            Err(_) => {}
+        if let Err(e) = reserve_row_ids(&raft, node_id, block).await {
+            tracing::debug!(error = %e, "row ID reservation not made; will retry");
         }
     }
 }
@@ -249,6 +249,7 @@ impl RaftNode {
             log_budget,
             checkpointer,
             row_id_reserver: parking_lot::Mutex::new(Some(row_id_reserver)),
+            row_id_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -418,6 +419,7 @@ impl RaftNode {
             return Ok(());
         }
 
+        self.cover_row_ids().await?;
         let cmd = Command::DataChange(changeset);
         let start = std::time::Instant::now();
         let resp = self
@@ -435,8 +437,25 @@ impl RaftNode {
         }
     }
 
+    /// Make sure every row ID handed out so far is covered by a recorded
+    /// reservation, before changes that may use them are committed. Usually
+    /// the background task has reserved ahead and there is nothing to do.
+    async fn cover_row_ids(&self) -> Result<(), RaftNodeError> {
+        let generator = crate::storage::row_id::generator();
+        if generator.uncovered().is_none() {
+            return Ok(());
+        }
+        let _gate = self.row_id_gate.lock().await;
+        // Another commit may have made the reservation while we waited.
+        if generator.uncovered().is_some() {
+            reserve_row_ids(&self.raft, self.id, ROW_ID_MIN_BLOCK).await?;
+        }
+        Ok(())
+    }
+
     /// Write a raw command to the Raft log
     pub async fn write(&self, cmd: Command) -> Result<CommandResponse, RaftNodeError> {
+        self.cover_row_ids().await?;
         let start = std::time::Instant::now();
         let resp = self
             .raft

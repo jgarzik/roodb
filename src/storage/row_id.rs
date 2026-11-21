@@ -27,28 +27,27 @@ pub fn get_node_id() -> u64 {
     NODE_ID.load(Ordering::SeqCst)
 }
 
-/// Hands out row IDs, in order, from a range it has been allowed.
+/// Hands out row IDs, in order.
 ///
 /// Row IDs become keys, so one must never be handed out twice - including
 /// after a restart, when this counter starts again from what was saved. The
-/// server therefore reserves IDs ahead of use: a range is recorded through
-/// Raft before any ID in it is handed out, and after a restart allocation
-/// resumes past everything ever reserved. The reserved range is `limit`;
-/// allocation waits when it runs out, and whoever does the reserving watches
-/// [`RowIdGenerator::demand`] to stay ahead.
+/// server therefore reserves IDs through Raft: a bound is recorded in the
+/// log, and after a restart allocation resumes past every bound recorded.
 ///
-/// Until [`RowIdGenerator::restore`] is called the range is unlimited: that
-/// is how `roodb_init` and tests without a server use it.
+/// Handing out an ID never waits. What waits is the commit: before a
+/// transaction's changes are proposed, the reserved bound must cover every ID
+/// handed out so far ([`RowIdGenerator::uncovered`]). An ID above the bound
+/// can therefore exist only in work that has not been committed, and reusing
+/// it after a crash is harmless.
+///
+/// Until [`RowIdGenerator::restore`] is called no bound is tracked: that is
+/// how `roodb_init` and tests without a server use it.
 pub struct RowIdGenerator {
     next_id: AtomicU64,
-    /// IDs below this may be handed out. `u64::MAX` means unlimited.
+    /// IDs below this are covered by a recorded reservation. `u64::MAX`
+    /// means reservations are not in use.
     limit: AtomicU64,
-    /// The end of the largest allocation that had to wait.
-    wanted: AtomicU64,
 }
-
-/// How long an allocation waits for more IDs to be reserved before giving up.
-const RESERVATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl RowIdGenerator {
     /// Create a new generator starting from 1
@@ -61,49 +60,19 @@ impl RowIdGenerator {
         Self {
             next_id: AtomicU64::new(start),
             limit: AtomicU64::new(u64::MAX),
-            wanted: AtomicU64::new(0),
         }
     }
 
     /// Generate the next row ID
     #[inline]
     pub fn next(&self) -> u64 {
-        self.allocate_batch(1)
+        self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Allocate `count` consecutive IDs and return the first.
-    ///
-    /// Waits if the reserved range does not cover them yet.
-    ///
-    /// # Panics
-    ///
-    /// If nothing extends the range for 30 seconds. That means Raft cannot
-    /// commit a reservation, and no write could succeed anyway.
+    #[inline]
     pub fn allocate_batch(&self, count: u64) -> u64 {
-        let mut waited_since: Option<std::time::Instant> = None;
-        loop {
-            let start = self.next_id.load(Ordering::SeqCst);
-            let end = start.saturating_add(count);
-            if end <= self.limit.load(Ordering::SeqCst) {
-                if self
-                    .next_id
-                    .compare_exchange(start, end, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    return start;
-                }
-                continue;
-            }
-            // Out of reserved IDs: say how far this allocation needs the
-            // range to reach, and give the reserver a moment.
-            self.wanted.fetch_max(end, Ordering::SeqCst);
-            let since = *waited_since.get_or_insert_with(std::time::Instant::now);
-            assert!(
-                since.elapsed() < RESERVATION_WAIT,
-                "no row IDs could be reserved for {RESERVATION_WAIT:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        self.next_id.fetch_add(count, Ordering::SeqCst)
     }
 
     /// Get current value without incrementing
@@ -111,19 +80,19 @@ impl RowIdGenerator {
         self.next_id.load(Ordering::SeqCst)
     }
 
-    /// Start from saved state: no ID below `bound` is handed out, and none
-    /// at all until a range is reserved with [`Self::extend_limit`].
+    /// Start from saved state: no ID below `bound` is handed out, and
+    /// reservations are tracked from here on.
     pub fn restore(&self, bound: u64) {
-        let next = self.next_id.fetch_max(bound, Ordering::SeqCst).max(bound);
-        // From unlimited to "nothing reserved yet"; never lower a limit a
+        self.next_id.fetch_max(bound, Ordering::SeqCst);
+        // From "not in use" to the saved bound; never lower a bound that a
         // reservation has already raised.
         let _ = self
             .limit
-            .compare_exchange(u64::MAX, next, Ordering::SeqCst, Ordering::SeqCst);
+            .compare_exchange(u64::MAX, bound, Ordering::SeqCst, Ordering::SeqCst);
         self.limit.fetch_max(bound, Ordering::SeqCst);
     }
 
-    /// IDs below `upto` have been reserved and may be handed out.
+    /// A reservation of the IDs below `upto` has been recorded.
     pub fn extend_limit(&self, upto: u64) {
         if self.limit.load(Ordering::SeqCst) != u64::MAX {
             self.limit.fetch_max(upto, Ordering::SeqCst);
@@ -139,15 +108,22 @@ impl RowIdGenerator {
         }
     }
 
-    /// `(next, limit, wanted)`: the next ID, the end of the reserved range
-    /// (`None` if unlimited), and the furthest any allocation has had to
-    /// wait for.
-    pub fn demand(&self) -> (u64, Option<u64>, u64) {
+    /// If IDs have been handed out beyond the reserved bound, the value the
+    /// bound has to reach to cover them. Nothing that might contain such an
+    /// ID may be committed until a reservation up to there is recorded.
+    pub fn uncovered(&self) -> Option<u64> {
+        let limit = self.limit.load(Ordering::SeqCst);
+        let next = self.next_id.load(Ordering::SeqCst);
+        (limit != u64::MAX && next > limit).then_some(next)
+    }
+
+    /// `(next, limit)`: the next ID, and the reserved bound (`None` if
+    /// reservations are not in use).
+    pub fn demand(&self) -> (u64, Option<u64>) {
         let limit = self.limit.load(Ordering::SeqCst);
         (
             self.next_id.load(Ordering::SeqCst),
             (limit != u64::MAX).then_some(limit),
-            self.wanted.load(Ordering::SeqCst),
         )
     }
 }
@@ -244,29 +220,29 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_until_restored() {
+    fn no_bound_is_tracked_until_restored() {
         let gen = RowIdGenerator::new();
         assert_eq!(gen.allocate_batch(1_000_000), 1);
-        assert_eq!(gen.demand(), (1_000_001, None, 0));
+        assert_eq!(gen.demand(), (1_000_001, None));
+        assert_eq!(gen.uncovered(), None);
     }
 
     #[test]
-    fn restore_resumes_past_saved_bound_and_waits_for_a_reservation() {
-        let gen = std::sync::Arc::new(RowIdGenerator::new());
+    fn allocation_never_waits_but_reports_what_is_uncovered() {
+        let gen = RowIdGenerator::new();
         gen.restore(5000);
-        assert_eq!(gen.demand(), (5000, Some(5000), 0));
+        assert_eq!(gen.demand(), (5000, Some(5000)));
+        assert_eq!(gen.uncovered(), None);
 
-        // An allocation now has to wait until a range is reserved.
-        let waiter = {
-            let gen = gen.clone();
-            std::thread::spawn(move || gen.allocate_batch(10))
-        };
-        while gen.demand().2 == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert_eq!(gen.demand().2, 5010, "the waiter says how far it needs");
+        // IDs are handed out at once, past the bound.
+        assert_eq!(gen.allocate_batch(10), 5000);
+        assert_eq!(gen.uncovered(), Some(5010));
+
+        // A reservation that does not reach far enough leaves some uncovered.
+        gen.extend_limit(5005);
+        assert_eq!(gen.uncovered(), Some(5010));
         gen.extend_limit(6000);
-        assert_eq!(waiter.join().unwrap(), 5000);
+        assert_eq!(gen.uncovered(), None);
         assert_eq!(gen.next(), 5010);
     }
 
@@ -279,9 +255,9 @@ mod tests {
         gen.extend_limit(200);
         gen.extend_limit(300);
         gen.skip_reserved();
-        assert_eq!(gen.demand(), (300, Some(300), 0));
-        gen.extend_limit(400);
+        assert_eq!(gen.demand(), (300, Some(300)));
         assert_eq!(gen.next(), 300);
+        assert_eq!(gen.uncovered(), Some(301));
     }
 
     #[test]
@@ -292,7 +268,7 @@ mod tests {
         assert_eq!(gen.allocate_batch(500), 1000);
         // A second restore with an older bound changes nothing.
         gen.restore(10);
-        assert_eq!(gen.demand(), (1500, Some(2000), 0));
+        assert_eq!(gen.demand(), (1500, Some(2000)));
         // extend_limit never shrinks either.
         gen.extend_limit(1200);
         assert_eq!(gen.demand().1, Some(2000));
