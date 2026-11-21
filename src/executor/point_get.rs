@@ -69,6 +69,32 @@ impl Executor for PointGet {
 
         // Do the O(log n) lookup
         let value = if let Some(ref ctx) = self.txn_context {
+            if ctx.read_locks(&self.table) {
+                // SELECT ... FOR UPDATE / FOR SHARE: lock the row, then
+                // read it as it stands. If there is no row, lock the gap it
+                // would be in (REPEATABLE READ), so that it stays missing.
+                use super::context::LockedRow;
+                match ctx.locked_read(&self.mvcc, &storage_key).await? {
+                    LockedRow::Row(data) => {
+                        self.result = Some(decode_row(&data)?);
+                    }
+                    LockedRow::Skipped => {}
+                    LockedRow::Missing => {
+                        if ctx.locks_gaps() && !ctx.is_buffered_deleted(&storage_key) {
+                            let (low, high) = self
+                                .mvcc
+                                .gap_around(
+                                    &storage_key,
+                                    &super::encoding::table_key_prefix(&self.table),
+                                    &super::encoding::table_key_end(&self.table),
+                                )
+                                .await?;
+                            ctx.lock_gap(&low, &high);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             self.mvcc.get(&storage_key, &ctx.read_view).await?
         } else {
             self.mvcc.inner().get(&storage_key).await?

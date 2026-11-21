@@ -479,3 +479,187 @@ async fn read_committed_locks_only_the_rows_it_changes() {
     let rows: Vec<(i32, i32)> = b.query("SELECT id, v FROM rc ORDER BY id").await.unwrap();
     assert_eq!(rows, [(1, 51), (2, 60), (3, 7)]);
 }
+
+/// SELECT ... FOR UPDATE locks the rows it returns: a writer waits for the
+/// reader's transaction, and the reader may then change what it read.
+#[tokio::test]
+async fn select_for_update_holds_the_rows_it_read() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE fu (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO fu VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    let v: Option<i32> = a
+        .query_first("SELECT v FROM fu WHERE id = 1 FOR UPDATE")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(10));
+
+    // Another row is free; a plain read of the locked row does not wait.
+    b.query_drop("UPDATE fu SET v = 21 WHERE id = 2")
+        .await
+        .unwrap();
+    let seen: Option<i32> = b
+        .query_first("SELECT v FROM fu WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(seen, Some(10));
+
+    let blocked = tokio::spawn(async move {
+        b.query_drop("UPDATE fu SET v = v + 1 WHERE id = 1")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("UPDATE fu SET v = 100 WHERE id = 1")
+        .await
+        .unwrap();
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().unwrap();
+    let v: Option<i32> = b
+        .query_first("SELECT v FROM fu WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(101));
+}
+
+/// A locking read waits for a writer and then returns what the writer
+/// committed, even outside a transaction.
+#[tokio::test]
+async fn a_locking_read_waits_and_reads_the_latest() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE lr (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO lr VALUES (1, 1)").await.unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("UPDATE lr SET v = 2 WHERE id = 1")
+        .await
+        .unwrap();
+    let blocked = tokio::spawn(async move {
+        let v: Option<i32> = b
+            .query_first("SELECT v FROM lr WHERE id = 1 FOR SHARE")
+            .await
+            .unwrap();
+        (b, v)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("COMMIT").await.unwrap();
+    let (mut b, v) = blocked.await.unwrap();
+    assert_eq!(v, Some(2));
+    // Outside a transaction the read's own locks are gone when it returns.
+    assert_eq!(waiting(&mut watcher).await, 0);
+    a.query_drop("UPDATE lr SET v = 3 WHERE id = 1")
+        .await
+        .unwrap();
+    // The older spelling.
+    let v: Option<i32> = b
+        .query_first("SELECT v FROM lr WHERE id = 1 LOCK IN SHARE MODE")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(3));
+}
+
+/// FOR SHARE readers coexist and keep writers out; NOWAIT fails at once on
+/// a locked row and SKIP LOCKED leaves it out.
+#[tokio::test]
+async fn shared_locks_nowait_and_skip_locked() {
+    let (_server, mut a, mut b) = start().await;
+    a.query_drop("CREATE TABLE sh (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO sh VALUES (1, 1), (2, 2), (3, 3)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    b.query_drop("BEGIN").await.unwrap();
+    let _: Vec<i32> = a
+        .query("SELECT v FROM sh WHERE id = 2 FOR SHARE")
+        .await
+        .unwrap();
+    // A second shared reader of the same row does not wait.
+    let v: Vec<i32> = b
+        .query("SELECT v FROM sh WHERE id = 2 FOR SHARE")
+        .await
+        .unwrap();
+    assert_eq!(v, [2]);
+    b.query_drop("COMMIT").await.unwrap();
+
+    // An exclusive request on it cannot be met now.
+    b.query_drop("BEGIN").await.unwrap();
+    let err = b
+        .query_drop("SELECT v FROM sh WHERE id = 2 FOR UPDATE NOWAIT")
+        .await
+        .expect_err("NOWAIT waited or succeeded");
+    assert_eq!(error_code(&err), 3572, "{err}");
+    let ids: Vec<i32> = b
+        .query("SELECT id FROM sh ORDER BY id FOR UPDATE SKIP LOCKED")
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 3]);
+    b.query_drop("ROLLBACK").await.unwrap();
+    a.query_drop("COMMIT").await.unwrap();
+
+    let ids: Vec<i32> = b
+        .query("SELECT id FROM sh ORDER BY id FOR UPDATE SKIP LOCKED")
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+/// A locking read of a range keeps rows from being inserted into it, and a
+/// locking read that finds no row keeps that row from being created.
+#[tokio::test]
+async fn a_locking_read_locks_the_range_it_read() {
+    let (server, mut a, mut b) = start().await;
+    let mut c = connect(&server).await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE rg (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO rg VALUES (10), (20), (30), (40)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    let ids: Vec<i32> = a
+        .query("SELECT id FROM rg WHERE id BETWEEN 15 AND 25 FOR UPDATE")
+        .await
+        .unwrap();
+    assert_eq!(ids, [20]);
+    let none: Vec<i32> = a
+        .query("SELECT id FROM rg WHERE id = 35 FOR UPDATE")
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // Beyond the rows that bound what was read: free.
+    c.query_drop("INSERT INTO rg VALUES (5)").await.unwrap();
+    c.query_drop("INSERT INTO rg VALUES (45)").await.unwrap();
+    // Inside the range, and where the missing row would be: wait.
+    let first =
+        tokio::spawn(async move { b.query_drop("INSERT INTO rg VALUES (17)").await.map(|()| b) });
+    until_waiting(&mut watcher, 1).await;
+    let second =
+        tokio::spawn(async move { c.query_drop("INSERT INTO rg VALUES (35)").await.map(|()| c) });
+    until_waiting(&mut watcher, 2).await;
+    // The read gives the same answer for as long as the transaction lasts.
+    let ids: Vec<i32> = a
+        .query("SELECT id FROM rg WHERE id BETWEEN 15 AND 25 FOR UPDATE")
+        .await
+        .unwrap();
+    assert_eq!(ids, [20]);
+    a.query_drop("COMMIT").await.unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    let ids: Vec<i32> = a.query("SELECT id FROM rg ORDER BY id").await.unwrap();
+    assert_eq!(ids, [5, 10, 17, 20, 30, 35, 40, 45]);
+}

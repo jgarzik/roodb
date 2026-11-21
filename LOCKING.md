@@ -236,6 +236,14 @@ rows (`MvccStorage::gap_around`, built on the storage engine's `next_key` /
 COMMITTED there are no gap locks, and a scanned row that does not match is
 unlocked at once (`unlock_record`).
 
+`SELECT ... FOR UPDATE` / `FOR SHARE` lock in the scan executors
+(`TableScan`, `RangeScan`, `PointGet`) through
+`TransactionContext::locking_scan` / `locked_read`: gap first, then each row,
+each read as it stands after it is locked. `NOWAIT` and `SKIP LOCKED` use
+`try_lock_record`, which never waits. A locking read outside a transaction
+runs in an implicit one that ends, releasing its locks, when the result has
+been sent.
+
 ## Lock Ordering Rules
 
 1. **Never hold sync locks across await** (except tokio::sync::Mutex)

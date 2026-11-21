@@ -63,6 +63,10 @@ pub enum ExecutorError {
     /// statement fails.
     LockWaitTimeout,
 
+    /// A row was locked by another transaction and the statement said
+    /// NOWAIT (MySQL error 3572).
+    LockNoWait,
+
     /// Internal executor error
     Internal(String),
 }
@@ -108,6 +112,10 @@ impl fmt::Display for ExecutorError {
             ExecutorError::LockWaitTimeout => {
                 write!(f, "Lock wait timeout exceeded; try restarting transaction")
             }
+            ExecutorError::LockNoWait => write!(
+                f,
+                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set."
+            ),
             ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }

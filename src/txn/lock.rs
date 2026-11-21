@@ -280,6 +280,29 @@ impl LockManager {
         self.acquire(txn, key, Wanted::Record(mode), timeout).await
     }
 
+    /// Lock one row for `txn` if that can be done without waiting. `None`
+    /// means another transaction stands in the way. Otherwise as
+    /// `lock_record`.
+    pub fn try_lock_record(&self, txn: u64, key: &[u8], mode: LockMode) -> Option<bool> {
+        let mut state = self.state.lock();
+        let held = state
+            .records
+            .get(key)
+            .and_then(|holders| holders.iter().find(|(holder, _)| *holder == txn))
+            .map(|(_, held)| *held);
+        if held.is_some_and(|held| held.covers(mode)) {
+            return Some(false);
+        }
+        if !state
+            .blockers(txn, key, &Wanted::Record(mode), None)
+            .is_empty()
+        {
+            return None;
+        }
+        state.grant_record(txn, key, mode);
+        Some(held.is_none())
+    }
+
     /// Give back a record lock before the transaction ends: for a row that
     /// was locked in order to look at it and turned out not to be wanted.
     pub fn unlock_record(&self, txn: u64, key: &[u8]) {
@@ -630,6 +653,20 @@ mod tests {
         let _ = writer.await;
         reader.await.unwrap().unwrap();
         assert_eq!(m.counts(), (2, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn trying_for_a_lock_never_waits() {
+        let m = LockManager::new();
+        assert_eq!(m.try_lock_record(1, b"k", LockMode::Shared), Some(true));
+        assert_eq!(m.try_lock_record(1, b"k", LockMode::Shared), Some(false));
+        assert_eq!(m.try_lock_record(2, b"k", LockMode::Shared), Some(true));
+        assert_eq!(m.try_lock_record(2, b"k", LockMode::Exclusive), None);
+        assert_eq!(m.try_lock_record(3, b"k", LockMode::Exclusive), None);
+        m.release_all(1);
+        // The only holder left may strengthen its lock.
+        assert_eq!(m.try_lock_record(2, b"k", LockMode::Exclusive), Some(false));
+        assert_eq!(m.counts(), (1, 0, 0));
     }
 
     #[tokio::test]

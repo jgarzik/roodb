@@ -385,8 +385,10 @@ enforced.
 - `SELECT` without `FROM`, and `FROM DUAL`, evaluate expressions once.
 - `ORDER BY` sorts `NULL` first ascending; `NULLS FIRST` / `NULLS LAST` are
   parsed and ignored.
-- `FOR UPDATE`, `FOR SHARE` (with `NOWAIT` / `SKIP LOCKED`) are accepted and
-  take no locks. `LOCK IN SHARE MODE` is a syntax error.
+- `FOR UPDATE` and `FOR SHARE` (or `LOCK IN SHARE MODE`) make the query a
+  locking read: see [How transactions behave](#how-transactions-behave).
+  `OF table [, ...]` limits the locking to those tables; `NOWAIT` and
+  `SKIP LOCKED` are supported.
 - `SQL_CALC_FOUND_ROWS` and index hints (`USE INDEX`, `FORCE INDEX`) are
   accepted and ignored. `FOUND_ROWS()` returns the number of rows the
   previous `SELECT` returned.
@@ -708,8 +710,17 @@ supported.
     make another reader of the same gap wait; they only make inserts wait.
   - Under `READ COMMITTED` there are no gap locks, and a row that was
     examined but did not match the `WHERE` is unlocked again at once.
-  - `SELECT ... FOR UPDATE` / `FOR SHARE` are accepted and lock nothing
-    yet, and `LOCK TABLES` is a no-op.
+  - **Locking reads.** `SELECT ... FOR UPDATE` locks the rows it reads
+    exclusively, `FOR SHARE` in shared mode (other `FOR SHARE` readers do
+    not wait; writers do). A locking read waits for rows another
+    transaction has locked and returns the latest committed rows, not the
+    statement's snapshot; it locks the range it read like `UPDATE` does.
+    With `NOWAIT` it fails at once (error 3572) instead of waiting; with
+    `SKIP LOCKED` it leaves locked rows out of the result. Rows are locked
+    where the tables are read: rows that a `WHERE` on a non-key column
+    rejects may be locked too. Outside a transaction the locks last only
+    until the statement returns.
+  - `LOCK TABLES` is a no-op.
 - **A duplicate key is reported by the statement.** An `INSERT` whose
   primary key already exists fails with error 1062 when it runs. If the
   existing row belongs to a transaction that has not finished, the insert
@@ -963,6 +974,7 @@ returns most often:
 | 1264, 1690 | 22003 | Numeric value out of range. 1690 is also reported for errors raised while a result is being returned, such as an unknown function |
 | 1292 | 22007 | Truncated incorrect value |
 | 1295 | HY000 | Statement cannot be prepared with parameters |
+| 3572 | HY000 | A row was locked and the statement said `NOWAIT` |
 | 1568 | HY000 | Transaction already in progress, or isolation level changed inside one |
 | 1063, 1074, 1425, 1427 | 42000 | Invalid column type specification |
 
@@ -991,10 +1003,10 @@ unknown function, duplicate view or procedure) are reported as 1105.
 
 - Reads are READ COMMITTED in effect (a snapshot per statement) although
   `REPEATABLE-READ` is reported; `SERIALIZABLE` is refused.
-- Row and gap locks are taken by `UPDATE`, `DELETE` and `INSERT ...
-  VALUES` only: `FOR UPDATE`, `FOR SHARE`, `LOCK TABLES` and `GET_LOCK`
-  lock nothing, and `INSERT ... SELECT`, `REPLACE` and `LOAD DATA` neither
-  take locks nor wait for them (a conflict is found at `COMMIT`).
+- Row and gap locks are taken by `UPDATE`, `DELETE`, `INSERT ... VALUES`
+  and locking reads. `LOCK TABLES` and `GET_LOCK` lock nothing, and
+  `INSERT ... SELECT`, `REPLACE` and `LOAD DATA` neither take locks nor
+  wait for them (a conflict is found at `COMMIT`).
 - `UPDATE` and `DELETE` do not find rows the same transaction inserted.
 - No savepoints, no `XA`, no `COMMIT WORK` / `AND CHAIN`.
 - DDL is neither transactional nor an implicit commit.

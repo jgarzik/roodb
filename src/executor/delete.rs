@@ -154,9 +154,22 @@ impl Delete {
             }
         }
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
-                .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
-                .await?
+            if ctx.locks_rows() {
+                // Which rows there are is taken as things stand now, after
+                // the gap lock: each is then locked and read again, so the
+                // values here do not matter.
+                self.mvcc
+                    .inner()
+                    .scan(Some(&prefix), Some(&end))
+                    .await?
+                    .into_iter()
+                    .map(|(k, v)| (k, v, 0u64))
+                    .collect()
+            } else {
+                self.mvcc
+                    .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
+                    .await?
+            }
         } else {
             self.mvcc
                 .inner()
@@ -183,7 +196,13 @@ impl Delete {
                     };
                     match ctx.with_own_change(&key, stored) {
                         Some(current) => current,
-                        None => continue,
+                        None => {
+                            // Deleted: there is no row to keep a lock on.
+                            if new_lock {
+                                ctx.unlock_record(&key);
+                            }
+                            continue;
+                        }
                     }
                 }
                 None => (value, row_version),

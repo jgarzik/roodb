@@ -93,9 +93,15 @@ impl Executor for TableScan {
         // Use MVCC scan with visibility filtering if we have a transaction context,
         // otherwise fall back to raw storage scan (for DDL or legacy tests)
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
-                .scan(Some(&prefix), Some(&end), &ctx.read_view)
-                .await?
+            if ctx.read_locks(&self.table) {
+                // SELECT ... FOR UPDATE / FOR SHARE: lock what is read.
+                ctx.locking_scan(&self.mvcc, &prefix, &end, &prefix, &end)
+                    .await?
+            } else {
+                self.mvcc
+                    .scan(Some(&prefix), Some(&end), &ctx.read_view)
+                    .await?
+            }
         } else {
             self.mvcc.inner().scan(Some(&prefix), Some(&end)).await?
         };

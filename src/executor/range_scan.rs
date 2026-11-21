@@ -121,9 +121,21 @@ impl Executor for RangeScan {
 
         // MVCC scan with tight bounds
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
-                .scan(Some(&start_key), Some(&end_key), &ctx.read_view)
+            if ctx.read_locks(&self.table) {
+                // SELECT ... FOR UPDATE / FOR SHARE: lock what is read.
+                ctx.locking_scan(
+                    &self.mvcc,
+                    &start_key,
+                    &end_key,
+                    &table_key_prefix(&self.table),
+                    &table_key_end(&self.table),
+                )
                 .await?
+            } else {
+                self.mvcc
+                    .scan(Some(&start_key), Some(&end_key), &ctx.read_view)
+                    .await?
+            }
         } else {
             self.mvcc
                 .inner()

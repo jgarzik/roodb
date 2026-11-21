@@ -76,12 +76,56 @@ pub struct QueryEngine {
     /// Catalog version the session's copy of the stored functions was taken
     /// at (see `sync_functions`).
     functions_version: Option<u64>,
+    /// The locking the statement now being run asked for with FOR UPDATE /
+    /// FOR SHARE, if it did. Set when the statement is parsed, used when it
+    /// is executed.
+    read_lock: Option<crate::executor::context::ReadLock>,
     /// Implicit transactions of the autocommit statements now executing
     /// (a trigger body nests inside its statement); rolled back if the
     /// statement fails before committing them
     implicit_txns: Vec<u64>,
     /// Where results are reported
     pub(crate) out: Box<dyn ResponseSink>,
+}
+
+/// The locking a statement asks for with `FOR UPDATE` / `FOR SHARE`, if it
+/// is a query that does.
+fn read_lock_of(stmt: &sqlparser::ast::Statement) -> Option<crate::executor::context::ReadLock> {
+    use crate::executor::context::{LockWait, ReadLock};
+    use sqlparser::ast::{LockType, NonBlock, Statement};
+
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let first = query.locks.first()?;
+    // FOR UPDATE wins over FOR SHARE if both are given.
+    let mode = if query
+        .locks
+        .iter()
+        .any(|lock| matches!(lock.lock_type, LockType::Update))
+    {
+        crate::txn::LockMode::Exclusive
+    } else {
+        crate::txn::LockMode::Shared
+    };
+    let wait = match first.nonblock {
+        None => LockWait::Wait,
+        Some(NonBlock::Nowait) => LockWait::NoWait,
+        Some(NonBlock::SkipLocked) => LockWait::SkipLocked,
+    };
+    // `OF t1, t2` limits the locking to those tables; without it every
+    // table the query reads is locked.
+    let mut of = Vec::new();
+    for lock in &query.locks {
+        match &lock.of {
+            Some(name) => of.push(name.to_string().trim_matches('`').to_lowercase()),
+            None => {
+                of.clear();
+                break;
+            }
+        }
+    }
+    Some(ReadLock { mode, wait, of })
 }
 
 /// What a client is told when its transaction lost a conflict found at
@@ -153,6 +197,7 @@ impl QueryEngine {
             mvcc,
             temp,
             functions_version: None,
+            read_lock: None,
             implicit_txns: Vec::new(),
             out,
         }
@@ -186,6 +231,7 @@ impl QueryEngine {
             _ => None,
         };
 
+        self.read_lock = read_lock_of(&ps.parsed_stmt);
         let Some((mut physical, required_privileges)) = cached else {
             // Cache miss: build the plan from the AST with placeholders kept
             let parsed_stmt = ps.parsed_stmt.clone();
@@ -378,6 +424,7 @@ impl QueryEngine {
         // Clear warnings at the start of each statement
         self.session.clear_warnings();
         self.sync_functions();
+        self.read_lock = None;
 
         // Check for transaction commands first
         if let Some(()) = self.try_handle_transaction_command(sql).await? {
@@ -713,6 +760,7 @@ impl QueryEngine {
             }
             Intercept::Continue(stmt) => *stmt,
         };
+        self.read_lock = read_lock_of(&stmt);
 
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
@@ -1059,8 +1107,10 @@ impl QueryEngine {
                 ),
                 None,
             )
-        } else if !returns_rows && self.session.autocommit {
-            // Autocommit DML - create implicit transaction
+        } else if (!returns_rows || self.read_lock.is_some()) && self.session.autocommit {
+            // Autocommit DML, or a locking read (which must wait for locks
+            // like anyone else, though it holds its own only until it is
+            // done) - create implicit transaction
             let txn = self
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)?;
@@ -1091,7 +1141,12 @@ impl QueryEngine {
             );
             let mut executor = engine.build_async(plan).await?;
 
-            self.send_result_set(&columns, &mut *executor).await
+            self.send_result_set(&columns, &mut *executor).await?;
+            if let Some(txn_id) = implicit_txn_id {
+                self.txn_manager.commit(txn_id).await?;
+                self.implicit_txns.retain(|id| *id != txn_id);
+            }
+            Ok(())
         } else {
             // Extract trigger info from INSERT plans before building executor
             let insert_trigger_info = self.extract_insert_trigger_info(&plan);
@@ -1534,6 +1589,7 @@ impl QueryEngine {
                 self.session.isolation_level,
                 IsolationLevel::ReadCommitted | IsolationLevel::ReadUncommitted
             ),
+            read: self.read_lock.clone(),
         }
     }
 
@@ -6153,6 +6209,8 @@ impl QueryEngine {
                     )
                 } else if let crate::executor::ExecutorError::LockDeadlock = exec_err {
                     (codes::ER_LOCK_DEADLOCK, "40001", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::LockNoWait = exec_err {
+                    (3572, states::GENERAL_ERROR, exec_err.to_string())
                 } else if let crate::executor::ExecutorError::LockWaitTimeout = exec_err {
                     (
                         codes::ER_LOCK_WAIT_TIMEOUT,

@@ -128,6 +128,10 @@ impl Parser {
         // Process conditional comments first, before any other normalization
         let sql = Self::normalize_conditional_comments(sql);
 
+        // LOCK IN SHARE MODE is the older spelling of FOR SHARE.
+        let re_share = Regex::new(r"(?i)\bLOCK\s+IN\s+SHARE\s+MODE\s*;?\s*$").unwrap();
+        let sql = re_share.replace(&sql, "FOR SHARE").to_string();
+
         // DO expr → SELECT expr (evaluate and discard result)
         let re_do = Regex::new(r"(?i)^\s*DO\s+").unwrap();
         let sql = re_do.replace(&sql, "SELECT ");

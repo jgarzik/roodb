@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::raft::RowChange;
-use crate::txn::{LockError, LockManager, LockMode, ReadView};
+use crate::storage::traits::KeyValue;
+use crate::txn::{LockError, LockManager, LockMode, MvccStorage, ReadView};
 
 use super::error::{ExecutorError, ExecutorResult};
 
@@ -21,6 +22,39 @@ pub struct LockHandle {
     /// Whether ranges that were read are locked against inserts (REPEATABLE
     /// READ) or only the rows themselves (READ COMMITTED).
     pub gap_locks: bool,
+    /// Set for a locking read (`SELECT ... FOR UPDATE` / `FOR SHARE`): the
+    /// rows the statement reads are locked too.
+    pub read: Option<ReadLock>,
+}
+
+/// The locking a `SELECT ... FOR UPDATE` / `FOR SHARE` asks for.
+#[derive(Debug, Clone)]
+pub struct ReadLock {
+    pub mode: LockMode,
+    pub wait: LockWait,
+    /// Tables named after `OF`, lower-cased; empty means every table read.
+    pub of: Vec<String>,
+}
+
+/// What a locking read does about a row another transaction has locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    /// Wait for it (up to the lock wait timeout).
+    Wait,
+    /// Fail the statement (`NOWAIT`).
+    NoWait,
+    /// Leave the row out of the result (`SKIP LOCKED`).
+    SkipLocked,
+}
+
+/// A row as a locking read finds it.
+pub enum LockedRow {
+    /// Locked; this is the row as it stands now.
+    Row(Vec<u8>),
+    /// There is no such row (any more).
+    Missing,
+    /// Locked by another transaction, and the statement said SKIP LOCKED.
+    Skipped,
 }
 
 /// Transaction context passed to executors
@@ -93,6 +127,107 @@ impl TransactionContext {
                 .map_err(lock_error),
             None => Ok(false),
         }
+    }
+
+    /// Whether this statement is a locking read of `table`.
+    pub fn read_locks(&self, table: &str) -> bool {
+        self.locks
+            .as_ref()
+            .and_then(|locks| locks.read.as_ref())
+            .is_some_and(|read| {
+                read.of.is_empty() || read.of.iter().any(|t| t.eq_ignore_ascii_case(table))
+            })
+    }
+
+    /// For a locking read: lock the row at `key` and return it as it stands
+    /// now. A row this transaction wrote itself is returned as it left it;
+    /// it holds that row already.
+    pub async fn locked_read(&self, mvcc: &MvccStorage, key: &[u8]) -> ExecutorResult<LockedRow> {
+        match self.write_buffer.get(key) {
+            Some(Some(own)) => return Ok(LockedRow::Row(own.clone())),
+            Some(None) => return Ok(LockedRow::Missing),
+            None => {}
+        }
+        let Some((locks, read)) = self
+            .locks
+            .as_ref()
+            .and_then(|locks| locks.read.as_ref().map(|read| (locks, read)))
+        else {
+            return Ok(match mvcc.get_current(key).await? {
+                Some((data, _)) => LockedRow::Row(data),
+                None => LockedRow::Missing,
+            });
+        };
+        let new_lock = match read.wait {
+            LockWait::Wait => locks
+                .manager
+                .lock_record(self.txn_id, key, read.mode, locks.timeout)
+                .await
+                .map_err(lock_error)?,
+            LockWait::NoWait | LockWait::SkipLocked => {
+                match locks.manager.try_lock_record(self.txn_id, key, read.mode) {
+                    Some(new_lock) => new_lock,
+                    None if read.wait == LockWait::NoWait => return Err(ExecutorError::LockNoWait),
+                    None => return Ok(LockedRow::Skipped),
+                }
+            }
+        };
+        match mvcc.get_current(key).await? {
+            Some((data, _)) => Ok(LockedRow::Row(data)),
+            None => {
+                if new_lock {
+                    locks.manager.unlock_record(self.txn_id, key);
+                }
+                Ok(LockedRow::Missing)
+            }
+        }
+    }
+
+    /// For a locking read of the keys in `[start, end)` of a table whose
+    /// keys span `(low, high)`: lock the range against inserts (REPEATABLE
+    /// READ), then lock each row in it and return the rows as they stand
+    /// now. Rows of this transaction's own that are not stored yet are not
+    /// included; the caller adds them from the write buffer as for any scan.
+    pub async fn locking_scan(
+        &self,
+        mvcc: &MvccStorage,
+        start: &[u8],
+        end: &[u8],
+        low: &[u8],
+        high: &[u8],
+    ) -> ExecutorResult<Vec<KeyValue>> {
+        if self.locks_gaps() {
+            // The gap reaches from the last row before the range to the
+            // first row at or after its end: nothing may be inserted
+            // anywhere a row of the range could be.
+            let before = if start <= low {
+                low.to_vec()
+            } else {
+                mvcc.gap_around(start, low, high).await?.0
+            };
+            let after = if end >= high {
+                high.to_vec()
+            } else if mvcc.get_current(end).await?.is_some() {
+                end.to_vec()
+            } else {
+                mvcc.gap_around(end, low, high).await?.1
+            };
+            self.lock_gap(&before, &after);
+        }
+        // Which keys there are is read after the gap is locked, and as
+        // things stand now rather than in the statement's snapshot: a
+        // locking read sees the latest committed rows.
+        let stored = mvcc.inner().scan(Some(start), Some(end)).await?;
+        let mut rows = Vec::with_capacity(stored.len());
+        for (key, _) in stored {
+            if self.write_buffer.contains_key(&key) {
+                continue;
+            }
+            if let LockedRow::Row(data) = self.locked_read(mvcc, &key).await? {
+                rows.push((key, data));
+            }
+        }
+        Ok(rows)
     }
 
     /// Give back a lock taken on a row only to look at it.
