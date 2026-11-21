@@ -21,6 +21,11 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `None` if the key does not exist or was deleted.
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
 
+    /// Like `get`, but answers from what has been flushed to disk only,
+    /// ignoring writes still in memory. This is the value a restart would
+    /// find.
+    async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
+
     /// Put a key-value pair
     ///
     /// Overwrites any existing value for the key.

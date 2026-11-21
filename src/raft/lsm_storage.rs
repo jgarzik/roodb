@@ -111,6 +111,8 @@ pub struct LsmRaftStorage {
     catalog: Arc<RwLock<Catalog>>,
     cached_last_applied: Arc<RwLock<Option<LogId>>>,
     cached_membership: Arc<RwLock<StoredMembership>>,
+    /// No other node will ever ask this one for a snapshot's contents.
+    single_node: bool,
 }
 
 /// A change to a system table, noted so the catalog can follow once the
@@ -146,18 +148,47 @@ impl LsmRaftStorage {
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        single_node: bool,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
             catalog,
             cached_last_applied: Arc::new(RwLock::new(None)),
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
+            single_node,
         };
 
         // Load existing state from LSM into caches
         this.load_cached_state().await?;
 
         Ok(this)
+    }
+
+    /// The state machine's position as flushed to disk: what a restart would
+    /// resume from. `None` if nothing has been flushed yet.
+    async fn durable_position(&self) -> Result<Option<SnapshotMeta>, StorageError> {
+        let Some(data) = self
+            .storage
+            .get_durable(LAST_APPLIED_KEY)
+            .await
+            .map_err(read_err)?
+        else {
+            return Ok(None);
+        };
+        let last_applied: LogId = bincode::deserialize(&data).map_err(read_err)?;
+        let membership = match self
+            .storage
+            .get_durable(MEMBERSHIP_KEY)
+            .await
+            .map_err(read_err)?
+        {
+            Some(data) => bincode::deserialize(&data).map_err(read_err)?,
+            None => StoredMembership::default(),
+        };
+        Ok(Some(SnapshotMeta {
+            last_log_id: Some(last_applied),
+            last_membership: membership,
+        }))
     }
 
     /// Load all cached state from LSM
@@ -1089,6 +1120,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
+        if self.single_node {
+            // What has been flushed is a snapshot: it is the state at the
+            // position flushed with it. Nobody will ask for its contents, so
+            // none are produced.
+            let Some(meta) = self.durable_position().await? else {
+                return Ok(None);
+            };
+            return Ok(Some(Snapshot {
+                meta,
+                snapshot: Cursor::new(Vec::new()),
+            }));
+        }
+
+        // A follower may need the contents. This runs between applies, so
+        // the scan and the position agree.
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
@@ -1128,49 +1174,25 @@ const RAFT_PREFIX: &[u8] = b"_raft:";
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
     type SnapshotData = SnapshotData;
 
+    /// A snapshot is a checkpoint: flush what has been applied, and report
+    /// the position that is now on disk. The log may then be purged up to
+    /// that position - and no further, since everything after it exists only
+    /// in memory and in the log.
+    ///
+    /// openraft runs this beside apply, not between applies, so the position
+    /// is read back from what was flushed rather than taken from memory. Only
+    /// the position is used from the result; the contents, when a follower
+    /// needs them, come from `get_current_snapshot`.
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
-        // OpenRaft serializes all state machine operations, so no concurrent
-        // apply() can modify user data while this runs.
-        // No flush needed: LSM scan reads from active memtable + immutable memtables +
-        // SSTables, so all applied data is visible in the snapshot. Memtable data may be
-        // lost on crash before flush — Raft's log provides durability, not the snapshot.
-        let last_applied = *self.cached_last_applied.read();
-        let membership = self.cached_membership.read().clone();
-
-        // Scan all user data (exclude Raft metadata keys)
-        let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
-        let user_data: Vec<_> = all_data
-            .into_iter()
-            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
-            .collect();
-
-        // Serialize snapshot data: [count: u64][entries...]
-        let mut snapshot_data = Vec::new();
-        snapshot_data.extend_from_slice(&(user_data.len() as u64).to_le_bytes());
-
-        for (key, value) in &user_data {
-            // [key_len: u32][key][value_len: u32][value]
-            snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(key);
-            snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(value);
-        }
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-        };
-
-        tracing::info!(
-            ?meta,
-            entries = user_data.len(),
-            bytes = snapshot_data.len(),
-            "Built snapshot"
-        );
-
+        self.storage.flush().await.map_err(write_err)?;
+        let meta = self.durable_position().await?.unwrap_or(SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        });
+        tracing::info!(?meta, "Checkpointed state machine");
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(snapshot_data),
+            snapshot: Cursor::new(Vec::new()),
         })
     }
 }

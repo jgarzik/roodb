@@ -203,6 +203,10 @@ mod tests {
             Ok(())
         }
 
+        async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+            self.get(key).await
+        }
+
         async fn write_batch(&self, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> StorageResult<()> {
             for (key, value) in batch {
                 match value {

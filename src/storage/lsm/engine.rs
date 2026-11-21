@@ -882,6 +882,16 @@ impl StorageEngine for LsmEngine {
         self.inner.get(key).await
     }
 
+    async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.check_open()?;
+        for table in self.inner.tables_for(key)? {
+            if let Some(result) = table.get(key).await? {
+                return Ok(result);
+            }
+        }
+        Ok(None)
+    }
+
     async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.inner.write_one(key, Some(value)).await
     }

@@ -397,3 +397,120 @@ async fn a_changeset_sees_its_own_earlier_changes() {
 
     node.shutdown().await.unwrap();
 }
+
+/// The log is purged as the state machine is checkpointed, so it stays
+/// within its budget - and never past what has been flushed to disk, since
+/// a purged entry that was only in memory could not be recovered.
+#[tokio::test]
+async fn the_log_is_purged_only_up_to_what_is_flushed() {
+    use openraft::storage::RaftLogStorage;
+    use roodb::io::PAGE_SIZE;
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15500)).parse().unwrap();
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "roodb_test_purge_{}_{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let io = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
+    // 256 KiB segments and a 1 MiB budget, against ~20 MiB of commits.
+    let segment_bytes = 64 * PAGE_SIZE as u64;
+    let mut log = LogStore::open(
+        io.clone(),
+        LogStoreConfig {
+            segment_bytes,
+            ..LogStoreConfig::for_data_dir(&path, Durability::Os)
+        },
+    )
+    .await
+    .unwrap();
+    let storage: Arc<dyn StorageEngine> = Arc::new(
+        LsmEngine::open(
+            io,
+            LsmConfig {
+                dir: path,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let mut node = RaftNode::new(
+        1,
+        addr,
+        test_raft_tls_config(),
+        storage.clone(),
+        test_catalog(),
+        log.clone(),
+        true,
+    )
+    .await
+    .unwrap();
+    let budget = 1 << 20;
+    node.set_log_budget(budget);
+    node.start_rpc_server().await.unwrap();
+    node.bootstrap_single_node().await.unwrap();
+    assert!(wait_for_leader(&[&node], 5000).await.is_some());
+
+    let value = vec![7u8; 2000];
+    for i in 0..10_000u64 {
+        let key = format!("row{i:08}").into_bytes();
+        node.propose_changes(insert_change("t", &key, &value))
+            .await
+            .unwrap();
+
+        if i % 500 == 499 {
+            // Wherever the purge point is, the flushed state has reached it.
+            let state = log.get_log_state().await.unwrap();
+            if let Some(purged) = state.last_purged_log_id {
+                let flushed = storage
+                    .get_durable(b"_raft:sm:last_applied")
+                    .await
+                    .unwrap()
+                    .expect("log purged with nothing flushed");
+                let flushed: roodb::raft::LogId = bincode::deserialize(&flushed).unwrap();
+                assert!(
+                    flushed.index >= purged.index,
+                    "log purged to {} but only {} is flushed",
+                    purged.index,
+                    flushed.index
+                );
+            }
+        }
+    }
+
+    // The log size is looked at a few times a second, so a burst overshoots
+    // the budget; once the checkpoint and purge have run it is back within a
+    // couple of segments of it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while log.disk_bytes() > budget + 2 * segment_bytes {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "log still {} bytes against a budget of {budget}",
+            log.disk_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let state = log.get_log_state().await.unwrap();
+    let purged = state.last_purged_log_id.expect("the log was never purged");
+    let flushed = storage
+        .get_durable(b"_raft:sm:last_applied")
+        .await
+        .unwrap()
+        .expect("log purged with nothing flushed");
+    let flushed: roodb::raft::LogId = bincode::deserialize(&flushed).unwrap();
+    assert!(flushed.index >= purged.index);
+
+    assert_eq!(
+        stored_row(&storage, b"row00000000").await,
+        Some(value.clone())
+    );
+    assert_eq!(stored_row(&storage, b"row00009999").await, Some(value));
+
+    node.shutdown().await.unwrap();
+}

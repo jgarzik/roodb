@@ -6,10 +6,12 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::raft::ReadPolicy;
-use openraft::Config;
+use openraft::{Config, SnapshotPolicy};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +51,48 @@ pub struct RaftNode {
     network: RaftNetworkFactoryImpl,
     tls_config: RaftTlsConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Log size, in bytes, above which a checkpoint is requested.
+    log_budget: Arc<AtomicU64>,
+    /// The task that requests checkpoints.
+    checkpointer: tokio::task::JoinHandle<()>,
+}
+
+/// How much log may accumulate before the state machine is checkpointed so
+/// that the log can be purged. It bounds both the disk the log uses and the
+/// work a restart has to replay.
+pub const DEFAULT_LOG_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How often the log size is looked at.
+const CHECKPOINT_POLL: Duration = Duration::from_millis(250);
+
+/// How long to wait for a requested checkpoint to shrink the log before
+/// asking again.
+const CHECKPOINT_RETRY: Duration = Duration::from_secs(5);
+
+/// Ask for a checkpoint whenever the log outgrows its budget.
+///
+/// A checkpoint flushes the state machine and tells openraft the position
+/// that is now on disk; openraft then purges the log up to it. Checkpointing
+/// on log size rather than on a count of entries keeps flushes large: each
+/// one writes a table, and many small tables mean much compaction.
+async fn checkpoint_task(raft: Raft, log: LogStore, budget: Arc<AtomicU64>) {
+    loop {
+        tokio::time::sleep(CHECKPOINT_POLL).await;
+        if log.disk_bytes() <= budget.load(Ordering::Relaxed) {
+            continue;
+        }
+        if raft.trigger().snapshot().await.is_err() {
+            // Raft has shut down.
+            return;
+        }
+        // Give the checkpoint and the purge that follows time to take effect.
+        let deadline = tokio::time::Instant::now() + CHECKPOINT_RETRY;
+        while log.disk_bytes() > budget.load(Ordering::Relaxed)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(CHECKPOINT_POLL).await;
+        }
+    }
 }
 
 impl RaftNode {
@@ -77,6 +121,11 @@ impl RaftNode {
                 enable_heartbeat: false,
                 enable_elect: false,
                 purge_batch_size: 1000,
+                // Checkpoints are requested by log size (see
+                // `checkpoint_task`), not by entry count, and with no
+                // followers to catch up nothing is kept behind one.
+                snapshot_policy: SnapshotPolicy::Never,
+                max_in_snapshot_log_to_keep: 0,
                 ..Default::default()
             }
         } else {
@@ -85,6 +134,7 @@ impl RaftNode {
                 election_timeout_min: 150,
                 election_timeout_max: 300,
                 heartbeat_interval: 50,
+                snapshot_policy: SnapshotPolicy::Never,
                 ..Default::default()
             }
         };
@@ -92,15 +142,25 @@ impl RaftNode {
 
         // The state machine applies committed entries to the LSM; the log
         // store holds the entries themselves.
-        let state_machine = LsmRaftStorage::new(storage, catalog)
+        let state_machine = LsmRaftStorage::new(storage, catalog, single_node)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
-        let raft = Raft::new(id, config, network.clone(), log_store, state_machine)
-            .await
-            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        let raft = Raft::new(
+            id,
+            config,
+            network.clone(),
+            log_store.clone(),
+            state_machine,
+        )
+        .await
+        .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+
+        let log_budget = Arc::new(AtomicU64::new(DEFAULT_LOG_BUDGET_BYTES));
+        let checkpointer =
+            tokio::spawn(checkpoint_task(raft.clone(), log_store, log_budget.clone()));
 
         Ok(Self {
             id,
@@ -109,7 +169,14 @@ impl RaftNode {
             network,
             tls_config,
             shutdown_tx: None,
+            log_budget,
+            checkpointer,
         })
+    }
+
+    /// Change how much log may accumulate before a checkpoint is requested.
+    pub fn set_log_budget(&self, bytes: u64) {
+        self.log_budget.store(bytes, Ordering::Relaxed);
     }
 
     /// Get the node ID
@@ -271,6 +338,7 @@ impl RaftNode {
 
     /// Shutdown the node
     pub async fn shutdown(&mut self) -> Result<(), RaftNodeError> {
+        self.checkpointer.abort();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -305,4 +373,11 @@ async fn handle_rpc_connection(
     tls_stream.flush().await?;
 
     Ok(())
+}
+
+impl Drop for RaftNode {
+    fn drop(&mut self) {
+        // The checkpoint task holds a handle to Raft and would keep it alive.
+        self.checkpointer.abort();
+    }
 }
