@@ -234,6 +234,9 @@ impl QueryEngine {
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
+        if let Some(table) = self.foreign_temp_table_among(&required_privileges) {
+            return self.send_no_such_table(&table).await;
+        }
 
         // Cache the plan template (with Placeholder literals) for future executions
         if let Some(ps_mut) = self.prepared_stmts.get_mut(statement_id) {
@@ -703,6 +706,9 @@ impl QueryEngine {
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
+        if let Some(table) = self.foreign_temp_table_among(&required_privileges) {
+            return self.send_no_such_table(&table).await;
+        }
 
         // Check authorization (async - needs to scan system.grants)
         if !required_privileges.is_empty() {
@@ -1338,6 +1344,17 @@ impl QueryEngine {
                 .is_some_and(|def| def.is_temporary)
     }
 
+    /// The first table a statement names that is another session's temporary
+    /// table. Every planned statement is checked here, reads included.
+    fn foreign_temp_table_among(&self, required: &[RequiredPrivilege]) -> Option<String> {
+        required.iter().find_map(|r| match &r.object {
+            PrivilegeObject::Table { table, .. } if self.is_foreign_temp_table(table) => {
+                Some(table.clone())
+            }
+            _ => None,
+        })
+    }
+
     async fn send_no_such_table(&mut self, table: &str) -> ProtocolResult<()> {
         self.send_error(
             codes::ER_NO_SUCH_TABLE,
@@ -1955,6 +1972,10 @@ impl QueryEngine {
         match &ast[0] {
             sqlparser::ast::Statement::AlterTable(alter) => {
                 let table_name = alter.name.to_string();
+                if self.is_foreign_temp_table(&table_name) {
+                    self.send_no_such_table(&table_name).await?;
+                    return Ok(Some(()));
+                }
 
                 // Clone current table def from catalog
                 let old_table_name = table_name.clone();
@@ -3809,6 +3830,20 @@ impl QueryEngine {
                     codes::ER_UNKNOWN_ERROR,
                     states::GENERAL_ERROR,
                     "Triggers cannot be created on system tables",
+                )
+                .await;
+        }
+        // Nor on a temporary table: the trigger would be stored for everyone
+        // and outlive the table. Another session's does not exist at all.
+        if self.is_foreign_temp_table(&def.table_name) {
+            return self.send_no_such_table(&def.table_name).await;
+        }
+        if self.temp.is_temp_table(&def.table_name) {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    "Triggers cannot be created on temporary tables",
                 )
                 .await;
         }

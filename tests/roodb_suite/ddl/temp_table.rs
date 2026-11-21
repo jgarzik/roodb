@@ -25,11 +25,29 @@ async fn test_temporary_table_belongs_to_its_session() {
         .await
         .expect("owner insert");
 
-    // The other session sees none of its rows and cannot change it.
-    let seen: Result<Vec<(i32, i32)>, _> = other.query("SELECT id, v FROM tt_owned").await;
-    if let Ok(rows) = seen {
-        assert!(rows.is_empty(), "another session read temporary rows");
+    // To the other session the table does not exist, whatever it tries.
+    for sql in [
+        "SELECT id, v FROM tt_owned",
+        "UPDATE tt_owned SET v = 0",
+        "DELETE FROM tt_owned",
+        "CREATE INDEX tt_owned_v ON tt_owned (v)",
+        "ALTER TABLE tt_owned ADD COLUMN extra INT",
+        "CREATE TRIGGER tt_owned_trg AFTER INSERT ON tt_owned FOR EACH ROW \
+         INSERT INTO tt_real VALUES (NEW.id)",
+    ] {
+        assert!(
+            other.query_drop(sql).await.is_err(),
+            "another session ran: {sql}"
+        );
     }
+    // Nor does its owner get a stored trigger on it.
+    assert!(owner
+        .query_drop(
+            "CREATE TRIGGER tt_owned_trg AFTER INSERT ON tt_owned FOR EACH ROW \
+             INSERT INTO tt_real VALUES (NEW.id)"
+        )
+        .await
+        .is_err());
     assert!(
         other
             .query_drop("INSERT INTO tt_owned VALUES (3, 30)")
