@@ -246,10 +246,14 @@ impl Executor for Insert {
             // not at commit. (A row without a primary key gets a key no one
             // else can have, so there is nothing to wait for.)
             let locked = !self.pk_column_indices.is_empty() && ctx.locks_rows();
+            // The row's key is locked first and the gap checked second. The
+            // other way round, a transaction could look for this key while
+            // we wait for the row lock, find nothing, lock the gap, and then
+            // see our row appear in it.
             if locked {
-                ctx.lock_insert(&key).await?;
                 ctx.lock_record(&key, crate::txn::LockMode::Exclusive)
                     .await?;
+                ctx.lock_insert(&key).await?;
             }
 
             // Check for duplicate: intra-batch buffer or existing storage
