@@ -9,8 +9,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::io::scheduler::IoPriority;
-use crate::io::{AsyncIO, AsyncIOFactory};
+use crate::io::{IoEngine, Urgency};
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::compaction::{
@@ -51,8 +50,8 @@ impl Default for LsmConfig {
 }
 
 /// LSM-Tree storage engine
-pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
-    factory: Arc<F>,
+pub struct LsmEngine {
+    io: IoEngine,
     /// Active memtable for writes (wrapped in RwLock for atomic rotation)
     memtable: RwLock<Arc<Memtable>>,
     /// Immutable memtables being flushed
@@ -70,16 +69,14 @@ pub struct LsmEngine<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> {
     /// LRU block cache shared across all SSTable reads
     block_cache: Arc<BlockCache>,
     /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
-    reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader<IO>>>>,
+    reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader>>>,
     /// Closed flag
     closed: AtomicBool,
-    /// Phantom for IO type
-    _io: std::marker::PhantomData<IO>,
 }
 
-impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
+impl LsmEngine {
     /// Create a new LSM engine
-    pub async fn open(factory: Arc<F>, config: LsmConfig) -> StorageResult<Self> {
+    pub async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
         // Create directory if needed
         std::fs::create_dir_all(&config.dir)?;
 
@@ -90,15 +87,15 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         let block_cache = Arc::new(BlockCache::new(total_cache_bytes));
 
         // Warmup: open readers for all existing SSTables and eager-load blocks
-        let mut reader_map: HashMap<Arc<str>, Arc<SstableReader<IO>>> = HashMap::new();
+        let mut reader_map: HashMap<Arc<str>, Arc<SstableReader>> = HashMap::new();
         for level in manifest.levels() {
             for info in &level.files {
                 let path = manifest.sstable_path(&info.name);
                 let cache_name: Arc<str> = info.name.as_str().into();
                 match SstableReader::open_with_cache(
-                    &*factory,
+                    &io,
                     &path,
-                    IoPriority::QueryRead,
+                    Urgency::Foreground,
                     Some(block_cache.clone()),
                 )
                 .await
@@ -119,7 +116,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         }
 
         Ok(Self {
-            factory,
+            io,
             memtable: RwLock::new(Arc::new(Memtable::new())),
             imm_memtables: RwLock::new(Vec::new()),
             manifest: RwLock::new(manifest),
@@ -129,13 +126,12 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             block_cache,
             reader_cache: RwLock::new(reader_map),
             closed: AtomicBool::new(false),
-            _io: std::marker::PhantomData,
         })
     }
 
     /// Flush memtable to L0 SSTable
     async fn flush_memtable(&self, mem: Arc<Memtable>) -> StorageResult<()> {
-        self.flush_memtable_with_priority(mem, IoPriority::Flush)
+        self.flush_memtable_with_priority(mem, Urgency::Background)
             .await
     }
 
@@ -152,7 +148,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
     async fn flush_memtable_with_priority(
         &self,
         mem: Arc<Memtable>,
-        priority: IoPriority,
+        urgency: Urgency,
     ) -> StorageResult<()> {
         if mem.is_empty() {
             return Ok(());
@@ -167,7 +163,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         };
 
         // Phase 2: Write SSTable without holding manifest lock
-        let mut writer = SstableWriter::create(&*self.factory, &path, priority).await?;
+        let mut writer = SstableWriter::create(&self.io, &path, urgency).await?;
 
         let entries = mem.iter();
         for (key, value) in entries {
@@ -207,9 +203,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 
         // Write-through: open reader and cache it (async, outside lock)
         let reader = SstableReader::open_with_cache(
-            &*self.factory,
+            &self.io,
             &path,
-            IoPriority::QueryRead,
+            Urgency::Foreground,
             Some(self.block_cache.clone()),
         )
         .await?;
@@ -254,7 +250,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
             None => return Ok(()),
         };
 
-        let new_file = execute_l0_compaction(&*self.factory, &job).await?;
+        let new_file = execute_l0_compaction(&self.io, &job).await?;
 
         // Invalidate caches for removed SSTables
         {
@@ -312,7 +308,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
                 "Starting level compaction"
             );
 
-            let new_file = execute_level_compaction(&*self.factory, &job).await?;
+            let new_file = execute_level_compaction(&self.io, &job).await?;
 
             // Invalidate caches for removed SSTables
             {
@@ -345,9 +341,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
     async fn cache_compaction_output(&self, path: &std::path::Path, name: &str) {
         let cache_name: Arc<str> = name.into();
         match SstableReader::open_with_cache(
-            &*self.factory,
+            &self.io,
             path,
-            IoPriority::QueryRead,
+            Urgency::Foreground,
             Some(self.block_cache.clone()),
         )
         .await
@@ -445,9 +441,9 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
         // Fallback: open any cache-missed SSTables and retry lookup
         for (path, cache_name) in cache_misses {
             match SstableReader::open_with_cache(
-                &*self.factory,
+                &self.io,
                 &path,
-                IoPriority::QueryRead,
+                Urgency::Foreground,
                 Some(self.block_cache.clone()),
             )
             .await
@@ -472,9 +468,7 @@ impl<IO: AsyncIO, F: AsyncIOFactory<IO = IO>> LsmEngine<IO, F> {
 }
 
 #[async_trait]
-impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
-    for LsmEngine<IO, F>
-{
+impl StorageEngine for LsmEngine {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
@@ -547,7 +541,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             let imm_snapshot: Vec<Arc<Memtable>> = self.imm_memtables.read().clone();
 
             // Pre-resolve all SSTable readers from cache while holding manifest lock
-            let mut readers: Vec<(Arc<SstableReader<IO>>, usize)> = Vec::new();
+            let mut readers: Vec<(Arc<SstableReader>, usize)> = Vec::new();
             let mut misses: Vec<(PathBuf, Arc<str>, usize)> = Vec::new();
             let mut source_idx = 100usize;
             for (level_num, level) in manifest.levels().iter().enumerate() {
@@ -578,9 +572,9 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
         // Fallback: open any cache-missed SSTables
         for (path, cache_name, source_idx) in cache_misses {
             match SstableReader::open_with_cache(
-                &*self.factory,
+                &self.io,
                 &path,
-                IoPriority::QueryRead,
+                Urgency::Foreground,
                 Some(self.block_cache.clone()),
             )
             .await
@@ -707,7 +701,7 @@ impl<IO: AsyncIO + 'static, F: AsyncIOFactory<IO = IO> + 'static> StorageEngine
             };
 
             // Flush to disk (memtable still visible in imm_memtables during this)
-            self.flush_memtable_with_priority(Arc::clone(&mem), IoPriority::Wal)
+            self.flush_memtable_with_priority(Arc::clone(&mem), Urgency::Critical)
                 .await?;
 
             // Now safe to remove - data is on disk

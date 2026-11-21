@@ -7,8 +7,7 @@
 //!
 //! Level sizing: L0 has 4 files max, L1+ have 10x size ratio
 
-use crate::io::scheduler::IoPriority;
-use crate::io::{AsyncIO, AsyncIOFactory};
+use crate::io::{IoEngine, Urgency};
 use crate::storage::error::StorageResult;
 use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::merge_iter::MergeIterator;
@@ -109,15 +108,15 @@ pub fn prepare_l0_compaction(manifest: &mut Manifest) -> Option<L0CompactionJob>
 /// Phase 2: Execute compaction I/O (without manifest lock)
 ///
 /// Returns the new SSTable info on success, or None if all entries were tombstones.
-pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
-    factory: &F,
+pub async fn execute_l0_compaction(
+    engine: &IoEngine,
     job: &L0CompactionJob,
 ) -> StorageResult<Option<SstableInfo>> {
     // K-way merge: each SSTable is a pre-sorted source
     let mut merger = MergeIterator::new();
 
     for (idx, path) in job.input_paths.iter().enumerate() {
-        let reader = SstableReader::open(factory, path, IoPriority::Compaction).await?;
+        let reader = SstableReader::open(engine, path, Urgency::Background).await?;
         let entries = reader.scan().await?;
         merger.add(entries, idx);
     }
@@ -131,8 +130,7 @@ pub async fn execute_l0_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
     }
 
     // Write to new SSTable
-    let mut writer =
-        SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
+    let mut writer = SstableWriter::create(engine, &job.output_path, Urgency::Background).await?;
 
     for (key, value) in &deduped {
         writer.add(key.clone(), Some(value.clone())).await?;
@@ -263,14 +261,14 @@ pub fn prepare_level_compaction(manifest: &mut Manifest, level: u32) -> Option<L
 }
 
 /// Phase 2: Execute level compaction I/O (L1+→L2+, without manifest lock)
-pub async fn execute_level_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
-    factory: &F,
+pub async fn execute_level_compaction(
+    engine: &IoEngine,
     job: &LevelCompactionJob,
 ) -> StorageResult<Option<SstableInfo>> {
     let mut merger = MergeIterator::new();
 
     for (idx, path) in job.input_paths.iter().enumerate() {
-        let reader = SstableReader::open(factory, path, IoPriority::Compaction).await?;
+        let reader = SstableReader::open(engine, path, Urgency::Background).await?;
         let entries = reader.scan().await?;
         merger.add(entries, idx);
     }
@@ -281,8 +279,7 @@ pub async fn execute_level_compaction<IO: AsyncIO, F: AsyncIOFactory<IO = IO>>(
         return Ok(None);
     }
 
-    let mut writer =
-        SstableWriter::create(factory, &job.output_path, IoPriority::Compaction).await?;
+    let mut writer = SstableWriter::create(engine, &job.output_path, Urgency::Background).await?;
 
     for (key, value) in &deduped {
         writer.add(key.clone(), Some(value.clone())).await?;

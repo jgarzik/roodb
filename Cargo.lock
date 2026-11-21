@@ -1716,6 +1716,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-skiplist",
  "flate2",
+ "futures-util",
  "hex",
  "io-uring",
  "lazy_static",

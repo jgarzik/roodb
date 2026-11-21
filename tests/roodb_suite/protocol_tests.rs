@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use roodb::catalog::{Catalog, DataType};
 use roodb::executor::datum::Datum;
 use roodb::executor::row::Row;
-use roodb::io::PosixIOFactory;
+use roodb::io::{IoBackend, IoEngine};
 use roodb::planner::logical::OutputColumn;
 use roodb::protocol::roodb::auth::{verify_native_password, HandshakeResponse41};
 use roodb::protocol::roodb::command::{parse_command, Command, ParsedCommand};
@@ -396,7 +396,7 @@ async fn test_server_integration_e2e() {
     cleanup_dir(&data_dir);
 
     // Create storage and catalog
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::Posix).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -500,7 +500,7 @@ async fn test_transaction_begin_commit() {
     let data_dir = test_dir("txn_commit");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::Posix).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -604,7 +604,7 @@ async fn test_transaction_rollback() {
     let data_dir = test_dir("txn_rollback");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::Posix).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -710,7 +710,7 @@ async fn test_autocommit() {
     let data_dir = test_dir("autocommit");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::Posix).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()

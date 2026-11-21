@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use roodb::catalog::Catalog;
-use roodb::io::scheduled_io_factory;
+use roodb::io::{IoBackend, IoEngine};
 use roodb::raft::RaftNode;
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
@@ -30,6 +30,9 @@ struct Cli {
     tds_port: Option<u16>,
     #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
     data_dir: PathBuf,
+    /// File I/O backend: auto (io_uring where available), uring, or posix
+    #[arg(long, default_value = "auto", env = "ROODB_IO_BACKEND")]
+    io_backend: IoBackend,
     #[arg(long, default_value = "./certs/server.crt", env = "ROODB_CERT_PATH")]
     cert_path: PathBuf,
     #[arg(long, default_value = "./certs/server.key", env = "ROODB_KEY_PATH")]
@@ -56,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port,
         tds_port,
         data_dir,
+        io_backend,
         cert_path,
         key_path,
         raft_ca_cert_path,
@@ -85,13 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RaftTlsConfig::from_files_with_ca(&cert_path, &key_path, &raft_ca_cert_path).await?;
 
     // Initialize storage engine
-    let io_factory = Arc::new(scheduled_io_factory());
+    let io = IoEngine::new(io_backend)?;
+    tracing::info!(backend = %io.backend(), "I/O engine started");
     let storage_config = LsmConfig {
         dir: data_dir,
         ..Default::default()
     };
-    let storage: Arc<dyn StorageEngine> =
-        Arc::new(LsmEngine::open(io_factory, storage_config).await?);
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(io, storage_config).await?);
 
     // Check if database is initialized
     if !is_initialized(&storage).await? {

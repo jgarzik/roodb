@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use roodb::catalog::Catalog;
-use roodb::io::default_io_factory;
+use roodb::io::{IoBackend, IoEngine};
 use roodb::raft::{ChangeSet, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
@@ -44,7 +44,7 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
             .as_nanos()
     ));
     let _ = std::fs::create_dir_all(&path);
-    let factory = Arc::new(default_io_factory());
+    let factory = IoEngine::new(IoBackend::Auto).unwrap();
     let config = LsmConfig {
         dir: path,
         ..Default::default()
