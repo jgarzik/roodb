@@ -230,37 +230,95 @@ pub struct BlockReader {
     entries: Vec<Entry>,
 }
 
+/// Check a block read from disk: its length and its checksum. `offset` is
+/// where it sits in the file, for error messages.
+///
+/// Blocks are verified once, when they are read, and trusted afterwards;
+/// lookups in a cached block do not pay for the checksum again.
+pub fn verify_block(buf: &[u8], offset: u64) -> StorageResult<()> {
+    if buf.len() < BLOCK_SIZE || !buf.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(StorageError::InvalidSstable(format!(
+            "block at offset {offset} has length {}",
+            buf.len()
+        )));
+    }
+    let body = buf.len() - BLOCK_FOOTER_SIZE;
+    let stored_crc = u32::from_be_bytes([buf[body], buf[body + 1], buf[body + 2], buf[body + 3]]);
+    let computed_crc = crc32fast::hash(&buf[..body]);
+    if stored_crc != computed_crc {
+        return Err(StorageError::CorruptedBlock {
+            offset,
+            expected: stored_crc,
+            actual: computed_crc,
+        });
+    }
+    let declared_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if declared_len != buf.len() {
+        return Err(StorageError::InvalidSstable(format!(
+            "block at offset {offset} says it is {declared_len} bytes, index says {}",
+            buf.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Look a key up in a verified block without decoding the other entries.
+/// `Some(None)` is a tombstone.
+pub fn find_in_block(buf: &[u8], key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
+    let truncated = || StorageError::InvalidSstable("entry truncated".to_string());
+    if buf.len() < BLOCK_HEADER_SIZE + BLOCK_FOOTER_SIZE {
+        return Err(truncated());
+    }
+    let body = buf.len() - BLOCK_FOOTER_SIZE;
+    let num_entries = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let mut pos = BLOCK_HEADER_SIZE;
+    for _ in 0..num_entries {
+        let header = buf
+            .get(pos..pos + ENTRY_HEADER_SIZE)
+            .ok_or_else(truncated)?;
+        let key_len = u16::from_be_bytes([header[0], header[1]]) as usize;
+        let value_len_raw = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+        let value_len = if value_len_raw == TOMBSTONE_MARKER {
+            0
+        } else {
+            value_len_raw as usize
+        };
+        let key_at = pos + ENTRY_HEADER_SIZE;
+        let value_at = key_at + key_len;
+        let end = value_at.checked_add(value_len).ok_or_else(truncated)?;
+        if end > body {
+            return Err(truncated());
+        }
+        match buf[key_at..value_at].cmp(key) {
+            std::cmp::Ordering::Less => pos = end,
+            std::cmp::Ordering::Equal => {
+                return Ok(Some(if value_len_raw == TOMBSTONE_MARKER {
+                    None
+                } else {
+                    Some(buf[value_at..end].to_vec())
+                }));
+            }
+            // Entries are sorted: the key is not here.
+            std::cmp::Ordering::Greater => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 impl BlockReader {
-    /// Parse a block. `buf` must be exactly the block; `offset` is where it
-    /// sits in the file, for error messages.
+    /// Verify and parse a block. `buf` must be exactly the block; `offset` is
+    /// where it sits in the file, for error messages.
     pub fn parse(buf: &[u8], offset: u64) -> StorageResult<Self> {
-        if buf.len() < BLOCK_SIZE || !buf.len().is_multiple_of(BLOCK_SIZE) {
-            return Err(StorageError::InvalidSstable(format!(
-                "block at offset {offset} has length {}",
-                buf.len()
-            )));
-        }
+        verify_block(buf, offset)?;
+        Self::parse_verified(buf)
+    }
 
-        // Verify CRC before trusting anything else in the block.
+    /// Parse a block that [`verify_block`] has already accepted.
+    pub fn parse_verified(buf: &[u8]) -> StorageResult<Self> {
+        if buf.len() < BLOCK_HEADER_SIZE + BLOCK_FOOTER_SIZE {
+            return Err(StorageError::InvalidSstable("block too small".to_string()));
+        }
         let body = buf.len() - BLOCK_FOOTER_SIZE;
-        let stored_crc =
-            u32::from_be_bytes([buf[body], buf[body + 1], buf[body + 2], buf[body + 3]]);
-        let computed_crc = crc32fast::hash(&buf[..body]);
-        if stored_crc != computed_crc {
-            return Err(StorageError::CorruptedBlock {
-                offset,
-                expected: stored_crc,
-                actual: computed_crc,
-            });
-        }
-
-        let declared_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if declared_len != buf.len() {
-            return Err(StorageError::InvalidSstable(format!(
-                "block at offset {offset} says it is {declared_len} bytes, index says {}",
-                buf.len()
-            )));
-        }
         let num_entries = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
 
         let mut entries = Vec::with_capacity(num_entries.min(body / ENTRY_HEADER_SIZE));
@@ -414,6 +472,31 @@ mod tests {
         let block = builder.build();
         assert!(BlockReader::parse(&block[..BLOCK_SIZE], 0).is_err());
         assert!(BlockReader::parse(&block[..100], 0).is_err());
+    }
+
+    #[test]
+    fn find_in_block_matches_full_parse() {
+        let mut builder = BlockBuilder::new();
+        builder.add(Entry::new(b"b".to_vec(), b"1".to_vec()));
+        builder.add(Entry::tombstone(b"d".to_vec()));
+        builder.add(Entry::new(b"f".to_vec(), Vec::new()));
+        builder.add(Entry::new(b"h".to_vec(), vec![7u8; 500]));
+        let block = builder.build();
+        verify_block(&block, 0).unwrap();
+
+        assert_eq!(
+            find_in_block(&block, b"b").unwrap(),
+            Some(Some(b"1".to_vec()))
+        );
+        assert_eq!(find_in_block(&block, b"d").unwrap(), Some(None));
+        assert_eq!(find_in_block(&block, b"f").unwrap(), Some(Some(Vec::new())));
+        assert_eq!(
+            find_in_block(&block, b"h").unwrap(),
+            Some(Some(vec![7u8; 500]))
+        );
+        for missing in [&b"a"[..], b"c", b"e", b"g", b"z"] {
+            assert_eq!(find_in_block(&block, missing).unwrap(), None);
+        }
     }
 
     #[test]

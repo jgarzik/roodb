@@ -33,6 +33,9 @@ pub struct BlockCache {
     shards: Box<[Mutex<Shard>]>,
     /// Total capacity as last set; each shard holds an equal share.
     capacity_bytes: AtomicUsize,
+    /// Held while the capacity is changed, so two concurrent resizes cannot
+    /// leave the shards at one value and `capacity_bytes` at the other.
+    resize: Mutex<()>,
 }
 
 struct Shard {
@@ -70,6 +73,7 @@ impl BlockCache {
         Self {
             shards,
             capacity_bytes: AtomicUsize::new(capacity_bytes),
+            resize: Mutex::new(()),
         }
     }
 
@@ -109,6 +113,7 @@ impl BlockCache {
 
     /// Dynamically resize the cache. Evicts LRU entries if shrinking.
     pub fn set_capacity(&self, new_capacity_bytes: usize) {
+        let _resizing = self.resize.lock();
         if self
             .capacity_bytes
             .swap(new_capacity_bytes, Ordering::Relaxed)

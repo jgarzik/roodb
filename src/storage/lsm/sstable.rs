@@ -25,6 +25,7 @@
 //! | Index offset (8B) | Index size (8B)                |
 //! | Bloom offset (8B) | Bloom size (8B)                |
 //! | Num blocks (4B)   | Num entries (8B)               |
+//! | Bloom CRC32 (4B)                                   |
 //! | Padding                                            |
 //! | CRC32 (4B) over everything before it               |
 //! | Magic (4B): "LSMT" | Version (4B): 3               |
@@ -35,7 +36,9 @@ use std::sync::Arc;
 
 use crate::io::{AlignedBuffer, File, IoEngine, OpenOptions, Urgency, PAGE_SIZE};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::lsm::block::{check_entry_size, BlockBuilder, BlockReader, Entry, BLOCK_SIZE};
+use crate::storage::lsm::block::{
+    check_entry_size, find_in_block, verify_block, BlockBuilder, BlockReader, Entry, BLOCK_SIZE,
+};
 use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::bloom::BloomFilter;
 
@@ -59,6 +62,10 @@ const WRITE_CHUNK: usize = 256 * BLOCK_SIZE;
 /// Adjacent blocks are fetched with one request per run of about this size.
 const MAX_READ_RUN: usize = 256 * BLOCK_SIZE;
 
+/// Blocks loaded per step when warming the cache, which bounds how much of a
+/// table is held in memory at once.
+const WARM_BATCH: usize = 256;
+
 /// Where one data block is and the first key in it.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
@@ -80,6 +87,8 @@ pub struct SstableMetadata {
     pub bloom_offset: u64,
     /// Bloom filter size in bytes (its region is padded to a page)
     pub bloom_size: u64,
+    /// Checksum of the bloom filter bytes
+    pub bloom_crc: u32,
 }
 
 fn invalid(what: impl Into<String>) -> StorageError {
@@ -200,7 +209,14 @@ impl SstableWriter {
         bloom_bytes.resize(bloom_size.next_multiple_of(PAGE_SIZE), 0);
         self.append(&bloom_bytes).await?;
 
-        let footer = self.build_footer(index_offset, index_size, bloom_offset, bloom_size);
+        let bloom_crc = crc32fast::hash(&bloom_bytes[..bloom_size]);
+        let footer = self.build_footer(
+            index_offset,
+            index_size,
+            bloom_offset,
+            bloom_size,
+            bloom_crc,
+        );
         self.append(&footer).await?;
         self.write_out().await?;
 
@@ -235,6 +251,7 @@ impl SstableWriter {
         index_size: usize,
         bloom_offset: u64,
         bloom_size: usize,
+        bloom_crc: u32,
     ) -> Vec<u8> {
         let mut buf = vec![0u8; FOOTER_SIZE];
         buf[0..8].copy_from_slice(&index_offset.to_be_bytes());
@@ -243,6 +260,7 @@ impl SstableWriter {
         buf[24..32].copy_from_slice(&(bloom_size as u64).to_be_bytes());
         buf[32..36].copy_from_slice(&(self.index_entries.len() as u32).to_be_bytes());
         buf[36..44].copy_from_slice(&(self.key_hashes.len() as u64).to_be_bytes());
+        buf[44..48].copy_from_slice(&bloom_crc.to_be_bytes());
         let crc = crc32fast::hash(&buf[..FOOTER_CRC_AT]);
         buf[FOOTER_CRC_AT..FOOTER_CRC_AT + 4].copy_from_slice(&crc.to_be_bytes());
         buf[FOOTER_SIZE - 8..FOOTER_SIZE - 4].copy_from_slice(&SSTABLE_MAGIC.to_be_bytes());
@@ -351,7 +369,20 @@ impl SstableReader {
         let bloom_region = (metadata.bloom_size as usize).next_multiple_of(PAGE_SIZE);
         let bloom = if bloom_region > 0 {
             let data = fetch(metadata.bloom_offset, bloom_region).await?;
-            BloomFilter::from_bytes(&data[..metadata.bloom_size as usize])
+            let bytes = &data[..metadata.bloom_size as usize];
+            // A damaged filter would answer "not here" for keys that are.
+            let actual = crc32fast::hash(bytes);
+            if actual != metadata.bloom_crc {
+                return Err(StorageError::CorruptedBlock {
+                    offset: metadata.bloom_offset,
+                    expected: metadata.bloom_crc,
+                    actual,
+                });
+            }
+            Some(
+                BloomFilter::from_bytes(bytes)
+                    .ok_or_else(|| invalid("bloom filter header is not valid"))?,
+            )
         } else {
             None
         };
@@ -400,6 +431,7 @@ impl SstableReader {
             bloom_size: u64_at(buf, 24),
             num_blocks: u32_at(buf, 32),
             num_entries: u64_at(buf, 36),
+            bloom_crc: u32_at(buf, 44),
             min_key: Vec::new(),
             max_key: Vec::new(),
         };
@@ -530,6 +562,8 @@ impl SstableReader {
                     let len = entry.block_len as usize;
                     let block = data[at..at + len].to_vec();
                     at += len;
+                    // Checked once here; cached blocks are trusted.
+                    verify_block(&block, entry.block_offset)?;
                     if let Some(ref cache) = self.block_cache {
                         cache.insert(&self.cache_name, entry.block_offset, block.clone());
                     }
@@ -559,8 +593,7 @@ impl SstableReader {
 
         let block_idx = self.find_block(key);
         let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
-        let reader = BlockReader::parse(&block, self.index[block_idx].block_offset)?;
-        Ok(reader.get(key).map(|entry| entry.value.clone()))
+        find_in_block(&block, key)
     }
 
     /// Find the block that might contain a key: the last one whose first key
@@ -605,8 +638,8 @@ impl SstableReader {
 
         let blocks = self.fetch_blocks(&wanted).await?;
         let mut results = Vec::new();
-        for (&idx, block) in wanted.iter().zip(&blocks) {
-            let reader = BlockReader::parse(block, self.index[idx].block_offset)?;
+        for block in &blocks {
+            let reader = BlockReader::parse_verified(block)?;
             for entry in reader.into_entries() {
                 if start.is_some_and(|s| entry.key.as_slice() < s) {
                     continue;
@@ -636,7 +669,9 @@ impl SstableReader {
     /// scan has zero cold misses.
     pub async fn eager_load_blocks(&self) -> StorageResult<()> {
         let all: Vec<usize> = (0..self.index.len()).collect();
-        self.fetch_blocks(&all).await?;
+        for batch in all.chunks(WARM_BATCH) {
+            self.fetch_blocks(batch).await?;
+        }
         Ok(())
     }
 }

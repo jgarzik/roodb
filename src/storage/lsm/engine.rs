@@ -2,9 +2,9 @@
 //!
 //! Writes go to an in-memory memtable. A full memtable is frozen and written
 //! out as a table in level 0; compaction then merges tables down the levels.
-//! There is no log here: what makes a write durable before its memtable is
-//! flushed is the Raft log, which is replayed from the last flushed position
-//! after a restart.
+//! There is no log here. A write that has not been flushed yet exists only in
+//! memory as far as this module is concerned; making it survive a crash is
+//! the job of the Raft log, which is replayed from the last flushed position.
 //!
 //! Order of operations, which is what makes a crash at any point safe:
 //! - A new table is written and synced, then recorded in the manifest, and
@@ -28,8 +28,8 @@ use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::lsm::block::check_entry_size;
 use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::compaction::{
-    apply_compaction, execute_compaction, pick_compaction, CompactionLimits, L0_COMPACTION_TRIGGER,
-    L1_BASE_SIZE, LAST_LEVEL,
+    apply_compaction, execute_compaction, pick_compaction, CompactionJob, CompactionLimits,
+    L0_COMPACTION_TRIGGER, L1_BASE_SIZE, LAST_LEVEL,
 };
 use crate::storage::lsm::manifest::{persist, Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
@@ -48,8 +48,16 @@ const MIN_BLOCK_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// writes outrun the disk.
 const MAX_FROZEN_MEMTABLES: usize = 4;
 
-/// How long the background worker waits before retrying after a failure.
+/// How long a background task waits before retrying after a failure.
 const BACKGROUND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// File whose lock marks a data directory as in use.
+const LOCK_FILE: &str = "LOCK";
+
+/// How long `open` waits for a directory that is still locked. An engine
+/// dropped without `close()` releases the lock as soon as its background
+/// tasks finish what they were doing.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A point at which a flush or compaction can be made to stop, leaving the
 /// directory as a crash at that moment would. Used by tests that reopen the
@@ -106,11 +114,13 @@ struct ReadSources {
 
 /// LSM-Tree storage engine.
 ///
-/// A background task writes frozen memtables out and compacts; it stops when
-/// the engine is closed or dropped.
+/// Two background tasks do the slow work: one writes frozen memtables out,
+/// the other compacts. They are separate so that a long compaction never
+/// holds up a flush that writers are waiting for. Both stop when the engine
+/// is closed or dropped.
 pub struct LsmEngine {
     inner: Arc<Inner>,
-    worker: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    workers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
 
 struct Inner {
@@ -139,10 +149,14 @@ struct Inner {
     reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader>>>,
     limits: CompactionLimits,
     crash_point: Option<CrashPoint>,
-    /// Wakes the background worker: a memtable was frozen, or it is time to
-    /// stop. Shared with the worker, which otherwise holds the engine only
-    /// weakly so that dropping the engine lets it go.
+    /// Wakes the flush task: a memtable was frozen, or it is time to stop.
+    /// Shared with the task, which otherwise holds the engine only weakly so
+    /// that dropping the engine lets it go.
     work: Arc<Notify>,
+    /// Wakes the compaction task.
+    compact_work: Arc<Notify>,
+    /// Exclusive lock on the data directory, held for the engine's lifetime.
+    _dir_lock: std::fs::File,
     /// Signalled each time a frozen memtable has been written out.
     flushed: Notify,
     /// The last background flush or compaction failed with this error. Paused
@@ -158,13 +172,21 @@ impl LsmEngine {
     /// Open the engine on a directory, creating it if needed.
     pub async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
         let inner = Arc::new(Inner::open(io, config).await?);
-        let worker = tokio::spawn(background_worker(
-            Arc::downgrade(&inner),
-            Arc::clone(&inner.work),
-        ));
+        let workers = vec![
+            tokio::spawn(background_task(
+                Arc::downgrade(&inner),
+                Arc::clone(&inner.work),
+                Work::Flush,
+            )),
+            tokio::spawn(background_task(
+                Arc::downgrade(&inner),
+                Arc::clone(&inner.compact_work),
+                Work::Compact,
+            )),
+        ];
         Ok(Self {
             inner,
-            worker: parking_lot::Mutex::new(Some(worker)),
+            workers: parking_lot::Mutex::new(workers),
         })
     }
 
@@ -173,12 +195,12 @@ impl LsmEngine {
         self.inner.block_cache.capacity()
     }
 
-    /// Stop the background worker and wait for it to finish what it is doing.
-    async fn stop_worker(&self) {
-        self.inner.stopping.store(true, Ordering::SeqCst);
-        self.inner.work.notify_one();
-        let worker = self.worker.lock().take();
-        if let Some(worker) = worker {
+    /// Stop the background tasks and wait for them to finish what they are
+    /// doing.
+    async fn stop_workers(&self) {
+        self.inner.stop();
+        let workers = std::mem::take(&mut *self.workers.lock());
+        for worker in workers {
             let _ = worker.await;
         }
     }
@@ -186,17 +208,24 @@ impl LsmEngine {
 
 impl Drop for LsmEngine {
     fn drop(&mut self) {
-        // Without close(): tell the worker to go. It holds the engine only
-        // while working, so it will not keep the files open.
-        self.inner.stopping.store(true, Ordering::SeqCst);
-        self.inner.work.notify_one();
+        // Without close(): tell the tasks to go. They hold the engine only
+        // while working and stop before starting another table, so the files
+        // and the directory lock are released promptly.
+        self.inner.stop();
     }
 }
 
-/// Write frozen memtables out and compact, whenever woken.
-async fn background_worker(engine: Weak<Inner>, work: Arc<Notify>) {
+/// What a background task does when woken.
+#[derive(Clone, Copy, Debug)]
+enum Work {
+    Flush,
+    Compact,
+}
+
+/// Run one kind of background work whenever woken, retrying after failures.
+async fn background_task(engine: Weak<Inner>, wake: Arc<Notify>, work: Work) {
     loop {
-        work.notified().await;
+        wake.notified().await;
         loop {
             let Some(inner) = engine.upgrade() else {
                 return;
@@ -204,16 +233,24 @@ async fn background_worker(engine: Weak<Inner>, work: Arc<Notify>) {
             if inner.stopping.load(Ordering::SeqCst) {
                 return;
             }
-            match inner.background_pass().await {
+            let result = match work {
+                Work::Flush => inner.background_flush().await,
+                Work::Compact => inner.compact(true).await,
+            };
+            match result {
                 Ok(()) => {
-                    *inner.background_error.lock() = None;
+                    if matches!(work, Work::Flush) {
+                        *inner.background_error.lock() = None;
+                    }
                     break;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "background flush failed; will retry");
-                    *inner.background_error.lock() = Some(e.to_string());
-                    // Let paused writers see the error.
-                    inner.flushed.notify_waiters();
+                    tracing::error!(?work, error = %e, "background work failed; will retry");
+                    if matches!(work, Work::Flush) {
+                        *inner.background_error.lock() = Some(e.to_string());
+                        // Let paused writers see the error.
+                        inner.flushed.notify_waiters();
+                    }
                     drop(inner);
                     tokio::time::sleep(BACKGROUND_RETRY).await;
                 }
@@ -222,9 +259,38 @@ async fn background_worker(engine: Weak<Inner>, work: Arc<Notify>) {
     }
 }
 
+/// Take the exclusive lock on a data directory, waiting a little for a
+/// previous engine in this process to let go of it.
+async fn lock_dir(dir: &std::path::Path) -> StorageResult<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))?;
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(StorageError::Manifest(format!(
+                    "data directory {} is in use by another RooDB process",
+                    dir.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
 impl Inner {
     async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
         std::fs::create_dir_all(&config.dir)?;
+        // Before anything is read or cleaned up: two engines on one directory
+        // would overwrite each other's manifest and delete each other's files.
+        let dir_lock = lock_dir(&config.dir).await?;
 
         let manifest = Manifest::open(&config.dir)?;
         let total_cache_bytes = config.total_cache_bytes;
@@ -276,11 +342,22 @@ impl Inner {
             },
             crash_point: config.crash_point,
             work: Arc::new(Notify::new()),
+            compact_work: Arc::new(Notify::new()),
+            _dir_lock: dir_lock,
             flushed: Notify::new(),
             background_error: parking_lot::Mutex::new(None),
             stopping: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         })
+    }
+
+    /// Tell the background tasks to exit.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.work.notify_one();
+        self.compact_work.notify_one();
+        // Writers paused on the flusher must not wait for a task that is gone.
+        self.flushed.notify_waiters();
     }
 
     fn check_open(&self) -> StorageResult<()> {
@@ -304,15 +381,38 @@ impl Inner {
     ///
     /// Readers see the change as soon as it is made; callers must not discard
     /// anything the old manifest still needs (a memtable, compaction inputs)
-    /// until this returns.
+    /// until this returns. If the change cannot be written it is undone, so
+    /// memory never runs ahead of disk.
     async fn commit_manifest(&self, change: impl FnOnce(&mut Manifest)) -> StorageResult<()> {
         let _writing = self.manifest_io.lock().await;
-        let (dir, data) = {
+        let (dir, data, before) = {
             let mut manifest = self.manifest.write();
+            let before = manifest.levels_snapshot();
             change(&mut manifest);
-            (manifest.dir().to_path_buf(), manifest.snapshot())
+            (manifest.dir().to_path_buf(), manifest.snapshot(), before)
         };
-        persist(&self.io, &dir, &data).await
+        let result = persist(&self.io, &dir, &data).await;
+        if result.is_err() {
+            self.manifest.write().restore_levels(before);
+        }
+        result
+    }
+
+    /// Forget a table that was written but could not be installed, and delete
+    /// its file. Left alone, a retry would write the same data again under a
+    /// new name and the abandoned files would pile up until restart.
+    fn discard_table(&self, name: &str, path: &std::path::Path) {
+        // An armed crash point is simulating a crash, which cleans nothing up.
+        if self.crash_point.is_some() {
+            return;
+        }
+        self.reader_cache.write().remove(name);
+        self.block_cache.invalidate_sstable(name);
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(file = name, error = %e, "failed to delete abandoned table");
+            }
+        }
     }
 
     /// Open a reader on a table this engine has just written and register it,
@@ -329,8 +429,14 @@ impl Inner {
             Some(self.block_cache.clone()),
         )
         .await?;
-        // Fresh data is the data most likely to be read next.
-        reader.eager_load_blocks().await?;
+        // Fresh data is the data most likely to be read next, but warming
+        // must not push everything else out of the cache, and failing to
+        // warm is no reason to fail the flush or compaction.
+        if info.size < (self.total_cache_bytes / 4) as u64 {
+            if let Err(e) = reader.eager_load_blocks().await {
+                tracing::warn!(table = %info.name, error = %e, "cache warm-up failed");
+            }
+        }
         self.reader_cache
             .write()
             .insert(info.name.as_str().into(), Arc::new(reader));
@@ -340,20 +446,38 @@ impl Inner {
     /// Write one frozen memtable out as a level-0 table.
     async fn flush_memtable(&self, mem: &Memtable, urgency: Urgency) -> StorageResult<()> {
         let entries = mem.iter();
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+        if entries.is_empty() {
             return Ok(());
-        };
-        let min_key = first.0.clone();
-        let max_key = last.0.clone();
-
+        }
         let (name, path) = {
             let mut manifest = self.manifest.write();
             let name = manifest.next_sstable_name();
             let path = manifest.sstable_path(&name);
             (name, path)
         };
+        let result = self
+            .write_level0_table(entries, &name, &path, urgency)
+            .await;
+        if result.is_err() {
+            self.discard_table(&name, &path);
+        }
+        result
+    }
 
-        let mut writer = SstableWriter::create(&self.io, &path, urgency).await?;
+    async fn write_level0_table(
+        &self,
+        entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        name: &str,
+        path: &std::path::Path,
+        urgency: Urgency,
+    ) -> StorageResult<()> {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(());
+        };
+        let min_key = first.0.clone();
+        let max_key = last.0.clone();
+
+        let mut writer = SstableWriter::create(&self.io, path, urgency).await?;
         for (key, value) in entries {
             writer.add(key, value).await?;
         }
@@ -361,12 +485,12 @@ impl Inner {
         self.crash_at(CrashPoint::FlushAfterTableWritten)?;
 
         let info = SstableInfo {
-            name,
+            name: name.to_string(),
             min_key,
             max_key,
-            size: std::fs::metadata(&path)?.len(),
+            size: std::fs::metadata(path)?.len(),
         };
-        self.register_table(&info, &path).await?;
+        self.register_table(&info, path).await?;
         self.commit_manifest(|manifest| manifest.add_sstable(0, info))
             .await
     }
@@ -377,10 +501,14 @@ impl Inner {
         (0..LAST_LEVEL).any(|level| self.limits.needs_compaction(&manifest, level))
     }
 
-    /// Run compactions until no level is over its limit.
-    async fn compact(&self) -> StorageResult<()> {
+    /// Run compactions until no level is over its limit. A background run
+    /// stops early when the engine is shutting down.
+    async fn compact(&self, background: bool) -> StorageResult<()> {
         let _compacting = self.compaction_lock.lock().await;
         loop {
+            if background && self.stopping.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let job = {
                 let mut manifest = self.manifest.write();
                 pick_compaction(&mut manifest, &self.limits)
@@ -397,17 +525,11 @@ impl Inner {
                 "compaction"
             );
 
-            let output = execute_compaction(&self.io, &job).await?;
-            self.crash_at(CrashPoint::CompactionAfterOutputWritten)?;
-
-            // The output becomes visible, and durable, before any input is
-            // touched. From here a crash leaves the inputs as unlisted files,
-            // which startup deletes.
-            if let Some(info) = &output {
-                self.register_table(info, &job.output_path).await?;
+            let installed = self.run_compaction(&job).await;
+            if installed.is_err() {
+                self.discard_table(&job.output_name, &job.output_path);
             }
-            self.commit_manifest(|manifest| apply_compaction(manifest, &job, output))
-                .await?;
+            installed?;
             self.crash_at(CrashPoint::CompactionAfterManifestSaved)?;
 
             {
@@ -429,21 +551,35 @@ impl Inner {
         }
     }
 
+    /// Write a compaction's output and install it in the manifest.
+    async fn run_compaction(&self, job: &CompactionJob) -> StorageResult<()> {
+        let output = execute_compaction(&self.io, job).await?;
+        self.crash_at(CrashPoint::CompactionAfterOutputWritten)?;
+
+        // The output becomes visible, and durable, before any input is
+        // touched. From here a crash leaves the inputs as unlisted files,
+        // which startup deletes.
+        if let Some(info) = &output {
+            self.register_table(info, &job.output_path).await?;
+        }
+        self.commit_manifest(|manifest| apply_compaction(manifest, job, output))
+            .await
+    }
+
     /// Apply writes to the active memtable as one unit.
     ///
     /// The memtable lock is held (shared) across every insert. Rotation takes
     /// it exclusively, so a memtable is never frozen and written out with part
     /// of a batch in it or while an insert is still on its way, and what
     /// reaches disk is always whole batches.
-    async fn write(&self, batch: impl IntoIterator<Item = WriteOp>) -> StorageResult<()> {
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
         self.check_open()?;
-        self.wait_for_flusher().await?;
         // Refuse what the table format cannot hold before any of the batch is
         // applied, so a batch is never half written.
-        let batch: Vec<WriteOp> = batch.into_iter().collect();
         for (key, value) in &batch {
             check_entry_size(key.len(), value.as_ref().map_or(0, Vec::len))?;
         }
+        self.wait_for_flusher().await?;
         let full = {
             let memtable = self.memtable.read();
             for (key, value) in batch {
@@ -451,17 +587,45 @@ impl Inner {
             }
             memtable.size() >= self.memtable_limit()
         };
+        self.after_write(full);
+        Ok(())
+    }
+
+    /// Apply a single write.
+    async fn write_one(&self, key: &[u8], value: Option<&[u8]>) -> StorageResult<()> {
+        self.check_open()?;
+        check_entry_size(key.len(), value.map_or(0, <[u8]>::len))?;
+        self.wait_for_flusher().await?;
+        let full = {
+            let memtable = self.memtable.read();
+            memtable.insert(key.to_vec(), value.map(<[u8]>::to_vec));
+            memtable.size() >= self.memtable_limit()
+        };
+        self.after_write(full);
+        Ok(())
+    }
+
+    /// Freeze the active memtable if the write filled it, and wake the
+    /// background task.
+    fn after_write(&self, full: bool) {
         if full {
             self.rotate(self.memtable_limit());
             self.rebalance_cache();
             self.work.notify_one();
         }
-        Ok(())
     }
 
     /// Pause while too many frozen memtables are waiting to be written out.
     async fn wait_for_flusher(&self) -> StorageResult<()> {
+        // The usual case, kept cheap: nothing to wait for.
+        if self.imm_memtables.read().len() < MAX_FROZEN_MEMTABLES {
+            return Ok(());
+        }
         loop {
+            // Nobody is left to flush once the background tasks have gone.
+            if self.stopping.load(Ordering::SeqCst) {
+                return Err(StorageError::Closed);
+            }
             // Register for the wake-up before checking, so a flush that
             // finishes in between is not missed.
             let flushed = self.flushed.notified();
@@ -478,11 +642,13 @@ impl Inner {
         }
     }
 
-    /// One round of background work: write frozen memtables out, then compact.
-    async fn background_pass(&self) -> StorageResult<()> {
-        self.flush_frozen(Urgency::Background).await?;
+    /// The flush task's work: write frozen memtables out, then hand over to
+    /// the compaction task if a level is now over its limit. Writers may be
+    /// waiting on this, so it does not run at background urgency.
+    async fn background_flush(&self) -> StorageResult<()> {
+        self.flush_frozen(Urgency::Foreground, true).await?;
         if self.compaction_due() {
-            self.compact().await?;
+            self.compact_work.notify_one();
         }
         Ok(())
     }
@@ -504,11 +670,14 @@ impl Inner {
     }
 
     /// Write every frozen memtable out, oldest first.
-    async fn flush_frozen(&self, urgency: Urgency) -> StorageResult<()> {
+    async fn flush_frozen(&self, urgency: Urgency, background: bool) -> StorageResult<()> {
         let _flushing = self.flush_lock.lock().await;
         // A memtable stays readable in `imm_memtables` until its table is on
         // disk and in the manifest; only then is it removed.
         loop {
+            if background && self.stopping.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let Some(oldest) = self.imm_memtables.read().first().cloned() else {
                 return Ok(());
             };
@@ -528,9 +697,9 @@ impl Inner {
     /// compact if due.
     async fn flush_all(&self, urgency: Urgency) -> StorageResult<()> {
         self.rotate(0);
-        self.flush_frozen(urgency).await?;
+        self.flush_frozen(urgency, false).await?;
         if self.compaction_due() {
-            self.compact().await?;
+            self.compact(false).await?;
         }
         Ok(())
     }
@@ -593,25 +762,59 @@ impl Inner {
     /// Look a key up everywhere, newest data first. `Some(None)` means the
     /// newest entry for the key is a tombstone.
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
-        let sources = self.read_sources()?;
-
-        if let Some(result) = sources.active.get(key) {
+        // Memtables first, and for most reads of recent data that is all.
+        // Capturing them before the tables is safe: data only ever moves from
+        // a memtable to a table, and a table is listed before its memtable is
+        // released, so the table list read afterwards holds whatever these
+        // memtables no longer do.
+        let (active, frozen) = {
+            let active = self.memtable.read();
+            (Arc::clone(&active), self.imm_memtables.read().clone())
+        };
+        if let Some(result) = active.get(key) {
             return Ok(Some(result));
         }
-        for mem in sources.frozen.iter().rev() {
+        for mem in frozen.iter().rev() {
             if let Some(result) = mem.get(key) {
                 return Ok(Some(result));
             }
         }
-        for table in &sources.tables {
-            if !table.may_contain(key) {
-                continue;
-            }
+
+        for table in self.tables_for(key)? {
             if let Some(result) = table.get(key).await? {
                 return Ok(Some(result));
             }
         }
         Ok(None)
+    }
+
+    /// The tables whose key range covers `key`, newest data first.
+    fn tables_for(&self, key: &[u8]) -> StorageResult<Vec<Arc<SstableReader>>> {
+        let manifest = self.manifest.read();
+        let readers = self.reader_cache.read();
+        let mut tables = Vec::new();
+        for (level_num, level) in manifest.levels().iter().enumerate() {
+            let mut consider = |info: &SstableInfo| -> StorageResult<()> {
+                if key < info.min_key.as_slice() || key > info.max_key.as_slice() {
+                    return Ok(());
+                }
+                let reader = readers.get(info.name.as_str()).ok_or_else(|| {
+                    StorageError::Manifest(format!("no open reader for table {}", info.name))
+                })?;
+                tables.push(Arc::clone(reader));
+                Ok(())
+            };
+            if level_num == 0 {
+                for info in level.files.iter().rev() {
+                    consider(info)?;
+                }
+            } else {
+                for info in &level.files {
+                    consider(info)?;
+                }
+            }
+        }
+        Ok(tables)
     }
 }
 
@@ -666,19 +869,15 @@ impl StorageEngine for LsmEngine {
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        self.inner
-            .write(std::iter::once((key.to_vec(), Some(value.to_vec()))))
-            .await
+        self.inner.write_one(key, Some(value)).await
     }
 
     async fn delete(&self, key: &[u8]) -> StorageResult<()> {
-        self.inner
-            .write(std::iter::once((key.to_vec(), None)))
-            .await
+        self.inner.write_one(key, None).await
     }
 
     async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
-        self.inner.write(batch).await
+        self.inner.write_batch(batch).await
     }
 
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
@@ -696,10 +895,10 @@ impl StorageEngine for LsmEngine {
     }
 
     async fn close(&self) -> StorageResult<()> {
-        // Stop background work, write out what is in memory, then refuse
-        // further use.
-        self.stop_worker().await;
+        // Write out what is in memory first. If that fails the engine is
+        // still whole - background tasks included - and close can be retried.
         self.inner.flush_all(Urgency::Background).await?;
+        self.stop_workers().await;
         self.inner.closed.store(true, Ordering::SeqCst);
         Ok(())
     }

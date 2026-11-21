@@ -597,3 +597,90 @@ async fn writers_wait_for_the_flusher_and_lose_nothing() {
     }
     engine.close().await.unwrap();
 }
+
+/// A directory with tables but no manifest has lost its manifest. Treating it
+/// as new would delete every table as a leftover.
+#[tokio::test]
+async fn a_lost_manifest_is_not_mistaken_for_a_new_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    engine.put(b"k", b"v").await.unwrap();
+    engine.flush().await.unwrap();
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let tables = sst_files(dir.path());
+    assert_eq!(tables.len(), 1);
+    std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+
+    assert!(
+        LsmEngine::open(io(), config(dir.path())).await.is_err(),
+        "open treated a directory with tables as empty"
+    );
+    assert_eq!(sst_files(dir.path()), tables, "the tables were deleted");
+}
+
+/// A damaged bloom filter would say "not here" for keys that are. It carries a
+/// checksum so the damage is reported instead.
+#[tokio::test]
+async fn a_damaged_bloom_filter_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    for i in 0..5000 {
+        engine
+            .put(format!("key{i:05}").as_bytes(), &[7u8; 32])
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let path = dir.path().join(&sst_files(dir.path())[0]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    // The bloom filter is the region just before the one-page footer; 5000
+    // keys give it more than one page, so this lands inside its bits.
+    let at = bytes.len() - 4096 - 3000;
+    bytes[at] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(
+        LsmEngine::open(io(), config(dir.path())).await.is_err(),
+        "a damaged bloom filter went unnoticed"
+    );
+}
+
+/// Two engines on one directory would overwrite each other's manifest. The
+/// second open is refused; after a close the directory can be opened again.
+#[tokio::test]
+async fn a_directory_can_only_be_open_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    first.put(b"k", b"v").await.unwrap();
+
+    let second = LsmEngine::open(io(), config(dir.path())).await;
+    assert!(second.is_err(), "the same directory was opened twice");
+
+    first.close().await.unwrap();
+    drop(first);
+    let reopened = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    assert_eq!(reopened.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+    reopened.close().await.unwrap();
+}
+
+/// Dropping an engine without close() lets go of the directory.
+#[tokio::test]
+async fn a_dropped_engine_releases_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..5u8 {
+        let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+        engine.put(&[round], b"v").await.unwrap();
+        engine.flush().await.unwrap();
+        // No close().
+    }
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    for round in 0..5u8 {
+        assert_eq!(engine.get(&[round]).await.unwrap(), Some(b"v".to_vec()));
+    }
+    engine.close().await.unwrap();
+}

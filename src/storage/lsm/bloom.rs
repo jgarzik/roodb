@@ -76,6 +76,11 @@ impl BloomFilter {
         }
         let num_hashes = u32::from_le_bytes(data[0..4].try_into().ok()?);
         let num_bits = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        // A filter with no bits or no hashes cannot have been written by us,
+        // and would divide by zero or match everything.
+        if num_bits == 0 || num_hashes == 0 {
+            return None;
+        }
         let expected_bytes = num_bits.div_ceil(8) as usize;
         if data.len() < 8 + expected_bytes {
             return None;

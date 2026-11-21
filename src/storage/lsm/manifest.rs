@@ -90,17 +90,33 @@ impl Manifest {
     pub fn open(dir: &Path) -> StorageResult<Self> {
         let manifest_path = dir.join(MANIFEST_FILE);
 
-        let data: ManifestData = if manifest_path.exists() {
+        let data: ManifestData = if manifest_path.try_exists()? {
             let content = std::fs::read_to_string(&manifest_path)?;
             serde_json::from_str(&content)
                 .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {}", e)))?
         } else {
+            // No manifest means a new directory. If tables are lying here
+            // anyway, the manifest was lost: treating the directory as new
+            // would delete them as leftovers.
+            let has_tables = match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".sst")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
+            if has_tables {
+                return Err(StorageError::Manifest(format!(
+                    "{} holds table files but no {MANIFEST_FILE}; refusing to treat it as empty",
+                    dir.display()
+                )));
+            }
             ManifestData::default()
         };
         if data.version != MANIFEST_VERSION {
             return Err(StorageError::Manifest(format!(
                 "data directory {} uses on-disk format {}, this build uses format {}; \
-                 re-initialize it with roodb_init",
+                 remove the directory and run roodb_init again",
                 dir.display(),
                 data.version,
                 MANIFEST_VERSION
@@ -145,6 +161,17 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+
+    /// The table lists, to put back with [`Self::restore_levels`] if a change
+    /// cannot be made durable.
+    pub fn levels_snapshot(&self) -> Vec<LevelInfo> {
+        self.data.levels.clone()
+    }
+
+    /// Undo changes to the table lists made since `levels` was taken.
+    pub fn restore_levels(&mut self, levels: Vec<LevelInfo>) {
+        self.data.levels = levels;
     }
 
     /// A copy of the current contents, for [`persist`].
