@@ -207,7 +207,9 @@ impl TransactionContext {
             };
             let after = if end >= high {
                 high.to_vec()
-            } else if mvcc.get_current(end).await?.is_some() {
+            } else if mvcc.inner().get(end).await?.is_some() {
+                // A key is stored right at the end of the range (a row, or
+                // the marker of a deleted one): the gap stops there.
                 end.to_vec()
             } else {
                 mvcc.gap_around(end, low, high).await?.1

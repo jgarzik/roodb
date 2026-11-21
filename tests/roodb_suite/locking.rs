@@ -684,3 +684,40 @@ async fn begin_commits_the_open_transaction() {
     let seen: Vec<i32> = b.query("SELECT id FROM bg").await.unwrap();
     assert_eq!(seen, [1]);
 }
+
+/// A deleted row still bounds a gap while its marker is stored, so the gap
+/// around a missing key reaches only as far as the nearest stored key on
+/// each side, deleted or not.
+#[tokio::test]
+async fn a_deleted_row_bounds_the_gap() {
+    let (server, mut a, mut b) = start().await;
+    let mut c = connect(&server).await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE dgap (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO dgap VALUES (10), (20), (30)")
+        .await
+        .unwrap();
+    a.query_drop("DELETE FROM dgap WHERE id = 20")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("DELETE FROM dgap WHERE id = 15")
+        .await
+        .unwrap();
+    // Past the deleted row: not in the gap.
+    c.query_drop("INSERT INTO dgap VALUES (25)").await.unwrap();
+    // Before it: in the gap.
+    let blocked = tokio::spawn(async move {
+        b.query_drop("INSERT INTO dgap VALUES (17)")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().unwrap();
+    let ids: Vec<i32> = b.query("SELECT id FROM dgap ORDER BY id").await.unwrap();
+    assert_eq!(ids, [10, 17, 25, 30]);
+}

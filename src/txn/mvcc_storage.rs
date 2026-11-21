@@ -56,35 +56,29 @@ impl MvccStorage {
         self.txn_manager.locks()
     }
 
-    /// The gap `key` lies in: the nearest existing rows on either side of
-    /// it, or `low` / `high` (the ends of its table's key range) where
-    /// there is none. A statement that looked for `key` and found nothing
-    /// locks this gap, so that nothing appears there.
+    /// The gap `key` lies in: the nearest stored keys on either side of it,
+    /// or `low` / `high` (the ends of its table's key range) where there is
+    /// none. A statement that looked for `key` and found nothing locks this
+    /// gap, so that nothing appears there.
+    ///
+    /// A deleted row counts as a boundary for as long as its marker is
+    /// stored, as a delete-marked record does in InnoDB until it is purged.
+    /// The gap is then narrower than the distance between live rows, which
+    /// is all right: it still surrounds `key`, and any narrower gap blocks
+    /// fewer inserts. It also keeps this to one step each way however many
+    /// deleted rows lie around.
     pub async fn gap_around(
         &self,
         key: &[u8],
         low: &[u8],
         high: &[u8],
     ) -> StorageResult<(Vec<u8>, Vec<u8>)> {
-        // A deleted row is still stored (as a marker) until it is purged;
-        // it is not a row any more, so look past it.
-        let mut at = key.to_vec();
-        let before = loop {
-            match self.inner.prev_key(&at, low).await? {
-                None => break low.to_vec(),
-                Some(found) if self.get_current(&found).await?.is_some() => break found,
-                Some(found) => at = found,
-            }
-        };
-        let mut at = key.to_vec();
-        let after = loop {
-            match self.inner.next_key(&at, high).await? {
-                None => break high.to_vec(),
-                Some(found) if self.get_current(&found).await?.is_some() => break found,
-                Some(found) => at = found,
-            }
-        };
-        Ok((before, after))
+        let before = self.inner.prev_key(key, low).await?;
+        let after = self.inner.next_key(key, high).await?;
+        Ok((
+            before.unwrap_or_else(|| low.to_vec()),
+            after.unwrap_or_else(|| high.to_vec()),
+        ))
     }
 
     /// The row as it stands now: the latest committed version, with the ID

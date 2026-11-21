@@ -706,7 +706,8 @@ supported.
     inserts: a scan locks the whole table, so no row can be added until
     the transaction ends; a primary-key lookup that finds nothing locks
     the gap between the neighbouring rows, so the missing row (or any
-    other in that gap) cannot be inserted by someone else. Gap locks never
+    other in that gap) cannot be inserted by someone else. (A recently
+    deleted row still counts as a neighbour.) Gap locks never
     make another reader of the same gap wait; they only make inserts wait.
   - Under `READ COMMITTED` there are no gap locks, and a row that was
     examined but did not match the `WHERE` is unlocked again at once.
