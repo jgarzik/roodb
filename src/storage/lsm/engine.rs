@@ -774,6 +774,53 @@ impl Inner {
         })
     }
 
+    /// The nearest live key after `key` (`forward`) or before it, without
+    /// reading the range in between: each memtable and table is asked for
+    /// its own nearest entry, and the nearest of those is the answer unless
+    /// the newest entry for that key is a tombstone, in which case the
+    /// search goes on from there.
+    async fn seek(&self, key: &[u8], forward: bool) -> StorageResult<Option<Vec<u8>>> {
+        let sources = self.read_sources()?;
+        let mut from = key.to_vec();
+        loop {
+            // Newest source first, so that of two entries for one key the
+            // first one seen is the one that counts.
+            let mut nearest: Option<(Vec<u8>, bool)> = None;
+            let mut consider = |candidate: Option<(Vec<u8>, bool)>| {
+                let Some(candidate) = candidate else { return };
+                let closer = match &nearest {
+                    None => true,
+                    Some((best, _)) if forward => candidate.0 < *best,
+                    Some((best, _)) => candidate.0 > *best,
+                };
+                if closer {
+                    nearest = Some(candidate);
+                }
+            };
+            let memtables = std::iter::once(&sources.active).chain(sources.frozen.iter().rev());
+            for memtable in memtables {
+                consider(if forward {
+                    memtable.next_after(&from)
+                } else {
+                    memtable.prev_before(&from)
+                });
+            }
+            for table in &sources.tables {
+                consider(if forward {
+                    table.next_after(&from).await?
+                } else {
+                    table.prev_before(&from).await?
+                });
+            }
+            match nearest {
+                None => return Ok(None),
+                Some((found, false)) => return Ok(Some(found)),
+                // Deleted: look past it.
+                Some((found, true)) => from = found,
+            }
+        }
+    }
+
     /// Look a key up everywhere, newest data first. `Some(None)` means the
     /// newest entry for the key is a tombstone.
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
@@ -907,6 +954,24 @@ impl StorageEngine for LsmEngine {
 
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
         self.inner.scan(start, end).await
+    }
+
+    async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.check_open()?;
+        Ok(self
+            .inner
+            .seek(key, true)
+            .await?
+            .filter(|found| found.as_slice() < high))
+    }
+
+    async fn prev_key(&self, key: &[u8], low: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.check_open()?;
+        Ok(self
+            .inner
+            .seek(key, false)
+            .await?
+            .filter(|found| found.as_slice() >= low))
     }
 
     async fn flush(&self) -> StorageResult<()> {

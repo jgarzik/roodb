@@ -503,6 +503,7 @@ Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 **Operations**:
 - `get()`: Check memtable → immutables → SSTables (newest first)
 - `put()`: Insert to memtable; a full memtable is frozen and handed to the background task
+- `next_key()` / `prev_key()`: the nearest live key after or before a key, found by asking each memtable and table for its own nearest entry (one block read per table) instead of reading the range.
 - `scan()`: Merge all sources, deduplicate by key, skip tombstones. Adjacent blocks are read in runs of up to 1 MiB, all runs in flight together.
 
 **Bloom Filters** (`lsm/bloom.rs`): Per-SSTable Bloom filters for accelerating point lookups, sized for the keys the table actually holds. Avoids reading SSTables that definitely don't contain a key.
@@ -560,7 +561,7 @@ pub struct Transaction {
 - `RepeatableRead`: the default level. Today it also takes a fresh snapshot per statement, so reads behave as under `ReadCommitted`; a single snapshot per transaction is not implemented yet
 - `Serializable`: Not yet implemented
 
-**Row locks** (`lock.rs`): `LockManager` holds the locks transactions take on rows: shared/exclusive record locks, gap locks, insert intentions, with FIFO granting, deadlock detection and wait timeouts. It lives in the `TransactionManager`, which releases a transaction's locks when it ends. `UPDATE`, `DELETE` and `INSERT` lock the rows they touch and then read them as they stand now (`MvccStorage::get_current`), so writers wait for each other. The version check when a changeset is applied remains as a backstop for rows changed without a lock. The locks are local to the node and are not replicated: they protect changes that are still buffered in a session.
+**Row locks** (`lock.rs`): `LockManager` holds the locks transactions take on rows: shared/exclusive record locks, gap locks, insert intentions, with FIFO granting, deadlock detection and wait timeouts. It lives in the `TransactionManager`, which releases a transaction's locks when it ends. `UPDATE`, `DELETE` and `INSERT` lock the rows they touch and then read them as they stand now (`MvccStorage::get_current`), so writers wait for each other. Under REPEATABLE READ they also lock the gaps they read (the whole table for a scan; the gap around a missing key for a lookup), which keeps other transactions from inserting there. The version check when a changeset is applied remains as a backstop for rows changed without a lock. The locks are local to the node and are not replicated: they protect changes that are still buffered in a session.
 
 **TransactionManager** (`manager.rs`):
 - Monotonic `txn_id` allocation

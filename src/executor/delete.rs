@@ -91,8 +91,28 @@ impl Delete {
         // With row locking the row is locked first and then read as it
         // stands now.
         let result = if ctx.locks_rows() {
-            ctx.lock_record(&storage_key, LockMode::Exclusive).await?;
-            self.mvcc.get_current(&storage_key).await?
+            let new_lock = ctx.lock_record(&storage_key, LockMode::Exclusive).await?;
+            let current = self.mvcc.get_current(&storage_key).await?;
+            if current.is_none() && !ctx.has_buffered_key(&storage_key) {
+                // No such row. What is locked instead is its absence: the
+                // gap it would be in, against inserts (REPEATABLE READ).
+                // There is no row to hold a lock on.
+                if ctx.locks_gaps() {
+                    let (low, high) = self
+                        .mvcc
+                        .gap_around(
+                            &storage_key,
+                            &table_key_prefix(&self.table),
+                            &table_key_end(&self.table),
+                        )
+                        .await?;
+                    ctx.lock_gap(&low, &high);
+                }
+                if new_lock {
+                    ctx.unlock_record(&storage_key);
+                }
+            }
+            current
         } else {
             self.mvcc
                 .get_with_version(&storage_key, &ctx.read_view)
@@ -125,7 +145,14 @@ impl Delete {
     async fn next_full_scan(&mut self) -> ExecutorResult<()> {
         let prefix = table_key_prefix(&self.table);
         let end = table_key_end(&self.table);
-
+        // The scan reads the whole table, so the whole table is what must
+        // not gain rows until this transaction ends (REPEATABLE READ).
+        // Locked before reading, so that nothing slips in between.
+        if let Some(ctx) = &self.txn_context {
+            if ctx.locks_gaps() {
+                ctx.lock_gap(&prefix, &end);
+            }
+        }
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
             self.mvcc
                 .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
@@ -145,10 +172,11 @@ impl Delete {
         for (key, value, row_version) in kv_pairs {
             // Lock each row the scan passes, then look at it as it stands
             // now (it may have changed, or gone, while we waited).
+            let mut new_lock = false;
             let (value, row_version) = match &self.txn_context {
                 Some(ctx) => {
                     let stored = if ctx.locks_rows() {
-                        ctx.lock_record(&key, LockMode::Exclusive).await?;
+                        new_lock = ctx.lock_record(&key, LockMode::Exclusive).await?;
                         self.mvcc.get_current(&key).await?
                     } else {
                         Some((value, row_version))
@@ -164,6 +192,14 @@ impl Delete {
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
+                    // READ COMMITTED keeps locks only on the rows it
+                    // changes. (REPEATABLE READ keeps every row it read as
+                    // it was, so it keeps them all.)
+                    if let Some(ctx) = &self.txn_context {
+                        if new_lock && !ctx.locks_gaps() {
+                            ctx.unlock_record(&key);
+                        }
+                    }
                     continue;
                 }
             }

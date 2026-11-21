@@ -1251,6 +1251,18 @@ impl QueryEngine {
         if let Some((global, seconds)) = parse_set_lock_wait_timeout(&sql_upper) {
             let wait = std::time::Duration::from_secs(seconds);
             if global {
+                // A server-wide setting is the administrator's to change.
+                if self.session.user != "root" {
+                    return self
+                        .send_error(
+                            1227,
+                            "42000",
+                            "Access denied; you need (at least one of) the SUPER or \
+                             SYSTEM_VARIABLES_ADMIN privilege(s) for this operation",
+                        )
+                        .await
+                        .map(Some);
+                }
                 // For sessions that start from now on, as in MySQL.
                 self.txn_manager.locks().set_default_wait(wait);
             } else {

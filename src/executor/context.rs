@@ -82,15 +82,30 @@ impl TransactionContext {
     }
 
     /// Lock a row for this transaction, waiting for others that hold it.
-    pub async fn lock_record(&self, key: &[u8], mode: LockMode) -> ExecutorResult<()> {
+    /// Returns whether the lock is new to the transaction (and so may be
+    /// given back with `unlock_record` if the row turns out not to matter).
+    pub async fn lock_record(&self, key: &[u8], mode: LockMode) -> ExecutorResult<bool> {
         match &self.locks {
             Some(locks) => locks
                 .manager
                 .lock_record(self.txn_id, key, mode, locks.timeout)
                 .await
                 .map_err(lock_error),
-            None => Ok(()),
+            None => Ok(false),
         }
+    }
+
+    /// Give back a lock taken on a row only to look at it.
+    pub fn unlock_record(&self, key: &[u8]) {
+        if let Some(locks) = &self.locks {
+            locks.manager.unlock_record(self.txn_id, key);
+        }
+    }
+
+    /// Whether this transaction locks the ranges it reads, so that what it
+    /// read stays as it was (REPEATABLE READ), or only the rows it changes.
+    pub fn locks_gaps(&self) -> bool {
+        self.locks.as_ref().is_some_and(|locks| locks.gap_locks)
     }
 
     /// Wait until this transaction may insert a row at `key`.

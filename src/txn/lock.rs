@@ -267,14 +267,34 @@ impl LockManager {
     /// Lock one row for `txn`, waiting up to `timeout` for transactions
     /// that hold it in a conflicting mode. A lock the transaction already
     /// holds is kept, and strengthened if an exclusive lock is asked for.
+    ///
+    /// Returns whether the lock is new to the transaction: only such a lock
+    /// may be given back with `unlock_record`.
     pub async fn lock_record(
         &self,
         txn: u64,
         key: &[u8],
         mode: LockMode,
         timeout: Duration,
-    ) -> Result<(), LockError> {
+    ) -> Result<bool, LockError> {
         self.acquire(txn, key, Wanted::Record(mode), timeout).await
+    }
+
+    /// Give back a record lock before the transaction ends: for a row that
+    /// was locked in order to look at it and turned out not to be wanted.
+    pub fn unlock_record(&self, txn: u64, key: &[u8]) {
+        let mut state = self.state.lock();
+        let Some(holders) = state.records.get_mut(key) else {
+            return;
+        };
+        holders.retain(|(holder, _)| *holder != txn);
+        if holders.is_empty() {
+            state.records.remove(key);
+        }
+        if let Some(held) = state.held.get_mut(&txn) {
+            held.remove(key);
+        }
+        state.wake();
     }
 
     /// Wait until no other transaction holds a gap lock covering `key`, so
@@ -285,7 +305,9 @@ impl LockManager {
         key: &[u8],
         timeout: Duration,
     ) -> Result<(), LockError> {
-        self.acquire(txn, key, Wanted::Insert, timeout).await
+        self.acquire(txn, key, Wanted::Insert, timeout)
+            .await
+            .map(|_| ())
     }
 
     /// Stop other transactions inserting any key strictly between `low` and
@@ -310,17 +332,21 @@ impl LockManager {
         key: &[u8],
         wanted: Wanted,
         timeout: Duration,
-    ) -> Result<(), LockError> {
+    ) -> Result<bool, LockError> {
+        // Whether the transaction holds nothing on the key yet. That cannot
+        // change while it waits: a transaction does one thing at a time.
+        let new;
         let (id, granted) = {
             let mut state = self.state.lock();
+            let held = state
+                .records
+                .get(key)
+                .and_then(|holders| holders.iter().find(|(holder, _)| *holder == txn))
+                .map(|(_, held)| *held);
+            new = held.is_none();
             if let Wanted::Record(mode) = wanted {
-                let already = state
-                    .records
-                    .get(key)
-                    .and_then(|holders| holders.iter().find(|(holder, _)| *holder == txn))
-                    .is_some_and(|(_, held)| held.covers(mode));
-                if already {
-                    return Ok(());
+                if held.is_some_and(|held| held.covers(mode)) {
+                    return Ok(false);
                 }
             }
             let blockers = state.blockers(txn, key, &wanted, None);
@@ -328,7 +354,7 @@ impl LockManager {
                 if let Wanted::Record(mode) = wanted {
                     state.grant_record(txn, key, mode);
                 }
-                return Ok(());
+                return Ok(new);
             }
             if state.closes_cycle(txn, &blockers) {
                 return Err(LockError::Deadlock);
@@ -354,7 +380,7 @@ impl LockManager {
         match tokio::time::timeout(timeout, granted).await {
             Ok(Ok(())) => {
                 guard.done = true;
-                Ok(())
+                Ok(new)
             }
             // The sender is dropped only with the manager's state.
             Ok(Err(_)) => Err(LockError::Timeout),
@@ -368,7 +394,7 @@ impl LockManager {
                     Err(LockError::Timeout)
                 } else {
                     guard.done = true;
-                    Ok(())
+                    Ok(new)
                 }
             }
         }
@@ -604,6 +630,35 @@ mod tests {
         let _ = writer.await;
         reader.await.unwrap().unwrap();
         assert_eq!(m.counts(), (2, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_new_lock_can_be_given_back() {
+        let m = LockManager::new();
+        assert!(m
+            .lock_record(1, b"k", LockMode::Shared, LONG)
+            .await
+            .unwrap());
+        // Asking again, or for more, is not a new lock.
+        assert!(!m
+            .lock_record(1, b"k", LockMode::Shared, LONG)
+            .await
+            .unwrap());
+        assert!(!m
+            .lock_record(1, b"k", LockMode::Exclusive, LONG)
+            .await
+            .unwrap());
+        let waiter = {
+            let m = m.clone();
+            tokio::spawn(async move { m.lock_record(2, b"k", LockMode::Exclusive, LONG).await })
+        };
+        until_waiting(&m, 1).await;
+        m.unlock_record(1, b"k");
+        assert!(waiter.await.unwrap().unwrap(), "new to the waiter");
+        m.unlock_record(2, b"k");
+        assert_eq!(m.counts(), (0, 0, 0));
+        // Giving back what is not held does nothing.
+        m.unlock_record(2, b"k");
     }
 
     #[tokio::test]

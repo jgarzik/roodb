@@ -345,6 +345,34 @@ impl StorageEngine for SessionStorage {
         self.shared.scan(start, end).await
     }
 
+    async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        if self.owns(key) || self.owns(high) {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let temp = self.temp.read();
+            return Ok(temp
+                .rows
+                .range::<[u8], _>((Excluded(key), Unbounded))
+                .next()
+                .map(|(k, _)| k.clone())
+                .filter(|k| k.as_slice() < high));
+        }
+        self.shared.next_key(key, high).await
+    }
+
+    async fn prev_key(&self, key: &[u8], low: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        if self.owns(key) || self.owns(low) {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let temp = self.temp.read();
+            return Ok(temp
+                .rows
+                .range::<[u8], _>((Unbounded, Excluded(key)))
+                .next_back()
+                .map(|(k, _)| k.clone())
+                .filter(|k| k.as_slice() >= low));
+        }
+        self.shared.prev_key(key, low).await
+    }
+
     async fn flush(&self) -> StorageResult<()> {
         self.shared.flush().await
     }

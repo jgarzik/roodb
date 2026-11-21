@@ -604,6 +604,47 @@ impl SstableReader {
             .saturating_sub(1)
     }
 
+    /// The first entry after `key`: its key, and whether it is a tombstone.
+    /// Reads one block, or two when `key` is the last of its block.
+    pub async fn next_after(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, bool)>> {
+        if self.index.is_empty() || key >= self.metadata.max_key.as_slice() {
+            return Ok(None);
+        }
+        let mut block_idx = self.find_block(key);
+        while block_idx < self.index.len() {
+            let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
+            let reader = BlockReader::parse_verified(&block)?;
+            let entries = reader.entries();
+            let at = entries.partition_point(|entry| entry.key.as_slice() <= key);
+            if let Some(entry) = entries.get(at) {
+                return Ok(Some((entry.key.clone(), entry.is_tombstone())));
+            }
+            block_idx += 1;
+        }
+        Ok(None)
+    }
+
+    /// The last entry before `key`: its key, and whether it is a tombstone.
+    /// Reads one block.
+    pub async fn prev_before(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, bool)>> {
+        if self.index.is_empty() || key <= self.metadata.min_key.as_slice() {
+            return Ok(None);
+        }
+        // The last block whose first key is before `key` holds the answer:
+        // that first key at least.
+        let block_idx = self
+            .index
+            .partition_point(|entry| entry.first_key.as_slice() < key)
+            .saturating_sub(1);
+        let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
+        let reader = BlockReader::parse_verified(&block)?;
+        let entries = reader.entries();
+        let at = entries.partition_point(|entry| entry.key.as_slice() < key);
+        Ok(at
+            .checked_sub(1)
+            .map(|i| (entries[i].key.clone(), entries[i].is_tombstone())))
+    }
+
     /// Scan all entries in the SSTable
     pub async fn scan(&self) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         self.scan_range_batched(None, None).await

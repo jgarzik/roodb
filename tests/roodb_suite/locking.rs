@@ -321,3 +321,161 @@ async fn autocommit_off_runs_transactions_back_to_back() {
     let mode: Option<u8> = a.query_first("SELECT @@autocommit").await.unwrap();
     assert_eq!(mode, Some(1));
 }
+
+/// A statement that read the whole table keeps rows from appearing in it
+/// until its transaction ends (REPEATABLE READ, the default).
+#[tokio::test]
+async fn a_scan_keeps_new_rows_out_until_the_transaction_ends() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE ph (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO ph VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("UPDATE ph SET v = v + 10 WHERE v > 0")
+        .await
+        .unwrap();
+    let blocked = tokio::spawn(async move {
+        b.query_drop("INSERT INTO ph VALUES (3, 3)")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    // Had the row slipped in, this would have changed three rows.
+    a.query_drop("UPDATE ph SET v = v + 10 WHERE v > 0")
+        .await
+        .unwrap();
+    assert_eq!(a.affected_rows(), 2);
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().expect("the insert failed");
+    let rows: Vec<(i32, i32)> = b.query("SELECT id, v FROM ph ORDER BY id").await.unwrap();
+    assert_eq!(rows, [(1, 21), (2, 22), (3, 3)]);
+}
+
+/// Looking for a row that is not there locks the gap it would be in: an
+/// insert into that gap waits, one elsewhere does not, and another
+/// transaction looking for the same missing row does not wait either.
+#[tokio::test]
+async fn a_missing_row_locks_its_gap() {
+    let (server, mut a, mut b) = start().await;
+    let mut c = connect(&server).await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE gap (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO gap VALUES (10, 0), (20, 0), (30, 0)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("DELETE FROM gap WHERE id = 15").await.unwrap();
+    assert_eq!(a.affected_rows(), 0);
+
+    // Outside the gap (10, 20): no wait. The rows at its ends are not
+    // locked either.
+    c.query_drop("INSERT INTO gap VALUES (25, 0)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO gap VALUES (5, 0)").await.unwrap();
+    c.query_drop("UPDATE gap SET v = 1 WHERE id = 10")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE gap SET v = 1 WHERE id = 20")
+        .await
+        .unwrap();
+    // Another transaction may look for the same missing row.
+    c.query_drop("BEGIN").await.unwrap();
+    c.query_drop("UPDATE gap SET v = 1 WHERE id = 15")
+        .await
+        .unwrap();
+    c.query_drop("COMMIT").await.unwrap();
+
+    // Inside the gap: waits, wherever in the gap it is.
+    let blocked = tokio::spawn(async move {
+        b.query_drop("INSERT INTO gap VALUES (17, 0)")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("ROLLBACK").await.unwrap();
+    let mut b = blocked.await.unwrap().expect("the insert failed");
+    let ids: Vec<i32> = b.query("SELECT id FROM gap ORDER BY id").await.unwrap();
+    assert_eq!(ids, [5, 10, 17, 20, 25, 30]);
+}
+
+/// Two transactions that both found a row missing and both go on to insert
+/// it: each holds the gap the other needs. One is rolled back.
+#[tokio::test]
+async fn two_inserts_into_a_gap_both_locked_deadlock() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE gdl (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO gdl VALUES (10), (20)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    b.query_drop("BEGIN").await.unwrap();
+    a.query_drop("DELETE FROM gdl WHERE id = 15").await.unwrap();
+    b.query_drop("DELETE FROM gdl WHERE id = 15").await.unwrap();
+    let first = tokio::spawn(async move {
+        a.query_drop("INSERT INTO gdl VALUES (15)")
+            .await
+            .map(|()| a)
+    });
+    until_waiting(&mut watcher, 1).await;
+    let err = b
+        .query_drop("INSERT INTO gdl VALUES (16)")
+        .await
+        .expect_err("the deadlock was not detected");
+    assert_eq!(error_code(&err), 1213, "{err}");
+    let mut a = first.await.unwrap().expect("the survivor failed");
+    a.query_drop("COMMIT").await.unwrap();
+    let ids: Vec<i32> = a.query("SELECT id FROM gdl ORDER BY id").await.unwrap();
+    assert_eq!(ids, [10, 15, 20]);
+}
+
+/// READ COMMITTED locks only the rows a statement changes: rows it merely
+/// looked at are free again, and new rows may appear.
+#[tokio::test]
+async fn read_committed_locks_only_the_rows_it_changes() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE rc (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO rc VALUES (1, 5), (2, 6)")
+        .await
+        .unwrap();
+
+    a.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .unwrap();
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("UPDATE rc SET v = 50 WHERE v = 5")
+        .await
+        .unwrap();
+
+    // A row the scan passed over, and a new row: neither waits.
+    b.query_drop("UPDATE rc SET v = 60 WHERE id = 2")
+        .await
+        .unwrap();
+    b.query_drop("INSERT INTO rc VALUES (3, 7)").await.unwrap();
+    // The row that was changed does.
+    let blocked = tokio::spawn(async move {
+        b.query_drop("UPDATE rc SET v = v + 1 WHERE id = 1")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().unwrap();
+    let rows: Vec<(i32, i32)> = b.query("SELECT id, v FROM rc ORDER BY id").await.unwrap();
+    assert_eq!(rows, [(1, 51), (2, 60), (3, 7)]);
+}

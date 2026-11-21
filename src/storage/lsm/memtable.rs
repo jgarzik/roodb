@@ -83,6 +83,20 @@ impl Memtable {
             .collect()
     }
 
+    /// The first entry after `key`: its key, and whether it is a tombstone.
+    pub fn next_after(&self, key: &[u8]) -> Option<(Vec<u8>, bool)> {
+        self.data
+            .lower_bound(Bound::Excluded(key))
+            .map(|entry| (entry.key().clone(), entry.value().is_none()))
+    }
+
+    /// The last entry before `key`: its key, and whether it is a tombstone.
+    pub fn prev_before(&self, key: &[u8]) -> Option<(Vec<u8>, bool)> {
+        self.data
+            .upper_bound(Bound::Excluded(key))
+            .map(|entry| (entry.key().clone(), entry.value().is_none()))
+    }
+
     /// Get all entries in sorted order (for flushing to SSTable)
     pub fn iter(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         self.data

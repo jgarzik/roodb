@@ -48,6 +48,29 @@ pub trait StorageEngine: Send + Sync {
     /// If `end` is `None`, scan to the end.
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>>;
 
+    /// The smallest key greater than `key` and less than `high`, if any.
+    ///
+    /// The default reads the whole range; an engine that can seek should
+    /// override it.
+    async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        let mut after = key.to_vec();
+        after.push(0);
+        Ok(self
+            .scan(Some(&after), Some(high))
+            .await?
+            .into_iter()
+            .next()
+            .map(|(k, _)| k))
+    }
+
+    /// The greatest key less than `key` and not less than `low`, if any.
+    ///
+    /// The default reads the whole range; an engine that can seek should
+    /// override it.
+    async fn prev_key(&self, key: &[u8], low: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        Ok(self.scan(Some(low), Some(key)).await?.pop().map(|(k, _)| k))
+    }
+
     /// Flush all pending writes to disk
     async fn flush(&self) -> StorageResult<()>;
 

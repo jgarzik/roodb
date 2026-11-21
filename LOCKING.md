@@ -226,8 +226,15 @@ transaction's locks when it commits or rolls back, whichever path ends it.
 `TransactionContext` and then read the row as it stands (`get_current`),
 not through the statement's snapshot. A deadlock is reported as error 1213
 and the transaction rolled back; a timed-out wait (`innodb_lock_wait_timeout`)
-as error 1205, failing the statement only. Statements do not take gap locks
-yet.
+as error 1205, failing the statement only.
+
+Under REPEATABLE READ a statement also locks the gaps it read: a table scan
+takes one gap lock over the table's whole key range before it reads; a
+primary-key lookup that finds no row locks the gap between the neighbouring
+rows (`MvccStorage::gap_around`, built on the storage engine's `next_key` /
+`prev_key`) and gives back the record lock it took to look. Under READ
+COMMITTED there are no gap locks, and a scanned row that does not match is
+unlocked at once (`unlock_record`).
 
 ## Lock Ordering Rules
 

@@ -56,6 +56,37 @@ impl MvccStorage {
         self.txn_manager.locks()
     }
 
+    /// The gap `key` lies in: the nearest existing rows on either side of
+    /// it, or `low` / `high` (the ends of its table's key range) where
+    /// there is none. A statement that looked for `key` and found nothing
+    /// locks this gap, so that nothing appears there.
+    pub async fn gap_around(
+        &self,
+        key: &[u8],
+        low: &[u8],
+        high: &[u8],
+    ) -> StorageResult<(Vec<u8>, Vec<u8>)> {
+        // A deleted row is still stored (as a marker) until it is purged;
+        // it is not a row any more, so look past it.
+        let mut at = key.to_vec();
+        let before = loop {
+            match self.inner.prev_key(&at, low).await? {
+                None => break low.to_vec(),
+                Some(found) if self.get_current(&found).await?.is_some() => break found,
+                Some(found) => at = found,
+            }
+        };
+        let mut at = key.to_vec();
+        let after = loop {
+            match self.inner.next_key(&at, high).await? {
+                None => break high.to_vec(),
+                Some(found) if self.get_current(&found).await?.is_some() => break found,
+                Some(found) => at = found,
+            }
+        };
+        Ok((before, after))
+    }
+
     /// The row as it stands now: the latest committed version, with the ID
     /// of the transaction that wrote it, or `None` if the row does not exist
     /// or has been deleted. Storage holds committed rows only (changes reach

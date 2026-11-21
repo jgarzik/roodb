@@ -699,10 +699,17 @@ supported.
   - Rows are locked as they are scanned: an `UPDATE` or `DELETE` that
     cannot find its rows by primary key examines, and locks, every row of
     the table.
-  - Ranges are not locked yet: another transaction can insert a row that a
-    statement's `WHERE` would have matched. `SELECT ... FOR UPDATE` /
-    `FOR SHARE` are accepted and lock nothing yet, and `LOCK TABLES` is a
-    no-op.
+  - **What was read stays as it was** (`REPEATABLE READ`, the default).
+    Besides the rows, the statement locks the gaps it read against
+    inserts: a scan locks the whole table, so no row can be added until
+    the transaction ends; a primary-key lookup that finds nothing locks
+    the gap between the neighbouring rows, so the missing row (or any
+    other in that gap) cannot be inserted by someone else. Gap locks never
+    make another reader of the same gap wait; they only make inserts wait.
+  - Under `READ COMMITTED` there are no gap locks, and a row that was
+    examined but did not match the `WHERE` is unlocked again at once.
+  - `SELECT ... FOR UPDATE` / `FOR SHARE` are accepted and lock nothing
+    yet, and `LOCK TABLES` is a no-op.
 - **A duplicate key is reported by the statement.** An `INSERT` whose
   primary key already exists fails with error 1062 when it runs. If the
   existing row belongs to a transaction that has not finished, the insert
@@ -712,7 +719,8 @@ supported.
   40001) and its whole transaction is rolled back. Retry it.
 - **Lock wait timeout.** A statement that waits longer than
   `innodb_lock_wait_timeout` seconds (default 50; `SET [SESSION | GLOBAL]
-  innodb_lock_wait_timeout = n`) fails with error 1205. Only that statement
+  innodb_lock_wait_timeout = n`; the global form needs `root`) fails with
+  error 1205. Only that statement
   fails; the transaction stays open.
 - **A conflict can still be found at `COMMIT`** when a transaction changes
   a row it did not lock at the time, which today means a row it inserted
@@ -983,9 +991,10 @@ unknown function, duplicate view or procedure) are reported as 1105.
 
 - Reads are READ COMMITTED in effect (a snapshot per statement) although
   `REPEATABLE-READ` is reported; `SERIALIZABLE` is refused.
-- Row locks are taken by `UPDATE`, `DELETE` and `INSERT` only. Ranges are
-  not locked, and `FOR UPDATE`, `FOR SHARE`, `LOCK TABLES` and `GET_LOCK`
-  lock nothing.
+- Row and gap locks are taken by `UPDATE`, `DELETE` and `INSERT ...
+  VALUES` only: `FOR UPDATE`, `FOR SHARE`, `LOCK TABLES` and `GET_LOCK`
+  lock nothing, and `INSERT ... SELECT`, `REPLACE` and `LOAD DATA` neither
+  take locks nor wait for them (a conflict is found at `COMMIT`).
 - `UPDATE` and `DELETE` do not find rows the same transaction inserted.
 - No savepoints, no `XA`, no `COMMIT WORK` / `AND CHAIN`.
 - DDL is neither transactional nor an implicit commit.

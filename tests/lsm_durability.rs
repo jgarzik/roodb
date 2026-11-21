@@ -689,3 +689,89 @@ async fn a_dropped_engine_releases_the_directory() {
     }
     engine.close().await.unwrap();
 }
+
+/// The nearest key on either side of a key is found across memtables and
+/// table files, skipping deleted keys, whether or not the key itself
+/// exists.
+#[tokio::test]
+async fn nearest_keys_are_found_across_memory_and_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    let key = |n: u32| format!("k{n:05}").into_bytes();
+
+    // Even keys in a file; enough of them, with large values, for the file
+    // to have many blocks.
+    for n in (0..2000).step_by(2) {
+        engine.put(&key(n), &value_of(300, n as u8)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    // A second file deletes a run of them; memory adds an odd key and
+    // deletes one more.
+    for n in (1000..1100).step_by(2) {
+        engine.delete(&key(n)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.put(&key(501), b"odd").await.unwrap();
+    engine.delete(&key(1500)).await.unwrap();
+
+    check_nearest(&engine).await;
+    // The same answers once everything is in files.
+    engine.flush().await.unwrap();
+    check_nearest(&engine).await;
+    engine.close().await.unwrap();
+}
+
+async fn check_nearest(engine: &LsmEngine) {
+    let key = |n: u32| format!("k{n:05}").into_bytes();
+    let low = key(0);
+    let high = b"k99999".to_vec();
+    // (from, expected next, expected previous)
+    let cases: [(u32, Option<u32>, Option<u32>); 12] = [
+        // Between two keys of the file, from a key that exists and one
+        // that does not.
+        (10, Some(12), Some(8)),
+        (11, Some(12), Some(10)),
+        // The key in memory sits between two in the file.
+        (500, Some(501), Some(498)),
+        (501, Some(502), Some(500)),
+        (502, Some(504), Some(501)),
+        // A deleted run is passed over in both directions.
+        (998, Some(1100), Some(996)),
+        (1100, Some(1102), Some(998)),
+        (1050, Some(1100), Some(998)),
+        // So is a key deleted in memory.
+        (1498, Some(1502), Some(1496)),
+        (1502, Some(1504), Some(1498)),
+        // The ends.
+        (0, Some(2), None),
+        (1998, None, Some(1996)),
+    ];
+    for (from, next, prev) in cases {
+        assert_eq!(
+            engine.next_key(&key(from), &high).await.unwrap(),
+            next.map(key),
+            "next after {from}"
+        );
+        assert_eq!(
+            engine.prev_key(&key(from), &low).await.unwrap(),
+            prev.map(key),
+            "previous before {from}"
+        );
+    }
+    assert_eq!(engine.next_key(&key(5000), &high).await.unwrap(), None);
+    assert_eq!(
+        engine.prev_key(&key(5000), &low).await.unwrap(),
+        Some(key(1998))
+    );
+    // The bounds: `high` is excluded, `low` included.
+    assert_eq!(engine.next_key(&key(10), &key(12)).await.unwrap(), None);
+    assert_eq!(
+        engine.next_key(&key(10), &key(13)).await.unwrap(),
+        Some(key(12))
+    );
+    assert_eq!(engine.prev_key(&key(12), &key(11)).await.unwrap(), None);
+    assert_eq!(
+        engine.prev_key(&key(12), &key(10)).await.unwrap(),
+        Some(key(10))
+    );
+}
