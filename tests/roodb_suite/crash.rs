@@ -534,3 +534,52 @@ async fn triggers_survive_a_kill() {
     let logged: Vec<i32> = conn.query("SELECT id FROM log ORDER BY id").await.unwrap();
     assert_eq!(logged, [1, 2]);
 }
+
+/// A stored function is callable from every session and after a restart,
+/// not only in the session that created it.
+#[tokio::test]
+async fn stored_functions_are_shared_and_survive_a_kill() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut creator = connect(&server).await;
+    creator
+        .query_drop(
+            "CREATE FUNCTION add_one(x BIGINT) RETURNS BIGINT BEGIN \
+             DECLARE y BIGINT; SELECT x + 1 INTO y; RETURN y; END",
+        )
+        .await
+        .unwrap();
+    let here: i64 = creator
+        .query_first("SELECT add_one(41)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(here, 42);
+
+    // A session that was already open, and one opened afterwards.
+    let mut other = connect(&server).await;
+    let there: i64 = other
+        .query_first("SELECT add_one(1)")
+        .await
+        .unwrap_or_else(|e| panic!("another session cannot call the function: {e}"))
+        .unwrap();
+    assert_eq!(there, 2);
+    drop(creator);
+    drop(other);
+    server.kill();
+
+    server.start();
+    let mut conn = connect(&server).await;
+    let after: i64 = conn
+        .query_first("SELECT add_one(9)")
+        .await
+        .unwrap_or_else(|e| panic!("the function did not survive: {e}\n{}", server.log_tail()))
+        .unwrap();
+    assert_eq!(after, 10);
+
+    // Dropped in one session, gone in the others.
+    let mut other = connect(&server).await;
+    let _: Option<i64> = other.query_first("SELECT add_one(1)").await.unwrap();
+    conn.query_drop("DROP FUNCTION add_one").await.unwrap();
+    assert!(other.query_drop("SELECT add_one(1)").await.is_err());
+}

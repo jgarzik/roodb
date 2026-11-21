@@ -787,6 +787,14 @@ impl Catalog {
     /// Register a procedure directly (for rebuilding from storage)
     pub fn register_procedure(&mut self, def: ProcedureDef) {
         self.procedures.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// The stored functions: procedures that return a value.
+    pub fn functions(&self) -> impl Iterator<Item = &ProcedureDef> {
+        self.procedures
+            .values()
+            .filter(|p| p.returns_type.is_some())
     }
 
     /// Check if a procedure exists

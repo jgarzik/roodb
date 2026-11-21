@@ -73,6 +73,9 @@ pub struct QueryEngine {
     /// This session's view of storage: its temporary tables' rows are kept
     /// here in memory, everything else is the shared engine.
     temp: Arc<SessionStorage>,
+    /// Catalog version the session's copy of the stored functions was taken
+    /// at (see `sync_functions`).
+    functions_version: Option<u64>,
     /// Implicit transactions of the autocommit statements now executing
     /// (a trigger body nests inside its statement); rolled back if the
     /// statement fails before committing them
@@ -104,6 +107,7 @@ impl QueryEngine {
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
             temp,
+            functions_version: None,
             implicit_txns: Vec::new(),
             out,
         }
@@ -117,6 +121,7 @@ impl QueryEngine {
         statement_id: u32,
         params: &[Datum],
     ) -> ProtocolResult<()> {
+        self.sync_functions();
         let Some(ps) = self.prepared_stmts.get(statement_id) else {
             return self
                 .send_error(
@@ -326,6 +331,7 @@ impl QueryEngine {
     async fn handle_query_inner(&mut self, sql: &str) -> ProtocolResult<()> {
         // Clear warnings at the start of each statement
         self.session.clear_warnings();
+        self.sync_functions();
 
         // Check for transaction commands first
         if let Some(()) = self.try_handle_transaction_command(sql).await? {
@@ -1280,6 +1286,45 @@ impl QueryEngine {
         }
 
         self.send_ok(0, 0).await
+    }
+
+    /// Bring this session's copy of the stored functions up to date.
+    ///
+    /// Expression evaluation finds a stored function through the session's
+    /// variables (`__udf_<name>` holds the body, `__udf_<name>_params` the
+    /// parameter names). The functions themselves live in the catalog, which
+    /// follows the system tables; this copies them over whenever the catalog
+    /// has changed, so a function is callable from every session and after a
+    /// restart, not only where and when it was created.
+    fn sync_functions(&mut self) {
+        let (version, functions) = {
+            let catalog = self.catalog.read();
+            let version = catalog.schema_version();
+            if self.functions_version == Some(version) {
+                return;
+            }
+            let functions: Vec<(String, String, String)> = catalog
+                .functions()
+                .map(|f| {
+                    let params = f
+                        .params
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (f.name.to_lowercase(), f.body_sql.clone(), params)
+                })
+                .collect();
+            (version, functions)
+        };
+        let vars = self.session.user_variables();
+        let mut vars = vars.write();
+        vars.retain(|name, _| !name.starts_with("__udf_"));
+        for (name, body, params) in functions {
+            vars.insert(format!("__udf_{name}_params"), Datum::String(params));
+            vars.insert(format!("__udf_{name}"), Datum::String(body));
+        }
+        self.functions_version = Some(version);
     }
 
     /// Whether `table` is a temporary table that belongs to another session.
@@ -4440,27 +4485,9 @@ impl QueryEngine {
             .await
             .map_err(|e| ProtocolError::Unsupported(format!("Failed to create function: {}", e)))?;
 
-        // Register in catalog
-        let param_names: String = proc_def
-            .params
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        {
-            let mut catalog = self.catalog.write();
-            catalog.register_procedure(proc_def);
-        }
-
-        // Register UDF in user_variables so eval_function can find it
-        {
-            let udf_key = format!("__udf_{}", func_name);
-            let params_key = format!("__udf_{}_params", func_name);
-            let vars = self.session.user_variables();
-            let mut w = vars.write();
-            w.insert(udf_key, Datum::String(body_sql));
-            w.insert(params_key, Datum::String(param_names));
-        }
+        // The catalog picked the function up when the change was applied;
+        // every session, this one included, gets it from there.
+        self.sync_functions();
 
         self.send_ok(0, 0).await
     }
