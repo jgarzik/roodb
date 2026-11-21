@@ -39,6 +39,8 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 | `--raft-ca-cert-path` | `ROODB_CA_CERT_PATH` | ./certs/ca.crt | CA certificate for Raft mTLS |
 | `--raft-port` | `ROODB_RAFT_PORT` | port + 1000 | Port for traffic between the nodes of a cluster |
 | `--advertise-host` | `ROODB_ADVERTISE_HOST` | the bind address | Host name or address at which other nodes reach this one. Needed when binding to 0.0.0.0 |
+| `--log-budget-mb` | `ROODB_LOG_BUDGET_MB` | 256 | How much log may accumulate before memory is written out to table files and the log shortened. Bounds the log's disk use and the replay work of a restart |
+| `--log-segment-mb` | `ROODB_LOG_SEGMENT_MB` | 64 | Size of the files the log is kept in; the log is shortened a whole file at a time. Applies to files created from then on |
 | `--join` | `ROODB_JOIN` | (none) | `host:raft-port` of a member of the cluster to join (several, comma-separated). For a node starting on an empty data directory |
 
 ### TLS Requirements
@@ -302,8 +304,9 @@ no `--join`, and the option is ignored if given.
   that were open on the old primary are rolled back.
 - A node that was down restarts on its data directory with no special
   options, follows the current primary and catches up.
-- Still to come (see `doc/ROADMAP.md`): catching up a node that has fallen
-  too far behind for the log by snapshot.
+- A node that has been away for longer than the log reaches back, or that
+  joins late, is sent a copy of the data instead. (Today that copy is built
+  in memory and limited to 4 GiB; see `doc/ROADMAP.md`.)
 
 **Operating a cluster:**
 
@@ -319,7 +322,8 @@ SHOW CLUSTER MEMBERS;
 ALTER CLUSTER REMOVE NODE 3;
 ```
 
-A removed node is told, and stops. Its data directory is of no further use
+A removed node is told, and stops; one that was down at the time finds out
+when it is started, and refuses to run. Its data directory is of no further use
 to the cluster: to bring the machine back, empty the directory and start
 the node with `--join` again (it gets a new node ID). Remove a failed node
 that is not coming back, so that it no longer counts towards the majority

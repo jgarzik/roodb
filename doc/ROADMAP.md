@@ -24,43 +24,25 @@ multi-core machines.
 
 ## CLU — Cluster mode in the server binary
 
-The binary starts as a single-node Raft cluster. Multi-node Raft runs only
-inside the test process.
+Clusters work: nodes join a running server with `--join`, the leader is the
+primary and the others read-only secondaries, another node takes over when
+the primary fails, and nodes can be listed and removed. What is left:
 
-How a cluster is run (decided): the first node is initialised with
-`roodb_init` and started as today. Every further node starts on an empty
-data directory with `--join host:port` of any member; the cluster gives it
-its node ID, sends it the data, and makes it a voter. The leader is the
-primary; the other nodes are read-only secondaries, as in MySQL Group
-Replication's single-primary mode: they answer reads from their own applied
-state and refuse writes with error 1290.
-
-In order:
-
-- A node that joins before the first node has ever been restarted is
-  brought up by replaying the log from its start. The first node must also
-  be able to bring up a joiner after its log has been purged: by snapshot
-  (next item).
-- Snapshots for a node that is new or has fallen behind the log: a
-  point-in-time view of the storage engine (frozen memtables and table
-  files, held open for the transfer) streamed in chunks of any total size,
-  installed atomically on the receiver. Today a snapshot is the whole
-  keyspace in one message, limited to 4 GiB.
-- A node that was down when it was removed never hears of it and, when
-  started again, calls elections nobody answers: at start, a node asks the
-  members whether it still belongs, and stops if not.
+- Snapshots at any size. A node that is new or has fallen behind the log
+  is brought up by a snapshot today, but the snapshot is the whole keyspace
+  held in memory and sent as one message (4 GiB at most), and in a cluster
+  every checkpoint builds one, by scanning everything, whether or not
+  anyone needs it. Instead: a checkpoint in a cluster costs what it costs
+  on a single node; when a node needs the data, a point-in-time view of the
+  storage engine (frozen memtables and table files, held open for the
+  transfer) is streamed in chunks and installed atomically on the receiver.
 - Moving the primary role to another node on request (today the only way
   is to stop the primary).
 - Persistent RPC connections between nodes (today one connection per
   request).
-- Tests through the real binary still to write: the cluster tests on the
-  posix backend too; a secondary too far behind for the log caught up by
-  snapshot.
-- Documents: admin.md (deployment modes, cluster operations, new flags,
-  troubleshooting) rewritten from what the binary does; SQL.md (the two
-  statements, error 1290, read-only sessions); design.md and LOCKING.md
-  (Raft section); README.md (replication model); CONTRIBUTING.md (the
-  cluster tests).
+- admin.md: a troubleshooting section for clusters (no majority, a node
+  that cannot be reached at its advertised address, certificates from
+  different CAs); README.md: the replication model as it now is.
 
 ## PRF — Performance pass
 

@@ -130,7 +130,8 @@ cargo test --release test_name                       # one test, any binary
   it without warning and checks that acknowledged work is still there.
 - `restart.rs`: data written before a restart is usable after it.
 - `cluster_binary.rs`: clusters of real server processes, formed by nodes
-  joining a running server.
+  joining a running server: replication, read-only secondaries, failover,
+  catching up by log and by snapshot, removing a node.
 - `locking.rs`: row locking between connections, each test on a server of
   its own.
 - `raft_cluster.rs`, `cluster/`: Raft behaviour (bootstrap, election, log

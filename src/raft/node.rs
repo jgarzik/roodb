@@ -575,12 +575,53 @@ impl RaftNode {
             // what it holds. (What it does not hold yet arrives from the
             // leader; a secondary is always a little behind.)
             use openraft::async_runtime::WatchReceiver;
+            let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
             let mut metrics = self.raft.metrics();
-            let known = metrics.wait_until(|m| m.current_leader.is_some());
-            tokio::time::timeout(READY_TIMEOUT, known)
-                .await
-                .map_err(|_| RaftNodeError::Raft("no leader was found".to_string()))?
-                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+            // What this node remembers of its cluster is published a moment
+            // after it starts. (A node that has just been admitted has
+            // nothing to remember yet, and is not kept waiting long.)
+            let loaded = metrics.wait_until(|m| m.membership_config.nodes().next().is_some());
+            let _ = tokio::time::timeout(Duration::from_secs(2), loaded).await;
+            let peers: Vec<String> = self
+                .members()
+                .into_iter()
+                .filter(|(id, _, _)| *id != self.id)
+                .map(|(_, addr, _)| addr)
+                .collect();
+            let removed = || {
+                RaftNodeError::Raft(
+                    "this node has been removed from its cluster; to bring it back, \
+                     empty its data directory and start it with --join"
+                        .to_string(),
+                )
+            };
+            // Was this node taken out of the cluster while it was down? It
+            // would not know: what it remembers (its membership, even who
+            // led) is from before. So it asks before it serves anything.
+            if crate::raft::network::removed_from_cluster(&self.tls_config, self.id, &peers).await {
+                return Err(removed());
+            }
+            loop {
+                let known = metrics.wait_until(|m| m.current_leader.is_some());
+                match tokio::time::timeout(Duration::from_secs(3), known).await {
+                    Ok(found) => {
+                        found.map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+                        break;
+                    }
+                    Err(_) if tokio::time::Instant::now() >= deadline => {
+                        return Err(RaftNodeError::Raft("no leader was found".to_string()));
+                    }
+                    Err(_) => {}
+                }
+                // Nobody has claimed to lead this node. Perhaps the cluster
+                // is electing; perhaps this node has been taken out of it
+                // meanwhile. Ask again.
+                if crate::raft::network::removed_from_cluster(&self.tls_config, self.id, &peers)
+                    .await
+                {
+                    return Err(removed());
+                }
+            }
         }
         if self.is_alone() {
             let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
@@ -649,6 +690,7 @@ impl RaftNode {
             self.raft.clone(),
             self.alone.clone(),
             self.removed.clone(),
+            self.tls_config.clone(),
         ));
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();

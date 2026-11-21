@@ -410,3 +410,151 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
     )
     .await;
 }
+
+/// A node that needs more than the log still holds is brought up to date
+/// by a copy of the data: a secondary that was down while the primary
+/// wrote more than a log segment and shortened its log, and a node that
+/// joins after that.
+#[tokio::test]
+async fn a_node_behind_the_log_is_caught_up_by_snapshot() {
+    // A small log budget and small log files, so that the primary
+    // checkpoints and shortens its log after a few megabytes.
+    let mut first =
+        ServerProcess::init(&[("ROODB_LOG_BUDGET_MB", "1"), ("ROODB_LOG_SEGMENT_MB", "1")]);
+    first.start();
+    let mut primary = connect(&first).await;
+    primary
+        .query_drop("CREATE TABLE bulk (id INT PRIMARY KEY, pad TEXT)")
+        .await
+        .unwrap();
+    // Three nodes, so that the two left when one is down are a majority.
+    let mut second = first.joiner();
+    second.start();
+    let mut third = first.joiner();
+    third.start();
+    for node in [&second, &third] {
+        let mut conn = connect(node).await;
+        until_rows(&mut conn, node, "SELECT COUNT(*) FROM bulk", &[0]).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut primary)
+        .await
+        .iter()
+        .filter(|(_, _, role)| role != "LEARNER")
+        .count()
+        < 3
+    {
+        assert!(Instant::now() < deadline, "the joiners never became voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    second.kill();
+
+    // Several log files' worth of changes.
+    let pad = "p".repeat(100_000);
+    let rows = 60;
+    for id in 0..rows {
+        primary
+            .query_drop(format!("INSERT INTO bulk VALUES ({id}, '{pad}')"))
+            .await
+            .unwrap();
+    }
+    // Wait for the log to have been shortened: its first segment is gone.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while first
+        .log_segments()
+        .iter()
+        .any(|name| name.ends_with("0000000000000001.seg"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the log was never shortened: {:?}",
+            first.log_segments()
+        );
+        // One more commit gives the checkpoint task something to see.
+        primary
+            .query_drop("UPDATE bulk SET pad = 'x' WHERE id = 0")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The secondary that was away needs entries that no longer exist.
+    second.start();
+    let mut on_second = connect(&second).await;
+    until_rows(
+        &mut on_second,
+        &second,
+        "SELECT COUNT(*) FROM bulk",
+        &[rows],
+    )
+    .await;
+    let padded: Option<usize> = on_second
+        .query_first("SELECT LENGTH(pad) FROM bulk WHERE id = 50")
+        .await
+        .unwrap();
+    assert_eq!(padded, Some(100_000));
+
+    // So does a node that joins now.
+    let mut fourth = first.joiner();
+    fourth.start();
+    let mut on_fourth = connect(&fourth).await;
+    until_rows(
+        &mut on_fourth,
+        &fourth,
+        "SELECT COUNT(*) FROM bulk",
+        &[rows],
+    )
+    .await;
+    // And both follow the log from there.
+    primary
+        .query_drop("INSERT INTO bulk VALUES (100000, 'after')")
+        .await
+        .unwrap();
+    for (conn, node) in [(&mut on_second, &second), (&mut on_fourth, &fourth)] {
+        until_rows(conn, node, "SELECT COUNT(*) FROM bulk", &[rows + 1]).await;
+    }
+}
+
+/// A node that was down when it was taken out of the cluster finds out when
+/// it is started again, and refuses to run.
+#[tokio::test]
+async fn a_node_removed_while_down_does_not_come_back() {
+    let [first, second, third] = cluster_of_three().await;
+    let mut primary = connect(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut primary)
+        .await
+        .iter()
+        .filter(|(_, _, role)| role == "SECONDARY")
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "the joiners never became voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let third_is_3 = members(&mut primary)
+        .await
+        .iter()
+        .any(|(id, addr, _)| *id == 3 && *addr == third.raft_addr());
+    let (mut gone, _kept) = if third_is_3 {
+        (third, second)
+    } else {
+        (second, third)
+    };
+    gone.kill();
+    primary
+        .query_drop("ALTER CLUSTER REMOVE NODE 3")
+        .await
+        .unwrap();
+
+    let log = gone.start_expecting_exit();
+    assert!(
+        log.contains("removed from its cluster"),
+        "the node did not say why it stopped:\n{log}"
+    );
+    // The cluster is unaffected.
+    primary
+        .query_drop("INSERT INTO formed VALUES (7)")
+        .await
+        .unwrap();
+}

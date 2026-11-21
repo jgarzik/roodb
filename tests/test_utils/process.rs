@@ -113,9 +113,8 @@ impl ServerProcess {
         self.data_dir.path().join("server.log")
     }
 
-    /// Start the server and wait until it accepts connections.
-    pub fn start(&mut self) {
-        assert!(self.child.is_none(), "server already running");
+    /// Start the server process, without waiting for anything.
+    fn spawn(&self) -> Child {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -145,7 +144,32 @@ impl ServerProcess {
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        let mut child = command.spawn().expect("spawn roodb");
+        command.spawn().expect("spawn roodb")
+    }
+
+    /// Start a server that is expected to refuse to run, wait for it to
+    /// exit, and return what it logged.
+    pub fn start_expecting_exit(&mut self) -> String {
+        assert!(self.child.is_none(), "server already running");
+        // Kept, so that it is killed with this value if it does not exit.
+        self.child = Some(self.spawn());
+        let start = Instant::now();
+        while !self.has_exited() {
+            assert!(
+                start.elapsed() < STARTUP_TIMEOUT * 2,
+                "the server is still running:\n{}",
+                self.log_tail()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.child = None;
+        self.log_tail()
+    }
+
+    /// Start the server and wait until it accepts connections.
+    pub fn start(&mut self) {
+        assert!(self.child.is_none(), "server already running");
+        let mut child = self.spawn();
 
         let start = Instant::now();
         loop {
@@ -181,6 +205,21 @@ impl ServerProcess {
         let log = std::fs::read_to_string(self.log_path()).unwrap_or_default();
         let start = log.len().saturating_sub(4000);
         log[log.ceil_char_boundary(start)..].to_string()
+    }
+
+    /// Names of the segment files of the server's log.
+    pub fn log_segments(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.data_dir.path().join("raft"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("log-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     /// Whether the server has exited by itself.

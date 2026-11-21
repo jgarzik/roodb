@@ -55,6 +55,48 @@ enum MessageType {
     SnapshotResponse = 6,
     Join = 7,
     Removed = 8,
+    Members = 9,
+}
+
+/// What a node says when asked who is in the cluster.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MembersReply {
+    /// The node answering.
+    pub node_id: NodeId,
+    /// Who it believes leads.
+    pub leader: Option<NodeId>,
+    /// The nodes of the membership it has.
+    pub members: Vec<NodeId>,
+}
+
+/// Ask the node at `addr` who is in the cluster.
+pub async fn ask_members(tls_config: &RaftTlsConfig, addr: &str) -> Result<MembersReply, String> {
+    let connection = RaftNetworkConnection {
+        target: 0,
+        addr: Some(addr.to_string()),
+        tls_config: tls_config.clone(),
+    };
+    connection
+        .send_request(MessageType::Members, &(), std::time::Duration::from_secs(5))
+        .await
+}
+
+/// Whether the node `id` has been taken out of its cluster: some node among
+/// `peers` that is itself the leader has a membership without it. Only the
+/// leader's word counts: it is the one that knows the current membership.
+pub async fn removed_from_cluster(
+    tls_config: &RaftTlsConfig,
+    id: NodeId,
+    peers: &[String],
+) -> bool {
+    for peer in peers {
+        if let Ok(reply) = ask_members(tls_config, peer).await {
+            if reply.leader == Some(reply.node_id) && !reply.members.contains(&id) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Tell the node at `addr` that it has been taken out of the cluster. The
@@ -134,6 +176,7 @@ impl TryFrom<u8> for MessageType {
             6 => Ok(Self::SnapshotResponse),
             7 => Ok(Self::Join),
             8 => Ok(Self::Removed),
+            9 => Ok(Self::Members),
             _ => Err(()),
         }
     }
@@ -337,6 +380,8 @@ pub struct RaftRpcHandler {
     alone: Arc<std::sync::atomic::AtomicBool>,
     /// Signalled when this node is told it has been removed.
     removed: Arc<tokio::sync::Notify>,
+    /// For asking other nodes whether that is true.
+    tls_config: RaftTlsConfig,
 }
 
 impl RaftRpcHandler {
@@ -344,12 +389,28 @@ impl RaftRpcHandler {
         raft: crate::raft::types::Raft,
         alone: Arc<std::sync::atomic::AtomicBool>,
         removed: Arc<tokio::sync::Notify>,
+        tls_config: RaftTlsConfig,
     ) -> Self {
         Self {
             raft,
             alone,
             removed,
+            tls_config,
         }
+    }
+
+    /// This node and the addresses of the other nodes it knows of.
+    fn peers(&self) -> (NodeId, Vec<String>) {
+        use openraft::async_runtime::WatchReceiver;
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let peers = metrics
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| **id != metrics.id)
+            .map(|(_, node)| node.addr.clone())
+            .collect();
+        (metrics.id, peers)
     }
 
     /// Admit a node that asks to join: give it a node ID, add it as a
@@ -466,20 +527,37 @@ impl RaftRpcHandler {
                 Ok(Bytes::from(encoded))
             }
             MessageType::Removed => {
-                // Only a node that is really out acts on it: a stray or
-                // forged message must not stop a member. The leader sends
-                // this after the removal is committed, so by the time it is
-                // believed here the cluster no longer counts on this node.
+                // The message is a hint, not an order: a stray or forged
+                // one must not stop a member. The node asks the leader
+                // itself, and stops only if the leader's membership no
+                // longer has it.
+                let (id, peers) = self.peers();
+                let tls_config = self.tls_config.clone();
+                let removed = self.removed.clone();
+                tokio::spawn(async move {
+                    if removed_from_cluster(&tls_config, id, &peers).await {
+                        removed.notify_one();
+                    }
+                });
+                let encoded = bincode::serialize(&true).map_err(|e| e.to_string())?;
+                Ok(Bytes::from(encoded))
+            }
+            MessageType::Members => {
                 use openraft::async_runtime::WatchReceiver;
-                let still_led = {
+                let reply = {
                     let metrics = self.raft.metrics();
                     let metrics = metrics.borrow_watched();
-                    metrics.state.is_leader()
+                    MembersReply {
+                        node_id: metrics.id,
+                        leader: metrics.current_leader,
+                        members: metrics
+                            .membership_config
+                            .nodes()
+                            .map(|(id, _)| *id)
+                            .collect(),
+                    }
                 };
-                if !still_led {
-                    self.removed.notify_one();
-                }
-                let encoded = bincode::serialize(&true).map_err(|e| e.to_string())?;
+                let encoded = bincode::serialize(&reply).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }
             MessageType::Join => {

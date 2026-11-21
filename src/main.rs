@@ -56,6 +56,15 @@ struct Cli {
     /// (default: the bind address)
     #[arg(long, env = "ROODB_ADVERTISE_HOST")]
     advertise_host: Option<String>,
+    /// How much log (in MiB) may accumulate before memory is written out
+    /// to table files so that the log can be shortened. It bounds the disk
+    /// the log uses and the work a restart has to replay.
+    #[arg(long, default_value = "256", env = "ROODB_LOG_BUDGET_MB")]
+    log_budget_mb: u64,
+    /// Size (in MiB) of the files the log is kept in. The log is shortened
+    /// a whole file at a time.
+    #[arg(long, default_value = "64", env = "ROODB_LOG_SEGMENT_MB")]
+    log_segment_mb: u64,
 }
 
 /// The file in the data directory that holds this node's ID.
@@ -111,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         join,
         raft_port,
         advertise_host,
+        log_budget_mb,
+        log_segment_mb,
     } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
@@ -196,7 +207,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Raft log: the server's write-ahead log.
     let log_store = LogStore::open(
         io.clone(),
-        LogStoreConfig::for_data_dir(&data_dir, durability),
+        LogStoreConfig {
+            segment_bytes: log_segment_mb.max(1) << 20,
+            ..LogStoreConfig::for_data_dir(&data_dir, durability)
+        },
     )
     .await?;
     tracing::info!(%durability, "Raft log opened");
@@ -217,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     raft_node.set_advertised_addr(advertised_raft_addr);
+    raft_node.set_log_budget(log_budget_mb.max(1) << 20);
 
     // Set node ID for globally unique row ID generation
     set_node_id(node_id);
