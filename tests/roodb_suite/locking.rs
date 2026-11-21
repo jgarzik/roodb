@@ -663,3 +663,24 @@ async fn a_locking_read_locks_the_range_it_read() {
     let ids: Vec<i32> = a.query("SELECT id FROM rg ORDER BY id").await.unwrap();
     assert_eq!(ids, [5, 10, 17, 20, 30, 35, 40, 45]);
 }
+
+/// BEGIN inside a transaction commits it and starts another.
+#[tokio::test]
+async fn begin_commits_the_open_transaction() {
+    let (_server, mut a, mut b) = start().await;
+    a.query_drop("CREATE TABLE bg (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("INSERT INTO bg VALUES (1)").await.unwrap();
+    // A statement that fails does not end the transaction...
+    assert!(a.query_drop("INSERT INTO bg VALUES (1)").await.is_err());
+    // ...and beginning again commits what it had done.
+    a.query_drop("START TRANSACTION").await.unwrap();
+    let seen: Vec<i32> = b.query("SELECT id FROM bg").await.unwrap();
+    assert_eq!(seen, [1]);
+    a.query_drop("INSERT INTO bg VALUES (2)").await.unwrap();
+    a.query_drop("ROLLBACK").await.unwrap();
+    let seen: Vec<i32> = b.query("SELECT id FROM bg").await.unwrap();
+    assert_eq!(seen, [1]);
+}

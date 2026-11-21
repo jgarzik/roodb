@@ -671,7 +671,7 @@ supported. Other window functions (`PERCENT_RANK`, `CUME_DIST`,
 
 | Statement | Description |
 |-----------|-------------|
-| `BEGIN`, `START TRANSACTION` | Start a transaction (error 1568 if one is open). Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
+| `BEGIN`, `START TRANSACTION` | Start a transaction. If one is open it is committed first. Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
 | `COMMIT` | Commit. Without an open transaction, no effect |
 | `ROLLBACK` | Discard the transaction's changes |
 | `SET autocommit = {0 \| 1 \| ON \| OFF}` | See below |
@@ -975,7 +975,7 @@ returns most often:
 | 1292 | 22007 | Truncated incorrect value |
 | 1295 | HY000 | Statement cannot be prepared with parameters |
 | 3572 | HY000 | A row was locked and the statement said `NOWAIT` |
-| 1568 | HY000 | Transaction already in progress, or isolation level changed inside one |
+| 1568 | HY000 | Isolation level changed inside a transaction |
 | 1063, 1074, 1425, 1427 | 42000 | Invalid column type specification |
 
 Several conditions that have a dedicated code in MySQL (unknown procedure,

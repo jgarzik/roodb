@@ -1351,15 +1351,13 @@ impl QueryEngine {
 
     /// Handle BEGIN / START TRANSACTION
     async fn handle_begin(&mut self) -> ProtocolResult<()> {
-        // Check if already in a transaction
+        // Starting a transaction ends the one that is open, by committing
+        // it, as in MySQL. Clients rely on it: after a statement fails
+        // inside a transaction they simply begin again.
         if self.session.in_transaction() {
-            return self
-                .send_error(
-                    codes::ER_CANT_CHANGE_TX_CHARACTERISTICS,
-                    states::GENERAL_ERROR,
-                    "Transaction already in progress",
-                )
-                .await;
+            if let Err(e) = self.commit_open_transaction().await {
+                return self.send_commit_error(&e).await;
+            }
         }
 
         // Read-only mode (replica) requires read-only transactions
