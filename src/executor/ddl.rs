@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 use crate::catalog::system_tables::{
     index_def_to_row, is_system_table, table_def_to_columns_rows, table_def_to_constraints_rows,
     table_def_to_tables_row, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_INDEXES, SYSTEM_TABLES,
+    SYSTEM_TRIGGERS,
 };
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
@@ -397,6 +398,41 @@ impl Executor for DropTable {
                                 row_data.to_vec(),
                             ));
                         }
+                    }
+                }
+            }
+
+            // The table's indexes and triggers go with it. Their rows name
+            // the table in the second column. Left behind, they would come
+            // back with the next table of this name.
+            for system_table in [SYSTEM_INDEXES, SYSTEM_TRIGGERS] {
+                let prefix = super::encoding::table_key_prefix(system_table);
+                let end = super::encoding::table_key_end(system_table);
+                let rows = mvcc
+                    .scan_raw(&prefix, &end)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                for (key, value) in rows {
+                    if crate::raft::is_mvcc_tombstone(&value)
+                        || value.len() <= crate::raft::MVCC_HEADER_SIZE
+                    {
+                        continue;
+                    }
+                    let row_data = &value[crate::raft::MVCC_HEADER_SIZE..];
+                    let Ok(row) = super::encoding::decode_row(row_data) else {
+                        continue;
+                    };
+                    if matches!(row.values().get(1), Some(Datum::String(t)) if t == &self.name) {
+                        changeset.push(RowChange::delete_with_value(
+                            system_table,
+                            key.clone(),
+                            row_data.to_vec(),
+                        ));
+                        self.changes.push(RowChange::delete_with_value(
+                            system_table,
+                            key,
+                            row_data.to_vec(),
+                        ));
                     }
                 }
             }

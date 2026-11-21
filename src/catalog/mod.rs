@@ -326,6 +326,54 @@ pub struct TriggerDef {
     pub create_sql: String,
 }
 
+impl TriggerDef {
+    /// Build a trigger from its `CREATE TRIGGER` statement:
+    /// `CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table
+    /// FOR EACH ROW body`. The statement is what is stored; this is how it
+    /// is turned back into a trigger when the catalog is rebuilt.
+    pub fn from_create_sql(sql: &str) -> Result<Self, String> {
+        let sql_clean = sql.trim().trim_end_matches(';');
+        let upper = sql_clean.to_uppercase();
+
+        const FOR_EACH_ROW: &str = "FOR EACH ROW";
+        let fer_pos = upper
+            .find(FOR_EACH_ROW)
+            .ok_or_else(|| "CREATE TRIGGER requires FOR EACH ROW".to_string())?;
+        let header = sql_clean[..fer_pos].trim();
+        let body_sql = sql_clean[fer_pos + FOR_EACH_ROW.len()..].trim();
+
+        // CREATE TRIGGER name BEFORE INSERT ON table
+        let tokens: Vec<&str> = header.split_whitespace().collect();
+        if tokens.len() < 7 {
+            return Err("Invalid CREATE TRIGGER syntax".to_string());
+        }
+        let name = tokens[2].trim_matches('`').to_string();
+        let table_name = tokens[6].trim_matches('`').to_string();
+        let timing = match tokens[3].to_uppercase().as_str() {
+            "BEFORE" => TriggerTiming::Before,
+            "AFTER" => TriggerTiming::After,
+            other => return Err(format!("Expected BEFORE or AFTER, got '{other}'")),
+        };
+        let event = match tokens[4].to_uppercase().as_str() {
+            "INSERT" => TriggerEvent::Insert,
+            "UPDATE" => TriggerEvent::Update,
+            "DELETE" => TriggerEvent::Delete,
+            other => return Err(format!("Expected INSERT, UPDATE, or DELETE, got '{other}'")),
+        };
+        let body = crate::sql::Parser::parse_one(body_sql)
+            .map_err(|e| format!("Parse error in trigger body: {e}"))?;
+
+        Ok(Self {
+            name,
+            table_name,
+            timing,
+            event,
+            body,
+            create_sql: sql.to_string(),
+        })
+    }
+}
+
 /// Catalog error
 #[derive(Debug, Clone)]
 pub enum CatalogError {
@@ -829,6 +877,23 @@ impl Catalog {
         }
         self.schema_version += 1;
         Ok(())
+    }
+
+    /// Whether a trigger of this name exists.
+    pub fn has_trigger(&self, name: &str) -> bool {
+        self.triggers.contains_key(name)
+    }
+
+    /// Forget every trigger (before rebuilding them from the system tables).
+    pub fn clear_triggers(&mut self) {
+        self.triggers.clear();
+        self.schema_version += 1;
+    }
+
+    /// Forget the triggers of one table (when it is dropped).
+    pub fn drop_triggers_of_table(&mut self, table_name: &str) {
+        self.triggers.retain(|_, t| t.table_name != table_name);
+        self.schema_version += 1;
     }
 
     /// Get triggers for a specific table, timing, and event

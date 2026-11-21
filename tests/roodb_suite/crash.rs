@@ -462,3 +462,67 @@ async fn temporary_table_rows_do_not_outlive_their_session() {
         .await
         .unwrap();
 }
+
+/// Triggers are schema like the rest: they come back after a kill, a dropped
+/// one stays dropped, and dropping a table drops its triggers.
+#[tokio::test]
+async fn triggers_survive_a_kill() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    for stmt in [
+        "CREATE TABLE src (id INT PRIMARY KEY)",
+        "CREATE TABLE log (id INT PRIMARY KEY)",
+        "CREATE TABLE log2 (id INT PRIMARY KEY)",
+        "CREATE TRIGGER trg_keep AFTER INSERT ON src FOR EACH ROW INSERT INTO log VALUES (NEW.id)",
+        "CREATE TRIGGER trg_drop AFTER INSERT ON src FOR EACH ROW INSERT INTO log2 VALUES (NEW.id)",
+        "INSERT INTO src VALUES (1)",
+        "DROP TRIGGER trg_drop",
+        "CREATE TABLE doomed (id INT PRIMARY KEY)",
+        "CREATE TRIGGER trg_doomed AFTER INSERT ON doomed FOR EACH ROW INSERT INTO log2 VALUES (NEW.id + 100)",
+        "DROP TABLE doomed",
+        "CREATE TABLE doomed (id INT PRIMARY KEY)",
+    ] {
+        conn.query_drop(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("`{stmt}` failed: {e}"));
+    }
+    // A second trigger of the same name is refused.
+    assert!(conn
+        .query_drop("CREATE TRIGGER trg_keep AFTER INSERT ON src FOR EACH ROW INSERT INTO log2 VALUES (NEW.id)")
+        .await
+        .is_err());
+    drop(conn);
+    server.kill();
+
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("INSERT INTO src VALUES (2)")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", server.log_tail()));
+    conn.query_drop("INSERT INTO doomed VALUES (7)")
+        .await
+        .unwrap();
+    let logged: Vec<i32> = conn.query("SELECT id FROM log ORDER BY id").await.unwrap();
+    assert_eq!(logged, [1, 2], "the trigger did not survive the restart");
+    let logged2: Vec<i32> = conn.query("SELECT id FROM log2 ORDER BY id").await.unwrap();
+    assert_eq!(
+        logged2,
+        [1],
+        "a dropped trigger, or one of a dropped table, fired after the restart"
+    );
+
+    // Dropping after a restart finds the stored trigger.
+    conn.query_drop("DROP TRIGGER trg_keep").await.unwrap();
+    assert!(conn.query_drop("DROP TRIGGER trg_keep").await.is_err());
+    conn.query_drop("DROP TRIGGER IF EXISTS trg_keep")
+        .await
+        .unwrap();
+    drop(conn);
+    server.kill();
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("INSERT INTO src VALUES (3)").await.unwrap();
+    let logged: Vec<i32> = conn.query("SELECT id FROM log ORDER BY id").await.unwrap();
+    assert_eq!(logged, [1, 2]);
+}

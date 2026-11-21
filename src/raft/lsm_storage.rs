@@ -18,9 +18,9 @@ use openraft::{EntryPayload, OptionalSend};
 use parking_lot::RwLock;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, row_to_procedure_def, row_to_view_def, rows_to_constraints,
-    rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES,
-    SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_VIEWS,
+    is_system_table, row_to_index_def, row_to_procedure_def, row_to_trigger_def, row_to_view_def,
+    rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES,
+    SYSTEM_INDEXES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -642,6 +642,28 @@ impl LsmRaftStorage {
             }
         }
 
+        // Scan system.triggers to rebuild triggers
+        let mut trigger_defs: Vec<crate::catalog::TriggerDef> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_TRIGGERS);
+            let end = table_key_end(SYSTEM_TRIGGERS);
+            let rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+            for (_key, value) in rows {
+                let Some(row_data) = extract_row_data(&value) else {
+                    continue;
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(trigger) = row_to_trigger_def(&row) {
+                        trigger_defs.push(trigger);
+                    }
+                }
+            }
+        }
+
         // Update catalog (clear and rebuild)
         let mut catalog = self.catalog.write();
 
@@ -679,6 +701,12 @@ impl LsmRaftStorage {
         for proc_def in procedure_defs {
             tracing::debug!(procedure = %proc_def.name, "Rebuilding procedure from snapshot");
             catalog.register_procedure(proc_def);
+        }
+
+        // Rebuild triggers
+        catalog.clear_triggers();
+        for trigger in trigger_defs {
+            catalog.create_trigger(trigger);
         }
 
         // Rebuild views
@@ -941,6 +969,17 @@ impl LsmRaftStorage {
                     } else {
                         catalog.register_procedure(proc_def);
                     }
+                }
+            }
+        } else if table == SYSTEM_TRIGGERS {
+            // Trigger changes - update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if is_delete {
+                    if let Some(crate::executor::Datum::String(name)) = row.values().first() {
+                        let _ = self.catalog.write().drop_trigger(name);
+                    }
+                } else if let Some(trigger) = row_to_trigger_def(&row) {
+                    self.catalog.write().create_trigger(trigger);
                 }
             }
         } else if table == SYSTEM_VIEWS {

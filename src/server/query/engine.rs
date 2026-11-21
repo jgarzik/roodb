@@ -3687,131 +3687,65 @@ impl QueryEngine {
     /// SQL statement via sqlparser. The body AST is stored in the catalog and
     /// executed during DML with NEW/OLD column substitutions.
     async fn handle_create_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
-        use crate::catalog::{TriggerDef, TriggerEvent, TriggerTiming};
+        use crate::catalog::system_tables::{trigger_def_to_row, SYSTEM_TRIGGERS};
+        use crate::catalog::TriggerDef;
+        use crate::executor::encoding::{encode_row, encode_row_key};
+        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
-        let sql_clean = sql.trim().trim_end_matches(';');
-        let upper = sql_clean.to_uppercase();
-
-        // Find "FOR EACH ROW" to split header from body
-        let fer_pos = match upper.find("FOR EACH ROW") {
-            Some(p) => p,
-            None => {
+        let def = match TriggerDef::from_create_sql(sql) {
+            Ok(def) => def,
+            Err(message) => {
                 return self
-                    .send_error(
-                        codes::ER_PARSE_ERROR,
-                        states::SYNTAX_ERROR,
-                        "CREATE TRIGGER requires FOR EACH ROW",
-                    )
+                    .send_error(codes::ER_PARSE_ERROR, states::SYNTAX_ERROR, &message)
                     .await;
             }
         };
-
-        let header = sql_clean[..fer_pos].trim();
-        let body_sql = sql_clean[fer_pos + 12..].trim(); // 12 = "FOR EACH ROW".len()
-
-        // Parse header tokens: CREATE TRIGGER name BEFORE INSERT ON table
-        let tokens: Vec<&str> = header.split_whitespace().collect();
-        if tokens.len() < 7 {
+        if self.catalog.read().has_trigger(&def.name) {
             return self
                 .send_error(
-                    codes::ER_PARSE_ERROR,
-                    states::SYNTAX_ERROR,
-                    "Invalid CREATE TRIGGER syntax",
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Trigger '{}' already exists", def.name),
                 )
                 .await;
         }
 
-        let name = tokens[2].trim_matches('`').to_string();
-        let timing_str = tokens[3].to_uppercase();
-        let event_str = tokens[4].to_uppercase();
-        let table_name = tokens[6].trim_matches('`').to_string();
-
-        let timing = match timing_str.as_str() {
-            "BEFORE" => TriggerTiming::Before,
-            "AFTER" => TriggerTiming::After,
-            _ => {
-                return self
-                    .send_error(
-                        codes::ER_PARSE_ERROR,
-                        states::SYNTAX_ERROR,
-                        &format!("Expected BEFORE or AFTER, got '{}'", timing_str),
-                    )
-                    .await;
-            }
-        };
-
-        let event = match event_str.as_str() {
-            "INSERT" => TriggerEvent::Insert,
-            "UPDATE" => TriggerEvent::Update,
-            "DELETE" => TriggerEvent::Delete,
-            _ => {
-                return self
-                    .send_error(
-                        codes::ER_PARSE_ERROR,
-                        states::SYNTAX_ERROR,
-                        &format!("Expected INSERT, UPDATE, or DELETE, got '{}'", event_str),
-                    )
-                    .await;
-            }
-        };
-
-        // Parse body as a standalone SQL statement through the full parser
-        let body = match crate::sql::Parser::parse_one(body_sql) {
-            Ok(stmt) => stmt,
+        // A trigger is schema: it is stored in a system table through Raft
+        // like the rest, and the catalog picks it up when that is applied.
+        let (local_id, node_id) = allocate_row_id_batch(1);
+        let key = encode_row_key(SYSTEM_TRIGGERS, encode_row_id(local_id, node_id));
+        let value = encode_row(&trigger_def_to_row(&def));
+        let changeset =
+            ChangeSet::new_with_changes(0, vec![RowChange::insert(SYSTEM_TRIGGERS, key, value)]);
+        match self.raft_node.propose_changes(changeset).await {
+            Ok(()) => self.send_ok(0, 0).await,
             Err(e) => {
-                return self
-                    .send_error(
-                        codes::ER_PARSE_ERROR,
-                        states::SYNTAX_ERROR,
-                        &format!("Parse error in trigger body: {}", e),
-                    )
-                    .await;
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Failed to create trigger: {}", e),
+                )
+                .await
             }
-        };
-
-        let def = TriggerDef {
-            name,
-            table_name,
-            timing,
-            event,
-            body,
-            create_sql: sql.to_string(),
-        };
-
-        {
-            let mut catalog = self.catalog.write();
-            catalog.create_trigger(def);
         }
-
-        self.send_ok(0, 0).await
     }
 
-    /// Handle DROP TRIGGER — parse and remove from catalog
+    /// Handle DROP TRIGGER: delete its row from system.triggers through Raft.
     async fn handle_drop_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
+        use crate::catalog::system_tables::SYSTEM_TRIGGERS;
+        use crate::executor::encoding::decode_row;
+
         let upper = sql.to_uppercase();
         let if_exists = upper.contains("IF EXISTS");
 
         // Extract trigger name: DROP TRIGGER [IF EXISTS] name
+        let statement = sql.trim_end_matches(';').trim();
         let name_part = if if_exists {
-            sql.trim_end_matches(';')
-                .trim()
-                .rsplit("EXISTS")
-                .next()
-                .unwrap_or("")
-                .trim()
+            let at = upper.find("EXISTS").map_or(0, |p| p + "EXISTS".len());
+            statement.get(at..).unwrap_or("").trim()
         } else {
-            sql.trim_end_matches(';')
-                .trim()
-                .strip_prefix("DROP TRIGGER ")
-                .or_else(|| {
-                    sql.trim_end_matches(';')
-                        .trim()
-                        .strip_prefix("drop trigger ")
-                })
-                .unwrap_or("")
-                .trim()
+            statement.get("DROP TRIGGER ".len()..).unwrap_or("").trim()
         };
-
         let trigger_name = name_part.trim_matches('`').trim_matches('"');
 
         if trigger_name.is_empty() {
@@ -3824,19 +3758,57 @@ impl QueryEngine {
                 .await;
         }
 
-        let result = {
-            let mut catalog = self.catalog.write();
-            catalog.drop_trigger(trigger_name)
-        };
+        // Find the trigger's row.
+        let prefix = crate::executor::encoding::table_key_prefix(SYSTEM_TRIGGERS);
+        let end = crate::executor::encoding::table_key_end(SYSTEM_TRIGGERS);
+        let rows = self
+            .mvcc
+            .scan_raw(&prefix, &end)
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
+        let mut changes = Vec::new();
+        for (key, value) in rows {
+            if crate::raft::is_mvcc_tombstone(&value)
+                || value.len() <= crate::raft::MVCC_HEADER_SIZE
+            {
+                continue;
+            }
+            let row_data = &value[crate::raft::MVCC_HEADER_SIZE..];
+            if let Ok(row) = decode_row(row_data) {
+                if matches!(row.values().first(), Some(Datum::String(name)) if name == trigger_name)
+                {
+                    changes.push(RowChange::delete_with_value(
+                        SYSTEM_TRIGGERS,
+                        key,
+                        row_data.to_vec(),
+                    ));
+                }
+            }
+        }
 
-        match result {
-            Ok(()) => self.send_ok(0, 0).await,
-            Err(_) if if_exists => self.send_ok(0, 0).await,
-            Err(e) => {
-                self.send_error(
+        if changes.is_empty() {
+            if if_exists {
+                return self.send_ok(0, 0).await;
+            }
+            return self
+                .send_error(
                     codes::ER_NO_SUCH_TABLE,
                     states::NO_SUCH_TABLE,
-                    &format!("{}", e),
+                    &format!("Trigger '{}' not found", trigger_name),
+                )
+                .await;
+        }
+        match self
+            .raft_node
+            .propose_changes(ChangeSet::new_with_changes(0, changes))
+            .await
+        {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(e) => {
+                self.send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &format!("Failed to drop trigger: {}", e),
                 )
                 .await
             }
