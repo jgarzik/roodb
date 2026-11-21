@@ -216,17 +216,12 @@ async fn test_reset_connection() {
     let tokens = client.batch("BEGIN").await;
     assert_eq!(env_changes(&tokens), vec![ENV_BEGIN_TRAN], "{tokens:?}");
 
-    // Reset keeping the transaction: it is still open, so BEGIN has one to
-    // commit before it starts another.
+    // Reset keeping the transaction: BEGIN fails, a transaction is open.
     let tokens = client
         .batch_with_status("BEGIN", STATUS_RESET_CONNECTION_SKIP_TRAN)
         .await;
-    assert!(errors(&tokens).is_empty(), "{tokens:?}");
-    assert_eq!(
-        env_changes(&tokens),
-        vec![ENV_RESET_CONNECTION, ENV_COMMIT_TRAN, ENV_BEGIN_TRAN],
-        "{tokens:?}"
-    );
+    assert_eq!(env_changes(&tokens)[0], ENV_RESET_CONNECTION, "{tokens:?}");
+    assert_eq!(errors(&tokens).len(), 1, "{tokens:?}");
 
     // Full reset: the open transaction is rolled back first, so BEGIN
     // succeeds, and the reset is acknowledged before anything else.
@@ -237,7 +232,6 @@ async fn test_reset_connection() {
     let changes = env_changes(&tokens);
     assert_eq!(changes[0], ENV_RESET_CONNECTION, "{tokens:?}");
     assert!(changes.contains(&ENV_BEGIN_TRAN), "{tokens:?}");
-    assert!(!changes.contains(&ENV_COMMIT_TRAN), "{tokens:?}");
 
     client.batch("ROLLBACK").await;
     server.shutdown().await;

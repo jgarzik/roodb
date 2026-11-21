@@ -23,31 +23,18 @@ multi-core machines.
 
 ## LCK — Row locking: close out
 
-Row, gap and locking-read locks are in. What a review of them found:
+Row, gap and locking-read locks are in and reviewed.
 
-- A lookup with `FOR UPDATE` that finds no row gives its record lock back
-  before it has locked the gap; an insert can slip in between.
-- A scan that locks a range does not wait for rows another transaction has
-  inserted there but not yet committed: it neither sees them nor waits on
-  their locks, and they appear after it has "locked" the range.
-- `INSERT` into a table without a primary key ignores gap locks.
-- `UPDATE` that changes a row's primary key takes no lock on the new key,
-  does not wait for gap locks there, and finds a duplicate only at commit.
-- A transaction that locked the gap around a missing key and then inserts
-  the key is chosen as deadlock victim when another insert of that key is
-  waiting. The waiting insert must not hold the row lock while it waits.
-- A deadlock inside a stored procedure or trigger body is reported as error
-  1105 and does not roll the transaction back.
-- Over TDS, a nested `BEGIN TRAN` now commits the outer transaction (the
-  MySQL behaviour). T-SQL nesting must not commit.
-- `FOR UPDATE OF alias` locks nothing: the name is compared with table
-  names, not resolved through the query's aliases. An unknown name should
-  be error 3568.
-- Finding the neighbour of a key steps over storage-level deletions one at a
-  time and checks its bound only at the end.
-- SQL.md says `REPLACE` and `LOAD DATA` take no locks; they do.
+- T-SQL transaction nesting over TDS: a nested `BEGIN TRAN` is refused
+  today; it should count levels, with only the outermost commit committing.
+- `FOR UPDATE OF` takes one table name; MySQL allows a list.
+- Finding the neighbour of a key still steps over storage-level deletions
+  one at a time (it now stops at its bound); make it a merge over the
+  sources.
+- The test server helper occasionally reports the server as started before
+  it accepts connections ("connection refused" in a locking test, once).
 
-Then: benchmark at 1, 16 and 64 threads on a quiet machine, both durability
+Benchmark at 1, 16 and 64 threads on a quiet machine, both durability
 modes, against MySQL; confirm single-thread throughput did not regress.
 
 ## CLU — Cluster mode in the server binary

@@ -236,6 +236,14 @@ rows (`MvccStorage::gap_around`, built on the storage engine's `next_key` /
 COMMITTED there are no gap locks, and a scanned row that does not match is
 unlocked at once (`unlock_record`).
 
+A statement that locks a range also locks the keys in it that other
+transactions hold record locks on (`LockManager::others_locked_in`): a row
+being inserted is not stored yet, and waiting on its key is how the reader
+waits for it. An insert (or an `UPDATE` that changes the primary key) locks
+its key, then checks the gap, and if the gap is locked gives the key back
+before it waits (`TransactionContext::lock_for_insert`): the gap's holder
+may want that key, and comes first.
+
 `SELECT ... FOR UPDATE` / `FOR SHARE` lock in the scan executors
 (`TableScan`, `RangeScan`, `PointGet`) through
 `TransactionContext::locking_scan` / `locked_read`: gap first, then each row,

@@ -779,7 +779,16 @@ impl Inner {
     /// its own nearest entry, and the nearest of those is the answer unless
     /// the newest entry for that key is a tombstone, in which case the
     /// search goes on from there.
-    async fn seek(&self, key: &[u8], forward: bool) -> StorageResult<Option<Vec<u8>>> {
+    ///
+    /// The search stops at `bound`: a key at or past `bound` going forward,
+    /// or before it going backward, is not an answer, and nothing beyond it
+    /// is looked at.
+    async fn seek(
+        &self,
+        key: &[u8],
+        forward: bool,
+        bound: &[u8],
+    ) -> StorageResult<Option<Vec<u8>>> {
         let sources = self.read_sources()?;
         let mut from = key.to_vec();
         loop {
@@ -812,8 +821,16 @@ impl Inner {
                     table.prev_before(&from).await?
                 });
             }
+            let within = |found: &[u8]| {
+                if forward {
+                    found < bound
+                } else {
+                    found >= bound
+                }
+            };
             match nearest {
                 None => return Ok(None),
+                Some((found, _)) if !within(&found) => return Ok(None),
                 Some((found, false)) => return Ok(Some(found)),
                 // Deleted: look past it.
                 Some((found, true)) => from = found,
@@ -958,20 +975,12 @@ impl StorageEngine for LsmEngine {
 
     async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.inner.check_open()?;
-        Ok(self
-            .inner
-            .seek(key, true)
-            .await?
-            .filter(|found| found.as_slice() < high))
+        self.inner.seek(key, true, high).await
     }
 
     async fn prev_key(&self, key: &[u8], low: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.inner.check_open()?;
-        Ok(self
-            .inner
-            .seek(key, false)
-            .await?
-            .filter(|found| found.as_slice() >= low))
+        self.inner.seek(key, false, low).await
     }
 
     async fn flush(&self) -> StorageResult<()> {

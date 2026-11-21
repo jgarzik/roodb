@@ -28,7 +28,7 @@
 //! protect changes that have not been committed, which exist only on that
 //! node too; nothing here is replicated.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,8 +78,9 @@ struct Waiter {
 
 #[derive(Default)]
 struct State {
-    /// Record locks: who holds each key, and how.
-    records: HashMap<Vec<u8>, Vec<(u64, LockMode)>>,
+    /// Record locks: who holds each key, and how. Ordered, so that the
+    /// locks inside a key range can be found.
+    records: BTreeMap<Vec<u8>, Vec<(u64, LockMode)>>,
     /// Gap locks: `(low, high, transaction)`, both ends exclusive.
     gaps: Vec<(Vec<u8>, Vec<u8>, u64)>,
     /// Requests that could not be granted at once, oldest first.
@@ -278,6 +279,34 @@ impl LockManager {
         timeout: Duration,
     ) -> Result<bool, LockError> {
         self.acquire(txn, key, Wanted::Record(mode), timeout).await
+    }
+
+    /// Whether `txn` would have to wait to insert at `key`: another
+    /// transaction holds a gap lock covering it.
+    pub fn insert_blocked(&self, txn: u64, key: &[u8]) -> bool {
+        !self
+            .state
+            .lock()
+            .blockers(txn, key, &Wanted::Insert, None)
+            .is_empty()
+    }
+
+    /// Keys strictly between `low` and `high` that other transactions hold
+    /// record locks on. A transaction that reads the range must wait for
+    /// these too: one of them may be a row that is being inserted, which is
+    /// not stored anywhere yet.
+    pub fn others_locked_in(&self, txn: u64, low: &[u8], high: &[u8]) -> Vec<Vec<u8>> {
+        use std::ops::Bound::Excluded;
+        if low >= high {
+            return Vec::new();
+        }
+        self.state
+            .lock()
+            .records
+            .range::<[u8], _>((Excluded(low), Excluded(high)))
+            .filter(|(_, holders)| holders.iter().any(|(holder, _)| *holder != txn))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Lock one row for `txn` if that can be done without waiting. `None`
@@ -653,6 +682,28 @@ mod tests {
         let _ = writer.await;
         reader.await.unwrap().unwrap();
         assert_eq!(m.counts(), (2, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn locks_of_others_in_a_range_are_found() {
+        let m = LockManager::new();
+        for (txn, key) in [(1, b"b"), (2, b"c"), (2, b"e"), (3, b"g")] {
+            m.lock_record(txn, key, LockMode::Exclusive, LONG)
+                .await
+                .unwrap();
+        }
+        // Between the bounds, and not the asker's own.
+        assert_eq!(
+            m.others_locked_in(1, b"a", b"f"),
+            [b"c".to_vec(), b"e".to_vec()]
+        );
+        assert_eq!(m.others_locked_in(2, b"b", b"g"), Vec::<Vec<u8>>::new());
+        assert!(m.others_locked_in(9, b"x", b"a").is_empty());
+
+        m.lock_gap(1, b"a", b"z");
+        assert!(m.insert_blocked(2, b"m"));
+        assert!(!m.insert_blocked(1, b"m"));
+        assert!(!m.insert_blocked(2, b"z"));
     }
 
     #[tokio::test]

@@ -79,7 +79,9 @@ impl Executor for PointGet {
                         self.result = Some(decode_row(&data)?);
                     }
                     LockedRow::Skipped => {}
-                    LockedRow::Missing => {
+                    LockedRow::Missing { new_lock } => {
+                        // The gap is locked before the key is given back,
+                        // so that nothing can be inserted in between.
                         if ctx.locks_gaps() && !ctx.is_buffered_deleted(&storage_key) {
                             let (low, high) = self
                                 .mvcc
@@ -90,6 +92,9 @@ impl Executor for PointGet {
                                 )
                                 .await?;
                             ctx.lock_gap(&low, &high);
+                        }
+                        if new_lock {
+                            ctx.unlock_record(&storage_key);
                         }
                     }
                 }

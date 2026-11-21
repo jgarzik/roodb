@@ -342,6 +342,8 @@ async fn establish(
     let cancel = Arc::new(AtomicBool::new(false));
     let sink: Sink = TdsSink::new(write_half, cancel.clone());
     let mut engine = QueryEngine::new(connection_id, client_ip, ctx, Box::new(sink));
+    // T-SQL transactions nest; see `QueryEngine::handle_begin`.
+    engine.begin_commits_open = false;
     engine.session.set_user(login.username.clone());
     if !login.database.is_empty() {
         engine.session.set_database(Some(login.database.clone()));

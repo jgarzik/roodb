@@ -76,6 +76,9 @@ pub struct QueryEngine {
     /// Catalog version the session's copy of the stored functions was taken
     /// at (see `sync_functions`).
     functions_version: Option<u64>,
+    /// Whether BEGIN inside a transaction commits it and starts another
+    /// (MySQL) or is refused (the TDS front-end, where transactions nest).
+    pub(crate) begin_commits_open: bool,
     /// The locking the statement now being run asked for with FOR UPDATE /
     /// FOR SHARE, if it did. Set when the statement is parsed, used when it
     /// is executed.
@@ -90,14 +93,42 @@ pub struct QueryEngine {
 
 /// The locking a statement asks for with `FOR UPDATE` / `FOR SHARE`, if it
 /// is a query that does.
-fn read_lock_of(stmt: &sqlparser::ast::Statement) -> Option<crate::executor::context::ReadLock> {
+///
+/// A table named after `OF` is named as the query knows it: by its alias if
+/// it has one. The names are resolved here to the tables themselves, which
+/// is what the executors that take the locks know. A name the query does
+/// not have is an error (MySQL error 3568).
+fn read_lock_of(
+    stmt: &sqlparser::ast::Statement,
+) -> Result<Option<crate::executor::context::ReadLock>, String> {
     use crate::executor::context::{LockWait, ReadLock};
-    use sqlparser::ast::{LockType, NonBlock, Statement};
+    use sqlparser::ast::{LockType, NonBlock, SetExpr, Statement, TableFactor};
 
     let Statement::Query(query) = stmt else {
-        return None;
+        return Ok(None);
     };
-    let first = query.locks.first()?;
+    let Some(first) = query.locks.first() else {
+        return Ok(None);
+    };
+    // The tables of the query: (name it goes by, table).
+    let mut tables: Vec<(String, String)> = Vec::new();
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        let mut add = |factor: &TableFactor| {
+            if let TableFactor::Table { name, alias, .. } = factor {
+                let table = name.to_string().trim_matches('`').to_string();
+                let known_as = alias
+                    .as_ref()
+                    .map_or_else(|| table.clone(), |a| a.name.value.clone());
+                tables.push((known_as, table));
+            }
+        };
+        for from in &select.from {
+            add(&from.relation);
+            for join in &from.joins {
+                add(&join.relation);
+            }
+        }
+    }
     // FOR UPDATE wins over FOR SHARE if both are given.
     let mode = if query
         .locks
@@ -118,19 +149,33 @@ fn read_lock_of(stmt: &sqlparser::ast::Statement) -> Option<crate::executor::con
     let mut of = Vec::new();
     for lock in &query.locks {
         match &lock.of {
-            Some(name) => of.push(name.to_string().trim_matches('`').to_lowercase()),
+            Some(name) => {
+                let name = name.to_string().trim_matches('`').to_string();
+                match tables
+                    .iter()
+                    .find(|(known_as, _)| known_as.eq_ignore_ascii_case(&name))
+                {
+                    Some((_, table)) => of.push(table.clone()),
+                    None => {
+                        return Err(format!("Unresolved table name `{name}` in locking clause."))
+                    }
+                }
+            }
             None => {
                 of.clear();
                 break;
             }
         }
     }
-    Some(ReadLock { mode, wait, of })
+    Ok(Some(ReadLock { mode, wait, of }))
 }
 
 /// What a client is told when its transaction lost a conflict found at
 /// commit: the same as for a deadlock, since the remedy is the same.
 const COMMIT_CONFLICT: &str = "Deadlock found when trying to get lock; try restarting transaction";
+
+/// How a deadlock is recognised in an error that has been reduced to text.
+const DEADLOCK_TEXT: &str = "Deadlock found when trying to get lock";
 
 /// Parse `SET [SESSION | GLOBAL | @@...] INNODB_LOCK_WAIT_TIMEOUT = n` from
 /// upper-cased SQL: whether it is the global setting, and the seconds
@@ -197,6 +242,7 @@ impl QueryEngine {
             mvcc,
             temp,
             functions_version: None,
+            begin_commits_open: true,
             read_lock: None,
             implicit_txns: Vec::new(),
             out,
@@ -231,7 +277,10 @@ impl QueryEngine {
             _ => None,
         };
 
-        self.read_lock = read_lock_of(&ps.parsed_stmt);
+        self.read_lock = match read_lock_of(&ps.parsed_stmt) {
+            Ok(read_lock) => read_lock,
+            Err(message) => return self.send_error(3568, "HY000", &message).await,
+        };
         let Some((mut physical, required_privileges)) = cached else {
             // Cache miss: build the plan from the AST with placeholders kept
             let parsed_stmt = ps.parsed_stmt.clone();
@@ -760,7 +809,10 @@ impl QueryEngine {
             }
             Intercept::Continue(stmt) => *stmt,
         };
-        self.read_lock = read_lock_of(&stmt);
+        self.read_lock = match read_lock_of(&stmt) {
+            Ok(read_lock) => read_lock,
+            Err(message) => return self.send_error(3568, "HY000", &message).await,
+        };
 
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
@@ -1351,10 +1403,22 @@ impl QueryEngine {
 
     /// Handle BEGIN / START TRANSACTION
     async fn handle_begin(&mut self) -> ProtocolResult<()> {
-        // Starting a transaction ends the one that is open, by committing
-        // it, as in MySQL. Clients rely on it: after a statement fails
-        // inside a transaction they simply begin again.
         if self.session.in_transaction() {
+            // T-SQL transactions nest: a second BEGIN TRAN must leave the
+            // first uncommitted. Nesting is not implemented, so over TDS it
+            // is refused rather than done wrongly.
+            if !self.begin_commits_open {
+                return self
+                    .send_error(
+                        codes::ER_CANT_CHANGE_TX_CHARACTERISTICS,
+                        states::GENERAL_ERROR,
+                        "Transaction already in progress",
+                    )
+                    .await;
+            }
+            // In MySQL, starting a transaction ends the one that is open
+            // by committing it. Clients rely on it: after a statement fails
+            // inside a transaction they simply begin again.
             if let Err(e) = self.commit_open_transaction().await {
                 return self.send_commit_error(&e).await;
             }
@@ -5946,8 +6010,13 @@ impl QueryEngine {
     /// Returns the number of rows affected.
     async fn execute_sql_silent(&mut self, sql: &str) -> Result<u64, String> {
         let result = self.execute_sql_silent_inner(sql).await;
-        if result.is_err() {
+        if let Err(message) = &result {
             self.abandon_implicit_txn().await;
+            // A deadlock ends the whole transaction wherever it is found,
+            // in a procedure or trigger body as in a plain statement.
+            if message.contains(DEADLOCK_TEXT) {
+                self.roll_back_open_transaction().await;
+            }
         }
         result
     }
@@ -6125,6 +6194,14 @@ impl QueryEngine {
         state: &str,
         message: &str,
     ) -> ProtocolResult<()> {
+        // A deadlock found inside a procedure or trigger reaches here as
+        // the text of a general error. It is a deadlock all the same, and
+        // clients decide whether to retry by the code.
+        let (code, state) = if message.contains(DEADLOCK_TEXT) {
+            (codes::ER_LOCK_DEADLOCK, "40001")
+        } else {
+            (code, state)
+        };
         self.out
             .error(&QueryError::new(code, state.to_string(), message));
         Ok(())

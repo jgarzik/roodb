@@ -721,3 +721,245 @@ async fn a_deleted_row_bounds_the_gap() {
     let ids: Vec<i32> = b.query("SELECT id FROM dgap ORDER BY id").await.unwrap();
     assert_eq!(ids, [10, 17, 25, 30]);
 }
+
+/// A locking read of a range waits for a row another transaction is in the
+/// middle of inserting there, and then includes it.
+#[tokio::test]
+async fn a_locking_read_waits_for_an_insert_in_flight() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE fl (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO fl VALUES (10), (20), (30)")
+        .await
+        .unwrap();
+
+    b.query_drop("BEGIN").await.unwrap();
+    b.query_drop("INSERT INTO fl VALUES (17)").await.unwrap();
+
+    let reader = tokio::spawn(async move {
+        a.query_drop("BEGIN").await.unwrap();
+        let ids: Vec<i32> = a
+            .query("SELECT id FROM fl WHERE id BETWEEN 15 AND 25 FOR UPDATE")
+            .await
+            .unwrap();
+        (a, ids)
+    });
+    until_waiting(&mut watcher, 1).await;
+    b.query_drop("COMMIT").await.unwrap();
+    let (mut a, ids) = reader.await.unwrap();
+    assert_eq!(ids, [17, 20]);
+    // And it stays that way for the rest of the transaction.
+    let again: Vec<i32> = a
+        .query("SELECT id FROM fl WHERE id BETWEEN 15 AND 25 FOR UPDATE")
+        .await
+        .unwrap();
+    assert_eq!(again, [17, 20]);
+
+    // The same for a statement that changes what it scans.
+    b.query_drop("BEGIN").await.unwrap();
+    b.query_drop("INSERT INTO fl VALUES (40)").await.unwrap();
+    a.query_drop("COMMIT").await.unwrap();
+    let deleter = tokio::spawn(async move {
+        a.query_drop("DELETE FROM fl WHERE id >= 0").await.unwrap();
+        let deleted = a.affected_rows();
+        (a, deleted)
+    });
+    until_waiting(&mut watcher, 1).await;
+    b.query_drop("COMMIT").await.unwrap();
+    let (_a, deleted) = deleter.await.unwrap();
+    assert_eq!(deleted, 5);
+}
+
+/// Rows of a table without a primary key are kept out of a range another
+/// transaction has read, like any others.
+#[tokio::test]
+async fn inserts_without_a_primary_key_respect_gap_locks() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE nopk (msg VARCHAR(20), n INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO nopk VALUES ('a', 1)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("UPDATE nopk SET n = n + 1").await.unwrap();
+    let blocked = tokio::spawn(async move {
+        b.query_drop("INSERT INTO nopk VALUES ('b', 1)")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("UPDATE nopk SET n = n + 1").await.unwrap();
+    assert_eq!(a.affected_rows(), 1);
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().unwrap();
+    let rows: Vec<(String, i32)> = b
+        .query("SELECT msg, n FROM nopk ORDER BY msg")
+        .await
+        .unwrap();
+    assert_eq!(rows, [("a".to_string(), 3), ("b".to_string(), 1)]);
+}
+
+/// Changing a row's primary key puts a row at the new key: it waits for a
+/// gap lock there, and a key already taken is refused by the statement.
+#[tokio::test]
+async fn an_update_of_the_primary_key_locks_the_new_key() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE mv (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO mv VALUES (1, 1), (9, 9)")
+        .await
+        .unwrap();
+
+    let err = b
+        .query_drop("UPDATE mv SET id = 1 WHERE id = 9")
+        .await
+        .expect_err("moved onto an existing key");
+    assert_eq!(error_code(&err), 1062, "{err}");
+
+    a.query_drop("BEGIN").await.unwrap();
+    let none: Vec<i32> = a
+        .query("SELECT id FROM mv WHERE id = 5 FOR UPDATE")
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let blocked = tokio::spawn(async move {
+        b.query_drop("UPDATE mv SET id = 5 WHERE id = 9")
+            .await
+            .map(|()| b)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("COMMIT").await.unwrap();
+    let mut b = blocked.await.unwrap().unwrap();
+    let ids: Vec<i32> = b.query("SELECT id FROM mv ORDER BY id").await.unwrap();
+    assert_eq!(ids, [1, 5]);
+}
+
+/// A transaction that found a key missing may insert it, even while
+/// another transaction is waiting to insert the same key.
+#[tokio::test]
+async fn the_holder_of_a_gap_inserts_ahead_of_a_waiting_insert() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE first (id INT PRIMARY KEY, who VARCHAR(4))")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO first VALUES (1, 'x'), (9, 'x')")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    let none: Vec<i32> = a
+        .query("SELECT id FROM first WHERE id = 5 FOR UPDATE")
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let waiting_insert = tokio::spawn(async move {
+        let result = b.query_drop("INSERT INTO first VALUES (5, 'b')").await;
+        (b, result)
+    });
+    until_waiting(&mut watcher, 1).await;
+    a.query_drop("INSERT INTO first VALUES (5, 'a')")
+        .await
+        .expect("the gap's holder could not insert into it");
+    a.query_drop("COMMIT").await.unwrap();
+    let (mut b, result) = waiting_insert.await.unwrap();
+    assert_eq!(error_code(&result.expect_err("duplicate accepted")), 1062);
+    let who: Option<String> = b
+        .query_first("SELECT who FROM first WHERE id = 5")
+        .await
+        .unwrap();
+    assert_eq!(who.as_deref(), Some("a"));
+}
+
+/// A deadlock found inside a stored procedure is still error 1213, and
+/// still rolls the transaction back.
+#[tokio::test]
+async fn a_deadlock_inside_a_procedure_rolls_back() {
+    let (server, mut a, mut b) = start().await;
+    let mut watcher = connect(&server).await;
+    a.query_drop("CREATE TABLE pdl (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO pdl VALUES (1, 0), (2, 0)")
+        .await
+        .unwrap();
+    a.query_drop("CREATE PROCEDURE touch_one() BEGIN UPDATE pdl SET v = 2 WHERE id = 1; END")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    b.query_drop("BEGIN").await.unwrap();
+    a.query_drop("UPDATE pdl SET v = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    b.query_drop("UPDATE pdl SET v = 2 WHERE id = 2")
+        .await
+        .unwrap();
+    let first = tokio::spawn(async move {
+        a.query_drop("UPDATE pdl SET v = 1 WHERE id = 2")
+            .await
+            .map(|()| a)
+    });
+    until_waiting(&mut watcher, 1).await;
+    let err = b
+        .query_drop("CALL touch_one()")
+        .await
+        .expect_err("the deadlock was not detected");
+    assert_eq!(error_code(&err), 1213, "{err}");
+    // B's transaction is gone: A is no longer held up, and B's earlier
+    // change is not committed by anything B does next.
+    let mut a = first.await.unwrap().expect("the survivor failed");
+    a.query_drop("COMMIT").await.unwrap();
+    b.query_drop("BEGIN").await.unwrap();
+    b.query_drop("COMMIT").await.unwrap();
+    let rows: Vec<(i32, i32)> = b.query("SELECT id, v FROM pdl ORDER BY id").await.unwrap();
+    assert_eq!(rows, [(1, 1), (2, 1)]);
+}
+
+/// FOR UPDATE OF names tables as the query does, by alias; a name the query
+/// does not have is an error.
+#[tokio::test]
+async fn for_update_of_resolves_aliases() {
+    let (_server, mut a, mut b) = start().await;
+    a.query_drop("CREATE TABLE ord (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("CREATE TABLE itm (id INT PRIMARY KEY, ord_id INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO ord VALUES (7, 0)").await.unwrap();
+    a.query_drop("INSERT INTO itm VALUES (1, 7)").await.unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    let rows: Vec<(i32, i32)> = a
+        .query(
+            "SELECT o.id, i.id FROM ord o JOIN itm i ON i.ord_id = o.id \
+             WHERE o.id = 7 FOR UPDATE OF o",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(7, 1)]);
+    // The named table is locked, the other is not.
+    b.query_drop("UPDATE itm SET ord_id = 7 WHERE id = 1")
+        .await
+        .unwrap();
+    let err = b
+        .query_drop("SELECT id FROM ord WHERE id = 7 FOR UPDATE NOWAIT")
+        .await
+        .expect_err("the aliased table was not locked");
+    assert_eq!(error_code(&err), 3572, "{err}");
+    a.query_drop("COMMIT").await.unwrap();
+
+    let err = a
+        .query_drop("SELECT id FROM ord o WHERE id = 7 FOR UPDATE OF nosuch")
+        .await
+        .expect_err("an unknown name was accepted");
+    assert_eq!(error_code(&err), 3568, "{err}");
+}

@@ -51,8 +51,10 @@ pub enum LockWait {
 pub enum LockedRow {
     /// Locked; this is the row as it stands now.
     Row(Vec<u8>),
-    /// There is no such row (any more).
-    Missing,
+    /// There is no such row (any more). The key is still locked if this
+    /// read locked it (`new_lock`): the caller decides what to hold in its
+    /// place before giving it back with `unlock_record`.
+    Missing { new_lock: bool },
     /// Locked by another transaction, and the statement said SKIP LOCKED.
     Skipped,
 }
@@ -145,7 +147,7 @@ impl TransactionContext {
     pub async fn locked_read(&self, mvcc: &MvccStorage, key: &[u8]) -> ExecutorResult<LockedRow> {
         match self.write_buffer.get(key) {
             Some(Some(own)) => return Ok(LockedRow::Row(own.clone())),
-            Some(None) => return Ok(LockedRow::Missing),
+            Some(None) => return Ok(LockedRow::Missing { new_lock: false }),
             None => {}
         }
         let Some((locks, read)) = self
@@ -155,7 +157,7 @@ impl TransactionContext {
         else {
             return Ok(match mvcc.get_current(key).await? {
                 Some((data, _)) => LockedRow::Row(data),
-                None => LockedRow::Missing,
+                None => LockedRow::Missing { new_lock: false },
             });
         };
         let new_lock = match read.wait {
@@ -174,12 +176,7 @@ impl TransactionContext {
         };
         match mvcc.get_current(key).await? {
             Some((data, _)) => Ok(LockedRow::Row(data)),
-            None => {
-                if new_lock {
-                    locks.manager.unlock_record(self.txn_id, key);
-                }
-                Ok(LockedRow::Missing)
-            }
+            None => Ok(LockedRow::Missing { new_lock }),
         }
     }
 
@@ -219,17 +216,81 @@ impl TransactionContext {
         // Which keys there are is read after the gap is locked, and as
         // things stand now rather than in the statement's snapshot: a
         // locking read sees the latest committed rows.
-        let stored = mvcc.inner().scan(Some(start), Some(end)).await?;
-        let mut rows = Vec::with_capacity(stored.len());
-        for (key, _) in stored {
+        let mut keys: Vec<Vec<u8>> = mvcc
+            .inner()
+            .scan(Some(start), Some(end))
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        self.add_keys_being_inserted(&mut keys, start, end);
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
             if self.write_buffer.contains_key(&key) {
                 continue;
             }
-            if let LockedRow::Row(data) = self.locked_read(mvcc, &key).await? {
-                rows.push((key, data));
+            match self.locked_read(mvcc, &key).await? {
+                LockedRow::Row(data) => rows.push((key, data)),
+                LockedRow::Missing { new_lock: true } => self.unlock_record(&key),
+                LockedRow::Missing { new_lock: false } | LockedRow::Skipped => {}
             }
         }
         Ok(rows)
+    }
+
+    /// Add to `keys` (the stored keys of `[start, end)`, in order) the keys
+    /// in that range that other transactions have locked. Among them are
+    /// rows being inserted: not stored yet, so a scan would pass them by,
+    /// and appearing in the range once their transaction commits. A
+    /// statement that locks the range locks these keys too, which makes it
+    /// wait for those transactions and see what they left.
+    pub fn add_keys_being_inserted(&self, keys: &mut Vec<Vec<u8>>, start: &[u8], end: &[u8]) {
+        let Some(locks) = &self.locks else { return };
+        // `start` itself belongs to the range; the lock table's range is
+        // open at both ends.
+        let mut locked = locks.manager.others_locked_in(self.txn_id, start, end);
+        if locks
+            .manager
+            .others_locked_in(self.txn_id, &[], end)
+            .iter()
+            .any(|key| key.as_slice() == start)
+        {
+            locked.push(start.to_vec());
+        }
+        if locked.is_empty() {
+            return;
+        }
+        keys.extend(locked);
+        keys.sort_unstable();
+        keys.dedup();
+    }
+
+    /// Wait until this transaction may insert a row at `key`, and (for a
+    /// key another transaction could also choose, `lock_key`) lock the key.
+    ///
+    /// The key is locked before the gap is looked at: otherwise another
+    /// transaction could look for the key while this one waits for it,
+    /// find nothing, lock the gap, and then see this row appear in it. But
+    /// the key is not held while waiting for a gap lock to go away: the
+    /// holder of that gap may want to insert this very key, and it comes
+    /// first.
+    pub async fn lock_for_insert(&self, key: &[u8], lock_key: bool) -> ExecutorResult<()> {
+        let Some(locks) = &self.locks else {
+            return Ok(());
+        };
+        if !lock_key {
+            return self.lock_insert(key).await;
+        }
+        loop {
+            let new_lock = self.lock_record(key, LockMode::Exclusive).await?;
+            if !locks.manager.insert_blocked(self.txn_id, key) {
+                return Ok(());
+            }
+            if new_lock {
+                self.unlock_record(key);
+            }
+            self.lock_insert(key).await?;
+        }
     }
 
     /// Give back a lock taken on a row only to look at it.

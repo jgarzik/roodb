@@ -387,7 +387,9 @@ enforced.
   parsed and ignored.
 - `FOR UPDATE` and `FOR SHARE` (or `LOCK IN SHARE MODE`) make the query a
   locking read: see [How transactions behave](#how-transactions-behave).
-  `OF table [, ...]` limits the locking to those tables; `NOWAIT` and
+  `OF name` limits the locking to one table, named as the query names it
+  (its alias, if it has one); a name the query does not have is error
+  3568. A list of names after `OF` is not accepted. `NOWAIT` and
   `SKIP LOCKED` are supported.
 - `SQL_CALC_FOUND_ROWS` and index hints (`USE INDEX`, `FORCE INDEX`) are
   accepted and ignored. `FOUND_ROWS()` returns the number of rows the
@@ -671,7 +673,7 @@ supported. Other window functions (`PERCENT_RANK`, `CUME_DIST`,
 
 | Statement | Description |
 |-----------|-------------|
-| `BEGIN`, `START TRANSACTION` | Start a transaction. If one is open it is committed first. Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
+| `BEGIN`, `START TRANSACTION` | Start a transaction. If one is open it is committed first (over the TDS endpoint it is refused with error 1568 instead: T-SQL transactions nest, and nesting is not implemented). Modifiers such as `READ ONLY` and `WITH CONSISTENT SNAPSHOT` are accepted and ignored |
 | `COMMIT` | Commit. Without an open transaction, no effect |
 | `ROLLBACK` | Discard the transaction's changes |
 | `SET autocommit = {0 \| 1 \| ON \| OFF}` | See below |
@@ -701,6 +703,11 @@ supported.
   - Rows are locked as they are scanned: an `UPDATE` or `DELETE` that
     cannot find its rows by primary key examines, and locks, every row of
     the table.
+  - A statement that reads a range also waits for rows other transactions
+    are inserting into it, and for an `UPDATE` that moves a row into it by
+    changing its primary key. A deadlock inside a stored procedure or
+    trigger is a deadlock like any other: error 1213, transaction rolled
+    back.
   - **What was read stays as it was** (`REPEATABLE READ`, the default).
     Besides the rows, the statement locks the gaps it read against
     inserts: a scan locks the whole table, so no row can be added until
@@ -975,8 +982,9 @@ returns most often:
 | 1264, 1690 | 22003 | Numeric value out of range. 1690 is also reported for errors raised while a result is being returned, such as an unknown function |
 | 1292 | 22007 | Truncated incorrect value |
 | 1295 | HY000 | Statement cannot be prepared with parameters |
+| 3568 | HY000 | `FOR UPDATE OF` / `FOR SHARE OF` names a table the query does not have |
 | 3572 | HY000 | A row was locked and the statement said `NOWAIT` |
-| 1568 | HY000 | Isolation level changed inside a transaction |
+| 1568 | HY000 | Isolation level changed inside a transaction; over TDS, `BEGIN` inside a transaction |
 | 1063, 1074, 1425, 1427 | 42000 | Invalid column type specification |
 
 Several conditions that have a dedicated code in MySQL (unknown procedure,
@@ -1005,9 +1013,10 @@ unknown function, duplicate view or procedure) are reported as 1105.
 - Reads are READ COMMITTED in effect (a snapshot per statement) although
   `REPEATABLE-READ` is reported; `SERIALIZABLE` is refused.
 - Row and gap locks are taken by `UPDATE`, `DELETE`, `INSERT ... VALUES`
-  and locking reads. `LOCK TABLES` and `GET_LOCK` lock nothing, and
-  `INSERT ... SELECT`, `REPLACE` and `LOAD DATA` neither take locks nor
-  wait for them (a conflict is found at `COMMIT`).
+  (and so by `REPLACE` and `LOAD DATA`, which insert that way) and by
+  locking reads. `LOCK TABLES` and `GET_LOCK` lock nothing, and
+  `INSERT ... SELECT` neither takes locks nor waits for them (a conflict
+  is found at `COMMIT`).
 - `UPDATE` and `DELETE` do not find rows the same transaction inserted.
 - No savepoints, no `XA`, no `COMMIT WORK` / `AND CHAIN`.
 - DDL is neither transactional nor an implicit commit.

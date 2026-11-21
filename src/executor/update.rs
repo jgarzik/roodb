@@ -88,7 +88,7 @@ impl Update {
     /// If a PK column was modified, the storage key changes:
     /// we must delete the old key and insert at the new key.
     /// Otherwise, emit a normal update at the same key.
-    fn emit_row_change(
+    async fn emit_row_change(
         &mut self,
         old_key: Vec<u8>,
         row: &Row,
@@ -113,8 +113,18 @@ impl Update {
         })?;
 
         if new_key != old_key {
-            // PK changed: check for duplicate at the new key
-            if ctx.has_buffered_key(&new_key) {
+            // PK changed: the row moves to a new key, which is an insert
+            // there. Lock the place as an insert does, then see whether it
+            // is taken.
+            let locked = ctx.locks_rows();
+            if locked {
+                ctx.lock_for_insert(&new_key, true).await?;
+            }
+            let taken = ctx.has_buffered_key(&new_key)
+                || (locked
+                    && !ctx.is_buffered_deleted(&new_key)
+                    && self.mvcc.get_current(&new_key).await?.is_some());
+            if taken {
                 return Err(super::error::ExecutorError::DuplicateKey(format!(
                     "Duplicate entry for key 'PRIMARY' in table '{}'",
                     self.table
@@ -211,7 +221,7 @@ impl Update {
                 new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            self.emit_row_change(storage_key, &row, row_version)?;
+            self.emit_row_change(storage_key, &row, row_version).await?;
         }
 
         Ok(())
@@ -234,13 +244,16 @@ impl Update {
                 // Which rows there are is taken as things stand now, after
                 // the gap lock: each is then locked and read again, so the
                 // values here do not matter.
-                self.mvcc
+                let mut keys: Vec<Vec<u8>> = self
+                    .mvcc
                     .inner()
                     .scan(Some(&prefix), Some(&end))
                     .await?
                     .into_iter()
-                    .map(|(k, v)| (k, v, 0u64))
-                    .collect()
+                    .map(|(k, _)| k)
+                    .collect();
+                ctx.add_keys_being_inserted(&mut keys, &prefix, &end);
+                keys.into_iter().map(|k| (k, Vec::new(), 0u64)).collect()
             } else {
                 self.mvcc
                     .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
@@ -344,7 +357,7 @@ impl Update {
                 new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            self.emit_row_change(key, &row, row_version)?;
+            self.emit_row_change(key, &row, row_version).await?;
         }
 
         Ok(())

@@ -158,13 +158,16 @@ impl Delete {
                 // Which rows there are is taken as things stand now, after
                 // the gap lock: each is then locked and read again, so the
                 // values here do not matter.
-                self.mvcc
+                let mut keys: Vec<Vec<u8>> = self
+                    .mvcc
                     .inner()
                     .scan(Some(&prefix), Some(&end))
                     .await?
                     .into_iter()
-                    .map(|(k, v)| (k, v, 0u64))
-                    .collect()
+                    .map(|(k, _)| k)
+                    .collect();
+                ctx.add_keys_being_inserted(&mut keys, &prefix, &end);
+                keys.into_iter().map(|k| (k, Vec::new(), 0u64)).collect()
             } else {
                 self.mvcc
                     .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
