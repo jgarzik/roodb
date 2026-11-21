@@ -2,7 +2,7 @@
 //!
 //! Tests for packet encoding/decoding, handshake, auth, and result sets.
 
-mod test_utils;
+use crate::test_utils;
 
 use std::path::PathBuf;
 use std::sync::Arc;

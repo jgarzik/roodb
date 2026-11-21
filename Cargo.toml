@@ -38,7 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TLS (required - no plaintext networking)
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
 rustls-pemfile = "2"
 
 # Bytes handling
@@ -50,27 +49,19 @@ parking_lot = "0.12"
 # Lock-free concurrent skip list (memtable)
 crossbeam-skiplist = "0.1"
 
-# Compression
-lz4_flex = "0.11"
-
 # SQL parsing
 sqlparser = { version = "0.61", features = ["visitor"] }
-
-# Ordered floats for sorting
-ordered-float = "4"
 
 # LRU cache for block cache
 lru = "0.12"
 
 # MySQL protocol support
 sha1 = "0.10"
+subtle = "2"
 rand = "0.8"
 bitflags = "2"
 regex = "1"
 lazy_static = "1"
-
-# Password hashing
-argon2 = "0.5"
 
 # Hex encoding
 hex = "0.4"
@@ -93,6 +84,9 @@ serial_test = "3"
 libc = "0.2"
 # MySQL client for integration tests (uses rustls with aws-lc-rs)
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
+# TDS (SQL Server protocol) client for integration tests
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73", "tds80"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [lib]
 name = "roodb"

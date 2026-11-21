@@ -255,11 +255,9 @@ impl IoMetrics {
             total_count += hist.count.load(Ordering::Relaxed);
         }
 
-        if total_count == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_micros(total_sum / total_count)
-        }
+        total_sum
+            .checked_div(total_count)
+            .map_or(Duration::ZERO, Duration::from_micros)
     }
 
     /// Take a snapshot of current metrics

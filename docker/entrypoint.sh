@@ -6,6 +6,8 @@ CERT_PATH="${ROODB_CERT_PATH:-/certs/server.crt}"
 KEY_PATH="${ROODB_KEY_PATH:-/certs/server.key}"
 CA_CERT_PATH="${ROODB_CA_CERT_PATH:-/certs/ca.crt}"
 PORT="${ROODB_PORT:-3307}"
+# ROODB_TDS_PORT, if set, is read by the server itself and enables the
+# SQL Server protocol (TDS) listener on that port.
 
 # Handle ROODB_ROOT_PASSWORD_FILE (Docker secrets pattern)
 if [ -n "$ROODB_ROOT_PASSWORD_FILE" ] && [ -f "$ROODB_ROOT_PASSWORD_FILE" ]; then

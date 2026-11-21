@@ -172,3 +172,79 @@ async fn test_case_sensitivity() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// Non-ASCII text in a string literal must come back unchanged.
+#[tokio::test]
+async fn test_non_ascii_literals_round_trip() {
+    let server = TestServer::start("edge_non_ascii").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("DROP TABLE IF EXISTS edge_non_ascii_tbl")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE edge_non_ascii_tbl (id INT PRIMARY KEY, val VARCHAR(100))")
+        .await
+        .unwrap();
+    let values = [
+        "b\u{f6}b",
+        "\u{65e5}\u{672c}\u{8a9e}",
+        "caf\u{e9} \u{1F600}",
+    ];
+    for (id, value) in values.iter().enumerate() {
+        conn.query_drop(format!(
+            "INSERT INTO edge_non_ascii_tbl VALUES ({id}, '{value}')"
+        ))
+        .await
+        .expect("INSERT failed");
+    }
+
+    let rows: Vec<String> = conn
+        .query("SELECT val FROM edge_non_ascii_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows, values);
+
+    conn.query_drop("DROP TABLE edge_non_ascii_tbl")
+        .await
+        .unwrap();
+    drop(conn);
+    server.shutdown().await;
+}
+
+/// An exclamation mark inside any kind of string literal is data.
+#[tokio::test]
+async fn test_exclamation_mark_in_literals() {
+    let server = TestServer::start("edge_bang").await;
+    let mut conn = server.connect().await;
+
+    conn.query_drop("DROP TABLE IF EXISTS edge_bang_tbl")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE edge_bang_tbl (id INT PRIMARY KEY, val VARCHAR(100))")
+        .await
+        .unwrap();
+    for stmt in [
+        "INSERT INTO edge_bang_tbl VALUES (1, 'single!')",
+        "INSERT INTO edge_bang_tbl VALUES (2, \"double!\")",
+        r"INSERT INTO edge_bang_tbl VALUES (3, 'it\'s great!')",
+        "INSERT INTO edge_bang_tbl VALUES (4, 'it''s great!')",
+    ] {
+        conn.query_drop(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("`{stmt}` failed: {e}"));
+    }
+
+    let rows: Vec<String> = conn
+        .query("SELECT val FROM edge_bang_tbl ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(rows, ["single!", "double!", "it's great!", "it's great!"]);
+
+    // Outside literals `!` is still NOT.
+    let not_zero: Option<i64> = conn.query_first("SELECT !0").await.unwrap();
+    assert_eq!(not_zero, Some(1));
+
+    conn.query_drop("DROP TABLE edge_bang_tbl").await.unwrap();
+    drop(conn);
+    server.shutdown().await;
+}

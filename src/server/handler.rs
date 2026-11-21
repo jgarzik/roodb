@@ -1,34 +1,26 @@
 //! Connection handler for RooDB client protocol
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-
-use parking_lot::RwLock;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::catalog::Catalog;
 use crate::protocol::roodb::starttls::starttls_handshake;
 use crate::protocol::roodb::RooDbConnection;
-use crate::raft::RaftNode;
-use crate::storage::StorageEngine;
-use crate::txn::TransactionManager;
+use crate::server::context::ServerContext;
+use crate::server::limits::HANDSHAKE_TIMEOUT;
+use crate::server::query::error::ProtocolError;
 
 /// Handle a RooDB client connection with STARTTLS
 ///
 /// Performs STARTTLS handshake, then runs authentication and command loop.
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    connection_id: u32,
     acceptor: TlsAcceptor,
-    storage: Arc<dyn StorageEngine>,
-    catalog: Arc<RwLock<Catalog>>,
-    txn_manager: Arc<TransactionManager>,
-    raft_node: Arc<RaftNode>,
+    ctx: ServerContext,
 ) {
+    let connection_id = ctx.next_connection_id();
     info!(%peer_addr, connection_id, "Client connected");
 
     // Disable Nagle's algorithm for low-latency request-response
@@ -36,32 +28,27 @@ pub async fn handle_connection(
         error!(%peer_addr, connection_id, error = %e, "Failed to set TCP_NODELAY");
     }
 
-    // Perform STARTTLS handshake
-    let (tls_stream, scramble) = match starttls_handshake(stream, acceptor, connection_id).await {
-        Ok(result) => result,
-        Err(e) => {
-            error!(%peer_addr, connection_id, error = %e, "STARTTLS handshake failed");
+    // Greeting, TLS upgrade and login must all finish within the handshake
+    // timeout; an unauthenticated client cannot hold a connection open.
+    let login = async {
+        let (tls_stream, scramble) = starttls_handshake(stream, acceptor, connection_id).await?;
+        let mut conn =
+            RooDbConnection::new(tls_stream, connection_id, peer_addr.ip(), scramble, &ctx);
+        // The handshake response comes over TLS
+        conn.complete_handshake().await?;
+        Ok::<_, ProtocolError>(conn)
+    };
+    let mut conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, login).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            error!(%peer_addr, connection_id, error = %e, "Handshake failed");
+            return;
+        }
+        Err(_) => {
+            warn!(%peer_addr, connection_id, "Handshake timed out");
             return;
         }
     };
-
-    // Create RooDB connection on TLS stream
-    let mut conn = RooDbConnection::new_with_scramble(
-        tls_stream,
-        connection_id,
-        peer_addr.ip(),
-        scramble,
-        storage,
-        catalog,
-        txn_manager,
-        raft_node,
-    );
-
-    // Complete authentication (handshake response comes over TLS)
-    if let Err(e) = conn.complete_handshake().await {
-        error!(%peer_addr, connection_id, error = %e, "Authentication failed");
-        return;
-    }
 
     // Run command loop
     if let Err(e) = conn.run().await {

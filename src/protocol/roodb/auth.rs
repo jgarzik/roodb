@@ -3,6 +3,9 @@
 //! Implements native password authentication.
 
 use sha1::{Digest, Sha1};
+use subtle::ConstantTimeEq;
+
+pub use crate::server::auth::compute_password_hash;
 
 use super::error::{ProtocolError, ProtocolResult};
 use super::handshake::capabilities;
@@ -295,28 +298,7 @@ pub fn verify_native_password_with_hash(
     let candidate_stage2 = hasher.finalize();
 
     // Step 4: Compare candidate_stage2 with stored_hash
-    candidate_stage2.as_slice() == stored_hash.as_slice()
-}
-
-/// Compute double SHA1 hash for password storage (mysql_native_password format)
-///
-/// Returns hex-encoded SHA1(SHA1(password))
-pub fn compute_password_hash(password: &str) -> String {
-    if password.is_empty() {
-        return String::new();
-    }
-
-    // Step 1: SHA1(password)
-    let mut hasher = Sha1::new();
-    hasher.update(password.as_bytes());
-    let stage1 = hasher.finalize();
-
-    // Step 2: SHA1(SHA1(password))
-    let mut hasher = Sha1::new();
-    hasher.update(stage1);
-    let stage2 = hasher.finalize();
-
-    hex::encode(stage2)
+    bool::from(candidate_stage2.as_slice().ct_eq(stored_hash.as_slice()))
 }
 
 /// Compute native password auth response

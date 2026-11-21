@@ -7,10 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::pki_types::CertificateDer;
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use rustls::version::TLS12;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use thiserror::Error;
 use tracing::warn;
+
+/// ALPN protocol name registered for TDS 8.0.
+pub const TDS_ALPN_PROTOCOL: &[u8] = b"tds/8.0";
 
 #[derive(Error, Debug)]
 pub enum TlsError {
@@ -28,6 +32,8 @@ pub enum TlsError {
 #[derive(Clone)]
 pub struct TlsConfig {
     server_config: Arc<ServerConfig>,
+    tds_strict_config: Arc<ServerConfig>,
+    tds_legacy_config: Arc<ServerConfig>,
     client_config: Arc<ClientConfig>,
 }
 
@@ -61,6 +67,22 @@ impl TlsConfig {
             .with_no_client_auth()
             .with_single_cert(certs.clone(), key.clone_key())?;
 
+        // TDS 8.0 ("strict"): TLS comes first and the client may name the
+        // protocol through ALPN.
+        let mut tds_strict = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key.clone_key())?;
+        tds_strict.alpn_protocols = vec![TDS_ALPN_PROTOCOL.to_vec()];
+
+        // TDS 7.x: the TLS handshake is tunnelled inside TDS packets. That
+        // exchange is defined for TLS 1.2 at most, and it cannot carry
+        // session tickets or resumption.
+        let mut tds_legacy = ServerConfig::builder_with_protocol_versions(&[&TLS12])
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key.clone_key())?;
+        tds_legacy.session_storage = Arc::new(NoServerSessionStorage {});
+        tds_legacy.send_tls13_tickets = 0;
+
         // Build client config with the same cert as root CA (self-signed scenario)
         let mut root_store = RootCertStore::empty();
         for cert in &certs {
@@ -75,6 +97,8 @@ impl TlsConfig {
 
         Ok(Self {
             server_config: Arc::new(server_config),
+            tds_strict_config: Arc::new(tds_strict),
+            tds_legacy_config: Arc::new(tds_legacy),
             client_config: Arc::new(client_config),
         })
     }
@@ -82,6 +106,18 @@ impl TlsConfig {
     /// Get the server TLS config
     pub fn server_config(&self) -> Arc<ServerConfig> {
         self.server_config.clone()
+    }
+
+    /// Server config for TDS 8.0 strict connections (TLS first, ALPN
+    /// `tds/8.0`, TLS 1.2 or 1.3).
+    pub fn tds_strict_config(&self) -> Arc<ServerConfig> {
+        self.tds_strict_config.clone()
+    }
+
+    /// Server config for TDS 7.x connections, whose TLS handshake is
+    /// tunnelled in PRELOGIN packets (TLS 1.2 only, no resumption).
+    pub fn tds_legacy_config(&self) -> Arc<ServerConfig> {
+        self.tds_legacy_config.clone()
     }
 
     /// Get the client TLS config

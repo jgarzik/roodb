@@ -10,19 +10,14 @@ use crate::test_utils::server_manager::ServerManager;
 ///
 /// Wraps the shared server manager. Each test gets unique table names
 /// for isolation while sharing the same server instance.
-pub struct TestServer {
-    #[allow(dead_code)]
-    test_name: String,
-}
+pub struct TestServer;
 
 impl TestServer {
     /// Start a test session (connects to shared server).
-    pub async fn start(name: &str) -> Self {
+    pub async fn start(_name: &str) -> Self {
         // Ensure server is running (lazy init on first call)
         let _ = ServerManager::global();
-        Self {
-            test_name: name.to_string(),
-        }
+        Self
     }
 
     /// Start with password - incompatible with shared server.
@@ -41,10 +36,19 @@ impl TestServer {
         ServerManager::global().connect().await
     }
 
+    /// Connect as a specific user. Returns the driver error if login fails.
+    pub async fn connect_as(&self, user: &str, password: &str) -> mysql_async::Result<Conn> {
+        ServerManager::global().connect_as(user, password).await
+    }
+
     /// Get the server port.
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         ServerManager::global().port()
+    }
+
+    /// Get the TDS (SQL Server protocol) port.
+    pub fn tds_port(&self) -> u16 {
+        ServerManager::global().tds_port()
     }
 
     /// Shutdown (no-op: shared server stays alive for other tests).

@@ -3,6 +3,10 @@
 //! Persists all Raft state (log entries, vote, membership) to LSM storage for durability.
 //! This enables cluster-ready multi-node operation with proper crash recovery.
 
+// openraft dictates these error types; they are large by its design, and the
+// functions here feed directly into openraft trait methods that return them.
+#![allow(clippy::result_large_err)]
+
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;

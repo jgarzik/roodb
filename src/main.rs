@@ -1,6 +1,6 @@
 //! RooDB server binary
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,8 +20,14 @@ use roodb::tls::{RaftTlsConfig, TlsConfig};
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "RooDB distributed SQL database server")]
 struct Cli {
+    /// Address to listen on (client and Raft ports)
+    #[arg(long, default_value = "0.0.0.0", env = "ROODB_BIND")]
+    bind: IpAddr,
     #[arg(long, default_value = "3307", env = "ROODB_PORT")]
     port: u16,
+    /// Also accept TDS (SQL Server protocol) clients on this port
+    #[arg(long, env = "ROODB_TDS_PORT")]
+    tds_port: Option<u16>,
     #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
     data_dir: PathBuf,
     #[arg(long, default_value = "./certs/server.crt", env = "ROODB_CERT_PATH")]
@@ -46,7 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse CLI args
     let Cli {
+        bind,
         port,
+        tds_port,
         data_dir,
         cert_path,
         key_path,
@@ -54,6 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
+
+    // Raft RPC uses port + 1000 by convention
+    let raft_port = port
+        .checked_add(1000)
+        .ok_or("--port is too high: the Raft port is port + 1000")?;
+    if let Some(tds_port) = tds_port {
+        if tds_port == port || tds_port == raft_port {
+            return Err(format!(
+                "--tds-port {} collides with the client port {} or the Raft port {}",
+                tds_port, port, raft_port
+            )
+            .into());
+        }
+    }
 
     // Load TLS config for client connections (no client cert auth)
     let tls_config = TlsConfig::from_files(&cert_path, &key_path).await?;
@@ -81,9 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
 
     // Initialize Raft node (single-node mode)
-    // Raft RPC uses port + 1000 by convention
-    let raft_port = port + 1000;
-    let raft_addr: SocketAddr = format!("0.0.0.0:{}", raft_port).parse()?;
+    let raft_addr = SocketAddr::new(bind, raft_port);
 
     let node_id = 1;
     let mut raft_node = RaftNode::new(
@@ -106,8 +126,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(raft_port, "Raft node bootstrapped (single-node mode)");
 
     // Start RooDB server
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let addr = SocketAddr::new(bind, port);
+    let mut server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    if let Some(tds_port) = tds_port {
+        server = server.enable_tds(SocketAddr::new(bind, tds_port));
+    }
     server.run().await?;
 
     Ok(())

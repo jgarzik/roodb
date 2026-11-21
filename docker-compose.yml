@@ -6,6 +6,9 @@ services:
     ports:
       - "3307:3307"   # Client connections (MySQL protocol over TLS)
       - "4307:4307"   # Raft consensus
+      # To accept SQL Server protocol (TDS) clients, set ROODB_TDS_PORT=1433
+      # under environment and publish the port:
+      # - "1433:1433"
     volumes:
       - roodb_data:/data
       - ./certs:/certs:ro
