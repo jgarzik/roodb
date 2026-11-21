@@ -50,7 +50,13 @@ enum Msg {
     Op(Op),
     Register {
         fd: RawFd,
-        reply: oneshot::Sender<Option<u32>>,
+        /// The reactor's own handle, for the route it answers with.
+        shared: Arc<ReactorShared>,
+        /// Answered with the file's route, which owns the registration:
+        /// wherever the route is dropped - by the file when it is closed,
+        /// or unreceived because the opener went away, before or after the
+        /// answer was sent - the registration is released.
+        reply: oneshot::Sender<FileRoute>,
     },
     Unregister(u32),
     Shutdown,
@@ -186,15 +192,16 @@ impl Uring {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.reactors.len();
         let shared = self.reactors[index].clone();
         let (reply, wait) = oneshot::channel();
-        let fixed = if shared.send(Msg::Register {
+        let sent = shared.send(Msg::Register {
             fd: file.as_raw_fd(),
+            shared: shared.clone(),
             reply,
-        }) {
-            wait.await.ok().flatten()
-        } else {
-            None
-        };
-        FileRoute { shared, fixed }
+        });
+        let registered = if sent { wait.await.ok() } else { None };
+        registered.unwrap_or(FileRoute {
+            shared,
+            fixed: None,
+        })
     }
 }
 
@@ -363,15 +370,13 @@ impl Reactor {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Op(op) => self.pending[op.urgency as usize].push_back(op),
-            Msg::Register { fd, reply } => {
-                let slot = self.register(fd);
-                // The opener may have gone away while we registered its file.
-                // Nobody would ever release the slot, so release it now.
-                if reply.send(slot).is_err() {
-                    if let Some(slot) = slot {
-                        self.unregister(slot);
-                    }
-                }
+            Msg::Register { fd, shared, reply } => {
+                let fixed = self.register(fd);
+                // The opener may have gone away while we registered its
+                // file, or may go away before it takes the answer. In both
+                // cases the route is dropped unreceived, and dropping it
+                // releases the registration.
+                let _ = reply.send(FileRoute { shared, fixed });
             }
             Msg::Unregister(slot) => self.unregister(slot),
             Msg::Shutdown => self.shutdown = true,
