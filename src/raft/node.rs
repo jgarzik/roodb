@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use openraft::raft::ReadPolicy;
 use openraft::Config;
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -253,7 +254,10 @@ impl RaftNode {
     /// Returns true if this node can accept writes (is the Raft leader).
     /// Non-leaders can still serve reads from local storage.
     pub async fn is_leader(&self) -> bool {
-        self.raft.ensure_linearizable().await.is_ok()
+        self.raft
+            .ensure_linearizable(ReadPolicy::ReadIndex)
+            .await
+            .is_ok()
     }
 
     /// Ensure linearizable read
@@ -262,7 +266,7 @@ impl RaftNode {
     /// Call this before returning query results if strong consistency is required.
     pub async fn ensure_linearizable(&self) -> Result<(), RaftNodeError> {
         self.raft
-            .ensure_linearizable()
+            .ensure_linearizable(ReadPolicy::ReadIndex)
             .await
             .map(|_| ())
             .map_err(|e| RaftNodeError::Raft(e.to_string()))

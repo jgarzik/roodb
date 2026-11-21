@@ -1,44 +1,45 @@
 //! Raft network implementation over TLS
 
-// openraft dictates these error types; they are large by its design, and the
-// functions here feed directly into openraft trait methods that return them.
-#![allow(clippy::result_large_err)]
-
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::network::v2::RaftNetworkV2;
+use openraft::network::{RPCOption, RaftNetworkFactory};
+use openraft::raft::AppendResult;
+use openraft::OptionalSend;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::raft::types::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    Node, NodeId, TypeConfig, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, Node, NodeId, Snapshot, SnapshotData,
+    SnapshotMeta, SnapshotResponse, TypeConfig, Vote, VoteRequest, VoteResponse,
 };
 use crate::tls::RaftTlsConfig;
 
-/// Create an RPC error with context about the operation and peer
-fn rpc_error<E: std::error::Error>(
+/// A whole snapshot as it travels between nodes.
+#[derive(Serialize, Deserialize)]
+struct SnapshotMessage {
+    vote: Vote,
+    meta: SnapshotMeta,
+    data: Vec<u8>,
+}
+
+/// Describe a failed RPC: what was being done, to whom, and why it failed.
+fn describe(
     target: NodeId,
     addr: Option<SocketAddr>,
     operation: &str,
     err: impl std::fmt::Display,
-) -> RPCError<NodeId, Node, RaftError<NodeId, E>> {
-    let addr_str = addr
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let msg = format!(
-        "Raft RPC {} to node {} ({}): {}",
-        operation, target, addr_str, err
-    );
-    RPCError::Unreachable(Unreachable::new(&NetworkError::new(
-        &std::io::Error::other(msg),
-    )))
+) -> String {
+    let addr = addr.map_or_else(|| "unknown".to_string(), |a| a.to_string());
+    format!("Raft RPC {operation} to node {target} ({addr}): {err}")
 }
 
 /// Message types for Raft RPC
@@ -49,8 +50,8 @@ enum MessageType {
     VoteResponse = 2,
     AppendEntries = 3,
     AppendEntriesResponse = 4,
-    InstallSnapshot = 5,
-    InstallSnapshotResponse = 6,
+    Snapshot = 5,
+    SnapshotResponse = 6,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -61,8 +62,8 @@ impl TryFrom<u8> for MessageType {
             2 => Ok(Self::VoteResponse),
             3 => Ok(Self::AppendEntries),
             4 => Ok(Self::AppendEntriesResponse),
-            5 => Ok(Self::InstallSnapshot),
-            6 => Ok(Self::InstallSnapshotResponse),
+            5 => Ok(Self::Snapshot),
+            6 => Ok(Self::SnapshotResponse),
             _ => Err(()),
         }
     }
@@ -113,103 +114,108 @@ pub struct RaftNetworkConnection {
 }
 
 impl RaftNetworkConnection {
-    async fn send_request<Req, Resp, E>(
+    /// Send one request and read its reply. Any failure is reported as text.
+    async fn send_request<Req, Resp>(
         &self,
         msg_type: MessageType,
         request: &Req,
-    ) -> Result<Resp, RPCError<NodeId, Node, RaftError<NodeId, E>>>
+    ) -> Result<Resp, String>
     where
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
-        E: std::error::Error,
     {
         let operation = format!("{:?}", msg_type);
+        let fail = |err: &dyn std::fmt::Display| describe(self.target, self.addr, &operation, err);
 
-        let addr = self.addr.ok_or_else(|| {
-            rpc_error::<E>(self.target, None, &operation, "address not configured")
-        })?;
+        let addr = self.addr.ok_or_else(|| fail(&"address not configured"))?;
 
         // Connect with TLS
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
-
+        let stream = TcpStream::connect(addr).await.map_err(|e| fail(&e))?;
         let connector = TlsConnector::from(self.tls_config.client_config());
-        // Use the IP address for SNI since we use self-signed certs in the cluster
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+        // Cluster certificates are issued for this name, whatever the address.
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").map_err(|e| fail(&e))?;
         let mut tls_stream = connector
             .connect(server_name, stream)
             .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+            .map_err(|e| fail(&e))?;
 
-        // Serialize request
-        let body = bincode::serialize(request)
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+        let body = bincode::serialize(request).map_err(|e| fail(&e))?;
 
         // Send: [msg_type: u8][len: u32][body]
+        let len = u32::try_from(body.len()).map_err(|_| fail(&"request larger than 4 GiB"))?;
         let mut buf = BytesMut::with_capacity(5 + body.len());
         buf.put_u8(msg_type as u8);
-        buf.put_u32(body.len() as u32);
+        buf.put_u32(len);
         buf.put_slice(&body);
-
-        tls_stream
-            .write_all(&buf)
-            .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
-        tls_stream
-            .flush()
-            .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+        tls_stream.write_all(&buf).await.map_err(|e| fail(&e))?;
+        tls_stream.flush().await.map_err(|e| fail(&e))?;
 
         // Read response: [len: u32][body]
         let mut len_buf = [0u8; 4];
         tls_stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+            .map_err(|e| fail(&e))?;
         let len = u32::from_be_bytes(len_buf) as usize;
-
         let mut resp_buf = vec![0u8; len];
         tls_stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
+            .map_err(|e| fail(&e))?;
 
-        // Deserialize response
-        let resp: Resp = bincode::deserialize(&resp_buf)
-            .map_err(|e| rpc_error::<E>(self.target, self.addr, &operation, e))?;
-
-        Ok(resp)
+        bincode::deserialize(&resp_buf).map_err(|e| fail(&e))
     }
 }
 
-impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
+fn unreachable(message: String) -> Unreachable<TypeConfig> {
+    Unreachable::<TypeConfig>::from_string(message)
+}
+
+impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
+    type SnapshotData = SnapshotData;
+
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse, RPCError<NodeId, Node, RaftError<NodeId>>> {
-        self.send_request(MessageType::AppendEntries, &req).await
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
+        // The reply on the wire says only success, conflict or a higher vote;
+        // the log positions it refers to are the ones we sent.
+        let prev_log_id = req.prev_log_id;
+        let last_log_id = req.last_log_id();
+        let response: AppendEntriesResponse = self
+            .send_request(MessageType::AppendEntries, &req)
+            .await
+            .map_err(|e| RPCError::Unreachable(unreachable(e)))?;
+        Ok(response.into_append_result(prev_log_id, last_log_id))
     }
 
     async fn vote(
         &mut self,
         req: VoteRequest,
         _option: RPCOption,
-    ) -> Result<VoteResponse, RPCError<NodeId, Node, RaftError<NodeId>>> {
-        self.send_request(MessageType::Vote, &req).await
+    ) -> Result<VoteResponse, RPCError<TypeConfig>> {
+        self.send_request(MessageType::Vote, &req)
+            .await
+            .map_err(|e| RPCError::Unreachable(unreachable(e)))
     }
 
-    async fn install_snapshot(
+    async fn full_snapshot(
         &mut self,
-        req: InstallSnapshotRequest,
+        vote: Vote,
+        snapshot: Snapshot,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse,
-        RPCError<NodeId, Node, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        self.send_request(MessageType::InstallSnapshot, &req).await
+    ) -> Result<SnapshotResponse, StreamingError<TypeConfig>> {
+        let message = SnapshotMessage {
+            vote,
+            meta: snapshot.meta,
+            data: snapshot.snapshot.into_inner(),
+        };
+        self.send_request(MessageType::Snapshot, &message)
+            .await
+            .map_err(|e| StreamingError::Unreachable(unreachable(e)))
     }
 }
 
@@ -238,20 +244,25 @@ impl RaftRpcHandler {
             MessageType::AppendEntries => {
                 let req: AppendEntriesRequest =
                     bincode::deserialize(body).map_err(|e| e.to_string())?;
-                let resp = self
+                let resp: AppendEntriesResponse = self
                     .raft
                     .append_entries(req)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .into();
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }
-            MessageType::InstallSnapshot => {
-                let req: InstallSnapshotRequest =
+            MessageType::Snapshot => {
+                let message: SnapshotMessage =
                     bincode::deserialize(body).map_err(|e| e.to_string())?;
+                let snapshot = Snapshot {
+                    meta: message.meta,
+                    snapshot: std::io::Cursor::new(message.data),
+                };
                 let resp = self
                     .raft
-                    .install_snapshot(req)
+                    .install_full_snapshot(message.vote, snapshot)
                     .await
                     .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;

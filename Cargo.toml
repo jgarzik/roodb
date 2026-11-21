@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive", "env"] }
 cfg-if = "1"
 
 # Raft consensus
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "0.10", features = ["serde", "type-alias"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

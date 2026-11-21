@@ -12,9 +12,12 @@ use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
-use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
-use openraft::{ErrorSubject, ErrorVerb};
+use futures_util::{Stream, TryStreamExt};
+use openraft::entry::RaftEntry;
+use openraft::storage::{
+    EntryResponder, IOFlushed, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
+};
+use openraft::{EntryPayload, OptionalSend};
 use parking_lot::RwLock;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -27,7 +30,7 @@ use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
 use crate::raft::changes::ChangeOp;
 use crate::raft::types::{
-    Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
+    Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotData, SnapshotMeta,
     StoredMembership, TypeConfig, Vote,
 };
 use crate::storage::StorageEngine;
@@ -81,22 +84,17 @@ const LAST_APPLIED_KEY: &[u8] = b"_raft:sm:last_applied";
 const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
 const LOG_PREFIX: &[u8] = b"_raft:log:";
 
+/// Storage methods report plain I/O errors; openraft adds the context.
+type StorageError = std::io::Error;
+
 /// Create a read error
 fn read_err(msg: impl ToString) -> StorageError {
-    StorageError::from_io_error(
-        ErrorSubject::Store,
-        ErrorVerb::Read,
-        std::io::Error::other(msg.to_string()),
-    )
+    std::io::Error::other(format!("raft storage read: {}", msg.to_string()))
 }
 
 /// Create a write error
 fn write_err(msg: impl ToString) -> StorageError {
-    StorageError::from_io_error(
-        ErrorSubject::Store,
-        ErrorVerb::Write,
-        std::io::Error::other(msg.to_string()),
-    )
+    std::io::Error::other(format!("raft storage write: {}", msg.to_string()))
 }
 
 /// Encode a log entry key with big-endian index for correct lexicographic ordering
@@ -245,7 +243,7 @@ impl LsmRaftStorage {
         if let Some((ref key, ref data)) = entries.last() {
             if let Some(_index) = log_index_from_key(key) {
                 let entry: Entry = bincode::deserialize(data).map_err(read_err)?;
-                *self.cached_last_log_id.write() = Some(*entry.get_log_id());
+                *self.cached_last_log_id.write() = Some(entry.log_id());
             }
         }
 
@@ -812,6 +810,10 @@ impl RaftLogReader<TypeConfig> for LsmRaftStorage {
 
         Ok(result)
     }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError> {
+        Ok(*self.cached_vote.read())
+    }
 }
 
 impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
@@ -853,10 +855,6 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError> {
-        Ok(*self.cached_vote.read())
-    }
-
     async fn save_committed(&mut self, _committed: Option<LogId>) -> Result<(), StorageError> {
         // Committed index is tracked implicitly by last_applied
         Ok(())
@@ -865,7 +863,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<TypeConfig>,
+        callback: IOFlushed<TypeConfig>,
     ) -> Result<(), StorageError>
     where
         I: IntoIterator<Item = Entry> + OptionalSend,
@@ -879,7 +877,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         let mut count = 0u64;
 
         for entry in entries {
-            let log_id = *entry.get_log_id();
+            let log_id = entry.log_id();
             let key = log_key(log_id.index);
             let data = bincode::serialize(&entry).map_err(write_err)?;
 
@@ -894,19 +892,20 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
         }
 
         // Notify that log is persisted (in memtable, will be flushed with next flush cycle)
-        callback.log_io_completed(Ok(()));
+        callback.io_completed(Ok(()));
 
         tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, "raft_append");
 
         Ok(())
     }
 
-    async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
+    async fn truncate_after(&mut self, last_log_id: Option<LogId>) -> Result<(), StorageError> {
         // Serialize with other log operations
         let _lock = self.log_mutex.lock().await;
 
-        // Delete all entries with index >= log_id.index
-        let start_key = log_key(log_id.index);
+        // Keep entries up to and including `last_log_id`; delete the rest.
+        let start_index = last_log_id.as_ref().map_or(0, |id| id.index() + 1);
+        let start_key = log_key(start_index);
         let end_key = log_key_end();
 
         let entries = self
@@ -928,12 +927,13 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 
         if let Some((ref _key, ref data)) = entries.last() {
             let entry: Entry = bincode::deserialize(data).map_err(read_err)?;
-            *self.cached_last_log_id.write() = Some(*entry.get_log_id());
+            *self.cached_last_log_id.write() = Some(entry.log_id());
         } else {
-            *self.cached_last_log_id.write() = *self.cached_last_purged.read();
+            let purged = *self.cached_last_purged.read();
+            *self.cached_last_log_id.write() = purged;
         }
 
-        tracing::debug!(?log_id, "Truncated log");
+        tracing::debug!(?last_log_id, "Truncated log");
         Ok(())
     }
 
@@ -971,6 +971,7 @@ impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
 }
 
 impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
+    type SnapshotData = SnapshotData;
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), StorageError> {
@@ -983,12 +984,22 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResponse>, StorageError>
+    async fn apply<Strm>(&mut self, mut stream: Strm) -> Result<(), StorageError>
     where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, std::io::Error>>
+            + Unpin
+            + OptionalSend,
     {
         use std::collections::HashSet;
+
+        // Take everything openraft has ready; each entry comes with the
+        // channel its client is waiting on (none on followers).
+        let mut entries = Vec::new();
+        let mut responders = Vec::new();
+        while let Some((entry, responder)) = stream.try_next().await? {
+            entries.push(entry);
+            responders.push(responder);
+        }
 
         let start = std::time::Instant::now();
         let mut results = Vec::new();
@@ -1008,7 +1019,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         };
 
         for entry in entries {
-            let log_id = *entry.get_log_id();
+            let log_id = entry.log_id();
 
             match &entry.payload {
                 EntryPayload::Blank => {
@@ -1254,21 +1265,22 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 .await?;
         }
 
-        Ok(results)
+        for (response, responder) in results.into_iter().zip(responders) {
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: SnapshotData,
     ) -> Result<(), StorageError> {
         let snapshot_data = snapshot.into_inner();
 
@@ -1398,16 +1410,11 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
-            snapshot_id: format!(
-                "{}-lsm-{}",
-                last_applied.map(|l| l.to_string()).unwrap_or_default(),
-                user_data.len()
-            ),
         };
 
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(snapshot_data)),
+            snapshot: Cursor::new(snapshot_data),
         }))
     }
 }
@@ -1416,6 +1423,8 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
 const RAFT_PREFIX: &[u8] = b"_raft:";
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
+    type SnapshotData = SnapshotData;
+
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
         // No log_mutex needed: snapshots read only non-Raft-prefixed keys (user data),
         // while log operations only touch Raft-prefixed keys. OpenRaft serializes all
@@ -1448,11 +1457,6 @@ impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
-            snapshot_id: format!(
-                "{}-lsm-{}",
-                last_applied.map(|l| l.to_string()).unwrap_or_default(),
-                user_data.len()
-            ),
         };
 
         tracing::info!(
@@ -1464,7 +1468,7 @@ impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(snapshot_data)),
+            snapshot: Cursor::new(snapshot_data),
         })
     }
 }

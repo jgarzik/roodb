@@ -1,4 +1,4 @@
-//! Type aliases for OpenRaft 0.9
+//! Raft type configuration and aliases
 
 use std::io::Cursor;
 
@@ -51,51 +51,59 @@ pub enum CommandResponse {
     Error(String),
 }
 
-// Use the macro to declare type config properly
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::DataChange(changes) => write!(
+                f,
+                "DataChange(txn {}, {} changes)",
+                changes.txn_id,
+                changes.changes.len()
+            ),
+            Command::Noop => f.write_str("Noop"),
+        }
+    }
+}
+
+// Everything not named here takes openraft's default.
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = Command,
         R = CommandResponse,
         Node = Node,
         NodeId = NodeId,
-        SnapshotData = Cursor<Vec<u8>>,
 );
 
+/// What a snapshot's data is carried in.
+pub type SnapshotData = Cursor<Vec<u8>>;
+
 /// Raft instance type alias
-pub type Raft = openraft::Raft<TypeConfig>;
+pub type Raft = openraft::Raft<TypeConfig, crate::raft::LsmRaftStorage>;
 
 /// Vote type alias
-pub type Vote = openraft::Vote<NodeId>;
+pub type Vote = openraft::alias::VoteOf<TypeConfig>;
 
 /// Log ID type alias
-pub type LogId = openraft::LogId<NodeId>;
+pub type LogId = openraft::alias::LogIdOf<TypeConfig>;
 
 /// Entry type alias
-pub type Entry = openraft::Entry<TypeConfig>;
+pub type Entry = openraft::alias::EntryOf<TypeConfig>;
 
 /// Snapshot meta type alias
-pub type SnapshotMeta = openraft::SnapshotMeta<NodeId, Node>;
+pub type SnapshotMeta = openraft::alias::SnapshotMetaOf<TypeConfig>;
 
 /// Snapshot type alias
-pub type Snapshot = openraft::storage::Snapshot<TypeConfig>;
-
-/// Storage error type alias
-pub type StorageError = openraft::StorageError<NodeId>;
+pub type Snapshot = openraft::alias::SnapshotOf<TypeConfig, SnapshotData>;
 
 /// Stored membership type alias
-pub type StoredMembership = openraft::StoredMembership<NodeId, Node>;
-
-/// Membership type alias
-pub type Membership = openraft::Membership<NodeId, Node>;
+pub type StoredMembership = openraft::alias::StoredMembershipOf<TypeConfig>;
 
 /// Log state type alias
 pub type LogState = openraft::storage::LogState<TypeConfig>;
 
-/// RPC types - these use TypeConfig which has associated types
+/// RPC types
 pub type AppendEntriesRequest = openraft::raft::AppendEntriesRequest<TypeConfig>;
-/// Response to append entries - uses NodeId directly
-pub type AppendEntriesResponse = openraft::raft::AppendEntriesResponse<NodeId>;
-pub type VoteRequest = openraft::raft::VoteRequest<NodeId>;
-pub type VoteResponse = openraft::raft::VoteResponse<NodeId>;
-pub type InstallSnapshotRequest = openraft::raft::InstallSnapshotRequest<TypeConfig>;
-pub type InstallSnapshotResponse = openraft::raft::InstallSnapshotResponse<NodeId>;
+pub type AppendEntriesResponse = openraft::raft::AppendEntriesResponse<TypeConfig>;
+pub type VoteRequest = openraft::raft::VoteRequest<TypeConfig>;
+pub type VoteResponse = openraft::raft::VoteResponse<TypeConfig>;
+pub type SnapshotResponse = openraft::raft::SnapshotResponse<TypeConfig>;
