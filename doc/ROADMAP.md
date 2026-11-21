@@ -10,7 +10,6 @@ multi-core machines.
 
 | Code | Phase |
 |------|-------|
-| LCK | Row locking: close out |
 | CLU | Cluster mode in the server binary |
 | PRF | Performance pass |
 | IDX | Secondary and unique indexes; ALTER TABLE done properly |
@@ -22,15 +21,6 @@ multi-core machines.
 | MTS | MySQL test suite |
 
 ---
-
-## LCK — Row locking: close out
-
-Row, gap and locking-read locks are in and reviewed.
-
-Benchmark at 1, 16 and 64 threads, both durability modes, against MySQL.
-Other work shares the machine, so compare builds run back to back in the
-same window (before and after, alternating) and judge by their ratio:
-confirm single-thread throughput did not regress with locking.
 
 ## CLU — Cluster mode in the server binary
 
@@ -62,7 +52,10 @@ Needs a quiet machine for every measurement.
   to I/O reactor. Registered buffers, reactor wake-up tuning; an own
   proposal batcher above Raft only if measurements call for it.
 - `--durability fsync` at 16 and 64 threads.
-- The lock manager is one mutex, and gap locks a linear list.
+- The lock manager is one mutex, and gap locks a linear list. With row
+  locking, single-thread write throughput measured about the same to 10%
+  lower than before it (runs alternated on a shared machine; reads
+  unchanged): find what the lock path costs per statement.
 - Compaction reads its inputs whole into memory; make it streaming.
 - The posix backend on Windows uses buffered I/O.
 

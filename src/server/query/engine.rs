@@ -1665,6 +1665,9 @@ impl QueryEngine {
                 .txn_manager
                 .begin(self.session.isolation_level, self.session.is_read_only)?;
             self.session.begin_transaction(txn.txn_id);
+            // A new transaction is one level deep, whatever depth the last
+            // one ended at.
+            self.nested_begins = 1;
         }
         Ok(())
     }
