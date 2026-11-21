@@ -483,7 +483,7 @@ async fn test_server_integration_e2e() {
     // Cleanup
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
 
     // Give server time to shutdown
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -598,7 +598,7 @@ async fn test_transaction_begin_commit() {
 
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);
@@ -711,7 +711,7 @@ async fn test_transaction_rollback() {
 
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);
@@ -814,7 +814,7 @@ async fn test_autocommit() {
     drop(conn1);
     drop(conn2);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);

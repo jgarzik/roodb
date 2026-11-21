@@ -49,7 +49,11 @@ impl RooDbServer {
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
     ) -> Self {
-        let txn_manager = Arc::new(TransactionManager::new());
+        // Transaction IDs continue from where the state machine has got to,
+        // not from 1: rows already on disk carry earlier IDs.
+        let txn_manager = Arc::new(TransactionManager::with_applied_floor(
+            raft_node.applied_txn_floor(),
+        ));
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
@@ -179,12 +183,17 @@ async fn accept_optional(
 pub struct ServerHandle {
     pub addr: SocketAddr,
     pub shutdown_tx: oneshot::Sender<()>,
+    raft_node: Arc<RaftNode>,
 }
 
 impl ServerHandle {
-    /// Shutdown the server
-    pub fn shutdown(self) {
+    /// Stop accepting connections and shut Raft down, with its log written
+    /// out. The storage engine is the caller's to close.
+    pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
+        if let Err(e) = self.raft_node.shutdown().await {
+            tracing::warn!(error = %e, "Raft shutdown reported an error");
+        }
     }
 }
 
@@ -228,17 +237,16 @@ pub async fn start_test_server(
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
+    // Forms the cluster on first start; on later starts resumes it and
+    // replays the log. Returns once the node leads and has caught up.
     raft_node
         .bootstrap_single_node()
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
-    // Brief wait for single-node leader election (with tick disabled, should be near-instant)
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     let raft_node = Arc::new(raft_node);
 
-    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node.clone());
     let actual_addr = server.addr();
 
     tokio::spawn(async move {
@@ -253,5 +261,6 @@ pub async fn start_test_server(
     Ok(ServerHandle {
         addr: actual_addr,
         shutdown_tx,
+        raft_node,
     })
 }

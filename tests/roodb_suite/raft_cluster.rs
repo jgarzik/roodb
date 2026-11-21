@@ -280,8 +280,9 @@ async fn test_log_replication() {
 
 /// Start a single-node Raft over fresh storage and return the node with the
 /// storage it applies to.
-async fn single_node(name: &str, port: u16) -> (RaftNode, Arc<dyn StorageEngine>) {
-    let addr: SocketAddr = format!("127.0.0.1:{}", test_port(port)).parse().unwrap();
+async fn single_node(name: &str) -> (RaftNode, Arc<dyn StorageEngine>) {
+    // Port 0: the node never talks to a peer, and a fixed port could collide.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (storage, log) = test_storage(name).await;
     let mut node = RaftNode::new(
         1,
@@ -314,7 +315,7 @@ async fn stored_row(storage: &Arc<dyn StorageEngine>, key: &[u8]) -> Option<Vec<
 /// failing one either.
 #[tokio::test]
 async fn a_rejected_changeset_writes_nothing() {
-    let (mut node, storage) = single_node("atomic_reject", 15300).await;
+    let (node, storage) = single_node("atomic_reject").await;
 
     node.propose_changes(insert_change("t", b"existing", b"v1"))
         .await
@@ -362,7 +363,7 @@ async fn a_rejected_changeset_writes_nothing() {
 /// same new key twice is.
 #[tokio::test]
 async fn a_changeset_sees_its_own_earlier_changes() {
-    let (mut node, storage) = single_node("atomic_overlay", 15400).await;
+    let (node, storage) = single_node("atomic_overlay").await;
 
     node.propose_changes(insert_change("t", b"row", b"old"))
         .await
@@ -406,7 +407,7 @@ async fn the_log_is_purged_only_up_to_what_is_flushed() {
     use openraft::storage::RaftLogStorage;
     use roodb::io::PAGE_SIZE;
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15500)).parse().unwrap();
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut path = std::env::temp_dir();
     path.push(format!(
         "roodb_test_purge_{}_{:?}",

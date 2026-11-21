@@ -26,6 +26,10 @@ pub enum Command {
     DataChange(ChangeSet),
     /// No-op for leader election
     Noop,
+    /// Row IDs below `upto` (the node-local counter) are reserved for
+    /// `node_id`. A node records this before handing any of them out, so that
+    /// after a restart it can resume past every ID it may have used.
+    ReserveRowIds { node_id: NodeId, upto: u64 },
 }
 
 // ============ MVCC header layout constants ============
@@ -61,6 +65,9 @@ impl std::fmt::Display for Command {
                 changes.changes.len()
             ),
             Command::Noop => f.write_str("Noop"),
+            Command::ReserveRowIds { node_id, upto } => {
+                write!(f, "ReserveRowIds(node {node_id}, upto {upto})")
+            }
         }
     }
 }

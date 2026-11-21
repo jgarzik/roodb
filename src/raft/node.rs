@@ -50,11 +50,18 @@ pub struct RaftNode {
     raft: Raft,
     network: RaftNetworkFactoryImpl,
     tls_config: RaftTlsConfig,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    log_store: LogStore,
+    single_node: bool,
+    /// Highest transaction ID the state machine has applied (or a bound
+    /// above it), for the transaction manager.
+    applied_txn_floor: Arc<AtomicU64>,
     /// Log size, in bytes, above which a checkpoint is requested.
     log_budget: Arc<AtomicU64>,
     /// The task that requests checkpoints.
     checkpointer: tokio::task::JoinHandle<()>,
+    /// The task that keeps row IDs reserved ahead of use.
+    row_id_reserver: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// How much log may accumulate before the state machine is checkpointed so
@@ -62,12 +69,71 @@ pub struct RaftNode {
 /// work a restart has to replay.
 pub const DEFAULT_LOG_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How long startup waits for the node to lead and to replay its log.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How often the log size is looked at.
 const CHECKPOINT_POLL: Duration = Duration::from_millis(250);
 
 /// How long to wait for a requested checkpoint to shrink the log before
 /// asking again.
 const CHECKPOINT_RETRY: Duration = Duration::from_secs(5);
+
+/// Smallest range of row IDs reserved at a time.
+const ROW_ID_MIN_BLOCK: u64 = 1 << 16;
+
+/// Largest range of row IDs reserved at a time.
+const ROW_ID_MAX_BLOCK: u64 = 1 << 24;
+
+/// How often the supply of reserved row IDs is looked at.
+const ROW_ID_POLL: Duration = Duration::from_millis(20);
+
+/// Reserve `block` more row IDs for this node, past both what is reserved
+/// and what any waiting allocation needs.
+async fn reserve_row_ids(raft: &Raft, node_id: NodeId, block: u64) -> Result<(), RaftNodeError> {
+    let (next, limit, wanted) = crate::storage::row_id::generator().demand();
+    let upto = next.max(limit.unwrap_or(0)).max(wanted) + block;
+    let response = raft
+        .client_write(Command::ReserveRowIds { node_id, upto })
+        .await
+        .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+    match response.data {
+        CommandResponse::Ok(_) => Ok(()),
+        CommandResponse::Error(message) => Err(RaftNodeError::Raft(message)),
+    }
+}
+
+/// Keep row IDs reserved ahead of use.
+///
+/// A new range is reserved when less than half of the last one is left, or
+/// when an allocation is waiting. Each range is twice what was used since the
+/// previous reservation, so a bulk load quickly gets ranges to match while an
+/// idle server wastes few IDs on a restart.
+async fn row_id_task(raft: Raft, node_id: NodeId) {
+    let generator = crate::storage::row_id::generator();
+    let mut block = ROW_ID_MIN_BLOCK;
+    let mut last_next = generator.demand().0;
+    loop {
+        tokio::time::sleep(ROW_ID_POLL).await;
+        let (next, limit, wanted) = generator.demand();
+        let Some(limit) = limit else {
+            continue;
+        };
+        if limit.saturating_sub(next) >= block / 2 && wanted <= limit {
+            continue;
+        }
+        let used = next.saturating_sub(last_next);
+        block = (used * 2).clamp(ROW_ID_MIN_BLOCK, ROW_ID_MAX_BLOCK);
+        last_next = next;
+        match reserve_row_ids(&raft, node_id, block).await {
+            Ok(()) => {}
+            // Not the leader, or shutting down. A follower hands out no row
+            // IDs; if this node becomes leader the next round succeeds.
+            Err(_) if raft.is_leader() => return,
+            Err(_) => {}
+        }
+    }
+}
 
 /// Ask for a checkpoint whenever the log outgrows its budget.
 ///
@@ -142,9 +208,10 @@ impl RaftNode {
 
         // The state machine applies committed entries to the LSM; the log
         // store holds the entries themselves.
-        let state_machine = LsmRaftStorage::new(storage, catalog, single_node)
+        let state_machine = LsmRaftStorage::new(storage, catalog, single_node, id)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        let applied_txn_floor = state_machine.applied_txn_floor();
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
@@ -159,8 +226,15 @@ impl RaftNode {
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
         let log_budget = Arc::new(AtomicU64::new(DEFAULT_LOG_BUDGET_BYTES));
-        let checkpointer =
-            tokio::spawn(checkpoint_task(raft.clone(), log_store, log_budget.clone()));
+        let checkpointer = tokio::spawn(checkpoint_task(
+            raft.clone(),
+            log_store.clone(),
+            log_budget.clone(),
+        ));
+
+        // Runs on every node: only a leader's reservations succeed, and a
+        // follower that becomes leader needs them at once.
+        let row_id_reserver = tokio::spawn(row_id_task(raft.clone(), id));
 
         Ok(Self {
             id,
@@ -168,10 +242,20 @@ impl RaftNode {
             raft,
             network,
             tls_config,
-            shutdown_tx: None,
+            shutdown_tx: parking_lot::Mutex::new(None),
+            log_store,
+            single_node,
+            applied_txn_floor,
             log_budget,
             checkpointer,
+            row_id_reserver: parking_lot::Mutex::new(Some(row_id_reserver)),
         })
+    }
+
+    /// The highest transaction ID the state machine has applied, or a bound
+    /// above it. Give this to the transaction manager.
+    pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
+        self.applied_txn_floor.clone()
     }
 
     /// Change how much log may accumulate before a checkpoint is requested.
@@ -194,17 +278,67 @@ impl RaftNode {
         self.network.add_node(id, addr);
     }
 
-    /// Bootstrap as a single-node cluster (auto-elect as leader)
+    /// Bring a single-node cluster up: form it on first start, resume it on
+    /// every later one, and return once this node is leading and its state
+    /// machine has caught up with its log.
     pub async fn bootstrap_single_node(&self) -> Result<(), RaftNodeError> {
-        let mut members = BTreeMap::new();
-        members.insert(self.id, Node::default());
-
-        self.raft
-            .initialize(members)
+        let initialized = self
+            .raft
+            .is_initialized()
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        if !initialized {
+            let mut members = BTreeMap::new();
+            members.insert(self.id, Node::default());
+            self.raft
+                .initialize(members)
+                .await
+                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+            tracing::info!(node_id = self.id, "Formed a single-node cluster");
+        }
+        self.wait_until_ready().await
+    }
 
-        tracing::info!(node_id = self.id, "Bootstrapped as single-node cluster");
+    /// Wait until this node leads and has applied everything in its log that
+    /// was committed before it last stopped. Until then reads could see an
+    /// older state than clients were shown before the restart.
+    ///
+    /// A single node holds no elections on a timer, so if it did not come
+    /// back as leader by itself it is told to stand.
+    pub async fn wait_until_ready(&self) -> Result<(), RaftNodeError> {
+        if self.single_node {
+            let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+            let mut next_election = tokio::time::Instant::now() + Duration::from_millis(200);
+            while !self.raft.is_leader() {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(RaftNodeError::Raft(
+                        "single node did not become leader".to_string(),
+                    ));
+                }
+                if now >= next_election {
+                    self.raft
+                        .trigger()
+                        .elect(false)
+                        .await
+                        .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+                    next_election = now + Duration::from_secs(1);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        self.raft
+            .wait_for_recovery(Some(READY_TIMEOUT))
+            .await
+            .map_err(|e| RaftNodeError::Raft(format!("recovery did not complete: {e}")))?;
+
+        // Row IDs. Every reservation made before the restart has been
+        // replayed by now; any ID in those ranges may have been used, so
+        // start past them, with a fresh range reserved before serving.
+        if self.single_node {
+            crate::storage::row_id::generator().skip_reserved();
+            reserve_row_ids(&self.raft, self.id, ROW_ID_MIN_BLOCK).await?;
+        }
         Ok(())
     }
 
@@ -238,7 +372,7 @@ impl RaftNode {
         let handler = Arc::new(RaftRpcHandler::new(self.raft.clone()));
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        self.shutdown_tx = Some(shutdown_tx);
+        *self.shutdown_tx.lock() = Some(shutdown_tx);
 
         tracing::info!(addr = %self.addr, "Raft RPC server listening");
 
@@ -336,16 +470,21 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Raft(e.to_string()))
     }
 
-    /// Shutdown the node
-    pub async fn shutdown(&mut self) -> Result<(), RaftNodeError> {
+    /// Stop the node: no more RPCs, Raft halted, and everything queued for
+    /// the log written out.
+    pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
         self.checkpointer.abort();
-        if let Some(tx) = self.shutdown_tx.take() {
+        if let Some(reserver) = self.row_id_reserver.lock().take() {
+            reserver.abort();
+        }
+        if let Some(tx) = self.shutdown_tx.lock().take() {
             let _ = tx.send(());
         }
         self.raft
             .shutdown()
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        self.log_store.close().await;
         Ok(())
     }
 }
@@ -377,7 +516,10 @@ async fn handle_rpc_connection(
 
 impl Drop for RaftNode {
     fn drop(&mut self) {
-        // The checkpoint task holds a handle to Raft and would keep it alive.
+        // These tasks hold a handle to Raft and would keep it alive.
         self.checkpointer.abort();
+        if let Some(reserver) = self.row_id_reserver.lock().take() {
+            reserver.abort();
+        }
     }
 }

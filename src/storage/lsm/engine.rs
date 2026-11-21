@@ -155,8 +155,9 @@ struct Inner {
     work: Arc<Notify>,
     /// Wakes the compaction task.
     compact_work: Arc<Notify>,
-    /// Exclusive lock on the data directory, held for the engine's lifetime.
-    _dir_lock: std::fs::File,
+    /// Exclusive lock on the data directory, held until the engine is closed
+    /// or dropped.
+    dir_lock: parking_lot::Mutex<Option<std::fs::File>>,
     /// Signalled each time a frozen memtable has been written out.
     flushed: Notify,
     /// The last background flush or compaction failed with this error. Paused
@@ -343,7 +344,7 @@ impl Inner {
             crash_point: config.crash_point,
             work: Arc::new(Notify::new()),
             compact_work: Arc::new(Notify::new()),
-            _dir_lock: dir_lock,
+            dir_lock: parking_lot::Mutex::new(Some(dir_lock)),
             flushed: Notify::new(),
             background_error: parking_lot::Mutex::new(None),
             stopping: AtomicBool::new(false),
@@ -924,6 +925,9 @@ impl StorageEngine for LsmEngine {
         self.inner.flush_all(Urgency::Background).await?;
         self.stop_workers().await;
         self.inner.closed.store(true, Ordering::SeqCst);
+        // A closed engine does nothing more with the directory, whoever still
+        // holds a handle to it; let the next one in.
+        self.inner.dir_lock.lock().take();
         Ok(())
     }
 }

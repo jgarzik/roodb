@@ -27,55 +27,128 @@ pub fn get_node_id() -> u64 {
     NODE_ID.load(Ordering::SeqCst)
 }
 
-/// Global row ID generator
+/// Hands out row IDs, in order, from a range it has been allowed.
 ///
-/// Generates globally unique row IDs for all database operations.
-/// Row IDs encode the node_id in the high 16 bits to ensure uniqueness
-/// across the cluster.
+/// Row IDs become keys, so one must never be handed out twice - including
+/// after a restart, when this counter starts again from what was saved. The
+/// server therefore reserves IDs ahead of use: a range is recorded through
+/// Raft before any ID in it is handed out, and after a restart allocation
+/// resumes past everything ever reserved. The reserved range is `limit`;
+/// allocation waits when it runs out, and whoever does the reserving watches
+/// [`RowIdGenerator::demand`] to stay ahead.
+///
+/// Until [`RowIdGenerator::restore`] is called the range is unlimited: that
+/// is how `roodb_init` and tests without a server use it.
 pub struct RowIdGenerator {
-    /// Next local counter value
     next_id: AtomicU64,
+    /// IDs below this may be handed out. `u64::MAX` means unlimited.
+    limit: AtomicU64,
+    /// The end of the largest allocation that had to wait.
+    wanted: AtomicU64,
 }
 
+/// How long an allocation waits for more IDs to be reserved before giving up.
+const RESERVATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl RowIdGenerator {
-    /// Create a new row ID generator starting at 1
+    /// Create a new generator starting from 1
     pub const fn new() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-        }
+        Self::starting_at(1)
     }
 
-    /// Create a row ID generator starting at a specific value
-    ///
-    /// Used for recovery after restart to continue from the last allocated ID.
+    /// Create a generator starting from a specific value
     pub const fn starting_at(start: u64) -> Self {
         Self {
             next_id: AtomicU64::new(start),
+            limit: AtomicU64::new(u64::MAX),
+            wanted: AtomicU64::new(0),
         }
     }
 
-    /// Allocate the next row ID
-    ///
-    /// This is thread-safe and guaranteed to return unique IDs.
+    /// Generate the next row ID
     #[inline]
     pub fn next(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::SeqCst)
+        self.allocate_batch(1)
     }
 
-    /// Allocate a batch of row IDs
+    /// Allocate `count` consecutive IDs and return the first.
     ///
-    /// Returns the start of the allocated range. The caller owns IDs from
-    /// `start` to `start + count - 1` (inclusive).
+    /// Waits if the reserved range does not cover them yet.
     ///
-    /// This reduces atomic contention by allocating many IDs at once.
-    #[inline]
+    /// # Panics
+    ///
+    /// If nothing extends the range for 30 seconds. That means Raft cannot
+    /// commit a reservation, and no write could succeed anyway.
     pub fn allocate_batch(&self, count: u64) -> u64 {
-        self.next_id.fetch_add(count, Ordering::SeqCst)
+        let mut waited_since: Option<std::time::Instant> = None;
+        loop {
+            let start = self.next_id.load(Ordering::SeqCst);
+            let end = start.saturating_add(count);
+            if end <= self.limit.load(Ordering::SeqCst) {
+                if self
+                    .next_id
+                    .compare_exchange(start, end, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return start;
+                }
+                continue;
+            }
+            // Out of reserved IDs: say how far this allocation needs the
+            // range to reach, and give the reserver a moment.
+            self.wanted.fetch_max(end, Ordering::SeqCst);
+            let since = *waited_since.get_or_insert_with(std::time::Instant::now);
+            assert!(
+                since.elapsed() < RESERVATION_WAIT,
+                "no row IDs could be reserved for {RESERVATION_WAIT:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
-    /// Get the current counter value (for debugging/metrics)
+    /// Get current value without incrementing
     pub fn current(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
+    }
+
+    /// Start from saved state: no ID below `bound` is handed out, and none
+    /// at all until a range is reserved with [`Self::extend_limit`].
+    pub fn restore(&self, bound: u64) {
+        let next = self.next_id.fetch_max(bound, Ordering::SeqCst).max(bound);
+        // From unlimited to "nothing reserved yet"; never lower a limit a
+        // reservation has already raised.
+        let _ = self
+            .limit
+            .compare_exchange(u64::MAX, next, Ordering::SeqCst, Ordering::SeqCst);
+        self.limit.fetch_max(bound, Ordering::SeqCst);
+    }
+
+    /// IDs below `upto` have been reserved and may be handed out.
+    pub fn extend_limit(&self, upto: u64) {
+        if self.limit.load(Ordering::SeqCst) != u64::MAX {
+            self.limit.fetch_max(upto, Ordering::SeqCst);
+        }
+    }
+
+    /// Skip every ID reserved so far. Called once after a restart has
+    /// replayed the log: any of them may have been used before the restart.
+    pub fn skip_reserved(&self) {
+        let limit = self.limit.load(Ordering::SeqCst);
+        if limit != u64::MAX {
+            self.next_id.fetch_max(limit, Ordering::SeqCst);
+        }
+    }
+
+    /// `(next, limit, wanted)`: the next ID, the end of the reserved range
+    /// (`None` if unlimited), and the furthest any allocation has had to
+    /// wait for.
+    pub fn demand(&self) -> (u64, Option<u64>, u64) {
+        let limit = self.limit.load(Ordering::SeqCst);
+        (
+            self.next_id.load(Ordering::SeqCst),
+            (limit != u64::MAX).then_some(limit),
+            self.wanted.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -85,31 +158,29 @@ impl Default for RowIdGenerator {
     }
 }
 
-/// Global row ID generator instance
-///
-/// This is the single source of truth for row IDs in the database.
-/// All modules should use this instead of maintaining their own counters.
+/// Global row ID generator
 static GLOBAL_ROW_ID_GEN: RowIdGenerator = RowIdGenerator::new();
 
-/// Allocate the next globally unique row ID
+/// The process-wide generator, for the code that saves and reserves ranges.
+pub fn generator() -> &'static RowIdGenerator {
+    &GLOBAL_ROW_ID_GEN
+}
+
+/// Generate a globally unique row ID
 ///
-/// The row ID encodes the node_id in the high 16 bits and a local counter
-/// in the low 48 bits, ensuring uniqueness across the cluster.
+/// Format: upper 16 bits = node_id, lower 48 bits = local counter
+/// This supports up to 65535 nodes and ~281 trillion rows per node.
 #[inline]
 pub fn next_row_id() -> u64 {
     let local = GLOBAL_ROW_ID_GEN.next();
     let node_id = NODE_ID.load(Ordering::SeqCst);
-    // Encode: [16-bit node_id][48-bit local counter]
     (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
 }
 
-/// Allocate a batch of globally unique row IDs
+/// Allocate a batch of row IDs, returning the starting local counter and node_id
 ///
-/// Returns (start_local, node_id) where the caller owns local IDs from
-/// `start_local` to `start_local + count - 1`. Use `encode_row_id()` to
-/// convert each local ID to a full row ID.
-///
-/// This reduces atomic contention by allocating many IDs at once.
+/// Returns (start_local, node_id) where caller can construct IDs as:
+/// `(node_id << 48) | ((start_local + i) & 0x0000_FFFF_FFFF_FFFF)`
 #[inline]
 pub fn allocate_row_id_batch(count: u64) -> (u64, u64) {
     let start_local = GLOBAL_ROW_ID_GEN.allocate_batch(count);
@@ -117,15 +188,13 @@ pub fn allocate_row_id_batch(count: u64) -> (u64, u64) {
     (start_local, node_id)
 }
 
-/// Encode a local counter value into a full row ID
-///
-/// Combines the node_id (high 16 bits) with the local counter (low 48 bits).
+/// Encode a local counter and node_id into a row ID
 #[inline]
 pub fn encode_row_id(local: u64, node_id: u64) -> u64 {
     (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
 }
 
-/// Get the current row ID counter value (for debugging/metrics)
+/// Get current row ID without incrementing (for debugging/testing)
 pub fn current_row_id() -> u64 {
     GLOBAL_ROW_ID_GEN.current()
 }
@@ -172,5 +241,60 @@ mod tests {
         assert!(local_counter > 0);
         // Reset for other tests
         set_node_id(0);
+    }
+
+    #[test]
+    fn unlimited_until_restored() {
+        let gen = RowIdGenerator::new();
+        assert_eq!(gen.allocate_batch(1_000_000), 1);
+        assert_eq!(gen.demand(), (1_000_001, None, 0));
+    }
+
+    #[test]
+    fn restore_resumes_past_saved_bound_and_waits_for_a_reservation() {
+        let gen = std::sync::Arc::new(RowIdGenerator::new());
+        gen.restore(5000);
+        assert_eq!(gen.demand(), (5000, Some(5000), 0));
+
+        // An allocation now has to wait until a range is reserved.
+        let waiter = {
+            let gen = gen.clone();
+            std::thread::spawn(move || gen.allocate_batch(10))
+        };
+        while gen.demand().2 == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(gen.demand().2, 5010, "the waiter says how far it needs");
+        gen.extend_limit(6000);
+        assert_eq!(waiter.join().unwrap(), 5000);
+        assert_eq!(gen.next(), 5010);
+    }
+
+    #[test]
+    fn ids_reserved_before_a_restart_are_skipped() {
+        let gen = RowIdGenerator::new();
+        // Saved state says IDs below 100 were reserved; the log then replays
+        // two more reservations made before the crash.
+        gen.restore(100);
+        gen.extend_limit(200);
+        gen.extend_limit(300);
+        gen.skip_reserved();
+        assert_eq!(gen.demand(), (300, Some(300), 0));
+        gen.extend_limit(400);
+        assert_eq!(gen.next(), 300);
+    }
+
+    #[test]
+    fn restore_never_moves_backwards() {
+        let gen = RowIdGenerator::new();
+        gen.restore(1000);
+        gen.extend_limit(2000);
+        assert_eq!(gen.allocate_batch(500), 1000);
+        // A second restore with an older bound changes nothing.
+        gen.restore(10);
+        assert_eq!(gen.demand(), (1500, Some(2000), 0));
+        // extend_limit never shrinks either.
+        gen.extend_limit(1200);
+        assert_eq!(gen.demand().1, Some(2000));
     }
 }

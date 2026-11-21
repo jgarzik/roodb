@@ -6,4 +6,5 @@
 pub mod auth;
 pub mod certs;
 pub mod cleanup;
+pub mod process;
 pub mod server_manager;

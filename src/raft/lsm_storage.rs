@@ -8,6 +8,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{Stream, TryStreamExt};
@@ -76,6 +77,22 @@ fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
 // Key prefixes for Raft state in LSM
 const LAST_APPLIED_KEY: &[u8] = b"_raft:sm:last_applied";
 const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
+/// A bound on the highest transaction ID applied (u64, little endian).
+const MAX_TXN_KEY: &[u8] = b"_raft:sm:max_txn_id";
+
+/// Prefix of the keys holding each node's reserved row ID bound (u64, little
+/// endian), followed by the node ID in big endian.
+const ROW_ID_KEY_PREFIX: &[u8] = b"_raft:sm:row_id:";
+
+fn row_id_key(node_id: u64) -> Vec<u8> {
+    let mut key = ROW_ID_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key
+}
+
+/// The stored bound is moved this far past the ID that crosses it, so that it
+/// is rewritten once per this many transactions rather than once per entry.
+const TXN_ID_STEP: u64 = 1024;
 
 /// Storage methods report plain I/O errors; openraft adds the context.
 type StorageError = std::io::Error;
@@ -113,6 +130,13 @@ pub struct LsmRaftStorage {
     cached_membership: Arc<RwLock<StoredMembership>>,
     /// No other node will ever ask this one for a snapshot's contents.
     single_node: bool,
+    /// The highest transaction ID applied, or a bound above it; shared with
+    /// the transaction manager, which keeps its own IDs ahead of it.
+    applied_txn_floor: Arc<AtomicU64>,
+    /// The bound as stored: never below `applied_txn_floor`.
+    stored_txn_bound: Arc<AtomicU64>,
+    /// This node's ID: whose row ID reservations are its own.
+    node_id: u64,
 }
 
 /// A change to a system table, noted so the catalog can follow once the
@@ -149,6 +173,7 @@ impl LsmRaftStorage {
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         single_node: bool,
+        node_id: u64,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
@@ -156,12 +181,21 @@ impl LsmRaftStorage {
             cached_last_applied: Arc::new(RwLock::new(None)),
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
             single_node,
+            applied_txn_floor: Arc::new(AtomicU64::new(0)),
+            stored_txn_bound: Arc::new(AtomicU64::new(0)),
+            node_id,
         };
 
         // Load existing state from LSM into caches
         this.load_cached_state().await?;
 
         Ok(this)
+    }
+
+    /// The highest transaction ID applied, or a bound above it. The
+    /// transaction manager keeps the IDs it hands out ahead of this.
+    pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
+        self.applied_txn_floor.clone()
     }
 
     /// The state machine's position as flushed to disk: what a restart would
@@ -205,43 +239,48 @@ impl LsmRaftStorage {
             *self.cached_membership.write() = membership;
         }
 
+        // Transaction IDs at or below this may be in rows on disk.
+        if let Some(data) = self.storage.get(MAX_TXN_KEY).await.map_err(read_err)? {
+            let bytes: [u8; 8] = data
+                .as_slice()
+                .try_into()
+                .map_err(|_| read_err("stored transaction ID bound is malformed"))?;
+            let bound = u64::from_le_bytes(bytes);
+            self.applied_txn_floor.store(bound, Ordering::SeqCst);
+            self.stored_txn_bound.store(bound, Ordering::SeqCst);
+        }
+
+        // Row IDs: resume past what was reserved, and hand none out until a
+        // new range has been reserved through Raft.
+        let reserved = match self
+            .storage
+            .get(&row_id_key(self.node_id))
+            .await
+            .map_err(read_err)?
+        {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| read_err("stored row ID bound is malformed"))?;
+                u64::from_le_bytes(bytes)
+            }
+            None => 0,
+        };
+        crate::storage::row_id::generator().restore(reserved);
+
         tracing::info!(
             last_applied = ?*self.cached_last_applied.read(),
+            txn_id_floor = self.applied_txn_floor.load(Ordering::SeqCst),
+            row_ids_reserved = reserved,
             "Loaded state machine position from LSM"
         );
 
-        // Load databases from system.databases into catalog
-        // These may have been written by roodb_init (without MVCC headers)
-        // or via Raft apply (with MVCC headers). Handle both.
-        self.load_databases_into_catalog().await?;
-
-        Ok(())
-    }
-
-    /// Load database names from system.databases into the catalog
-    ///
-    /// Handles both raw rows (from roodb_init) and MVCC-wrapped rows (from Raft apply).
-    async fn load_databases_into_catalog(&self) -> Result<(), StorageError> {
-        let prefix = table_key_prefix(SYSTEM_DATABASES);
-        let end = table_key_end(SYSTEM_DATABASES);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(read_err)?;
-
-        let mut catalog = self.catalog.write();
-        for (_key, value) in rows {
-            let Some(row_data) = extract_row_data(&value) else {
-                continue;
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
-                    catalog.register_database(db_name.clone());
-                }
-            }
-        }
+        // The catalog is not stored anywhere but in the system tables.
+        // Rebuild all of it - databases, tables, indexes, views, procedures -
+        // from what is on disk. Entries replayed from the log afterwards
+        // update it as they are applied, as they do while running.
+        self.rebuild_catalog_from_system_tables().await?;
 
         Ok(())
     }
@@ -418,7 +457,8 @@ impl LsmRaftStorage {
         Ok(())
     }
 
-    /// Rebuild entire catalog from system tables after snapshot install
+    /// Rebuild the entire catalog from the system tables: at startup, and after
+    /// a snapshot has replaced the data.
     async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
         use crate::catalog::{IndexDef, TableDef};
 
@@ -636,7 +676,7 @@ impl LsmRaftStorage {
             catalog.register_view(view_def);
         }
 
-        tracing::info!("Rebuilt catalog from system tables after snapshot install");
+        tracing::info!("Rebuilt catalog from system tables");
         Ok(())
     }
 
@@ -924,16 +964,26 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             let mut batch: Vec<WriteOp> = Vec::new();
             let mut tracked: Vec<TrackedChange> = Vec::new();
             let mut membership_change = None;
+            let mut new_txn_id = None;
+            let mut reserved_row_ids = None;
 
             let response = match &entry.payload {
                 EntryPayload::Blank => CommandResponse::Ok(None),
                 EntryPayload::Normal(Command::Noop) => CommandResponse::Ok(None),
+                EntryPayload::Normal(Command::ReserveRowIds { node_id, upto }) => {
+                    batch.push((row_id_key(*node_id), Some(upto.to_le_bytes().to_vec())));
+                    if *node_id == self.node_id {
+                        reserved_row_ids = Some(*upto);
+                    }
+                    CommandResponse::Ok(None)
+                }
                 EntryPayload::Normal(Command::DataChange(changeset)) => {
                     match self
                         .plan_changeset(changeset, &existing_tables, &existing_indexes)
                         .await?
                     {
                         Ok(plan) => {
+                            new_txn_id = Some(changeset.txn_id);
                             tracing::debug!(
                                 txn_id = changeset.txn_id,
                                 changes = changeset.changes.len(),
@@ -965,9 +1015,26 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 }
             };
 
+            // Rows now carry this transaction's ID. Keep the stored bound
+            // above every ID in a row, in the same batch as the rows.
+            if let Some(txn_id) = new_txn_id {
+                if txn_id > self.stored_txn_bound.load(Ordering::SeqCst) {
+                    let bound = txn_id + TXN_ID_STEP;
+                    batch.push((MAX_TXN_KEY.to_vec(), Some(bound.to_le_bytes().to_vec())));
+                    self.stored_txn_bound.store(bound, Ordering::SeqCst);
+                }
+            }
+
             let position = bincode::serialize(&log_id).map_err(write_err)?;
             batch.push((LAST_APPLIED_KEY.to_vec(), Some(position)));
             self.storage.write_batch(batch).await.map_err(write_err)?;
+            if let Some(txn_id) = new_txn_id {
+                self.applied_txn_floor.fetch_max(txn_id, Ordering::SeqCst);
+            }
+            // Only now that the reservation is recorded may the IDs be used.
+            if let Some(upto) = reserved_row_ids {
+                crate::storage::row_id::generator().extend_limit(upto);
+            }
 
             // Memory follows storage.
             *self.cached_last_applied.write() = Some(log_id);
