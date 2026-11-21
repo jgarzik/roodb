@@ -86,7 +86,7 @@ All integration tests build into the single `suite` test binary. TDS tests use t
 
 - io_uring only available on Linux
 - Use `#[cfg(target_os = "linux")]` for io_uring code
-- POSIX fallback used automatically on non-Linux
+- The I/O backend is chosen at startup (`--io-backend auto|uring|posix`, `ROODB_IO_BACKEND`); `auto` falls back to the posix worker pool when io_uring is unavailable
 
 ## Development Notes
 

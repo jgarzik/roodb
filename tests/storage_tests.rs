@@ -1,16 +1,11 @@
 //! Integration tests for the storage engine
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use roodb::io::scheduler::IoPriority;
-use roodb::io::PosixIOFactory;
+use roodb::io::{IoBackend, IoEngine, Urgency};
 use roodb::storage::lsm::engine::LsmConfig;
 use roodb::storage::lsm::LsmEngine;
 use roodb::storage::StorageEngine;
-
-#[cfg(target_os = "linux")]
-use roodb::io::UringIOFactory;
 
 fn test_dir(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -127,12 +122,12 @@ async fn test_sstable_write_read() {
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let factory = PosixIOFactory;
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let path = dir.join("test.sst");
 
     // Write SSTable
     {
-        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+        let mut writer = SstableWriter::create(&factory, &path, Urgency::Background)
             .await
             .unwrap();
 
@@ -155,7 +150,7 @@ async fn test_sstable_write_read() {
 
     // Read SSTable
     {
-        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+        let reader = SstableReader::open(&factory, &path, Urgency::Foreground)
             .await
             .unwrap();
 
@@ -186,12 +181,12 @@ async fn test_sstable_large() {
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let factory = PosixIOFactory;
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let path = dir.join("large.sst");
 
     // Write many entries (enough to span multiple blocks)
     {
-        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+        let mut writer = SstableWriter::create(&factory, &path, Urgency::Background)
             .await
             .unwrap();
 
@@ -209,7 +204,7 @@ async fn test_sstable_large() {
 
     // Read back and verify
     {
-        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+        let reader = SstableReader::open(&factory, &path, Urgency::Foreground)
             .await
             .unwrap();
 
@@ -235,7 +230,7 @@ async fn test_lsm_put_get() {
     let dir = test_dir("lsm_basic");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -265,7 +260,7 @@ async fn test_lsm_delete() {
     let dir = test_dir("lsm_delete");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -288,7 +283,7 @@ async fn test_lsm_scan() {
     let dir = test_dir("lsm_scan");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -321,7 +316,7 @@ async fn test_lsm_flush() {
     let dir = test_dir("lsm_flush");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -352,7 +347,7 @@ async fn test_lsm_recovery() {
     let dir = test_dir("lsm_recovery");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -402,7 +397,7 @@ async fn test_uring_lsm_basic() {
     let dir = test_dir("uring_lsm");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(UringIOFactory);
+    let factory = IoEngine::new(IoBackend::Uring).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -427,12 +422,12 @@ async fn test_uring_sstable_write_read() {
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let factory = UringIOFactory;
+    let factory = IoEngine::new(IoBackend::Uring).unwrap();
     let path = dir.join("test.sst");
 
     // Write SSTable
     {
-        let mut writer = SstableWriter::create(&factory, &path, IoPriority::Flush)
+        let mut writer = SstableWriter::create(&factory, &path, Urgency::Background)
             .await
             .unwrap();
 
@@ -450,7 +445,7 @@ async fn test_uring_sstable_write_read() {
 
     // Read SSTable
     {
-        let reader = SstableReader::open(&factory, &path, IoPriority::QueryRead)
+        let reader = SstableReader::open(&factory, &path, Urgency::Foreground)
             .await
             .unwrap();
 
@@ -471,11 +466,12 @@ async fn test_lsm_memory_budget() {
     let dir = test_dir("lsm_memory_budget");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     // Small budget: 1MB total → flush threshold = 512KB
     let config = LsmConfig {
         dir: dir.clone(),
         total_cache_bytes: 1024 * 1024,
+        ..Default::default()
     };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
@@ -506,12 +502,13 @@ async fn test_lsm_custom_budget() {
     let dir = test_dir("lsm_custom_budget");
     cleanup_dir(&dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     // 8MB budget → flush threshold = 4MB
     let budget = 8 * 1024 * 1024;
     let config = LsmConfig {
         dir: dir.clone(),
         total_cache_bytes: budget,
+        ..Default::default()
     };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();

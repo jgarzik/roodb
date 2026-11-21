@@ -1,369 +1,329 @@
 //! SSTable (Sorted String Table) reader and writer
 //!
-//! SSTable file format:
+//! File layout. Every region is a whole number of 4 KiB pages:
 //! ```text
 //! +------------------+
-//! | Data Block 0     |  (4KB)
-//! | Data Block 1     |  (4KB)
+//! | Data block 0     |  one page, or more for an oversized entry
+//! | Data block 1     |
 //! | ...              |
-//! | Index Block      |  (4KB)
-//! | Footer           |  (4KB)
+//! | Index            |  where each block is, its first key, the last key
+//! | Bloom filter     |
+//! | Footer           |  one page
 //! +------------------+
 //! ```
 //!
-//! Footer format (last 4KB):
+//! Index:
 //! ```text
-//! | Index Block Offset (8B) |
-//! | Index Block Size (8B)   |
-//! | Num Data Blocks (4B)    |
-//! | Min Key Len (2B)        |
-//! | Min Key                 |
-//! | Max Key Len (2B)        |
-//! | Max Key                 |
-//! | Padding                 |
-//! | Magic (4B): "LSMT"      |
-//! | Version (4B): 1         |
-//! +-------------------------+
+//! | Num blocks (4B)                                             |
+//! | per block: offset (8B), length (4B), key len (2B), first key |
+//! | Max key len (2B), max key                                    |
+//! | Padding, CRC32 (4B) over everything before it                |
+//! ```
+//!
+//! Footer (last page of the file):
+//! ```text
+//! | Index offset (8B) | Index size (8B)                |
+//! | Bloom offset (8B) | Bloom size (8B)                |
+//! | Num blocks (4B)   | Num entries (8B)               |
+//! | Bloom CRC32 (4B)                                   |
+//! | Padding                                            |
+//! | CRC32 (4B) over everything before it               |
+//! | Magic (4B): "LSMT" | Version (4B): 3               |
 //! ```
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::io::scheduler::{IoContext, IoPriority, OpKind};
-use crate::io::{AlignedBuffer, AsyncIO, AsyncIOFactory, PAGE_SIZE};
+use crate::io::{AlignedBuffer, File, IoEngine, OpenOptions, Urgency, PAGE_SIZE};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::lsm::block::{BlockBuilder, BlockReader, Entry, BLOCK_SIZE};
+use crate::storage::lsm::block::{
+    check_entry_size, find_in_block, verify_block, BlockBuilder, BlockReader, Entry, BLOCK_SIZE,
+};
 use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::bloom::BloomFilter;
 
 /// SSTable magic number
 const SSTABLE_MAGIC: u32 = 0x4C534D54; // "LSMT"
 
-/// SSTable version (v2 adds bloom filter)
-const SSTABLE_VERSION: u32 = 2;
+/// SSTable format version. Version 3 has variable-size blocks, 32-bit value
+/// lengths and checksums on the index and footer.
+const SSTABLE_VERSION: u32 = 3;
 
 /// Footer size (one page)
 const FOOTER_SIZE: usize = PAGE_SIZE;
 
-/// Index entry: block offset + first key
+/// Offset of the footer checksum; magic and version follow it.
+const FOOTER_CRC_AT: usize = FOOTER_SIZE - 12;
+
+/// Blocks are gathered into writes of about this size, so a flush costs one
+/// request per megabyte rather than one per block.
+const WRITE_CHUNK: usize = 256 * BLOCK_SIZE;
+
+/// Adjacent blocks are fetched with one request per run of about this size.
+const MAX_READ_RUN: usize = 256 * BLOCK_SIZE;
+
+/// Blocks loaded per step when warming the cache, which bounds how much of a
+/// table is held in memory at once.
+const WARM_BATCH: usize = 256;
+
+/// Where one data block is and the first key in it.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub block_offset: u64,
+    pub block_len: u32,
     pub first_key: Vec<u8>,
 }
 
-/// SSTable metadata from footer
+/// SSTable metadata from the footer and index
 #[derive(Debug, Clone)]
 pub struct SstableMetadata {
     pub index_offset: u64,
     pub index_size: u64,
     pub num_blocks: u32,
+    pub num_entries: u64,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
-    /// Bloom filter offset (0 if no bloom filter)
+    /// Bloom filter offset
     pub bloom_offset: u64,
-    /// Bloom filter size (0 if no bloom filter)
+    /// Bloom filter size in bytes (its region is padded to a page)
     pub bloom_size: u64,
+    /// Checksum of the bloom filter bytes
+    pub bloom_crc: u32,
+}
+
+fn invalid(what: impl Into<String>) -> StorageError {
+    StorageError::InvalidSstable(what.into())
 }
 
 /// SSTable writer
-pub struct SstableWriter<IO: AsyncIO> {
-    io: IO,
+pub struct SstableWriter {
+    io: File,
     path: PathBuf,
+    /// Logical end of the table: where the next region will live.
     offset: u64,
+    /// Regions not yet handed to the I/O engine. Always whole pages.
+    out: Vec<u8>,
+    /// File offset where `out` starts.
+    out_offset: u64,
     block_builder: BlockBuilder,
     index_entries: Vec<IndexEntry>,
-    min_key: Option<Vec<u8>>,
-    max_key: Option<Vec<u8>>,
-    /// I/O priority for write operations
-    priority: IoPriority,
-    /// Bloom filter built during add()
-    bloom: BloomFilter,
-    /// Number of keys added (for bloom sizing)
-    num_keys: usize,
+    max_key: Vec<u8>,
+    /// How urgent this table's writes are.
+    urgency: Urgency,
+    /// Hashes of every key, for a bloom filter sized once the count is known.
+    key_hashes: Vec<(u64, u64)>,
 }
 
-impl<IO: AsyncIO> SstableWriter<IO> {
+impl SstableWriter {
     /// Create a new SSTable writer
-    pub async fn create<F: AsyncIOFactory<IO = IO>>(
-        factory: &F,
-        path: &Path,
-        priority: IoPriority,
-    ) -> StorageResult<Self> {
-        let io = factory.open(path, true).await?;
+    pub async fn create(engine: &IoEngine, path: &Path, urgency: Urgency) -> StorageResult<Self> {
+        // Table names are never reused within a run and leftovers from a
+        // crashed run are deleted at startup, so the file must not exist.
+        let io = engine.open(path, OpenOptions::create_new()).await?;
         Ok(Self {
             io,
             path: path.to_path_buf(),
             offset: 0,
+            out: Vec::with_capacity(WRITE_CHUNK),
+            out_offset: 0,
             block_builder: BlockBuilder::new(),
             index_entries: Vec::new(),
-            min_key: None,
-            max_key: None,
-            priority,
-            bloom: BloomFilter::new(1024), // Initial size, will be rebuilt in finish()
-            num_keys: 0,
+            max_key: Vec::new(),
+            urgency,
+            key_hashes: Vec::new(),
         })
     }
 
-    /// Add an entry to the SSTable
+    /// Add an entry to the SSTable. Entries must arrive in key order.
     pub async fn add(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> StorageResult<()> {
-        let entry = match value {
-            Some(v) => Entry::new(key.clone(), v),
-            None => Entry::tombstone(key.clone()),
-        };
+        check_entry_size(key.len(), value.as_ref().map_or(0, Vec::len))?;
+        self.key_hashes.push(BloomFilter::hash_key(&key));
+        self.max_key.clone_from(&key);
 
-        // Update min/max keys and bloom filter
-        if self.min_key.is_none() {
-            self.min_key = Some(key.clone());
-        }
-        self.bloom.add(&key);
-        self.num_keys += 1;
-        self.max_key = Some(key);
-
-        // Try to add to current block
+        let entry = Entry { key, value };
         if !self.block_builder.can_fit(&entry) {
-            // Flush current block
             self.flush_block().await?;
         }
-
-        self.block_builder.add(entry);
+        let added = self.block_builder.add(entry);
+        debug_assert!(added, "an empty block takes any entry");
         Ok(())
     }
 
-    /// Flush current block to disk
+    /// Finish the current block and queue it for writing.
     async fn flush_block(&mut self) -> StorageResult<()> {
-        if self.block_builder.is_empty() {
+        let Some(first_key) = self.block_builder.first_key().map(<[u8]>::to_vec) else {
             return Ok(());
-        }
-
-        // Record index entry before building
-        // is_empty() check above guarantees first_key() returns Some
-        let first_key = self
-            .block_builder
-            .first_key()
-            .expect("block not empty: first_key must exist")
-            .to_vec();
+        };
+        let block = std::mem::take(&mut self.block_builder).build();
+        let block_len =
+            u32::try_from(block.len()).map_err(|_| invalid("block larger than 4 GiB"))?;
         self.index_entries.push(IndexEntry {
             block_offset: self.offset,
+            block_len,
             first_key,
         });
+        self.append(&block).await
+    }
 
-        // Build and write block
-        let block = std::mem::take(&mut self.block_builder).build();
-        let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        buf.copy_from_slice(&block)?;
-
-        self.io
-            .write_at_priority(&buf, self.offset, self.priority)
-            .await?;
-        self.offset += BLOCK_SIZE as u64;
-
-        self.block_builder = BlockBuilder::new();
+    /// Append whole pages to the table, writing out full chunks as they fill.
+    async fn append(&mut self, pages: &[u8]) -> StorageResult<()> {
+        debug_assert!(pages.len().is_multiple_of(PAGE_SIZE));
+        self.out.extend_from_slice(pages);
+        self.offset += pages.len() as u64;
+        if self.out.len() >= WRITE_CHUNK {
+            self.write_out().await?;
+        }
         Ok(())
     }
 
-    /// Finish writing the SSTable
+    /// Hand the gathered pages to the I/O engine.
+    async fn write_out(&mut self) -> StorageResult<()> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        let mut buf = AlignedBuffer::new(self.out.len())?;
+        buf.copy_from_slice(&self.out)?;
+        self.io.write_at(buf, self.out_offset, self.urgency).await?;
+        self.out_offset += self.out.len() as u64;
+        self.out.clear();
+        Ok(())
+    }
+
+    /// Finish writing the SSTable and make it durable.
     pub async fn finish(mut self) -> StorageResult<PathBuf> {
-        // Flush any remaining data
         self.flush_block().await?;
 
-        if self.index_entries.is_empty() {
-            // Empty SSTable - just close
-            return Ok(self.path);
-        }
-
-        // Write index block (may span multiple pages)
         let index_offset = self.offset;
-        let index_block = self.build_index_block();
-        let index_size = index_block.len();
-        for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
-            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            buf.copy_from_slice(&index_block[chunk_start..chunk_start + BLOCK_SIZE])?;
-            self.io
-                .write_at_priority(&buf, self.offset, self.priority)
-                .await?;
-            self.offset += BLOCK_SIZE as u64;
-        }
+        let index = self.build_index();
+        let index_size = index.len();
+        self.append(&index).await?;
 
-        // Write bloom filter (take ownership via swap, pad to BLOCK_SIZE)
+        // The bloom filter is sized for the keys actually written.
         let bloom_offset = self.offset;
-        let mut bloom = BloomFilter::new(self.num_keys);
-        std::mem::swap(&mut bloom, &mut self.bloom);
-        let bloom_bytes = bloom.to_bytes();
-        let bloom_size = bloom_bytes.len().next_multiple_of(BLOCK_SIZE);
-        let mut bloom_padded = vec![0u8; bloom_size];
-        bloom_padded[..bloom_bytes.len()].copy_from_slice(&bloom_bytes);
-        for chunk_start in (0..bloom_size).step_by(BLOCK_SIZE) {
-            let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-            buf.copy_from_slice(&bloom_padded[chunk_start..chunk_start + BLOCK_SIZE])?;
-            self.io
-                .write_at_priority(&buf, self.offset, self.priority)
-                .await?;
-            self.offset += BLOCK_SIZE as u64;
+        let mut bloom = BloomFilter::new(self.key_hashes.len());
+        for hash in &self.key_hashes {
+            bloom.add_hash(*hash);
         }
+        let mut bloom_bytes = bloom.to_bytes();
+        let bloom_size = bloom_bytes.len();
+        bloom_bytes.resize(bloom_size.next_multiple_of(PAGE_SIZE), 0);
+        self.append(&bloom_bytes).await?;
 
-        // Write footer
-        let footer =
-            self.build_footer(index_offset, index_size, bloom_offset, bloom_bytes.len())?;
-        let mut buf = AlignedBuffer::new(FOOTER_SIZE)?;
-        buf.copy_from_slice(&footer)?;
-        self.io
-            .write_at_priority(&buf, self.offset, self.priority)
-            .await?;
+        let bloom_crc = crc32fast::hash(&bloom_bytes[..bloom_size]);
+        let footer = self.build_footer(
+            index_offset,
+            index_size,
+            bloom_offset,
+            bloom_size,
+            bloom_crc,
+        );
+        self.append(&footer).await?;
+        self.write_out().await?;
 
-        // Sync to disk with context derived from write priority
-        let sync_ctx = IoContext::new(self.priority.to_context().urgency, OpKind::Sync);
-        self.io.sync_with_context(sync_ctx).await?;
+        // The table is not referenced until it is on stable storage.
+        self.io.sync_data(self.urgency).await?;
 
         Ok(self.path)
     }
 
-    /// Build the index block (may span multiple pages).
-    ///
-    /// Returns a buffer whose length is a multiple of BLOCK_SIZE.
-    /// Layout: [num_entries: 4B] [entries...] [padding] [CRC32: 4B]
-    /// CRC covers all bytes from 0..total_size-4.
-    fn build_index_block(&self) -> Vec<u8> {
-        // Calculate required size: 4 (count) + entries + 4 (CRC)
-        let entries_size: usize = self
-            .index_entries
-            .iter()
-            .map(|e| 8 + 2 + e.first_key.len())
-            .sum();
-        let needed = 4 + entries_size + 4; // count + entries + CRC
-        let total_size = needed.next_multiple_of(BLOCK_SIZE);
-
-        let mut buf = vec![0u8; total_size];
-
-        // Write num entries
-        let num_entries = self.index_entries.len() as u32;
-        buf[0..4].copy_from_slice(&num_entries.to_be_bytes());
-
-        // Write index entries
-        let mut offset = 4;
+    fn build_index(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.index_entries.len() as u32).to_be_bytes());
         for entry in &self.index_entries {
-            // Block offset (8 bytes)
-            buf[offset..offset + 8].copy_from_slice(&entry.block_offset.to_be_bytes());
-            offset += 8;
-
-            // Key length (2 bytes)
-            let key_len = entry.first_key.len() as u16;
-            buf[offset..offset + 2].copy_from_slice(&key_len.to_be_bytes());
-            offset += 2;
-
-            // Key
-            buf[offset..offset + entry.first_key.len()].copy_from_slice(&entry.first_key);
-            offset += entry.first_key.len();
+            buf.extend_from_slice(&entry.block_offset.to_be_bytes());
+            buf.extend_from_slice(&entry.block_len.to_be_bytes());
+            buf.extend_from_slice(&(entry.first_key.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&entry.first_key);
         }
+        buf.extend_from_slice(&(self.max_key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.max_key);
 
-        // CRC32 at the very end of the buffer
-        let crc = crc32fast::hash(&buf[..total_size - 4]);
-        buf[total_size - 4..].copy_from_slice(&crc.to_be_bytes());
-
+        let len = (buf.len() + 4).next_multiple_of(PAGE_SIZE);
+        buf.resize(len - 4, 0);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_be_bytes());
         buf
     }
 
-    /// Build the footer block
     fn build_footer(
         &self,
         index_offset: u64,
         index_size: usize,
         bloom_offset: u64,
         bloom_size: usize,
-    ) -> StorageResult<Vec<u8>> {
+        bloom_crc: u32,
+    ) -> Vec<u8> {
         let mut buf = vec![0u8; FOOTER_SIZE];
-
-        let min_key = self.min_key.as_ref().ok_or_else(|| {
-            StorageError::InvalidSstable(
-                "Cannot build footer: no entries added (min_key missing)".to_string(),
-            )
-        })?;
-        let max_key = self.max_key.as_ref().ok_or_else(|| {
-            StorageError::InvalidSstable(
-                "Cannot build footer: no entries added (max_key missing)".to_string(),
-            )
-        })?;
-
-        let mut offset = 0;
-
-        // Index block offset (8 bytes)
-        buf[offset..offset + 8].copy_from_slice(&index_offset.to_be_bytes());
-        offset += 8;
-
-        // Index block size (8 bytes)
-        buf[offset..offset + 8].copy_from_slice(&(index_size as u64).to_be_bytes());
-        offset += 8;
-
-        // Num data blocks (4 bytes)
-        let num_blocks = self.index_entries.len() as u32;
-        buf[offset..offset + 4].copy_from_slice(&num_blocks.to_be_bytes());
-        offset += 4;
-
-        // Min key length (2 bytes)
-        buf[offset..offset + 2].copy_from_slice(&(min_key.len() as u16).to_be_bytes());
-        offset += 2;
-
-        // Min key
-        buf[offset..offset + min_key.len()].copy_from_slice(min_key);
-        offset += min_key.len();
-
-        // Max key length (2 bytes)
-        buf[offset..offset + 2].copy_from_slice(&(max_key.len() as u16).to_be_bytes());
-        offset += 2;
-
-        // Max key
-        buf[offset..offset + max_key.len()].copy_from_slice(max_key);
-        offset += max_key.len();
-
-        // Bloom filter offset (8 bytes)
-        buf[offset..offset + 8].copy_from_slice(&bloom_offset.to_be_bytes());
-        offset += 8;
-
-        // Bloom filter size (8 bytes)
-        buf[offset..offset + 8].copy_from_slice(&(bloom_size as u64).to_be_bytes());
-        let _ = offset;
-
-        // Magic and version at the very end
+        buf[0..8].copy_from_slice(&index_offset.to_be_bytes());
+        buf[8..16].copy_from_slice(&(index_size as u64).to_be_bytes());
+        buf[16..24].copy_from_slice(&bloom_offset.to_be_bytes());
+        buf[24..32].copy_from_slice(&(bloom_size as u64).to_be_bytes());
+        buf[32..36].copy_from_slice(&(self.index_entries.len() as u32).to_be_bytes());
+        buf[36..44].copy_from_slice(&(self.key_hashes.len() as u64).to_be_bytes());
+        buf[44..48].copy_from_slice(&bloom_crc.to_be_bytes());
+        let crc = crc32fast::hash(&buf[..FOOTER_CRC_AT]);
+        buf[FOOTER_CRC_AT..FOOTER_CRC_AT + 4].copy_from_slice(&crc.to_be_bytes());
         buf[FOOTER_SIZE - 8..FOOTER_SIZE - 4].copy_from_slice(&SSTABLE_MAGIC.to_be_bytes());
         buf[FOOTER_SIZE - 4..].copy_from_slice(&SSTABLE_VERSION.to_be_bytes());
-
-        Ok(buf)
+        buf
     }
 }
 
+/// Read `len` bytes (a whole number of pages) at `offset` with one request.
+async fn read_region(
+    io: &File,
+    offset: u64,
+    len: usize,
+    urgency: Urgency,
+) -> StorageResult<Vec<u8>> {
+    let buf = io
+        .read_at(AlignedBuffer::new(len)?, offset, urgency)
+        .await?;
+    if buf.len() != len {
+        return Err(invalid(format!(
+            "short read at offset {offset}: wanted {len} bytes, file has {}",
+            buf.len()
+        )));
+    }
+    Ok(buf.as_slice().to_vec())
+}
+
+fn u64_at(buf: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(buf[at..at + 8].try_into().expect("8 bytes"))
+}
+
+fn u32_at(buf: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"))
+}
+
 /// SSTable reader
-pub struct SstableReader<IO: AsyncIO> {
-    io: IO,
+pub struct SstableReader {
+    io: File,
     metadata: SstableMetadata,
     index: Vec<IndexEntry>,
-    /// I/O priority for read operations
-    priority: IoPriority,
+    /// How urgent this reader's reads are.
+    urgency: Urgency,
     /// Optional block cache for avoiding repeated disk reads
     block_cache: Option<Arc<BlockCache>>,
     /// SSTable name for cache key (shared to avoid per-lookup allocation)
     cache_name: Arc<str>,
-    /// Bloom filter (if present in SSTable v2+)
     bloom: Option<BloomFilter>,
 }
 
-impl<IO: AsyncIO> SstableReader<IO> {
+impl SstableReader {
     /// Open an existing SSTable
-    pub async fn open<F: AsyncIOFactory<IO = IO>>(
-        factory: &F,
-        path: &Path,
-        priority: IoPriority,
-    ) -> StorageResult<Self> {
-        Self::open_with_cache(factory, path, priority, None).await
+    pub async fn open(engine: &IoEngine, path: &Path, urgency: Urgency) -> StorageResult<Self> {
+        Self::open_with_cache(engine, path, urgency, None).await
     }
 
     /// Open an existing SSTable with an optional block cache
-    pub async fn open_with_cache<F: AsyncIOFactory<IO = IO>>(
-        factory: &F,
+    pub async fn open_with_cache(
+        engine: &IoEngine,
         path: &Path,
-        priority: IoPriority,
+        urgency: Urgency,
         block_cache: Option<Arc<BlockCache>>,
     ) -> StorageResult<Self> {
-        let io = factory.open(path, false).await?;
+        let io = engine.open(path, OpenOptions::read_only()).await?;
 
         // Derive cache name from file path
         let cache_name: Arc<str> = path
@@ -372,112 +332,57 @@ impl<IO: AsyncIO> SstableReader<IO> {
             .unwrap_or("unknown")
             .into();
 
-        // Read file size
-        let file_size = io.file_size().await?;
-        if file_size < FOOTER_SIZE as u64 {
-            return Err(StorageError::InvalidSstable("file too small".to_string()));
+        let file_size = io.size()?;
+        if file_size < FOOTER_SIZE as u64 || !file_size.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(invalid(format!("file size {file_size} is not a table")));
         }
 
-        // Read footer (check cache first)
+        // Fetch a region through the block cache when there is one.
+        let fetch = |offset: u64, len: usize| {
+            let io = &io;
+            let cache = block_cache.as_ref();
+            let cache_name = &cache_name;
+            async move {
+                if let Some(cached) = cache.and_then(|c| c.get(cache_name, offset)) {
+                    return Ok::<_, StorageError>(cached);
+                }
+                let data = read_region(io, offset, len, urgency).await?;
+                if let Some(cache) = cache {
+                    cache.insert(cache_name, offset, data.clone());
+                }
+                Ok(Arc::new(data))
+            }
+        };
+
         let footer_offset = file_size - FOOTER_SIZE as u64;
-        let footer_data = if let Some(ref cache) = block_cache {
-            if let Some(cached) = cache.get(&cache_name, footer_offset) {
-                cached
-            } else {
-                let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
-                io.read_at_priority(&mut footer_buf, footer_offset, priority)
-                    .await?;
-                let data = footer_buf.as_slice().to_vec();
-                cache.insert(&cache_name, footer_offset, data.clone());
-                Arc::new(data)
-            }
-        } else {
-            let mut footer_buf = AlignedBuffer::new(FOOTER_SIZE)?;
-            io.read_at_priority(&mut footer_buf, footer_offset, priority)
-                .await?;
-            Arc::new(footer_buf.as_slice().to_vec())
-        };
+        let footer = fetch(footer_offset, FOOTER_SIZE).await?;
+        let mut metadata = Self::parse_footer(&footer, footer_offset)?;
 
-        // Parse footer
-        let metadata = Self::parse_footer(&footer_data)?;
+        let index_data = fetch(metadata.index_offset, metadata.index_size as usize).await?;
+        let (index, max_key) = Self::parse_index(&index_data, &metadata)?;
+        metadata.min_key = index
+            .first()
+            .map(|e| e.first_key.clone())
+            .unwrap_or_default();
+        metadata.max_key = max_key;
 
-        // Read index block (may span multiple pages, check cache)
-        let index_size = metadata.index_size as usize;
-        let index_data: Arc<Vec<u8>> = if let Some(ref cache) = block_cache {
-            // Cache index as a single block keyed by index_offset
-            if let Some(cached) = cache.get(&cache_name, metadata.index_offset) {
-                cached
-            } else {
-                let mut data = vec![0u8; index_size];
-                for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
-                    let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-                    io.read_at_priority(
-                        &mut page_buf,
-                        metadata.index_offset + chunk_start as u64,
-                        priority,
-                    )
-                    .await?;
-                    data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
-                }
-                cache.insert(&cache_name, metadata.index_offset, data.clone());
-                Arc::new(data)
+        let bloom_region = (metadata.bloom_size as usize).next_multiple_of(PAGE_SIZE);
+        let bloom = if bloom_region > 0 {
+            let data = fetch(metadata.bloom_offset, bloom_region).await?;
+            let bytes = &data[..metadata.bloom_size as usize];
+            // A damaged filter would answer "not here" for keys that are.
+            let actual = crc32fast::hash(bytes);
+            if actual != metadata.bloom_crc {
+                return Err(StorageError::CorruptedBlock {
+                    offset: metadata.bloom_offset,
+                    expected: metadata.bloom_crc,
+                    actual,
+                });
             }
-        } else {
-            let mut data = vec![0u8; index_size];
-            for chunk_start in (0..index_size).step_by(BLOCK_SIZE) {
-                let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-                io.read_at_priority(
-                    &mut page_buf,
-                    metadata.index_offset + chunk_start as u64,
-                    priority,
-                )
-                .await?;
-                data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
-            }
-            Arc::new(data)
-        };
-
-        // Parse index
-        let index = Self::parse_index(&index_data)?;
-
-        // Read bloom filter (v2+), using block cache if available
-        let bloom = if metadata.bloom_size > 0 {
-            if let Some(ref cache) = block_cache {
-                if let Some(cached) = cache.get(&cache_name, metadata.bloom_offset) {
-                    BloomFilter::from_bytes(&cached[..metadata.bloom_size as usize])
-                } else {
-                    let bloom_disk_size =
-                        (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
-                    let mut bloom_data = vec![0u8; bloom_disk_size];
-                    for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
-                        let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-                        io.read_at_priority(
-                            &mut page_buf,
-                            metadata.bloom_offset + chunk_start as u64,
-                            priority,
-                        )
-                        .await?;
-                        bloom_data[chunk_start..chunk_start + BLOCK_SIZE]
-                            .copy_from_slice(&page_buf);
-                    }
-                    cache.insert(&cache_name, metadata.bloom_offset, bloom_data.clone());
-                    BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
-                }
-            } else {
-                let bloom_disk_size = (metadata.bloom_size as usize).next_multiple_of(BLOCK_SIZE);
-                let mut bloom_data = vec![0u8; bloom_disk_size];
-                for chunk_start in (0..bloom_disk_size).step_by(BLOCK_SIZE) {
-                    let mut page_buf = AlignedBuffer::new(BLOCK_SIZE)?;
-                    io.read_at_priority(
-                        &mut page_buf,
-                        metadata.bloom_offset + chunk_start as u64,
-                        priority,
-                    )
-                    .await?;
-                    bloom_data[chunk_start..chunk_start + BLOCK_SIZE].copy_from_slice(&page_buf);
-                }
-                BloomFilter::from_bytes(&bloom_data[..metadata.bloom_size as usize])
-            }
+            Some(
+                BloomFilter::from_bytes(bytes)
+                    .ok_or_else(|| invalid("bloom filter header is not valid"))?,
+            )
         } else {
             None
         };
@@ -486,192 +391,196 @@ impl<IO: AsyncIO> SstableReader<IO> {
             io,
             metadata,
             index,
-            priority,
+            urgency,
             block_cache,
             cache_name,
             bloom,
         })
     }
 
-    /// Parse footer from buffer
-    fn parse_footer(buf: &[u8]) -> StorageResult<SstableMetadata> {
-        // Verify magic
-        let magic = u32::from_be_bytes([
-            buf[FOOTER_SIZE - 8],
-            buf[FOOTER_SIZE - 7],
-            buf[FOOTER_SIZE - 6],
-            buf[FOOTER_SIZE - 5],
-        ]);
+    /// Parse and validate the footer. `footer_offset` is where it sits, which
+    /// bounds every region it points at.
+    fn parse_footer(buf: &[u8], footer_offset: u64) -> StorageResult<SstableMetadata> {
+        if buf.len() != FOOTER_SIZE {
+            return Err(invalid("footer has the wrong size"));
+        }
+        let magic = u32_at(buf, FOOTER_SIZE - 8);
         if magic != SSTABLE_MAGIC {
-            return Err(StorageError::InvalidSstable(format!(
-                "invalid magic: expected {:#x}, got {:#x}",
-                SSTABLE_MAGIC, magic
+            return Err(invalid(format!("bad magic {magic:#x}")));
+        }
+        let version = u32_at(buf, FOOTER_SIZE - 4);
+        if version != SSTABLE_VERSION {
+            return Err(invalid(format!(
+                "format version {version} is not supported (this build reads version {SSTABLE_VERSION})"
             )));
         }
-
-        // Verify version (accept v1 and v2)
-        let version = u32::from_be_bytes([
-            buf[FOOTER_SIZE - 4],
-            buf[FOOTER_SIZE - 3],
-            buf[FOOTER_SIZE - 2],
-            buf[FOOTER_SIZE - 1],
-        ]);
-        if version != 1 && version != SSTABLE_VERSION {
-            return Err(StorageError::InvalidSstable(format!(
-                "unsupported version: {}",
-                version
-            )));
-        }
-
-        let mut offset = 0;
-
-        // Index offset
-        let index_offset = u64::from_be_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-            buf[offset + 4],
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-        ]);
-        offset += 8;
-
-        // Index size
-        let index_size = u64::from_be_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-            buf[offset + 4],
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-        ]);
-        offset += 8;
-
-        // Num blocks
-        let num_blocks = u32::from_be_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-        ]);
-        offset += 4;
-
-        // Min key
-        let min_key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
-        offset += 2;
-        let min_key = buf[offset..offset + min_key_len].to_vec();
-        offset += min_key_len;
-
-        // Max key
-        let max_key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
-        offset += 2;
-        let max_key = buf[offset..offset + max_key_len].to_vec();
-        offset += max_key_len;
-
-        // Bloom filter fields (v2 only)
-        let (bloom_offset, bloom_size) = if version >= 2 {
-            let bo = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
-            offset += 8;
-            let bs = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
-            let _ = offset;
-            (bo, bs)
-        } else {
-            (0, 0)
-        };
-
-        Ok(SstableMetadata {
-            index_offset,
-            index_size,
-            num_blocks,
-            min_key,
-            max_key,
-            bloom_offset,
-            bloom_size,
-        })
-    }
-
-    /// Parse index block from buffer (may be multiple pages)
-    fn parse_index(buf: &[u8]) -> StorageResult<Vec<IndexEntry>> {
-        let total_size = buf.len();
-        // Verify CRC (last 4 bytes of the buffer)
-        let stored_crc = u32::from_be_bytes([
-            buf[total_size - 4],
-            buf[total_size - 3],
-            buf[total_size - 2],
-            buf[total_size - 1],
-        ]);
-        let computed_crc = crc32fast::hash(&buf[..total_size - 4]);
-        if stored_crc != computed_crc {
-            return Err(StorageError::InvalidSstable(
-                "index CRC mismatch".to_string(),
-            ));
-        }
-
-        let num_entries = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-
-        let mut entries = Vec::with_capacity(num_entries);
-        let mut offset = 4;
-
-        for _ in 0..num_entries {
-            // Block offset
-            let block_offset = u64::from_be_bytes([
-                buf[offset],
-                buf[offset + 1],
-                buf[offset + 2],
-                buf[offset + 3],
-                buf[offset + 4],
-                buf[offset + 5],
-                buf[offset + 6],
-                buf[offset + 7],
-            ]);
-            offset += 8;
-
-            // Key length
-            let key_len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
-            offset += 2;
-
-            // Key
-            let first_key = buf[offset..offset + key_len].to_vec();
-            offset += key_len;
-
-            entries.push(IndexEntry {
-                block_offset,
-                first_key,
+        let stored = u32_at(buf, FOOTER_CRC_AT);
+        let actual = crc32fast::hash(&buf[..FOOTER_CRC_AT]);
+        if stored != actual {
+            return Err(StorageError::CorruptedBlock {
+                offset: footer_offset,
+                expected: stored,
+                actual,
             });
         }
 
-        Ok(entries)
+        let metadata = SstableMetadata {
+            index_offset: u64_at(buf, 0),
+            index_size: u64_at(buf, 8),
+            bloom_offset: u64_at(buf, 16),
+            bloom_size: u64_at(buf, 24),
+            num_blocks: u32_at(buf, 32),
+            num_entries: u64_at(buf, 36),
+            bloom_crc: u32_at(buf, 44),
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+        };
+
+        let page = PAGE_SIZE as u64;
+        let bloom_region = metadata.bloom_size.next_multiple_of(page);
+        let layout_ok = metadata.index_offset.is_multiple_of(page)
+            && metadata.index_size >= page
+            && metadata.index_size.is_multiple_of(page)
+            && metadata.index_offset.checked_add(metadata.index_size)
+                == Some(metadata.bloom_offset)
+            && metadata.bloom_offset.checked_add(bloom_region) == Some(footer_offset);
+        if !layout_ok {
+            return Err(invalid("footer describes an impossible layout"));
+        }
+        Ok(metadata)
     }
 
-    /// Read a data block, using cache if available
-    pub async fn read_data_block(&self, block_offset: u64) -> StorageResult<Arc<Vec<u8>>> {
-        if let Some(ref cache) = self.block_cache {
-            if let Some(cached) = cache.get(&self.cache_name, block_offset) {
-                return Ok(cached);
+    /// Parse the index: the block list and the table's last key.
+    fn parse_index(
+        buf: &[u8],
+        metadata: &SstableMetadata,
+    ) -> StorageResult<(Vec<IndexEntry>, Vec<u8>)> {
+        if buf.len() < PAGE_SIZE {
+            return Err(invalid("index too small"));
+        }
+        let body = buf.len() - 4;
+        let stored = u32_at(buf, body);
+        let actual = crc32fast::hash(&buf[..body]);
+        if stored != actual {
+            return Err(StorageError::CorruptedBlock {
+                offset: metadata.index_offset,
+                expected: stored,
+                actual,
+            });
+        }
+
+        let take = |pos: &mut usize, len: usize| -> StorageResult<&[u8]> {
+            let end = pos
+                .checked_add(len)
+                .filter(|end| *end <= body)
+                .ok_or_else(|| invalid("index truncated"))?;
+            let slice = &buf[*pos..end];
+            *pos = end;
+            Ok(slice)
+        };
+
+        let mut pos = 0;
+        let num_blocks = u32_at(take(&mut pos, 4)?, 0);
+        if num_blocks != metadata.num_blocks {
+            return Err(invalid("index and footer disagree on the block count"));
+        }
+        let mut entries = Vec::new();
+        let mut expected_offset = 0u64;
+        for _ in 0..num_blocks {
+            let block_offset = u64_at(take(&mut pos, 8)?, 0);
+            let block_len = u32_at(take(&mut pos, 4)?, 0);
+            let key_len = u16::from_be_bytes(take(&mut pos, 2)?.try_into().expect("2 bytes"));
+            let first_key = take(&mut pos, key_len as usize)?.to_vec();
+            // Blocks are laid out back to back from the start of the file.
+            if block_offset != expected_offset
+                || block_len == 0
+                || !(block_len as usize).is_multiple_of(BLOCK_SIZE)
+            {
+                return Err(invalid("index describes an impossible block"));
+            }
+            expected_offset += block_len as u64;
+            entries.push(IndexEntry {
+                block_offset,
+                block_len,
+                first_key,
+            });
+        }
+        if expected_offset != metadata.index_offset {
+            return Err(invalid("blocks do not end where the index begins"));
+        }
+        let max_key_len = u16::from_be_bytes(take(&mut pos, 2)?.try_into().expect("2 bytes"));
+        let max_key = take(&mut pos, max_key_len as usize)?.to_vec();
+        Ok((entries, max_key))
+    }
+
+    /// Fetch the given blocks (indices into the index, ascending), from the
+    /// cache where possible. Blocks that have to be read are fetched as runs of
+    /// adjacent blocks, one request per run, all runs in flight together.
+    async fn fetch_blocks(&self, wanted: &[usize]) -> StorageResult<Vec<Arc<Vec<u8>>>> {
+        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(wanted.len());
+        let mut misses: Vec<usize> = Vec::new(); // positions in `wanted`
+        for (pos, &idx) in wanted.iter().enumerate() {
+            let cached = self
+                .block_cache
+                .as_ref()
+                .and_then(|cache| cache.get(&self.cache_name, self.index[idx].block_offset));
+            if cached.is_none() {
+                misses.push(pos);
+            }
+            blocks.push(cached);
+        }
+
+        if !misses.is_empty() {
+            // (first position in `misses`, block count, bytes)
+            let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+            for (m, &pos) in misses.iter().enumerate() {
+                let entry = &self.index[wanted[pos]];
+                let len = entry.block_len as usize;
+                match runs.last_mut() {
+                    Some((first, count, bytes))
+                        if *bytes + len <= MAX_READ_RUN
+                            && self.index[wanted[misses[*first]]].block_offset + *bytes as u64
+                                == entry.block_offset =>
+                    {
+                        *count += 1;
+                        *bytes += len;
+                    }
+                    _ => runs.push((m, 1, len)),
+                }
+            }
+
+            let reads = runs.iter().map(|&(first, _, bytes)| {
+                let offset = self.index[wanted[misses[first]]].block_offset;
+                read_region(&self.io, offset, bytes, self.urgency)
+            });
+            let fetched = futures_util::future::try_join_all(reads).await?;
+
+            for (&(first, count, _), data) in runs.iter().zip(fetched) {
+                let mut at = 0;
+                for &pos in &misses[first..first + count] {
+                    let entry = &self.index[wanted[pos]];
+                    let len = entry.block_len as usize;
+                    let block = data[at..at + len].to_vec();
+                    at += len;
+                    // Checked once here; cached blocks are trusted.
+                    verify_block(&block, entry.block_offset)?;
+                    if let Some(ref cache) = self.block_cache {
+                        cache.insert(&self.cache_name, entry.block_offset, block.clone());
+                    }
+                    blocks[pos] = Some(Arc::new(block));
+                }
             }
         }
 
-        let mut buf = AlignedBuffer::new(BLOCK_SIZE)?;
-        self.io
-            .read_at_priority(&mut buf, block_offset, self.priority)
-            .await?;
-        let data = buf.as_slice().to_vec();
-
-        if let Some(ref cache) = self.block_cache {
-            cache.insert(&self.cache_name, block_offset, data.clone());
-        }
-
-        Ok(Arc::new(data))
+        Ok(blocks
+            .into_iter()
+            .map(|block| block.expect("every block is cached or was just read"))
+            .collect())
     }
 
-    /// Get a value by key
+    /// Get a value by key. `Some(None)` is a tombstone.
     pub async fn get(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
-        // Check key range
-        if key < self.metadata.min_key.as_slice() || key > self.metadata.max_key.as_slice() {
+        if self.index.is_empty() || !self.may_contain(key) {
             return Ok(None);
         }
 
@@ -682,57 +591,22 @@ impl<IO: AsyncIO> SstableReader<IO> {
             }
         }
 
-        // Binary search index to find the right block
         let block_idx = self.find_block(key);
-
-        // Read and search the block (with cache)
-        let block_offset = self.index[block_idx].block_offset;
-        let block_data = self.read_data_block(block_offset).await?;
-
-        let reader = BlockReader::parse(&block_data, block_offset)?;
-        if let Some(entry) = reader.get(key) {
-            Ok(Some(entry.value.clone()))
-        } else {
-            Ok(None)
-        }
+        let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
+        find_in_block(&block, key)
     }
 
-    /// Find the block that might contain a key
+    /// Find the block that might contain a key: the last one whose first key
+    /// is not after it.
     fn find_block(&self, key: &[u8]) -> usize {
-        // Binary search: find last block where first_key <= key
-        let mut lo = 0;
-        let mut hi = self.index.len();
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.index[mid].first_key.as_slice() <= key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        // Return the block before (or first block if at start)
-        if lo > 0 {
-            lo - 1
-        } else {
-            0
-        }
+        self.index
+            .partition_point(|entry| entry.first_key.as_slice() <= key)
+            .saturating_sub(1)
     }
 
     /// Scan all entries in the SSTable
     pub async fn scan(&self) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        let mut results = Vec::new();
-
-        for entry in &self.index {
-            let block_data = self.read_data_block(entry.block_offset).await?;
-            let reader = BlockReader::parse(&block_data, entry.block_offset)?;
-            for e in reader.entries() {
-                results.push((e.key.clone(), e.value.clone()));
-            }
-        }
-
-        Ok(results)
+        self.scan_range_batched(None, None).await
     }
 
     /// Scan entries in a key range
@@ -741,141 +615,41 @@ impl<IO: AsyncIO> SstableReader<IO> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        let mut results = Vec::new();
-
-        // Find starting block
-        let start_idx = match start {
-            Some(k) => self.find_block(k),
-            None => 0,
-        };
-
-        for entry in self.index.iter().skip(start_idx) {
-            // Check if we've passed the end key
-            if let Some(e) = end {
-                if entry.first_key.as_slice() >= e {
-                    break;
-                }
-            }
-
-            let block_data = self.read_data_block(entry.block_offset).await?;
-            let reader = BlockReader::parse(&block_data, entry.block_offset)?;
-            for e in reader.entries() {
-                // Check range
-                if let Some(s) = start {
-                    if e.key.as_slice() < s {
-                        continue;
-                    }
-                }
-                if let Some(en) = end {
-                    if e.key.as_slice() >= en {
-                        break;
-                    }
-                }
-                results.push((e.key.clone(), e.value.clone()));
-            }
-        }
-
-        Ok(results)
+        self.scan_range_batched(start, end).await
     }
 
-    /// Scan entries in a key range using batched block reads.
+    /// Scan entries in `[start, end)`.
     ///
-    /// Instead of reading blocks one at a time, this determines which blocks
-    /// are needed, submits all cache-miss reads in a single batch via read_batch(),
-    /// then processes entries from the fetched blocks.
+    /// Works out which blocks are needed, reads the ones not in the cache -
+    /// adjacent blocks as one request per run, all runs in flight together -
+    /// then collects the entries in range.
     pub async fn scan_range_batched(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        // Find starting and ending block indices
-        let start_idx = match start {
-            Some(k) => self.find_block(k),
-            None => 0,
-        };
-
-        // Determine which blocks we need (and which are cache misses)
-        let mut needed_blocks: Vec<(usize, u64)> = Vec::new(); // (block_index, offset)
-        for (i, entry) in self.index.iter().enumerate().skip(start_idx) {
-            if let Some(e) = end {
-                if entry.first_key.as_slice() >= e {
-                    break;
-                }
-            }
-            needed_blocks.push((i, entry.block_offset));
-        }
-
-        if needed_blocks.is_empty() {
+        let start_idx = start.map_or(0, |key| self.find_block(key));
+        let wanted: Vec<usize> = (start_idx..self.index.len())
+            .take_while(|&i| end.is_none_or(|e| self.index[i].first_key.as_slice() < e))
+            .collect();
+        if wanted.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Separate cache hits from misses
-        let mut miss_indices: Vec<usize> = Vec::new(); // indices into needed_blocks
-        let mut cached_blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(needed_blocks.len());
-
-        for (idx, &(_, offset)) in needed_blocks.iter().enumerate() {
-            if let Some(ref cache) = self.block_cache {
-                if let Some(cached) = cache.get(&self.cache_name, offset) {
-                    cached_blocks.push(Some(cached));
+        let blocks = self.fetch_blocks(&wanted).await?;
+        let mut results = Vec::new();
+        for block in &blocks {
+            let reader = BlockReader::parse_verified(block)?;
+            for entry in reader.into_entries() {
+                if start.is_some_and(|s| entry.key.as_slice() < s) {
                     continue;
                 }
-            }
-            cached_blocks.push(None);
-            miss_indices.push(idx);
-        }
-
-        // Batch-read all cache misses
-        if !miss_indices.is_empty() {
-            let requests: Vec<(u64, usize)> = miss_indices
-                .iter()
-                .map(|&idx| (needed_blocks[idx].1, BLOCK_SIZE))
-                .collect();
-
-            let batch_results = self.io.read_batch(&requests).await;
-
-            for (i, result) in batch_results.into_iter().enumerate() {
-                let idx = miss_indices[i];
-                let offset = needed_blocks[idx].1;
-                match result {
-                    Ok(buf) => {
-                        let data = buf.as_slice().to_vec();
-                        if let Some(ref cache) = self.block_cache {
-                            cache.insert(&self.cache_name, offset, data.clone());
-                        }
-                        cached_blocks[idx] = Some(Arc::new(data));
-                    }
-                    Err(e) => {
-                        return Err(StorageError::Io(crate::io::IoError::Io(
-                            std::io::Error::other(format!("batch read failed: {}", e)),
-                        )));
-                    }
+                if end.is_some_and(|e| entry.key.as_slice() >= e) {
+                    break;
                 }
+                results.push((entry.key, entry.value));
             }
         }
-
-        // Process all blocks and collect results — take ownership to avoid clones
-        let mut results = Vec::new();
-        for (i, &(_, offset)) in needed_blocks.iter().enumerate() {
-            let block_data = cached_blocks[i]
-                .as_ref()
-                .expect("all blocks should be loaded after batch read");
-
-            let reader = BlockReader::parse(block_data, offset)?;
-            for e in reader.into_entries() {
-                if let Some(s) = start {
-                    if e.key.as_slice() < s {
-                        continue;
-                    }
-                }
-                if let Some(en) = end {
-                    if e.key.as_slice() >= en {
-                        break;
-                    }
-                }
-                results.push((e.key, e.value));
-            }
-        }
-
         Ok(results)
     }
 
@@ -889,13 +663,14 @@ impl<IO: AsyncIO> SstableReader<IO> {
         key >= self.metadata.min_key.as_slice() && key <= self.metadata.max_key.as_slice()
     }
 
-    /// Eagerly load all data blocks into the block cache.
+    /// Load every data block into the block cache.
     ///
     /// Called after flush/compaction to pre-populate the cache so the first
     /// scan has zero cold misses.
     pub async fn eager_load_blocks(&self) -> StorageResult<()> {
-        for entry in &self.index {
-            self.read_data_block(entry.block_offset).await?;
+        let all: Vec<usize> = (0..self.index.len()).collect();
+        for batch in all.chunks(WARM_BATCH) {
+            self.fetch_blocks(batch).await?;
         }
         Ok(())
     }

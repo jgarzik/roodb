@@ -43,36 +43,27 @@ impl Memtable {
         self.data.get(key).map(|entry| entry.value().clone())
     }
 
-    /// Put a key-value pair
-    pub fn put(&self, key: &[u8], value: &[u8]) {
-        let key_vec = key.to_vec();
-        let value_vec = value.to_vec();
-
-        // Update size estimate (racy with concurrent puts to same key — acceptable
-        // since this is an approximate threshold for flush decisions)
-        let entry_size = key.len() + value.len() + 16; // overhead estimate
-        if let Some(old) = self.data.get(key) {
-            let old_size = key.len() + old.value().as_ref().map(|v| v.len()).unwrap_or(0) + 16;
+    /// Insert or replace an entry. `None` is a tombstone.
+    pub fn insert(&self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        // Size is an estimate used for the flush threshold; concurrent writes
+        // to one key can skew it slightly.
+        let entry_size = key.len() + value.as_ref().map_or(0, Vec::len) + 16;
+        if let Some(old) = self.data.get(&key) {
+            let old_size = key.len() + old.value().as_ref().map_or(0, Vec::len) + 16;
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
         self.size.fetch_add(entry_size, Ordering::Relaxed);
-
-        self.data.insert(key_vec, Some(value_vec));
+        self.data.insert(key, value);
     }
 
-    /// Delete a key (insert tombstone)
+    /// Insert or update a key-value pair
+    pub fn put(&self, key: &[u8], value: &[u8]) {
+        self.insert(key.to_vec(), Some(value.to_vec()));
+    }
+
+    /// Mark a key as deleted (insert tombstone)
     pub fn delete(&self, key: &[u8]) {
-        let key_vec = key.to_vec();
-
-        // Update size estimate
-        let entry_size = key.len() + 16;
-        if let Some(old) = self.data.get(key) {
-            let old_size = key.len() + old.value().as_ref().map(|v| v.len()).unwrap_or(0) + 16;
-            self.size.fetch_sub(old_size, Ordering::Relaxed);
-        }
-        self.size.fetch_add(entry_size, Ordering::Relaxed);
-
-        self.data.insert(key_vec, None); // Tombstone
+        self.insert(key.to_vec(), None);
     }
 
     /// Scan a range of keys

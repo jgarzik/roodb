@@ -9,8 +9,8 @@ use parking_lot::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use roodb::catalog::Catalog;
-use roodb::io::scheduled_io_factory;
-use roodb::raft::RaftNode;
+use roodb::io::{IoBackend, IoEngine};
+use roodb::raft::{Durability, LogStore, LogStoreConfig, RaftNode};
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
@@ -30,6 +30,13 @@ struct Cli {
     tds_port: Option<u16>,
     #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
     data_dir: PathBuf,
+    /// File I/O backend: auto (io_uring where available), uring, or posix
+    #[arg(long, default_value = "auto", env = "ROODB_IO_BACKEND")]
+    io_backend: IoBackend,
+    /// When a commit is acknowledged: os (once written; survives a server
+    /// crash) or fsync (once flushed to stable storage; survives power loss)
+    #[arg(long, default_value = "os", env = "ROODB_DURABILITY")]
+    durability: Durability,
     #[arg(long, default_value = "./certs/server.crt", env = "ROODB_CERT_PATH")]
     cert_path: PathBuf,
     #[arg(long, default_value = "./certs/server.key", env = "ROODB_KEY_PATH")]
@@ -56,6 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port,
         tds_port,
         data_dir,
+        io_backend,
+        durability,
         cert_path,
         key_path,
         raft_ca_cert_path,
@@ -85,13 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RaftTlsConfig::from_files_with_ca(&cert_path, &key_path, &raft_ca_cert_path).await?;
 
     // Initialize storage engine
-    let io_factory = Arc::new(scheduled_io_factory());
+    let io = IoEngine::new(io_backend)?;
+    tracing::info!(backend = %io.backend(), "I/O engine started");
     let storage_config = LsmConfig {
-        dir: data_dir,
+        dir: data_dir.clone(),
         ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> =
-        Arc::new(LsmEngine::open(io_factory, storage_config).await?);
+        Arc::new(LsmEngine::open(io.clone(), storage_config).await?);
 
     // Check if database is initialized
     if !is_initialized(&storage).await? {
@@ -101,6 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize catalog with system tables
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
+
+    // The Raft log: the server's write-ahead log.
+    let log_store = LogStore::open(
+        io.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, durability),
+    )
+    .await?;
+    tracing::info!(%durability, "Raft log opened");
 
     // Initialize Raft node (single-node mode)
     let raft_addr = SocketAddr::new(bind, raft_port);
@@ -112,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
         true,
     )
     .await?;
@@ -127,11 +146,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start RooDB server
     let addr = SocketAddr::new(bind, port);
-    let mut server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let mut server = RooDbServer::new(
+        addr,
+        tls_config,
+        storage.clone(),
+        catalog,
+        raft_node.clone(),
+    );
     if let Some(tds_port) = tds_port {
         server = server.enable_tds(SocketAddr::new(bind, tds_port));
     }
-    server.run().await?;
+    server.run_until(shutdown_signal()).await?;
+
+    // Asked to stop. Nothing here is needed for correctness - a killed
+    // server recovers from its log - but stopping in order writes memory out
+    // to tables, so the next start has next to nothing to replay.
+    tracing::info!("Shutting down");
+    // Flushing can take a while. A second request means "now": everything
+    // acknowledged is already in the log, so exiting here loses nothing.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        tracing::warn!("Second stop request: exiting without flushing");
+        std::process::exit(1);
+    });
+    if let Err(e) = raft_node.shutdown().await {
+        tracing::warn!(error = %e, "Raft shutdown reported an error");
+    }
+    storage.close().await?;
+    tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Completes when the process is asked to stop: SIGINT or SIGTERM on Unix,
+/// Ctrl-C elsewhere.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            tracing::warn!("cannot listen for termination signals; stop with kill");
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }

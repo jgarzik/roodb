@@ -3,16 +3,20 @@
 //! The manifest tracks which SSTables exist at each level and their key ranges.
 //! It is stored as JSON for simplicity and human readability.
 
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::io::{AlignedBuffer, IoEngine, OpenOptions, Urgency};
 use crate::storage::error::{StorageError, StorageResult};
 
 /// Manifest file name
 pub const MANIFEST_FILE: &str = "MANIFEST";
+
+/// Version of the on-disk layout this build reads and writes: the manifest
+/// itself and the table format it points at. A directory written by a
+/// different version is refused rather than misread.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// SSTable file info
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +43,9 @@ pub struct LevelInfo {
 /// Manifest data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestData {
+    /// On-disk layout version; see [`MANIFEST_VERSION`].
+    #[serde(default)]
+    pub version: u32,
     /// Sequence number for generating SSTable names
     pub sequence: u64,
     /// Levels
@@ -48,6 +55,7 @@ pub struct ManifestData {
 impl Default for ManifestData {
     fn default() -> Self {
         Self {
+            version: MANIFEST_VERSION,
             sequence: 0,
             levels: vec![
                 LevelInfo {
@@ -82,55 +90,93 @@ impl Manifest {
     pub fn open(dir: &Path) -> StorageResult<Self> {
         let manifest_path = dir.join(MANIFEST_FILE);
 
-        let data = if manifest_path.exists() {
+        let data: ManifestData = if manifest_path.try_exists()? {
             let content = std::fs::read_to_string(&manifest_path)?;
             serde_json::from_str(&content)
                 .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {}", e)))?
         } else {
+            // No manifest means a new directory. If tables are lying here
+            // anyway, the manifest was lost: treating the directory as new
+            // would delete them as leftovers.
+            let has_tables = match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".sst")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
+            if has_tables {
+                return Err(StorageError::Manifest(format!(
+                    "{} holds table files but no {MANIFEST_FILE}; refusing to treat it as empty",
+                    dir.display()
+                )));
+            }
             ManifestData::default()
         };
+        if data.version != MANIFEST_VERSION {
+            return Err(StorageError::Manifest(format!(
+                "data directory {} uses on-disk format {}, this build uses format {}; \
+                 remove the directory and run roodb_init again",
+                dir.display(),
+                data.version,
+                MANIFEST_VERSION
+            )));
+        }
 
-        Ok(Self {
+        let manifest = Self {
             dir: dir.to_path_buf(),
             data,
-        })
+        };
+        manifest.remove_leftovers()?;
+        Ok(manifest)
     }
 
-    /// Save manifest to disk using atomic rename
-    ///
-    /// This ensures the manifest is never partially written:
-    /// 1. Write to a temporary file
-    /// 2. fsync the temporary file
-    /// 3. Rename to final path (atomic on POSIX)
-    pub fn save(&self) -> StorageResult<()> {
-        let manifest_path = self.dir.join(MANIFEST_FILE);
-        let temp_path = self.dir.join(format!("{}.tmp", MANIFEST_FILE));
-
-        // Serialize content
-        let content = serde_json::to_string_pretty(&self.data)
-            .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
-
-        // Write to temporary file
-        {
-            let mut file = File::create(&temp_path)?;
-            file.write_all(content.as_bytes())?;
-            // fsync to ensure data is on disk before rename
-            file.sync_all()?;
-        }
-
-        // Atomic rename
-        std::fs::rename(&temp_path, &manifest_path)?;
-
-        // Optionally sync the directory to ensure rename is durable
-        // (Some filesystems require this for full durability)
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = File::open(&self.dir) {
-                let _ = dir.sync_all();
+    /// Delete what an interrupted run left behind: a half-written manifest,
+    /// and table files the manifest does not list (a flush or compaction that
+    /// wrote its output but did not get as far as recording it). Without this
+    /// a later table given the same name would land on top of the old file.
+    fn remove_leftovers(&self) -> StorageResult<()> {
+        let listed: std::collections::HashSet<&str> = self
+            .data
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|f| f.name.as_str()))
+            .collect();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let manifest_tmp = format!("{MANIFEST_FILE}.tmp");
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let leftover =
+                name == manifest_tmp || (name.ends_with(".sst") && !listed.contains(name.as_str()));
+            if leftover {
+                tracing::warn!(file = %name, "removing file left by an interrupted run");
+                std::fs::remove_file(entry.path())?;
             }
         }
-
         Ok(())
+    }
+
+    /// The table lists, to put back with [`Self::restore_levels`] if a change
+    /// cannot be made durable.
+    pub fn levels_snapshot(&self) -> Vec<LevelInfo> {
+        self.data.levels.clone()
+    }
+
+    /// Undo changes to the table lists made since `levels` was taken.
+    pub fn restore_levels(&mut self, levels: Vec<LevelInfo>) {
+        self.data.levels = levels;
+    }
+
+    /// A copy of the current contents, for [`persist`].
+    pub fn snapshot(&self) -> ManifestData {
+        self.data.clone()
     }
 
     /// Generate next SSTable file name
@@ -199,6 +245,53 @@ impl Manifest {
     }
 }
 
+/// Write a manifest to disk, replacing the previous one atomically:
+/// write a temporary file, make it durable, rename it over the manifest, then
+/// make the rename durable. A crash leaves either the old manifest or the new
+/// one, never a mixture.
+///
+/// An error before the rename means the old manifest is still the one on
+/// disk. An error after it is reported as [`StorageError::ManifestNotSynced`]:
+/// the new manifest is what a restart will most likely find, so the caller
+/// must not undo the change or delete anything the new manifest lists.
+pub async fn persist(io: &IoEngine, dir: &Path, data: &ManifestData) -> StorageResult<()> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let temp_path = dir.join(format!("{MANIFEST_FILE}.tmp"));
+
+    let content = serde_json::to_string_pretty(data)
+        .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
+
+    // The manifest is a small text file of arbitrary length, so it is written
+    // through the page cache: a whole number of pages first, then cut to size.
+    let options = OpenOptions {
+        direct: false,
+        ..OpenOptions::create_truncate()
+    };
+    let file = io.open(&temp_path, options).await?;
+    let mut buf = AlignedBuffer::new(content.len().max(1))?;
+    buf.copy_from_slice(content.as_bytes())?;
+    file.write_at(buf, 0, Urgency::Critical).await?;
+    file.set_len(content.len() as u64)?;
+    file.sync_all(Urgency::Critical).await?;
+    drop(file);
+
+    std::fs::rename(&temp_path, &manifest_path)?;
+
+    // The rename lives in the directory; sync that too. Not every platform
+    // can open a directory, and where it cannot there is nothing to sync.
+    let dir_options = OpenOptions {
+        direct: false,
+        ..OpenOptions::read_only()
+    };
+    if let Ok(dir_file) = io.open(dir, dir_options).await {
+        dir_file
+            .sync_all(Urgency::Critical)
+            .await
+            .map_err(|e| StorageError::ManifestNotSynced(e.to_string()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,8 +309,9 @@ mod tests {
         path
     }
 
-    #[test]
-    fn test_manifest_create_and_save() {
+    #[tokio::test]
+    async fn test_manifest_create_and_save() {
+        let io = IoEngine::new(crate::io::IoBackend::from_env().unwrap()).unwrap();
         let dir = temp_dir("create");
 
         let mut manifest = Manifest::open(&dir).unwrap();
@@ -236,7 +330,10 @@ mod tests {
             },
         );
 
-        manifest.save().unwrap();
+        persist(&io, manifest.dir(), &manifest.snapshot())
+            .await
+            .unwrap();
+        assert!(!dir.join("MANIFEST.tmp").exists());
 
         // Reload and verify
         let manifest2 = Manifest::open(&dir).unwrap();

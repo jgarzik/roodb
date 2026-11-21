@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use roodb::catalog::Catalog;
-use roodb::io::default_io_factory;
-use roodb::raft::{ChangeSet, RaftNode, RowChange};
+use roodb::io::{IoBackend, IoEngine};
+use roodb::raft::{ChangeSet, Durability, LogStore, LogStoreConfig, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::RaftTlsConfig;
 use test_utils::certs::{test_raft_tls_config, write_raft_cluster_certs};
@@ -19,8 +19,8 @@ fn test_port(base: u16) -> u16 {
     base + (std::process::id() as u16 % 1000)
 }
 
-/// Create a temporary storage engine for testing
-async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
+/// Create a temporary storage engine and Raft log for testing
+async fn test_storage(name: &str) -> (Arc<dyn StorageEngine>, LogStore) {
     let mut path = std::env::temp_dir();
     path.push(format!(
         "roodb_test_{}_{}_{:?}",
@@ -32,12 +32,19 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
             .as_nanos()
     ));
     let _ = std::fs::create_dir_all(&path);
-    let factory = Arc::new(default_io_factory());
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
+    let log = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&path, Durability::Os),
+    )
+    .await
+    .unwrap();
     let config = LsmConfig {
         dir: path,
         ..Default::default()
     };
-    Arc::new(LsmEngine::open(factory, config).await.unwrap())
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    (storage, log)
 }
 
 /// Create a test catalog for Raft tests
@@ -97,7 +104,7 @@ async fn test_single_node_bootstrap() {
     let storage = test_storage("single_bootstrap").await;
     let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog, true)
+    let mut node = RaftNode::new(1, addr, tls_config, storage.0, catalog, storage.1, true)
         .await
         .unwrap();
 
@@ -128,7 +135,7 @@ async fn test_single_node_multiple_writes() {
     let storage = test_storage("single_writes").await;
     let catalog = test_catalog();
 
-    let mut node = RaftNode::new(1, addr, tls_config, storage, catalog, true)
+    let mut node = RaftNode::new(1, addr, tls_config, storage.0, catalog, storage.1, true)
         .await
         .unwrap();
     node.start_rpc_server().await.unwrap();
@@ -169,13 +176,13 @@ async fn test_three_node_cluster_bootstrap() {
     let catalog3 = test_catalog();
 
     // Create nodes with unique per-node mTLS certs
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -224,13 +231,13 @@ async fn test_log_replication() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -269,4 +276,242 @@ async fn test_log_replication() {
     node1.shutdown().await.unwrap();
     node2.shutdown().await.unwrap();
     node3.shutdown().await.unwrap();
+}
+
+/// Start a single-node Raft over fresh storage and return the node with the
+/// storage it applies to.
+async fn single_node(name: &str) -> (RaftNode, Arc<dyn StorageEngine>) {
+    // Port 0: the node never talks to a peer, and a fixed port could collide.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (storage, log) = test_storage(name).await;
+    let mut node = RaftNode::new(
+        1,
+        addr,
+        test_raft_tls_config(),
+        storage.clone(),
+        test_catalog(),
+        log,
+        true,
+    )
+    .await
+    .unwrap();
+    node.start_rpc_server().await.unwrap();
+    node.bootstrap_single_node().await.unwrap();
+    assert!(wait_for_leader(&[&node], 5000).await.is_some());
+    (node, storage)
+}
+
+/// The row data stored under a key, if a live row is there.
+async fn stored_row(storage: &Arc<dyn StorageEngine>, key: &[u8]) -> Option<Vec<u8>> {
+    let raw = storage.get(key).await.unwrap()?;
+    // 17-byte MVCC header: transaction id, roll pointer, deleted flag.
+    if raw[16] == 1 {
+        return None;
+    }
+    Some(raw[17..].to_vec())
+}
+
+/// A changeset that fails any check writes nothing: not the rows before the
+/// failing one either.
+#[tokio::test]
+async fn a_rejected_changeset_writes_nothing() {
+    let (node, storage) = single_node("atomic_reject").await;
+
+    node.propose_changes(insert_change("t", b"existing", b"v1"))
+        .await
+        .unwrap();
+
+    // Two new rows, then a duplicate of the existing one.
+    let mut cs = ChangeSet::new(2);
+    cs.push(RowChange::insert("t", b"new-a".to_vec(), b"a".to_vec()));
+    cs.push(RowChange::insert("t", b"new-b".to_vec(), b"b".to_vec()));
+    cs.push(RowChange::insert("t", b"existing".to_vec(), b"v2".to_vec()));
+    let err = node.propose_changes(cs).await.unwrap_err().to_string();
+    assert!(err.contains("Duplicate key"), "{err}");
+
+    assert_eq!(stored_row(&storage, b"new-a").await, None, "partial write");
+    assert_eq!(stored_row(&storage, b"new-b").await, None, "partial write");
+    assert_eq!(
+        stored_row(&storage, b"existing").await,
+        Some(b"v1".to_vec())
+    );
+
+    // A version conflict on a later change undoes the earlier ones too.
+    let mut cs = ChangeSet::new(3);
+    cs.push(RowChange::insert("t", b"new-c".to_vec(), b"c".to_vec()));
+    cs.push(RowChange::update_with_version(
+        "t",
+        b"existing".to_vec(),
+        b"v3".to_vec(),
+        999,
+    ));
+    let err = node.propose_changes(cs).await.unwrap_err().to_string();
+    assert!(err.contains("Write conflict"), "{err}");
+    assert_eq!(stored_row(&storage, b"new-c").await, None, "partial write");
+
+    // The node is fine: later changesets apply.
+    node.propose_changes(insert_change("t", b"after", b"ok"))
+        .await
+        .unwrap();
+    assert_eq!(stored_row(&storage, b"after").await, Some(b"ok".to_vec()));
+
+    node.shutdown().await.unwrap();
+}
+
+/// Checks see the changeset's own earlier changes: deleting a row and
+/// inserting it again in one transaction is not a duplicate, inserting the
+/// same new key twice is.
+#[tokio::test]
+async fn a_changeset_sees_its_own_earlier_changes() {
+    let (node, storage) = single_node("atomic_overlay").await;
+
+    node.propose_changes(insert_change("t", b"row", b"old"))
+        .await
+        .unwrap();
+
+    let mut cs = ChangeSet::new(2);
+    cs.push(RowChange::delete("t", b"row".to_vec()));
+    cs.push(RowChange::insert("t", b"row".to_vec(), b"new".to_vec()));
+    node.propose_changes(cs).await.unwrap();
+    assert_eq!(stored_row(&storage, b"row").await, Some(b"new".to_vec()));
+
+    let mut cs = ChangeSet::new(3);
+    cs.push(RowChange::insert("t", b"twice".to_vec(), b"1".to_vec()));
+    cs.push(RowChange::insert("t", b"twice".to_vec(), b"2".to_vec()));
+    let err = node.propose_changes(cs).await.unwrap_err().to_string();
+    assert!(err.contains("Duplicate key"), "{err}");
+    assert_eq!(stored_row(&storage, b"twice").await, None);
+
+    // INSERT IGNORE skips the duplicate and keeps the rest.
+    let mut cs = ChangeSet::new_with_changes_ignore(
+        4,
+        vec![
+            RowChange::insert("t", b"row".to_vec(), b"ignored".to_vec()),
+            RowChange::insert("t", b"fresh".to_vec(), b"kept".to_vec()),
+        ],
+        true,
+    );
+    cs.push(RowChange::delete("t", b"gone".to_vec()));
+    node.propose_changes(cs).await.unwrap();
+    assert_eq!(stored_row(&storage, b"row").await, Some(b"new".to_vec()));
+    assert_eq!(stored_row(&storage, b"fresh").await, Some(b"kept".to_vec()));
+
+    node.shutdown().await.unwrap();
+}
+
+/// The log is purged as the state machine is checkpointed, so it stays
+/// within its budget - and never past what has been flushed to disk, since
+/// a purged entry that was only in memory could not be recovered.
+#[tokio::test]
+async fn the_log_is_purged_only_up_to_what_is_flushed() {
+    use openraft::storage::RaftLogStorage;
+    use roodb::io::PAGE_SIZE;
+
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "roodb_test_purge_{}_{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let io = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
+    // 256 KiB segments and a 1 MiB budget, against ~20 MiB of commits.
+    let segment_bytes = 64 * PAGE_SIZE as u64;
+    let mut log = LogStore::open(
+        io.clone(),
+        LogStoreConfig {
+            segment_bytes,
+            ..LogStoreConfig::for_data_dir(&path, Durability::Os)
+        },
+    )
+    .await
+    .unwrap();
+    let storage: Arc<dyn StorageEngine> = Arc::new(
+        LsmEngine::open(
+            io,
+            LsmConfig {
+                dir: path,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let mut node = RaftNode::new(
+        1,
+        addr,
+        test_raft_tls_config(),
+        storage.clone(),
+        test_catalog(),
+        log.clone(),
+        true,
+    )
+    .await
+    .unwrap();
+    let budget = 1 << 20;
+    node.set_log_budget(budget);
+    node.start_rpc_server().await.unwrap();
+    node.bootstrap_single_node().await.unwrap();
+    assert!(wait_for_leader(&[&node], 5000).await.is_some());
+
+    let value = vec![7u8; 2000];
+    for i in 0..10_000u64 {
+        let key = format!("row{i:08}").into_bytes();
+        node.propose_changes(insert_change("t", &key, &value))
+            .await
+            .unwrap();
+
+        if i % 500 == 499 {
+            // Wherever the purge point is, the flushed state has reached it.
+            let state = log.get_log_state().await.unwrap();
+            if let Some(purged) = state.last_purged_log_id {
+                let flushed = storage
+                    .get_durable(b"_raft:sm:last_applied")
+                    .await
+                    .unwrap()
+                    .expect("log purged with nothing flushed");
+                let flushed: roodb::raft::LogId = bincode::deserialize(&flushed).unwrap();
+                assert!(
+                    flushed.index >= purged.index,
+                    "log purged to {} but only {} is flushed",
+                    purged.index,
+                    flushed.index
+                );
+            }
+        }
+    }
+
+    // The log size is looked at a few times a second, so a burst overshoots
+    // the budget; once the checkpoint and purge have run it is back within a
+    // couple of segments of it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while log.disk_bytes() > budget + 2 * segment_bytes {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "log still {} bytes against a budget of {budget}",
+            log.disk_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let state = log.get_log_state().await.unwrap();
+    let purged = state.last_purged_log_id.expect("the log was never purged");
+    let flushed = storage
+        .get_durable(b"_raft:sm:last_applied")
+        .await
+        .unwrap()
+        .expect("log purged with nothing flushed");
+    let flushed: roodb::raft::LogId = bincode::deserialize(&flushed).unwrap();
+    assert!(flushed.index >= purged.index);
+
+    assert_eq!(
+        stored_row(&storage, b"row00000000").await,
+        Some(value.clone())
+    );
+    assert_eq!(stored_row(&storage, b"row00009999").await, Some(value));
+
+    node.shutdown().await.unwrap();
 }

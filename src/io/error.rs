@@ -28,3 +28,12 @@ pub enum IoError {
 
 /// Result type for IO operations
 pub type IoResult<T> = Result<T, IoError>;
+
+impl From<IoError> for std::io::Error {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        }
+    }
+}

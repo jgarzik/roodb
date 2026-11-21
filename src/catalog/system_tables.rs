@@ -32,6 +32,9 @@ pub const SYSTEM_PROCEDURES: &str = "system.procedures";
 // Views
 pub const SYSTEM_VIEWS: &str = "system.views";
 
+// Triggers
+pub const SYSTEM_TRIGGERS: &str = "system.triggers";
+
 /// Check if a table name is a system table
 pub fn is_system_table(name: &str) -> bool {
     name.starts_with("system.")
@@ -188,6 +191,35 @@ pub fn views_table_def() -> TableDef {
 }
 
 /// Get all system table definitions for bootstrapping
+/// Create the TableDef for system.triggers. A trigger is stored as the
+/// statement that created it.
+pub fn triggers_table_def() -> TableDef {
+    TableDef::new(SYSTEM_TRIGGERS)
+        .column(ColumnDef::new("trigger_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("create_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec!["trigger_name".to_string()]))
+}
+
+/// Convert a trigger to its system.triggers row.
+pub fn trigger_def_to_row(def: &crate::catalog::TriggerDef) -> Row {
+    Row::new(vec![
+        Datum::String(def.name.clone()),
+        Datum::String(def.table_name.clone()),
+        Datum::String(def.create_sql.clone()),
+    ])
+}
+
+/// Rebuild a trigger from its system.triggers row.
+pub fn row_to_trigger_def(row: &Row) -> Option<crate::catalog::TriggerDef> {
+    match row.values().get(2) {
+        Some(Datum::String(create_sql)) => {
+            crate::catalog::TriggerDef::from_create_sql(create_sql).ok()
+        }
+        _ => None,
+    }
+}
+
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
     vec![
         tables_table_def(),
@@ -202,6 +234,7 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         table_statistics_table_def(),
         procedures_table_def(),
         views_table_def(),
+        triggers_table_def(),
     ]
 }
 
@@ -673,7 +706,7 @@ mod tests {
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 12);
+        assert_eq!(tables.len(), 13);
 
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
@@ -688,6 +721,7 @@ mod tests {
         assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
         assert!(names.contains(&SYSTEM_VIEWS));
         assert!(names.contains(&SYSTEM_PROCEDURES));
+        assert!(names.contains(&SYSTEM_TRIGGERS));
     }
 
     #[test]

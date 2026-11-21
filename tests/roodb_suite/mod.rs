@@ -14,6 +14,7 @@ mod harness;
 
 pub mod auth;
 pub mod cluster;
+pub mod crash;
 pub mod ddl;
 pub mod dml;
 pub mod edge_cases;
@@ -22,6 +23,7 @@ pub mod prepared;
 pub mod protocol_tests;
 pub mod queries;
 pub mod raft_cluster;
+pub mod restart;
 pub mod tds;
 pub mod types;
 

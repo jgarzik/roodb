@@ -13,7 +13,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use roodb::init::{initialize_database, InitConfig, InitError};
-use roodb::io::default_io_factory;
+use roodb::io::{IoBackend, IoEngine};
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
@@ -23,23 +23,35 @@ use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 struct Cli {
     #[arg(long, default_value = "./data", env = "ROODB_DATA_DIR")]
     data_dir: PathBuf,
+    /// File I/O backend: auto (io_uring where available), uring, or posix
+    #[arg(long, default_value = "auto", env = "ROODB_IO_BACKEND")]
+    io_backend: IoBackend,
 }
 
 #[tokio::main]
 async fn main() {
     // Parse CLI args
-    let Cli { data_dir } = Cli::parse();
+    let Cli {
+        data_dir,
+        io_backend,
+    } = Cli::parse();
 
     eprintln!("RooDB initialization");
     eprintln!("Data directory: {}", data_dir.display());
 
     // Open storage engine
-    let io_factory = Arc::new(default_io_factory());
+    let io = match IoEngine::new(io_backend) {
+        Ok(io) => io,
+        Err(e) => {
+            eprintln!("ERROR: Failed to start the I/O engine: {}", e);
+            std::process::exit(3);
+        }
+    };
     let storage_config = LsmConfig {
         dir: data_dir,
         ..Default::default()
     };
-    let storage: Arc<dyn StorageEngine> = match LsmEngine::open(io_factory, storage_config).await {
+    let storage: Arc<dyn StorageEngine> = match LsmEngine::open(io, storage_config).await {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
             eprintln!("ERROR: Failed to open storage: {}", e);

@@ -20,9 +20,9 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 │  └─────────────────────────────┘    │
 │                                     │
 │  ┌─────────────────────────────┐    │
-│  │ Blocking Pool (elastic)     │    │
-│  │ - spawn_blocking() only     │    │
-│  │ - POSIX file I/O (non-Linux)│    │
+│  │ I/O threads                 │    │
+│  │ - io_uring reactors (Linux) │    │
+│  │ - or posix worker pool      │    │
 │  └─────────────────────────────┘    │
 └─────────────────────────────────────┘
 ```
@@ -34,7 +34,7 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 | Phase | Yields? | Notes |
 |-------|---------|-------|
 | Network read/write | Yes | Async I/O |
-| Storage read/write | Yes | Async I/O (io_uring or spawn_blocking) |
+| Storage read/write | Yes | Async I/O (io_uring reactors or posix worker pool) |
 | Parse SQL | No | Synchronous CPU |
 | Resolve/TypeCheck | No | Synchronous CPU |
 | Plan (logical/physical) | No | Synchronous CPU |
@@ -56,12 +56,12 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 
 ## I/O Patterns
 
-**Abstraction**: `AsyncIO` trait with platform-specific backends
+**Abstraction**: one `IoEngine`, backend chosen at startup (see `io/` below)
 
-| Platform | Backend | Features |
-|----------|---------|----------|
-| Linux | `UringIO` | io_uring, O_DIRECT, 64-entry queue |
-| Other | `PosixIO` | `spawn_blocking()`, no O_DIRECT |
+| Backend | Where | Features |
+|---------|-------|----------|
+| `uring` | Linux (default) | io_uring reactors, batched submission, registered files, O_DIRECT |
+| `posix` | Everywhere | worker pool, positional I/O, direct I/O where available |
 
 **Alignment Requirements**:
 - All buffers: 4KB aligned via `AlignedBuffer`
@@ -170,67 +170,57 @@ pub trait Executor: Send {
 
 ### `io/`
 
-Cross-platform async I/O with priority scheduling.
+The block I/O layer. RooDB does its own file I/O instead of relying on the
+kernel page cache: files are opened for direct I/O and every request goes
+through one `IoEngine` created at startup.
 
 **Architecture**:
 ```
-                    ┌─────────────────┐
-                    │  LSM / Raft     │
-                    └────────┬────────┘
-                             │ IoContext (urgency + kind)
-                    ┌────────▼────────┐
-                    │  I/O Scheduler  │  Backpressure, metrics
-                    └────────┬────────┘
-              ┌──────────────┴──────────────┐
-              │                             │
-     ┌────────▼────────┐           ┌────────▼────────┐
-     │    UringIO      │           │    PosixIO      │
-     │   (Linux)       │           │   (non-Linux)   │
-     └─────────────────┘           └─────────────────┘
+        LSM (SSTables, compaction)            tasks on any thread
+                    │  File::read_at / write_at / sync_data (+ Urgency)
+           ┌────────▼────────┐
+           │    IoEngine     │   backend chosen at startup (--io-backend)
+           └───┬─────────┬───┘
+     ┌─────────▼───┐ ┌───▼──────────┐
+     │ uring       │ │ posix        │
+     │ reactors    │ │ worker pool  │
+     └─────────────┘ └──────────────┘
 ```
 
 **Files**:
-- `traits.rs` - `AsyncIO`, `AsyncIOFactory` traits
-- `aligned_buffer.rs` - Page-aligned memory allocation
-- `scheduler/` - Priority scheduling, backpressure, metrics
-- `uring.rs` - Linux io_uring backend
-- `posix_aio.rs` - POSIX fallback
-
-**Scheduler** (`scheduler/`):
-
-**Files**: `engine.rs` (core scheduler), `backpressure.rs` (saturation tracking), `batcher.rs` / `batch.rs` (batch submission), `limiter.rs` (rate limiting), `throughput.rs` (throughput tracking), `metrics.rs` (I/O metrics), `config.rs` (tuning parameters).
-
-Two-dimensional I/O context:
-```rust
-pub enum Urgency {
-    Critical,    // Blocks COMMIT (Raft vote, txn durability)
-    Foreground,  // User query latency (SLO-bound)
-    Background,  // Flush, compaction - deferrable
-}
-
-pub enum OpKind { Read, Write, Sync }
-
-pub struct IoContext { urgency: Urgency, kind: OpKind }
-```
-
-Backpressure behavior:
-- Critical: Always processed immediately
-- Foreground: Delayed if backpressure saturated
-- Background: Delayed if any backpressure
-
-`ScheduledIOFactory` wraps any `AsyncIOFactory` to add scheduling.
+- `engine.rs` - `IoEngine`, `File`, `OpenOptions`, `Urgency`, `IoStats`
+- `uring.rs` - io_uring backend (Linux)
+- `posix.rs` - worker-pool backend (all platforms)
+- `aligned_buffer.rs` - page-aligned buffers
 
 **Backends**:
 
-| Platform | Backend | Features |
-|----------|---------|----------|
-| Linux | `UringIO` | io_uring, O_DIRECT, 64-entry queue |
-| Other | `PosixIO` | `spawn_blocking()`, no O_DIRECT |
+| Backend | Where | How |
+|---------|-------|-----|
+| `uring` | Linux, default | A few reactor threads, each owning one ring. Requests from all tasks are queued to a reactor, which submits everything pending with one system call. Files are registered in the ring; a write and its sync are linked into one request. `O_DIRECT`. |
+| `posix` | Everywhere; fallback when io_uring is unavailable | Worker threads doing positional reads and writes. `O_DIRECT` on Linux, `F_NOCACHE` on macOS, buffered on Windows. |
 
-**AlignedBuffer**:
-- `Layout::from_size_align()` for 4KB alignment
-- Manual `NonNull<u8>` management
-- Implements `Send + Sync`
+`--io-backend auto` (the default) uses `uring` when the kernel will create a
+ring and otherwise falls back to `posix` with a warning.
+
+**Requests**:
+- Buffers are passed by value and handed back on completion. A submitted
+  request keeps its buffer and file alive until the kernel is finished, even if
+  the caller stops waiting.
+- Reads fill the buffer unless the file ends first; writes are complete or an
+  error. Write lengths are rounded up to a page and zero padded.
+- Offsets and lengths are multiples of 4 KiB.
+
+**Urgency**:
+```rust
+pub enum Urgency {
+    Critical,    // a commit is waiting: Raft log and vote
+    Foreground,  // a client query is waiting
+    Background,  // flush, compaction
+}
+```
+More urgent requests are submitted first. Background requests are capped per
+reactor so they cannot fill a ring.
 
 ### `init/`
 
@@ -369,10 +359,11 @@ pub struct RowChange {
 - `is_leader()`: Check if this node can accept writes
 
 **Storage**:
-- `LsmRaftStorage` (`lsm_storage.rs`): Production storage - persists log/state to LSM, rebuilds catalog on apply
-- `MemStorage` (`storage.rs`): Test-only in-memory storage
-- Log entries stored in LSM, state machine applies changes to storage and rebuilds catalog
-- Vote persistence uses `flush_critical()` (Critical I/O priority) to prevent split-brain
+- `LogStore` (`log_store.rs`): the Raft log on disk, and the server's write-ahead log. Preallocated segment files under `raft/`, written with direct I/O. Log entries, the vote, truncations, the purge point and the commit point are checksummed records in one stream.
+  - One writer task writes everything queued with a single request and then completes the waiting appends: commits that arrive together share a write, and with `--durability fsync` the flush too.
+  - Recovery replays the segments; in the newest one the first record that fails its checksum is the end of the log.
+  - A spare segment is kept ready and purged segments are recycled.
+- `LsmRaftStorage` (`lsm_storage.rs`): the state machine. Applies committed entries to the LSM, rebuilds the catalog on apply, and keeps its own position (last applied, membership) in the LSM.
 
 **Read Path**: Direct to local LSM (no Raft)
 **Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM
@@ -465,32 +456,36 @@ LSM-Tree storage engine.
 - Flush threshold: `total_cache_bytes / 2` (default 128MB budget → 64MB threshold)
 - Atomic size tracking
 
-**SSTable** (`lsm/sstable.rs`):
+**Writes**: `put`, `delete` and `write_batch` insert into the active memtable under a shared lock held for the whole batch; freezing a memtable takes the lock exclusively. A frozen memtable, and therefore every table on disk, holds whole batches only. Keys are limited to 65,535 bytes and values to 1 GiB, checked before any of a batch is applied.
+
+**Background work**: one task writes frozen memtables out (oldest first) and then compacts. Writers pause when four frozen memtables are waiting.
+
+**SSTable** (`lsm/sstable.rs`), format 3. Every region is a whole number of 4 KiB pages:
 ```
-| Data Block 0 (4KB) |
-| Data Block 1 (4KB) |
-| ...                |
-| Index Block (4KB)  |
-| Footer (4KB)       |
+| Data block 0   |  one page, or more for an oversized entry
+| Data block 1   |
+| ...            |
+| Index          |  per block: offset, length, first key; then the last key; CRC32
+| Bloom filter   |
+| Footer (4KB)   |  index and bloom location, counts, CRC32, magic "LSMT", version
 ```
 
 **Block Format** (`lsm/block.rs`):
 ```
-| Num Entries (4B) | Entry... | Padding | CRC32 (4B) |
-Entry: | Key Len (2B) | Val Len (2B) | Key | Value |
+| Block Len (4B) | Num Entries (4B) | Entry... | Padding | CRC32 (4B) |
+Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 ```
-- Tombstone: `Val Len = 0xFFFF`
-
-**Footer**: Index offset, block count, min/max keys, magic (`LSMT`), version
+- Tombstone: `Val Len = 0xFFFFFFFF`
+- A block is one page unless a single entry needs more; the index records each block's length.
 
 **Operations**:
 - `get()`: Check memtable → immutables → SSTables (newest first)
-- `put()`: Insert to memtable, trigger flush if needed
-- `scan()`: Merge all sources, deduplicate by key, skip tombstones
+- `put()`: Insert to memtable; a full memtable is frozen and handed to the background task
+- `scan()`: Merge all sources, deduplicate by key, skip tombstones. Adjacent blocks are read in runs of up to 1 MiB, all runs in flight together.
 
-**Bloom Filters** (`lsm/bloom.rs`): Per-SSTable Bloom filters for accelerating point lookups. Avoids reading SSTables that definitely don't contain a key.
+**Bloom Filters** (`lsm/bloom.rs`): Per-SSTable Bloom filters for accelerating point lookups, sized for the keys the table actually holds. Avoids reading SSTables that definitely don't contain a key.
 
-**Block Cache** (`lsm/block_cache.rs`): LRU block cache with dynamic sizing. Part of the unified memory budget (128MB default) shared with memtables. Starts at full budget, shrinks as memtable grows (minimum 4MB).
+**Block Cache** (`lsm/block_cache.rs`): LRU block cache with dynamic sizing, split into up to 16 shards with a lock each. Part of the unified memory budget (128MB default) shared with memtables. Starts at full budget, shrinks as memtable grows (minimum 4MB).
 
 **Merge Iterator** (`lsm/merge_iter.rs`): Multi-way merge iterator for range scans across memtables and SSTables. Deduplicates by key, resolves to newest version.
 
@@ -500,9 +495,13 @@ Entry: | Key Len (2B) | Val Len (2B) | Key | Value |
 - L0 trigger: 4 files
 - Level size ratio: 10x
 - L1 base: 10MB
-- Process: Find overlap → Merge → Write new SSTable → Update manifest
+- Deepest level: 6
+- Process: pick a level over its limit → merge its files with the overlapping files one level down → write one new SSTable → update manifest → delete inputs
+- Tombstones are carried down and dropped only when no deeper table overlaps the output's key range
 
-**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level. Uses atomic write pattern (temp file → fsync → rename) to prevent corruption.
+**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level, with a layout version. Replaced atomically (temp file → fsync → rename → fsync directory).
+
+**Crash safety**: a table is written and synced, then listed in the manifest, and only then is its source (a memtable, or the tables a compaction replaced) released. At startup, table files the manifest does not list are deleted, and a listed table that is missing or fails its checksums stops startup.
 
 ### `tls.rs`
 

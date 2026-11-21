@@ -11,6 +11,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
 use crate::protocol::tds::{self, connection::TdsAcceptors};
+use crate::raft::LogStore;
 use crate::raft::RaftNode;
 use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
@@ -48,7 +49,11 @@ impl RooDbServer {
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
     ) -> Self {
-        let txn_manager = Arc::new(TransactionManager::new());
+        // Transaction IDs continue from where the state machine has got to,
+        // not from 1: rows already on disk carry earlier IDs.
+        let txn_manager = Arc::new(TransactionManager::with_applied_floor(
+            raft_node.applied_txn_floor(),
+        ));
         Self {
             addr,
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
@@ -71,8 +76,17 @@ impl RooDbServer {
 
     /// Run the server until the process exits
     pub async fn run(self) -> Result<(), ServerError> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Serve clients until `shutdown` completes, then stop accepting and
+    /// return. Connections already open are left to their tasks.
+    pub async fn run_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
-        self.accept_loop(listener, std::future::pending()).await
+        self.accept_loop(listener, shutdown).await
     }
 
     /// Run the server with a pre-bound listener and shutdown signal
@@ -178,12 +192,17 @@ async fn accept_optional(
 pub struct ServerHandle {
     pub addr: SocketAddr,
     pub shutdown_tx: oneshot::Sender<()>,
+    raft_node: Arc<RaftNode>,
 }
 
 impl ServerHandle {
-    /// Shutdown the server
-    pub fn shutdown(self) {
+    /// Stop accepting connections and shut Raft down, with its log written
+    /// out. The storage engine is the caller's to close.
+    pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
+        if let Err(e) = self.raft_node.shutdown().await {
+            tracing::warn!(error = %e, "Raft shutdown reported an error");
+        }
     }
 }
 
@@ -197,6 +216,7 @@ pub async fn start_test_server(
     raft_tls_config: RaftTlsConfig,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
+    log_store: LogStore,
 ) -> Result<ServerHandle, ServerError> {
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -212,6 +232,7 @@ pub async fn start_test_server(
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
         true,
     )
     .await
@@ -225,17 +246,16 @@ pub async fn start_test_server(
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
+    // Forms the cluster on first start; on later starts resumes it and
+    // replays the log. Returns once the node leads and has caught up.
     raft_node
         .bootstrap_single_node()
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
-    // Brief wait for single-node leader election (with tick disabled, should be near-instant)
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     let raft_node = Arc::new(raft_node);
 
-    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node.clone());
     let actual_addr = server.addr();
 
     tokio::spawn(async move {
@@ -250,5 +270,6 @@ pub async fn start_test_server(
     Ok(ServerHandle {
         addr: actual_addr,
         shutdown_tx,
+        raft_node,
     })
 }

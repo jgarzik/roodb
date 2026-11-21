@@ -7,44 +7,32 @@
 // functions here feed directly into openraft trait methods that return them.
 #![allow(clippy::result_large_err)]
 
-use std::fmt::Debug;
 use std::io::Cursor;
-use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
-use openraft::{EntryPayload, OptionalSend, RaftLogId, RaftLogReader, RaftSnapshotBuilder};
-use openraft::{ErrorSubject, ErrorVerb};
+use futures_util::{Stream, TryStreamExt};
+use openraft::entry::RaftEntry;
+use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
+use openraft::{EntryPayload, OptionalSend};
 use parking_lot::RwLock;
-use tokio::sync::Mutex as TokioMutex;
 
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, row_to_procedure_def, row_to_view_def, rows_to_constraints,
-    rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES, SYSTEM_INDEXES,
-    SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_VIEWS,
+    is_system_table, row_to_index_def, row_to_procedure_def, row_to_trigger_def, row_to_view_def,
+    rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES,
+    SYSTEM_INDEXES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
-use crate::raft::changes::ChangeOp;
+use crate::raft::changes::{ChangeOp, ChangeSet};
 use crate::raft::types::{
-    Command, CommandResponse, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
-    StoredMembership, TypeConfig, Vote,
+    Command, CommandResponse, LogId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership,
+    TypeConfig,
 };
+use crate::storage::traits::WriteOp;
 use crate::storage::StorageEngine;
 
-use super::types::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
-
-/// Encode row data with MVCC header for storage
-///
-/// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data]
-fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
-    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
-    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR = 0 (no version chain)
-    result.push(if deleted { 1 } else { 0 }); // deleted flag
-    result.extend_from_slice(data);
-    result
-}
+use super::types::{encode_mvcc_row, is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
 /// Extract txn_id (version) from a stored row with MVCC header
 ///
@@ -75,132 +63,118 @@ fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
 }
 
 // Key prefixes for Raft state in LSM
-const VOTE_KEY: &[u8] = b"_raft:vote";
-const PURGED_KEY: &[u8] = b"_raft:log_state:purged";
 const LAST_APPLIED_KEY: &[u8] = b"_raft:sm:last_applied";
 const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
-const LOG_PREFIX: &[u8] = b"_raft:log:";
+/// A bound on the highest transaction ID applied (u64, little endian).
+const MAX_TXN_KEY: &[u8] = b"_raft:sm:max_txn_id";
+
+/// Prefix of the keys holding each node's reserved row ID bound (u64, little
+/// endian), followed by the node ID in big endian.
+const ROW_ID_KEY_PREFIX: &[u8] = b"_raft:sm:row_id:";
+
+fn row_id_key(node_id: u64) -> Vec<u8> {
+    let mut key = ROW_ID_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key
+}
+
+/// The stored bound is moved this far past the ID that crosses it, so that it
+/// is rewritten once per this many transactions rather than once per entry.
+const TXN_ID_STEP: u64 = 1024;
+
+/// Storage methods report plain I/O errors; openraft adds the context.
+type StorageError = std::io::Error;
 
 /// Create a read error
 fn read_err(msg: impl ToString) -> StorageError {
-    StorageError::from_io_error(
-        ErrorSubject::Store,
-        ErrorVerb::Read,
-        std::io::Error::other(msg.to_string()),
-    )
+    std::io::Error::other(format!("raft storage read: {}", msg.to_string()))
 }
 
 /// Create a write error
 fn write_err(msg: impl ToString) -> StorageError {
-    StorageError::from_io_error(
-        ErrorSubject::Store,
-        ErrorVerb::Write,
-        std::io::Error::other(msg.to_string()),
-    )
+    std::io::Error::other(format!("raft storage write: {}", msg.to_string()))
 }
 
-/// Encode a log entry key with big-endian index for correct lexicographic ordering
-fn log_key(index: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(LOG_PREFIX.len() + 8);
-    key.extend_from_slice(LOG_PREFIX);
-    key.extend_from_slice(&index.to_be_bytes());
-    key
-}
-
-/// Extract log index from a log key
-fn log_index_from_key(key: &[u8]) -> Option<u64> {
-    if key.len() == LOG_PREFIX.len() + 8 && key.starts_with(LOG_PREFIX) {
-        let bytes: [u8; 8] = key[LOG_PREFIX.len()..].try_into().ok()?;
-        Some(u64::from_be_bytes(bytes))
-    } else {
-        None
-    }
-}
-
-/// Compute end key for log range scan (prefix + max)
-fn log_key_end() -> Vec<u8> {
-    let mut key = Vec::with_capacity(LOG_PREFIX.len() + 8);
-    key.extend_from_slice(LOG_PREFIX);
-    key.extend_from_slice(&u64::MAX.to_be_bytes());
-    key
-}
-
-/// LSM-backed Raft storage
+/// The Raft state machine: applies committed log entries to the LSM.
 ///
-/// Stores all Raft state durably in LSM:
-/// - Vote: `_raft:vote`
-/// - Log entries: `_raft:log:{BE_u64_index}`
-/// - Last purged: `_raft:log_state:purged`
+/// The log itself lives in the [`LogStore`](crate::raft::LogStore). What is
+/// kept here, in the LSM alongside the data, is the state machine's own
+/// position:
 /// - Last applied: `_raft:sm:last_applied`
 /// - Membership: `_raft:sm:membership`
 ///
-/// # Locking Architecture
+/// # Locking
 ///
-/// This struct uses multiple independent RwLocks. The locks are designed to be
-/// independent subsystems with no nesting requirements:
-///
-/// - `log_mutex` - Serializes log operations (append, get_log_state, try_get_log_entries).
-///   This ensures that when get_log_state() reports log entry N exists, any subsequent
-///   try_get_log_entries() will find it. Required because LsmRaftStorage is Clone with
-///   shared state, but OpenRaft's `&mut self` methods imply serialized access.
-///   **Not held by snapshot operations** (`build_snapshot`, `get_current_snapshot`):
-///   snapshots only read non-Raft-prefixed keys (user data), log operations only touch
-///   Raft-prefixed keys, and OpenRaft serializes state machine operations.
-/// - `catalog` - Schema metadata. Acquired briefly during apply() for DDL changes.
-///   Never held during storage I/O operations.
-/// - `cached_*` - In-memory caches for Raft state. Each is updated independently
-///   after successful storage writes. None are held across await points.
-///
-/// **Key invariant**: Catalog lock is acquired alone, never nested with storage
-/// operations or other locks. Storage writes complete first, then catalog is updated.
+/// - `catalog` - Schema metadata. Acquired briefly during apply() for DDL
+///   changes, never held during storage I/O.
+/// - `cached_*` - In-memory copies of the state machine's position, updated
+///   after the storage write. Never held across await points.
 #[derive(Clone)]
 pub struct LsmRaftStorage {
     storage: Arc<dyn StorageEngine>,
     /// Catalog reference for updating schema on DDL changes.
-    /// See struct-level locking documentation.
     catalog: Arc<RwLock<Catalog>>,
-    /// Serializes log operations to prevent races between append and read operations.
-    /// See struct-level documentation for details.
-    log_mutex: Arc<TokioMutex<()>>,
-    // In-memory caches for hot paths
-    cached_vote: Arc<RwLock<Option<Vote>>>,
     cached_last_applied: Arc<RwLock<Option<LogId>>>,
     cached_membership: Arc<RwLock<StoredMembership>>,
-    cached_last_log_id: Arc<RwLock<Option<LogId>>>,
-    cached_last_purged: Arc<RwLock<Option<LogId>>>,
-    /// Single-node mode: skip expensive durability operations that only matter for multi-node
+    /// No other node will ever ask this one for a snapshot's contents.
     single_node: bool,
+    /// The highest transaction ID applied, or a bound above it; shared with
+    /// the transaction manager, which keeps its own IDs ahead of it.
+    applied_txn_floor: Arc<AtomicU64>,
+    /// The bound as stored: never below `applied_txn_floor`.
+    stored_txn_bound: Arc<AtomicU64>,
+    /// This node's ID: whose row ID reservations are its own.
+    node_id: u64,
+}
+
+/// A change to a system table, noted so the catalog can follow once the
+/// change has been written.
+struct TrackedChange {
+    table: String,
+    value: Vec<u8>,
+    is_delete: bool,
+}
+
+/// What an accepted changeset does.
+#[derive(Default)]
+struct ChangesetPlan {
+    writes: Vec<WriteOp>,
+    tracked: Vec<TrackedChange>,
+    /// Tables and indexes this changeset creates.
+    new_tables: Vec<String>,
+    new_indexes: Vec<String>,
+    /// Tables and indexes this changeset drops.
+    dropped_tables: Vec<String>,
+    dropped_indexes: Vec<String>,
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LsmRaftStorage")
-            .field("cached_vote", &*self.cached_vote.read())
             .field("cached_last_applied", &*self.cached_last_applied.read())
-            .field("cached_last_log_id", &*self.cached_last_log_id.read())
             .finish()
     }
 }
 
 impl LsmRaftStorage {
-    /// Create new LSM-backed Raft storage
+    /// Create the state machine over a storage engine.
     ///
-    /// On creation, reads existing state from LSM to populate caches.
+    /// Reads its position from the LSM to populate the caches.
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
         single_node: bool,
+        node_id: u64,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
             catalog,
-            log_mutex: Arc::new(TokioMutex::new(())),
-            cached_vote: Arc::new(RwLock::new(None)),
             cached_last_applied: Arc::new(RwLock::new(None)),
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
-            cached_last_log_id: Arc::new(RwLock::new(None)),
-            cached_last_purged: Arc::new(RwLock::new(None)),
             single_node,
+            applied_txn_floor: Arc::new(AtomicU64::new(0)),
+            stored_txn_bound: Arc::new(AtomicU64::new(0)),
+            node_id,
         };
 
         // Load existing state from LSM into caches
@@ -209,20 +183,90 @@ impl LsmRaftStorage {
         Ok(this)
     }
 
+    /// Load the bounds on transaction IDs and row IDs from storage. They only
+    /// ever move forward, here as everywhere.
+    async fn load_counters(&self) -> Result<(), StorageError> {
+        // Transaction IDs at or below this may be in rows on disk.
+        if let Some(data) = self.storage.get(MAX_TXN_KEY).await.map_err(read_err)? {
+            let bytes: [u8; 8] = data
+                .as_slice()
+                .try_into()
+                .map_err(|_| read_err("stored transaction ID bound is malformed"))?;
+            let bound = u64::from_le_bytes(bytes);
+            self.applied_txn_floor.fetch_max(bound, Ordering::SeqCst);
+            self.stored_txn_bound.fetch_max(bound, Ordering::SeqCst);
+        }
+
+        // Row IDs: resume past what was reserved, and hand none out until a
+        // new range has been reserved through Raft.
+        let reserved = match self
+            .storage
+            .get(&row_id_key(self.node_id))
+            .await
+            .map_err(read_err)?
+        {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| read_err("stored row ID bound is malformed"))?;
+                u64::from_le_bytes(bytes)
+            }
+            None => 0,
+        };
+        crate::storage::row_id::generator().restore(reserved);
+
+        Ok(())
+    }
+
+    /// The highest transaction ID applied, or a bound above it. The
+    /// transaction manager keeps the IDs it hands out ahead of this.
+    pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
+        self.applied_txn_floor.clone()
+    }
+
+    /// The state machine's position as flushed to disk: what a restart would
+    /// resume from. `None` if nothing has been flushed yet.
+    async fn durable_position(&self) -> Result<Option<SnapshotMeta>, StorageError> {
+        // The position and the membership are two keys, and a flush can land
+        // between reading one and the other. Read the position again
+        // afterwards and go round if it moved.
+        loop {
+            let Some(position) = self
+                .storage
+                .get_durable(LAST_APPLIED_KEY)
+                .await
+                .map_err(read_err)?
+            else {
+                return Ok(None);
+            };
+            let membership = self
+                .storage
+                .get_durable(MEMBERSHIP_KEY)
+                .await
+                .map_err(read_err)?;
+            let again = self
+                .storage
+                .get_durable(LAST_APPLIED_KEY)
+                .await
+                .map_err(read_err)?;
+            if again.as_deref() != Some(position.as_slice()) {
+                continue;
+            }
+            let last_applied: LogId = bincode::deserialize(&position).map_err(read_err)?;
+            let membership = match membership {
+                Some(data) => bincode::deserialize(&data).map_err(read_err)?,
+                None => StoredMembership::default(),
+            };
+            return Ok(Some(SnapshotMeta {
+                last_log_id: Some(last_applied),
+                last_membership: membership,
+            }));
+        }
+    }
+
     /// Load all cached state from LSM
     async fn load_cached_state(&self) -> Result<(), StorageError> {
-        // Load vote
-        if let Some(data) = self.storage.get(VOTE_KEY).await.map_err(read_err)? {
-            let vote: Vote = bincode::deserialize(&data).map_err(read_err)?;
-            *self.cached_vote.write() = Some(vote);
-        }
-
-        // Load last purged
-        if let Some(data) = self.storage.get(PURGED_KEY).await.map_err(read_err)? {
-            let log_id: LogId = bincode::deserialize(&data).map_err(read_err)?;
-            *self.cached_last_purged.write() = Some(log_id);
-        }
-
         // Load last applied
         if let Some(data) = self.storage.get(LAST_APPLIED_KEY).await.map_err(read_err)? {
             let log_id: LogId = bincode::deserialize(&data).map_err(read_err)?;
@@ -235,60 +279,20 @@ impl LsmRaftStorage {
             *self.cached_membership.write() = membership;
         }
 
-        // Scan for last log entry
-        let entries = self
-            .storage
-            .scan(Some(LOG_PREFIX), Some(&log_key_end()))
-            .await
-            .map_err(read_err)?;
-
-        if let Some((ref key, ref data)) = entries.last() {
-            if let Some(_index) = log_index_from_key(key) {
-                let entry: Entry = bincode::deserialize(data).map_err(read_err)?;
-                *self.cached_last_log_id.write() = Some(*entry.get_log_id());
-            }
-        }
+        self.load_counters().await?;
 
         tracing::info!(
-            vote = ?*self.cached_vote.read(),
-            last_purged = ?*self.cached_last_purged.read(),
-            last_log = ?*self.cached_last_log_id.read(),
             last_applied = ?*self.cached_last_applied.read(),
-            "Loaded Raft state from LSM"
+            txn_id_floor = self.applied_txn_floor.load(Ordering::SeqCst),
+            row_ids = ?crate::storage::row_id::generator().demand(),
+            "Loaded state machine position from LSM"
         );
 
-        // Load databases from system.databases into catalog
-        // These may have been written by roodb_init (without MVCC headers)
-        // or via Raft apply (with MVCC headers). Handle both.
-        self.load_databases_into_catalog().await?;
-
-        Ok(())
-    }
-
-    /// Load database names from system.databases into the catalog
-    ///
-    /// Handles both raw rows (from roodb_init) and MVCC-wrapped rows (from Raft apply).
-    async fn load_databases_into_catalog(&self) -> Result<(), StorageError> {
-        let prefix = table_key_prefix(SYSTEM_DATABASES);
-        let end = table_key_end(SYSTEM_DATABASES);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(read_err)?;
-
-        let mut catalog = self.catalog.write();
-        for (_key, value) in rows {
-            let Some(row_data) = extract_row_data(&value) else {
-                continue;
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
-                    catalog.register_database(db_name.clone());
-                }
-            }
-        }
+        // The catalog is not stored anywhere but in the system tables.
+        // Rebuild all of it - databases, tables, indexes, views, procedures -
+        // from what is on disk. Entries replayed from the log afterwards
+        // update it as they are applied, as they do while running.
+        self.rebuild_catalog_from_system_tables().await?;
 
         Ok(())
     }
@@ -465,7 +469,8 @@ impl LsmRaftStorage {
         Ok(())
     }
 
-    /// Rebuild entire catalog from system tables after snapshot install
+    /// Rebuild the entire catalog from the system tables: at startup, and after
+    /// a snapshot has replaced the data.
     async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
         use crate::catalog::{IndexDef, TableDef};
 
@@ -637,6 +642,28 @@ impl LsmRaftStorage {
             }
         }
 
+        // Scan system.triggers to rebuild triggers
+        let mut trigger_defs: Vec<crate::catalog::TriggerDef> = Vec::new();
+        {
+            let prefix = table_key_prefix(SYSTEM_TRIGGERS);
+            let end = table_key_end(SYSTEM_TRIGGERS);
+            let rows = self
+                .storage
+                .scan(Some(&prefix), Some(&end))
+                .await
+                .map_err(read_err)?;
+            for (_key, value) in rows {
+                let Some(row_data) = extract_row_data(&value) else {
+                    continue;
+                };
+                if let Ok(row) = decode_row(row_data) {
+                    if let Some(trigger) = row_to_trigger_def(&row) {
+                        trigger_defs.push(trigger);
+                    }
+                }
+            }
+        }
+
         // Update catalog (clear and rebuild)
         let mut catalog = self.catalog.write();
 
@@ -676,6 +703,12 @@ impl LsmRaftStorage {
             catalog.register_procedure(proc_def);
         }
 
+        // Rebuild triggers
+        catalog.clear_triggers();
+        for trigger in trigger_defs {
+            catalog.create_trigger(trigger);
+        }
+
         // Rebuild views
         catalog.clear_views();
         for view_def in view_defs {
@@ -683,8 +716,183 @@ impl LsmRaftStorage {
             catalog.register_view(view_def);
         }
 
-        tracing::info!("Rebuilt catalog from system tables after snapshot install");
+        tracing::info!("Rebuilt catalog from system tables");
         Ok(())
+    }
+
+    /// Work out what a changeset writes, without writing anything.
+    ///
+    /// Every check runs first: the version checks against what is stored now,
+    /// then the duplicate-key checks, which also see the changeset's own
+    /// earlier changes (a DELETE followed by an INSERT of the same key is not
+    /// a duplicate). If any check fails the changeset writes nothing at all;
+    /// the inner `Err` carries the message for the client.
+    async fn plan_changeset(
+        &self,
+        changeset: &ChangeSet,
+        existing_tables: &std::collections::HashSet<String>,
+        existing_indexes: &std::collections::HashSet<String>,
+    ) -> Result<Result<ChangesetPlan, String>, StorageError> {
+        // Version checks see storage as it was before this changeset, which
+        // is what the executors saw when they read the rows.
+        for change in &changeset.changes {
+            let Some(expected_version) = change.expected_version else {
+                continue;
+            };
+            match self.storage.get(&change.key).await.map_err(read_err)? {
+                Some(current) => {
+                    let current_version = extract_row_version(&current).unwrap_or(0);
+                    if current_version != expected_version {
+                        tracing::warn!(
+                            table = %change.table,
+                            expected = expected_version,
+                            actual = current_version,
+                            "OCC conflict: row was modified by another transaction"
+                        );
+                        return Ok(Err(format!(
+                            "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
+                            change.table, expected_version, current_version
+                        )));
+                    }
+                }
+                // A row that is already gone is fine to delete, not to update.
+                None if change.op == ChangeOp::Update => {
+                    tracing::warn!(table = %change.table, "OCC conflict: row no longer exists");
+                    return Ok(Err(format!(
+                        "Write conflict: row in '{}' no longer exists",
+                        change.table
+                    )));
+                }
+                None => {}
+            }
+        }
+
+        let mut plan = ChangesetPlan::default();
+        // Whether each key touched so far holds a live row after those changes.
+        let mut live: std::collections::HashMap<&[u8], bool> = std::collections::HashMap::new();
+        for change in &changeset.changes {
+            match (&change.op, &change.value) {
+                (ChangeOp::Insert | ChangeOp::Update, Some(value)) => {
+                    if change.op == ChangeOp::Insert && !is_system_table(&change.table) {
+                        let exists = match live.get(change.key.as_slice()) {
+                            Some(live) => *live,
+                            None => self
+                                .storage
+                                .get(&change.key)
+                                .await
+                                .map_err(read_err)?
+                                .is_some_and(|row| !is_mvcc_tombstone(&row)),
+                        };
+                        if exists {
+                            if changeset.ignore_duplicates {
+                                // INSERT IGNORE: skip this row.
+                                continue;
+                            }
+                            tracing::warn!(
+                                table = %change.table,
+                                "INSERT conflict: row already exists with this key"
+                            );
+                            return Ok(Err(format!(
+                                "Duplicate key: row in '{}' already exists",
+                                change.table
+                            )));
+                        }
+                    }
+
+                    // Two sessions can race to create the same table or
+                    // index; the second creation is dropped.
+                    if change.op == ChangeOp::Insert
+                        && (change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES)
+                    {
+                        let name =
+                            decode_row(value)
+                                .ok()
+                                .and_then(|row| match row.values().first() {
+                                    Some(crate::executor::Datum::String(name)) => {
+                                        Some(name.clone())
+                                    }
+                                    _ => None,
+                                });
+                        if let Some(name) = name {
+                            let (existing, new, dropped) = if change.table == SYSTEM_TABLES {
+                                (existing_tables, &mut plan.new_tables, &plan.dropped_tables)
+                            } else {
+                                (
+                                    existing_indexes,
+                                    &mut plan.new_indexes,
+                                    &plan.dropped_indexes,
+                                )
+                            };
+                            // It exists if it existed before and this
+                            // changeset has not dropped it, or if this
+                            // changeset already created it.
+                            let exists = (existing.contains(&name) && !dropped.contains(&name))
+                                || new.contains(&name);
+                            if exists {
+                                tracing::debug!(
+                                    table = %change.table,
+                                    name = %name,
+                                    "Skipping duplicate CREATE in apply()"
+                                );
+                                continue;
+                            }
+                            new.push(name);
+                        }
+                    }
+
+                    plan.writes.push((
+                        change.key.clone(),
+                        Some(encode_mvcc_row(changeset.txn_id, false, value)),
+                    ));
+                    live.insert(change.key.as_slice(), true);
+                    plan.tracked.push(TrackedChange {
+                        table: change.table.clone(),
+                        value: value.clone(),
+                        is_delete: false,
+                    });
+                }
+                // An insert or update with no value changes nothing.
+                (ChangeOp::Insert | ChangeOp::Update, None) => {}
+                (ChangeOp::Delete, value) => {
+                    plan.writes.push((
+                        change.key.clone(),
+                        Some(encode_mvcc_row(changeset.txn_id, true, &[])),
+                    ));
+                    live.insert(change.key.as_slice(), false);
+                    if let Some(value) = value {
+                        // Dropping a table or index frees its name: a later
+                        // CREATE of the same name, in this changeset or a
+                        // following one, is not a duplicate.
+                        if change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES {
+                            let name =
+                                decode_row(value)
+                                    .ok()
+                                    .and_then(|row| match row.values().first() {
+                                        Some(crate::executor::Datum::String(name)) => {
+                                            Some(name.clone())
+                                        }
+                                        _ => None,
+                                    });
+                            if let Some(name) = name {
+                                if change.table == SYSTEM_TABLES {
+                                    plan.new_tables.retain(|n| n != &name);
+                                    plan.dropped_tables.push(name);
+                                } else {
+                                    plan.new_indexes.retain(|n| n != &name);
+                                    plan.dropped_indexes.push(name);
+                                }
+                            }
+                        }
+                        plan.tracked.push(TrackedChange {
+                            table: change.table.clone(),
+                            value: value.clone(),
+                            is_delete: true,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Ok(plan))
     }
 
     /// Helper to track system table changes for catalog rebuild
@@ -704,9 +912,13 @@ impl LsmRaftStorage {
             // Decode row to get table_name (first column)
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
+                    // Several entries are applied per call; for one name the
+                    // last operation is the one that stands.
                     if is_delete {
+                        affected_tables.remove(table_name);
                         dropped_tables.insert(table_name.clone());
                     } else {
+                        dropped_tables.remove(table_name);
                         affected_tables.insert(table_name.clone());
                     }
                 }
@@ -727,8 +939,10 @@ impl LsmRaftStorage {
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(index_name)) = row.values().first() {
                     if is_delete {
+                        affected_indexes.remove(index_name);
                         dropped_indexes.insert(index_name.clone());
                     } else {
+                        dropped_indexes.remove(index_name);
                         affected_indexes.insert(index_name.clone());
                     }
                 }
@@ -757,6 +971,17 @@ impl LsmRaftStorage {
                     }
                 }
             }
+        } else if table == SYSTEM_TRIGGERS {
+            // Trigger changes - update catalog directly
+            if let Ok(row) = decode_row(value) {
+                if is_delete {
+                    if let Some(crate::executor::Datum::String(name)) = row.values().first() {
+                        let _ = self.catalog.write().drop_trigger(name);
+                    }
+                } else if let Some(trigger) = row_to_trigger_def(&row) {
+                    self.catalog.write().create_trigger(trigger);
+                }
+            }
         } else if table == SYSTEM_VIEWS {
             // View changes — update catalog directly
             if let Ok(row) = decode_row(value) {
@@ -773,222 +998,32 @@ impl LsmRaftStorage {
     }
 }
 
-impl RaftLogReader<TypeConfig> for LsmRaftStorage {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
-        &mut self,
-        range: RB,
-    ) -> Result<Vec<Entry>, StorageError> {
-        use std::ops::Bound;
-
-        // Serialize with other log operations to ensure visibility of appended entries
-        let _lock = self.log_mutex.lock().await;
-
-        let start_index = match range.start_bound() {
-            Bound::Included(&i) => i,
-            Bound::Excluded(&i) => i + 1,
-            Bound::Unbounded => 0,
-        };
-
-        let end_index = match range.end_bound() {
-            Bound::Included(&i) => Some(i + 1),
-            Bound::Excluded(&i) => Some(i),
-            Bound::Unbounded => None,
-        };
-
-        let start_key = log_key(start_index);
-        let end_key = end_index.map(log_key).unwrap_or_else(log_key_end);
-
-        let entries = self
-            .storage
-            .scan(Some(&start_key), Some(&end_key))
-            .await
-            .map_err(read_err)?;
-
-        let mut result = Vec::with_capacity(entries.len());
-        for (_key, data) in entries {
-            let entry: Entry = bincode::deserialize(&data).map_err(read_err)?;
-            result.push(entry);
-        }
-
-        Ok(result)
-    }
-}
-
-impl RaftLogStorage<TypeConfig> for LsmRaftStorage {
-    type LogReader = Self;
-
-    async fn get_log_state(&mut self) -> Result<LogState, StorageError> {
-        // Serialize with other log operations to ensure consistency
-        let _lock = self.log_mutex.lock().await;
-
-        let last_purged = *self.cached_last_purged.read();
-        let last_log_id = *self.cached_last_log_id.read();
-
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id,
-        })
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
-    }
-
-    async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError> {
-        let start = std::time::Instant::now();
-        let data = bincode::serialize(vote).map_err(write_err)?;
-
-        self.storage.put(VOTE_KEY, &data).await.map_err(write_err)?;
-
-        if !self.single_node {
-            // CRITICAL: flush to disk before returning - vote durability prevents double-voting
-            // Uses Critical priority to bypass backpressure and ensure durability
-            // Single-node: skip flush (can't have split-brain with 1 node)
-            self.storage.flush_critical().await.map_err(write_err)?;
-        }
-
-        *self.cached_vote.write() = Some(*vote);
-
-        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, ?vote, "save_vote");
-        Ok(())
-    }
-
-    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError> {
-        Ok(*self.cached_vote.read())
-    }
-
-    async fn save_committed(&mut self, _committed: Option<LogId>) -> Result<(), StorageError> {
-        // Committed index is tracked implicitly by last_applied
-        Ok(())
-    }
-
-    async fn append<I>(
-        &mut self,
-        entries: I,
-        callback: LogFlushed<TypeConfig>,
-    ) -> Result<(), StorageError>
-    where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        let start = std::time::Instant::now();
-        // Serialize with other log operations to ensure visibility before cache update
-        let _lock = self.log_mutex.lock().await;
-
-        let mut last_log_id = None;
-        let mut count = 0u64;
-
-        for entry in entries {
-            let log_id = *entry.get_log_id();
-            let key = log_key(log_id.index);
-            let data = bincode::serialize(&entry).map_err(write_err)?;
-
-            self.storage.put(&key, &data).await.map_err(write_err)?;
-
-            last_log_id = Some(log_id);
-            count += 1;
-        }
-
-        if let Some(log_id) = last_log_id {
-            *self.cached_last_log_id.write() = Some(log_id);
-        }
-
-        // Notify that log is persisted (in memtable, will be flushed with next flush cycle)
-        callback.log_io_completed(Ok(()));
-
-        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, "raft_append");
-
-        Ok(())
-    }
-
-    async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        // Serialize with other log operations
-        let _lock = self.log_mutex.lock().await;
-
-        // Delete all entries with index >= log_id.index
-        let start_key = log_key(log_id.index);
-        let end_key = log_key_end();
-
-        let entries = self
-            .storage
-            .scan(Some(&start_key), Some(&end_key))
-            .await
-            .map_err(read_err)?;
-
-        for (key, _) in entries {
-            self.storage.delete(&key).await.map_err(write_err)?;
-        }
-
-        // Update cached last log id by scanning for new max
-        let entries = self
-            .storage
-            .scan(Some(LOG_PREFIX), Some(&start_key))
-            .await
-            .map_err(read_err)?;
-
-        if let Some((ref _key, ref data)) = entries.last() {
-            let entry: Entry = bincode::deserialize(data).map_err(read_err)?;
-            *self.cached_last_log_id.write() = Some(*entry.get_log_id());
-        } else {
-            *self.cached_last_log_id.write() = *self.cached_last_purged.read();
-        }
-
-        tracing::debug!(?log_id, "Truncated log");
-        Ok(())
-    }
-
-    async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError> {
-        let start = std::time::Instant::now();
-        // Serialize with other log operations
-        let _lock = self.log_mutex.lock().await;
-
-        // Delete all entries with index <= log_id.index
-        let end_key = log_key(log_id.index + 1);
-
-        let entries = self
-            .storage
-            .scan(Some(LOG_PREFIX), Some(&end_key))
-            .await
-            .map_err(read_err)?;
-
-        let count = entries.len() as u64;
-        for (key, _) in entries {
-            self.storage.delete(&key).await.map_err(write_err)?;
-        }
-
-        // Persist last purged
-        let data = bincode::serialize(&log_id).map_err(write_err)?;
-        self.storage
-            .put(PURGED_KEY, &data)
-            .await
-            .map_err(write_err)?;
-
-        *self.cached_last_purged.write() = Some(log_id);
-
-        tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, count, ?log_id, "raft_purge");
-        Ok(())
-    }
-}
-
 impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
+    type SnapshotData = SnapshotData;
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), StorageError> {
-        // Serialize with log operations to ensure consistency between applied state and log state.
-        // Without this, a concurrent append could update cached_last_log_id while we read
-        // cached_last_applied, leading to inconsistent views.
-        let _lock = self.log_mutex.lock().await;
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResponse>, StorageError>
+    async fn apply<Strm>(&mut self, mut stream: Strm) -> Result<(), StorageError>
     where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, std::io::Error>>
+            + Unpin
+            + OptionalSend,
     {
         use std::collections::HashSet;
+
+        // Take everything openraft has ready; each entry comes with the
+        // channel its client is waiting on (none on followers).
+        let mut entries = Vec::new();
+        let mut responders = Vec::new();
+        while let Some((entry, responder)) = stream.try_next().await? {
+            entries.push(entry);
+            responders.push(responder);
+        }
 
         let start = std::time::Instant::now();
         let mut results = Vec::new();
@@ -1008,238 +1043,123 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         };
 
         for entry in entries {
-            let log_id = *entry.get_log_id();
+            let log_id = entry.log_id();
 
-            match &entry.payload {
-                EntryPayload::Blank => {
-                    results.push(CommandResponse::Ok(None));
-                }
-                EntryPayload::Normal(cmd) => {
-                    let resp = match cmd {
-                        Command::DataChange(changeset) => {
-                            // Apply each row change to storage with MVCC headers.
-                            // This is the unified write path for both leader and follower:
-                            // - Leader: collected changes during execution, now persisting after Raft commit
-                            // - Follower: received changes via AppendEntries, now persisting locally
-                            //
-                            // Two-pass approach: OCC checks first, then applies.
-                            // This prevents false conflicts when multiple changes in
-                            // the same changeset target the same key (e.g., UPDATE + DELETE
-                            // on the same row). All OCC checks see the pre-changeset
-                            // storage state, matching what executors saw during scan.
-                            let mut conflict_error: Option<String> = None;
+            // Everything an entry changes goes to storage as one batch,
+            // together with the entry's position. Storage keeps a batch whole,
+            // so what is on disk is always the result of applying the log up
+            // to exactly the position recorded with it - which is what lets a
+            // restart resume from that position by replaying the log.
+            let mut batch: Vec<WriteOp> = Vec::new();
+            let mut tracked: Vec<TrackedChange> = Vec::new();
+            let mut membership_change = None;
+            let mut new_txn_id = None;
+            let mut reserved_row_ids = None;
 
-                            // Pass 1: OCC version checks (before any writes)
-                            for change in &changeset.changes {
-                                if let Some(expected_version) = change.expected_version {
-                                    if let Ok(Some(current_data)) =
-                                        self.storage.get(&change.key).await
-                                    {
-                                        let current_version =
-                                            extract_row_version(&current_data).unwrap_or(0);
-                                        if current_version != expected_version {
-                                            tracing::warn!(
-                                                table = %change.table,
-                                                expected = expected_version,
-                                                actual = current_version,
-                                                "OCC conflict: row was modified by another transaction"
-                                            );
-                                            conflict_error = Some(format!(
-                                                "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
-                                                change.table, expected_version, current_version
-                                            ));
-                                            break;
-                                        }
-                                    } else if change.op == ChangeOp::Update {
-                                        tracing::warn!(
-                                            table = %change.table,
-                                            "OCC conflict: row no longer exists"
-                                        );
-                                        conflict_error = Some(format!(
-                                            "Write conflict: row in '{}' no longer exists",
-                                            change.table
-                                        ));
-                                        break;
-                                    }
-                                    // For DELETE, if row doesn't exist, that's ok (idempotent)
-                                }
-                            }
-
-                            // Pass 2: Apply changes (only if no OCC conflict)
-                            if conflict_error.is_none() {
-                                for change in &changeset.changes {
-                                    match change.op {
-                                        ChangeOp::Insert | ChangeOp::Update => {
-                                            if let Some(ref value) = change.value {
-                                                // Check for duplicate key on INSERT for user tables
-                                                if change.op == ChangeOp::Insert
-                                                    && !is_system_table(&change.table)
-                                                {
-                                                    if let Ok(Some(existing_data)) =
-                                                        self.storage.get(&change.key).await
-                                                    {
-                                                        // Skip tombstones (deleted rows)
-                                                        let is_tombstone =
-                                                            is_mvcc_tombstone(&existing_data);
-                                                        if !is_tombstone {
-                                                            if changeset.ignore_duplicates {
-                                                                // IGNORE: silently skip this row
-                                                                continue;
-                                                            }
-                                                            tracing::warn!(
-                                                                table = %change.table,
-                                                                "INSERT conflict: row already exists with this key"
-                                                            );
-                                                            conflict_error = Some(format!(
-                                                                "Duplicate key: row in '{}' already exists",
-                                                                change.table
-                                                            ));
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-
-                                                // Check for duplicate table creation (race condition fix)
-                                                if change.table == SYSTEM_TABLES
-                                                    && change.op == ChangeOp::Insert
-                                                {
-                                                    if let Ok(row) = decode_row(value) {
-                                                        if let Some(
-                                                            crate::executor::Datum::String(
-                                                                table_name,
-                                                            ),
-                                                        ) = row.values().first()
-                                                        {
-                                                            if existing_tables.contains(table_name)
-                                                            {
-                                                                tracing::debug!(
-                                                                    table = %table_name,
-                                                                    "Skipping duplicate CREATE TABLE in apply()"
-                                                                );
-                                                                continue;
-                                                            }
-                                                            existing_tables
-                                                                .insert(table_name.clone());
-                                                        }
-                                                    }
-                                                }
-
-                                                // Check for duplicate index creation
-                                                if change.table == SYSTEM_INDEXES
-                                                    && change.op == ChangeOp::Insert
-                                                {
-                                                    if let Ok(row) = decode_row(value) {
-                                                        if let Some(
-                                                            crate::executor::Datum::String(
-                                                                index_name,
-                                                            ),
-                                                        ) = row.values().first()
-                                                        {
-                                                            if existing_indexes.contains(index_name)
-                                                            {
-                                                                tracing::debug!(
-                                                                    index = %index_name,
-                                                                    "Skipping duplicate CREATE INDEX in apply()"
-                                                                );
-                                                                continue;
-                                                            }
-                                                            existing_indexes
-                                                                .insert(index_name.clone());
-                                                        }
-                                                    }
-                                                }
-
-                                                let encoded =
-                                                    encode_mvcc_row(changeset.txn_id, false, value);
-
-                                                self.storage
-                                                    .put(&change.key, &encoded)
-                                                    .await
-                                                    .map_err(write_err)?;
-
-                                                self.track_system_table_change(
-                                                    &change.table,
-                                                    value,
-                                                    false,
-                                                    &mut affected_tables,
-                                                    &mut dropped_tables,
-                                                    &mut affected_indexes,
-                                                    &mut dropped_indexes,
-                                                );
-                                            }
-                                        }
-                                        ChangeOp::Delete => {
-                                            let encoded =
-                                                encode_mvcc_row(changeset.txn_id, true, &[]);
-                                            self.storage
-                                                .put(&change.key, &encoded)
-                                                .await
-                                                .map_err(write_err)?;
-
-                                            if let Some(ref value) = change.value {
-                                                self.track_system_table_change(
-                                                    &change.table,
-                                                    value,
-                                                    true,
-                                                    &mut affected_tables,
-                                                    &mut dropped_tables,
-                                                    &mut affected_indexes,
-                                                    &mut dropped_indexes,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            } // end pass 2
-
-                            // Return conflict error or success
-                            if let Some(err_msg) = conflict_error {
-                                tracing::debug!(
-                                    txn_id = changeset.txn_id,
-                                    "RAFT APPLY: OCC conflict detected"
-                                );
-                                CommandResponse::Error(err_msg)
-                            } else {
-                                tracing::debug!(
-                                    txn_id = changeset.txn_id,
-                                    changes = changeset.changes.len(),
-                                    "RAFT APPLY: wrote {} changes to storage",
-                                    changeset.changes.len()
-                                );
-                                CommandResponse::Ok(None)
-                            }
-                        }
-                        Command::Noop => CommandResponse::Ok(None),
+            let response = match &entry.payload {
+                EntryPayload::Blank => CommandResponse::Ok(None),
+                EntryPayload::Normal(Command::Noop) => CommandResponse::Ok(None),
+                EntryPayload::Normal(Command::ReserveRowIds { node_id, upto }) => {
+                    // Reservations can be proposed out of order; the stored
+                    // bound only ever grows, as the one in memory does.
+                    let key = row_id_key(*node_id);
+                    let stored = match self.storage.get(&key).await.map_err(read_err)? {
+                        Some(data) => data
+                            .as_slice()
+                            .try_into()
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| read_err("stored row ID bound is malformed"))?,
+                        None => 0,
                     };
-                    results.push(resp);
+                    let bound = stored.max(*upto);
+                    batch.push((key, Some(bound.to_le_bytes().to_vec())));
+                    if *node_id == self.node_id {
+                        reserved_row_ids = Some(bound);
+                    }
+                    CommandResponse::Ok(None)
                 }
-                EntryPayload::Membership(ref m) => {
+                EntryPayload::Normal(Command::DataChange(changeset)) => {
+                    match self
+                        .plan_changeset(changeset, &existing_tables, &existing_indexes)
+                        .await?
+                    {
+                        Ok(plan) => {
+                            new_txn_id = Some(changeset.txn_id);
+                            tracing::debug!(
+                                txn_id = changeset.txn_id,
+                                changes = changeset.changes.len(),
+                                writes = plan.writes.len(),
+                                "RAFT APPLY: changeset accepted"
+                            );
+                            batch = plan.writes;
+                            tracked = plan.tracked;
+                            for name in &plan.dropped_tables {
+                                existing_tables.remove(name);
+                            }
+                            for name in &plan.dropped_indexes {
+                                existing_indexes.remove(name);
+                            }
+                            existing_tables.extend(plan.new_tables);
+                            existing_indexes.extend(plan.new_indexes);
+                            CommandResponse::Ok(None)
+                        }
+                        Err(message) => {
+                            tracing::debug!(
+                                txn_id = changeset.txn_id,
+                                error = %message,
+                                "RAFT APPLY: changeset rejected, nothing written"
+                            );
+                            CommandResponse::Error(message)
+                        }
+                    }
+                }
+                EntryPayload::Membership(m) => {
                     let membership = StoredMembership::new(Some(log_id), m.clone());
-
-                    // Persist membership
                     let data = bincode::serialize(&membership).map_err(write_err)?;
-                    self.storage
-                        .put(MEMBERSHIP_KEY, &data)
-                        .await
-                        .map_err(write_err)?;
+                    batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+                    membership_change = Some(membership);
+                    CommandResponse::Ok(None)
+                }
+            };
 
-                    *self.cached_membership.write() = membership;
-                    results.push(CommandResponse::Ok(None));
+            // Rows now carry this transaction's ID. Keep the stored bound
+            // above every ID in a row, in the same batch as the rows.
+            if let Some(txn_id) = new_txn_id {
+                if txn_id > self.stored_txn_bound.load(Ordering::SeqCst) {
+                    let bound = txn_id + TXN_ID_STEP;
+                    batch.push((MAX_TXN_KEY.to_vec(), Some(bound.to_le_bytes().to_vec())));
+                    self.stored_txn_bound.store(bound, Ordering::SeqCst);
                 }
             }
 
-            // Track last applied log_id (persisted once after all entries)
-            *self.cached_last_applied.write() = Some(log_id);
-        }
+            let position = bincode::serialize(&log_id).map_err(write_err)?;
+            batch.push((LAST_APPLIED_KEY.to_vec(), Some(position)));
+            self.storage.write_batch(batch).await.map_err(write_err)?;
+            if let Some(txn_id) = new_txn_id {
+                self.applied_txn_floor.fetch_max(txn_id, Ordering::SeqCst);
+            }
+            // Only now that the reservation is recorded may the IDs be used.
+            if let Some(upto) = reserved_row_ids {
+                crate::storage::row_id::generator().extend_limit(upto);
+            }
 
-        // Persist last applied once after the entire batch
-        let last_applied_snapshot = *self.cached_last_applied.read();
-        if let Some(last_applied) = last_applied_snapshot {
-            let data = bincode::serialize(&last_applied).map_err(write_err)?;
-            self.storage
-                .put(LAST_APPLIED_KEY, &data)
-                .await
-                .map_err(write_err)?;
+            // Memory follows storage.
+            *self.cached_last_applied.write() = Some(log_id);
+            if let Some(membership) = membership_change {
+                *self.cached_membership.write() = membership;
+            }
+            for change in tracked {
+                self.track_system_table_change(
+                    &change.table,
+                    &change.value,
+                    change.is_delete,
+                    &mut affected_tables,
+                    &mut dropped_tables,
+                    &mut affected_indexes,
+                    &mut dropped_indexes,
+                );
+            }
+            results.push(response);
         }
 
         tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, entries = results.len(), "raft_apply");
@@ -1254,84 +1174,62 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 .await?;
         }
 
-        Ok(results)
+        for (response, responder) in results.into_iter().zip(responders) {
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: SnapshotData,
     ) -> Result<(), StorageError> {
         let snapshot_data = snapshot.into_inner();
 
-        // Parse snapshot data if present
+        // Everything goes in as one batch - the old data out, the snapshot's
+        // in, and the position - so that storage is never part old state and
+        // part new under either position.
+        let mut batch: Vec<WriteOp> = Vec::new();
+
         if !snapshot_data.is_empty() {
-            // Delete existing user data (preserve Raft metadata)
             let existing_data = self.storage.scan(None, None).await.map_err(read_err)?;
-            let mut deleted_count = 0;
+            let deleted_count = existing_data.len();
             for (key, _) in existing_data {
-                if !key.starts_with(RAFT_PREFIX) {
-                    self.storage.delete(&key).await.map_err(write_err)?;
-                    deleted_count += 1;
+                if !is_position_key(&key) {
+                    batch.push((key, None));
                 }
             }
 
             // Parse snapshot: [count: u64][entries...]
-            if snapshot_data.len() < 8 {
-                return Err(read_err("Invalid snapshot: too short"));
-            }
-            let count = u64::from_le_bytes(
-                snapshot_data[..8]
-                    .try_into()
-                    .map_err(|_| read_err("Invalid snapshot: count parse error"))?,
-            ) as usize;
-            let mut offset = 8;
-
-            // Install each entry
-            let mut installed_count = 0;
+            let truncated = || read_err("Invalid snapshot: truncated");
+            let take = |offset: &mut usize, len: usize| -> Result<&[u8], StorageError> {
+                let end = offset
+                    .checked_add(len)
+                    .filter(|end| *end <= snapshot_data.len())
+                    .ok_or_else(truncated)?;
+                let bytes = &snapshot_data[*offset..end];
+                *offset = end;
+                Ok(bytes)
+            };
+            let mut offset = 0;
+            let count = u64::from_le_bytes(take(&mut offset, 8)?.try_into().expect("8 bytes"));
+            let mut installed_count = 0u64;
             for _ in 0..count {
                 // [key_len: u32][key][value_len: u32][value]
-                if offset + 4 > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated key length"));
-                }
-                let key_len = u32::from_le_bytes(
-                    snapshot_data[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| read_err("Invalid snapshot: key length parse error"))?,
-                ) as usize;
-                offset += 4;
-
-                if offset + key_len > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated key"));
-                }
-                let key = &snapshot_data[offset..offset + key_len];
-                offset += key_len;
-
-                if offset + 4 > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated value length"));
-                }
-                let value_len = u32::from_le_bytes(
-                    snapshot_data[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| read_err("Invalid snapshot: value length parse error"))?,
-                ) as usize;
-                offset += 4;
-
-                if offset + value_len > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated value"));
-                }
-                let value = &snapshot_data[offset..offset + value_len];
-                offset += value_len;
-
-                self.storage.put(key, value).await.map_err(write_err)?;
+                let key_len =
+                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
+                let key = take(&mut offset, key_len as usize)?.to_vec();
+                let value_len =
+                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
+                let value = take(&mut offset, value_len as usize)?.to_vec();
+                batch.push((key, Some(value)));
                 installed_count += 1;
             }
 
@@ -1340,27 +1238,26 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 deleted = deleted_count,
                 installed = installed_count,
                 bytes = snapshot_data.len(),
-                "Installed snapshot data"
+                "Installing snapshot data"
             );
         }
 
-        // Update last applied from snapshot metadata
         if let Some(log_id) = meta.last_log_id {
             let data = bincode::serialize(&log_id).map_err(write_err)?;
-            self.storage
-                .put(LAST_APPLIED_KEY, &data)
-                .await
-                .map_err(write_err)?;
+            batch.push((LAST_APPLIED_KEY.to_vec(), Some(data)));
+        }
+        let data = bincode::serialize(&meta.last_membership).map_err(write_err)?;
+        batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+        self.storage.write_batch(batch).await.map_err(write_err)?;
+
+        if let Some(log_id) = meta.last_log_id {
             *self.cached_last_applied.write() = Some(log_id);
         }
-
-        // Update membership from snapshot
-        let data = bincode::serialize(&meta.last_membership).map_err(write_err)?;
-        self.storage
-            .put(MEMBERSHIP_KEY, &data)
-            .await
-            .map_err(write_err)?;
         *self.cached_membership.write() = meta.last_membership.clone();
+
+        // The snapshot's rows carry transaction IDs and row IDs this node
+        // may never have seen; pick up the bounds that came with them.
+        self.load_counters().await?;
 
         // Rebuild catalog from system tables after snapshot install
         self.rebuild_catalog_from_system_tables().await?;
@@ -1373,7 +1270,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
-        // No log_mutex needed: see build_snapshot() comment for rationale.
+        if self.single_node {
+            // What has been flushed is a snapshot: it is the state at the
+            // position flushed with it. Nobody will ask for its contents, so
+            // none are produced.
+            let Some(meta) = self.durable_position().await? else {
+                return Ok(None);
+            };
+            return Ok(Some(Snapshot {
+                meta,
+                snapshot: Cursor::new(Vec::new()),
+            }));
+        }
+
+        // A follower may need the contents. This runs between applies, so
+        // the scan and the position agree.
         let last_applied = *self.cached_last_applied.read();
         let membership = self.cached_membership.read().clone();
 
@@ -1381,7 +1292,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
         let user_data: Vec<_> = all_data
             .into_iter()
-            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
+            .filter(|(key, _)| !is_position_key(key))
             .collect();
 
         // Serialize snapshot data: [count: u64][entries...]
@@ -1398,98 +1309,46 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
-            snapshot_id: format!(
-                "{}-lsm-{}",
-                last_applied.map(|l| l.to_string()).unwrap_or_default(),
-                user_data.len()
-            ),
         };
 
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(snapshot_data)),
+            snapshot: Cursor::new(snapshot_data),
         }))
     }
 }
 
-/// Raft metadata key prefix - excluded from snapshots
-const RAFT_PREFIX: &[u8] = b"_raft:";
-
-impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
-    async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
-        // No log_mutex needed: snapshots read only non-Raft-prefixed keys (user data),
-        // while log operations only touch Raft-prefixed keys. OpenRaft serializes all
-        // state machine operations, so no concurrent apply() can modify user data.
-        // No flush needed: LSM scan reads from active memtable + immutable memtables +
-        // SSTables, so all applied data is visible in the snapshot. Memtable data may be
-        // lost on crash before flush — Raft's log provides durability, not the snapshot.
-        let last_applied = *self.cached_last_applied.read();
-        let membership = self.cached_membership.read().clone();
-
-        // Scan all user data (exclude Raft metadata keys)
-        let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
-        let user_data: Vec<_> = all_data
-            .into_iter()
-            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
-            .collect();
-
-        // Serialize snapshot data: [count: u64][entries...]
-        let mut snapshot_data = Vec::new();
-        snapshot_data.extend_from_slice(&(user_data.len() as u64).to_le_bytes());
-
-        for (key, value) in &user_data {
-            // [key_len: u32][key][value_len: u32][value]
-            snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(key);
-            snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(value);
-        }
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-            snapshot_id: format!(
-                "{}-lsm-{}",
-                last_applied.map(|l| l.to_string()).unwrap_or_default(),
-                user_data.len()
-            ),
-        };
-
-        tracing::info!(
-            ?meta,
-            entries = user_data.len(),
-            bytes = snapshot_data.len(),
-            "Built snapshot"
-        );
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(snapshot_data)),
-        })
-    }
+/// The keys that say where this node's state machine is. They belong to the
+/// node, not to the data: a snapshot does not carry them and installing one
+/// sets them from the snapshot's own position. Everything else - including
+/// the transaction ID bound and the row ID reservations, which describe the
+/// data - travels with a snapshot.
+fn is_position_key(key: &[u8]) -> bool {
+    key == LAST_APPLIED_KEY || key == MEMBERSHIP_KEY
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
+    type SnapshotData = SnapshotData;
 
-    #[test]
-    fn test_log_key_encoding() {
-        let key = log_key(12345);
-        assert!(key.starts_with(LOG_PREFIX));
-        assert_eq!(log_index_from_key(&key), Some(12345));
-    }
-
-    #[test]
-    fn test_log_key_ordering() {
-        // Verify big-endian encoding gives correct lexicographic order
-        let key1 = log_key(1);
-        let key2 = log_key(2);
-        let key100 = log_key(100);
-        let key1000 = log_key(1000);
-
-        assert!(key1 < key2);
-        assert!(key2 < key100);
-        assert!(key100 < key1000);
+    /// A snapshot is a checkpoint: flush what has been applied, and report
+    /// the position that is now on disk. The log may then be purged up to
+    /// that position - and no further, since everything after it exists only
+    /// in memory and in the log.
+    ///
+    /// openraft runs this beside apply, not between applies, so the position
+    /// is read back from what was flushed rather than taken from memory. Only
+    /// the position is used from the result; the contents, when a follower
+    /// needs them, come from `get_current_snapshot`.
+    async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError> {
+        self.storage.flush().await.map_err(write_err)?;
+        let meta = self.durable_position().await?.unwrap_or(SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        });
+        tracing::info!(?meta, "Checkpointed state machine");
+        Ok(Snapshot {
+            meta,
+            snapshot: Cursor::new(Vec::new()),
+        })
     }
 }
