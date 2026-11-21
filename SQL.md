@@ -195,7 +195,8 @@ A view stores its query text (`system.views`) and is expanded when used in
 `FROM`; it survives restarts. Views can be queried, joined, and defined on
 other views. They are read-only: `INSERT`, `UPDATE` and `DELETE` on a view
 fail. The query is only checked for syntax at creation, so a view on a
-missing table is created and fails when used. A column list
+missing table is created and fails when used. A view cannot be defined on a
+temporary table (error 1352). A column list
 (`CREATE VIEW v (a, b) AS ...`) is ignored. `SHOW CREATE TABLE view` shows
 the definition; `DESCRIBE view` and `SHOW CREATE VIEW` do not work. Views
 appear in `SHOW TABLES`.
@@ -211,16 +212,17 @@ DROP [TEMPORARY] TABLE name
   are never written to disk or replicated, and are gone when the session
   disconnects (or resets its connection).
 - A session may hold at most 256 MiB of temporary-table rows.
-- To every other session the table does not exist: `SELECT`, `INSERT`,
-  `UPDATE`, `DELETE`, `CREATE INDEX`, `ALTER TABLE`, `CREATE TRIGGER` and
-  `DROP TABLE` naming it fail with error 1146 (`Table 'name' doesn't exist`).
+- To every other session the table does not exist: any statement naming
+  it, in any position (a join, a subquery, a `UNION` branch,
+  `INSERT ... SELECT`, `CREATE INDEX`, `ALTER TABLE`, `CREATE TRIGGER`,
+  `DROP TABLE`), fails with error 1146 (`Table 'name' doesn't exist`).
 - The name is nevertheless reserved server-wide while the table exists: a
   temporary table cannot have the name of an existing table (it does not
   shadow it), and no other session can create a table, temporary or not,
   with that name.
 - Temporary tables take part in transactions like other tables (`ROLLBACK`
   discards uncommitted changes to them), and the primary key is enforced.
-- Triggers cannot be created on temporary tables.
+- Triggers and views cannot be created on temporary tables.
 - `CREATE TEMPORARY TABLE ... AS SELECT` creates the columns but copies no rows.
 
 ### Triggers
@@ -233,7 +235,7 @@ DROP TRIGGER [IF EXISTS] name
 
 Triggers are stored in `system.triggers` and survive restarts. Trigger names
 are global; creating a second trigger with an existing name is refused.
-Triggers cannot be created on `system.*` tables or temporary tables.
+The table must exist, and cannot be a `system.*` table or a temporary table.
 
 What actually runs:
 

@@ -211,6 +211,7 @@ impl QueryEngine {
             let schema_version = catalog_guard.schema_version();
 
             let resolved = Resolver::new_with_placeholders(&catalog_guard)
+                .for_session(self.temp.table_names())
                 .resolve(parsed_stmt.clone())
                 .map_err(PlanError::Sql)?;
 
@@ -234,9 +235,6 @@ impl QueryEngine {
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
-        if let Some(table) = self.foreign_temp_table_among(&required_privileges) {
-            return self.send_no_such_table(&table).await;
-        }
 
         // Cache the plan template (with Placeholder literals) for future executions
         if let Some(ps_mut) = self.prepared_stmts.get_mut(statement_id) {
@@ -678,6 +676,7 @@ impl QueryEngine {
             let catalog_guard = self.catalog.read();
 
             let resolved = Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names())
                 .resolve(stmt)
                 .map_err(PlanError::Sql)?;
 
@@ -706,9 +705,6 @@ impl QueryEngine {
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
-        if let Some(table) = self.foreign_temp_table_among(&required_privileges) {
-            return self.send_no_such_table(&table).await;
-        }
 
         // Check authorization (async - needs to scan system.grants)
         if !required_privileges.is_empty() {
@@ -1333,6 +1329,43 @@ impl QueryEngine {
         self.functions_version = Some(version);
     }
 
+    /// Delete the rows of a system table that `matches`, through Raft, and
+    /// return how many there were. The catalog changes when the deletion is
+    /// applied, so the change is the same on every node and after a restart.
+    async fn delete_system_rows(
+        &self,
+        table: &str,
+        matches: impl Fn(&[Datum]) -> bool,
+    ) -> Result<usize, String> {
+        use crate::raft::{is_mvcc_tombstone, RowChange, MVCC_HEADER_SIZE};
+
+        let rows = self
+            .storage
+            .scan(Some(&table_key_prefix(table)), Some(&table_key_end(table)))
+            .await
+            .map_err(|e| format!("Failed to read {table}: {e}"))?;
+        let mut changeset = ChangeSet::new(0);
+        for (key, value) in rows {
+            if value.len() <= MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
+                continue;
+            }
+            let row_data = &value[MVCC_HEADER_SIZE..];
+            if let Ok(row) = decode_row(row_data) {
+                if matches(row.values()) {
+                    changeset.push(RowChange::delete_with_value(table, key, row_data.to_vec()));
+                }
+            }
+        }
+        let count = changeset.changes.len();
+        if count > 0 {
+            self.raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| format!("Failed to change {table}: {e}"))?;
+        }
+        Ok(count)
+    }
+
     /// Whether `table` is a temporary table that belongs to another session.
     /// To this session it does not exist.
     fn is_foreign_temp_table(&self, table: &str) -> bool {
@@ -1342,17 +1375,6 @@ impl QueryEngine {
                 .read()
                 .get_table(table)
                 .is_some_and(|def| def.is_temporary)
-    }
-
-    /// The first table a statement names that is another session's temporary
-    /// table. Every planned statement is checked here, reads included.
-    fn foreign_temp_table_among(&self, required: &[RequiredPrivilege]) -> Option<String> {
-        required.iter().find_map(|r| match &r.object {
-            PrivilegeObject::Table { table, .. } if self.is_foreign_temp_table(table) => {
-                Some(table.clone())
-            }
-            _ => None,
-        })
     }
 
     async fn send_no_such_table(&mut self, table: &str) -> ProtocolResult<()> {
@@ -1598,13 +1620,21 @@ impl QueryEngine {
                 .map(|_| Some(()));
         }
 
-        // Drop the database from the catalog
-        {
-            let mut catalog = self.catalog.write();
-            let _ = catalog.drop_database(&db_name.to_lowercase());
+        // Delete its row in system.databases; the catalog follows when that
+        // is applied, here and after a restart.
+        let db_name = db_name.to_lowercase();
+        let dropped = self
+            .delete_system_rows(crate::catalog::system_tables::SYSTEM_DATABASES, |row| {
+                matches!(row.first(), Some(Datum::String(name)) if name.to_lowercase() == db_name)
+            })
+            .await;
+        match dropped {
+            Ok(_) => self.send_ok(0, 0).await.map(Some),
+            Err(e) => self
+                .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e)
+                .await
+                .map(Some),
         }
-
-        self.send_ok(0, 0).await.map(Some)
     }
 
     /// Handle UNION queries by parsing with sqlparser, executing each side,
@@ -1658,6 +1688,7 @@ impl QueryEngine {
             let catalog_guard = self.catalog.read();
             let stmt = crate::sql::Parser::parse_one(first_sql).map_err(ProtocolError::Sql)?;
             let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names())
                 .resolve(stmt)
                 .map_err(ProtocolError::Sql)?;
             crate::sql::TypeChecker::check(&resolved).map_err(ProtocolError::Sql)?;
@@ -1696,26 +1727,36 @@ impl QueryEngine {
             if part_sql.is_empty() {
                 continue;
             }
-            let plan = {
+            // A part that names something that does not exist fails the
+            // whole statement; it is not quietly left out of the result.
+            let planned = {
                 let catalog_guard = self.catalog.read();
                 let stmt = match crate::sql::Parser::parse_one(part_sql) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let resolved = match crate::sql::Resolver::new(&catalog_guard).resolve(stmt) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                let _ = crate::sql::TypeChecker::check(&resolved);
-                let logical = match LogicalPlanBuilder::build(resolved) {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                let optimized = Optimizer::new().optimize(logical);
-                match PhysicalPlanner::plan(optimized, &catalog_guard) {
-                    Ok(p) => p,
-                    Err(_) => continue,
+                match crate::sql::Resolver::new(&catalog_guard)
+                    .for_session(self.temp.table_names())
+                    .resolve(stmt)
+                {
+                    Ok(resolved) => {
+                        let _ = crate::sql::TypeChecker::check(&resolved);
+                        let logical = match LogicalPlanBuilder::build(resolved) {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        let optimized = Optimizer::new().optimize(logical);
+                        match PhysicalPlanner::plan(optimized, &catalog_guard) {
+                            Ok(p) => Ok(p),
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
+            };
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(e) => return self.send_sql_error(&e).await.map(|_| Some(())),
             };
 
             // Validate column count matches first SELECT
@@ -1873,7 +1914,7 @@ impl QueryEngine {
         // Resolve the CREATE TABLE (drop catalog guard before await)
         let resolved = {
             let catalog = self.catalog.read();
-            let resolver = crate::sql::Resolver::new(&catalog);
+            let resolver = crate::sql::Resolver::new(&catalog).for_session(self.temp.table_names());
             resolver.resolve(stmt).map_err(|e| e.to_string())
         };
         let resolved = match resolved {
@@ -1992,8 +2033,25 @@ impl QueryEngine {
                 };
 
                 // Apply each operation to the cloned def
+                let mut dropped_indexes = Vec::new();
                 for op in &alter.operations {
-                    self.apply_alter_op(&mut new_def, op)?;
+                    self.apply_alter_op(&mut new_def, op, &mut dropped_indexes)?;
+                }
+
+                // Indexes dropped here are dropped as DROP INDEX drops them:
+                // by deleting their rows in system.indexes.
+                if !dropped_indexes.is_empty() {
+                    let table = old_table_name.clone();
+                    self.delete_system_rows(crate::catalog::system_tables::SYSTEM_INDEXES, |row| {
+                        match (row.first(), row.get(1)) {
+                            (Some(Datum::String(index)), Some(Datum::String(on))) => {
+                                *on == table && dropped_indexes.contains(index)
+                            }
+                            _ => false,
+                        }
+                    })
+                    .await
+                    .map_err(ProtocolError::Internal)?;
                 }
 
                 // Persist via Raft (delete old system rows, insert new ones)
@@ -2010,6 +2068,7 @@ impl QueryEngine {
         &self,
         def: &mut crate::catalog::TableDef,
         op: &sqlparser::ast::AlterTableOperation,
+        dropped_indexes: &mut Vec<String>,
     ) -> ProtocolResult<()> {
         use sqlparser::ast::AlterTableOperation;
 
@@ -2156,17 +2215,12 @@ impl QueryEngine {
             }
 
             AlterTableOperation::DropIndex { name } => {
-                let idx_name = name.value.clone();
-                // Remove from catalog indexes
-                let mut catalog = self.catalog.write();
-                let _ = catalog.drop_index(&idx_name);
+                dropped_indexes.push(name.value.clone());
             }
 
             AlterTableOperation::DropConstraint { name, .. } => {
-                let constraint_name = name.value.clone();
-                // Try to drop as index first, then as a named constraint
-                let mut catalog = self.catalog.write();
-                let _ = catalog.drop_index(&constraint_name);
+                // A constraint may be backed by an index of the same name.
+                dropped_indexes.push(name.value.clone());
             }
 
             AlterTableOperation::AlterColumn { column_name, op } => {
@@ -3381,7 +3435,7 @@ impl QueryEngine {
             let datum = (|| -> Option<Datum> {
                 let val_stmt = Parser::parse_one(&scope_expr).ok()?;
                 let catalog = self.catalog.read();
-                let resolver = Resolver::new(&catalog);
+                let resolver = Resolver::new(&catalog).for_session(self.temp.table_names());
                 let resolved = resolver.resolve(val_stmt).ok()?;
 
                 if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
@@ -3438,7 +3492,7 @@ impl QueryEngine {
             let datum = (|| -> Option<Datum> {
                 let val_stmt = Parser::parse_one(&scope_expr).ok()?;
                 let catalog = self.catalog.read();
-                let resolver = Resolver::new(&catalog);
+                let resolver = Resolver::new(&catalog).for_session(self.temp.table_names());
                 let resolved = resolver.resolve(val_stmt).ok()?;
 
                 if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
@@ -3657,6 +3711,35 @@ impl QueryEngine {
                 .await;
         }
 
+        // A view is stored for every session, so it cannot be built on a
+        // temporary table, this session's or another's: the query must
+        // resolve the same with no temporary table in sight.
+        let on_temp_table = {
+            let catalog = self.catalog.read();
+            let resolves = |hide_temp: bool| {
+                let Ok(stmt) = crate::sql::Parser::parse_one(query_sql) else {
+                    return false;
+                };
+                let resolver = crate::sql::Resolver::new(&catalog);
+                let resolver = if hide_temp {
+                    resolver.for_session(Vec::new())
+                } else {
+                    resolver
+                };
+                resolver.resolve(stmt).is_ok()
+            };
+            resolves(false) && !resolves(true)
+        };
+        if on_temp_table {
+            return self
+                .send_error(
+                    1352,
+                    states::GENERAL_ERROR,
+                    "View's SELECT refers to a temporary table",
+                )
+                .await;
+        }
+
         // Check if view already exists
         let exists = {
             let catalog = self.catalog.read();
@@ -3835,7 +3918,9 @@ impl QueryEngine {
         }
         // Nor on a temporary table: the trigger would be stored for everyone
         // and outlive the table. Another session's does not exist at all.
-        if self.is_foreign_temp_table(&def.table_name) {
+        if self.is_foreign_temp_table(&def.table_name)
+            || self.catalog.read().get_table(&def.table_name).is_none()
+        {
             return self.send_no_such_table(&def.table_name).await;
         }
         if self.temp.is_temp_table(&def.table_name) {
@@ -3972,6 +4057,11 @@ impl QueryEngine {
             ..
         } = plan
         {
+            // Stored triggers belong to stored tables, never to a session's
+            // temporary one.
+            if self.temp.is_temp_table(table) {
+                return None;
+            }
             // Check if any triggers exist for this table
             let catalog = self.catalog.read();
             let has_before = !catalog
@@ -5534,6 +5624,7 @@ impl QueryEngine {
         let plan = {
             let catalog_guard = self.catalog.read();
             let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names())
                 .resolve(stmt)
                 .map_err(|e| e.to_string())?;
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
@@ -5608,6 +5699,7 @@ impl QueryEngine {
         let plan = {
             let catalog_guard = self.catalog.read();
             let resolved = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names())
                 .resolve(stmt)
                 .map_err(|e| e.to_string())?;
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;

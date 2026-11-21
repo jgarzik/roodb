@@ -30,6 +30,11 @@ async fn test_temporary_table_belongs_to_its_session() {
         "SELECT id, v FROM tt_owned",
         "UPDATE tt_owned SET v = 0",
         "DELETE FROM tt_owned",
+        "SELECT * FROM tt_real WHERE id IN (SELECT id FROM tt_owned)",
+        "SELECT r.id FROM tt_real r JOIN tt_owned o ON o.id = r.id",
+        "INSERT INTO tt_real SELECT id FROM tt_owned",
+        "SELECT id FROM tt_real UNION SELECT id FROM tt_owned",
+        "CREATE VIEW tt_spy AS SELECT id FROM tt_owned",
         "CREATE INDEX tt_owned_v ON tt_owned (v)",
         "ALTER TABLE tt_owned ADD COLUMN extra INT",
         "CREATE TRIGGER tt_owned_trg AFTER INSERT ON tt_owned FOR EACH ROW \
@@ -143,5 +148,14 @@ async fn test_trigger_on_system_table_is_refused() {
         )
         .await;
     assert!(result.is_err(), "a trigger was created on a system table");
+    // Nor on a table that does not exist: it would attach itself to whatever
+    // later took the name.
+    let result = conn
+        .query_drop(
+            "CREATE TRIGGER tt_nowhere_trg AFTER INSERT ON tt_no_such_table FOR EACH ROW \
+             INSERT INTO tt_trg_log VALUES (1)",
+        )
+        .await;
+    assert!(result.is_err(), "a trigger was created on a missing table");
     conn.query_drop("DROP TABLE tt_trg_log").await.unwrap();
 }

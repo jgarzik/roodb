@@ -584,6 +584,61 @@ async fn stored_functions_are_shared_and_survive_a_kill() {
     assert!(other.query_drop("SELECT add_one(1)").await.is_err());
 }
 
+/// What a schema statement removed stays removed after a restart: a dropped
+/// database, and an index dropped through ALTER TABLE.
+#[tokio::test]
+async fn dropped_schema_objects_stay_dropped_after_a_kill() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("CREATE DATABASE gone_db").await.unwrap();
+    conn.query_drop("CREATE DATABASE kept_db").await.unwrap();
+    conn.query_drop("DROP DATABASE gone_db").await.unwrap();
+
+    conn.query_drop("CREATE TABLE idx_t (id INT PRIMARY KEY, a INT, b INT)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE INDEX idx_gone ON idx_t (a)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE INDEX idx_kept ON idx_t (b)")
+        .await
+        .unwrap();
+    conn.query_drop("ALTER TABLE idx_t DROP INDEX idx_gone")
+        .await
+        .unwrap();
+    drop(conn);
+    server.kill();
+
+    server.start();
+    let mut conn = connect(&server).await;
+    let databases: Vec<String> = conn.query("SHOW DATABASES").await.unwrap();
+    assert!(
+        databases.iter().any(|d| d == "kept_db"),
+        "kept_db is missing: {databases:?}"
+    );
+    assert!(
+        !databases.iter().any(|d| d == "gone_db"),
+        "the dropped database came back: {databases:?}"
+    );
+    let indexes: Vec<String> = conn
+        .query("SELECT index_name FROM system.indexes WHERE table_name = 'idx_t'")
+        .await
+        .unwrap();
+    assert!(
+        indexes.iter().any(|i| i == "idx_kept"),
+        "idx_kept is missing: {indexes:?}"
+    );
+    assert!(
+        !indexes.iter().any(|i| i == "idx_gone"),
+        "the dropped index came back: {indexes:?}"
+    );
+    // Its name is free again.
+    conn.query_drop("CREATE INDEX idx_gone ON idx_t (a)")
+        .await
+        .unwrap();
+}
+
 /// A row whose key is too large to store is refused, and the server goes on
 /// working: it is not committed to the log, where applying it would fail
 /// forever.

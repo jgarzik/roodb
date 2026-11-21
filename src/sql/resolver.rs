@@ -31,6 +31,10 @@ pub struct Resolver<'a> {
     view_depth: Cell<usize>,
     /// CTE definitions (WITH ... AS) — populated at resolve_query time
     ctes: std::cell::RefCell<std::collections::HashMap<String, ResolvedSelect>>,
+    /// The temporary tables of the session being resolved for. When set, any
+    /// other temporary table in the catalog belongs to another session and
+    /// is not found.
+    session_temp_tables: Option<Vec<String>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -42,6 +46,7 @@ impl<'a> Resolver<'a> {
             placeholder_counter: Cell::new(0),
             view_depth: Cell::new(0),
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            session_temp_tables: None,
         }
     }
 
@@ -53,6 +58,23 @@ impl<'a> Resolver<'a> {
             placeholder_counter: Cell::new(0),
             view_depth: Cell::new(0),
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            session_temp_tables: None,
+        }
+    }
+
+    /// Resolve on behalf of a session that owns these temporary tables. No
+    /// other temporary table can then be named, in any part of a statement.
+    pub fn for_session(mut self, temp_tables: Vec<String>) -> Self {
+        self.session_temp_tables = Some(temp_tables);
+        self
+    }
+
+    /// Look a table up as this session sees it.
+    fn table(&self, name: &str) -> Option<&'a crate::catalog::TableDef> {
+        let def = self.catalog.get_table(name)?;
+        match &self.session_temp_tables {
+            Some(owned) if def.is_temporary && !owned.iter().any(|t| t == name) => None,
+            _ => Some(def),
         }
     }
 
@@ -130,8 +152,7 @@ impl<'a> Resolver<'a> {
                     .map(|n| n.to_string())
                     .unwrap_or_default();
                 // Verify table exists
-                self.catalog
-                    .get_table(&table)
+                self.table(&table)
                     .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
                 Ok(ResolvedStatement::AnalyzeTable { table })
             }
@@ -144,14 +165,12 @@ impl<'a> Resolver<'a> {
                     .map(|t| t.name.to_string())
                     .unwrap_or_default();
                 // Verify table exists
-                self.catalog
-                    .get_table(&table)
+                self.table(&table)
                     .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
                 Ok(ResolvedStatement::Delete {
                     table: table.clone(),
                     table_columns: self
-                        .catalog
-                        .get_table(&table)
+                        .table(&table)
                         .map(|td| {
                             td.columns
                                 .iter()
@@ -331,8 +350,7 @@ impl<'a> Resolver<'a> {
 
         // Resolve column indices
         let table_def = self
-            .catalog
-            .get_table(&table)
+            .table(&table)
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
         let mut resolved_cols = Vec::new();
@@ -357,8 +375,7 @@ impl<'a> Resolver<'a> {
         let table = insert.table.to_string();
 
         let table_def = self
-            .catalog
-            .get_table(&table)
+            .table(&table)
             .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
 
         // Handle INSERT ... SET syntax by converting to INSERT ... VALUES
@@ -660,8 +677,7 @@ impl<'a> Resolver<'a> {
         };
 
         let table_def = self
-            .catalog
-            .get_table(&table_name)
+            .table(&table_name)
             .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
 
         // Handle UPDATE with JOIN: rewrite JOIN ON condition to IN-subquery filter
@@ -673,8 +689,7 @@ impl<'a> Resolver<'a> {
                     _ => continue,
                 };
                 let joined_def = self
-                    .catalog
-                    .get_table(&joined_table_name)
+                    .table(&joined_table_name)
                     .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
                 if let Some(on_expr) = extract_join_condition(&join.join_operator) {
                     let pairs = extract_equijoin_pairs(on_expr, &table_name, &joined_table_name);
@@ -771,7 +786,7 @@ impl<'a> Resolver<'a> {
             for join in &table.joins {
                 if let sp::TableFactor::Table { name, .. } = &join.relation {
                     let jt = name.to_string();
-                    if let Some(jd) = self.catalog.get_table(&jt) {
+                    if let Some(jd) = self.table(&jt) {
                         ms.add_table(&jt, &jt, jd);
                     }
                 }
@@ -882,14 +897,12 @@ impl<'a> Resolver<'a> {
                     _ => continue,
                 };
                 let joined_def = self
-                    .catalog
-                    .get_table(&joined_table_name)
+                    .table(&joined_table_name)
                     .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
 
                 if let Some(on_expr) = extract_join_condition(&join.join_operator) {
                     let target_def = self
-                        .catalog
-                        .get_table(&target)
+                        .table(&target)
                         .ok_or_else(|| SqlError::TableNotFound(target.clone()))?;
                     let mut multi_scope = Scope::single_table(&target, target_def);
                     multi_scope.add_table(&joined_table_name, &joined_table_name, joined_def);
@@ -987,8 +1000,7 @@ impl<'a> Resolver<'a> {
         };
 
         let table_def = self
-            .catalog
-            .get_table(&target_table)
+            .table(&target_table)
             .ok_or_else(|| SqlError::TableNotFound(target_table.clone()))?;
 
         let scope = Scope::single_table(&target_table, table_def);
@@ -1190,7 +1202,7 @@ impl<'a> Resolver<'a> {
                     .unwrap_or_else(|| table_ref.name.clone());
                 if table_ref.inner_query.is_some() {
                     scope.add_derived_table(&alias, &table_ref.columns);
-                } else if let Some(table_def) = self.catalog.get_table(&table_ref.name) {
+                } else if let Some(table_def) = self.table(&table_ref.name) {
                     scope.add_table(&alias, &table_ref.name, table_def);
                 }
             }
@@ -1202,7 +1214,7 @@ impl<'a> Resolver<'a> {
                     .unwrap_or_else(|| join.table.name.clone());
                 if join.table.inner_query.is_some() {
                     scope.add_derived_table(&alias, &join.table.columns);
-                } else if let Some(table_def) = self.catalog.get_table(&join.table.name) {
+                } else if let Some(table_def) = self.table(&join.table.name) {
                     scope.add_table(&alias, &join.table.name, table_def);
                 }
             }
@@ -1395,8 +1407,7 @@ impl<'a> Resolver<'a> {
                         scope.add_derived_table(&alias, &table_ref.columns);
                     } else {
                         let table_def = self
-                            .catalog
-                            .get_table(&table_ref.name)
+                            .table(&table_ref.name)
                             .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
                         scope.add_table(&alias, &table_ref.name, table_def);
                     }
@@ -1428,8 +1439,7 @@ impl<'a> Resolver<'a> {
                             scope.add_derived_table(&alias, &table_ref.columns);
                         } else {
                             let table_def = self
-                                .catalog
-                                .get_table(&table_ref.name)
+                                .table(&table_ref.name)
                                 .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
                             scope.add_table(&alias, &table_ref.name, table_def);
                         }
@@ -1594,7 +1604,7 @@ impl<'a> Resolver<'a> {
                 }
 
                 // Check physical table first
-                if let Some(table_def) = self.catalog.get_table(&table_name) {
+                if let Some(table_def) = self.table(&table_name) {
                     return Ok(ResolvedTableRef {
                         name: table_name,
                         alias: alias.as_ref().map(|a| a.name.value.clone()),

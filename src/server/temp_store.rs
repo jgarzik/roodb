@@ -92,6 +92,19 @@ impl SessionStorage {
         self.has_temp.store(true, Ordering::Relaxed);
     }
 
+    /// Names of this session's temporary tables.
+    pub fn table_names(&self) -> Vec<String> {
+        if !self.has_temp.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.temp
+            .read()
+            .tables
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    }
+
     /// Whether `table` is one of this session's temporary tables.
     pub fn is_temp_table(&self, table: &str) -> bool {
         self.has_temp.load(Ordering::Relaxed)

@@ -121,8 +121,10 @@ catalog of the node the session is on, and their rows are kept in that
 session's memory (`server/temp_store.rs`), never in the log or the LSM. To
 every other session the table does not exist: statements naming it fail with
 "table doesn't exist". (The name is still taken, so two sessions cannot use
-the same temporary table name at once.) Triggers cannot be created on
-temporary or system tables.
+the same temporary table name at once.) The check is in the `Resolver`,
+which is given the session's own temporary tables and finds no others.
+Triggers and views cannot be created on temporary tables, nor triggers on
+system tables.
 
 **Types**:
 - `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, BigIntUnsigned, Float, Double, Decimal, Varchar(n), Text, Blob, Bit(n) (n = 1..64, held as a u64), Timestamp, Json, Geometry
