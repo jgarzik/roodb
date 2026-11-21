@@ -10,8 +10,11 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 - Storage writes only occur in `apply()` after Raft consensus, one atomic batch per log entry
 - This means DML operations (INSERT/UPDATE/DELETE) don't hold database locks during execution
 
-There are no row or table locks today: conflicting writers are detected when
-they commit. Rows of temporary tables never leave the session that owns them.
+Transactions lock the rows they change, so that writers wait for each other
+instead of colliding at commit (see Row locks below). Those are logical
+locks between transactions, held across statements; everything else in this
+document is about short-lived synchronization inside the server. Rows of
+temporary tables never leave the session that owns them.
 
 ## Synchronization Primitives
 
@@ -217,8 +220,14 @@ oneshot channel outside the mutex. No other lock is taken while it is held.
 The locks exist only in memory on the node that granted them; they are not
 replicated.
 
-Statements do not take these locks yet: writers still find conflicts at
-commit. Wiring the statements to the lock manager is in progress.
+The lock manager belongs to the `TransactionManager`, which releases a
+transaction's locks when it commits or rolls back, whichever path ends it.
+`UPDATE`, `DELETE` and `INSERT` take record locks through the executor's
+`TransactionContext` and then read the row as it stands (`get_current`),
+not through the statement's snapshot. A deadlock is reported as error 1213
+and the transaction rolled back; a timed-out wait (`innodb_lock_wait_timeout`)
+as error 1205, failing the statement only. Statements do not take gap locks
+yet.
 
 ## Lock Ordering Rules
 

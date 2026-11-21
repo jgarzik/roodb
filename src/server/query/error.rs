@@ -160,6 +160,8 @@ pub mod codes {
     pub const ER_BAD_FIELD_ERROR: u16 = 1054;
     pub const ER_BAD_NULL_ERROR: u16 = 1048;
     pub const ER_DUP_ENTRY: u16 = 1062;
+    pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+    pub const ER_LOCK_DEADLOCK: u16 = 1213;
     pub const ER_EMPTY_QUERY: u16 = 1065;
     pub const ER_WRONG_FIELD_SPEC: u16 = 1063;
     pub const ER_BLOB_CANT_HAVE_DEFAULT: u16 = 1101;

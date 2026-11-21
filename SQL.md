@@ -681,38 +681,47 @@ supported.
 
 ### How transactions behave
 
-Row locking is planned and will change parts of this section. Today:
-
 - **Writes are buffered until `COMMIT`.** Other sessions never see
   uncommitted changes. `COMMIT` applies all of a transaction's changes
   atomically, or none.
 - **Every statement reads a fresh snapshot.** The reported isolation level
-  is `REPEATABLE-READ`, but inside a transaction each statement sees
+  is `REPEATABLE-READ`, but inside a transaction each `SELECT` sees
   everything committed before that statement started, so reads behave as
   READ COMMITTED: a row read twice in one transaction can differ, and new
   rows can appear. Setting another isolation level does not change this.
-- **No statement waits for another session.** There are no row or table
-  locks. `SELECT ... FOR UPDATE` / `FOR SHARE` and `LOCK TABLES` are
-  accepted and lock nothing.
-- **Conflicts are detected at `COMMIT`** (optimistic concurrency). If a row
-  that the transaction updated or deleted was changed by another committed
-  transaction in the meantime, or a row it inserted now exists, `COMMIT`
-  fails and the whole transaction is rolled back:
-
-  ```
-  ERROR 1105 (HY000): Raft commit failed: Raft error: Write conflict: row in 't' was modified by another transaction (expected version 24, found 28)
-  ERROR 1105 (HY000): Raft commit failed: Raft error: Duplicate key: row in 't' already exists
-  ```
-
-  Applications must be prepared to retry the transaction. In autocommit
-  mode the same errors are reported by the statement itself.
-- **A transaction's own writes are only partly visible to it.** `SELECT`
-  sees rows the transaction has inserted or changed. `UPDATE` and `DELETE`
-  do not: they neither find rows the same transaction inserted, nor see
-  values it changed earlier (`UPDATE t SET v = 11 WHERE id = 1` followed by
-  `UPDATE t SET v = 12 WHERE v = 11` changes nothing the second time). A
-  second insert of a key the transaction already inserted is detected
-  immediately (error 1062); a clash with a committed row only at `COMMIT`.
+- **Writers lock rows and wait for each other.** `UPDATE` and `DELETE` take
+  an exclusive lock on each row they examine; `INSERT` into a table with a
+  primary key locks the new row's key. A statement that needs a row locked
+  by another transaction waits until that transaction commits or rolls
+  back, then works on the row as it then stands (so `v = v + 1` from two
+  sessions adds two). Locks are held until the transaction ends. A plain
+  `SELECT` takes no locks and never waits.
+  - Rows are locked as they are scanned: an `UPDATE` or `DELETE` that
+    cannot find its rows by primary key examines, and locks, every row of
+    the table.
+  - Ranges are not locked yet: another transaction can insert a row that a
+    statement's `WHERE` would have matched. `SELECT ... FOR UPDATE` /
+    `FOR SHARE` are accepted and lock nothing yet, and `LOCK TABLES` is a
+    no-op.
+- **A duplicate key is reported by the statement.** An `INSERT` whose
+  primary key already exists fails with error 1062 when it runs. If the
+  existing row belongs to a transaction that has not finished, the insert
+  waits to see whether it commits.
+- **Deadlock.** If transactions wait for each other in a cycle, the one
+  whose request would close the cycle fails with error 1213 (SQLSTATE
+  40001) and its whole transaction is rolled back. Retry it.
+- **Lock wait timeout.** A statement that waits longer than
+  `innodb_lock_wait_timeout` seconds (default 50; `SET [SESSION | GLOBAL]
+  innodb_lock_wait_timeout = n`) fails with error 1205. Only that statement
+  fails; the transaction stays open.
+- **A conflict can still be found at `COMMIT`** when a transaction changes
+  a row it did not lock at the time, which today means a row it inserted
+  itself (see the next point). The commit then fails with error 1213 and
+  the transaction is rolled back.
+- **A transaction's own writes are partly visible to it.** `SELECT` sees
+  rows the transaction has inserted or changed. `UPDATE` and `DELETE` see
+  the transaction's earlier changes to rows that already existed, but do
+  not find rows the same transaction inserted.
 - **A session that ends takes its transaction with it.** When a client
   disconnects, the connection fails, or the connection is reset, the open
   transaction is rolled back and the session's temporary tables are
@@ -720,11 +729,11 @@ Row locking is planned and will change parts of this section. Today:
 - **DDL is not transactional.** `CREATE`, `DROP` and `ALTER` take effect
   immediately, are not undone by `ROLLBACK`, and do not commit the open
   transaction.
-- **`autocommit`.** By default each statement commits on its own.
-  `SET autocommit = 0` opens a transaction that lasts until the next
-  `COMMIT` or `ROLLBACK`; statements after that are committed individually
-  again until a transaction is started explicitly. `@@autocommit` always
-  reports `1`. Use `BEGIN` ... `COMMIT`.
+- **`autocommit`.** By default each statement commits on its own. After
+  `SET autocommit = 0` every statement runs in a transaction: the first
+  statement opens one, it lasts until `COMMIT` or `ROLLBACK`, and the next
+  statement opens another. `SET autocommit = 1` commits the open
+  transaction. `@@autocommit` reports the session's setting.
 
 ## Users and Privileges
 
@@ -810,7 +819,8 @@ prefixes are accepted.
 | `version` | `8.0.0-RooDB` |
 | `version_comment` | `RooDB` |
 | `sql_mode` | Session value; initially `ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,NO_ZERO_DATE,NO_ZERO_IN_DATE,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES` |
-| `autocommit` | `1` (fixed) |
+| `autocommit` | Session value |
+| `innodb_lock_wait_timeout` | Session value, seconds; initially 50 |
 | `transaction_isolation`, `tx_isolation` | `REPEATABLE-READ` (fixed) |
 | `max_allowed_packet` | `16777216` |
 | `character_set_client`, `character_set_connection`, `character_set_results` | `utf8mb4` |
@@ -936,8 +946,10 @@ returns most often:
 | 1062 | 23000 | Duplicate primary key |
 | 1064 | 42000 | Syntax error |
 | 1065 | HY000 | Empty query |
-| 1105 | HY000 | General error. Used for unsupported statements and expressions, write conflicts and duplicate keys found at `COMMIT`, and most errors in views, procedures, functions and triggers |
+| 1105 | HY000 | General error. Used for unsupported statements and expressions, and most errors in views, procedures, functions and triggers |
 | 1136 | 21S01 | Column count does not match value count |
+| 1205 | HY000 | Lock wait timeout exceeded |
+| 1213 | 40001 | Deadlock, or a conflict found at `COMMIT`; the transaction was rolled back |
 | 1146 | 42S02 | Table does not exist |
 | 1222 | 21000 | `UNION` branches have different numbers of columns |
 | 1264, 1690 | 22003 | Numeric value out of range. 1690 is also reported for errors raised while a result is being returned, such as an unknown function |
@@ -947,8 +959,7 @@ returns most often:
 | 1063, 1074, 1425, 1427 | 42000 | Invalid column type specification |
 
 Several conditions that have a dedicated code in MySQL (unknown procedure,
-unknown function, duplicate view or procedure, lock or conflict errors)
-are reported as 1105.
+unknown function, duplicate view or procedure) are reported as 1105.
 
 ## Limitations and differences from MySQL
 
@@ -972,12 +983,11 @@ are reported as 1105.
 
 - Reads are READ COMMITTED in effect (a snapshot per statement) although
   `REPEATABLE-READ` is reported; `SERIALIZABLE` is refused.
-- No locking: nothing waits; `FOR UPDATE`, `FOR SHARE`, `LOCK TABLES` and
-  `GET_LOCK` lock nothing. Conflicts surface as an error at `COMMIT`.
-- `UPDATE` and `DELETE` do not see the same transaction's earlier writes.
+- Row locks are taken by `UPDATE`, `DELETE` and `INSERT` only. Ranges are
+  not locked, and `FOR UPDATE`, `FOR SHARE`, `LOCK TABLES` and `GET_LOCK`
+  lock nothing.
+- `UPDATE` and `DELETE` do not find rows the same transaction inserted.
 - No savepoints, no `XA`, no `COMMIT WORK` / `AND CHAIN`.
-- `SET autocommit = 0` covers only the first transaction; `@@autocommit`
-  always reads `1`.
 - DDL is neither transactional nor an implicit commit.
 
 **Queries**
@@ -1022,6 +1032,8 @@ are reported as 1105.
 - Unknown `SET` statements succeed without effect; system variables other
   than `sql_mode` are fixed values, and a statement containing `@@` returns
   only those variables.
-- `SHOW VARIABLES`, `SHOW STATUS` and `SHOW PROCESSLIST` are empty;
+- `SHOW VARIABLES` and `SHOW PROCESSLIST` are empty; `SHOW STATUS` reports
+  only lock counts (`Innodb_row_lock_current_waits`, `Roodb_row_locks`,
+  `Roodb_gap_locks`);
   `INFORMATION_SCHEMA` is a small fixed emulation.
 - `LOAD DATA` reads server-side files into single-column tables only.

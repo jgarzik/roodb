@@ -4,8 +4,24 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::raft::RowChange;
-use crate::txn::ReadView;
+use crate::txn::{LockError, LockManager, LockMode, ReadView};
+
+use super::error::{ExecutorError, ExecutorResult};
+
+/// How a statement takes row locks: where, and how long it will wait.
+#[derive(Debug, Clone)]
+pub struct LockHandle {
+    pub manager: Arc<LockManager>,
+    /// How long to wait for a lock another transaction holds.
+    pub timeout: Duration,
+    /// Whether ranges that were read are locked against inserts (REPEATABLE
+    /// READ) or only the rows themselves (READ COMMITTED).
+    pub gap_locks: bool,
+}
 
 /// Transaction context passed to executors
 ///
@@ -30,6 +46,16 @@ pub struct TransactionContext {
     /// Maps row keys to their uncommitted values (None = deleted).
     /// Reads check this buffer first before querying storage.
     write_buffer: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Row locking for this statement. `None` where there is nothing to
+    /// lock against: plain reads, and executors run without a server.
+    locks: Option<LockHandle>,
+}
+
+fn lock_error(e: LockError) -> ExecutorError {
+    match e {
+        LockError::Deadlock => ExecutorError::LockDeadlock,
+        LockError::Timeout => ExecutorError::LockWaitTimeout,
+    }
 }
 
 impl TransactionContext {
@@ -40,6 +66,52 @@ impl TransactionContext {
             read_view,
             changes: Vec::new(),
             write_buffer: HashMap::new(),
+            locks: None,
+        }
+    }
+
+    /// Take row locks through `locks` for the rest of this statement.
+    pub fn with_locks(mut self, locks: LockHandle) -> Self {
+        self.locks = Some(locks);
+        self
+    }
+
+    /// Whether this statement takes row locks.
+    pub fn locks_rows(&self) -> bool {
+        self.locks.is_some()
+    }
+
+    /// Lock a row for this transaction, waiting for others that hold it.
+    pub async fn lock_record(&self, key: &[u8], mode: LockMode) -> ExecutorResult<()> {
+        match &self.locks {
+            Some(locks) => locks
+                .manager
+                .lock_record(self.txn_id, key, mode, locks.timeout)
+                .await
+                .map_err(lock_error),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait until this transaction may insert a row at `key`.
+    pub async fn lock_insert(&self, key: &[u8]) -> ExecutorResult<()> {
+        match &self.locks {
+            Some(locks) => locks
+                .manager
+                .lock_insert(self.txn_id, key, locks.timeout)
+                .await
+                .map_err(lock_error),
+            None => Ok(()),
+        }
+    }
+
+    /// Keep other transactions from inserting between `low` and `high`, if
+    /// this transaction locks the ranges it reads.
+    pub fn lock_gap(&self, low: &[u8], high: &[u8]) {
+        if let Some(locks) = &self.locks {
+            if locks.gap_locks {
+                locks.manager.lock_gap(self.txn_id, low, high);
+            }
         }
     }
 
@@ -105,6 +177,27 @@ impl TransactionContext {
     /// - None if the key is not in the buffer
     pub fn get_buffered(&self, key: &[u8]) -> Option<Option<&Vec<u8>>> {
         self.write_buffer.get(key).map(|v| v.as_ref())
+    }
+
+    /// A stored row as this transaction should see it when changing it
+    /// again: with the transaction's own earlier change to it, if it made
+    /// one. `None` if the row does not exist or the transaction has deleted
+    /// it. The version stays that of the stored row, which is what the
+    /// change will be checked against when it is applied.
+    ///
+    /// (A row the transaction itself inserted is not in storage yet and is
+    /// not found this way.)
+    pub fn with_own_change(
+        &self,
+        key: &[u8],
+        stored: Option<(Vec<u8>, u64)>,
+    ) -> Option<(Vec<u8>, u64)> {
+        let (data, version) = stored?;
+        match self.write_buffer.get(key) {
+            Some(Some(own)) => Some((own.clone(), version)),
+            Some(None) => None,
+            None => Some((data, version)),
+        }
     }
 
     /// Check if a key is marked as deleted in the buffer

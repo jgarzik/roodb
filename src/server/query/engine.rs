@@ -84,6 +84,40 @@ pub struct QueryEngine {
     pub(crate) out: Box<dyn ResponseSink>,
 }
 
+/// What a client is told when its transaction lost a conflict found at
+/// commit: the same as for a deadlock, since the remedy is the same.
+const COMMIT_CONFLICT: &str = "Deadlock found when trying to get lock; try restarting transaction";
+
+/// Parse `SET [SESSION | GLOBAL | @@...] INNODB_LOCK_WAIT_TIMEOUT = n` from
+/// upper-cased SQL: whether it is the global setting, and the seconds
+/// (MySQL allows 1 to 1073741824).
+fn parse_set_lock_wait_timeout(sql_upper: &str) -> Option<(bool, u64)> {
+    let rest = sql_upper
+        .trim_end_matches(';')
+        .trim()
+        .strip_prefix("SET ")?;
+    let (name, value) = rest.split_once('=')?;
+    let name = name.trim();
+    let (global, name) = if let Some(n) = name.strip_prefix("GLOBAL ") {
+        (true, n)
+    } else if let Some(n) = name.strip_prefix("@@GLOBAL.") {
+        (true, n)
+    } else if let Some(n) = name.strip_prefix("SESSION ") {
+        (false, n)
+    } else if let Some(n) = name.strip_prefix("@@SESSION.") {
+        (false, n)
+    } else if let Some(n) = name.strip_prefix("@@") {
+        (false, n)
+    } else {
+        (false, name)
+    };
+    if name.trim() != "INNODB_LOCK_WAIT_TIMEOUT" {
+        return None;
+    }
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some((global, seconds.clamp(1, 1_073_741_824)))
+}
+
 /// What is left of a DROP TABLE once temporary tables are dealt with.
 enum TempDrop {
     /// Run this plan (the statement, or what remains of it).
@@ -104,7 +138,8 @@ impl QueryEngine {
     ) -> Self {
         let temp = Arc::new(SessionStorage::new(ctx.storage.clone()));
         let mvcc = Arc::new(MvccStorage::new(temp.clone(), ctx.txn_manager.clone()));
-        let session = Session::new(connection_id);
+        let mut session = Session::new(connection_id);
+        session.lock_wait_timeout = ctx.txn_manager.locks().default_wait();
         session.init_eval_flags();
         Self {
             connection_id,
@@ -748,6 +783,12 @@ impl QueryEngine {
             Err(e) => {
                 warn!("Query execution error: {}", e);
                 self.abandon_implicit_txn().await;
+                if matches!(
+                    e,
+                    ProtocolError::Executor(crate::executor::ExecutorError::LockDeadlock)
+                ) {
+                    self.roll_back_open_transaction().await;
+                }
                 self.send_error_from_protocol_error(&e).await
             }
         };
@@ -996,6 +1037,9 @@ impl QueryEngine {
 
         // Check if this is DDL (no MVCC needed)
         let is_ddl = plan.is_ddl();
+        if !is_ddl {
+            self.ensure_transaction()?;
+        }
 
         // Reuse per-connection MVCC storage wrapper
         let mvcc = self.mvcc.clone();
@@ -1009,9 +1053,10 @@ impl QueryEngine {
             let read_view = self.txn_manager.create_read_view(txn_id)?;
             let pending = self.session.get_pending_changes();
             (
-                Some(TransactionContext::with_pending_changes(
-                    txn_id, read_view, pending,
-                )),
+                Some(
+                    TransactionContext::with_pending_changes(txn_id, read_view, pending)
+                        .with_locks(self.lock_handle()),
+                ),
                 None,
             )
         } else if !returns_rows && self.session.autocommit {
@@ -1022,7 +1067,7 @@ impl QueryEngine {
             self.implicit_txns.push(txn.txn_id);
             let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
             (
-                Some(TransactionContext::new(txn.txn_id, read_view)),
+                Some(TransactionContext::new(txn.txn_id, read_view).with_locks(self.lock_handle())),
                 Some(txn.txn_id),
             )
         } else {
@@ -1200,6 +1245,18 @@ impl QueryEngine {
                     .map(|_| Some(()));
             };
             return self.handle_set_isolation_level(level).await.map(Some);
+        }
+
+        // SET [SESSION | GLOBAL] innodb_lock_wait_timeout = seconds
+        if let Some((global, seconds)) = parse_set_lock_wait_timeout(&sql_upper) {
+            let wait = std::time::Duration::from_secs(seconds);
+            if global {
+                // For sessions that start from now on, as in MySQL.
+                self.txn_manager.locks().set_default_wait(wait);
+            } else {
+                self.session.lock_wait_timeout = wait;
+            }
+            return self.send_ok(0, 0).await.map(Some);
         }
 
         // Catch-all: silently accept any other SET statement (SET NAMES, SET charset, etc.)
@@ -1454,54 +1511,103 @@ impl QueryEngine {
         Ok(())
     }
 
-    /// Handle COMMIT
-    async fn handle_commit(&mut self) -> ProtocolResult<()> {
-        if let Some(txn_id) = self.session.current_txn {
-            // First, propose any pending changes to Raft
-            let changes = self.session.take_pending_changes();
-            if !changes.is_empty() {
-                if let Err(e) = self.commit_changes(txn_id, changes, false).await {
-                    // Raft proposal failed - rollback the transaction
-                    self.session.end_transaction();
-                    let _ = self.txn_manager.rollback(txn_id).await;
-                    return self
-                        .send_error(
-                            codes::ER_UNKNOWN_ERROR,
-                            states::GENERAL_ERROR,
-                            &format!("Raft commit failed: {}", e),
-                        )
-                        .await;
-                }
-            }
+    /// The row locking a statement of this session does.
+    fn lock_handle(&self) -> crate::executor::context::LockHandle {
+        crate::executor::context::LockHandle {
+            manager: self.txn_manager.locks().clone(),
+            timeout: self.session.lock_wait_timeout,
+            // READ COMMITTED locks rows only; REPEATABLE READ also locks the
+            // ranges it has read against inserts.
+            gap_locks: !matches!(
+                self.session.isolation_level,
+                IsolationLevel::ReadCommitted | IsolationLevel::ReadUncommitted
+            ),
+        }
+    }
 
-            // Now commit the transaction in the transaction manager.
-            // CRITICAL: After successful Raft proposal, the data IS committed and durable.
-            // The txn_manager.commit() is just bookkeeping - if it fails, we log the error
-            // but still report success to the client since data is already committed via Raft.
-            match self.txn_manager.commit(txn_id).await {
-                Ok(()) => {
-                    self.session.end_transaction();
-                    debug!(
-                        connection_id = self.connection_id,
-                        txn_id = txn_id,
-                        "Committed transaction"
-                    );
-                }
-                Err(e) => {
-                    // Log the error but don't fail - data is already committed via Raft
-                    tracing::error!(
-                        connection_id = self.connection_id,
-                        txn_id = txn_id,
-                        error = %e,
-                        "TxnManager commit failed after Raft success - data IS committed, txn bookkeeping inconsistent"
-                    );
-                    self.session.end_transaction();
-                    // Still report success - data is durable
-                }
+    /// With autocommit off, a statement that finds no transaction open
+    /// starts one; it stays open until COMMIT or ROLLBACK.
+    fn ensure_transaction(&mut self) -> ProtocolResult<()> {
+        if !self.session.autocommit && self.session.current_txn.is_none() {
+            let txn = self
+                .txn_manager
+                .begin(self.session.isolation_level, self.session.is_read_only)?;
+            self.session.begin_transaction(txn.txn_id);
+        }
+        Ok(())
+    }
+
+    /// Roll the session's open transaction back, if it has one: its
+    /// uncommitted changes are dropped and its locks released.
+    async fn roll_back_open_transaction(&mut self) {
+        self.session.clear_pending_changes();
+        if let Some(txn_id) = self.session.current_txn {
+            if let Err(e) = self.txn_manager.rollback(txn_id).await {
+                warn!(txn_id, error = %e, "Rollback failed");
+            }
+            self.session.end_transaction();
+        }
+    }
+
+    /// Commit the session's open transaction, if it has one. On failure the
+    /// transaction has been rolled back.
+    async fn commit_open_transaction(&mut self) -> Result<(), String> {
+        let Some(txn_id) = self.session.current_txn else {
+            return Ok(());
+        };
+        // First, propose any pending changes to Raft
+        let changes = self.session.take_pending_changes();
+        if !changes.is_empty() {
+            if let Err(e) = self.commit_changes(txn_id, changes, false).await {
+                self.session.end_transaction();
+                let _ = self.txn_manager.rollback(txn_id).await;
+                return Err(e);
             }
         }
+        // The data is committed once the proposal succeeds; what remains is
+        // bookkeeping (and releasing the transaction's locks). A failure
+        // there is logged, not reported: the commit did happen.
+        if let Err(e) = self.txn_manager.commit(txn_id).await {
+            tracing::error!(
+                connection_id = self.connection_id,
+                txn_id = txn_id,
+                error = %e,
+                "TxnManager commit failed after Raft success - data IS committed, txn bookkeeping inconsistent"
+            );
+        }
+        self.session.end_transaction();
+        debug!(
+            connection_id = self.connection_id,
+            txn_id = txn_id,
+            "Committed transaction"
+        );
+        Ok(())
+    }
+
+    /// Report a commit that failed.
+    async fn send_commit_error(&mut self, e: &str) -> ProtocolResult<()> {
+        if e.contains("Write conflict") {
+            self.send_error(codes::ER_LOCK_DEADLOCK, "40001", COMMIT_CONFLICT)
+                .await
+        } else if e.contains("Duplicate key") {
+            self.send_error(codes::ER_DUP_ENTRY, "23000", e).await
+        } else {
+            self.send_error(
+                codes::ER_UNKNOWN_ERROR,
+                states::GENERAL_ERROR,
+                &format!("Raft commit failed: {}", e),
+            )
+            .await
+        }
+    }
+
+    /// Handle COMMIT
+    async fn handle_commit(&mut self) -> ProtocolResult<()> {
         // COMMIT without BEGIN is a no-op
-        self.send_ok(0, 0).await
+        match self.commit_open_transaction().await {
+            Ok(()) => self.send_ok(0, 0).await,
+            Err(e) => self.send_commit_error(&e).await,
+        }
     }
 
     /// Handle ROLLBACK
@@ -1537,21 +1643,12 @@ impl QueryEngine {
 
     /// Handle SET autocommit = value
     async fn handle_set_autocommit(&mut self, value: bool) -> ProtocolResult<()> {
-        // If turning off autocommit and not in transaction, start one
-        if !value && !self.session.in_transaction() && self.session.autocommit {
-            if let Ok(txn) = self
-                .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)
-            {
-                self.session.begin_transaction(txn.txn_id);
-            }
-        }
-
-        // If turning on autocommit while in transaction, commit it
-        if value && self.session.in_transaction() {
-            if let Some(txn_id) = self.session.current_txn {
-                let _ = self.txn_manager.commit(txn_id).await;
-                self.session.end_transaction();
+        // Turning autocommit on commits the open transaction, changes and
+        // all. (Turning it off opens nothing yet: the next statement does.)
+        if value && !self.session.autocommit {
+            if let Err(e) = self.commit_open_transaction().await {
+                self.session.set_autocommit(value);
+                return self.send_commit_error(&e).await;
             }
         }
 
@@ -1738,7 +1835,8 @@ impl QueryEngine {
         // Create a read-only transaction context for UNION queries
         let txn = self.txn_manager.begin(self.session.isolation_level, true)?;
         let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
-        let txn_context = Some(TransactionContext::new(txn.txn_id, read_view));
+        let txn_context =
+            Some(TransactionContext::new(txn.txn_id, read_view).with_locks(self.lock_handle()));
 
         // Execute first query
         let engine = ExecutorEngine::with_raft(
@@ -3071,11 +3169,39 @@ impl QueryEngine {
         else if sql_upper.starts_with("SHOW VARIABLES")
             || sql_upper.starts_with("SHOW SESSION VARIABLES")
             || sql_upper.starts_with("SHOW GLOBAL VARIABLES")
-            || sql_upper.starts_with("SHOW STATUS")
+        {
+            let rows: Vec<Vec<String>> = Vec::new();
+            self.send_custom_result_set(&["Variable_name", "Value"], &rows)
+                .await
+                .map(Some)
+        }
+        // SHOW [GLOBAL | SESSION] STATUS [LIKE 'pattern']
+        else if sql_upper.starts_with("SHOW STATUS")
             || sql_upper.starts_with("SHOW SESSION STATUS")
             || sql_upper.starts_with("SHOW GLOBAL STATUS")
         {
-            let rows: Vec<Vec<String>> = Vec::new();
+            let (record_locks, gap_locks, waiting) = self.txn_manager.locks().counts();
+            let status = [
+                ("Innodb_row_lock_current_waits", waiting),
+                ("Roodb_row_locks", record_locks),
+                ("Roodb_gap_locks", gap_locks),
+            ];
+            // The pattern, if any, is the quoted text after LIKE.
+            let pattern = sql_upper.split_once(" LIKE ").map(|(_, p)| {
+                p.trim()
+                    .trim_end_matches(';')
+                    .trim_matches('\'')
+                    .to_string()
+            });
+            let rows: Vec<Vec<String>> = status
+                .iter()
+                .filter(|(name, _)| {
+                    pattern
+                        .as_deref()
+                        .is_none_or(|p| crate::executor::datum::like_match(&name.to_uppercase(), p))
+                })
+                .map(|(name, value)| vec![name.to_string(), value.to_string()])
+                .collect();
             self.send_custom_result_set(&["Variable_name", "Value"], &rows)
                 .await
                 .map(Some)
@@ -3729,7 +3855,16 @@ impl QueryEngine {
                 "time_zone" => "SYSTEM",
                 "system_time_zone" => "UTC",
                 "transaction_isolation" | "tx_isolation" => "REPEATABLE-READ",
-                "autocommit" => "1",
+                "autocommit" => {
+                    col_names.push(format!("@@{}", var_lower));
+                    values.push(if self.session.autocommit { "1" } else { "0" }.to_string());
+                    continue;
+                }
+                "innodb_lock_wait_timeout" => {
+                    col_names.push(format!("@@{}", var_lower));
+                    values.push(self.session.lock_wait_timeout.as_secs().to_string());
+                    continue;
+                }
                 "version" => "8.0.0-RooDB",
                 "version_comment" => "RooDB",
                 "default_storage_engine" | "storage_engine" => "RooDB",
@@ -5710,9 +5845,10 @@ impl QueryEngine {
                 .create_read_view(txn_id)
                 .map_err(|e| e.to_string())?;
             let pending = self.session.get_pending_changes();
-            Some(TransactionContext::with_pending_changes(
-                txn_id, read_view, pending,
-            ))
+            Some(
+                TransactionContext::with_pending_changes(txn_id, read_view, pending)
+                    .with_locks(self.lock_handle()),
+            )
         } else {
             let read_view = self
                 .txn_manager
@@ -5784,6 +5920,9 @@ impl QueryEngine {
             TempDrop::NoSuchTable(name) => return Err(format!("Table '{name}' doesn't exist")),
         };
         let is_ddl = plan.is_ddl();
+        if !is_ddl {
+            self.ensure_transaction().map_err(|e| e.to_string())?;
+        }
         let mvcc = self.mvcc.clone();
 
         let (txn_context, implicit_txn_id) = if is_ddl {
@@ -5795,9 +5934,10 @@ impl QueryEngine {
                 .map_err(|e| e.to_string())?;
             let pending = self.session.get_pending_changes();
             (
-                Some(TransactionContext::with_pending_changes(
-                    txn_id, read_view, pending,
-                )),
+                Some(
+                    TransactionContext::with_pending_changes(txn_id, read_view, pending)
+                        .with_locks(self.lock_handle()),
+                ),
                 None,
             )
         } else if self.session.autocommit {
@@ -5811,7 +5951,7 @@ impl QueryEngine {
                 .create_read_view(txn.txn_id)
                 .map_err(|e| e.to_string())?;
             (
-                Some(TransactionContext::new(txn.txn_id, read_view)),
+                Some(TransactionContext::new(txn.txn_id, read_view).with_locks(self.lock_handle())),
                 Some(txn.txn_id),
             )
         } else {
@@ -5884,6 +6024,7 @@ impl QueryEngine {
         self.session.reset();
         // The reset cleared the session's copy of the stored functions.
         self.functions_version = None;
+        self.session.lock_wait_timeout = self.txn_manager.locks().default_wait();
     }
 
     /// Transaction status of the session, reported with every result.
@@ -5998,6 +6139,14 @@ impl QueryEngine {
                         states::NO_SUCH_TABLE,
                         exec_err.to_string(),
                     )
+                } else if let crate::executor::ExecutorError::LockDeadlock = exec_err {
+                    (codes::ER_LOCK_DEADLOCK, "40001", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::LockWaitTimeout = exec_err {
+                    (
+                        codes::ER_LOCK_WAIT_TIMEOUT,
+                        states::GENERAL_ERROR,
+                        exec_err.to_string(),
+                    )
                 } else if let crate::executor::ExecutorError::NullValue(_) = exec_err {
                     (codes::ER_BAD_NULL_ERROR, "23000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::DataOutOfRange(ref msg) = exec_err {
@@ -6048,6 +6197,14 @@ impl QueryEngine {
                 let msg = e.to_string();
                 if msg.contains("Duplicate key") {
                     (codes::ER_DUP_ENTRY, "23000", msg)
+                } else if msg.contains("Write conflict") {
+                    // Another transaction changed a row this one read
+                    // without locking it: it has lost, and must be retried.
+                    (
+                        codes::ER_LOCK_DEADLOCK,
+                        "40001",
+                        COMMIT_CONFLICT.to_string(),
+                    )
                 } else {
                     (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, msg)
                 }

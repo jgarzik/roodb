@@ -16,6 +16,7 @@ pub mod ddl;
 pub mod dml;
 pub mod edge_cases;
 pub mod errors;
+pub mod locking;
 pub mod prepared;
 pub mod protocol_tests;
 pub mod queries;

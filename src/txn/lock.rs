@@ -200,9 +200,34 @@ impl State {
 }
 
 /// The lock table of one node.
-#[derive(Default)]
 pub struct LockManager {
     state: Mutex<State>,
+    /// How long a new session waits for a lock, in seconds
+    /// (`innodb_lock_wait_timeout`, global).
+    default_wait_secs: std::sync::atomic::AtomicU64,
+}
+
+/// MySQL's default for `innodb_lock_wait_timeout`.
+pub const DEFAULT_LOCK_WAIT_SECS: u64 = 50;
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            default_wait_secs: std::sync::atomic::AtomicU64::new(DEFAULT_LOCK_WAIT_SECS),
+        }
+    }
+}
+
+impl std::fmt::Debug for LockManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (records, gaps, waiting) = self.counts();
+        f.debug_struct("LockManager")
+            .field("records", &records)
+            .field("gaps", &gaps)
+            .field("waiting", &waiting)
+            .finish()
+    }
 }
 
 /// Removes a request from the queue if the requester stops waiting for it.
@@ -223,6 +248,20 @@ impl Drop for WaitGuard<'_> {
 impl LockManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// How long sessions that have not chosen otherwise wait for a lock.
+    pub fn default_wait(&self) -> Duration {
+        Duration::from_secs(
+            self.default_wait_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Change the wait for sessions that start from now on.
+    pub fn set_default_wait(&self, wait: Duration) {
+        self.default_wait_secs
+            .store(wait.as_secs(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Lock one row for `txn`, waiting up to `timeout` for transactions

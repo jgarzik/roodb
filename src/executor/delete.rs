@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedExpr;
 use crate::raft::RowChange;
-use crate::txn::MvccStorage;
+use crate::txn::{LockMode, MvccStorage};
 
 use crate::server::session::UserVariables;
 
@@ -87,10 +87,18 @@ impl Delete {
         // Always read from MVCC storage (not write buffer) to get the correct
         // OCC version. The full-scan path also reads from MVCC, not the buffer.
         // The write buffer is for SELECT read-your-writes, not DML OCC checks.
-        let result = self
-            .mvcc
-            .get_with_version(&storage_key, &ctx.read_view)
-            .await?;
+        //
+        // With row locking the row is locked first and then read as it
+        // stands now.
+        let result = if ctx.locks_rows() {
+            ctx.lock_record(&storage_key, LockMode::Exclusive).await?;
+            self.mvcc.get_current(&storage_key).await?
+        } else {
+            self.mvcc
+                .get_with_version(&storage_key, &ctx.read_view)
+                .await?
+        };
+        let result = ctx.with_own_change(&storage_key, result);
 
         if let Some((data, row_version)) = result {
             let row = decode_row(&data)?;
@@ -135,6 +143,23 @@ impl Delete {
         let mut matching: Vec<(Vec<u8>, u64, Row)> = Vec::new();
 
         for (key, value, row_version) in kv_pairs {
+            // Lock each row the scan passes, then look at it as it stands
+            // now (it may have changed, or gone, while we waited).
+            let (value, row_version) = match &self.txn_context {
+                Some(ctx) => {
+                    let stored = if ctx.locks_rows() {
+                        ctx.lock_record(&key, LockMode::Exclusive).await?;
+                        self.mvcc.get_current(&key).await?
+                    } else {
+                        Some((value, row_version))
+                    };
+                    match ctx.with_own_change(&key, stored) {
+                        Some(current) => current,
+                        None => continue,
+                    }
+                }
+                None => (value, row_version),
+            };
             let row = decode_row(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;

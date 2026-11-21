@@ -14,7 +14,7 @@ mod read_view;
 mod transaction;
 mod undo_log;
 
-pub use lock::{LockError, LockManager, LockMode};
+pub use lock::{LockError, LockManager, LockMode, DEFAULT_LOCK_WAIT_SECS};
 pub use manager::TransactionManager;
 pub use mvcc_storage::MvccStorage;
 pub use purge::PurgeTask;

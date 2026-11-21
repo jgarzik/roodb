@@ -239,10 +239,31 @@ impl Executor for Insert {
                 )
             })?;
 
+            // A row with a primary key can collide with another
+            // transaction's. Wait for anyone who has locked the place it
+            // goes or the row itself; then whether the key is taken is a
+            // settled fact, and a duplicate is reported by this statement,
+            // not at commit. (A row without a primary key gets a key no one
+            // else can have, so there is nothing to wait for.)
+            let locked = !self.pk_column_indices.is_empty() && ctx.locks_rows();
+            if locked {
+                ctx.lock_insert(&key).await?;
+                ctx.lock_record(&key, crate::txn::LockMode::Exclusive)
+                    .await?;
+            }
+
             // Check for duplicate: intra-batch buffer or existing storage
             let is_duplicate = if !self.pk_column_indices.is_empty() {
                 if ctx.has_buffered_key(&key) {
                     true
+                } else if ctx.is_buffered_deleted(&key) {
+                    // Deleted earlier in this transaction: free to reuse.
+                    false
+                } else if locked {
+                    match &self.mvcc {
+                        Some(mvcc) => mvcc.get_current(&key).await?.is_some(),
+                        None => false,
+                    }
                 } else if !self.on_duplicate.is_empty() {
                     // Check storage for existing row (needed for ODKU)
                     if let Some(ref mvcc) = self.mvcc {

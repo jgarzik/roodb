@@ -51,6 +51,29 @@ impl MvccStorage {
         &self.inner
     }
 
+    /// The row locks of this node's transactions.
+    pub fn locks(&self) -> &Arc<super::LockManager> {
+        self.txn_manager.locks()
+    }
+
+    /// The row as it stands now: the latest committed version, with the ID
+    /// of the transaction that wrote it, or `None` if the row does not exist
+    /// or has been deleted. Storage holds committed rows only (changes reach
+    /// it when they are applied), so this is simply what is stored. A
+    /// statement that has locked a row reads it this way, not through its
+    /// snapshot: the lock is what makes the latest version the right one.
+    pub async fn get_current(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let Some(encoded) = self.inner.get(key).await? else {
+            return Ok(None);
+        };
+        match Self::decode_row(&encoded) {
+            Some((_, _, true, _)) => Ok(None),
+            Some((txn_id, _, false, data)) => Ok(Some((data.to_vec(), txn_id))),
+            // A row without a header: always there, written by no one.
+            None => Ok(Some((encoded, 0))),
+        }
+    }
+
     /// Encode a row with MVCC header
     ///
     /// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data]

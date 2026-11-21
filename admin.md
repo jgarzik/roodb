@@ -549,7 +549,9 @@ Query system tables for metadata (read-only, managed by SQL commands):
 | `system.roles` | Role definitions |
 | `system.role_grants` | Role-to-user assignments |
 
-**Note:** SHOW STATUS and SHOW PROCESSLIST are not yet implemented.
+**Lock monitoring:** `SHOW STATUS LIKE 'Innodb_row_lock_current_waits'` reports how many statements are waiting for a row lock right now; `Roodb_row_locks` and `Roodb_gap_locks` report how many locks are held. `innodb_lock_wait_timeout` (seconds, default 50) bounds a wait; set it per session, or with `SET GLOBAL` for sessions that connect afterwards.
+
+**Note:** `SHOW STATUS` reports nothing else yet, and `SHOW PROCESSLIST` is empty.
 
 ## Backup and Recovery
 

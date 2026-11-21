@@ -5,6 +5,7 @@
 //! - COMMIT: Mark transaction as committed, persist to WAL
 //! - ROLLBACK: Apply undo log in reverse, mark as aborted
 
+use super::lock::LockManager;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,6 +44,10 @@ pub struct TransactionManager {
     /// machine advances this as it applies entries - on a follower, and when
     /// it replays its log after a restart.
     applied_floor: Arc<AtomicU64>,
+
+    /// Row locks held by the transactions of this node. They are released
+    /// here, when a transaction ends, however it ends.
+    locks: Arc<LockManager>,
 }
 
 impl TransactionManager {
@@ -63,7 +68,13 @@ impl TransactionManager {
             is_leader: AtomicBool::new(true), // Default to leader for single-node
             timeout_config: RwLock::new(TimeoutConfig::default()),
             applied_floor,
+            locks: LockManager::new(),
         }
+    }
+
+    /// The row locks of this node's transactions.
+    pub fn locks(&self) -> &Arc<LockManager> {
+        &self.locks
     }
 
     /// Move the ID counter past everything the state machine has applied.
@@ -138,6 +149,9 @@ impl TransactionManager {
     /// The undo log for INSERT operations can be discarded.
     /// UPDATE/DELETE undo logs are kept for MVCC until purge.
     pub async fn commit(&self, txn_id: u64) -> TransactionResult<()> {
+        // Its changes have been applied (or it made none): others may now
+        // have the rows.
+        self.locks.release_all(txn_id);
         // Get and validate transaction
         {
             let mut active = self.active_transactions.write();
@@ -168,6 +182,7 @@ impl TransactionManager {
     /// to Raft. On ROLLBACK, the session simply discards the buffered changes.
     /// This method just removes the transaction from the active set.
     pub async fn rollback(&self, txn_id: u64) -> TransactionResult<()> {
+        self.locks.release_all(txn_id);
         // Get and validate transaction
         {
             let mut active = self.active_transactions.write();

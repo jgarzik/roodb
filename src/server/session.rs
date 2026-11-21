@@ -109,6 +109,9 @@ pub struct Session {
     pub autocommit: bool,
     /// Transaction isolation level for this session
     pub isolation_level: IsolationLevel,
+    /// How long a statement waits for a row lock another transaction holds
+    /// (`innodb_lock_wait_timeout`).
+    pub lock_wait_timeout: std::time::Duration,
     /// Whether this is a read-only connection (connected to replica)
     pub is_read_only: bool,
     /// Per-session timeout configuration
@@ -146,6 +149,7 @@ impl Session {
             current_txn: None,
             autocommit: true,
             isolation_level: IsolationLevel::default(),
+            lock_wait_timeout: std::time::Duration::from_secs(crate::txn::DEFAULT_LOCK_WAIT_SECS),
             is_read_only: false,
             timeout_config: TimeoutConfig::default(),
             pending_changes: Vec::new(),
@@ -204,6 +208,7 @@ impl Session {
     pub fn reset(&mut self) {
         self.autocommit = true;
         self.isolation_level = IsolationLevel::default();
+        self.lock_wait_timeout = std::time::Duration::from_secs(crate::txn::DEFAULT_LOCK_WAIT_SECS);
         self.warnings.clear();
         self.sql_prepared_stmts.clear();
         self.sql_modes = default_sql_modes();

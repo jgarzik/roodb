@@ -55,6 +55,14 @@ pub enum ExecutorError {
     /// Duplicate key violation (MySQL error 1062)
     DuplicateKey(String),
 
+    /// Waiting for a row lock would have completed a deadlock (MySQL error
+    /// 1213). The transaction is rolled back.
+    LockDeadlock,
+
+    /// A row lock was not granted in time (MySQL error 1205). Only the
+    /// statement fails.
+    LockWaitTimeout,
+
     /// Internal executor error
     Internal(String),
 }
@@ -93,6 +101,13 @@ impl fmt::Display for ExecutorError {
             ExecutorError::InvalidArgumentForLogarithm(msg) => write!(f, "{}", msg),
             ExecutorError::TruncatedWrongValue(msg) => write!(f, "{}", msg),
             ExecutorError::DuplicateKey(msg) => write!(f, "{}", msg),
+            ExecutorError::LockDeadlock => write!(
+                f,
+                "Deadlock found when trying to get lock; try restarting transaction"
+            ),
+            ExecutorError::LockWaitTimeout => {
+                write!(f, "Lock wait timeout exceeded; try restarting transaction")
+            }
             ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
