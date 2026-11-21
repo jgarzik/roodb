@@ -46,7 +46,7 @@ use super::prelogin::{
     encode_prelogin_response, negotiate_encryption, parse_prelogin, Encryption, SERVER_VERSION,
 };
 use super::rpc::{bind_parameters, declared_names, parse_rpc, Procedure, RpcCall};
-use super::shims::{split_batch, translate, Action, ShimContext};
+use super::shims::{is_plain, split_batch, translate, Action, ShimContext};
 use super::sink::TdsSink;
 use super::token::{
     put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
@@ -416,13 +416,30 @@ struct TdsConnection {
     statement_cache_bytes: usize,
 }
 
+/// What a procedure call produced besides its results.
+#[derive(Default)]
+struct CallOutcome {
+    /// Statement handle to return as an output parameter
+    handle: Option<(String, i32)>,
+    /// A rollback ended a transaction
+    rolled_back: bool,
+}
+
 /// A statement ready to be executed with parameter values.
 #[derive(Debug, Clone)]
 enum Prepared {
     /// No parameters: runs as plain SQL text
     Text(String),
-    /// Parameter references rewritten to placeholders and prepared in the
-    /// engine
+    /// Parameterised text the driver shims act on (several statements, a
+    /// driver statement, a session probe): translated and bound afresh at
+    /// each execution
+    Dynamic {
+        sql: String,
+        /// Declared parameter names, lower-case
+        names: Vec<String>,
+    },
+    /// One plain statement: parameter references rewritten to
+    /// placeholders and prepared in the engine
     Bound {
         /// Engine prepared-statement ID
         statement_id: u32,
@@ -610,8 +627,8 @@ impl TdsConnection {
                 }
                 PacketType::Rpc => {
                     let before = self.environment();
-                    self.rpc_request(&message.payload).await?;
-                    self.finish_request(before, false).await?;
+                    let rolled_back = self.rpc_request(&message.payload).await?;
+                    self.finish_request(before, rolled_back).await?;
                 }
                 _ => return Err(TdsError::Protocol("unexpected message type")),
             }
@@ -631,33 +648,49 @@ impl TdsConnection {
         Ok(())
     }
 
-    /// Run SQL text as a client sent it: split into statements, apply
-    /// the driver shims, and stop at the first statement that fails.
-    /// Returns whether a rollback was the last transaction statement run.
+    /// The session as the driver shims need to see it.
+    fn shim_context(&self) -> ShimContext<'_> {
+        let session = &self.engine.session;
+        ShimContext {
+            connection_id: self.connection_id,
+            in_transaction: session.in_transaction(),
+            database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
+            user: &session.user,
+            product_version: PRODUCT_VERSION,
+        }
+    }
+
+    /// Run SQL text as a client sent it. Returns whether a rollback ended
+    /// a transaction.
     async fn run_sql(&mut self, sql: &str) -> Result<bool, TdsError> {
+        self.run_statements(sql, None).await
+    }
+
+    /// Run SQL text: split it into statements, apply the driver shims to
+    /// each, and stop at the first statement that fails or when the
+    /// client cancels.
+    ///
+    /// `params` are the declared parameter names and their values; a
+    /// statement that refers to parameters is prepared and executed with
+    /// the values bound.
+    async fn run_statements(
+        &mut self,
+        sql: &str,
+        params: Option<(&[String], &[Datum])>,
+    ) -> Result<bool, TdsError> {
         let mut rolled_back = false;
         for statement in split_batch(sql) {
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let errors_before = self.sink().error_count();
-            let action = {
-                let session = &self.engine.session;
-                translate(
-                    &statement,
-                    &ShimContext {
-                        connection_id: self.connection_id,
-                        in_transaction: session.in_transaction(),
-                        database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
-                        user: &session.user,
-                        product_version: PRODUCT_VERSION,
-                    },
-                )
-            };
+            let action = translate(&statement, &self.shim_context());
             match action {
                 Action::Run(sql) => {
                     let was_in_transaction = self.engine.session.in_transaction();
-                    self.execute(&sql).await?;
+                    self.run_one(&sql, params).await?;
                     if was_in_transaction && !self.engine.session.in_transaction() {
-                        rolled_back = sql == "ROLLBACK"
-                            || sql.trim_start().to_uppercase().starts_with("ROLLBACK");
+                        rolled_back = sql.trim_start().to_uppercase().starts_with("ROLLBACK");
                     }
                 }
                 Action::Accept => self.engine.send_ok(0, 0).await?,
@@ -668,6 +701,43 @@ impl TdsConnection {
             }
         }
         Ok(rolled_back)
+    }
+
+    /// Run one translated statement, binding parameter values if it
+    /// refers to any.
+    async fn run_one(
+        &mut self,
+        sql: &str,
+        params: Option<(&[String], &[Datum])>,
+    ) -> Result<(), TdsError> {
+        let Some((names, values)) = params else {
+            return self.execute(sql).await;
+        };
+        let (bound_sql, order) = bind_parameters(sql, names);
+        if order.is_empty() {
+            return self.execute(sql).await;
+        }
+        let statement_id = match self.engine.prepared_stmts.prepare(&bound_sql) {
+            Ok(statement) => statement.id,
+            Err(e) => {
+                self.engine.send_error_from_protocol_error(&e).await?;
+                return Ok(());
+            }
+        };
+        let args: Vec<Datum> = order.iter().map(|index| values[*index].clone()).collect();
+        let result = self.execute_bound(statement_id, &args).await;
+        self.engine.prepared_stmts.close(statement_id);
+        result
+    }
+
+    /// Execute an engine prepared statement with bound values.
+    async fn execute_bound(&mut self, statement_id: u32, args: &[Datum]) -> Result<(), TdsError> {
+        if let Err(e) = self.engine.execute_prepared(statement_id, args).await {
+            let _ = self.engine.send_error_from_protocol_error(&e).await;
+            let _ = self.sink().finish(false).await;
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     /// The SQL text of a batch request.
@@ -687,35 +757,41 @@ impl TdsConnection {
             .error(&QueryError::new(code, states::GENERAL_ERROR, message));
     }
 
-    /// Run the procedure calls of an RPC request.
-    async fn rpc_request(&mut self, payload: &[u8]) -> Result<(), TdsError> {
+    /// Run the procedure calls of an RPC request. Returns whether a
+    /// rollback ended a transaction.
+    async fn rpc_request(&mut self, payload: &[u8]) -> Result<bool, TdsError> {
         let body = skip_all_headers(payload)?;
         let calls = match parse_rpc(body, MAX_REQUEST) {
             Ok(calls) => calls,
             Err(e) => {
                 self.refuse(codes::ER_UNKNOWN_COM_ERROR, &e.to_string());
-                return Ok(());
+                return Ok(false);
             }
         };
+        let mut rolled_back = false;
         for call in calls {
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             self.sink().begin_procedure();
-            let handle = self.procedure_call(call).await?;
-            match handle {
+            let outcome = self.procedure_call(call).await?;
+            rolled_back = outcome.rolled_back;
+            match outcome.handle {
                 Some((name, value)) => self.sink().end_procedure(&[(name.as_str(), value)]),
                 None => self.sink().end_procedure(&[]),
             }
         }
-        Ok(())
+        Ok(rolled_back)
     }
 
-    /// Run one procedure call. Returns the statement handle to report as
-    /// an output parameter, if the procedure produces one.
-    async fn procedure_call(&mut self, call: RpcCall) -> Result<Option<(String, i32)>, TdsError> {
+    /// Run one procedure call.
+    async fn procedure_call(&mut self, call: RpcCall) -> Result<CallOutcome, TdsError> {
         let text = |param: Option<&RpcParam>| match param.map(|p| &p.value) {
             Some(Datum::String(s)) => Some(s.clone()),
             _ => None,
         };
         let params = &call.params;
+        let mut outcome = CallOutcome::default();
 
         match call.procedure {
             // sp_executesql @stmt, @params, values...
@@ -725,41 +801,37 @@ impl TdsConnection {
                         codes::ER_WRONG_ARGUMENTS,
                         "sp_executesql expects a statement",
                     );
-                    return Ok(None);
+                    return Ok(outcome);
                 };
                 let declaration = text(params.get(1)).unwrap_or_default();
+                let values = params.get(2..).unwrap_or(&[]);
                 let key = (sql, declaration);
-                let prepared = match self.statement_cache.get(&key) {
-                    Some(prepared) => prepared.clone(),
-                    None => {
-                        let Some(prepared) = self.prepare(&key.0, &key.1).await? else {
-                            return Ok(None);
-                        };
-                        let size = key.0.len() + key.1.len();
-                        if size <= MAX_CACHED_STATEMENT {
-                            if self.statement_cache.len() >= STATEMENT_CACHE_SIZE
-                                || self.statement_cache_bytes + size > STATEMENT_CACHE_BYTES
-                            {
-                                self.clear_statement_cache();
-                            }
-                            self.statement_cache_bytes += size;
-                            self.statement_cache.insert(key, prepared.clone());
-                            self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
-                                .await?;
-                            return Ok(None);
-                        }
-                        // Too large to remember: run it and release it.
-                        self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
-                            .await?;
-                        if let Prepared::Bound { statement_id, .. } = prepared {
-                            self.engine.prepared_stmts.close(statement_id);
-                        }
-                        return Ok(None);
-                    }
+
+                if let Some(prepared) = self.statement_cache.get(&key).cloned() {
+                    outcome.rolled_back = self.execute_prepared(&prepared, values).await?;
+                    return Ok(outcome);
+                }
+                let Some(prepared) = self.prepare(&key.0, &key.1).await? else {
+                    return Ok(outcome);
                 };
-                self.execute_prepared(&prepared, params.get(2..).unwrap_or(&[]))
-                    .await?;
-                Ok(None)
+                outcome.rolled_back = self.execute_prepared(&prepared, values).await?;
+
+                // Remember an engine statement for next time, within the
+                // cache's budgets; otherwise release it.
+                if let Prepared::Bound { statement_id, .. } = prepared {
+                    let size = key.0.len() + key.1.len();
+                    if size <= MAX_CACHED_STATEMENT {
+                        if self.statement_cache.len() >= STATEMENT_CACHE_SIZE
+                            || self.statement_cache_bytes + size > STATEMENT_CACHE_BYTES
+                        {
+                            self.clear_statement_cache();
+                        }
+                        self.statement_cache_bytes += size;
+                        self.statement_cache.insert(key, prepared);
+                    } else {
+                        self.engine.prepared_stmts.close(statement_id);
+                    }
+                }
             }
 
             // sp_prepare @handle OUTPUT, @params, @stmt
@@ -767,7 +839,7 @@ impl TdsConnection {
             Procedure::Prepare | Procedure::PrepExec => {
                 let Some(sql) = text(params.get(2)) else {
                     self.refuse(codes::ER_WRONG_ARGUMENTS, "Expected a statement to prepare");
-                    return Ok(None);
+                    return Ok(outcome);
                 };
                 let declaration = text(params.get(1)).unwrap_or_default();
                 let size = sql.len() + declaration.len();
@@ -778,10 +850,10 @@ impl TdsConnection {
                         codes::ER_UNKNOWN_ERROR,
                         "Too many prepared statements on this connection",
                     );
-                    return Ok(None);
+                    return Ok(outcome);
                 }
                 let Some(prepared) = self.prepare(&sql, &declaration).await? else {
-                    return Ok(None);
+                    return Ok(outcome);
                 };
                 let handle = self.next_handle;
                 self.next_handle = self.next_handle.wrapping_add(1).max(1);
@@ -789,14 +861,15 @@ impl TdsConnection {
                 self.prepared_bytes += size;
 
                 if call.procedure == Procedure::PrepExec {
-                    self.execute_prepared(&prepared, params.get(3..).unwrap_or(&[]))
+                    outcome.rolled_back = self
+                        .execute_prepared(&prepared, params.get(3..).unwrap_or(&[]))
                         .await?;
                 }
                 let name = match params.first() {
                     Some(p) if !p.name.is_empty() => p.name.clone(),
                     _ => "@handle".to_string(),
                 };
-                Ok(Some((name, handle)))
+                outcome.handle = Some((name, handle));
             }
 
             // sp_execute @handle, values...
@@ -811,11 +884,11 @@ impl TdsConnection {
                         codes::ER_WRONG_ARGUMENTS,
                         "Could not find the prepared statement for this handle",
                     );
-                    return Ok(None);
+                    return Ok(outcome);
                 };
-                self.execute_prepared(&prepared, params.get(1..).unwrap_or(&[]))
+                outcome.rolled_back = self
+                    .execute_prepared(&prepared, params.get(1..).unwrap_or(&[]))
                     .await?;
-                Ok(None)
             }
 
             // sp_unprepare @handle
@@ -836,7 +909,6 @@ impl TdsConnection {
                         "Could not find the prepared statement for this handle",
                     ),
                 }
-                Ok(None)
             }
 
             Procedure::Other(name) => {
@@ -844,12 +916,12 @@ impl TdsConnection {
                     codes::ER_SP_DOES_NOT_EXIST,
                     &format!("Could not find stored procedure '{}'.", name),
                 );
-                Ok(None)
             }
         }
+        Ok(outcome)
     }
 
-    /// Prepare a statement whose parameters are declared in `declaration`.
+    /// Prepare text whose parameters are declared in `declaration`.
     /// Returns `None` if the statement was refused (the error is already
     /// reported).
     async fn prepare(
@@ -861,28 +933,22 @@ impl TdsConnection {
         if names.is_empty() {
             return Ok(Some(Prepared::Text(sql.to_string())));
         }
-        // Apply the driver shims to the statement text. A statement the
-        // shims answer themselves takes no parameters.
-        let sql = {
-            let session = &self.engine.session;
-            let action = translate(
-                sql,
-                &ShimContext {
-                    connection_id: self.connection_id,
-                    in_transaction: session.in_transaction(),
-                    database: session.database.as_deref().unwrap_or(DEFAULT_DATABASE),
-                    user: &session.user,
-                    product_version: PRODUCT_VERSION,
-                },
-            );
-            match action {
-                Action::Run(sql) => sql,
-                Action::Accept | Action::Refuse(_) => {
-                    return Ok(Some(Prepared::Text(sql.to_string())))
-                }
+
+        // Only a single statement that the shims leave untouched can be
+        // prepared once. Anything else depends on the session at the time
+        // it runs, or is several statements.
+        let statements = split_batch(sql);
+        let plain = match statements.as_slice() {
+            [only] if is_plain(only, &self.shim_context()) => only,
+            _ => {
+                return Ok(Some(Prepared::Dynamic {
+                    sql: sql.to_string(),
+                    names,
+                }))
             }
         };
-        let (bound_sql, order) = bind_parameters(&sql, &names);
+
+        let (bound_sql, order) = bind_parameters(plain, &names);
         match self.engine.prepared_stmts.prepare(&bound_sql) {
             Ok(statement) => Ok(Some(Prepared::Bound {
                 statement_id: statement.id,
@@ -896,23 +962,10 @@ impl TdsConnection {
         }
     }
 
-    /// Execute a prepared statement with the parameter values of a call.
-    /// Values are matched to parameters by name, or by position when
-    /// unnamed, and bound as typed values.
-    async fn execute_prepared(
-        &mut self,
-        prepared: &Prepared,
-        values: &[RpcParam],
-    ) -> Result<(), TdsError> {
-        let (statement_id, names, order) = match prepared {
-            Prepared::Text(sql) => return self.run_sql(sql).await.map(|_| ()),
-            Prepared::Bound {
-                statement_id,
-                names,
-                order,
-            } => (*statement_id, names, order),
-        };
-
+    /// Match the parameter values of a call to the declared parameters,
+    /// by name or by position when unnamed. Returns one value per
+    /// declared name, or `None` after refusing a wrong argument list.
+    fn match_values(&mut self, names: &[String], values: &[RpcParam]) -> Option<Vec<Datum>> {
         let mut bound: Vec<Option<Datum>> = vec![None; names.len()];
         let mut next_position = 0;
         for param in values {
@@ -929,7 +982,7 @@ impl TdsConnection {
                             codes::ER_WRONG_ARGUMENTS,
                             &format!("{} is not a parameter of this statement", param.name),
                         );
-                        return Ok(());
+                        return None;
                     }
                 }
             };
@@ -940,7 +993,7 @@ impl TdsConnection {
                         codes::ER_WRONG_ARGUMENTS,
                         "Too many parameter values for this statement",
                     );
-                    return Ok(());
+                    return None;
                 }
             }
         }
@@ -949,20 +1002,41 @@ impl TdsConnection {
                 codes::ER_WRONG_ARGUMENTS,
                 &format!("Parameter {} was not supplied", names[missing]),
             );
-            return Ok(());
+            return None;
         }
+        Some(bound.into_iter().flatten().collect())
+    }
 
-        // One value per placeholder, in placeholder order
-        let args: Vec<Datum> = order
-            .iter()
-            .map(|index| bound[*index].clone().unwrap_or(Datum::Null))
-            .collect();
-        if let Err(e) = self.engine.execute_prepared(statement_id, &args).await {
-            let _ = self.engine.send_error_from_protocol_error(&e).await;
-            let _ = self.sink().finish(false).await;
-            return Err(e.into());
+    /// Execute a prepared statement with the parameter values of a call,
+    /// bound as typed values. Returns whether a rollback ended a
+    /// transaction.
+    async fn execute_prepared(
+        &mut self,
+        prepared: &Prepared,
+        values: &[RpcParam],
+    ) -> Result<bool, TdsError> {
+        match prepared {
+            Prepared::Text(sql) => self.run_sql(sql).await,
+            Prepared::Dynamic { sql, names } => {
+                let Some(args) = self.match_values(names, values) else {
+                    return Ok(false);
+                };
+                self.run_statements(sql, Some((names, &args))).await
+            }
+            Prepared::Bound {
+                statement_id,
+                names,
+                order,
+            } => {
+                let Some(by_name) = self.match_values(names, values) else {
+                    return Ok(false);
+                };
+                // One value per placeholder, in placeholder order
+                let args: Vec<Datum> = order.iter().map(|i| by_name[*i].clone()).collect();
+                self.execute_bound(*statement_id, &args).await?;
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     /// Forget the sp_executesql statement cache, releasing its statements.

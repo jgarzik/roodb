@@ -478,3 +478,133 @@ async fn test_prepare_execute_unprepare() {
     assert!(errors(&tokens).is_empty(), "{tokens:?}");
     server.shutdown().await;
 }
+
+/// Parameterised text that the driver shims also touch: several
+/// statements, a leading session option, probes that depend on session
+/// state. Parameter values must still be bound and probes must be
+/// current.
+#[tokio::test]
+async fn test_parameterised_batches_and_probes() {
+    let server = TestServer::start("tds_rpc_batch").await;
+    for (encryption, name) in TRANSPORTS {
+        let mut client = connect(&server, encryption).await;
+        let table = format!("tds_rpcb_{name}");
+        run(&mut client, format!("DROP TABLE IF EXISTS {table}")).await;
+        run(
+            &mut client,
+            format!("CREATE TABLE {table} (id INT PRIMARY KEY, v VARCHAR(50))"),
+        )
+        .await;
+
+        // The shape ORMs send: a session option, then the statement
+        client
+            .execute(
+                format!("SET NOCOUNT ON; INSERT INTO {table} VALUES (@P1, @P2)").as_str(),
+                &[&1i32, &"one"],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: option + insert failed: {e}"));
+
+        // Several statements sharing the parameters, in a transaction
+        client
+            .execute(
+                format!(
+                    "BEGIN TRAN; INSERT INTO {table} VALUES (@P1, @P2); \
+                     UPDATE {table} SET v = @P2 WHERE id = 1; COMMIT TRAN"
+                )
+                .as_str(),
+                &[&2i32, &"two"],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: parameterised batch failed: {e}"));
+
+        let rows = client
+            .simple_query(format!("SELECT id, v FROM {table} ORDER BY id"))
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        let got: Vec<(i32, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<i32, _>(0).unwrap(),
+                    r.get::<&str, _>(1).unwrap_or("<NULL>").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, "two".to_string()), (2, "two".to_string())],
+            "{name}: values were bound in every statement"
+        );
+
+        // A probe in a parameterised statement reflects the session now,
+        // not when the statement was first seen.
+        let probe = "SELECT @@TRANCOUNT, @P1";
+        let trancount = |rows: &[tiberius::Row]| format!("{:?}", rows[0].cells().next().unwrap().1);
+        let rows = client
+            .query(probe, &[&1i32])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert!(
+            trancount(&rows).contains('0'),
+            "{name}: {}",
+            trancount(&rows)
+        );
+        run(&mut client, "BEGIN TRAN".to_string()).await;
+        let rows = client
+            .query(probe, &[&1i32])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert!(
+            trancount(&rows).contains('1'),
+            "{name}: {}",
+            trancount(&rows)
+        );
+        run(&mut client, "ROLLBACK".to_string()).await;
+
+        run(&mut client, format!("DROP TABLE {table}")).await;
+    }
+    server.shutdown().await;
+}
+
+/// A rollback issued through an RPC is reported as a rollback.
+#[tokio::test]
+async fn test_rollback_through_rpc_is_reported_as_rollback() {
+    let server = TestServer::start("tds_rpc_rollback").await;
+    let mut client = RawTds::login_root(&server).await;
+
+    let tokens = client.batch("BEGIN TRAN").await;
+    assert_eq!(env_changes(&tokens), vec![ENV_BEGIN_TRAN], "{tokens:?}");
+    let tokens = client
+        .rpc(
+            SP_EXECUTESQL,
+            &[rpc_param(
+                "",
+                false,
+                &nvarchar_value("IF @@TRANCOUNT > 0 ROLLBACK TRAN"),
+            )],
+        )
+        .await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    assert_eq!(env_changes(&tokens), vec![ENV_ROLLBACK_TRAN], "{tokens:?}");
+
+    let tokens = client.batch("BEGIN TRAN").await;
+    assert_eq!(env_changes(&tokens), vec![ENV_BEGIN_TRAN]);
+    let tokens = client
+        .rpc(
+            SP_EXECUTESQL,
+            &[rpc_param("", false, &nvarchar_value("COMMIT TRAN"))],
+        )
+        .await;
+    assert_eq!(env_changes(&tokens), vec![ENV_COMMIT_TRAN], "{tokens:?}");
+    server.shutdown().await;
+}

@@ -33,16 +33,13 @@ const ACCEPTED_SET_OPTIONS: &[&str] = &[
     "DATEFIRST",
     "DATEFORMAT",
     "DEADLOCK_PRIORITY",
-    "FMTONLY",
     "LANGUAGE",
     "LOCK_TIMEOUT",
     "NOCOUNT",
-    "NOEXEC",
     "NO_BROWSETABLE",
     "NUMERIC_ROUNDABORT",
     "QUERY_GOVERNOR_COST_LIMIT",
     "QUOTED_IDENTIFIER",
-    "ROWCOUNT",
     "TEXTSIZE",
     "XACT_ABORT",
 ];
@@ -107,7 +104,8 @@ fn regions(sql: &str) -> Vec<(char, Region)> {
                     }
                 }
             }
-            '-' if chars.get(i + 1) == Some(&'-') => {
+            // `-- ` and `#` comments run to the end of the line
+            '#' | '-' if c == '#' || chars.get(i + 1) == Some(&'-') => {
                 while i < chars.len() {
                     out.push((chars[i], Region::Comment));
                     i += 1;
@@ -117,21 +115,17 @@ fn regions(sql: &str) -> Vec<(char, Region)> {
                 }
             }
             '/' if chars.get(i + 1) == Some(&'*') => {
+                // The closing `*/` cannot overlap the opening `/*`, so
+                // `/*/` is still an open comment.
+                let body = i + 2;
                 out.push(('/', Region::Comment));
                 out.push(('*', Region::Comment));
-                i += 2;
+                i = body;
                 while i < chars.len() {
                     out.push((chars[i], Region::Comment));
                     i += 1;
-                    if chars[i - 1] == '/' && chars[i - 2] == '*' && out.len() > 3 {
-                        // "/*/" is not a complete comment
-                        let body_start = out
-                            .iter()
-                            .rposition(|(_, r)| *r != Region::Comment)
-                            .map_or(0, |p| p + 1);
-                        if out.len() - body_start >= 4 {
-                            break;
-                        }
+                    if chars[i - 1] == '/' && i - 2 >= body && chars[i - 2] == '*' {
+                        break;
                     }
                 }
             }
@@ -149,7 +143,13 @@ fn regions(sql: &str) -> Vec<(char, Region)> {
 /// A routine definition (`CREATE PROCEDURE/FUNCTION/TRIGGER`) contains
 /// semicolons in its body and is kept whole.
 pub fn split_batch(sql: &str) -> Vec<String> {
-    let words: Vec<String> = sql
+    let marked = regions(sql);
+    // The first words of the statement, comments aside
+    let code: String = marked
+        .iter()
+        .map(|(c, region)| if *region == Region::Comment { ' ' } else { *c })
+        .collect();
+    let words: Vec<String> = code
         .split_whitespace()
         .take(8)
         .map(str::to_uppercase)
@@ -165,7 +165,7 @@ pub fn split_batch(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut has_code = false;
-    for (c, region) in regions(sql) {
+    for (c, region) in marked {
         if region == Region::Code && c == ';' {
             if has_code {
                 statements.push(current.trim().to_string());
@@ -306,48 +306,95 @@ fn rewrite_probes(sql: &str, ctx: &ShimContext<'_>) -> String {
     out
 }
 
+/// If `statement` starts with the guard `IF @@TRANCOUNT > 0`, return the
+/// statement it guards, exactly as written.
+fn strip_guard(statement: &str) -> Option<&str> {
+    fn word<'a>(text: &'a str, expected: &str) -> Option<&'a str> {
+        let head = text.get(..expected.len())?;
+        head.eq_ignore_ascii_case(expected)
+            .then(|| &text[expected.len()..])
+    }
+    let rest = word(statement.trim_start(), "IF")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = word(rest.trim_start(), "@@TRANCOUNT")?;
+    let rest = rest.trim_start().strip_prefix('>')?;
+    let rest = rest.trim_start().strip_prefix('0')?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let guarded = rest.trim_start();
+    (!guarded.is_empty()).then_some(guarded)
+}
+
 /// Decide how to carry out one statement.
 pub fn translate(statement: &str, ctx: &ShimContext<'_>) -> Action {
-    // Compare on upper-cased words, with `>` split off so that
-    // `@@TRANCOUNT>0` and `@@TRANCOUNT > 0` read the same.
-    let spaced = statement.trim().trim_end_matches(';').replace('>', " > ");
-    let upper: Vec<String> = spaced.split_whitespace().map(str::to_uppercase).collect();
+    let mut text = statement.trim().trim_end_matches(';').trim_end();
+
+    // `IF @@TRANCOUNT > 0 <statement>`: outside a transaction there is
+    // nothing to do; inside one, the guarded statement runs as written.
+    while let Some(guarded) = strip_guard(text) {
+        if !ctx.in_transaction {
+            return Action::Accept;
+        }
+        text = guarded;
+    }
+
+    // The leading words decide; a handful is enough for every pattern.
+    let upper: Vec<String> = text
+        .split_whitespace()
+        .take(6)
+        .map(str::to_uppercase)
+        .collect();
     let words: Vec<&str> = upper.iter().map(String::as_str).collect();
+    let word_count = text.split_whitespace().take(7).count();
     let is_tran = |w: &str| matches!(w, "TRAN" | "TRANSACTION");
 
-    match words.as_slice() {
+    match (words.as_slice(), word_count) {
         // Transactions, optionally named
-        ["BEGIN", t, ..] if is_tran(t) => Action::Run("BEGIN".to_string()),
-        ["COMMIT"] | ["COMMIT", "WORK"] => Action::Run("COMMIT".to_string()),
-        ["COMMIT", t, ..] if is_tran(t) => Action::Run("COMMIT".to_string()),
-        ["ROLLBACK"] | ["ROLLBACK", "WORK"] => Action::Run("ROLLBACK".to_string()),
-        ["ROLLBACK", t] if is_tran(t) => Action::Run("ROLLBACK".to_string()),
+        (["BEGIN", t, ..], _) if is_tran(t) => Action::Run("BEGIN".to_string()),
+        (["COMMIT"] | ["COMMIT", "WORK"], _) => Action::Run("COMMIT".to_string()),
+        (["COMMIT", t, ..], _) if is_tran(t) => Action::Run("COMMIT".to_string()),
+        (["ROLLBACK"] | ["ROLLBACK", "WORK"], _) => Action::Run("ROLLBACK".to_string()),
+        (["ROLLBACK", t], _) if is_tran(t) => Action::Run("ROLLBACK".to_string()),
         // A named rollback is a rollback to a savepoint
-        ["ROLLBACK", t, _name] if is_tran(t) => Action::Refuse("Savepoints are not supported"),
-        ["SAVE", t, ..] if is_tran(t) => Action::Refuse("Savepoints are not supported"),
-
-        // `IF @@TRANCOUNT > 0 <statement>`
-        ["IF", "@@TRANCOUNT", ">", "0", rest @ ..] if !rest.is_empty() => {
-            if ctx.in_transaction {
-                translate(&rest.join(" "), ctx)
-            } else {
-                Action::Accept
-            }
-        }
+        (["ROLLBACK", t, _name], _) if is_tran(t) => Action::Refuse("Savepoints are not supported"),
+        (["SAVE", t, ..], _) if is_tran(t) => Action::Refuse("Savepoints are not supported"),
 
         // Implicit transactions are the inverse of autocommit
-        ["SET", "IMPLICIT_TRANSACTIONS", "ON"] => Action::Run("SET autocommit = 0".to_string()),
-        ["SET", "IMPLICIT_TRANSACTIONS", "OFF"] => Action::Run("SET autocommit = 1".to_string()),
+        (["SET", "IMPLICIT_TRANSACTIONS", "ON"], _) => {
+            Action::Run("SET autocommit = 0".to_string())
+        }
+        (["SET", "IMPLICIT_TRANSACTIONS", "OFF"], _) => {
+            Action::Run("SET autocommit = 1".to_string())
+        }
 
         // Snapshot isolation is served by the repeatable-read snapshot
-        ["SET", "TRANSACTION", "ISOLATION", "LEVEL", "SNAPSHOT"] => {
+        (["SET", "TRANSACTION", "ISOLATION", "LEVEL", "SNAPSHOT"], _) => {
             Action::Run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_string())
         }
 
-        ["SET", option, ..] if ACCEPTED_SET_OPTIONS.contains(option) => Action::Accept,
+        // These change whether or how much statements execute. Turning
+        // them off is the normal state; turning them on cannot be
+        // acknowledged and then ignored.
+        (["SET", "FMTONLY" | "NOEXEC", "OFF"] | ["SET", "ROWCOUNT", "0"], 3) => Action::Accept,
+        (["SET", "FMTONLY" | "NOEXEC" | "ROWCOUNT", ..], _) => {
+            Action::Refuse("This session option is not supported")
+        }
 
-        _ => Action::Run(rewrite_probes(statement, ctx)),
+        (["SET", option, ..], _) if ACCEPTED_SET_OPTIONS.contains(option) => Action::Accept,
+
+        _ => Action::Run(rewrite_probes(text, ctx)),
     }
+}
+
+/// Whether the shims leave `statement` alone, whatever the session state:
+/// it is not one of the driver statements and uses no probe. Only such a
+/// statement can be prepared once and reused.
+pub fn is_plain(statement: &str, ctx: &ShimContext<'_>) -> bool {
+    let text = statement.trim().trim_end_matches(';').trim_end();
+    strip_guard(text).is_none() && translate(text, ctx) == Action::Run(text.to_string())
 }
 
 #[cfg(test)]
@@ -569,6 +616,106 @@ mod tests {
             translate("SELECT DB_NAME(), SUSER_NAME()", &c),
             run("SELECT 'we''ird\\\\db', 'o''brien'")
         );
+    }
+
+    #[test]
+    fn hash_comments_are_comments() {
+        // A semicolon or quote inside a `#` comment is not code
+        assert_eq!(
+            split_batch("UPDATE t SET a = 1 # was 2; DELETE FROM log\n WHERE id = 5"),
+            ["UPDATE t SET a = 1 # was 2; DELETE FROM log\n WHERE id = 5"]
+        );
+        assert_eq!(
+            split_batch("SELECT 1 # don't\n; SELECT 2"),
+            ["SELECT 1 # don't", "SELECT 2"]
+        );
+        let c = ctx(true);
+        assert_eq!(translate("SELECT 1 # @@SPID", &c), run("SELECT 1 # @@SPID"));
+    }
+
+    #[test]
+    fn adjacent_block_comments_end_where_the_lexer_ends_them() {
+        // The second comment runs to the last `*/`; `/*/` does not close it.
+        assert_eq!(
+            split_batch("/**//*/ ; DROP TABLE t; */ SELECT 1"),
+            ["/**//*/ ; DROP TABLE t; */ SELECT 1"]
+        );
+        assert_eq!(split_batch("/*/ ; */ SELECT 1; SELECT 2").len(), 2);
+        // Many adjacent comments are handled in linear time
+        let many = "/**/".repeat(200_000);
+        assert_eq!(split_batch(&format!("{many} SELECT 1")).len(), 1);
+    }
+
+    #[test]
+    fn guards_keep_the_statement_text_and_do_not_recurse() {
+        let c = ctx(true);
+        // The guarded statement is run exactly as written
+        assert_eq!(
+            translate(
+                "IF @@TRANCOUNT > 0 INSERT INTO log VALUES ('Mixed Case')",
+                &c
+            ),
+            run("INSERT INTO log VALUES ('Mixed Case')")
+        );
+        assert_eq!(
+            translate("if @@trancount>0 UPDATE t SET x = 1 WHERE a >= 2", &c),
+            run("UPDATE t SET x = 1 WHERE a >= 2")
+        );
+        // Thousands of nested guards neither overflow the stack nor
+        // take quadratic time
+        let nested = format!("{}COMMIT", "IF @@TRANCOUNT > 0 ".repeat(50_000));
+        assert_eq!(translate(&nested, &c), run("COMMIT"));
+        assert_eq!(translate(&nested, &ctx(false)), Action::Accept);
+    }
+
+    #[test]
+    fn routine_definition_after_a_comment_is_not_split() {
+        for sql in [
+            "/* v2 */ CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+            "-- header\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+            "# header\ncreate trigger t after insert on x for each row begin set @a = 1; end",
+        ] {
+            assert_eq!(split_batch(sql), [sql], "{sql}");
+        }
+        // A comment that merely mentions a routine does not disable splitting
+        assert_eq!(
+            split_batch("/* CREATE PROCEDURE */ SELECT 1; SELECT 2").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn options_that_change_execution_are_not_silently_accepted() {
+        let c = ctx(false);
+        // Turning them off is the default state and harmless
+        for sql in ["SET FMTONLY OFF", "SET NOEXEC OFF", "SET ROWCOUNT 0"] {
+            assert_eq!(translate(sql, &c), Action::Accept, "{sql}");
+        }
+        // Turning them on would mean "do not execute" or "limit rows";
+        // acknowledging that and executing anyway would be wrong.
+        for sql in ["SET FMTONLY ON", "SET NOEXEC ON", "SET ROWCOUNT 10"] {
+            assert!(matches!(translate(sql, &c), Action::Refuse(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn session_dependence_is_detected() {
+        let c = ctx(false);
+        for sql in [
+            "SELECT @@TRANCOUNT, @p1",
+            "SELECT DB_NAME()",
+            "IF @@TRANCOUNT > 0 COMMIT",
+            "SET NOCOUNT ON",
+            "BEGIN TRAN",
+        ] {
+            assert!(!is_plain(sql, &c), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE id = @p1",
+            "INSERT INTO t VALUES (@a, '@@SPID')",
+        ] {
+            assert!(is_plain(sql, &c), "{sql}");
+        }
     }
 
     #[test]
