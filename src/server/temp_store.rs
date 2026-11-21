@@ -190,6 +190,8 @@ impl SessionStorage {
             };
             let new = match (&change.op, &change.value) {
                 (ChangeOp::Delete, _) => 0,
+                // INSERT IGNORE leaves a row that is already there as it is.
+                (ChangeOp::Insert, _) if ignore_duplicates && old > 0 => old,
                 (_, Some(value)) => key.len() + value.len() + crate::raft::MVCC_HEADER_SIZE,
                 (_, None) => old,
             };
