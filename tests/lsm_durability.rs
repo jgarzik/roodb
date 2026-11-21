@@ -503,3 +503,97 @@ async fn reopening_after_a_crash_at_any_point_loses_nothing_flushed() {
         engine.close().await.unwrap();
     }
 }
+
+/// Memtables are flushed in the background once they fill; memory does not
+/// grow without bound waiting for someone to call flush().
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_memtables_are_flushed_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        // A 1 MiB budget gives a 512 KiB memtable.
+        total_cache_bytes: 1 << 20,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    // 8 MiB of writes and no explicit flush.
+    for i in 0..8000 {
+        engine
+            .put(format!("key{i:06}").as_bytes(), &[5u8; 1000])
+            .await
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while sst_files(dir.path()).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing was flushed in the background"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for i in (0..8000).step_by(97) {
+        assert_eq!(
+            engine.get(format!("key{i:06}").as_bytes()).await.unwrap(),
+            Some(vec![5u8; 1000])
+        );
+    }
+    engine.close().await.unwrap();
+}
+
+/// Writers that outrun the flusher wait for it instead of piling memtables
+/// up in memory, and every write still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn writers_wait_for_the_flusher_and_lose_nothing() {
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 3000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        // A 256 KiB memtable against ~48 MiB of writes: hundreds of
+        // rotations, far more than the frozen-memtable limit.
+        total_cache_bytes: 512 * 1024,
+        ..config(dir.path())
+    };
+    let engine = Arc::new(LsmEngine::open(io(), cfg.clone()).await.unwrap());
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                for i in 0..PER_WRITER {
+                    let key = format!("w{w}-{i:06}");
+                    engine.put(key.as_bytes(), &[w as u8; 2000]).await.unwrap();
+                }
+            })
+        })
+        .collect();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        for writer in writers {
+            writer.await.unwrap();
+        }
+    })
+    .await
+    .expect("writers stalled forever");
+
+    for w in 0..WRITERS {
+        for i in (0..PER_WRITER).step_by(53) {
+            let key = format!("w{w}-{i:06}");
+            assert_eq!(
+                engine.get(key.as_bytes()).await.unwrap(),
+                Some(vec![w as u8; 2000]),
+                "{key}"
+            );
+        }
+    }
+    engine.close().await.unwrap();
+    drop(engine);
+
+    // Everything is on disk after close.
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    for w in 0..WRITERS {
+        let last = format!("w{w}-{:06}", PER_WRITER - 1);
+        assert_eq!(
+            engine.get(last.as_bytes()).await.unwrap(),
+            Some(vec![w as u8; 2000])
+        );
+    }
+    engine.close().await.unwrap();
+}

@@ -16,11 +16,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::task::JoinHandle;
 
 use crate::io::{IoEngine, Urgency};
 use crate::storage::error::{StorageError, StorageResult};
@@ -41,6 +42,14 @@ pub const DEFAULT_TOTAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Minimum block cache size to prevent starvation under heavy write pressure
 const MIN_BLOCK_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Frozen memtables allowed to wait for the background flusher. At this many,
+/// writers pause until one has been written out, which bounds memory when
+/// writes outrun the disk.
+const MAX_FROZEN_MEMTABLES: usize = 4;
+
+/// How long the background worker waits before retrying after a failure.
+const BACKGROUND_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A point at which a flush or compaction can be made to stop, leaving the
 /// directory as a crash at that moment would. Used by tests that reopen the
@@ -95,8 +104,16 @@ struct ReadSources {
     tables: Vec<Arc<SstableReader>>,
 }
 
-/// LSM-Tree storage engine
+/// LSM-Tree storage engine.
+///
+/// A background task writes frozen memtables out and compacts; it stops when
+/// the engine is closed or dropped.
 pub struct LsmEngine {
+    inner: Arc<Inner>,
+    worker: parking_lot::Mutex<Option<JoinHandle<()>>>,
+}
+
+struct Inner {
     io: IoEngine,
     /// Active memtable for writes (wrapped in RwLock for atomic rotation)
     memtable: RwLock<Arc<Memtable>>,
@@ -122,6 +139,17 @@ pub struct LsmEngine {
     reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader>>>,
     limits: CompactionLimits,
     crash_point: Option<CrashPoint>,
+    /// Wakes the background worker: a memtable was frozen, or it is time to
+    /// stop. Shared with the worker, which otherwise holds the engine only
+    /// weakly so that dropping the engine lets it go.
+    work: Arc<Notify>,
+    /// Signalled each time a frozen memtable has been written out.
+    flushed: Notify,
+    /// The last background flush or compaction failed with this error. Paused
+    /// writers report it instead of waiting on a disk that is not coming back.
+    background_error: parking_lot::Mutex<Option<String>>,
+    /// The worker should exit.
+    stopping: AtomicBool,
     /// Closed flag
     closed: AtomicBool,
 }
@@ -129,6 +157,73 @@ pub struct LsmEngine {
 impl LsmEngine {
     /// Open the engine on a directory, creating it if needed.
     pub async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
+        let inner = Arc::new(Inner::open(io, config).await?);
+        let worker = tokio::spawn(background_worker(
+            Arc::downgrade(&inner),
+            Arc::clone(&inner.work),
+        ));
+        Ok(Self {
+            inner,
+            worker: parking_lot::Mutex::new(Some(worker)),
+        })
+    }
+
+    /// Current block cache capacity in bytes (for testing/observability).
+    pub fn block_cache_capacity(&self) -> usize {
+        self.inner.block_cache.capacity()
+    }
+
+    /// Stop the background worker and wait for it to finish what it is doing.
+    async fn stop_worker(&self) {
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        self.inner.work.notify_one();
+        let worker = self.worker.lock().take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+        }
+    }
+}
+
+impl Drop for LsmEngine {
+    fn drop(&mut self) {
+        // Without close(): tell the worker to go. It holds the engine only
+        // while working, so it will not keep the files open.
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        self.inner.work.notify_one();
+    }
+}
+
+/// Write frozen memtables out and compact, whenever woken.
+async fn background_worker(engine: Weak<Inner>, work: Arc<Notify>) {
+    loop {
+        work.notified().await;
+        loop {
+            let Some(inner) = engine.upgrade() else {
+                return;
+            };
+            if inner.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            match inner.background_pass().await {
+                Ok(()) => {
+                    *inner.background_error.lock() = None;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "background flush failed; will retry");
+                    *inner.background_error.lock() = Some(e.to_string());
+                    // Let paused writers see the error.
+                    inner.flushed.notify_waiters();
+                    drop(inner);
+                    tokio::time::sleep(BACKGROUND_RETRY).await;
+                }
+            }
+        }
+    }
+}
+
+impl Inner {
+    async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
         std::fs::create_dir_all(&config.dir)?;
 
         let manifest = Manifest::open(&config.dir)?;
@@ -180,6 +275,10 @@ impl LsmEngine {
                 level_base_bytes: config.level_base_bytes,
             },
             crash_point: config.crash_point,
+            work: Arc::new(Notify::new()),
+            flushed: Notify::new(),
+            background_error: parking_lot::Mutex::new(None),
+            stopping: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         })
     }
@@ -330,19 +429,15 @@ impl LsmEngine {
         }
     }
 
-    /// Current block cache capacity in bytes (for testing/observability).
-    pub fn block_cache_capacity(&self) -> usize {
-        self.block_cache.capacity()
-    }
-
     /// Apply writes to the active memtable as one unit.
     ///
     /// The memtable lock is held (shared) across every insert. Rotation takes
     /// it exclusively, so a memtable is never frozen and written out with part
     /// of a batch in it or while an insert is still on its way, and what
     /// reaches disk is always whole batches.
-    fn write(&self, batch: impl IntoIterator<Item = WriteOp>) -> StorageResult<()> {
+    async fn write(&self, batch: impl IntoIterator<Item = WriteOp>) -> StorageResult<()> {
         self.check_open()?;
+        self.wait_for_flusher().await?;
         // Refuse what the table format cannot hold before any of the batch is
         // applied, so a batch is never half written.
         let batch: Vec<WriteOp> = batch.into_iter().collect();
@@ -359,6 +454,35 @@ impl LsmEngine {
         if full {
             self.rotate(self.memtable_limit());
             self.rebalance_cache();
+            self.work.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Pause while too many frozen memtables are waiting to be written out.
+    async fn wait_for_flusher(&self) -> StorageResult<()> {
+        loop {
+            // Register for the wake-up before checking, so a flush that
+            // finishes in between is not missed.
+            let flushed = self.flushed.notified();
+            if self.imm_memtables.read().len() < MAX_FROZEN_MEMTABLES {
+                return Ok(());
+            }
+            if let Some(error) = self.background_error.lock().clone() {
+                return Err(StorageError::StdIo(std::io::Error::other(format!(
+                    "writes are paused: memtables cannot be flushed: {error}"
+                ))));
+            }
+            self.work.notify_one();
+            flushed.await;
+        }
+    }
+
+    /// One round of background work: write frozen memtables out, then compact.
+    async fn background_pass(&self) -> StorageResult<()> {
+        self.flush_frozen(Urgency::Background).await?;
+        if self.compaction_due() {
+            self.compact().await?;
         }
         Ok(())
     }
@@ -379,28 +503,32 @@ impl LsmEngine {
         self.imm_memtables.write().push(frozen);
     }
 
-    /// Write every memtable out, oldest first, then compact if due.
-    async fn flush_all(&self, urgency: Urgency) -> StorageResult<()> {
-        {
-            let _flushing = self.flush_lock.lock().await;
-            self.rotate(0);
-
-            // A memtable stays readable in `imm_memtables` until its table is
-            // on disk and in the manifest; only then is it removed.
-            loop {
-                let Some(oldest) = self.imm_memtables.read().first().cloned() else {
-                    break;
-                };
-                self.flush_memtable(&oldest, urgency).await?;
-                {
-                    let mut frozen = self.imm_memtables.write();
-                    if frozen.first().is_some_and(|m| Arc::ptr_eq(m, &oldest)) {
-                        frozen.remove(0);
-                    }
+    /// Write every frozen memtable out, oldest first.
+    async fn flush_frozen(&self, urgency: Urgency) -> StorageResult<()> {
+        let _flushing = self.flush_lock.lock().await;
+        // A memtable stays readable in `imm_memtables` until its table is on
+        // disk and in the manifest; only then is it removed.
+        loop {
+            let Some(oldest) = self.imm_memtables.read().first().cloned() else {
+                return Ok(());
+            };
+            self.flush_memtable(&oldest, urgency).await?;
+            {
+                let mut frozen = self.imm_memtables.write();
+                if frozen.first().is_some_and(|m| Arc::ptr_eq(m, &oldest)) {
+                    frozen.remove(0);
                 }
-                self.rebalance_cache();
             }
+            self.rebalance_cache();
+            self.flushed.notify_waiters();
         }
+    }
+
+    /// Write everything in memory out - the active memtable included - then
+    /// compact if due.
+    async fn flush_all(&self, urgency: Urgency) -> StorageResult<()> {
+        self.rotate(0);
+        self.flush_frozen(urgency).await?;
         if self.compaction_due() {
             self.compact().await?;
         }
@@ -487,24 +615,11 @@ impl LsmEngine {
     }
 }
 
-#[async_trait]
-impl StorageEngine for LsmEngine {
+impl Inner {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.check_open()?;
         // A tombstone and a key that was never written read the same.
         Ok(self.read_all(key).await?.flatten())
-    }
-
-    async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        self.write(std::iter::once((key.to_vec(), Some(value.to_vec()))))
-    }
-
-    async fn delete(&self, key: &[u8]) -> StorageResult<()> {
-        self.write(std::iter::once((key.to_vec(), None)))
-    }
-
-    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
-        self.write(batch)
     }
 
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
@@ -542,21 +657,50 @@ impl StorageEngine for LsmEngine {
 
         Ok(result)
     }
+}
+
+#[async_trait]
+impl StorageEngine for LsmEngine {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        self.inner
+            .write(std::iter::once((key.to_vec(), Some(value.to_vec()))))
+            .await
+    }
+
+    async fn delete(&self, key: &[u8]) -> StorageResult<()> {
+        self.inner
+            .write(std::iter::once((key.to_vec(), None)))
+            .await
+    }
+
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+        self.inner.write(batch).await
+    }
+
+    async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
+        self.inner.scan(start, end).await
+    }
 
     async fn flush(&self) -> StorageResult<()> {
-        self.check_open()?;
-        self.flush_all(Urgency::Background).await
+        self.inner.check_open()?;
+        self.inner.flush_all(Urgency::Background).await
     }
 
     async fn flush_critical(&self) -> StorageResult<()> {
-        self.check_open()?;
-        self.flush_all(Urgency::Critical).await
+        self.inner.check_open()?;
+        self.inner.flush_all(Urgency::Critical).await
     }
 
     async fn close(&self) -> StorageResult<()> {
-        // Flush first, then mark as closed
-        self.flush_all(Urgency::Background).await?;
-        self.closed.store(true, Ordering::SeqCst);
+        // Stop background work, write out what is in memory, then refuse
+        // further use.
+        self.stop_worker().await;
+        self.inner.flush_all(Urgency::Background).await?;
+        self.inner.closed.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
