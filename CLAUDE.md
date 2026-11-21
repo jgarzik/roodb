@@ -2,7 +2,7 @@
 
 Rust SQL database: two wire protocols (MySQL-compatible, TDS) over one query engine, LSM storage, Raft log.
 
-Read on demand: `CONTRIBUTING.md` (layout, key types, query flow, tests, debugging), `design.md` (internals), `LOCKING.md`, `admin.md` (flags, deployment), `SQL.md` (supported SQL).
+Read on demand: `CONTRIBUTING.md` (layout, key types, query flow, tests, debugging), `design.md` (internals), `LOCKING.md`, `admin.md` (flags, deployment), `SQL.md` (supported SQL), `doc/ROADMAP.md` (remaining work, in order).
 
 ## Before every commit (non-negotiable)
 
@@ -17,6 +17,7 @@ cargo test --release
 
 - `#[allow(dead_code)]` is banned.
 - No commit may leave a document stale. In the same commit, update every doc the change affects: `SQL.md` whenever supported SQL changes; likewise `design.md`, `admin.md`, `LOCKING.md`, `README.md`, `CONTRIBUTING.md`, `CLAUDE.md`.
+- `doc/ROADMAP.md` is the plan. Phases have three-letter codes and are listed in the order they are done. When an item is finished, delete it from the file in the same commit; add newly found work to it. The file is empty when the work is done.
 
 ## Invariants
 

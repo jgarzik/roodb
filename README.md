@@ -76,6 +76,7 @@ cargo test --release
 | [design.md](design.md) | Architecture and per-module reference |
 | [LOCKING.md](LOCKING.md) | Locks and lock ordering |
 | [mtesting.md](mtesting.md) | MySQL test suite integration |
+| [doc/ROADMAP.md](doc/ROADMAP.md) | Work that remains, in order |
 
 ## Architecture
 
