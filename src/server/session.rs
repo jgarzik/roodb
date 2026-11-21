@@ -133,9 +133,6 @@ pub struct Session {
 
     /// Active SQL modes (e.g., NO_UNSIGNED_SUBTRACTION, STRICT_TRANS_TABLES)
     sql_modes: HashSet<String>,
-
-    /// Temporary table names owned by this session (cleaned up on disconnect)
-    temp_table_names: Vec<String>,
 }
 
 impl Session {
@@ -163,7 +160,6 @@ impl Session {
             // SQL modes — MySQL 8.0 defaults
             sql_modes: default_sql_modes(),
             // Temporary tables
-            temp_table_names: Vec::new(),
         }
     }
 
@@ -387,17 +383,5 @@ impl Session {
         let mut modes: Vec<&str> = self.sql_modes.iter().map(|s| s.as_str()).collect();
         modes.sort();
         modes.join(",")
-    }
-
-    // ============ Temporary Tables ============
-
-    /// Register a temporary table name for cleanup on disconnect
-    pub fn register_temp_table(&mut self, name: String) {
-        self.temp_table_names.push(name);
-    }
-
-    /// Take all temporary table names (called on disconnect for cleanup)
-    pub fn take_temp_tables(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.temp_table_names)
     }
 }

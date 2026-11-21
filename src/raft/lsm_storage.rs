@@ -32,19 +32,7 @@ use crate::raft::types::{
 use crate::storage::traits::WriteOp;
 use crate::storage::StorageEngine;
 
-use super::types::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
-
-/// Encode row data with MVCC header for storage
-///
-/// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data]
-fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
-    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
-    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR = 0 (no version chain)
-    result.push(if deleted { 1 } else { 0 }); // deleted flag
-    result.extend_from_slice(data);
-    result
-}
+use super::types::{encode_mvcc_row, is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
 /// Extract txn_id (version) from a stored row with MVCC header
 ///

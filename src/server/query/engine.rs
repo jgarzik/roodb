@@ -16,9 +16,10 @@ use crate::executor::{Datum, Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
-use crate::raft::{ChangeSet, RaftNode};
+use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::server::context::ServerContext;
 use crate::server::session::Session;
+use crate::server::temp_store::SessionStorage;
 use crate::sql::privileges::{
     check_privilege, GrantEntry, HostPattern, Privilege, PrivilegeObject, RequiredPrivilege,
 };
@@ -69,6 +70,9 @@ pub struct QueryEngine {
     pub(crate) prepared_stmts: PreparedStatementManager,
     /// Per-connection MVCC storage (avoids Arc::new per query)
     mvcc: Arc<MvccStorage>,
+    /// This session's view of storage: its temporary tables' rows are kept
+    /// here in memory, everything else is the shared engine.
+    temp: Arc<SessionStorage>,
     /// Implicit transactions of the autocommit statements now executing
     /// (a trigger body nests inside its statement); rolled back if the
     /// statement fails before committing them
@@ -85,10 +89,8 @@ impl QueryEngine {
         ctx: &ServerContext,
         out: Box<dyn ResponseSink>,
     ) -> Self {
-        let mvcc = Arc::new(MvccStorage::new(
-            ctx.storage.clone(),
-            ctx.txn_manager.clone(),
-        ));
+        let temp = Arc::new(SessionStorage::new(ctx.storage.clone()));
+        let mvcc = Arc::new(MvccStorage::new(temp.clone(), ctx.txn_manager.clone()));
         let session = Session::new(connection_id);
         session.init_eval_flags();
         Self {
@@ -101,6 +103,7 @@ impl QueryEngine {
             raft_node: ctx.raft_node.clone(),
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
+            temp,
             implicit_txns: Vec::new(),
             out,
         }
@@ -950,6 +953,15 @@ impl QueryEngine {
 
     /// Execute a physical plan and send results
     async fn execute_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+        // A temporary table lives in this session only: dropping it touches
+        // neither the log nor the system tables.
+        if let PhysicalPlan::DropTable { name, .. } = &plan {
+            if self.temp.remove_table(name) {
+                let _ = self.catalog.write().drop_table(name);
+                return self.send_ok(0, 0).await;
+            }
+        }
+
         // Check if this is a query that returns rows
         let returns_rows = matches!(
             plan,
@@ -1066,15 +1078,9 @@ impl QueryEngine {
                     self.session.add_pending_changes(changes);
                 } else {
                     // Autocommit: propose immediately
-                    let changeset = ChangeSet::new_with_changes_ignore(
-                        implicit_txn_id.unwrap_or(0),
-                        changes,
-                        ignore_dups,
-                    );
-                    self.raft_node
-                        .propose_changes(changeset)
+                    self.commit_changes(implicit_txn_id.unwrap_or(0), changes, ignore_dups)
                         .await
-                        .map_err(|e| ProtocolError::Raft(e.to_string()))?;
+                        .map_err(ProtocolError::Raft)?;
                 }
             }
 
@@ -1246,14 +1252,40 @@ impl QueryEngine {
         self.send_ok(0, 0).await
     }
 
+    /// Commit a transaction's row changes.
+    ///
+    /// Changes to ordinary tables go through Raft. Changes to this session's
+    /// temporary tables are applied here, in memory, once the rest has
+    /// committed; they are checked first so that a duplicate key in a
+    /// temporary table fails the commit before anything is proposed.
+    async fn commit_changes(
+        &mut self,
+        txn_id: u64,
+        changes: Vec<RowChange>,
+        ignore_duplicates: bool,
+    ) -> Result<(), String> {
+        let (temporary, shared) = self.temp.split(changes);
+        self.temp
+            .check(&temporary, ignore_duplicates)
+            .map_err(|e| format!("Raft error: {e}"))?;
+        if !shared.is_empty() {
+            let changeset = ChangeSet::new_with_changes_ignore(txn_id, shared, ignore_duplicates);
+            self.raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        self.temp.apply(txn_id, temporary, ignore_duplicates);
+        Ok(())
+    }
+
     /// Handle COMMIT
     async fn handle_commit(&mut self) -> ProtocolResult<()> {
         if let Some(txn_id) = self.session.current_txn {
             // First, propose any pending changes to Raft
             let changes = self.session.take_pending_changes();
             if !changes.is_empty() {
-                let changeset = ChangeSet::new_with_changes(txn_id, changes);
-                if let Err(e) = self.raft_node.propose_changes(changeset).await {
+                if let Err(e) = self.commit_changes(txn_id, changes, false).await {
                     // Raft proposal failed - rollback the transaction
                     self.session.end_transaction();
                     let _ = self.txn_manager.rollback(txn_id).await;
@@ -1673,24 +1705,12 @@ impl QueryEngine {
     /// Clean up temporary tables when the connection closes.
     /// Deletes data rows from storage and removes catalog entries.
     pub(crate) async fn cleanup_temp_tables(&mut self) {
-        let temp_tables = self.session.take_temp_tables();
+        // The rows were only ever in this session's memory; dropping them
+        // is all there is to do, besides forgetting the tables.
+        let temp_tables = self.temp.clear();
         if temp_tables.is_empty() {
             return;
         }
-
-        // First pass: delete data rows from storage (async, no catalog lock)
-        let storage = self.mvcc.inner().clone();
-        for name in &temp_tables {
-            let prefix = crate::executor::encoding::table_key_prefix(name);
-            let end = crate::executor::encoding::table_key_end(name);
-            if let Ok(rows) = storage.scan(Some(&prefix), Some(&end)).await {
-                for (key, _) in rows {
-                    let _ = storage.delete(&key).await;
-                }
-            }
-        }
-
-        // Second pass: drop all catalog entries under a single lock
         {
             let mut catalog = self.catalog.write();
             for name in &temp_tables {
@@ -1705,8 +1725,9 @@ impl QueryEngine {
         );
     }
 
-    /// Handle CREATE TEMPORARY TABLE — creates table in catalog without Raft persistence.
-    /// Temporary tables are session-scoped and cleaned up on disconnect.
+    /// Handle CREATE TEMPORARY TABLE. The table is known to the catalog but
+    /// not to the system tables, and its rows are kept in this session's
+    /// memory: nothing about it is logged or replicated.
     async fn try_handle_create_temporary_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         let upper = sql.trim().to_uppercase();
         if !upper.starts_with("CREATE TEMPORARY TABLE ") {
@@ -1806,8 +1827,8 @@ impl QueryEngine {
             Ok(false) => {} // success, continue
         }
 
-        // Register in session for cleanup on disconnect
-        self.session.register_temp_table(name);
+        // Its rows are kept in this session from here on.
+        self.temp.add_table(&name);
 
         self.send_ok(0, 0).await.map(|_| Some(()))
     }
@@ -5560,15 +5581,8 @@ impl QueryEngine {
             if self.session.in_transaction() {
                 self.session.add_pending_changes(changes);
             } else {
-                let changeset = ChangeSet::new_with_changes_ignore(
-                    implicit_txn_id.unwrap_or(0),
-                    changes,
-                    ignore_dups,
-                );
-                self.raft_node
-                    .propose_changes(changeset)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                self.commit_changes(implicit_txn_id.unwrap_or(0), changes, ignore_dups)
+                    .await?;
             }
         }
 

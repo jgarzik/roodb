@@ -41,6 +41,18 @@ pub const MVCC_HEADER_SIZE: usize = 17;
 /// Byte offset of the deleted/tombstone flag within the MVCC header
 pub const MVCC_DELETED_OFFSET: usize = 16;
 
+/// Encode row data with its MVCC header, as rows are stored.
+///
+/// Format: [DB_TRX_ID:8][DB_ROLL_PTR:8][deleted:1][row_data]
+pub fn encode_mvcc_row(txn_id: u64, deleted: bool, data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(MVCC_HEADER_SIZE + data.len());
+    result.extend_from_slice(&txn_id.to_le_bytes()); // DB_TRX_ID
+    result.extend_from_slice(&0u64.to_le_bytes()); // DB_ROLL_PTR = 0 (no version chain)
+    result.push(u8::from(deleted));
+    result.extend_from_slice(data);
+    result
+}
+
 /// Check whether an MVCC-encoded row is a tombstone (deleted).
 pub fn is_mvcc_tombstone(data: &[u8]) -> bool {
     data.len() > MVCC_DELETED_OFFSET && data[MVCC_DELETED_OFFSET] == 1

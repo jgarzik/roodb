@@ -383,3 +383,82 @@ async fn a_table_recreated_before_a_kill_is_the_new_one() {
         .await
         .unwrap();
 }
+
+/// A temporary table's rows belong to its session and are gone with it.
+/// After a kill, an ordinary table created under the same name is empty.
+#[tokio::test]
+async fn temporary_table_rows_do_not_outlive_their_session() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("CREATE TABLE real_t (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TEMPORARY TABLE tmp (id INT PRIMARY KEY, v VARCHAR(20))")
+        .await
+        .unwrap();
+    for id in 0..100 {
+        conn.query_drop(format!("INSERT INTO tmp VALUES ({id}, 'temp')"))
+            .await
+            .unwrap();
+    }
+    // Temporary and ordinary rows changed in one transaction.
+    conn.query_drop("BEGIN").await.unwrap();
+    conn.query_drop("INSERT INTO real_t VALUES (1, 1)")
+        .await
+        .unwrap();
+    conn.query_drop("UPDATE tmp SET v = 'changed' WHERE id < 10")
+        .await
+        .unwrap();
+    conn.query_drop("DELETE FROM tmp WHERE id >= 90")
+        .await
+        .unwrap();
+    conn.query_drop("COMMIT").await.unwrap();
+    let count: i64 = conn
+        .query_first("SELECT COUNT(*) FROM tmp")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 90);
+    let changed: i64 = conn
+        .query_first("SELECT COUNT(*) FROM tmp WHERE v = 'changed'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed, 10);
+    // A duplicate key in a temporary table is still an error.
+    assert!(conn
+        .query_drop("INSERT INTO tmp VALUES (5, 'dup')")
+        .await
+        .is_err());
+
+    // Another session does not see the rows.
+    let mut other = connect(&server).await;
+    let seen: Result<Vec<(i32, String)>, _> = other.query("SELECT id, v FROM tmp").await;
+    if let Ok(rows) = seen {
+        assert!(rows.is_empty(), "another session saw temporary rows");
+    }
+    drop(other);
+    drop(conn);
+    server.kill();
+
+    server.start();
+    let mut conn = connect(&server).await;
+    let real: Vec<(i32, i32)> = conn.query("SELECT id, v FROM real_t").await.unwrap();
+    assert_eq!(real, [(1, 1)], "the ordinary half of the transaction");
+    conn.query_drop("CREATE TABLE tmp (id INT PRIMARY KEY, v VARCHAR(20))")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", server.log_tail()));
+    let ghosts: i64 = conn
+        .query_first("SELECT COUNT(*) FROM tmp")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ghosts, 0,
+        "rows of a dead session's temporary table came back"
+    );
+    conn.query_drop("INSERT INTO tmp VALUES (5, 'fresh')")
+        .await
+        .unwrap();
+}
