@@ -11,6 +11,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::io::{IoEngine, Urgency};
 use crate::storage::error::{StorageError, StorageResult};
+use crate::storage::lsm::block::check_entry_size;
 use crate::storage::lsm::block_cache::BlockCache;
 use crate::storage::lsm::compaction::{
     execute_l0_compaction, execute_level_compaction, finalize_l0_compaction,
@@ -95,26 +96,28 @@ impl LsmEngine {
             for info in &level.files {
                 let path = manifest.sstable_path(&info.name);
                 let cache_name: Arc<str> = info.name.as_str().into();
-                match SstableReader::open_with_cache(
+                // A table the manifest lists holds data nothing else has. If
+                // it is missing or damaged, refuse to start rather than serve
+                // what is left as if it were everything.
+                let reader = SstableReader::open_with_cache(
                     &io,
                     &path,
                     Urgency::Foreground,
                     Some(block_cache.clone()),
                 )
                 .await
-                {
-                    Ok(reader) => {
-                        let reader = Arc::new(reader);
-                        // Eager-load blocks for small SSTables (< 25% of budget)
-                        if info.size < (total_cache_bytes / 4) as u64 {
-                            let _ = reader.eager_load_blocks().await;
-                        }
-                        reader_map.insert(cache_name, reader);
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = ?path, error = %e, "Failed to warmup SSTable reader");
-                    }
+                .map_err(|e| {
+                    StorageError::Manifest(format!(
+                        "table {} listed in the manifest cannot be opened: {e}",
+                        path.display()
+                    ))
+                })?;
+                let reader = Arc::new(reader);
+                // Eager-load blocks for small SSTables (< 25% of budget)
+                if info.size < (total_cache_bytes / 4) as u64 {
+                    reader.eager_load_blocks().await?;
                 }
+                reader_map.insert(cache_name, reader);
             }
         }
 
@@ -371,6 +374,12 @@ impl LsmEngine {
     fn write(&self, batch: impl IntoIterator<Item = WriteOp>) -> StorageResult<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
+        }
+        // Refuse what the table format cannot hold before any of the batch is
+        // applied, so a batch is never half written.
+        let batch: Vec<WriteOp> = batch.into_iter().collect();
+        for (key, value) in &batch {
+            check_entry_size(key.len(), value.as_ref().map_or(0, Vec::len))?;
         }
         let full = {
             let memtable = self.memtable.read();

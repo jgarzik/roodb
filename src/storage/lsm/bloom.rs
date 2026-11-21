@@ -28,9 +28,20 @@ impl BloomFilter {
         }
     }
 
+    /// The pair of hashes a key is filed under. A writer that does not yet
+    /// know how many keys it will see can keep these and build the filter at
+    /// the end.
+    pub fn hash_key(key: &[u8]) -> (u64, u64) {
+        double_hash(key)
+    }
+
     /// Add a key to the bloom filter
     pub fn add(&mut self, key: &[u8]) {
-        let (h1, h2) = double_hash(key);
+        self.add_hash(double_hash(key));
+    }
+
+    /// Add a key by its hashes (see [`Self::hash_key`]).
+    pub fn add_hash(&mut self, (h1, h2): (u64, u64)) {
         for i in 0..self.num_hashes {
             let bit = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.num_bits as u64;
             self.bits[bit as usize / 8] |= 1 << (bit % 8);
