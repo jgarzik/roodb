@@ -343,6 +343,8 @@ struct Mem {
     size: u64,
     /// Highest entry index each segment holds.
     segment_last_index: BTreeMap<u64, Option<u64>>,
+    /// Size of each segment file.
+    segment_sizes: BTreeMap<u64, u64>,
 }
 
 impl Mem {
@@ -371,6 +373,9 @@ struct WriterShared {
     /// memory. Positions only move forward and are never reused, unlike entry
     /// indexes, which a truncation hands out again.
     written: Mutex<(u64, u64)>,
+    /// A spare segment is being prepared. Only one task does so at a time:
+    /// they would otherwise share the temporary file.
+    preparing_spare: std::sync::atomic::AtomicBool,
     /// The first write error. Once set, the log refuses further work.
     failed: Mutex<Option<String>>,
     counters: Counters,
@@ -453,39 +458,41 @@ async fn create_segment(io: &IoEngine, path: &Path, size: u64) -> io::Result<Fil
 
 /// Prepare a spare segment: a full-size file whose blocks have all been
 /// written, so that using it later involves no allocation in the filesystem.
-async fn prepare_spare(io: IoEngine, dir: PathBuf, size: u64) {
-    let tmp = dir.join(SPARE_TMP);
-    let spare = dir.join(SPARE_FILE);
-    if spare.exists() {
+/// Does nothing if another task is already preparing one.
+async fn prepare_spare(shared: Arc<WriterShared>) {
+    if shared.preparing_spare.swap(true, Ordering::SeqCst) {
         return;
     }
-    let _ = std::fs::remove_file(&tmp);
-    let result: io::Result<()> = async {
-        let file = create_segment(&io, &tmp, size).await?;
-        let chunk = 1 << 20;
-        let mut offset = 0;
-        while offset < size {
-            let len = chunk.min((size - offset) as usize);
-            let mut buf = AlignedBuffer::new(len)?;
-            buf.zero();
-            buf.set_len(len);
-            file.write_at(buf, offset, Urgency::Background)
-                .await
-                .map_err(io::Error::other)?;
-            offset += len as u64;
-        }
-        file.sync_data(Urgency::Background)
-            .await
-            .map_err(io::Error::other)?;
-        drop(file);
-        std::fs::rename(&tmp, &spare)?;
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "could not prepare a spare log segment");
+    let dir = &shared.config.dir;
+    let size = shared.config.segment_bytes;
+    let tmp = dir.join(SPARE_TMP);
+    let spare = dir.join(SPARE_FILE);
+    if !spare.exists() {
         let _ = std::fs::remove_file(&tmp);
+        let result: io::Result<()> = async {
+            let file = create_segment(&shared.io, &tmp, size).await?;
+            let chunk = 1 << 20;
+            let mut offset = 0;
+            while offset < size {
+                let len = chunk.min((size - offset) as usize);
+                let mut buf = AlignedBuffer::new(len)?;
+                buf.zero();
+                buf.set_len(len);
+                file.write_at(buf, offset, Urgency::Background).await?;
+                offset += len as u64;
+            }
+            file.sync_data(Urgency::Background).await?;
+            drop(file);
+            std::fs::rename(&tmp, &spare)?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not prepare a spare log segment");
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
+    shared.preparing_spare.store(false, Ordering::SeqCst);
 }
 
 /// The writer task: the only code that writes to segment files.
@@ -660,11 +667,7 @@ async fn roll(
     shared.counters.segments.fetch_add(1, Ordering::Relaxed);
 
     // Have the next one ready before it is needed.
-    tokio::spawn(prepare_spare(
-        shared.io.clone(),
-        dir.clone(),
-        shared.config.segment_bytes,
-    ));
+    tokio::spawn(prepare_spare(shared.clone()));
     Ok(WriterTail {
         file,
         page_offset: HEADER_SIZE as u64,
@@ -755,6 +758,7 @@ impl LogStore {
             config: config.clone(),
             files: Mutex::new(HashMap::new()),
             written: Mutex::new((0, 0)),
+            preparing_spare: std::sync::atomic::AtomicBool::new(false),
             failed: Mutex::new(None),
             counters: Counters::default(),
         });
@@ -772,6 +776,7 @@ impl LogStore {
             offset: HEADER_SIZE as u64,
             size: config.segment_bytes,
             segment_last_index: BTreeMap::new(),
+            segment_sizes: BTreeMap::new(),
         };
 
         let mut tail: Option<WriterTail> = None;
@@ -811,6 +816,7 @@ impl LogStore {
             }
 
             mem.segment_last_index.insert(seq, None);
+            mem.segment_sizes.insert(seq, size);
             let scan = Self::replay_segment(&mut mem, seq, &contents)?;
             // Every segment but the newest was closed with an End record
             // before its successor was started. (If the successor was never
@@ -869,12 +875,13 @@ impl LogStore {
                 mem.offset = HEADER_SIZE as u64;
                 mem.size = config.segment_bytes;
                 mem.segment_last_index.insert(seq, None);
+                mem.segment_sizes.insert(seq, config.segment_bytes);
                 tail
             }
         };
 
         tokio::spawn(writer_task(writer.clone(), rx, tail));
-        tokio::spawn(prepare_spare(io, config.dir.clone(), config.segment_bytes));
+        tokio::spawn(prepare_spare(writer.clone()));
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -961,7 +968,22 @@ impl LogStore {
                 }
             }
         }
-        mem.last_log_id = mem.slots.back().map(|s| s.log_id).or(mem.purged);
+        mem.last_log_id = match mem.slots.back() {
+            Some(slot) => Some(slot.log_id),
+            None => {
+                // Nothing is left in memory. Normally the log then ends at
+                // the purge point - but on replay the "purge point" may have
+                // been inferred from where the oldest surviving segment
+                // starts, and a truncation recorded in that segment can reach
+                // back before it. The truncation point is then the truth; the
+                // real purge record comes later in the stream.
+                let target = last_log_id.map(|id| id.index());
+                if mem.purged.map(|id| id.index()) > target {
+                    mem.purged = last_log_id;
+                }
+                mem.purged
+            }
+        };
         // Indexes past here will be handed out again; eviction must look at
         // the new entries, not skip them as already done.
         let next = mem.last_log_id.map_or(0, |id| id.index() + 1);
@@ -1059,6 +1081,7 @@ impl LogStore {
             mem.offset = HEADER_SIZE as u64;
             mem.size = size;
             mem.segment_last_index.insert(seq, None);
+            mem.segment_sizes.insert(seq, size);
         }
 
         let mut bytes = Vec::with_capacity(needed as usize);
@@ -1099,11 +1122,17 @@ impl LogStore {
         }
     }
 
-    /// Bytes the log's live segments occupy on disk.
+    /// Bytes of log on disk: every earlier segment in full, plus what has
+    /// been written of the current one.
     pub fn disk_bytes(&self) -> u64 {
         let mem = self.shared.mem.lock();
-        let earlier = mem.segment_last_index.len().saturating_sub(1) as u64;
-        earlier * self.shared.writer.config.segment_bytes + mem.offset
+        let earlier: u64 = mem
+            .segment_sizes
+            .iter()
+            .filter(|(seq, _)| **seq != mem.seq)
+            .map(|(_, size)| *size)
+            .sum();
+        earlier + mem.offset
     }
 
     /// Finish every write that has been queued and stop the writer.
@@ -1112,6 +1141,36 @@ impl LogStore {
         if self.send(Cmd::Close(tx)).is_ok() {
             let _ = rx.await;
         }
+    }
+}
+
+/// Where an entry's record is: segment, payload offset, payload length.
+type Location = (u64, u64, u32);
+
+impl LogStore {
+    /// Read one entry back from its segment. The record is checked against
+    /// its header and checksum before it is trusted.
+    async fn read_back(&self, (seq, offset, len): Location) -> io::Result<Entry> {
+        let file = self.shared.writer.files.lock().get(&seq).cloned();
+        let file = file.ok_or_else(|| corrupt(format!("Raft log segment {seq} is gone")))?;
+        let record = read_exact(
+            &file,
+            offset - RECORD_HEADER as u64,
+            RECORD_HEADER + len as usize,
+        )
+        .await?;
+        let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4"));
+        let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4"));
+        let payload = &record[RECORD_HEADER..];
+        if stored_len != len
+            || record[8] != KIND_ENTRY
+            || stored_crc != record_crc(seq, KIND_ENTRY, payload)
+        {
+            return Err(corrupt(format!(
+                "Raft log segment {seq} is damaged at offset {offset}"
+            )));
+        }
+        decode(payload)
     }
 }
 
@@ -1131,56 +1190,61 @@ impl RaftLogReader<TypeConfig> for LogStore {
             Bound::Unbounded => u64::MAX,
         };
 
-        // Take what is cached; note where the rest is.
-        let mut found: Vec<Result<Entry, (u64, u64, u32)>> = Vec::new();
-        {
-            let mem = self.shared.mem.lock();
-            let Some(first) = mem.first_index() else {
-                return Ok(Vec::new());
-            };
-            let from = start.max(first);
-            let to = end.min(first + mem.slots.len() as u64);
-            for index in from..to {
-                let slot = &mem.slots[(index - first) as usize];
-                found.push(match &slot.entry {
-                    Some(entry) => Ok(entry.clone()),
-                    None => Err((slot.seq, slot.offset, slot.len)),
-                });
-            }
-        }
-
-        let mut entries = Vec::with_capacity(found.len());
-        for item in found {
-            match item {
-                Ok(entry) => entries.push(entry),
-                Err((seq, offset, len)) => {
-                    let file = self.shared.writer.files.lock().get(&seq).cloned();
-                    let file =
-                        file.ok_or_else(|| corrupt(format!("Raft log segment {seq} is gone")))?;
-                    // Read the record with its header and check it before
-                    // trusting it: this is data coming back from disk.
-                    let record = read_exact(
-                        &file,
-                        offset - RECORD_HEADER as u64,
-                        RECORD_HEADER + len as usize,
-                    )
-                    .await?;
-                    let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4"));
-                    let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4"));
-                    let payload = &record[RECORD_HEADER..];
-                    if stored_len != len
-                        || record[8] != KIND_ENTRY
-                        || stored_crc != record_crc(seq, KIND_ENTRY, payload)
-                    {
-                        return Err(corrupt(format!(
-                            "Raft log segment {seq} is damaged at offset {offset}"
-                        )));
-                    }
-                    entries.push(decode(payload)?);
+        // An entry that is no longer in memory is read from its segment after
+        // the lock is released. A purge can delete or recycle that segment in
+        // the meantime; when a read fails, look again, and give up only if the
+        // entry is still supposed to be there.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            // Take what is cached; note where the rest is.
+            let mut found: Vec<(u64, Result<Entry, Location>)> = Vec::new();
+            {
+                let mem = self.shared.mem.lock();
+                let Some(first) = mem.first_index() else {
+                    return Ok(Vec::new());
+                };
+                let from = start.max(first);
+                let to = end.min(first + mem.slots.len() as u64);
+                for index in from..to {
+                    let slot = &mem.slots[(index - first) as usize];
+                    found.push((
+                        index,
+                        match &slot.entry {
+                            Some(entry) => Ok(entry.clone()),
+                            None => Err((slot.seq, slot.offset, slot.len)),
+                        },
+                    ));
                 }
             }
+
+            let mut entries = Vec::with_capacity(found.len());
+            let mut failure: Option<(u64, io::Error)> = None;
+            for (index, item) in found {
+                match item {
+                    Ok(entry) => entries.push(entry),
+                    Err(location) => match self.read_back(location).await {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => {
+                            failure = Some((index, e));
+                            break;
+                        }
+                    },
+                }
+            }
+            let Some((index, error)) = failure else {
+                return Ok(entries);
+            };
+            let still_live = self
+                .shared
+                .mem
+                .lock()
+                .first_index()
+                .is_some_and(|first| index >= first);
+            if still_live || attempts >= 3 {
+                return Err(error);
+            }
         }
-        Ok(entries)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
@@ -1340,6 +1404,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         if !dead.is_empty() {
             for seq in &dead {
                 mem.segment_last_index.remove(seq);
+                mem.segment_sizes.remove(seq);
             }
             self.send(Cmd::Delete { seqs: dead })?;
         }

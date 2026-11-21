@@ -52,11 +52,11 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    /// Create a new Raft node with storage engine integration
+    /// Create a new Raft node.
     ///
-    /// The storage engine is used for both Raft log persistence and applying
-    /// committed changes. All Raft state (log entries, vote, membership) is
-    /// persisted to LSM storage for crash recovery.
+    /// `log_store` holds the Raft log and the vote. `storage` is what the
+    /// state machine applies committed entries to; it also holds the state
+    /// machine's own position (last applied entry, membership).
     pub async fn new(
         id: NodeId,
         addr: SocketAddr,

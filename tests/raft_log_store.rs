@@ -767,3 +767,72 @@ async fn a_damaged_entry_read_back_from_disk_is_reported() {
         vec![entry_sized(199, 500)]
     );
 }
+
+/// A truncation recorded in one segment can reach back into the segment
+/// before it. Once that earlier segment has been purged away, replay has to
+/// take the truncation point, not the segment boundary, as where the log
+/// continues from.
+#[tokio::test]
+async fn truncation_across_a_purged_segment_boundary_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), Durability::Os);
+    let mut store = LogStore::open(io(), cfg.clone()).await.unwrap();
+
+    // Fill exactly past one segment boundary.
+    let mut next = 0u64;
+    while store.stats().segments < 2 {
+        append(&mut store, vec![entry_sized(next, 1000)]).await;
+        next += 1;
+    }
+    // `next - 1` is the first entry of the second segment. Cut back into the
+    // first segment and write a different continuation.
+    let keep = next - 6;
+    store.truncate_after(Some(id(keep))).await.unwrap();
+    let replacement = |index: u64| {
+        Entry::new_normal(
+            log_id::<TypeConfig>(2, 2, index),
+            Command::DataChange(ChangeSet::new_with_changes(
+                index + 9000,
+                vec![RowChange::insert("t", vec![2], vec![3u8; 1000])],
+            )),
+        )
+    };
+    let last = keep + 60;
+    append(&mut store, (keep + 1..=last).map(replacement).collect()).await;
+
+    // Purge past the first segment's original end; the first segment goes.
+    let purge_at = log_id::<TypeConfig>(2, 2, keep + 30);
+    store.purge(purge_at).await.unwrap();
+    append(&mut store, vec![replacement(last + 1)]).await;
+    store.close().await;
+    assert_eq!(segment_files(dir.path()).len(), 1, "first segment purged");
+    drop(store);
+
+    let mut store = LogStore::open(io(), cfg).await.unwrap();
+    let state = store.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(purge_at));
+    assert_eq!(
+        state.last_log_id,
+        Some(log_id::<TypeConfig>(2, 2, last + 1))
+    );
+    let live = read(&mut store, 0..last + 10).await;
+    assert_eq!(live.len() as u64, last + 1 - (keep + 30));
+    assert_eq!(live[0], replacement(keep + 31));
+}
+
+/// The space the log reports reflects the real size of each segment.
+#[tokio::test]
+async fn disk_usage_counts_oversized_segments_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), Durability::Os);
+    let mut store = LogStore::open(io(), cfg.clone()).await.unwrap();
+    append(&mut store, vec![entry(0)]).await;
+    let big = 5 * cfg.segment_bytes as usize;
+    append(&mut store, vec![entry_sized(1, big)]).await;
+    append(&mut store, vec![entry(2)]).await;
+    assert!(
+        store.disk_bytes() > big as u64,
+        "disk_bytes {} does not cover the {big}-byte entry",
+        store.disk_bytes()
+    );
+}

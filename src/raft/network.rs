@@ -114,8 +114,32 @@ pub struct RaftNetworkConnection {
 }
 
 impl RaftNetworkConnection {
-    /// Send one request and read its reply. Any failure is reported as text.
+    /// Send one request and read its reply, giving up after `limit`. A peer
+    /// that has stopped answering must not hold up replication to it for
+    /// ever: openraft leaves the time limit to the transport.
     async fn send_request<Req, Resp>(
+        &self,
+        msg_type: MessageType,
+        request: &Req,
+        limit: std::time::Duration,
+    ) -> Result<Resp, String>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        match tokio::time::timeout(limit, self.exchange(msg_type, request)).await {
+            Ok(result) => result,
+            Err(_) => Err(describe(
+                self.target,
+                self.addr,
+                &format!("{msg_type:?}"),
+                format_args!("no reply within {limit:?}"),
+            )),
+        }
+    }
+
+    /// Send one request and read its reply. Any failure is reported as text.
+    async fn exchange<Req, Resp>(
         &self,
         msg_type: MessageType,
         request: &Req,
@@ -178,14 +202,14 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         // The reply on the wire says only success, conflict or a higher vote;
         // the log positions it refers to are the ones we sent.
         let prev_log_id = req.prev_log_id;
         let last_log_id = req.last_log_id();
         let response: AppendEntriesResponse = self
-            .send_request(MessageType::AppendEntries, &req)
+            .send_request(MessageType::AppendEntries, &req, option.soft_ttl())
             .await
             .map_err(|e| RPCError::Unreachable(unreachable(e)))?;
         Ok(response.into_append_result(prev_log_id, last_log_id))
@@ -194,9 +218,9 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
     async fn vote(
         &mut self,
         req: VoteRequest,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse, RPCError<TypeConfig>> {
-        self.send_request(MessageType::Vote, &req)
+        self.send_request(MessageType::Vote, &req, option.soft_ttl())
             .await
             .map_err(|e| RPCError::Unreachable(unreachable(e)))
     }
@@ -205,17 +229,21 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         &mut self,
         vote: Vote,
         snapshot: Snapshot,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        option: RPCOption,
     ) -> Result<SnapshotResponse, StreamingError<TypeConfig>> {
         let message = SnapshotMessage {
             vote,
             meta: snapshot.meta,
             data: snapshot.snapshot.into_inner(),
         };
-        self.send_request(MessageType::Snapshot, &message)
-            .await
-            .map_err(|e| StreamingError::Unreachable(unreachable(e)))
+        // Stop as soon as openraft no longer wants this snapshot sent.
+        tokio::select! {
+            closed = cancel => Err(StreamingError::Closed(closed)),
+            result = self.send_request(MessageType::Snapshot, &message, option.soft_ttl()) => {
+                result.map_err(|e| StreamingError::Unreachable(unreachable(e)))
+            }
+        }
     }
 }
 
