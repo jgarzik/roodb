@@ -153,9 +153,7 @@ rewritten.** On a table that already has rows:
 - adding, dropping or changing the primary key does not re-key existing rows.
 
 Use these forms on empty tables. Other forms (`ENGINE=`, `COMMENT=`,
-`CONVERT TO`, `ORDER BY`, partitioning) are refused. A failed `ALTER TABLE`
-(syntax error, unknown table or column) currently reports the error and
-then closes the connection.
+`CONVERT TO`, `ORDER BY`, partitioning) are refused.
 
 `RENAME TABLE a TO b` is not supported.
 
@@ -1018,4 +1016,3 @@ are reported as 1105.
 - `SHOW VARIABLES`, `SHOW STATUS` and `SHOW PROCESSLIST` are empty;
   `INFORMATION_SCHEMA` is a small fixed emulation.
 - `LOAD DATA` reads server-side files into single-column tables only.
-- A failed `ALTER TABLE` closes the connection.

@@ -1995,6 +1995,30 @@ impl QueryEngine {
     /// Handle ALTER TABLE statements.
     /// Modifies the catalog and persists changes to system tables via Raft.
     async fn try_handle_alter_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
+        // A statement that fails is answered with an error; only a failure
+        // to talk to the client ends the connection.
+        match self.alter_table(sql).await {
+            Err(ProtocolError::Sql(e)) => self.send_sql_error(&e).await.map(Some),
+            Err(ProtocolError::Planner(e)) => self.send_planner_error(&e).await.map(Some),
+            Err(
+                e @ (ProtocolError::Unsupported(_)
+                | ProtocolError::Executor(_)
+                | ProtocolError::Transaction(_)
+                | ProtocolError::Raft(_)
+                | ProtocolError::Internal(_)),
+            ) => self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    &e.to_string(),
+                )
+                .await
+                .map(Some),
+            other => other,
+        }
+    }
+
+    async fn alter_table(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         let upper = sql.trim().to_uppercase();
         if !upper.starts_with("ALTER TABLE ") {
             return Ok(None);
