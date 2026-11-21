@@ -6,9 +6,12 @@ This document describes the synchronization primitives and locking conventions u
 
 RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contention:
 - Writes are buffered in session memory until COMMIT
-- On COMMIT, changes are proposed to Raft
-- Storage writes only occur in `apply()` after Raft consensus
+- On COMMIT, changes are proposed to Raft and appended to the on-disk Raft log
+- Storage writes only occur in `apply()` after Raft consensus, one atomic batch per log entry
 - This means DML operations (INSERT/UPDATE/DELETE) don't hold database locks during execution
+
+There are no row or table locks today: conflicting writers are detected when
+they commit. Rows of temporary tables never leave the session that owns them.
 
 ## Synchronization Primitives
 
@@ -16,9 +19,10 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 
 | Type | Library | Use Case |
 |------|---------|----------|
-| `RwLock` | parking_lot | Sync contexts (catalog, txn state, raft caches) |
-| `Mutex` | tokio::sync | Async contexts where lock is held across await (compaction, Raft log) |
-| `Mutex` | parking_lot | Short sync critical sections (I/O handles) |
+| `RwLock` | parking_lot | Sync contexts (catalog, txn state, raft caches, memtables, manifest) |
+| `Mutex` | tokio::sync | Async contexts where lock is held across await (flush, compaction, manifest write) |
+| `Mutex` | parking_lot | Short sync critical sections (block cache shards, Raft log index) |
+| `Notify`, channels | tokio::sync | Waking background tasks; handing work to the log writer |
 | `Atomic*` | std::sync::atomic | Counters and flags |
 
 ### Why parking_lot?
@@ -27,9 +31,9 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 - Better performance than std::sync
 - Simpler API (no `.unwrap()` needed)
 
-### Why tokio::sync::Mutex for compaction/log?
+### Why tokio::sync::Mutex for flush, compaction and the manifest?
 
-The compaction mutexes (`l0_compaction_mutex`, `level_compaction_mutex`) and Raft `log_mutex` are held across `await` points. Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
+`flush_lock`, `compaction_lock` and `manifest_io` are held across `await` points (file I/O). Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
 
 ## Module Locking Inventory
 
@@ -41,11 +45,17 @@ The compaction mutexes (`l0_compaction_mutex`, `level_compaction_mutex`) and Raf
 
 No locks held during connection spawn.
 
-### Protocol (`src/protocol/roodb/`)
+### Query engine (`src/server/query/`, `src/server/temp_store.rs`)
 
 | Component | Type | Purpose |
 |-----------|------|---------|
 | `catalog` | parking_lot::RwLock | Schema access for planning |
+| `SessionStorage::temp` | parking_lot::RwLock | One session's temporary tables and their rows |
+| `SessionStorage::has_temp` | AtomicBool | Lets sessions without temporary tables skip the lock |
+| session user variables | parking_lot::RwLock | `@variables`, and the session's copy of the stored functions |
+
+`SessionStorage::temp` is never held across an `await`: reads of shared
+storage happen before or after it is taken.
 
 **Critical pattern:** Catalog lock is acquired in a closure and dropped before any `await`:
 ```rust
@@ -83,22 +93,38 @@ Multiple RwLocks but NEVER nested - each acquired/released independently.
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `memtable.data` | parking_lot::RwLock | In-memory KV store |
-| `memtable.size` | AtomicUsize | Approximate size tracking |
-| `imm_memtables` | parking_lot::RwLock | Pending flush memtables |
-| `manifest` | parking_lot::RwLock | SSTable metadata (readers concurrent, writers exclusive) |
-| `l0_compaction_mutex` | tokio::sync::Mutex | Serializes L0→L1 compactions |
-| `level_compaction_mutex` | tokio::sync::Mutex | Serializes L1+→L2+ compactions |
-| `reader_cache` | parking_lot::RwLock | Cached open SSTable readers (avoids re-opening per scan) |
-| `block_cache.inner` | parking_lot::Mutex | LRU cache of SSTable data blocks (Mutex: all ops mutate LRU order) |
-| `closed` | AtomicBool | Engine shutdown flag |
+| `memtable` | parking_lot::RwLock | The active memtable. Writers insert under the read lock; rotation takes the write lock |
+| memtable contents | lock-free skip list + AtomicUsize size | In-memory KV store |
+| `imm_memtables` | parking_lot::RwLock | Frozen memtables waiting to be written out, oldest first |
+| `manifest` | parking_lot::RwLock | Which tables exist at which level (in memory) |
+| `manifest_io` | tokio::sync::Mutex | Held while the manifest is changed and written, so changes reach disk in order |
+| `flush_lock` | tokio::sync::Mutex | Memtables reach disk one at a time, oldest first |
+| `compaction_lock` | tokio::sync::Mutex | One compaction at a time |
+| `reader_cache` | parking_lot::RwLock | An open reader for every table in the manifest |
+| block cache shards | parking_lot::Mutex each | LRU of SSTable blocks, split into shards to spread contention |
+| `work`, `compact_work`, `flushed` | tokio::sync::Notify | Wake the flush task, the compaction task, and stalled writers |
+| `background_error` | parking_lot::Mutex | Last failure of a background task, reported to stalled writers |
+| `dir_lock` | parking_lot::Mutex over a locked file | Exclusive lock on the data directory |
+| `stopping`, `closed` | AtomicBool | Shutdown flags |
+
+Lock order where more than one is held: `flush_lock` or `compaction_lock` →
+`manifest_io` → `manifest` (briefly). `memtable` is taken before
+`imm_memtables`.
+
+**Critical pattern:** A write batch is atomic with respect to rotation.
+
+`write_batch()` inserts every entry of a batch while holding the `memtable`
+read lock; rotation needs the write lock. A batch therefore lands in one
+memtable, and a flush can never capture half of it. The Raft state machine
+relies on this: each log entry is one batch that includes the applied
+position, so what is on disk is always an exact prefix of the log.
 
 **Critical pattern:** Atomic memtable snapshots prevent rotation races:
 
-Both `read_all()` and `scan()` must read the active memtable and immutable memtables atomically
-to prevent entries from becoming temporarily invisible during memtable rotation:
+Both `get()` and `scan()` must read the active memtable and the frozen
+memtables under the memtable lock, so an entry cannot be missed while it moves
+from one to the other:
 ```rust
-// CRITICAL: Both must be read while holding memtable lock
 let (memtable_snapshot, imm_snapshot) = {
     let mem_guard = self.memtable.read();
     let memtable_snapshot = Arc::clone(&*mem_guard);
@@ -108,49 +134,22 @@ let (memtable_snapshot, imm_snapshot) = {
 // Use snapshots outside lock for actual reads
 ```
 
-Without this, a concurrent `put()` could rotate the memtable between reading the two
-structures, causing an entry to be missed (moved from memtable to imm_memtables
-between our reads).
+**Critical pattern:** A frozen memtable leaves `imm_memtables` only after its
+table is on disk and in the manifest. Until then its entries stay readable
+from memory; there is no moment when they are in neither place.
 
-**Critical pattern:** Flush removes from imm_memtables only AFTER disk write:
+**Critical pattern:** Flush and compaction do their I/O without the manifest lock.
 
-When flushing memtables to disk, entries must remain visible in `imm_memtables`
-until the disk write completes. Otherwise there's a visibility gap:
-```rust
-// WRONG: Entries invisible during flush
-let imm_mems = std::mem::take(&mut *imm_memtables);  // Entries gone!
-for mem in imm_mems {
-    flush_to_disk(mem).await;  // Not on disk yet - entries invisible
-}
+Each picks its work under a brief `manifest` read lock, reads and writes files
+with only its own tokio mutex held, and then makes one manifest change under
+`manifest_io`: the new manifest is written and synced first, the in-memory
+manifest is swapped second, and input files are deleted last. A crash at any
+point leaves either the old state or the new one; leftovers are removed when
+the directory is next opened.
 
-// CORRECT: Entries visible until disk write completes
-loop {
-    let mem = imm_memtables.first().cloned();  // Peek, don't remove
-    flush_to_disk(mem).await;  // Now on disk
-    imm_memtables.remove(0);  // Safe to remove
-}
-```
-
-**Critical pattern:** Compaction uses split-phase locking:
-```rust
-// Phase 1: Brief write-lock to prepare job
-let job = {
-    let mut manifest = self.manifest.write();
-    prepare_l0_compaction(&mut manifest)
-    // Lock released here
-};
-// Phase 2: I/O without lock
-let new_file = execute_l0_compaction(&*self.factory, &job).await?;
-// Phase 3: Re-acquire write-lock to finalize
-{
-    let mut manifest = self.manifest.write();
-    finalize_l0_compaction(&mut manifest, &job, new_file)?;
-}
-```
-
-L0 and level compactions use separate tokio Mutexes, allowing concurrent L0→L1
-and L1+→L2+ compaction. Within each path, the manifest RwLock is held only briefly
-(prepare and finalize phases), while the expensive I/O phase runs without any lock.
+Flush and compaction run in separate background tasks with separate locks, so
+a long compaction never holds up a flush that writers are waiting for. Writers
+stall (without holding any lock) while four frozen memtables are waiting.
 
 ### I/O (`src/io/`)
 
@@ -166,39 +165,32 @@ needs no lock. Neither backend holds a lock while a request is in the kernel.
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `log_mutex` | tokio::sync::Mutex | Serializes log operations |
-| `cached_vote` | parking_lot::RwLock | Vote state cache |
+| `LogStore` `mem` | parking_lot::Mutex | Index of log entries, recent entries, vote, purge and commit points |
+| `LogStore` command channel | tokio mpsc (unbounded) | Appends and other log changes, handed to the single writer task |
+| `WriterShared::files` | parking_lot::Mutex | Open segment files, for reading entries back |
+| `WriterShared::written` | parking_lot::Mutex | How far the log has reached disk (segment, offset) |
+| `WriterShared::failed` | parking_lot::Mutex | First write error; once set the log refuses further work |
+| `preparing_spare` | AtomicBool | Only one task prepares the spare segment |
 | `cached_last_applied` | parking_lot::RwLock | Last applied log ID |
 | `cached_membership` | parking_lot::RwLock | Cluster membership |
-| `cached_last_log_id` | parking_lot::RwLock | Last log entry |
-| `cached_last_purged` | parking_lot::RwLock | Last purged log ID |
+| `applied_txn_floor`, `stored_txn_bound` | AtomicU64 | Highest applied transaction ID and the bound stored for restart |
 | `catalog` | parking_lot::RwLock | Schema updates in apply() |
 | `nodes` | parking_lot::RwLock | Peer addresses |
 
-**Critical pattern:** Log mutex serializes log operations to establish memory barrier ordering:
+**Critical pattern:** One task writes the log.
 
-`LsmRaftStorage` is `Clone` with shared `Arc` fields. OpenRaft's `&mut self` methods imply
-serialized access, but clones can call methods concurrently. The `log_mutex` ensures that
-when `get_log_state()` reports log entry N exists, `try_get_log_entries()` will find it.
+Appends do not write. They record the entry in `mem`, send it to the writer
+task, and return; the writer drains everything queued, writes it with one
+request (plus a flush with `--durability fsync`) and then reports each append
+as complete. No lock is held while the write is in the kernel, and commits
+that arrive together share the write. Nothing in the log store is locked
+across an `await`.
 
-Without the mutex, the separate locks for storage (memtable) and cache (cached_last_log_id)
-don't establish happens-before ordering across operations:
-```rust
-// Thread A: append()
-storage.put(entry_49).await;    // Acquires memtable lock
-cached_last_log_id = 49;        // Acquires cache lock
+**Critical pattern:** The state machine is driven by one task.
 
-// Thread B: get_log_state() then try_get_log_entries()
-// Without log_mutex, Thread B could see cache=49 but miss the memtable entry
-```
-
-**Critical pattern:** Only `applied_state()` acquires `log_mutex`:
-
-Of the state machine methods, only `applied_state()` acquires `log_mutex` — it must see
-a consistent view of cached state alongside log operations. `get_current_snapshot()` and
-`build_snapshot()` do NOT hold `log_mutex`; they read only non-Raft-prefixed keys (user data)
-while OpenRaft serializes all state machine operations, so no concurrent apply() can
-modify user data. This avoids write stalls under snapshot load.
+OpenRaft applies entries, builds snapshots and installs them from a single
+task, so the state machine needs no lock of its own for ordering. The cached
+position is updated after the storage batch that carries it has been written.
 
 **Critical pattern:** Async work (storage scans) done before catalog lock:
 ```rust
@@ -233,17 +225,14 @@ Row IDs are cluster-unique via node-ID-in-high-bits encoding (`src/storage/row_i
 
 - **Format:** `[16-bit node_id][48-bit local counter]` — supports 65536 nodes, 281T rows/node
 - **`NODE_ID: AtomicU64`** — static, set once at startup from the Raft node ID (SeqCst)
-- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — single global counter (SeqCst `fetch_add`)
-- **`next_row_id()`** — allocates one ID, encodes with node_id
-- **`allocate_row_id_batch(count)`** — batch allocation reducing atomic contention for bulk INSERTs
+- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — single global counter (`fetch_add`) plus a `limit`: the end of the range this node has reserved
+- **`next_row_id()`** / **`allocate_row_id_batch(count)`** — never block and never wait on Raft
 
-```rust
-pub fn next_row_id() -> u64 {
-    let local = GLOBAL_ROW_ID_GEN.next();
-    let node_id = NODE_ID.load(Ordering::SeqCst);
-    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
-}
-```
+Ranges are reserved through Raft (`Command::ReserveRowIds`) ahead of use. An
+ID may be handed out beyond the recorded reservation, but a commit that uses
+one waits until a reservation covering it has been applied. After a restart
+the counter resumes above everything reserved, so an ID that reached storage
+is never issued again.
 
 ## Adding New Locks
 

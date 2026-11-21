@@ -26,15 +26,17 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ./roodb --port PORT --data-dir PATH --cert-path PATH --key-path PATH --raft-ca-cert-path PATH
 ```
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| bind | 0.0.0.0 | Address to listen on (client, TDS and Raft ports) |
-| port | 3307 | Client connection port |
-| tds_port | (off) | Also accept SQL Server protocol (TDS) clients on this port |
-| data_dir | ./data | Data directory path |
-| cert_path | ./certs/server.crt | TLS certificate |
-| key_path | ./certs/server.key | TLS private key |
-| ca_cert_path | ./certs/ca.crt | CA certificate for Raft mTLS |
+| Argument | Environment | Default | Description |
+|----------|-------------|---------|-------------|
+| `--bind` | `ROODB_BIND` | 0.0.0.0 | Address to listen on (client, TDS and Raft ports) |
+| `--port` | `ROODB_PORT` | 3307 | Client connection port |
+| `--tds-port` | `ROODB_TDS_PORT` | (off) | Also accept SQL Server protocol (TDS) clients on this port |
+| `--data-dir` | `ROODB_DATA_DIR` | ./data | Data directory path |
+| `--io-backend` | `ROODB_IO_BACKEND` | auto | File I/O backend: `auto`, `uring` or `posix` (see I/O Backend) |
+| `--durability` | `ROODB_DURABILITY` | os | When a commit is acknowledged: `os` or `fsync` (see Durability) |
+| `--cert-path` | `ROODB_CERT_PATH` | ./certs/server.crt | TLS certificate |
+| `--key-path` | `ROODB_KEY_PATH` | ./certs/server.key | TLS private key |
+| `--raft-ca-cert-path` | `ROODB_CA_CERT_PATH` | ./certs/ca.crt | CA certificate for Raft mTLS |
 
 ### TLS Requirements
 
@@ -104,6 +106,8 @@ A node with a certificate signed by a different CA will be rejected by the clust
 | `ROODB_ROOT_PASSWORD` | Set root password on first boot |
 | `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
 | `ROODB_BIND` | Listen address (same as `--bind`) |
+| `ROODB_PORT`, `ROODB_DATA_DIR` | Same as `--port`, `--data-dir` |
+| `ROODB_CERT_PATH`, `ROODB_KEY_PATH`, `ROODB_CA_CERT_PATH` | Same as `--cert-path`, `--key-path`, `--raft-ca-cert-path` |
 | `ROODB_TDS_PORT` | Enable the TDS listener on this port (same as `--tds-port`) |
 | `ROODB_IO_BACKEND` | File I/O backend: `auto` (default), `uring` or `posix` (same as `--io-backend`) |
 | `ROODB_DURABILITY` | When a commit is acknowledged: `os` (default) or `fsync` (same as `--durability`) |
@@ -523,6 +527,11 @@ Query system tables for metadata (read-only, managed by SQL commands):
 | `system.columns` | Column definitions |
 | `system.indexes` | Index definitions |
 | `system.constraints` | Table constraints |
+| `system.databases` | Databases |
+| `system.views` | View definitions |
+| `system.procedures` | Stored procedures and functions |
+| `system.triggers` | Trigger definitions |
+| `system.table_statistics` | Optimizer statistics |
 | `system.users` | User accounts |
 | `system.grants` | Privileges |
 | `system.roles` | Role definitions |
@@ -537,22 +546,33 @@ Query system tables for metadata (read-only, managed by SQL commands):
 RooDB uses filesystem-level backups. The data directory contains all state:
 
 ```bash
-# Stop server for consistent backup
-pkill roodb
+# Stop the server: SIGTERM shuts it down in order (stop accepting, flush, close)
+pkill -TERM roodb
 
 # Copy entire data directory
 cp -r ./data ./backup/data-$(date +%Y%m%d)
 
-# Restart server
+# Restart server on the same directory
 ./roodb
 ```
 
-For minimal downtime, you can snapshot while running (point-in-time consistency via LSM design), but stopping ensures full consistency.
+Copy the directory only while the server is stopped. A copy taken from a
+running server is not a consistent backup: table files, `MANIFEST` and the log
+change independently while it runs.
 
-**Critical files:**
-- `manifest.json` - SSTable registry; must match SSTable files
-- `sstables/*.sst` - Actual data
-- Raft state - Cluster membership and log position
+**Critical files** (see the data directory layout above):
+- `MANIFEST` - which table files are live; must match the `*.sst` files
+- `*.sst` - flushed data
+- `raft/` - the log: every commit not yet flushed into a table file, plus the Raft vote and log position
+
+### Restart and crash recovery
+
+The server restarts on an existing data directory without `roodb_init`. After
+a clean stop, a crash or `kill -9`, it replays the part of the log that had
+not yet been flushed and then starts accepting connections; nothing that was
+acknowledged to a client is lost (subject to the `--durability` mode for power
+loss). A second server cannot open a directory that is in use: `LOCK` is held
+while one is running.
 
 ### Single Node Recovery
 
@@ -640,7 +660,8 @@ mysql -h 127.0.0.1 -P 3307 -u root -p -e "SELECT COUNT(*) FROM mydb.mytable"
 
 | Symptom | Cause | Solution |
 |---------|-------|----------|
-| Missing tables after restart | Corrupted manifest.json | Restore from backup |
+| Server refuses to start: table file or `MANIFEST` missing or damaged | Files removed or corrupted outside the server | Restore the whole data directory from backup |
+| Server refuses to start: data directory in use | Another server holds `LOCK` | Stop the other server |
 | Slow queries | Pending compaction | Wait for background compaction |
 
 ## Connection Examples

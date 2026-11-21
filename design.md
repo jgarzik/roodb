@@ -80,7 +80,8 @@ pub trait AsyncIO: Send + Sync {
 ## Query Execution Flow
 
 ```
-SQL string
+protocol front-end (RooDbConnection / TdsConnection)
+ → QueryEngine::handle_query() / execute_prepared()  [src/server/query/engine.rs]
  → Parser::parse_one()           [sqlparser crate, MySql dialect]
  → Resolver::resolve()           [name resolution, column indices]
  → TypeChecker::check()          [type validation]
@@ -89,6 +90,7 @@ SQL string
  → PhysicalPlanner::plan()       [algorithm selection]
  → ExecutorEngine::build()       [construct executor tree]
  → executor.open() / .next() / .close()  [Volcano iteration]
+ → ResponseSink (rows, OK, errors) → protocol encoder  [RooDbSink / TdsSink]
 ```
 
 **Catalog Lock**: Held during planning phase only. Released before executor I/O.
@@ -102,14 +104,24 @@ SQL string
 Schema metadata cache. The catalog is an in-memory cache of schema metadata, rebuilt from system tables on startup.
 
 **System Tables** (stored in LSM, replicated via Raft):
-- `system.tables` - table definitions
-- `system.columns` - column definitions
-- `system.indexes` - index definitions
-- `system.users` - user accounts (auth)
-- `system.grants` - privileges
+- `system.tables`, `system.columns`, `system.indexes`, `system.constraints` - table definitions
+- `system.databases` - databases
+- `system.views`, `system.procedures` (stored procedures and functions), `system.triggers`
+- `system.table_statistics` - optimizer statistics
+- `system.users`, `system.grants`, `system.roles`, `system.role_grants` - accounts and privileges
+
+The system tables are the only durable copy of the schema. A schema statement
+writes rows to them through Raft; the catalog changes when those rows are
+applied (on every node), and is rebuilt in full from them at startup. Stored
+functions are copied from the catalog into each session when the catalog's
+schema version changes.
+
+Temporary tables are the exception: their definition is registered in the
+catalog of the node the session is on, and their rows are kept in that
+session's memory (`server/temp_store.rs`), never in the log or the LSM.
 
 **Types**:
-- `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, Float, Double, Varchar(n), Text, Blob, Timestamp
+- `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, BigIntUnsigned, Float, Double, Decimal, Varchar(n), Text, Blob, Bit(n) (n = 1..64, held as a u64), Timestamp, Json, Geometry
 - `ColumnDef`: name, data_type, nullable, default, auto_increment
 - `TableDef`: name, columns, constraints
 - `Constraint`: PrimaryKey, Unique, ForeignKey, Check
@@ -117,7 +129,7 @@ Schema metadata cache. The catalog is an in-memory cache of schema metadata, reb
 **Operations**:
 - `get_table()`, `create_table()`, `drop_table()`, `get_column_index()`
 - `with_system_tables()`: Bootstrap with system table definitions
-- `rebuild_from_storage()`: Reload from system tables (startup)
+- Rebuilt from the system tables by the Raft state machine (`rebuild_catalog_from_system_tables()` in `raft/lsm_storage.rs`) at startup, and updated there as entries are applied
 
 ### `executor/`
 
@@ -398,6 +410,10 @@ pub struct RooDbServer {
 3. Complete authentication
 4. Enter command loop
 
+**Session storage** (`temp_store.rs`): `SessionStorage` wraps the shared storage engine for one session. Keys of the session's temporary tables are served from an in-memory map (at most 256 MiB per session); every other key goes to the shared engine. The map is dropped when the session ends.
+
+**Shutdown** (`main.rs`): on SIGTERM or SIGINT the server stops accepting connections, shuts Raft down (closing the log), flushes and closes storage, and exits. A second signal exits at once.
+
 **Session** (`session.rs`):
 - `current_txn`: Active transaction ID (None = autocommit)
 - `autocommit`: Default true
@@ -535,8 +551,10 @@ pub struct Transaction {
 **Isolation Levels**:
 - `ReadUncommitted`: See uncommitted changes
 - `ReadCommitted`: Fresh snapshot per statement
-- `RepeatableRead`: Single snapshot for transaction (default)
+- `RepeatableRead`: the default level. Today it also takes a fresh snapshot per statement, so reads behave as under `ReadCommitted`; a single snapshot per transaction is not implemented yet
 - `Serializable`: Not yet implemented
+
+There are no row locks yet. Writers do not wait for each other; a conflict between concurrent transactions is detected when the later one commits, and that commit fails.
 
 **TransactionManager** (`manager.rs`):
 - Monotonic `txn_id` allocation

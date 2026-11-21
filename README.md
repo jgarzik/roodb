@@ -17,12 +17,12 @@ On single-node and leader-replica configurations, nothing should be faster.
 
 Most SQL databases were designed in an era of slow disks and single-core CPUs.
 RooDB is designed from scratch for today's hardware: dozens of cores, millions
-of IOPS from NVMe, and kernel-bypass I/O via io_uring. The result is a database
+of IOPS from NVMe, and batched direct I/O via io_uring. The result is a database
 that keeps the hardware busy instead of waiting on locks and syscalls.
 
 ## Features
 
-- **io_uring I/O** — zero-copy, kernel-bypass I/O on Linux; async POSIX fallback elsewhere
+- **io_uring I/O** — direct I/O (no page cache) submitted in batches by reactor threads on Linux; a POSIX worker-pool backend everywhere, chosen at startup
 - **Lock-free memtable** — concurrent skip list for zero-contention writes
 - **Unified memory budget** — block cache and memtables share a single adaptive pool
 - **LSM storage engine** — write-optimized with cascading compaction
@@ -63,32 +63,25 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ### Run Tests
 
 ```bash
-# Run all tests (single-threaded - see Known Limitations)
 cargo test --release
-
-# Run a specific test
-cargo test --release test_name
-
-# Lint
-cargo clippy --all-targets
 ```
+
+## Documentation
+
+| File | Contents |
+|------|----------|
+| [SQL.md](SQL.md) | Supported SQL |
+| [admin.md](admin.md) | Configuration, deployment, users and privileges, backup, troubleshooting |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, debugging, source layout, where to start reading |
+| [design.md](design.md) | Architecture and per-module reference |
+| [LOCKING.md](LOCKING.md) | Locks and lock ordering |
+| [mtesting.md](mtesting.md) | MySQL test suite integration |
 
 ## Architecture
 
-```
-src/
-├── catalog/       # Schema catalog (tables, columns, system tables)
-├── executor/      # Volcano-style query executor
-├── io/            # Cross-platform async I/O (io_uring / POSIX)
-├── planner/       # Query planner and optimizer
-├── protocol/      # Wire protocols: roodb/ (MySQL-compatible) and tds/ (SQL Server)
-├── raft/          # Raft consensus layer (OpenRaft)
-├── server/        # Listeners, authentication, session, query engine (server/query/)
-├── sql/           # SQL parsing and AST
-├── storage/       # LSM storage engine
-├── tls.rs         # TLS configuration
-└── txn/           # Transaction management (MVCC)
-```
+The source layout and the path of a statement through the code are in
+[CONTRIBUTING.md](CONTRIBUTING.md#source-layout); [design.md](design.md)
+describes each module.
 
 **Replication Model**:
 - Leader accepts all writes, replicates via Raft
@@ -96,20 +89,19 @@ src/
 - Schema stored in system tables, replicated like data
 - Raft log serves as the write-ahead log
 
+The `roodb` binary currently starts as a single-node Raft cluster; starting a
+multi-node cluster from the command line is planned (see
+[admin.md](admin.md#deployment-modes)).
+
 ## Test Suite
 
-RooDB includes a comprehensive integration test suite that validates the full SQL stack across 4 configurations:
-
-| Configuration | Cluster | I/O Backend |
-|--------------|---------|-------------|
-| `single_uring` | 1-node | io_uring (Linux only) |
-| `single_posix` | 1-node | POSIX |
-| `cluster_uring` | 3-node Raft | io_uring (Linux only) |
-| `cluster_posix` | 3-node Raft | POSIX |
-
-Tests drive the server through real client libraries: `mysql_async` for the RooDB (MySQL-compatible) protocol and `tiberius` for TDS, plus hand-built packets for malformed and adversarial input.
-
-## Known Limitations
+Integration tests start the real server binary and drive it through client
+libraries: `mysql_async` for the RooDB (MySQL-compatible) protocol and
+`tiberius` for TDS, plus hand-built packets for malformed and adversarial
+input. Other tests kill and restart the server to check durability, and run
+three-node Raft clusters inside the test process. CI runs the tests on Linux,
+macOS and Windows, and on Linux with both I/O backends (io_uring and posix).
+See [CONTRIBUTING.md](CONTRIBUTING.md#tests).
 
 ## Dependencies
 
