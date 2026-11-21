@@ -11,6 +11,7 @@ mod harness;
 
 pub mod auth;
 pub mod cluster;
+pub mod cluster_binary;
 pub mod crash;
 pub mod ddl;
 pub mod dml;

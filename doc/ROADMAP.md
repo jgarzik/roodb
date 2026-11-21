@@ -37,23 +37,10 @@ state and refuse writes with error 1290.
 
 In order:
 
-- Peer addresses in the Raft membership itself (the node type carries the
-  address), so that every node learns its peers from the replicated
-  membership and from nothing else. The network layer dials what the
-  membership says.
-- Node identity: the node ID kept in the data directory (node 1 written by
-  `roodb_init`; a joiner's written when the cluster assigns it), read at
-  start, and used for row IDs. Flags: `--join`, `--raft-port` (default
-  port + 1000), `--advertise-host` (what peers dial; default the bind
-  address).
-- One Raft configuration for every node, with timers, heartbeats and
-  elections switched at run time: off while the node is the only member, on
-  as soon as there is a second.
-- Joining: a join request to any member (a follower answers with the
-  leader's address); the leader allocates the next node ID through the log,
-  adds the node as a learner, waits for it to catch up, and promotes it. A
-  node that restarts rejoins by itself from its stored identity and the
-  membership it has.
+- A node that joins before the first node has ever been restarted is
+  brought up by replaying the log from its start. The first node must also
+  be able to bring up a joiner after its log has been purged: by snapshot
+  (next item).
 - Snapshots for a node that is new or has fallen behind the log: a
   point-in-time view of the storage engine (frozen memtables and table
   files, held open for the transfer) streamed in chunks of any total size,

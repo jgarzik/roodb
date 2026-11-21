@@ -90,9 +90,8 @@ describes each module.
 - Schema stored in system tables, replicated like data
 - Raft log serves as the write-ahead log
 
-The `roodb` binary currently starts as a single-node Raft cluster; starting a
-multi-node cluster from the command line is planned (see
-[admin.md](admin.md#deployment-modes)).
+The `roodb` binary starts as a single-node Raft cluster; further nodes join
+it with `--join` (see [admin.md](admin.md#deployment-modes)).
 
 ## Test Suite
 

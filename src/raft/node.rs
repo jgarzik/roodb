@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,7 +52,14 @@ pub struct RaftNode {
     tls_config: RaftTlsConfig,
     shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     log_store: LogStore,
-    single_node: bool,
+    /// The storage the state machine applies to.
+    storage: Arc<dyn StorageEngine>,
+    /// What other nodes dial to reach this one, if not `addr`.
+    advertised_addr: Option<String>,
+    /// Whether this node is the only member of its cluster. Alone, it runs
+    /// without timers, heartbeats or elections; they are switched on when a
+    /// second node is admitted.
+    alone: Arc<AtomicBool>,
     /// Highest transaction ID the state machine has applied (or a bound
     /// above it), for the transaction manager.
     applied_txn_floor: Arc<AtomicU64>,
@@ -184,9 +191,11 @@ impl RaftNode {
             // Single-node: disable all unnecessary Raft overhead
             Config {
                 cluster_name: "roodb".to_string(),
-                heartbeat_interval: 1,
-                election_timeout_min: 50,
-                election_timeout_max: 100,
+                // The timing of a cluster: unused while the node is alone
+                // (its timers are off), in force once another node joins.
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
                 enable_tick: false,
                 enable_heartbeat: false,
                 enable_elect: false,
@@ -215,7 +224,7 @@ impl RaftNode {
 
         // The state machine applies committed entries to the LSM; the log
         // store holds the entries themselves.
-        let state_machine = LsmRaftStorage::new(storage, catalog, single_node, id)
+        let state_machine = LsmRaftStorage::new(storage.clone(), catalog, id)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
         let applied_txn_floor = state_machine.applied_txn_floor();
@@ -231,6 +240,26 @@ impl RaftNode {
         )
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+
+        // A node that restarts as one of several members is not alone,
+        // whatever it was started as.
+        let alone = {
+            use openraft::async_runtime::WatchReceiver;
+            let members = raft
+                .metrics()
+                .borrow_watched()
+                .membership_config
+                .nodes()
+                .count();
+            single_node && members <= 1
+        };
+        if !alone && single_node {
+            let runtime = raft.runtime_config();
+            runtime.tick(true);
+            runtime.heartbeat(true);
+            runtime.elect(true);
+        }
+        let alone = Arc::new(AtomicBool::new(alone));
 
         let log_budget = Arc::new(AtomicU64::new(DEFAULT_LOG_BUDGET_BYTES));
         let checkpointer = tokio::spawn(checkpoint_task(
@@ -251,7 +280,9 @@ impl RaftNode {
             tls_config,
             shutdown_tx: parking_lot::Mutex::new(None),
             log_store,
-            single_node,
+            storage,
+            advertised_addr: None,
+            alone,
             applied_txn_floor,
             log_budget,
             checkpointer,
@@ -297,14 +328,89 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
         if !initialized {
             let mut members = BTreeMap::new();
-            members.insert(self.id, Node::default());
+            let addr = self
+                .advertised_addr
+                .clone()
+                .unwrap_or_else(|| self.addr.to_string());
+            members.insert(self.id, Node::new(addr));
             self.raft
                 .initialize(members)
                 .await
                 .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
             tracing::info!(node_id = self.id, "Formed a single-node cluster");
+            self.wait_until_ready().await?;
+            return self.seed_log().await;
         }
         self.wait_until_ready().await
+    }
+
+    /// Put what storage already holds into the log, as the cluster's first
+    /// entry. `roodb_init` wrote it before there was a log; with it in the
+    /// log, a node that joins with nothing is brought to the same state by
+    /// the log like everything else.
+    async fn seed_log(&self) -> Result<(), RaftNodeError> {
+        use crate::raft::lsm_storage::RAFT_KEY_PREFIX;
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .storage
+            .scan(None, None)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(RAFT_KEY_PREFIX))
+            .collect();
+        self.write(Command::Seed(entries)).await.map(|_| ())
+    }
+
+    /// Set the address other nodes are to reach this one at, where it
+    /// differs from the address it listens on.
+    pub fn set_advertised_addr(&mut self, addr: String) {
+        self.advertised_addr = Some(addr);
+    }
+
+    /// Whether this node is the only member of its cluster.
+    pub fn is_alone(&self) -> bool {
+        self.alone.load(Ordering::SeqCst)
+    }
+
+    /// Ask a running cluster to admit a new node whose Raft port is at
+    /// `own_addr`, through any of `members`. Returns the node ID the
+    /// cluster assigned. Follows a member's pointer to the leader, and
+    /// keeps trying for a while: the cluster may be electing.
+    pub async fn request_membership(
+        tls_config: &RaftTlsConfig,
+        members: &[String],
+        own_addr: &str,
+    ) -> Result<NodeId, RaftNodeError> {
+        use crate::raft::network::{request_join, JoinReply};
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let mut candidates: Vec<String> = members.to_vec();
+        let mut last_error = String::from("no member given");
+        loop {
+            for member in candidates.clone() {
+                match request_join(tls_config, &member, own_addr).await {
+                    Ok(JoinReply::Joined { node_id }) => return Ok(node_id),
+                    Ok(JoinReply::NotLeader {
+                        leader: Some(leader),
+                    }) => {
+                        if !candidates.contains(&leader) {
+                            candidates.insert(0, leader);
+                        }
+                        last_error = format!("{member} is not the leader");
+                    }
+                    Ok(JoinReply::NotLeader { leader: None }) => {
+                        last_error = format!("{member} knows no leader yet");
+                    }
+                    Ok(JoinReply::Failed(e)) => last_error = e,
+                    Err(e) => last_error = e,
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RaftNodeError::Raft(format!(
+                    "could not join the cluster: {last_error}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Wait until this node leads and has applied everything in its log that
@@ -314,7 +420,19 @@ impl RaftNode {
     /// A single node holds no elections on a timer, so if it did not come
     /// back as leader by itself it is told to stand.
     pub async fn wait_until_ready(&self) -> Result<(), RaftNodeError> {
-        if self.single_node {
+        if !self.is_alone() {
+            // One of several: ready when it knows who leads and has applied
+            // what it holds. (What it does not hold yet arrives from the
+            // leader; a secondary is always a little behind.)
+            use openraft::async_runtime::WatchReceiver;
+            let mut metrics = self.raft.metrics();
+            let known = metrics.wait_until(|m| m.current_leader.is_some());
+            tokio::time::timeout(READY_TIMEOUT, known)
+                .await
+                .map_err(|_| RaftNodeError::Raft("no leader was found".to_string()))?
+                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        }
+        if self.is_alone() {
             let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
             let mut next_election = tokio::time::Instant::now() + Duration::from_millis(200);
             while !self.raft.is_leader() {
@@ -343,7 +461,7 @@ impl RaftNode {
         // Row IDs. Every reservation made before the restart has been
         // replayed by now; any ID in those ranges may have been used, so
         // start past them, with a fresh range reserved before serving.
-        if self.single_node {
+        if self.is_alone() {
             crate::storage::row_id::generator().skip_reserved();
             reserve_row_ids(&self.raft, self.id, ROW_ID_MIN_BLOCK).await?;
         }
@@ -357,7 +475,7 @@ impl RaftNode {
     ) -> Result<(), RaftNodeError> {
         let mut member_map = BTreeMap::new();
         for (id, addr) in &members {
-            member_map.insert(*id, Node::default());
+            member_map.insert(*id, Node::new(addr.to_string()));
             self.network.add_node(*id, *addr);
         }
 
@@ -377,7 +495,7 @@ impl RaftNode {
         self.addr = listener.local_addr()?;
 
         let acceptor = TlsAcceptor::from(self.tls_config.server_config());
-        let handler = Arc::new(RaftRpcHandler::new(self.raft.clone()));
+        let handler = Arc::new(RaftRpcHandler::new(self.raft.clone(), self.alone.clone()));
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         *self.shutdown_tx.lock() = Some(shutdown_tx);

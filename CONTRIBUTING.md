@@ -129,14 +129,16 @@ cargo test --release test_name                       # one test, any binary
 - `crash.rs`: starts its own server process on its own data directory, kills
   it without warning and checks that acknowledged work is still there.
 - `restart.rs`: data written before a restart is usable after it.
+- `cluster_binary.rs`: clusters of real server processes, formed by nodes
+  joining a running server.
+- `locking.rs`: row locking between connections, each test on a server of
+  its own.
 - `raft_cluster.rs`, `cluster/`: Raft behaviour (bootstrap, election, log
   replication, follower reads), using `RaftNode` instances inside the test
   process, including three-node clusters.
 
-The `roodb` binary itself starts as a single-node Raft cluster; starting a
-multi-node cluster from the command line is planned (see
-[admin.md](admin.md#deployment-modes)). No test runs SQL against a multi-node
-cluster of server processes.
+The `roodb` binary starts as a single-node Raft cluster, and further nodes
+join it with `--join` (see [admin.md](admin.md#deployment-modes)).
 
 Always use `--release` for the Raft cluster tests: they are timing sensitive.
 

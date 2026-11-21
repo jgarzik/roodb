@@ -43,6 +43,46 @@ struct Cli {
     key_path: PathBuf,
     #[arg(long, default_value = "./certs/ca.crt", env = "ROODB_CA_CERT_PATH")]
     raft_ca_cert_path: PathBuf,
+    /// Join the cluster that the node at this address (host:port of its
+    /// Raft port) belongs to, instead of running alone. Several may be
+    /// given, separated by commas. Used on an empty data directory; a node
+    /// that has joined once remembers its cluster.
+    #[arg(long, value_delimiter = ',', env = "ROODB_JOIN")]
+    join: Vec<String>,
+    /// Port for traffic between the nodes of a cluster (default: port + 1000)
+    #[arg(long, env = "ROODB_RAFT_PORT")]
+    raft_port: Option<u16>,
+    /// Host name or address at which the other nodes reach this one
+    /// (default: the bind address)
+    #[arg(long, env = "ROODB_ADVERTISE_HOST")]
+    advertise_host: Option<String>,
+}
+
+/// The file in the data directory that holds this node's ID.
+const NODE_ID_FILE: &str = "NODE_ID";
+
+/// The node ID recorded in the data directory, if there is one.
+fn stored_node_id(data_dir: &std::path::Path) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(data_dir.join(NODE_ID_FILE)) {
+        Ok(text) => Ok(Some(text.trim().parse().map_err(|_| {
+            format!("{NODE_ID_FILE} in the data directory does not hold a node ID")
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Record this node's ID in the data directory, durably: a node must never
+/// come back under another identity.
+fn store_node_id(data_dir: &std::path::Path, id: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = data_dir.join(NODE_ID_FILE);
+    let temporary = data_dir.join(format!("{NODE_ID_FILE}.tmp"));
+    let mut file = std::fs::File::create(&temporary)?;
+    writeln!(file, "{id}")?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &path)?;
+    std::fs::File::open(data_dir)?.sync_all()
 }
 
 #[tokio::main]
@@ -68,14 +108,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cert_path,
         key_path,
         raft_ca_cert_path,
+        join,
+        raft_port,
+        advertise_host,
     } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
 
-    // Raft RPC uses port + 1000 by convention
-    let raft_port = port
-        .checked_add(1000)
-        .ok_or("--port is too high: the Raft port is port + 1000")?;
+    // Raft RPC uses port + 1000 unless told otherwise
+    let raft_port = match raft_port {
+        Some(raft_port) => raft_port,
+        None => port
+            .checked_add(1000)
+            .ok_or("--port is too high: the Raft port is port + 1000")?,
+    };
+    if raft_port == port {
+        return Err("--raft-port must differ from --port".into());
+    }
     if let Some(tds_port) = tds_port {
         if tds_port == port || tds_port == raft_port {
             return Err(format!(
@@ -103,11 +152,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage: Arc<dyn StorageEngine> =
         Arc::new(LsmEngine::open(io.clone(), storage_config).await?);
 
-    // Check if database is initialized
-    if !is_initialized(&storage).await? {
-        eprintln!("ERROR: Database not initialized. Run 'roodb_init' first.");
-        std::process::exit(1);
-    }
+    // Who this node is. The first node of a cluster is initialised by
+    // roodb_init and is node 1. Any other starts with nothing, asks the
+    // cluster named by --join to admit it, and is told its ID. Either way
+    // the ID is recorded, and a restart goes by the record.
+    let advertised_raft_addr = format!(
+        "{}:{raft_port}",
+        advertise_host.unwrap_or_else(|| bind.to_string())
+    );
+    let initialized = is_initialized(&storage).await?;
+    let (node_id, joining) = match stored_node_id(&data_dir)? {
+        Some(id) => (id, false),
+        None if join.is_empty() => {
+            if !initialized {
+                eprintln!(
+                    "ERROR: Database not initialized. Run 'roodb_init' first, \
+                     or give --join to join an existing cluster."
+                );
+                std::process::exit(1);
+            }
+            store_node_id(&data_dir, 1)?;
+            (1, false)
+        }
+        None => {
+            if initialized {
+                return Err(
+                    "--join was given, but the data directory already holds a database \
+                     of its own; a node joins with an empty data directory"
+                        .into(),
+                );
+            }
+            let id = RaftNode::request_membership(&raft_tls_config, &join, &advertised_raft_addr)
+                .await?;
+            store_node_id(&data_dir, id)?;
+            tracing::info!(node_id = id, "Admitted to the cluster");
+            (id, true)
+        }
+    };
 
     // Initialize catalog with system tables
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
@@ -120,10 +201,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     tracing::info!(%durability, "Raft log opened");
 
-    // Initialize Raft node (single-node mode)
+    // The Raft node. Node 1 starts as the only member of its cluster
+    // unless its membership says otherwise; a node that joined is one of
+    // several from the start.
     let raft_addr = SocketAddr::new(bind, raft_port);
-
-    let node_id = 1;
+    let started_alone = node_id == 1 && !joining;
     let mut raft_node = RaftNode::new(
         node_id,
         raft_addr,
@@ -131,18 +213,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         catalog.clone(),
         log_store,
-        true,
+        started_alone,
     )
     .await?;
+    raft_node.set_advertised_addr(advertised_raft_addr);
 
     // Set node ID for globally unique row ID generation
     set_node_id(node_id);
 
     raft_node.start_rpc_server().await?;
-    raft_node.bootstrap_single_node().await?;
+    if raft_node.is_alone() {
+        raft_node.bootstrap_single_node().await?;
+        tracing::info!(raft_port, node_id, "Running as a single-node cluster");
+    } else {
+        raft_node.wait_until_ready().await?;
+        tracing::info!(raft_port, node_id, "Running as a member of a cluster");
+    }
     let raft_node = Arc::new(raft_node);
-
-    tracing::info!(raft_port, "Raft node bootstrapped (single-node mode)");
 
     // Start RooDB server
     let addr = SocketAddr::new(bind, port);

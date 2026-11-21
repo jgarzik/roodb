@@ -21,6 +21,7 @@ use crate::raft::types::{
     AppendEntriesRequest, AppendEntriesResponse, Node, NodeId, Snapshot, SnapshotData,
     SnapshotMeta, SnapshotResponse, TypeConfig, Vote, VoteRequest, VoteResponse,
 };
+use crate::raft::types::{Command, CommandResponse};
 use crate::tls::RaftTlsConfig;
 
 /// A whole snapshot as it travels between nodes.
@@ -34,11 +35,11 @@ struct SnapshotMessage {
 /// Describe a failed RPC: what was being done, to whom, and why it failed.
 fn describe(
     target: NodeId,
-    addr: Option<SocketAddr>,
+    addr: Option<&str>,
     operation: &str,
     err: impl std::fmt::Display,
 ) -> String {
-    let addr = addr.map_or_else(|| "unknown".to_string(), |a| a.to_string());
+    let addr = addr.unwrap_or("unknown");
     format!("Raft RPC {operation} to node {target} ({addr}): {err}")
 }
 
@@ -52,6 +53,51 @@ enum MessageType {
     AppendEntriesResponse = 4,
     Snapshot = 5,
     SnapshotResponse = 6,
+    Join = 7,
+}
+
+/// A node asking to be admitted to the cluster.
+#[derive(Serialize, Deserialize)]
+struct JoinRequest {
+    /// Where the other nodes can reach its Raft port.
+    addr: String,
+}
+
+/// What a member answers to a node asking to join.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum JoinReply {
+    /// Admitted, under this node ID. The data follows through Raft.
+    Joined {
+        node_id: NodeId,
+    },
+    /// Ask the leader instead (at this address, if known).
+    NotLeader {
+        leader: Option<String>,
+    },
+    Failed(String),
+}
+
+/// Ask the member at `member` to admit a node whose Raft port is at
+/// `own_addr`.
+pub async fn request_join(
+    tls_config: &RaftTlsConfig,
+    member: &str,
+    own_addr: &str,
+) -> Result<JoinReply, String> {
+    let connection = RaftNetworkConnection {
+        target: 0,
+        addr: Some(member.to_string()),
+        tls_config: tls_config.clone(),
+    };
+    connection
+        .send_request(
+            MessageType::Join,
+            &JoinRequest {
+                addr: own_addr.to_string(),
+            },
+            std::time::Duration::from_secs(30),
+        )
+        .await
 }
 
 impl TryFrom<u8> for MessageType {
@@ -64,6 +110,7 @@ impl TryFrom<u8> for MessageType {
             4 => Ok(Self::AppendEntriesResponse),
             5 => Ok(Self::Snapshot),
             6 => Ok(Self::SnapshotResponse),
+            7 => Ok(Self::Join),
             _ => Err(()),
         }
     }
@@ -96,8 +143,15 @@ impl RaftNetworkFactoryImpl {
 impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
     type Network = RaftNetworkConnection;
 
-    async fn new_client(&mut self, target: NodeId, _node: &Node) -> Self::Network {
-        let addr = self.nodes.read().get(&target).copied();
+    async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
+        // A node's address is part of the membership every node replicates,
+        // so that is where it is looked for. (Addresses given by hand, with
+        // `add_node`, serve members recorded without one.)
+        let addr = if node.addr.is_empty() {
+            self.nodes.read().get(&target).map(SocketAddr::to_string)
+        } else {
+            Some(node.addr.clone())
+        };
         RaftNetworkConnection {
             target,
             addr,
@@ -109,7 +163,8 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
 /// A single network connection to a Raft peer
 pub struct RaftNetworkConnection {
     target: NodeId,
-    addr: Option<SocketAddr>,
+    /// `host:port`; a host name is resolved each time a connection is made.
+    addr: Option<String>,
     tls_config: RaftTlsConfig,
 }
 
@@ -131,7 +186,7 @@ impl RaftNetworkConnection {
             Ok(result) => result,
             Err(_) => Err(describe(
                 self.target,
-                self.addr,
+                self.addr.as_deref(),
                 &format!("{msg_type:?}"),
                 format_args!("no reply within {limit:?}"),
             )),
@@ -149,9 +204,13 @@ impl RaftNetworkConnection {
         Resp: serde::de::DeserializeOwned,
     {
         let operation = format!("{:?}", msg_type);
-        let fail = |err: &dyn std::fmt::Display| describe(self.target, self.addr, &operation, err);
-
-        let addr = self.addr.ok_or_else(|| fail(&"address not configured"))?;
+        let fail = |err: &dyn std::fmt::Display| {
+            describe(self.target, self.addr.as_deref(), &operation, err)
+        };
+        let addr = self
+            .addr
+            .as_deref()
+            .ok_or_else(|| fail(&"address not configured"))?;
 
         // Connect with TLS
         let stream = TcpStream::connect(addr).await.map_err(|e| fail(&e))?;
@@ -250,11 +309,88 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
 /// RPC server handler - processes incoming Raft messages
 pub struct RaftRpcHandler {
     raft: crate::raft::types::Raft,
+    /// Set while this node is the only member of its cluster (see
+    /// `RaftNode`); cleared here when a second node is admitted.
+    alone: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RaftRpcHandler {
-    pub fn new(raft: crate::raft::types::Raft) -> Self {
-        Self { raft }
+    pub fn new(raft: crate::raft::types::Raft, alone: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { raft, alone }
+    }
+
+    /// Admit a node that asks to join: give it a node ID, add it as a
+    /// learner, and make it a voter once it has caught up. Only the leader
+    /// can; any other member says who the leader is.
+    async fn join(&self, request: JoinRequest) -> JoinReply {
+        use openraft::async_runtime::WatchReceiver;
+
+        let (id, leader, membership) = {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow_watched();
+            (
+                metrics.id,
+                metrics.current_leader,
+                metrics.membership_config.clone(),
+            )
+        };
+        if leader != Some(id) {
+            let leader = leader.and_then(|leader| {
+                membership
+                    .nodes()
+                    .find(|(node, _)| **node == leader)
+                    .map(|(_, node)| node.addr.clone())
+            });
+            return JoinReply::NotLeader { leader };
+        }
+        // Asked again by a node that is already in (its first answer may
+        // have been lost): the same answer.
+        if let Some((node_id, _)) = membership
+            .nodes()
+            .find(|(_, node)| node.addr == request.addr)
+        {
+            return JoinReply::Joined { node_id: *node_id };
+        }
+
+        let node_id = match self.raft.client_write(Command::AllocNodeId).await {
+            Ok(response) => match response.data {
+                CommandResponse::Ok(Some(bytes)) if bytes.len() == 8 => {
+                    u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+                }
+                other => return JoinReply::Failed(format!("no node ID was allocated: {other:?}")),
+            },
+            Err(e) => return JoinReply::Failed(e.to_string()),
+        };
+
+        // No longer alone: this node needs its timers, to send heartbeats
+        // and to notice if the others stop answering.
+        self.alone.store(false, std::sync::atomic::Ordering::SeqCst);
+        let runtime = self.raft.runtime_config();
+        runtime.tick(true);
+        runtime.heartbeat(true);
+        runtime.elect(true);
+
+        // The node is told its ID now and starts listening; meanwhile it is
+        // sent the log (or a snapshot), and made a voter when it has it all.
+        let raft = self.raft.clone();
+        let node = Node::new(request.addr.clone());
+        tokio::spawn(async move {
+            if let Err(e) = raft.add_learner(node_id, node, true).await {
+                tracing::error!(node_id, error = %e, "A joining node could not be added");
+                return;
+            }
+            let voters = std::collections::BTreeSet::from([node_id]);
+            match raft
+                .change_membership(openraft::ChangeMembers::AddVoterIds(voters), false)
+                .await
+            {
+                Ok(_) => tracing::info!(node_id, "A node joined the cluster"),
+                Err(e) => {
+                    tracing::error!(node_id, error = %e, "A joining node could not be made a voter");
+                }
+            }
+        });
+        JoinReply::Joined { node_id }
     }
 
     /// Handle an incoming RPC request
@@ -294,6 +430,12 @@ impl RaftRpcHandler {
                     .await
                     .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
+                Ok(Bytes::from(encoded))
+            }
+            MessageType::Join => {
+                let request: JoinRequest = bincode::deserialize(body).map_err(|e| e.to_string())?;
+                let reply = self.join(request).await;
+                let encoded = bincode::serialize(&reply).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }
             _ => Err(format!("Unexpected message type: {:?}", msg_type)),

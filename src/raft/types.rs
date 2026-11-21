@@ -30,6 +30,15 @@ pub enum Command {
     /// `node_id`. A node records this before handing any of them out, so that
     /// after a restart it can resume past every ID it may have used.
     ReserveRowIds { node_id: NodeId, upto: u64 },
+    /// What `roodb_init` wrote into the first node's storage before there
+    /// was a log: stored keys and values, as they are. It is the first
+    /// thing proposed when the cluster is formed, so that the log accounts
+    /// for everything in storage and a node that joins later, with nothing,
+    /// ends up with the same.
+    Seed(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Hand out the next node ID. The response carries it. IDs are never
+    /// reused, also not after a node has left.
+    AllocNodeId,
 }
 
 // ============ MVCC header layout constants ============
@@ -80,6 +89,8 @@ impl std::fmt::Display for Command {
             Command::ReserveRowIds { node_id, upto } => {
                 write!(f, "ReserveRowIds(node {node_id}, upto {upto})")
             }
+            Command::Seed(entries) => write!(f, "Seed({} entries)", entries.len()),
+            Command::AllocNodeId => f.write_str("AllocNodeId"),
         }
     }
 }

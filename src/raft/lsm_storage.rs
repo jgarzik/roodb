@@ -68,6 +68,13 @@ const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
 /// A bound on the highest transaction ID applied (u64, little endian).
 const MAX_TXN_KEY: &[u8] = b"_raft:sm:max_txn_id";
 
+/// The next node ID to hand out. The first node is 1.
+const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
+
+/// Keys with this prefix are the state machine's own bookkeeping; every
+/// other key is data.
+pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
+
 /// Prefix of the keys holding each node's reserved row ID bound (u64, little
 /// endian), followed by the node ID in big endian.
 const ROW_ID_KEY_PREFIX: &[u8] = b"_raft:sm:row_id:";
@@ -116,8 +123,6 @@ pub struct LsmRaftStorage {
     catalog: Arc<RwLock<Catalog>>,
     cached_last_applied: Arc<RwLock<Option<LogId>>>,
     cached_membership: Arc<RwLock<StoredMembership>>,
-    /// No other node will ever ask this one for a snapshot's contents.
-    single_node: bool,
     /// The highest transaction ID applied, or a bound above it; shared with
     /// the transaction manager, which keeps its own IDs ahead of it.
     applied_txn_floor: Arc<AtomicU64>,
@@ -163,7 +168,6 @@ impl LsmRaftStorage {
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
-        single_node: bool,
         node_id: u64,
     ) -> Result<Self, StorageError> {
         let this = Self {
@@ -171,7 +175,6 @@ impl LsmRaftStorage {
             catalog,
             cached_last_applied: Arc::new(RwLock::new(None)),
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
-            single_node,
             applied_txn_floor: Arc::new(AtomicU64::new(0)),
             stored_txn_bound: Arc::new(AtomicU64::new(0)),
             node_id,
@@ -1064,6 +1067,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             let mut membership_change = None;
             let mut new_txn_id = None;
             let mut reserved_row_ids = None;
+            let mut seeded = false;
 
             let response = match &entry.payload {
                 EntryPayload::Blank => CommandResponse::Ok(None),
@@ -1086,6 +1090,28 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                         reserved_row_ids = Some(bound);
                     }
                     CommandResponse::Ok(None)
+                }
+                EntryPayload::Normal(Command::Seed(entries)) => {
+                    for (key, value) in entries {
+                        batch.push((key.clone(), Some(value.clone())));
+                    }
+                    seeded = true;
+                    CommandResponse::Ok(None)
+                }
+                EntryPayload::Normal(Command::AllocNodeId) => {
+                    let next = match self.storage.get(NEXT_NODE_ID_KEY).await.map_err(read_err)? {
+                        Some(data) => data
+                            .as_slice()
+                            .try_into()
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| read_err("stored node ID counter is malformed"))?,
+                        None => 2,
+                    };
+                    batch.push((
+                        NEXT_NODE_ID_KEY.to_vec(),
+                        Some((next + 1).to_le_bytes().to_vec()),
+                    ));
+                    CommandResponse::Ok(Some(next.to_le_bytes().to_vec()))
                 }
                 EntryPayload::Normal(Command::DataChange(changeset)) => {
                     match self
@@ -1146,6 +1172,11 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             self.storage.write_batch(batch).await.map_err(write_err)?;
             if let Some(txn_id) = new_txn_id {
                 self.applied_txn_floor.fetch_max(txn_id, Ordering::SeqCst);
+            }
+            // The seed brings rows of the system tables with it: let the
+            // catalog see them.
+            if seeded {
+                self.rebuild_catalog_from_system_tables().await?;
             }
             // Only now that the reservation is recorded may the IDs be used.
             if let Some(upto) = reserved_row_ids {
@@ -1279,7 +1310,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, StorageError> {
-        if self.single_node {
+        // Alone in the cluster: no other node will ever ask for a
+        // snapshot's contents.
+        let alone = self.cached_membership.read().nodes().count() <= 1;
+        if alone {
             // What has been flushed is a snapshot: it is the state at the
             // position flushed with it. Nobody will ask for its contents, so
             // none are produced.

@@ -383,6 +383,9 @@ pub struct RowChange {
   - A spare segment is kept ready and purged segments are recycled.
 - `LsmRaftStorage` (`lsm_storage.rs`): the state machine. Applies committed entries to the LSM, rebuilds the catalog on apply, and keeps its own position (last applied, membership) in the LSM.
 
+- Cluster membership: every node has an ID, kept in `NODE_ID` in its data directory. The first node is 1; a node started with `--join` asks a member to admit it (`JoinRequest` on the Raft port), the leader allocates the next ID through the log (`Command::AllocNodeId`), adds the node as a learner and promotes it when it has caught up. Peer addresses are part of the replicated membership. A node that is alone runs without timers or elections; they are switched on at run time when a second node is admitted.
+- `Command::Seed`: the first entry of a new cluster's log carries what `roodb_init` wrote to storage before there was a log, so that the log accounts for everything in storage and a joining node receives it.
+
 **Read Path**: Direct to local LSM (no Raft)
 **Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM
 

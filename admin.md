@@ -37,6 +37,9 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 | `--cert-path` | `ROODB_CERT_PATH` | ./certs/server.crt | TLS certificate |
 | `--key-path` | `ROODB_KEY_PATH` | ./certs/server.key | TLS private key |
 | `--raft-ca-cert-path` | `ROODB_CA_CERT_PATH` | ./certs/ca.crt | CA certificate for Raft mTLS |
+| `--raft-port` | `ROODB_RAFT_PORT` | port + 1000 | Port for traffic between the nodes of a cluster |
+| `--advertise-host` | `ROODB_ADVERTISE_HOST` | the bind address | Host name or address at which other nodes reach this one. Needed when binding to 0.0.0.0 |
+| `--join` | `ROODB_JOIN` | (none) | `host:raft-port` of a member of the cluster to join (several, comma-separated). For a node starting on an empty data directory |
 
 ### TLS Requirements
 
@@ -231,6 +234,7 @@ data/
 ├── *.sst              # LSM table files
 ├── MANIFEST           # Which table files exist, by level
 ├── LOCK               # Held while a server has the directory open
+├── NODE_ID            # This node's ID in its cluster
 └── raft/
     ├── log-*.seg      # The Raft log (the write-ahead log), in fixed-size segments
     └── spare.seg      # A prepared segment waiting to be used
@@ -257,51 +261,41 @@ The server automatically bootstraps as a single-node Raft cluster, electing itse
 
 ### Multi-Node Cluster
 
-Multi-node clusters provide high availability through Raft consensus. Currently, cluster deployment requires programmatic setup (CLI support planned).
+A cluster is a first node, started as above, and further nodes that join it.
+A joining node starts with an **empty data directory** (no `roodb_init`) and
+the address of the Raft port of any member:
 
-**Cluster requirements:**
-- 3 nodes minimum (tolerates 1 failure)
-- 5 nodes for higher availability (tolerates 2 failures)
-- All nodes need TLS certificates signed by the same CA (mTLS)
-- Shared CA certificate on all nodes for peer verification
-- Network connectivity between all nodes on Raft RPC port
+```bash
+# first node: initialised with roodb_init, then started as a single node
+./roodb --bind 10.0.0.1 --port 3307 --data-dir ./data ...
 
-**Bootstrap procedure (programmatic):**
-
-```rust
-// 1. Create RaftNode for each member
-let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1).await?;
-let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2).await?;
-let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3).await?;
-
-// 2. Register all peers on all nodes
-node1.add_peer(2, addr2);
-node1.add_peer(3, addr3);
-node2.add_peer(1, addr1);
-node2.add_peer(3, addr3);
-node3.add_peer(1, addr1);
-node3.add_peer(2, addr2);
-
-// 3. Start RPC servers on all nodes
-node1.start_rpc_server().await?;
-node2.start_rpc_server().await?;
-node3.start_rpc_server().await?;
-
-// 4. Bootstrap from ONE node with full membership
-let members = vec![(1, addr1), (2, addr2), (3, addr3)];
-node1.bootstrap_cluster(members).await?;
-
-// 5. Wait for leader election (~500-1000ms)
-tokio::time::sleep(Duration::from_millis(1000)).await;
+# second and third node, each on its own machine and empty data directory
+./roodb --bind 10.0.0.2 --port 3307 --data-dir ./data --join 10.0.0.1:4307 ...
+./roodb --bind 10.0.0.3 --port 3307 --data-dir ./data --join 10.0.0.1:4307 ...
 ```
 
-See `tests/roodb_suite/raft_cluster.rs` for complete working example.
+The cluster gives the new node its node ID (kept in `NODE_ID` in the data
+directory), sends it the data, and makes it a voting member once it has
+caught up. From then on the node knows its cluster: on a restart it needs
+no `--join`, and the option is ignored if given.
 
-**Cluster behavior:**
-- Writes must go to leader (followers return "not leader" error)
-- Reads served from any node (local LSM)
-- Leader election: 150-300ms timeout, 50ms heartbeat
-- Automatic failover when leader fails (if quorum remains)
+**Requirements:**
+- 3 nodes tolerate the loss of 1; 5 tolerate 2.
+- Every node needs a certificate signed by the same CA, and that CA's
+  certificate (`--raft-ca-cert-path`): nodes authenticate each other with
+  mutual TLS.
+- Every node must be able to reach every other node's Raft port
+  (`--raft-port`, by default the client port + 1000) at the address the node
+  advertises: its `--bind` address, or `--advertise-host` when it binds to
+  `0.0.0.0` or sits behind another name.
+
+**Behaviour today:**
+- Writes go to the leader. The other nodes apply what the leader commits
+  and answer reads from their own state, which can be slightly behind.
+- Leader election: 150-300 ms timeout, 50 ms heartbeat.
+- Still to come (see `doc/ROADMAP.md`): refusing writes on a node that is
+  not the leader, taking over when the leader fails, catching up a node
+  that has fallen far behind by snapshot, and removing a node.
 
 ## First-Time Initialization
 
