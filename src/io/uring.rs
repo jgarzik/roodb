@@ -29,8 +29,10 @@ use super::error::IoResult;
 const RING_ENTRIES: u32 = 1024;
 /// Completion queue size of each ring; also the cap on requests in the kernel.
 const MAX_INFLIGHT: usize = 4096;
-/// Background requests allowed in the kernel at once, per reactor.
-const MAX_BACKGROUND: usize = 128;
+/// Background requests allowed in the kernel at once, per reactor. Kept low:
+/// each can be a megabyte or more, and once requests are in the device's
+/// queue the order they were submitted in no longer protects anyone.
+const MAX_BACKGROUND: usize = 16;
 /// Size of each ring's fixed file table.
 const FIXED_FILES: u32 = 4096;
 /// Largest single transfer handed to the kernel; longer requests continue
