@@ -381,8 +381,14 @@ impl Inner {
     ///
     /// Readers see the change as soon as it is made; callers must not discard
     /// anything the old manifest still needs (a memtable, compaction inputs)
-    /// until this returns. If the change cannot be written it is undone, so
-    /// memory never runs ahead of disk.
+    /// until this returns successfully.
+    ///
+    /// If the new manifest never reached disk, the change is undone so that
+    /// memory matches what a restart would find. If it reached disk but could
+    /// not be confirmed durable ([`StorageError::ManifestNotSynced`]) the
+    /// change stands: memory and disk agree, and the caller gets the error so
+    /// that it neither releases what the old manifest needed nor deletes what
+    /// the new one lists.
     async fn commit_manifest(&self, change: impl FnOnce(&mut Manifest)) -> StorageResult<()> {
         let _writing = self.manifest_io.lock().await;
         let (dir, data, before) = {
@@ -392,8 +398,10 @@ impl Inner {
             (manifest.dir().to_path_buf(), manifest.snapshot(), before)
         };
         let result = persist(&self.io, &dir, &data).await;
-        if result.is_err() {
-            self.manifest.write().restore_levels(before);
+        if let Err(e) = &result {
+            if !matches!(e, StorageError::ManifestNotSynced(_)) {
+                self.manifest.write().restore_levels(before);
+            }
         }
         result
     }
@@ -401,7 +409,13 @@ impl Inner {
     /// Forget a table that was written but could not be installed, and delete
     /// its file. Left alone, a retry would write the same data again under a
     /// new name and the abandoned files would pile up until restart.
-    fn discard_table(&self, name: &str, path: &std::path::Path) {
+    ///
+    /// `error` is why installing it failed. Nothing is deleted if the manifest
+    /// on disk may already list the table.
+    fn discard_table(&self, name: &str, path: &std::path::Path, error: &StorageError) {
+        if matches!(error, StorageError::ManifestNotSynced(_)) {
+            return;
+        }
         // An armed crash point is simulating a crash, which cleans nothing up.
         if self.crash_point.is_some() {
             return;
@@ -458,8 +472,8 @@ impl Inner {
         let result = self
             .write_level0_table(entries, &name, &path, urgency)
             .await;
-        if result.is_err() {
-            self.discard_table(&name, &path);
+        if let Err(e) = &result {
+            self.discard_table(&name, &path, e);
         }
         result
     }
@@ -526,8 +540,8 @@ impl Inner {
             );
 
             let installed = self.run_compaction(&job).await;
-            if installed.is_err() {
-                self.discard_table(&job.output_name, &job.output_path);
+            if let Err(e) = &installed {
+                self.discard_table(&job.output_name, &job.output_path, e);
             }
             installed?;
             self.crash_at(CrashPoint::CompactionAfterManifestSaved)?;

@@ -37,6 +37,11 @@ pub enum StorageError {
     #[error("Manifest error: {0}")]
     Manifest(String),
 
+    /// The new manifest is in place on disk but could not be confirmed
+    /// durable. The change must be treated as made.
+    #[error("Manifest replaced but not confirmed durable: {0}")]
+    ManifestNotSynced(String),
+
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(String),

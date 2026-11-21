@@ -249,6 +249,11 @@ impl Manifest {
 /// write a temporary file, make it durable, rename it over the manifest, then
 /// make the rename durable. A crash leaves either the old manifest or the new
 /// one, never a mixture.
+///
+/// An error before the rename means the old manifest is still the one on
+/// disk. An error after it is reported as [`StorageError::ManifestNotSynced`]:
+/// the new manifest is what a restart will most likely find, so the caller
+/// must not undo the change or delete anything the new manifest lists.
 pub async fn persist(io: &IoEngine, dir: &Path, data: &ManifestData) -> StorageResult<()> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let temp_path = dir.join(format!("{MANIFEST_FILE}.tmp"));
@@ -279,7 +284,10 @@ pub async fn persist(io: &IoEngine, dir: &Path, data: &ManifestData) -> StorageR
         ..OpenOptions::read_only()
     };
     if let Ok(dir_file) = io.open(dir, dir_options).await {
-        dir_file.sync_all(Urgency::Critical).await?;
+        dir_file
+            .sync_all(Urgency::Critical)
+            .await
+            .map_err(|e| StorageError::ManifestNotSynced(e.to_string()))?;
     }
     Ok(())
 }
