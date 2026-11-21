@@ -178,6 +178,14 @@ fn read_lock_of(
 /// commit: the same as for a deadlock, since the remedy is the same.
 const COMMIT_CONFLICT: &str = "Deadlock found when trying to get lock; try restarting transaction";
 
+/// What a write gets on a node that is not the primary.
+use crate::raft::NOT_PRIMARY;
+
+/// What COMMIT gets when the transaction was rolled back because its node
+/// stopped being the primary (MySQL Group Replication's error 3101).
+const ROLLED_BACK_BY_FAILOVER: &str =
+    "Plugin instructed the server to rollback the current transaction.";
+
 /// How a deadlock is recognised in an error that has been reduced to text.
 const DEADLOCK_TEXT: &str = "Deadlock found when trying to get lock";
 
@@ -1142,6 +1150,13 @@ impl QueryEngine {
 
         // Check if this is DDL (no MVCC needed)
         let is_ddl = plan.is_ddl();
+        // A secondary reads. Anything that writes or locks is the
+        // primary's to do.
+        if (is_ddl || !returns_rows || self.read_lock.is_some()) && self.read_only() {
+            return self
+                .send_error(1290, states::GENERAL_ERROR, NOT_PRIMARY)
+                .await;
+        }
         if !is_ddl {
             self.ensure_transaction()?;
         }
@@ -1170,7 +1185,7 @@ impl QueryEngine {
             // done) - create implicit transaction
             let txn = self
                 .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)?;
+                .begin(self.session.isolation_level, self.read_only())?;
             self.implicit_txns.push(txn.txn_id);
             let read_view = self.txn_manager.create_read_view(txn.txn_id)?;
             (
@@ -1426,7 +1441,7 @@ impl QueryEngine {
         }
 
         // Read-only mode (replica) requires read-only transactions
-        let read_only = self.session.is_read_only;
+        let read_only = self.read_only();
         match self
             .txn_manager
             .begin(self.session.isolation_level, read_only)
@@ -1642,6 +1657,12 @@ impl QueryEngine {
         Ok(())
     }
 
+    /// Whether this session may only read: it is on a node that is not the
+    /// primary of its cluster.
+    fn read_only(&self) -> bool {
+        self.session.is_read_only || !self.txn_manager.is_leader()
+    }
+
     /// The row locking a statement of this session does.
     fn lock_handle(&self) -> crate::executor::context::LockHandle {
         crate::executor::context::LockHandle {
@@ -1663,7 +1684,7 @@ impl QueryEngine {
         if !self.session.autocommit && self.session.current_txn.is_none() {
             let txn = self
                 .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)?;
+                .begin(self.session.isolation_level, self.read_only())?;
             self.session.begin_transaction(txn.txn_id);
             // A new transaction is one level deep, whatever depth the last
             // one ended at.
@@ -1690,6 +1711,15 @@ impl QueryEngine {
         let Some(txn_id) = self.session.current_txn else {
             return Ok(());
         };
+        // The transaction may have been rolled back behind the session's
+        // back: this node stopped being the primary, and with that its
+        // locks were gone. What it had buffered must not be committed now,
+        // even if the node leads again.
+        if !self.txn_manager.is_active(txn_id) {
+            self.session.clear_pending_changes();
+            self.session.end_transaction();
+            return Err(ROLLED_BACK_BY_FAILOVER.to_string());
+        }
         // First, propose any pending changes to Raft
         let changes = self.session.take_pending_changes();
         if !changes.is_empty() {
@@ -6100,7 +6130,7 @@ impl QueryEngine {
         } else if self.session.autocommit {
             let txn = self
                 .txn_manager
-                .begin(self.session.isolation_level, self.session.is_read_only)
+                .begin(self.session.isolation_level, self.read_only())
                 .map_err(|e| e.to_string())?;
             self.implicit_txns.push(txn.txn_id);
             let read_view = self
@@ -6218,11 +6248,22 @@ impl QueryEngine {
     ) -> ProtocolResult<()> {
         // A deadlock found inside a procedure or trigger reaches here as
         // the text of a general error. It is a deadlock all the same, and
-        // clients decide whether to retry by the code.
+        // clients decide whether to retry by the code. Likewise a write
+        // refused because this node is not the primary, wherever it was
+        // refused.
         let (code, state) = if message.contains(DEADLOCK_TEXT) {
             (codes::ER_LOCK_DEADLOCK, "40001")
+        } else if message.contains(NOT_PRIMARY) {
+            (1290, states::GENERAL_ERROR)
+        } else if message.contains(ROLLED_BACK_BY_FAILOVER) {
+            (3101, "40000")
         } else {
             (code, state)
+        };
+        let message = if message.contains(NOT_PRIMARY) {
+            NOT_PRIMARY
+        } else {
+            message
         };
         self.out
             .error(&QueryError::new(code, state.to_string(), message));

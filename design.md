@@ -384,6 +384,7 @@ pub struct RowChange {
 - `LsmRaftStorage` (`lsm_storage.rs`): the state machine. Applies committed entries to the LSM, rebuilds the catalog on apply, and keeps its own position (last applied, membership) in the LSM.
 
 - Cluster membership: every node has an ID, kept in `NODE_ID` in its data directory. The first node is 1; a node started with `--join` asks a member to admit it (`JoinRequest` on the Raft port), the leader allocates the next ID through the log (`Command::AllocNodeId`), adds the node as a learner and promotes it when it has caught up. Peer addresses are part of the replicated membership. A node that is alone runs without timers or elections; they are switched on at run time when a second node is admitted.
+- Roles: the leader is the primary; every other node is a read-only secondary. `RaftNode::watch_leadership` tells the server when the node starts or stops leading: the transaction manager is told, a node that stops leading rolls back its open transactions (`TransactionManager::abort_all`), and a node that starts leading moves its row ID counter past everything it had reserved before. Sessions refuse writes, DDL and locking reads with error 1290 unless the node leads.
 - `Command::Seed`: the first entry of a new cluster's log carries what `roodb_init` wrote to storage before there was a log, so that the log accounts for everything in storage and a joining node receives it.
 
 **Read Path**: Direct to local LSM (no Raft)

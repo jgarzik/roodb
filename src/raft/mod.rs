@@ -11,5 +11,5 @@ pub use changes::{ChangeOp, ChangeSet, RowChange};
 pub use log_store::{Durability, LogStats, LogStore, LogStoreConfig};
 pub use lsm_storage::LsmRaftStorage;
 pub use network::{RaftNetworkFactoryImpl, RaftRpcHandler};
-pub use node::RaftNode;
+pub use node::{RaftNode, NOT_PRIMARY};
 pub use types::*;

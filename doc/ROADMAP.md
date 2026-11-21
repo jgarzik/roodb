@@ -46,23 +46,18 @@ In order:
   files, held open for the transfer) streamed in chunks of any total size,
   installed atomically on the receiver. Today a snapshot is the whole
   keyspace in one message, limited to 4 GiB.
-- Row ID reservations after recovery on a node that is not alone.
-- Primary and secondaries: a session on a secondary is read-only (error
-  1290 on writes, locking reads and DDL); when a node stops being leader
-  its open transactions are rolled back and their locks released; when it
-  becomes leader it accepts writes once it has applied its log.
+- A test that a node which becomes primary gives out row IDs no node gave
+  out before (a table without a primary key, written before and after a
+  failover).
 - Leaving: `ALTER CLUSTER REMOVE NODE id` on the primary; the removed node
   stops serving. `SHOW CLUSTER MEMBERS` on any node: ID, address, role
   (primary, secondary, learner), so that clients and routers can find the
   primary.
 - Persistent RPC connections between nodes (today one connection per
   request).
-- Tests through the real binary, on both I/O backends: three nodes formed
-  by joining; writes on the primary read on the secondaries; a secondary
-  killed and restarted catches up; the primary killed, another takes over
-  and no acknowledged commit is lost; a secondary too far behind for the
-  log is caught up by snapshot; a node removed; a write refused on a
-  secondary.
+- Tests through the real binary still to write: the cluster tests on the
+  posix backend too; a secondary too far behind for the log caught up by
+  snapshot; a node removed.
 - Documents: admin.md (deployment modes, cluster operations, new flags,
   troubleshooting) rewritten from what the binary does; SQL.md (the two
   statements, error 1290, read-only sessions); design.md and LOCKING.md

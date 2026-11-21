@@ -289,13 +289,22 @@ no `--join`, and the option is ignored if given.
   advertises: its `--bind` address, or `--advertise-host` when it binds to
   `0.0.0.0` or sits behind another name.
 
-**Behaviour today:**
-- Writes go to the leader. The other nodes apply what the leader commits
-  and answer reads from their own state, which can be slightly behind.
-- Leader election: 150-300 ms timeout, 50 ms heartbeat.
-- Still to come (see `doc/ROADMAP.md`): refusing writes on a node that is
-  not the leader, taking over when the leader fails, catching up a node
-  that has fallen far behind by snapshot, and removing a node.
+**Primary and secondaries:**
+- The node that leads the cluster is the **primary**: it takes all writes.
+  The others are **secondaries**: they apply what the primary commits and
+  answer reads from their own state, which can be slightly behind. A
+  secondary refuses anything that writes or locks with error 1290, the
+  error of a read-only MySQL server. This is the single-primary model of
+  MySQL Group Replication; point writers at the primary.
+- When the primary fails or is cut off, the remaining nodes elect a new one
+  (150-300 ms election timeout, 50 ms heartbeat), provided a majority of the
+  nodes is still up. Nothing that was acknowledged is lost. Transactions
+  that were open on the old primary are rolled back.
+- A node that was down restarts on its data directory with no special
+  options, follows the current primary and catches up.
+- Still to come (see `doc/ROADMAP.md`): catching up a node that has fallen
+  too far behind for the log by snapshot, removing a node, and a statement
+  that shows the members and which is the primary.
 
 ## First-Time Initialization
 

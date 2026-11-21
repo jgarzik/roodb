@@ -749,6 +749,13 @@ supported.
   rows the transaction has inserted or changed. `UPDATE` and `DELETE` see
   the transaction's earlier changes to rows that already existed, but do
   not find rows the same transaction inserted.
+- **In a cluster, only the primary writes.** On any other node a session
+  is read-only: `SELECT` works (from that node's own state, which may be a
+  little behind the primary), and every statement that writes or locks,
+  DDL and `SELECT ... FOR UPDATE` included, fails with error 1290. If the
+  primary changes while a transaction is open, the transaction is rolled
+  back and its `COMMIT` fails with error 3101. See
+  [admin.md](admin.md#deployment-modes).
 - **A session that ends takes its transaction with it.** When a client
   disconnects, the connection fails, or the connection is reset, the open
   transaction is rolled back and the session's temporary tables are
@@ -982,7 +989,9 @@ returns most often:
 | 1222 | 21000 | `UNION` branches have different numbers of columns |
 | 1264, 1690 | 22003 | Numeric value out of range. 1690 is also reported for errors raised while a result is being returned, such as an unknown function |
 | 1292 | 22007 | Truncated incorrect value |
+| 1290 | HY000 | The node is a secondary of its cluster: it is read-only |
 | 1295 | HY000 | Statement cannot be prepared with parameters |
+| 3101 | 40000 | The transaction was rolled back because its node stopped being the primary; start it again on the primary |
 | 3568 | HY000 | `FOR UPDATE OF` / `FOR SHARE OF` names a table the query does not have |
 | 3572 | HY000 | A row was locked and the statement said `NOWAIT` |
 | 1568 | HY000 | Isolation level changed inside a transaction |

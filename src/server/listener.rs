@@ -86,7 +86,25 @@ impl RooDbServer {
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
+        self.follow_leadership();
         self.accept_loop(listener, shutdown).await
+    }
+
+    /// Keep the transaction manager told whether this node is the primary
+    /// (the leader of its cluster). When it stops being one, its open
+    /// transactions are rolled back: their locks and buffered changes mean
+    /// nothing to the node that leads now.
+    fn follow_leadership(&self) {
+        let txn_manager = self.ctx.txn_manager.clone();
+        self.ctx.raft_node.watch_leadership(move |leads| {
+            txn_manager.set_leader(leads);
+            if leads {
+                tracing::info!("This node is the primary");
+            } else {
+                let aborted = txn_manager.abort_all();
+                tracing::info!(aborted, "This node is a secondary: read-only");
+            }
+        });
     }
 
     /// Run the server with a pre-bound listener and shutdown signal

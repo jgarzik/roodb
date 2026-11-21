@@ -74,6 +74,11 @@ pub struct RaftNode {
     row_id_gate: tokio::sync::Mutex<()>,
 }
 
+/// What a write is refused with on a node that is not the leader of its
+/// cluster: MySQL's message for a read-only server (error 1290).
+pub const NOT_PRIMARY: &str =
+    "The MySQL server is running with the --super-read-only option so it cannot execute this statement";
+
 /// How much log may accumulate before the state machine is checkpointed so
 /// that the log can be purged. It bounds both the disk the log uses and the
 /// work a restart has to replay.
@@ -367,6 +372,43 @@ impl RaftNode {
         self.advertised_addr = Some(addr);
     }
 
+    /// Whether this node leads its cluster right now, as far as it knows.
+    pub fn leads(&self) -> bool {
+        self.raft.is_leader()
+    }
+
+    /// Call `changed(leads)` now and every time this node starts or stops
+    /// leading its cluster, from a task of its own.
+    pub fn watch_leadership(self: &Arc<Self>, changed: impl Fn(bool) + Send + 'static) {
+        use openraft::async_runtime::WatchReceiver;
+        let node = Arc::downgrade(self);
+        let mut metrics = self.raft.metrics();
+        tokio::spawn(async move {
+            let mut led: Option<bool> = None;
+            loop {
+                let leads = metrics.borrow_watched().state.is_leader();
+                if led != Some(leads) {
+                    led = Some(leads);
+                    if leads {
+                        // IDs this node handed out the last time it led may
+                        // have been used: go past everything it reserved,
+                        // and reserve afresh before any is handed out.
+                        let Some(node) = node.upgrade() else { return };
+                        crate::storage::row_id::generator().skip_reserved();
+                        if let Err(e) = reserve_row_ids(&node.raft, node.id, ROW_ID_MIN_BLOCK).await
+                        {
+                            tracing::warn!(error = %e, "Could not reserve row IDs on becoming leader");
+                        }
+                    }
+                    changed(leads);
+                }
+                if metrics.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Whether this node is the only member of its cluster.
     pub fn is_alone(&self) -> bool {
         self.alone.load(Ordering::SeqCst)
@@ -552,6 +594,11 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
         }
 
+        // Only the leader writes. Said here, before anything is tried, in
+        // the words a client of a read-only MySQL server would get.
+        if !self.raft.is_leader() {
+            return Err(RaftNodeError::Raft(NOT_PRIMARY.to_string()));
+        }
         self.cover_row_ids().await?;
         let cmd = Command::DataChange(changeset);
         let start = std::time::Instant::now();
@@ -588,6 +635,9 @@ impl RaftNode {
 
     /// Write a raw command to the Raft log
     pub async fn write(&self, cmd: Command) -> Result<CommandResponse, RaftNodeError> {
+        if !self.raft.is_leader() {
+            return Err(RaftNodeError::Raft(NOT_PRIMARY.to_string()));
+        }
         self.cover_row_ids().await?;
         let start = std::time::Instant::now();
         let resp = self

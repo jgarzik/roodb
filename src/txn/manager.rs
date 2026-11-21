@@ -93,6 +93,24 @@ impl TransactionManager {
         self.is_leader.load(Ordering::SeqCst)
     }
 
+    /// Roll back every open transaction and release its locks. For a node
+    /// that has stopped being the leader: what its transactions had locked
+    /// and buffered means nothing on the node that leads now. A session
+    /// finds its transaction gone when it next tries to commit.
+    pub fn abort_all(&self) -> usize {
+        let aborted: Vec<u64> = self
+            .active_transactions
+            .write()
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
+        for &txn_id in &aborted {
+            self.locks.release_all(txn_id);
+            self.undo_log.remove_transaction(txn_id);
+        }
+        aborted.len()
+    }
+
     /// Update timeout configuration
     pub fn set_timeout_config(&self, config: TimeoutConfig) {
         *self.timeout_config.write() = config;

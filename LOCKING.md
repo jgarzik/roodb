@@ -218,7 +218,10 @@ The whole table is guarded by one `parking_lot::Mutex`, held only to inspect
 or change the table, never while a requester waits: a waiter parks on a
 oneshot channel outside the mutex. No other lock is taken while it is held.
 The locks exist only in memory on the node that granted them; they are not
-replicated.
+replicated. Only the primary of a cluster grants any: a secondary refuses
+statements that would lock. When a node stops being the primary, every open
+transaction on it is rolled back and its locks released
+(`TransactionManager::abort_all`); a session finds out when it next commits.
 
 The lock manager belongs to the `TransactionManager`, which releases a
 transaction's locks when it commits or rolls back, whichever path ends it.
