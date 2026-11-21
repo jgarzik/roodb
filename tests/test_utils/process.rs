@@ -14,7 +14,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// A `roodb` server under test.
 pub struct ServerProcess {
     data_dir: TempDir,
-    certs: RaftCertFiles,
+    /// Shared by the nodes of one cluster: they trust one CA.
+    certs: std::sync::Arc<RaftCertFiles>,
+    /// The Raft address of a member to join, for a node that starts empty.
+    join: Option<String>,
     port: u16,
     child: Option<Child>,
     /// Extra environment for the server, e.g. `ROODB_DURABILITY`.
@@ -29,21 +32,28 @@ static TAKEN_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new(
 
 /// Find a port whose Raft companion port (port + 1000) is free too, and
 /// that no other server of this process has been given.
+///
+/// The ports come from below the range the system hands out by itself.
+/// Other tests in this process listen on ports the system picks for them;
+/// if a server's port came from that range too, such a test could be given
+/// the port while the server is down between a kill and a restart, and the
+/// restarted server's test would then be talking to a stranger.
 fn free_port() -> u16 {
-    for _ in 0..200 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        if port > 64_000 {
-            continue;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", port + 1000)).is_err() {
-            continue;
-        }
-        let mut taken = TAKEN_PORTS.lock().unwrap();
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 8_000;
+    let start = (std::process::id() % u32::from(COUNT)) as u16;
+    let mut taken = TAKEN_PORTS.lock().unwrap();
+    for step in 0..COUNT {
+        let port = FIRST + (start + step) % COUNT;
         let clash = taken
             .iter()
             .any(|&t| t == port || t + 1000 == port || t == port + 1000);
-        if !clash {
+        if clash {
+            continue;
+        }
+        let free = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::TcpListener::bind(("127.0.0.1", port + 1000)).is_ok();
+        if free {
             taken.push(port);
             return port;
         }
@@ -68,7 +78,8 @@ impl ServerProcess {
         assert!(status.success(), "roodb_init failed: {status}");
         Self {
             data_dir,
-            certs,
+            certs: std::sync::Arc::new(certs),
+            join: None,
             port: free_port(),
             child: None,
             env: env
@@ -78,9 +89,28 @@ impl ServerProcess {
         }
     }
 
+    /// A further node for this server's cluster: an empty data directory,
+    /// no `roodb_init`, started with `--join` pointing at this server. Not
+    /// started yet.
+    pub fn joiner(&self) -> Self {
+        Self {
+            data_dir: TempDir::new().expect("data dir"),
+            certs: self.certs.clone(),
+            join: Some(self.raft_addr()),
+            port: free_port(),
+            child: None,
+            env: self.env.clone(),
+        }
+    }
+
+    /// Where other nodes reach this one.
+    pub fn raft_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.port + 1000)
+    }
+
     /// Where the server's log output goes.
     fn log_path(&self) -> std::path::PathBuf {
-        self.certs.ca_cert_path.with_file_name("server.log")
+        self.data_dir.path().join("server.log")
     }
 
     /// Start the server and wait until it accepts connections.
@@ -105,6 +135,11 @@ impl ServerProcess {
             .arg(&self.certs.node1_key_path)
             .arg("--raft-ca-cert-path")
             .arg(&self.certs.ca_cert_path)
+            .args(
+                self.join
+                    .iter()
+                    .flat_map(|member| ["--join", member.as_str()]),
+            )
             .stdout(Stdio::null())
             .stderr(log);
         for (key, value) in &self.env {
