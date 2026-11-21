@@ -76,6 +76,9 @@ aes = "0.8"
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+# Unix-only dependencies
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

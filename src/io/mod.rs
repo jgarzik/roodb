@@ -30,15 +30,20 @@
 use std::sync::Arc;
 
 pub mod aligned_buffer;
+pub mod engine;
 pub mod error;
+mod pool;
 pub mod posix_aio;
 pub mod scheduler;
 pub mod traits;
 
 #[cfg(target_os = "linux")]
+mod reactor;
+#[cfg(target_os = "linux")]
 pub mod uring;
 
 pub use aligned_buffer::AlignedBuffer;
+pub use engine::{File, IoBackend, IoConfig, IoEngine, IoStats, OpenOptions};
 pub use error::{IoError, IoResult};
 pub use posix_aio::{PosixIO, PosixIOFactory};
 pub use traits::{AsyncIO, AsyncIOFactory, PAGE_SIZE};
