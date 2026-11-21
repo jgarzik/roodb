@@ -108,7 +108,9 @@ pub struct SstableWriter {
 impl SstableWriter {
     /// Create a new SSTable writer
     pub async fn create(engine: &IoEngine, path: &Path, urgency: Urgency) -> StorageResult<Self> {
-        let io = engine.open(path, OpenOptions::create()).await?;
+        // Table names are never reused within a run and leftovers from a
+        // crashed run are deleted at startup, so the file must not exist.
+        let io = engine.open(path, OpenOptions::create_new()).await?;
         Ok(Self {
             io,
             path: path.to_path_buf(),

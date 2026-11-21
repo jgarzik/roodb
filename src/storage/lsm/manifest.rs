@@ -14,6 +14,11 @@ use crate::storage::error::{StorageError, StorageResult};
 /// Manifest file name
 pub const MANIFEST_FILE: &str = "MANIFEST";
 
+/// Version of the on-disk layout this build reads and writes: the manifest
+/// itself and the table format it points at. A directory written by a
+/// different version is refused rather than misread.
+pub const MANIFEST_VERSION: u32 = 2;
+
 /// SSTable file info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SstableInfo {
@@ -39,6 +44,9 @@ pub struct LevelInfo {
 /// Manifest data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestData {
+    /// On-disk layout version; see [`MANIFEST_VERSION`].
+    #[serde(default)]
+    pub version: u32,
     /// Sequence number for generating SSTable names
     pub sequence: u64,
     /// Levels
@@ -48,6 +56,7 @@ pub struct ManifestData {
 impl Default for ManifestData {
     fn default() -> Self {
         Self {
+            version: MANIFEST_VERSION,
             sequence: 0,
             levels: vec![
                 LevelInfo {
@@ -82,18 +91,61 @@ impl Manifest {
     pub fn open(dir: &Path) -> StorageResult<Self> {
         let manifest_path = dir.join(MANIFEST_FILE);
 
-        let data = if manifest_path.exists() {
+        let data: ManifestData = if manifest_path.exists() {
             let content = std::fs::read_to_string(&manifest_path)?;
             serde_json::from_str(&content)
                 .map_err(|e| StorageError::Manifest(format!("failed to parse manifest: {}", e)))?
         } else {
             ManifestData::default()
         };
+        if data.version != MANIFEST_VERSION {
+            return Err(StorageError::Manifest(format!(
+                "data directory {} uses on-disk format {}, this build uses format {}; \
+                 re-initialize it with roodb_init",
+                dir.display(),
+                data.version,
+                MANIFEST_VERSION
+            )));
+        }
 
-        Ok(Self {
+        let manifest = Self {
             dir: dir.to_path_buf(),
             data,
-        })
+        };
+        manifest.remove_leftovers()?;
+        Ok(manifest)
+    }
+
+    /// Delete what an interrupted run left behind: a half-written manifest,
+    /// and table files the manifest does not list (a flush or compaction that
+    /// wrote its output but did not get as far as recording it). Without this
+    /// a later table given the same name would land on top of the old file.
+    fn remove_leftovers(&self) -> StorageResult<()> {
+        let listed: std::collections::HashSet<&str> = self
+            .data
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|f| f.name.as_str()))
+            .collect();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let manifest_tmp = format!("{MANIFEST_FILE}.tmp");
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let leftover =
+                name == manifest_tmp || (name.ends_with(".sst") && !listed.contains(name.as_str()));
+            if leftover {
+                tracing::warn!(file = %name, "removing file left by an interrupted run");
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     /// Save manifest to disk using atomic rename

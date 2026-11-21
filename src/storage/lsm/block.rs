@@ -37,8 +37,10 @@ pub const ENTRY_HEADER_SIZE: usize = 6;
 /// Largest key the format can hold.
 pub const MAX_KEY_SIZE: usize = u16::MAX as usize;
 
-/// Largest value the format can hold.
-pub const MAX_VALUE_SIZE: usize = (u32::MAX - 1) as usize;
+/// Largest value accepted: 1 GiB, the most a MySQL client can send in one
+/// packet. The format's 32-bit lengths have room to spare above this, so a
+/// block holding the largest key and value still has a length that fits.
+pub const MAX_VALUE_SIZE: usize = 1 << 30;
 
 /// Value length that marks a deleted key.
 pub const TOMBSTONE_MARKER: u32 = u32::MAX;
@@ -203,8 +205,9 @@ impl BlockBuilder {
     /// Build the block: a whole number of pages.
     pub fn build(self) -> Vec<u8> {
         let len = self.size.next_multiple_of(BLOCK_SIZE);
+        let len_field = u32::try_from(len).expect("entry sizes are capped well below 4 GiB");
         let mut buf = Vec::with_capacity(len);
-        buf.extend_from_slice(&(len as u32).to_be_bytes());
+        buf.extend_from_slice(&len_field.to_be_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         for entry in &self.entries {
             entry.encode_into(&mut buf);
@@ -421,5 +424,23 @@ mod tests {
             Err(StorageError::KeyTooLarge { .. })
         ));
         assert!(check_entry_size(1, 100_000_000).is_ok());
+        assert!(check_entry_size(MAX_KEY_SIZE, MAX_VALUE_SIZE).is_ok());
+        assert!(matches!(
+            check_entry_size(1, MAX_VALUE_SIZE + 1),
+            Err(StorageError::ValueTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_largest_accepted_entry_fits_the_block_length_field() {
+        // Every entry that passes the size check must produce a block whose
+        // length fits in 32 bits; otherwise it could be written to the
+        // memtable and then never flushed.
+        let largest = BLOCK_HEADER_SIZE
+            + BLOCK_FOOTER_SIZE
+            + ENTRY_HEADER_SIZE
+            + MAX_KEY_SIZE
+            + MAX_VALUE_SIZE;
+        assert!(u32::try_from(largest.next_multiple_of(BLOCK_SIZE)).is_ok());
     }
 }

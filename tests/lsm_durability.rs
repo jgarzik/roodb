@@ -297,3 +297,69 @@ async fn a_missing_sstable_fails_open() {
     let result = LsmEngine::open(io(), config(dir.path())).await;
     assert!(result.is_err(), "open succeeded with a table missing");
 }
+
+/// After a crash an SSTable name must not be handed out twice: a file left
+/// behind by the crashed process may still be lying there under that name.
+#[tokio::test]
+async fn files_left_by_a_crash_are_removed_and_never_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    for i in 0..100 {
+        engine
+            .put(format!("first{i:04}").as_bytes(), b"one")
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.close().await.unwrap();
+    drop(engine);
+    let live = sst_files(dir.path());
+    assert_eq!(live.len(), 1);
+
+    // What a crash mid-flush leaves: files the manifest never heard of, under
+    // the names the next flushes would have used, longer than what will be
+    // written next, plus a half-written manifest.
+    for seq in 0..64u64 {
+        let name = format!("{seq:06}.sst");
+        if live.contains(&name) {
+            continue;
+        }
+        std::fs::write(dir.path().join(name), vec![0xA5u8; 256 * 1024]).unwrap();
+    }
+    std::fs::write(dir.path().join("MANIFEST.tmp"), b"{ \"sequ").unwrap();
+
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    assert_eq!(
+        sst_files(dir.path()),
+        live,
+        "open() should delete files the manifest does not list"
+    );
+    assert!(!dir.path().join("MANIFEST.tmp").exists());
+
+    for i in 0..100 {
+        engine
+            .put(format!("second{i:04}").as_bytes(), b"two")
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    for i in 0..100 {
+        assert_eq!(
+            engine.get(format!("first{i:04}").as_bytes()).await.unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            engine
+                .get(format!("second{i:04}").as_bytes())
+                .await
+                .unwrap(),
+            Some(b"two".to_vec())
+        );
+    }
+    engine.close().await.unwrap();
+}
