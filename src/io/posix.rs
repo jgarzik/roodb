@@ -10,9 +10,8 @@ use std::thread::JoinHandle;
 
 use parking_lot::{Condvar, Mutex};
 
-use super::engine::{Op, OpKind};
+use super::engine::{Op, OpKind, Urgency};
 use super::error::IoResult;
-use super::scheduler::Urgency;
 
 /// Upper bound on worker threads chosen automatically.
 const MAX_AUTO_WORKERS: usize = 16;

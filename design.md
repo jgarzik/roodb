@@ -170,67 +170,57 @@ pub trait Executor: Send {
 
 ### `io/`
 
-Cross-platform async I/O with priority scheduling.
+The block I/O layer. RooDB does its own file I/O instead of relying on the
+kernel page cache: files are opened for direct I/O and every request goes
+through one `IoEngine` created at startup.
 
 **Architecture**:
 ```
-                    ┌─────────────────┐
-                    │  LSM / Raft     │
-                    └────────┬────────┘
-                             │ IoContext (urgency + kind)
-                    ┌────────▼────────┐
-                    │  I/O Scheduler  │  Backpressure, metrics
-                    └────────┬────────┘
-              ┌──────────────┴──────────────┐
-              │                             │
-     ┌────────▼────────┐           ┌────────▼────────┐
-     │    UringIO      │           │    PosixIO      │
-     │   (Linux)       │           │   (non-Linux)   │
-     └─────────────────┘           └─────────────────┘
+        LSM (SSTables, compaction)            tasks on any thread
+                    │  File::read_at / write_at / sync_data (+ Urgency)
+           ┌────────▼────────┐
+           │    IoEngine     │   backend chosen at startup (--io-backend)
+           └───┬─────────┬───┘
+     ┌─────────▼───┐ ┌───▼──────────┐
+     │ uring       │ │ posix        │
+     │ reactors    │ │ worker pool  │
+     └─────────────┘ └──────────────┘
 ```
 
 **Files**:
-- `traits.rs` - `AsyncIO`, `AsyncIOFactory` traits
-- `aligned_buffer.rs` - Page-aligned memory allocation
-- `scheduler/` - Priority scheduling, backpressure, metrics
-- `uring.rs` - Linux io_uring backend
-- `posix_aio.rs` - POSIX fallback
-
-**Scheduler** (`scheduler/`):
-
-**Files**: `engine.rs` (core scheduler), `backpressure.rs` (saturation tracking), `batcher.rs` / `batch.rs` (batch submission), `limiter.rs` (rate limiting), `throughput.rs` (throughput tracking), `metrics.rs` (I/O metrics), `config.rs` (tuning parameters).
-
-Two-dimensional I/O context:
-```rust
-pub enum Urgency {
-    Critical,    // Blocks COMMIT (Raft vote, txn durability)
-    Foreground,  // User query latency (SLO-bound)
-    Background,  // Flush, compaction - deferrable
-}
-
-pub enum OpKind { Read, Write, Sync }
-
-pub struct IoContext { urgency: Urgency, kind: OpKind }
-```
-
-Backpressure behavior:
-- Critical: Always processed immediately
-- Foreground: Delayed if backpressure saturated
-- Background: Delayed if any backpressure
-
-`ScheduledIOFactory` wraps any `AsyncIOFactory` to add scheduling.
+- `engine.rs` - `IoEngine`, `File`, `OpenOptions`, `Urgency`, `IoStats`
+- `uring.rs` - io_uring backend (Linux)
+- `posix.rs` - worker-pool backend (all platforms)
+- `aligned_buffer.rs` - page-aligned buffers
 
 **Backends**:
 
-| Platform | Backend | Features |
-|----------|---------|----------|
-| Linux | `UringIO` | io_uring, O_DIRECT, 64-entry queue |
-| Other | `PosixIO` | `spawn_blocking()`, no O_DIRECT |
+| Backend | Where | How |
+|---------|-------|-----|
+| `uring` | Linux, default | A few reactor threads, each owning one ring. Requests from all tasks are queued to a reactor, which submits everything pending with one system call. Files are registered in the ring; a write and its sync are linked into one request. `O_DIRECT`. |
+| `posix` | Everywhere; fallback when io_uring is unavailable | Worker threads doing positional reads and writes. `O_DIRECT` on Linux, `F_NOCACHE` on macOS, buffered on Windows. |
 
-**AlignedBuffer**:
-- `Layout::from_size_align()` for 4KB alignment
-- Manual `NonNull<u8>` management
-- Implements `Send + Sync`
+`--io-backend auto` (the default) uses `uring` when the kernel will create a
+ring and otherwise falls back to `posix` with a warning.
+
+**Requests**:
+- Buffers are passed by value and handed back on completion. A submitted
+  request keeps its buffer and file alive until the kernel is finished, even if
+  the caller stops waiting.
+- Reads fill the buffer unless the file ends first; writes are complete or an
+  error. Write lengths are rounded up to a page and zero padded.
+- Offsets and lengths are multiples of 4 KiB.
+
+**Urgency**:
+```rust
+pub enum Urgency {
+    Critical,    // a commit is waiting: Raft log and vote
+    Foreground,  // a client query is waiting
+    Background,  // flush, compaction
+}
+```
+More urgent requests are submitted first. Background requests are capped per
+reactor so they cannot fill a ring.
 
 ### `init/`
 

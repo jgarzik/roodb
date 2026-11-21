@@ -105,8 +105,23 @@ A node with a certificate signed by a different CA will be rejected by the clust
 | `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
 | `ROODB_BIND` | Listen address (same as `--bind`) |
 | `ROODB_TDS_PORT` | Enable the TDS listener on this port (same as `--tds-port`) |
+| `ROODB_IO_BACKEND` | File I/O backend: `auto` (default), `uring` or `posix` (same as `--io-backend`) |
 
 Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
+
+### I/O Backend
+
+RooDB does its own file I/O with direct I/O and picks a backend when it starts:
+
+| `--io-backend` | Behaviour |
+|----------------|-----------|
+| `auto` (default) | io_uring if the kernel allows it, otherwise `posix` (a warning is logged) |
+| `uring` | io_uring; startup fails if the kernel refuses it |
+| `posix` | Worker threads doing positional reads and writes; works everywhere |
+
+io_uring is unavailable on non-Linux hosts, on old kernels, and in containers
+whose seccomp profile blocks it (recent Docker releases block it by default). `roodb_init`
+accepts the same flag. The backend in use is logged at startup.
 
 ## SQL Server Protocol (TDS)
 

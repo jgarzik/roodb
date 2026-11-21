@@ -5,7 +5,10 @@
 use std::ops::{Deref, DerefMut};
 
 use super::error::{IoError, IoResult};
-use super::traits::PAGE_SIZE;
+
+/// Unit of alignment for direct I/O: buffer addresses, transfer sizes and file
+/// offsets are all multiples of this.
+pub const PAGE_SIZE: usize = 4096;
 
 /// A buffer aligned to PAGE_SIZE for direct IO operations
 ///
@@ -60,19 +63,6 @@ impl AlignedBuffer {
     /// Create a buffer with multiple pages
     pub fn pages(count: usize) -> IoResult<Self> {
         Self::new(count * PAGE_SIZE)
-    }
-
-    /// Create a 2MB buffer for large I/O operations
-    ///
-    /// Suitable for bulk reads/writes like memtable flush and compaction.
-    /// Aligns with Linux huge page size for potential memory optimization.
-    pub fn large() -> IoResult<Self> {
-        Self::new(2 * 1024 * 1024)
-    }
-
-    /// Create a buffer for the specified chunk size
-    pub fn for_chunk(chunk: super::scheduler::ChunkSize) -> IoResult<Self> {
-        Self::new(chunk.bytes())
     }
 
     /// Round up a size to the nearest PAGE_SIZE multiple

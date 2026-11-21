@@ -1,516 +1,693 @@
-//! io_uring backend for Linux
+//! The io_uring backend.
 //!
-//! This module provides an async IO implementation using Linux's io_uring
-//! interface for high-performance direct IO operations.
+//! A reactor is a thread that owns one ring. Tasks hand it requests over a
+//! channel; the reactor turns everything that has arrived into submission
+//! entries and enters the kernel once for the lot, so the cost of the system
+//! call is shared by all requests queued at that moment. Completions are
+//! delivered straight to the waiting tasks.
 //!
-//! All blocking io_uring operations (`submit_and_wait`) are offloaded to
-//! Tokio's blocking thread pool via `spawn_blocking`, preventing Tokio
-//! worker threads from being stalled by I/O.
+//! Each open file is pinned to one reactor and registered in that ring's fixed
+//! file table, which spares the kernel a descriptor lookup per request.
+//!
+//! Requests carry an urgency. More urgent requests are submitted first, and
+//! background work (flush, compaction) is capped so it cannot fill the ring.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::collections::VecDeque;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
-use async_trait::async_trait;
-use io_uring::{opcode, types, IoUring};
-use parking_lot::Mutex;
+use io_uring::{opcode, squeue, types, IoUring};
+use tokio::sync::oneshot;
 
-use crate::io::aligned_buffer::AlignedBuffer;
-use crate::io::error::{IoError, IoResult};
-use crate::io::traits::{AsyncIO, AsyncIOFactory, PAGE_SIZE};
+use super::engine::{Counters, Op, OpKind, Urgency};
+use super::error::IoResult;
 
-/// io_uring-based async IO implementation
-///
-/// Each instance owns its own io_uring ring and file descriptor.
-/// The ring mutex serializes operations on the same file handle,
-/// while `spawn_blocking` ensures Tokio worker threads are never blocked.
-pub struct UringIO {
-    file: File,
-    ring: Arc<Mutex<IoUring>>,
+/// Submission queue size of each ring.
+const RING_ENTRIES: u32 = 1024;
+/// Completion queue size of each ring; also the cap on requests in the kernel.
+const MAX_INFLIGHT: usize = 4096;
+/// Background requests allowed in the kernel at once, per reactor.
+const MAX_BACKGROUND: usize = 128;
+/// Size of each ring's fixed file table.
+const FIXED_FILES: u32 = 4096;
+/// Largest single transfer handed to the kernel; longer requests continue
+/// where the previous transfer stopped.
+const MAX_TRANSFER: usize = 1 << 30;
+/// Upper bound on reactors chosen automatically.
+const MAX_AUTO_REACTORS: usize = 4;
+
+/// `user_data` of the read that watches the wake-up eventfd.
+const WAKE: u64 = u64::MAX;
+/// Low bit of `user_data`: 0 = the transfer itself, 1 = its attached sync.
+const TAG_SYNC: u64 = 1;
+
+enum Msg {
+    Op(Op),
+    Register {
+        fd: RawFd,
+        reply: oneshot::Sender<Option<u32>>,
+    },
+    Unregister(u32),
+    Shutdown,
 }
 
-// Static assertions: UringIO is Send+Sync because all fields are.
-// (IoUring 0.7+ explicitly implements Send+Sync.)
-const _: () = {
-    fn _assert_send<T: Send>() {}
-    fn _assert_sync<T: Sync>() {}
-    fn _check() {
-        _assert_send::<UringIO>();
-        _assert_sync::<UringIO>();
-    }
-};
+/// The part of a reactor other threads can touch.
+pub(crate) struct ReactorShared {
+    tx: Sender<Msg>,
+    eventfd: OwnedFd,
+    /// True while the reactor is, or is about to be, blocked in the kernel.
+    sleeping: AtomicBool,
+}
 
-impl UringIO {
-    /// Open a file for io_uring operations
-    pub fn open(path: &Path, create: bool) -> IoResult<Self> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-
-        if create {
-            opts.create(true);
+impl ReactorShared {
+    fn send(&self, msg: Msg) -> bool {
+        if self.tx.send(msg).is_err() {
+            return false;
         }
+        // The reactor sets `sleeping` and then looks at the channel once more
+        // before blocking; we queue and then look at `sleeping`. One of the two
+        // always sees the other, so a request is never left unnoticed.
+        if self.sleeping.swap(false, Ordering::SeqCst) {
+            let one: u64 = 1;
+            // SAFETY: writes 8 bytes from a live local to a descriptor we own.
+            // A failed write can only mean the counter is already non-zero,
+            // which wakes the reactor just the same.
+            unsafe {
+                libc::write(
+                    self.eventfd.as_raw_fd(),
+                    (&one as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
+        true
+    }
+}
 
-        // Enable direct IO (O_DIRECT)
-        opts.custom_flags(libc::O_DIRECT);
+/// How one file reaches its reactor.
+pub(crate) struct FileRoute {
+    shared: Arc<ReactorShared>,
+    fixed: Option<u32>,
+}
 
-        let file = opts.open(path)?;
+impl FileRoute {
+    /// Queue a request. Returns false if the reactor has shut down.
+    pub(crate) fn submit(&self, op: Op) -> bool {
+        self.shared.send(Msg::Op(op))
+    }
+}
 
-        // Create io_uring instance with reasonable queue depth
-        let ring = IoUring::new(64)?;
+impl Drop for FileRoute {
+    fn drop(&mut self) {
+        // Runs when the last request on the file has finished, so the slot is
+        // idle by now.
+        if let Some(slot) = self.fixed {
+            self.shared.send(Msg::Unregister(slot));
+        }
+    }
+}
 
+/// The set of reactors.
+pub(crate) struct Uring {
+    reactors: Vec<Arc<ReactorShared>>,
+    threads: Vec<JoinHandle<()>>,
+    next: AtomicUsize,
+}
+
+impl Uring {
+    /// Start `reactors` threads (0 = a quarter of the cores, capped). Fails if
+    /// the kernel will not create a ring.
+    pub(crate) fn start(reactors: usize, counters: Arc<Counters>) -> IoResult<Self> {
+        let count = if reactors == 0 {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            (cores / 4).clamp(1, MAX_AUTO_REACTORS)
+        } else {
+            reactors
+        };
+        let mut this = Self {
+            reactors: Vec::with_capacity(count),
+            threads: Vec::with_capacity(count),
+            next: AtomicUsize::new(0),
+        };
+        for i in 0..count {
+            // SAFETY: eventfd() returns a fresh descriptor or -1.
+            let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: `raw` is a valid descriptor that nothing else owns.
+            let eventfd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let (tx, rx) = mpsc::channel();
+            let shared = Arc::new(ReactorShared {
+                tx,
+                eventfd,
+                sleeping: AtomicBool::new(false),
+            });
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let thread_shared = shared.clone();
+            let thread_counters = counters.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("roodb-uring-{i}"))
+                .spawn(move || {
+                    // The ring is created on the thread that will use it: the
+                    // kernel ties a single-issuer ring to its creating thread.
+                    match Reactor::new(rx, thread_shared, thread_counters) {
+                        Ok(mut reactor) => {
+                            let _ = ready_tx.send(Ok(()));
+                            reactor.run();
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                        }
+                    }
+                })?;
+            this.reactors.push(shared);
+            this.threads.push(thread);
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    return Err(std::io::Error::other("io_uring reactor failed to start").into())
+                }
+            }
+        }
+        Ok(this)
+    }
+
+    /// Pin a newly opened file to a reactor and register it there.
+    pub(crate) async fn route_for(&self, file: &std::fs::File) -> FileRoute {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.reactors.len();
+        let shared = self.reactors[index].clone();
+        let (reply, wait) = oneshot::channel();
+        let fixed = if shared.send(Msg::Register {
+            fd: file.as_raw_fd(),
+            reply,
+        }) {
+            wait.await.ok().flatten()
+        } else {
+            None
+        };
+        FileRoute { shared, fixed }
+    }
+}
+
+impl Drop for Uring {
+    fn drop(&mut self) {
+        for shared in &self.reactors {
+            shared.send(Msg::Shutdown);
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A request that has been, or is about to be, handed to the kernel.
+struct InFlight {
+    op: Op,
+    /// Bytes transferred so far.
+    done: usize,
+    /// Completions still expected for the entries currently in the kernel.
+    cqes_left: u8,
+    /// First error seen (positive errno).
+    error: Option<i32>,
+    /// A read hit end of file.
+    eof: bool,
+    /// The attached sync has succeeded.
+    synced: bool,
+    /// The last attempt should simply be repeated (interrupted).
+    again: bool,
+}
+
+struct Reactor {
+    ring: IoUring,
+    rx: Receiver<Msg>,
+    shared: Arc<ReactorShared>,
+    counters: Arc<Counters>,
+    pending: [VecDeque<Op>; Urgency::COUNT],
+    retry: VecDeque<usize>,
+    slots: Vec<Option<InFlight>>,
+    free_slots: Vec<usize>,
+    inflight: usize,
+    background_inflight: usize,
+    fixed_enabled: bool,
+    free_fixed: Vec<u32>,
+    next_fixed: u32,
+    wake_buf: Box<u64>,
+    wake_armed: bool,
+    shutdown: bool,
+}
+
+impl Reactor {
+    fn new(
+        rx: Receiver<Msg>,
+        shared: Arc<ReactorShared>,
+        counters: Arc<Counters>,
+    ) -> std::io::Result<Self> {
+        // Single issuer + deferred task work: completions are processed only
+        // when this thread asks for them, which avoids interrupting it. Older
+        // kernels do not know these flags, so fall back to a plain ring.
+        let ring = IoUring::builder()
+            .setup_cqsize(MAX_INFLIGHT as u32)
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(RING_ENTRIES)
+            .or_else(|_| {
+                IoUring::builder()
+                    .setup_cqsize(MAX_INFLIGHT as u32)
+                    .build(RING_ENTRIES)
+            })?;
+        let fixed_enabled = ring.submitter().register_files_sparse(FIXED_FILES).is_ok();
         Ok(Self {
-            file,
-            ring: Arc::new(Mutex::new(ring)),
+            ring,
+            rx,
+            shared,
+            counters,
+            pending: Default::default(),
+            retry: VecDeque::new(),
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            inflight: 0,
+            background_inflight: 0,
+            fixed_enabled,
+            free_fixed: Vec::new(),
+            next_fixed: 0,
+            wake_buf: Box::new(0),
+            wake_armed: false,
+            shutdown: false,
         })
     }
 
-    fn check_alignment(buf: &AlignedBuffer, offset: u64) -> IoResult<()> {
-        // Check buffer pointer alignment
-        if !(buf.as_ptr() as usize).is_multiple_of(PAGE_SIZE) {
-            return Err(IoError::Alignment {
-                expected: PAGE_SIZE,
-                actual: buf.as_ptr() as usize % PAGE_SIZE,
-            });
+    fn run(&mut self) {
+        loop {
+            self.drain_channel();
+            let pushed = self.fill_submission_queue();
+            if self.shutdown && self.inflight == 0 && self.nothing_queued() {
+                return;
+            }
+            self.arm_wake();
+
+            // Announce that we are about to block, then look at the channel one
+            // last time (see `ReactorShared::send`).
+            self.shared.sleeping.store(true, Ordering::SeqCst);
+            match self.rx.try_recv() {
+                Ok(msg) => {
+                    self.shared.sleeping.store(false, Ordering::SeqCst);
+                    self.handle(msg);
+                    // Hand over what is already queued without waiting, then
+                    // go round again for the new arrivals.
+                    self.enter(0, pushed);
+                    self.reap();
+                    continue;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.shutdown = true,
+            }
+            let ok = self.enter(1, pushed);
+            self.shared.sleeping.store(false, Ordering::SeqCst);
+            self.reap();
+            if !ok {
+                self.fail_everything();
+                return;
+            }
+        }
+    }
+
+    fn nothing_queued(&self) -> bool {
+        self.retry.is_empty() && self.pending.iter().all(VecDeque::is_empty)
+    }
+
+    /// Enter the kernel: submit what is queued and wait for `want` completions.
+    /// Returns false on an error that makes the ring unusable.
+    fn enter(&mut self, want: usize, pushed: usize) -> bool {
+        if pushed > 0 {
+            self.counters.submits.fetch_add(1, Ordering::Relaxed);
+        }
+        loop {
+            match self.ring.submit_and_wait(want) {
+                Ok(_) => return true,
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    // The completion queue is full or the kernel is short of
+                    // memory for now: make room and let the loop come back.
+                    Some(libc::EBUSY) | Some(libc::EAGAIN) => return true,
+                    _ => {
+                        tracing::error!(error = %e, "io_uring submit failed");
+                        return false;
+                    }
+                },
+            }
+        }
+    }
+
+    fn drain_channel(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) => self.handle(msg),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.shutdown = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: Msg) {
+        match msg {
+            Msg::Op(op) => self.pending[op.urgency as usize].push_back(op),
+            Msg::Register { fd, reply } => {
+                let _ = reply.send(self.register(fd));
+            }
+            Msg::Unregister(slot) => {
+                let _ = self.ring.submitter().register_files_update(slot, &[-1]);
+                self.free_fixed.push(slot);
+            }
+            Msg::Shutdown => self.shutdown = true,
+        }
+    }
+
+    fn register(&mut self, fd: RawFd) -> Option<u32> {
+        if !self.fixed_enabled {
+            return None;
+        }
+        let (slot, fresh) = match self.free_fixed.pop() {
+            Some(slot) => (slot, false),
+            None if self.next_fixed < FIXED_FILES => (self.next_fixed, true),
+            None => return None,
+        };
+        match self.ring.submitter().register_files_update(slot, &[fd]) {
+            Ok(_) => {
+                if fresh {
+                    self.next_fixed += 1;
+                }
+                Some(slot)
+            }
+            Err(_) => {
+                if !fresh {
+                    self.free_fixed.push(slot);
+                }
+                None
+            }
+        }
+    }
+
+    /// Keep one read on the eventfd in the kernel so that a write to it
+    /// produces a completion and ends a wait.
+    fn arm_wake(&mut self) {
+        if self.wake_armed {
+            return;
+        }
+        let entry = opcode::Read::new(
+            types::Fd(self.shared.eventfd.as_raw_fd()),
+            (&mut *self.wake_buf as *mut u64).cast(),
+            std::mem::size_of::<u64>() as u32,
+        )
+        .build()
+        .user_data(WAKE);
+        // SAFETY: the entry points at `wake_buf`, a heap allocation owned by
+        // the reactor that outlives the ring's use of it.
+        if unsafe { self.ring.submission().push(&entry) }.is_ok() {
+            self.wake_armed = true;
+        }
+    }
+
+    /// Move queued requests into the submission queue, most urgent first.
+    /// Returns how many requests were pushed.
+    fn fill_submission_queue(&mut self) -> usize {
+        let mut pushed = 0;
+        while let Some(&slot) = self.retry.front() {
+            if !self.push_entries(slot) {
+                return pushed;
+            }
+            self.retry.pop_front();
+            pushed += 1;
+        }
+        for urgency in 0..Urgency::COUNT {
+            let background = urgency == Urgency::Background as usize;
+            loop {
+                if self.inflight >= MAX_INFLIGHT / 2 {
+                    return pushed;
+                }
+                if background && self.background_inflight >= MAX_BACKGROUND {
+                    break;
+                }
+                if self.submission_space() < 3 {
+                    return pushed;
+                }
+                let Some(op) = self.pending[urgency].pop_front() else {
+                    break;
+                };
+                let slot = self.allocate_slot(op);
+                self.inflight += 1;
+                if background {
+                    self.background_inflight += 1;
+                }
+                let ok = self.push_entries(slot);
+                debug_assert!(ok, "space was checked before taking the request");
+                pushed += 1;
+            }
+        }
+        pushed
+    }
+
+    fn submission_space(&mut self) -> usize {
+        let sq = self.ring.submission();
+        sq.capacity() - sq.len()
+    }
+
+    fn allocate_slot(&mut self, op: Op) -> usize {
+        let state = InFlight {
+            op,
+            done: 0,
+            cqes_left: 0,
+            error: None,
+            eof: false,
+            synced: false,
+            again: false,
+        };
+        match self.free_slots.pop() {
+            Some(slot) => {
+                self.slots[slot] = Some(state);
+                slot
+            }
+            None => {
+                self.slots.push(Some(state));
+                self.slots.len() - 1
+            }
+        }
+    }
+
+    /// Build and queue the entries for the next step of the request in `slot`.
+    /// Returns false, leaving nothing queued, if the queue lacks room.
+    fn push_entries(&mut self, slot: usize) -> bool {
+        // Leave one entry spare for the wake-up read.
+        if self.submission_space() < 3 {
+            return false;
+        }
+        let state = self.slots[slot]
+            .as_mut()
+            .expect("slot holds a request while it is queued");
+        state.again = false;
+        let user_data = (slot as u64) << 1;
+        let fixed = match &state.op.file.route {
+            super::engine::Route::Uring(route) => route.fixed,
+            super::engine::Route::Pool(_) => None,
+        };
+        let raw = state.op.file.file.as_raw_fd();
+        let offset = state.op.offset + state.done as u64;
+
+        // Each opcode takes the descriptor as either a fixed-table index or a
+        // raw descriptor; the two are different types.
+        macro_rules! with_fd {
+            (|$fd:ident| $build:expr) => {
+                match fixed {
+                    Some(index) => {
+                        let $fd = types::Fixed(index);
+                        $build
+                    }
+                    None => {
+                        let $fd = types::Fd(raw);
+                        $build
+                    }
+                }
+            };
         }
 
-        // Check offset alignment
-        if !offset.is_multiple_of(PAGE_SIZE as u64) {
-            return Err(IoError::OffsetAlignment {
-                offset,
-                alignment: PAGE_SIZE,
-            });
+        let mut entries: [Option<squeue::Entry>; 2] = [None, None];
+        match &mut state.op.kind {
+            OpKind::Read { buf } => {
+                let len = (buf.capacity() - state.done).min(MAX_TRANSFER) as u32;
+                // SAFETY: `done` is below the capacity, so the pointer stays
+                // inside the buffer.
+                let ptr = unsafe { buf.as_mut_ptr().add(state.done) };
+                entries[0] = Some(
+                    with_fd!(|fd| opcode::Read::new(fd, ptr, len).offset(offset).build())
+                        .user_data(user_data),
+                );
+            }
+            OpKind::Write { buf, len, sync } => {
+                let transfer_done = state.done >= *len;
+                if !transfer_done {
+                    let chunk = (*len - state.done).min(MAX_TRANSFER) as u32;
+                    // SAFETY: `done` is below `len`, which is within the buffer.
+                    let ptr = unsafe { buf.as_mut_ptr().add(state.done) as *const u8 };
+                    let mut entry =
+                        with_fd!(|fd| opcode::Write::new(fd, ptr, chunk).offset(offset).build())
+                            .user_data(user_data);
+                    if sync.is_some() {
+                        // Run the sync only after this write has fully
+                        // succeeded; a short write cancels it.
+                        entry = entry.flags(squeue::Flags::IO_LINK);
+                    }
+                    entries[0] = Some(entry);
+                }
+                if let Some(data_only) = *sync {
+                    let flags = if data_only {
+                        types::FsyncFlags::DATASYNC
+                    } else {
+                        types::FsyncFlags::empty()
+                    };
+                    let entry = with_fd!(|fd| opcode::Fsync::new(fd).flags(flags).build())
+                        .user_data(user_data | TAG_SYNC);
+                    let index = if transfer_done { 0 } else { 1 };
+                    entries[index] = Some(entry);
+                }
+            }
+            OpKind::Sync { data_only } => {
+                let flags = if *data_only {
+                    types::FsyncFlags::DATASYNC
+                } else {
+                    types::FsyncFlags::empty()
+                };
+                entries[0] = Some(
+                    with_fd!(|fd| opcode::Fsync::new(fd).flags(flags).build()).user_data(user_data),
+                );
+            }
+            OpKind::Allocate { len } => {
+                let len = *len;
+                entries[0] = Some(
+                    with_fd!(|fd| opcode::Fallocate::new(fd, len).build()).user_data(user_data),
+                );
+            }
         }
 
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AsyncIO for UringIO {
-    async fn read_at(&self, buf: &mut AlignedBuffer, offset: u64) -> IoResult<usize> {
-        Self::check_alignment(buf, offset)?;
-
-        let ring = self.ring.clone();
-        let fd = self.file.as_raw_fd();
-        let capacity = buf.capacity();
-
-        // Offload blocking io_uring submit_and_wait to the blocking thread pool
-        let result_buf = tokio::task::spawn_blocking(move || {
-            let mut tmp_buf = AlignedBuffer::new(capacity)?;
-            let fd = types::Fd(fd);
-            let read_e = opcode::Read::new(fd, tmp_buf.as_mut_ptr(), capacity as u32)
-                .offset(offset)
-                .build()
-                .user_data(0x42);
-
-            let mut ring = ring.lock();
-
-            // SAFETY: tmp_buf lives on this thread's stack until submit_and_wait returns.
-            // The kernel only accesses the buffer during the I/O operation.
-            unsafe {
-                ring.submission().push(&read_e).map_err(|_| {
-                    IoError::Io(std::io::Error::other("io_uring submission queue full"))
-                })?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            let cqe = ring
-                .completion()
-                .next()
-                .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
-
-            let result = cqe.result();
-            if result < 0 {
-                return Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
-            }
-
-            let bytes_read = result as usize;
-            tmp_buf.set_len(bytes_read);
-            Ok(tmp_buf)
-        })
-        .await
-        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))??;
-
-        let bytes_read = result_buf.len();
-        buf.as_mut_slice()[..bytes_read].copy_from_slice(result_buf.as_slice());
-        buf.set_len(bytes_read);
-        Ok(bytes_read)
-    }
-
-    async fn write_at(&self, buf: &AlignedBuffer, offset: u64) -> IoResult<usize> {
-        Self::check_alignment(buf, offset)?;
-
-        // For direct IO, we need to write aligned sizes
-        let write_len = AlignedBuffer::round_up(buf.len());
-        if write_len > buf.capacity() {
-            return Err(IoError::BufferSize {
-                size: buf.len(),
-                alignment: PAGE_SIZE,
-            });
+        let mut sq = self.ring.submission();
+        for entry in entries.iter().flatten() {
+            // SAFETY: the buffers the entry points into are owned by the
+            // request in `self.slots`, which is kept until every completion
+            // for it has been seen; the file is kept open the same way.
+            unsafe { sq.push(entry) }.expect("submission queue space was checked");
+            state.cqes_left += 1;
         }
-
-        let ring = self.ring.clone();
-        let fd = self.file.as_raw_fd();
-
-        // Copy data for ownership in blocking task (zero-padded to alignment)
-        let mut data = vec![0u8; write_len];
-        data[..buf.len()].copy_from_slice(buf.as_slice());
-
-        tokio::task::spawn_blocking(move || {
-            let mut tmp_buf = AlignedBuffer::new(write_len)?;
-            tmp_buf.copy_from_slice(&data)?;
-
-            let fd = types::Fd(fd);
-            let write_e = opcode::Write::new(fd, tmp_buf.as_ptr(), write_len as u32)
-                .offset(offset)
-                .build()
-                .user_data(0x43);
-
-            let mut ring = ring.lock();
-
-            // SAFETY: tmp_buf lives on this thread's stack until submit_and_wait returns.
-            unsafe {
-                ring.submission().push(&write_e).map_err(|_| {
-                    IoError::Io(std::io::Error::other("io_uring submission queue full"))
-                })?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            let cqe = ring
-                .completion()
-                .next()
-                .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
-
-            let result = cqe.result();
-            if result < 0 {
-                return Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
-            }
-
-            Ok(result as usize)
-        })
-        .await
-        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
-    }
-
-    async fn sync(&self) -> IoResult<()> {
-        let ring = self.ring.clone();
-        let fd = self.file.as_raw_fd();
-
-        tokio::task::spawn_blocking(move || {
-            let fd = types::Fd(fd);
-            let fsync_e = opcode::Fsync::new(fd).build().user_data(0x44);
-
-            let mut ring = ring.lock();
-
-            unsafe {
-                ring.submission().push(&fsync_e).map_err(|_| {
-                    IoError::Io(std::io::Error::other("io_uring submission queue full"))
-                })?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            let cqe = ring
-                .completion()
-                .next()
-                .ok_or_else(|| IoError::Io(std::io::Error::other("io_uring completion missing")))?;
-
-            let result = cqe.result();
-            if result < 0 {
-                return Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
-            }
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?
-    }
-
-    async fn file_size(&self) -> IoResult<u64> {
-        let metadata = self.file.metadata()?;
-        Ok(metadata.len())
-    }
-
-    async fn truncate(&self, size: u64) -> IoResult<()> {
-        self.file.set_len(size)?;
-        Ok(())
-    }
-
-    /// Check if batch operations are optimized
-    ///
-    /// io_uring supports true batch submission.
-    fn supports_batch(&self) -> bool {
         true
     }
 
-    /// Read multiple regions in a single io_uring submission
-    ///
-    /// All reads are submitted as a batch and awaited via a single
-    /// `submit_and_wait` call inside `spawn_blocking`.
-    async fn read_batch(&self, requests: &[(u64, usize)]) -> Vec<IoResult<AlignedBuffer>> {
-        if requests.is_empty() {
-            return Vec::new();
-        }
-
-        let ring = self.ring.clone();
-        let fd = self.file.as_raw_fd();
-        let requests_owned: Vec<(u64, usize)> = requests.to_vec();
-
-        match tokio::task::spawn_blocking(move || read_batch_blocking(ring, fd, &requests_owned))
-            .await
-        {
-            Ok(results) => results,
-            Err(e) => {
-                let mut results = Vec::with_capacity(requests.len());
-                for _ in 0..requests.len() {
-                    results.push(Err(IoError::Io(std::io::Error::other(e.to_string()))));
-                }
-                results
-            }
-        }
-    }
-
-    /// Write multiple regions in a single io_uring submission
-    ///
-    /// All writes are submitted as a batch and awaited via a single
-    /// `submit_and_wait` call inside `spawn_blocking`.
-    async fn write_batch(&self, requests: &[(u64, AlignedBuffer)]) -> Vec<IoResult<usize>> {
-        if requests.is_empty() {
-            return Vec::new();
-        }
-
-        let ring = self.ring.clone();
-        let fd = self.file.as_raw_fd();
-
-        // Copy buffer data for ownership in the blocking task
-        let owned_requests: Vec<(u64, Vec<u8>, usize)> = requests
-            .iter()
-            .map(|(offset, buf)| {
-                let write_len = AlignedBuffer::round_up(buf.len());
-                let mut data = vec![0u8; write_len];
-                data[..buf.len()].copy_from_slice(buf.as_slice());
-                (*offset, data, write_len)
-            })
+    fn reap(&mut self) {
+        let completed: Vec<(u64, i32)> = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
             .collect();
-
-        match tokio::task::spawn_blocking(move || write_batch_blocking(ring, fd, &owned_requests))
-            .await
-        {
-            Ok(results) => results,
-            Err(e) => {
-                let mut results = Vec::with_capacity(requests.len());
-                for _ in 0..requests.len() {
-                    results.push(Err(IoError::Io(std::io::Error::other(e.to_string()))));
-                }
-                results
-            }
-        }
-    }
-}
-
-/// Execute batch reads synchronously (called from spawn_blocking)
-fn read_batch_blocking(
-    ring: Arc<Mutex<IoUring>>,
-    raw_fd: i32,
-    requests: &[(u64, usize)],
-) -> Vec<IoResult<AlignedBuffer>> {
-    // Allocate buffers upfront
-    let mut buffers: Vec<Option<AlignedBuffer>> = Vec::with_capacity(requests.len());
-    for &(_, size) in requests {
-        match AlignedBuffer::new(size) {
-            Ok(buf) => buffers.push(Some(buf)),
-            Err(e) => {
-                let mut results: Vec<IoResult<AlignedBuffer>> = Vec::with_capacity(requests.len());
-                for _ in 0..buffers.len() {
-                    results.push(Err(IoError::NotSupported("allocation failed".into())));
-                }
-                results.push(Err(e));
-                for _ in (buffers.len() + 1)..requests.len() {
-                    results.push(Err(IoError::NotSupported("allocation failed".into())));
-                }
-                return results;
-            }
-        }
-    }
-
-    let fd = types::Fd(raw_fd);
-    let mut ring = ring.lock();
-
-    // Build and submit all read operations
-    for (i, (&(offset, _), buf_opt)) in requests.iter().zip(buffers.iter_mut()).enumerate() {
-        if let Some(buf) = buf_opt {
-            if !offset.is_multiple_of(PAGE_SIZE as u64) {
-                *buf_opt = None;
+        for (user_data, result) in completed {
+            if user_data == WAKE {
+                self.wake_armed = false;
                 continue;
             }
-
-            let read_e = opcode::Read::new(fd, buf.as_mut_ptr(), buf.capacity() as u32)
-                .offset(offset)
-                .build()
-                .user_data(i as u64);
-
-            // SAFETY: Each buffer in buffers outlives submit_and_wait below.
-            unsafe {
-                if ring.submission().push(&read_e).is_err() {
-                    *buf_opt = None;
-                }
-            }
+            self.on_completion((user_data >> 1) as usize, user_data & TAG_SYNC != 0, result);
         }
     }
 
-    // Submit all and wait for completions
-    let submitted = match ring.submit_and_wait(requests.len()) {
-        Ok(n) => n,
-        Err(e) => {
-            let mut results: Vec<IoResult<AlignedBuffer>> = Vec::with_capacity(requests.len());
-            for _ in 0..requests.len() {
-                results.push(Err(IoError::Io(std::io::Error::from(e.kind()))));
-            }
-            return results;
-        }
-    };
-
-    // Collect results
-    let mut results: Vec<IoResult<AlignedBuffer>> = Vec::with_capacity(requests.len());
-    for _ in 0..requests.len() {
-        results.push(Err(IoError::NotSupported("incomplete".into())));
-    }
-
-    for cqe in ring.completion() {
-        let idx = cqe.user_data() as usize;
-        if idx >= requests.len() {
-            continue;
-        }
-
-        let result = cqe.result();
+    fn on_completion(&mut self, slot: usize, is_sync: bool, result: i32) {
+        let Some(state) = self.slots.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        state.cqes_left -= 1;
         if result < 0 {
-            results[idx] = Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
-        } else if let Some(mut buf) = buffers[idx].take() {
-            buf.set_len(result as usize);
-            results[idx] = Ok(buf);
-        }
-    }
-
-    // Handle any that weren't submitted
-    for (i, buf_opt) in buffers.iter().enumerate() {
-        if buf_opt.is_some() && matches!(results[i], Err(IoError::NotSupported(_))) {
-            results[i] = Err(IoError::OffsetAlignment {
-                offset: requests[i].0,
-                alignment: PAGE_SIZE,
-            });
-        }
-    }
-
-    let _ = submitted;
-    results
-}
-
-/// Execute batch writes synchronously (called from spawn_blocking)
-fn write_batch_blocking(
-    ring: Arc<Mutex<IoUring>>,
-    raw_fd: i32,
-    requests: &[(u64, Vec<u8>, usize)], // (offset, data, write_len)
-) -> Vec<IoResult<usize>> {
-    let fd = types::Fd(raw_fd);
-    let num_requests = requests.len();
-
-    // Create aligned buffers from owned data
-    let mut aligned_bufs: Vec<Option<AlignedBuffer>> = Vec::with_capacity(num_requests);
-    let mut results: Vec<IoResult<usize>> = Vec::with_capacity(num_requests);
-    for _ in 0..num_requests {
-        results.push(Err(IoError::NotSupported("not submitted".into())));
-    }
-
-    for (i, (offset, data, write_len)) in requests.iter().enumerate() {
-        if !offset.is_multiple_of(PAGE_SIZE as u64) {
-            results[i] = Err(IoError::OffsetAlignment {
-                offset: *offset,
-                alignment: PAGE_SIZE,
-            });
-            aligned_bufs.push(None);
-            continue;
-        }
-
-        match AlignedBuffer::new(*write_len) {
-            Ok(mut buf) => {
-                if buf.copy_from_slice(data).is_err() {
-                    results[i] = Err(IoError::BufferSize {
-                        size: data.len(),
-                        alignment: PAGE_SIZE,
-                    });
-                    aligned_bufs.push(None);
-                    continue;
-                }
-                aligned_bufs.push(Some(buf));
-            }
-            Err(e) => {
-                results[i] = Err(e);
-                aligned_bufs.push(None);
-            }
-        }
-    }
-
-    let mut ring = ring.lock();
-    let mut valid_indices = Vec::with_capacity(num_requests);
-
-    for (i, (offset, _, write_len)) in requests.iter().enumerate() {
-        if let Some(ref buf) = aligned_bufs[i] {
-            let write_e = opcode::Write::new(fd, buf.as_ptr(), *write_len as u32)
-                .offset(*offset)
-                .build()
-                .user_data(i as u64);
-
-            // SAFETY: aligned_bufs outlive submit_and_wait below.
-            unsafe {
-                if ring.submission().push(&write_e).is_err() {
-                    results[i] = Err(IoError::Io(std::io::Error::other("queue full")));
-                    continue;
+            let errno = -result;
+            match errno {
+                libc::EINTR | libc::EAGAIN => state.again = true,
+                // The write this sync was linked to did not complete in full;
+                // the request continues with the rest of the write.
+                libc::ECANCELED if is_sync => {}
+                _ => {
+                    state.error.get_or_insert(errno);
                 }
             }
-            valid_indices.push(i);
-        }
-    }
-
-    if valid_indices.is_empty() {
-        return results;
-    }
-
-    if let Err(e) = ring.submit_and_wait(valid_indices.len()) {
-        for &idx in &valid_indices {
-            results[idx] = Err(IoError::Io(e.kind().into()));
-        }
-        return results;
-    }
-
-    for cqe in ring.completion() {
-        let idx = cqe.user_data() as usize;
-        if idx >= num_requests {
-            continue;
-        }
-
-        let result = cqe.result();
-        if result < 0 {
-            results[idx] = Err(IoError::Io(std::io::Error::from_raw_os_error(-result)));
+        } else if is_sync {
+            state.synced = true;
         } else {
-            results[idx] = Ok(result as usize);
+            match &state.op.kind {
+                OpKind::Read { .. } => {
+                    if result == 0 {
+                        state.eof = true;
+                    }
+                    state.done += result as usize;
+                }
+                OpKind::Write { .. } => state.done += result as usize,
+                OpKind::Sync { .. } => state.synced = true,
+                OpKind::Allocate { .. } => {}
+            }
         }
+        if state.cqes_left > 0 {
+            return;
+        }
+
+        let finished = if state.error.is_some() {
+            true
+        } else if state.again {
+            false
+        } else {
+            match &state.op.kind {
+                OpKind::Read { buf } => state.eof || state.done >= buf.capacity(),
+                OpKind::Write { len, sync, .. } => {
+                    state.done >= *len && (sync.is_none() || state.synced)
+                }
+                OpKind::Sync { .. } | OpKind::Allocate { .. } => true,
+            }
+        };
+        if !finished {
+            self.retry.push_back(slot);
+            return;
+        }
+
+        let state = self.slots[slot].take().expect("checked above");
+        self.free_slots.push(slot);
+        self.inflight -= 1;
+        if state.op.urgency == Urgency::Background {
+            self.background_inflight -= 1;
+        }
+        let result = match state.error {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            None => Ok(state.done),
+        };
+        state.op.complete(result);
     }
 
-    results
-}
-
-/// Factory for creating UringIO instances
-pub struct UringIOFactory;
-
-#[async_trait]
-impl AsyncIOFactory for UringIOFactory {
-    type IO = UringIO;
-
-    async fn open(&self, path: &Path, create: bool) -> IoResult<Self::IO> {
-        UringIO::open(path, create)
+    /// The ring is unusable: fail every request we know about.
+    fn fail_everything(&mut self) {
+        let error = || std::io::Error::other("io_uring reactor stopped after a submit error");
+        // Requests in the kernel may still be using their buffers, so those
+        // are leaked rather than freed; the callers are told the request
+        // failed.
+        for state in self.slots.drain(..).flatten() {
+            let InFlight { op, .. } = state;
+            let Op {
+                file, kind, done, ..
+            } = op;
+            std::mem::forget(kind);
+            std::mem::forget(file);
+            drop(done);
+        }
+        for queue in &mut self.pending {
+            for op in queue.drain(..) {
+                op.complete(Err(error()));
+            }
+        }
     }
 }

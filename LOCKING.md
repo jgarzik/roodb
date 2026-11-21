@@ -156,18 +156,11 @@ and L1+→L2+ compaction. Within each path, the manifest RwLock is held only bri
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `UringIO::ring` | parking_lot::Mutex | io_uring queue |
-| `PosixIO::file` | parking_lot::Mutex | POSIX file handle |
+| uring reactor channel | std::sync::mpsc | Requests from tasks to a reactor thread; no lock held across I/O |
+| posix `Shared::queues` | parking_lot::Mutex + Condvar | Worker pool request queues |
 
-Single lock per I/O instance; never nested.
-
-### I/O Scheduler (`src/io/scheduler/`)
-
-| Component | Type | Purpose |
-|-----------|------|---------|
-| `IoScheduler::files` | parking_lot::RwLock | Open files registry |
-| `IoEngine::rings` | parking_lot::RwLock | Hot/cold ring allocation |
-| `AdaptiveLimiter::bucket` | parking_lot::Mutex | Token bucket for background I/O rate limiting |
+Each io_uring ring is owned by one reactor thread and is never shared, so it
+needs no lock. Neither backend holds a lock while a request is in the kernel.
 
 ### Raft (`src/raft/`)
 

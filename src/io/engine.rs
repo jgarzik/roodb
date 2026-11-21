@@ -25,11 +25,27 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use super::aligned_buffer::AlignedBuffer;
+use super::aligned_buffer::{AlignedBuffer, PAGE_SIZE};
 use super::error::{IoError, IoResult};
-use super::pool::Pool;
-use super::scheduler::Urgency;
-use super::traits::PAGE_SIZE;
+use super::posix::Pool;
+
+/// How soon a request must complete. More urgent requests are handed to the
+/// kernel first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Urgency {
+    /// A commit is waiting on it: the Raft log and vote.
+    Critical = 0,
+    /// A client query is waiting on it.
+    Foreground = 1,
+    /// Flush and compaction. Capped so it cannot crowd out the others.
+    Background = 2,
+}
+
+impl Urgency {
+    /// Number of urgency levels.
+    pub const COUNT: usize = 3;
+}
 
 /// Which backend to run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,9 +234,9 @@ impl Op {
 
 /// Where a file's requests go.
 pub(crate) enum Route {
-    Pool(Arc<super::pool::Shared>),
+    Pool(Arc<super::posix::Shared>),
     #[cfg(target_os = "linux")]
-    Uring(super::reactor::FileRoute),
+    Uring(super::uring::FileRoute),
 }
 
 /// The open file shared by a [`File`] and its in-flight requests.
@@ -233,7 +249,7 @@ pub(crate) struct Handle {
 enum Backend {
     Pool(Pool),
     #[cfg(target_os = "linux")]
-    Uring(super::reactor::Uring),
+    Uring(super::uring::Uring),
 }
 
 struct EngineInner {
@@ -279,14 +295,14 @@ impl IoEngine {
                 IoBackend::Posix,
             )),
             IoBackend::Uring => Ok((
-                Backend::Uring(super::reactor::Uring::start(
+                Backend::Uring(super::uring::Uring::start(
                     config.reactors,
                     counters.clone(),
                 )?),
                 IoBackend::Uring,
             )),
             IoBackend::Auto => {
-                match super::reactor::Uring::start(config.reactors, counters.clone()) {
+                match super::uring::Uring::start(config.reactors, counters.clone()) {
                     Ok(uring) => Ok((Backend::Uring(uring), IoBackend::Uring)),
                     Err(e) => {
                         tracing::warn!(
