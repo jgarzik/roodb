@@ -1,14 +1,11 @@
 //! RooDB integration test suite.
 //!
-//! Comprehensive SQL tests organized by category:
-//! - ddl: CREATE/DROP TABLE, INDEX
-//! - dml: INSERT, UPDATE, DELETE
-//! - queries: SELECT, WHERE, JOINs, aggregates, ordering
-//! - types: Data type coverage
-//! - functions: Scalar functions
-//! - transactions: BEGIN/COMMIT/ROLLBACK
-//! - errors: Error handling
-//! - edge_cases: Complex scenarios
+//! - ddl, dml, queries, types, errors, edge_cases, prepared, auth: SQL through
+//!   the `mysql_async` client, against one shared server process
+//! - tds: the same server through TDS clients
+//! - protocol_tests: the RooDB wire protocol
+//! - crash, restart: durability across a kill and a restart
+//! - raft_cluster, cluster: Raft nodes inside the test process
 
 mod harness;
 

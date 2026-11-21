@@ -225,15 +225,23 @@ async fn a_kill_mid_stream_loses_nothing_acknowledged() {
                 }
             })
         };
-        // Let it run long enough for thousands of commits, then pull the plug.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Pull the plug once a stream of commits is under way. How long that
+        // takes depends on the machine (a flush per commit is slow on some),
+        // so wait for the commits, not for a length of time; the deadline
+        // only keeps a stuck server from hanging the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while acknowledged.load(std::sync::atomic::Ordering::SeqCst) < 100 {
+            assert!(
+                std::time::Instant::now() < deadline && !writer.is_finished(),
+                "{durability}: commits stopped at {}\n{}",
+                acknowledged.load(std::sync::atomic::Ordering::SeqCst),
+                server.log_tail()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         server.kill();
         writer.await.unwrap();
         let last_acknowledged = acknowledged.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            last_acknowledged > 100,
-            "{durability}: only {last_acknowledged} commits before the kill"
-        );
 
         server.start();
         let mut conn = connect(&server).await;

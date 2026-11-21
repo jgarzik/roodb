@@ -33,17 +33,7 @@ fn test_port(base: u16) -> u16 {
 
 /// Create a temporary storage engine and Raft log for testing
 async fn test_storage(name: &str) -> (Arc<dyn StorageEngine>, LogStore) {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "roodb_test_{}_{}_{:?}",
-        name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::create_dir_all(&path);
+    let path = crate::test_utils::cleanup::scratch_dir(name);
     let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let log = LogStore::open(
         factory.clone(),

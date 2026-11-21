@@ -21,17 +21,7 @@ fn test_port(base: u16) -> u16 {
 
 /// Create a temporary storage engine and Raft log for testing
 async fn test_storage(name: &str) -> (Arc<dyn StorageEngine>, LogStore) {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "roodb_test_{}_{}_{:?}",
-        name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::create_dir_all(&path);
+    let path = crate::test_utils::cleanup::scratch_dir(name);
     let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let log = LogStore::open(
         factory.clone(),
@@ -408,16 +398,7 @@ async fn the_log_is_purged_only_up_to_what_is_flushed() {
     use roodb::io::PAGE_SIZE;
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "roodb_test_purge_{}_{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
+    let path = crate::test_utils::cleanup::scratch_dir("purge");
     let io = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     // 256 KiB segments and a 1 MiB budget, against ~20 MiB of commits.
     let segment_bytes = 64 * PAGE_SIZE as u64;

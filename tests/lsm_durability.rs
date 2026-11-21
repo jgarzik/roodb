@@ -131,6 +131,11 @@ async fn a_batch_is_never_split_by_a_flush() {
             if i % 16 == 0 {
                 tokio::task::yield_now().await;
             }
+            // However the two tasks happen to be scheduled, something is
+            // flushed while batches are still being written.
+            if i == BATCHES / 2 {
+                engine.flush().await.unwrap();
+            }
         }
         stop.store(true, Ordering::Relaxed);
         flusher.await.unwrap();
