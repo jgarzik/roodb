@@ -297,8 +297,8 @@ enum Cmd {
         done: Done,
         /// Flush to stable storage whatever the durability setting says.
         force_sync: bool,
-        /// Highest entry index these bytes contain.
-        last_index: Option<u64>,
+        /// Where these bytes end: segment and offset.
+        end: (u64, u64),
     },
     /// Start a new segment.
     Roll {
@@ -366,9 +366,11 @@ struct WriterShared {
     config: LogStoreConfig,
     /// Open segment files, for reading entries back.
     files: Mutex<HashMap<u64, File>>,
-    /// One more than the highest entry index known to be written; entries
-    /// below it may be dropped from memory.
-    written_next: AtomicU64,
+    /// How far the log has been written: segment and offset. An entry whose
+    /// record ends at or before this is on disk and may be dropped from
+    /// memory. Positions only move forward and are never reused, unlike entry
+    /// indexes, which a truncation hands out again.
+    written: Mutex<(u64, u64)>,
     /// The first write error. Once set, the log refuses further work.
     failed: Mutex<Option<String>>,
     counters: Counters,
@@ -509,13 +511,13 @@ async fn writer_task(
         let mut bytes: Vec<u8> = Vec::new();
         let mut waiting: Vec<Done> = Vec::new();
         let mut sync = false;
-        let mut last_index: Option<u64> = None;
+        let mut end: Option<(u64, u64)> = None;
         while let Some(Cmd::Data { .. }) = queue.front() {
             let Some(Cmd::Data {
                 bytes: more,
                 done,
                 force_sync,
-                last_index: index,
+                end: this_end,
             }) = queue.pop_front()
             else {
                 unreachable!("front was checked to be data");
@@ -526,7 +528,7 @@ async fn writer_task(
             sync |= force_sync;
             bytes.extend_from_slice(&more);
             waiting.push(done);
-            last_index = index.or(last_index);
+            end = Some(this_end);
         }
 
         if !waiting.is_empty() {
@@ -537,8 +539,8 @@ async fn writer_task(
             if let Err(e) = &result {
                 tracing::error!(error = %e, "Raft log write failed");
                 shared.failed.lock().get_or_insert_with(|| e.to_string());
-            } else if let Some(index) = last_index {
-                shared.written_next.fetch_max(index + 1, Ordering::Relaxed);
+            } else if let Some(end) = end {
+                *shared.written.lock() = end;
             }
             for done in waiting {
                 done.complete(&result);
@@ -549,7 +551,13 @@ async fn writer_task(
         match queue.pop_front() {
             Some(Cmd::Roll { seq, size, header }) => {
                 let result = match shared.check() {
-                    Ok(()) => roll(&shared, seq, size, header).await,
+                    // The finished segment, End record included, is made
+                    // durable before its successor exists. Recovery relies on
+                    // it: a segment with a successor must end properly.
+                    Ok(()) => match tail.file.sync_data(Urgency::Critical).await {
+                        Ok(()) => roll(&shared, seq, size, header).await,
+                        Err(e) => Err(e.into()),
+                    },
                     Err(e) => Err(e),
                 };
                 match result {
@@ -746,7 +754,7 @@ impl LogStore {
             io: io.clone(),
             config: config.clone(),
             files: Mutex::new(HashMap::new()),
-            written_next: AtomicU64::new(0),
+            written: Mutex::new((0, 0)),
             failed: Mutex::new(None),
             counters: Counters::default(),
         });
@@ -821,6 +829,21 @@ impl LogStore {
             if last && !scan.ended {
                 let page_offset = scan.end - scan.end % PAGE_SIZE as u64;
                 let partial = contents[page_offset as usize..scan.end as usize].to_vec();
+                // Whatever lies beyond the end of the log - the rest of a
+                // torn write, or whole records that followed it - must not be
+                // there when new records are written over this spot: an old
+                // record that happened to start where a new one ends would be
+                // replayed as if it came after it.
+                if let Some(extent) = contents[scan.end as usize..].iter().rposition(|b| *b != 0) {
+                    let dirty_end = (scan.end as usize + extent + 1).next_multiple_of(PAGE_SIZE);
+                    let span = dirty_end - page_offset as usize;
+                    let mut buf = AlignedBuffer::new(span)?;
+                    buf.zero();
+                    buf.as_mut_slice()[..partial.len()].copy_from_slice(&partial);
+                    buf.set_len(span);
+                    file.write_at_sync(buf, page_offset, Urgency::Critical)
+                        .await?;
+                }
                 tail = Some(WriterTail {
                     file,
                     page_offset,
@@ -830,11 +853,7 @@ impl LogStore {
         }
 
         // Everything recovered is on disk.
-        if let Some(last) = mem.last_log_id {
-            writer
-                .written_next
-                .store(last.index() + 1, Ordering::Relaxed);
-        }
+        *writer.written.lock() = (mem.seq, mem.offset);
         Self::evict(&mut mem, &writer);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -943,6 +962,10 @@ impl LogStore {
             }
         }
         mem.last_log_id = mem.slots.back().map(|s| s.log_id).or(mem.purged);
+        // Indexes past here will be handed out again; eviction must look at
+        // the new entries, not skip them as already done.
+        let next = mem.last_log_id.map_or(0, |id| id.index() + 1);
+        mem.evicted_upto = mem.evicted_upto.min(next);
     }
 
     fn purge_mem(mem: &mut Mem, log_id: LogId) {
@@ -974,16 +997,18 @@ impl LogStore {
         if mem.cached_bytes <= writer.config.cache_bytes {
             return;
         }
-        let written_next = writer.written_next.load(Ordering::Relaxed);
-        let first = match mem.first_index() {
-            Some(first) => first,
-            None => return,
+        let written = *writer.written.lock();
+        let Some(first) = mem.first_index() else {
+            return;
         };
         let mut at = mem.evicted_upto.max(first);
-        while mem.cached_bytes > writer.config.cache_bytes && at < written_next {
+        while mem.cached_bytes > writer.config.cache_bytes {
             let Some(slot) = mem.slots.get_mut((at - first) as usize) else {
                 break;
             };
+            if (slot.seq, slot.offset + slot.len as u64) > written {
+                break;
+            }
             if slot.entry.take().is_some() {
                 mem.cached_bytes -= slot.len as usize;
             }
@@ -1013,11 +1038,12 @@ impl LogStore {
         if mem.offset + needed + end_record > mem.size {
             let mut bytes = Vec::with_capacity(RECORD_HEADER);
             frame(mem.seq, KIND_END, &[], &mut bytes);
+            mem.offset += end_record;
             self.send(Cmd::Data {
                 bytes,
                 done: Done::None,
                 force_sync: false,
-                last_index: None,
+                end: (mem.seq, mem.offset),
             })?;
 
             // A batch larger than a standard segment gets one made to fit.
@@ -1049,7 +1075,7 @@ impl LogStore {
             bytes,
             done,
             force_sync,
-            last_index,
+            end: (mem.seq, mem.offset),
         })?;
         Ok(offsets)
     }
@@ -1131,8 +1157,26 @@ impl RaftLogReader<TypeConfig> for LogStore {
                     let file = self.shared.writer.files.lock().get(&seq).cloned();
                     let file =
                         file.ok_or_else(|| corrupt(format!("Raft log segment {seq} is gone")))?;
-                    let payload = read_exact(&file, offset, len as usize).await?;
-                    entries.push(decode(&payload)?);
+                    // Read the record with its header and check it before
+                    // trusting it: this is data coming back from disk.
+                    let record = read_exact(
+                        &file,
+                        offset - RECORD_HEADER as u64,
+                        RECORD_HEADER + len as usize,
+                    )
+                    .await?;
+                    let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4"));
+                    let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4"));
+                    let payload = &record[RECORD_HEADER..];
+                    if stored_len != len
+                        || record[8] != KIND_ENTRY
+                        || stored_crc != record_crc(seq, KIND_ENTRY, payload)
+                    {
+                        return Err(corrupt(format!(
+                            "Raft log segment {seq} is damaged at offset {offset}"
+                        )));
+                    }
+                    entries.push(decode(payload)?);
                 }
             }
         }

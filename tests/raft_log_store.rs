@@ -626,3 +626,144 @@ async fn a_garbled_header_on_the_newest_segment_fails_open() {
     std::fs::write(&path, &bytes).unwrap();
     assert!(LogStore::open(io(), cfg).await.is_err());
 }
+
+/// After a torn tail is cut, records that lay beyond the tear must be gone.
+/// Otherwise a new record that happens to end exactly where an old one began
+/// would be followed, at the next restart, by that old record.
+#[tokio::test]
+async fn records_beyond_a_torn_tail_never_come_back() {
+    // Find the payload size that makes a record exactly one page, so that
+    // records line up with the pages a write replaces. A record ends in a few
+    // zero bytes, so its size is measured as the difference between a log of
+    // two records and a log of one.
+    let used_by = |count: u64| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::open(io(), config(dir.path(), Durability::Os))
+            .await
+            .unwrap();
+        for index in 0..count {
+            append(&mut store, vec![entry_sized(index, 3000)]).await;
+        }
+        store.close().await;
+        let bytes = std::fs::read(dir.path().join(&segment_files(dir.path())[0])).unwrap();
+        bytes.iter().rposition(|b| *b != 0).unwrap()
+    };
+    let record = used_by(2).await - used_by(1).await;
+    let payload = 3000 + PAGE_SIZE - record;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), Durability::Os);
+    {
+        let mut store = LogStore::open(io(), cfg.clone()).await.unwrap();
+        for index in 0..10 {
+            append(&mut store, vec![entry_sized(index, payload)]).await;
+        }
+        store.close().await;
+    }
+    let path = dir.path().join(&segment_files(dir.path())[0]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Damage the 4th record only; records 5..10 after it are intact, each
+    // starting on a page boundary.
+    bytes[PAGE_SIZE + 3 * PAGE_SIZE + 20] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    {
+        let mut store = LogStore::open(io(), cfg.clone()).await.unwrap();
+        assert_eq!(read(&mut store, 0..100).await.len(), 3);
+        // One record of the same size goes where the damaged one was; it ends
+        // exactly where the old 5th record begins.
+        append(&mut store, vec![entry_sized(3, payload)]).await;
+        store.close().await;
+    }
+    let mut store = LogStore::open(io(), cfg).await.unwrap();
+    let all = read(&mut store, 0..100).await;
+    assert_eq!(all.len(), 4, "old records after the tear were replayed");
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_log_id,
+        Some(id(3))
+    );
+}
+
+/// After a truncation the same indexes are handed out again. The new entries
+/// are not yet on disk and must not be dropped from memory as if they were.
+#[tokio::test]
+async fn entries_reusing_truncated_indexes_stay_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LogStoreConfig {
+        cache_bytes: 4 * 1024,
+        ..config(dir.path(), Durability::Os)
+    };
+    let mut store = LogStore::open(io(), cfg.clone()).await.unwrap();
+    for chunk in (0..400u64).collect::<Vec<_>>().chunks(40) {
+        append(
+            &mut store,
+            chunk.iter().map(|i| entry_sized(*i, 500)).collect(),
+        )
+        .await;
+    }
+    store.truncate_after(Some(id(99))).await.unwrap();
+
+    let replacement = |index: u64| {
+        Entry::new_normal(
+            log_id::<TypeConfig>(2, 2, index),
+            Command::DataChange(ChangeSet::new_with_changes(
+                index + 5000,
+                vec![RowChange::insert("t", vec![1], vec![9u8; 500])],
+            )),
+        )
+    };
+    // Read each batch back before its write can have completed.
+    for start in (100..400u64).step_by(50) {
+        let batch: Vec<Entry> = (start..start + 50).map(replacement).collect();
+        let (tx, rx) = TypeConfig::oneshot();
+        store
+            .append(batch.clone(), IOFlushed::signal(tx))
+            .await
+            .unwrap();
+        assert_eq!(read(&mut store, start..start + 50).await, batch);
+        rx.await.unwrap().unwrap();
+    }
+    for index in [100u64, 137, 250, 399] {
+        assert_eq!(
+            read(&mut store, index..index + 1).await,
+            vec![replacement(index)],
+            "entry {index}"
+        );
+    }
+    store.close().await;
+    drop(store);
+    let mut store = LogStore::open(io(), cfg).await.unwrap();
+    assert_eq!(read(&mut store, 99..100).await, vec![entry_sized(99, 500)]);
+    assert_eq!(read(&mut store, 399..400).await, vec![replacement(399)]);
+}
+
+/// An entry read back from disk is checked before it is used.
+#[tokio::test]
+async fn a_damaged_entry_read_back_from_disk_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LogStoreConfig {
+        cache_bytes: 1024,
+        segment_bytes: 16 << 20,
+        ..config(dir.path(), Durability::Os)
+    };
+    let mut store = LogStore::open(io(), cfg).await.unwrap();
+    for chunk in (0..200u64).collect::<Vec<_>>().chunks(20) {
+        append(
+            &mut store,
+            chunk.iter().map(|i| entry_sized(*i, 500)).collect(),
+        )
+        .await;
+    }
+    // Entry 0 is on disk only by now. Damage it behind the store's back.
+    let path = dir.path().join(&segment_files(dir.path())[0]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[PAGE_SIZE + 100] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(store.try_get_log_entries(0..1).await.is_err());
+    // Entries still in memory are unaffected.
+    assert_eq!(
+        read(&mut store, 199..200).await,
+        vec![entry_sized(199, 500)]
+    );
+}
