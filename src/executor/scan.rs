@@ -203,6 +203,16 @@ mod tests {
             Ok(())
         }
 
+        async fn write_batch(&self, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> StorageResult<()> {
+            for (key, value) in batch {
+                match value {
+                    Some(value) => self.put(&key, &value).await?,
+                    None => self.delete(&key).await?,
+                }
+            }
+            Ok(())
+        }
+
         async fn scan(
             &self,
             start: Option<&[u8]>,

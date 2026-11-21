@@ -7,6 +7,9 @@ use crate::storage::error::StorageResult;
 /// A key-value pair
 pub type KeyValue = (Vec<u8>, Vec<u8>);
 
+/// One write in a batch: the key, and the value to store or `None` to delete.
+pub type WriteOp = (Vec<u8>, Option<Vec<u8>>);
+
 /// Abstract storage engine interface
 ///
 /// Provides ordered key-value storage with point lookups, range scans,
@@ -27,6 +30,11 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// No-op if the key does not exist.
     async fn delete(&self, key: &[u8]) -> StorageResult<()>;
+
+    /// Apply several writes as one unit: `Some` stores a value, `None`
+    /// deletes the key. Readers may see the writes arrive one by one, but
+    /// what reaches disk holds either all of a batch or none of it.
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()>;
 
     /// Scan a range of keys
     ///

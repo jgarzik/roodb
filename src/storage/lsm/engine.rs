@@ -21,7 +21,7 @@ use crate::storage::lsm::manifest::{Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
 use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
-use crate::storage::traits::{KeyValue, StorageEngine};
+use crate::storage::traits::{KeyValue, StorageEngine, WriteOp};
 
 /// Default total memory budget: 128MB (block cache + memtables share this pool)
 pub const DEFAULT_TOTAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
@@ -70,6 +70,9 @@ pub struct LsmEngine {
     block_cache: Arc<BlockCache>,
     /// Cache of open SSTable readers — avoids reopening fd/parsing metadata per scan
     reader_cache: RwLock<HashMap<Arc<str>, Arc<SstableReader>>>,
+    /// Held while memtables are being written out, so that they reach disk
+    /// one at a time and oldest first.
+    flush_lock: TokioMutex<()>,
     /// Closed flag
     closed: AtomicBool,
 }
@@ -125,14 +128,9 @@ impl LsmEngine {
             total_cache_bytes,
             block_cache,
             reader_cache: RwLock::new(reader_map),
+            flush_lock: TokioMutex::new(()),
             closed: AtomicBool::new(false),
         })
-    }
-
-    /// Flush memtable to L0 SSTable
-    async fn flush_memtable(&self, mem: Arc<Memtable>) -> StorageResult<()> {
-        self.flush_memtable_with_priority(mem, Urgency::Background)
-            .await
     }
 
     /// Flush memtable to L0 SSTable with specified priority
@@ -364,6 +362,69 @@ impl LsmEngine {
         self.block_cache.capacity()
     }
 
+    /// Apply writes to the active memtable as one unit.
+    ///
+    /// The memtable lock is held (shared) across every insert. Rotation takes
+    /// it exclusively, so a memtable is never frozen and written out with part
+    /// of a batch in it or while an insert is still on its way, and what
+    /// reaches disk is always whole batches.
+    fn write(&self, batch: impl IntoIterator<Item = WriteOp>) -> StorageResult<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(StorageError::Closed);
+        }
+        let full = {
+            let memtable = self.memtable.read();
+            for (key, value) in batch {
+                memtable.insert(key, value);
+            }
+            memtable.size() >= self.memtable_limit()
+        };
+        if full {
+            self.rotate(self.memtable_limit());
+            self.rebalance_cache();
+        }
+        Ok(())
+    }
+
+    /// Size at which the active memtable is frozen: half the memory budget.
+    fn memtable_limit(&self) -> usize {
+        self.total_cache_bytes / 2
+    }
+
+    /// Freeze the active memtable if it holds at least `min_size` bytes and
+    /// start a new one.
+    fn rotate(&self, min_size: usize) {
+        let mut active = self.memtable.write();
+        if active.is_empty() || active.size() < min_size {
+            return;
+        }
+        let frozen = std::mem::replace(&mut *active, Arc::new(Memtable::new()));
+        self.imm_memtables.write().push(frozen);
+    }
+
+    /// Write every memtable out, oldest first.
+    async fn flush_all(&self, urgency: Urgency) -> StorageResult<()> {
+        let _flushing = self.flush_lock.lock().await;
+        self.rotate(0);
+
+        // A memtable stays readable in `imm_memtables` until its table is on
+        // disk and in the manifest; only then is it removed.
+        loop {
+            let Some(oldest) = self.imm_memtables.read().first().cloned() else {
+                return Ok(());
+            };
+            self.flush_memtable_with_priority(Arc::clone(&oldest), urgency)
+                .await?;
+            {
+                let mut frozen = self.imm_memtables.write();
+                if frozen.first().is_some_and(|m| Arc::ptr_eq(m, &oldest)) {
+                    frozen.remove(0);
+                }
+            }
+            self.rebalance_cache();
+        }
+    }
+
     /// Rebalance block cache capacity based on current memtable pressure.
     ///
     /// Gives block cache all remaining budget after subtracting active + immutable
@@ -482,45 +543,15 @@ impl StorageEngine for LsmEngine {
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(StorageError::Closed);
-        }
-
-        // Get current memtable and insert
-        let current_mem = Arc::clone(&*self.memtable.read());
-        current_mem.put(key, value);
-
-        // Check if memtable needs flushing (threshold = half of total budget)
-        let flush_threshold = self.total_cache_bytes / 2;
-        if current_mem.size() >= flush_threshold {
-            // Rotate memtable: create new one and move old to immutables
-            let new_mem = Arc::new(Memtable::new());
-            {
-                let mut mem_guard = self.memtable.write();
-                // Only rotate if we're still looking at the same memtable.
-                // Another thread may have already rotated between our size check
-                // and acquiring this write lock.
-                if Arc::ptr_eq(&current_mem, &*mem_guard) {
-                    let old_mem = std::mem::replace(&mut *mem_guard, new_mem);
-                    // Push old memtable to immutables (data preserved, NOT cleared)
-                    self.imm_memtables.write().push(old_mem);
-                }
-                // If not the same, another thread already rotated - nothing to do
-            }
-            self.rebalance_cache();
-            // Note: Flush happens in background or on explicit flush() call
-        }
-
-        Ok(())
+        self.write(std::iter::once((key.to_vec(), Some(value.to_vec()))))
     }
 
     async fn delete(&self, key: &[u8]) -> StorageResult<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(StorageError::Closed);
-        }
+        self.write(std::iter::once((key.to_vec(), None)))
+    }
 
-        self.memtable.read().delete(key);
-        Ok(())
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+        self.write(batch)
     }
 
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
@@ -630,128 +661,19 @@ impl StorageEngine for LsmEngine {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
         }
-
-        // Rotate current memtable to immutable and create fresh one
-        {
-            let mut mem_guard = self.memtable.write();
-            if !mem_guard.is_empty() {
-                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
-                self.imm_memtables.write().push(old_mem);
-            }
-        }
-
-        // Flush immutable memtables one at a time
-        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
-        // to prevent visibility gaps where entries are not in memtable, imm_memtables, or disk
-        loop {
-            // Peek at the oldest memtable (first in vec) but don't remove yet
-            let mem = {
-                let imm = self.imm_memtables.read();
-                imm.first().cloned()
-            };
-
-            let mem = match mem {
-                Some(m) => m,
-                None => break, // No more memtables to flush
-            };
-
-            // Flush to disk (memtable still visible in imm_memtables during this)
-            self.flush_memtable(Arc::clone(&mem)).await?;
-
-            // Now safe to remove - data is on disk
-            {
-                let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
-                    imm.remove(0);
-                }
-            }
-            self.rebalance_cache();
-        }
-
-        Ok(())
+        self.flush_all(Urgency::Background).await
     }
 
     async fn flush_critical(&self) -> StorageResult<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StorageError::Closed);
         }
-
-        // Rotate current memtable to immutable and create fresh one
-        {
-            let mut mem_guard = self.memtable.write();
-            if !mem_guard.is_empty() {
-                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
-                self.imm_memtables.write().push(old_mem);
-            }
-        }
-
-        // Flush immutable memtables one at a time with Critical priority (WAL)
-        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
-        // to prevent visibility gaps where entries are not in memtable, imm_memtables, or disk
-        loop {
-            // Peek at the oldest memtable (first in vec) but don't remove yet
-            let mem = {
-                let imm = self.imm_memtables.read();
-                imm.first().cloned()
-            };
-
-            let mem = match mem {
-                Some(m) => m,
-                None => break, // No more memtables to flush
-            };
-
-            // Flush to disk (memtable still visible in imm_memtables during this)
-            self.flush_memtable_with_priority(Arc::clone(&mem), Urgency::Critical)
-                .await?;
-
-            // Now safe to remove - data is on disk
-            {
-                let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
-                    imm.remove(0);
-                }
-            }
-            self.rebalance_cache();
-        }
-
-        Ok(())
+        self.flush_all(Urgency::Critical).await
     }
 
     async fn close(&self) -> StorageResult<()> {
         // Flush first, then mark as closed
-        // Rotate current memtable to immutable
-        {
-            let mut mem_guard = self.memtable.write();
-            if !mem_guard.is_empty() {
-                let old_mem = std::mem::replace(&mut *mem_guard, Arc::new(Memtable::new()));
-                self.imm_memtables.write().push(old_mem);
-            }
-        }
-
-        // Flush immutable memtables one at a time
-        // CRITICAL: Only remove from imm_memtables AFTER successful write to disk
-        loop {
-            let mem = {
-                let imm = self.imm_memtables.read();
-                imm.first().cloned()
-            };
-
-            let mem = match mem {
-                Some(m) => m,
-                None => break,
-            };
-
-            self.flush_memtable(Arc::clone(&mem)).await?;
-
-            {
-                let mut imm = self.imm_memtables.write();
-                if imm.first().map(|m| Arc::ptr_eq(m, &mem)).unwrap_or(false) {
-                    imm.remove(0);
-                }
-            }
-            self.rebalance_cache();
-        }
-
+        self.flush_all(Urgency::Background).await?;
         self.closed.store(true, Ordering::SeqCst);
         Ok(())
     }
