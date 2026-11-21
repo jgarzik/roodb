@@ -106,6 +106,7 @@ A node with a certificate signed by a different CA will be rejected by the clust
 | `ROODB_BIND` | Listen address (same as `--bind`) |
 | `ROODB_TDS_PORT` | Enable the TDS listener on this port (same as `--tds-port`) |
 | `ROODB_IO_BACKEND` | File I/O backend: `auto` (default), `uring` or `posix` (same as `--io-backend`) |
+| `ROODB_DURABILITY` | When a commit is acknowledged: `os` (default) or `fsync` (same as `--durability`) |
 
 Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
 
@@ -122,6 +123,17 @@ RooDB does its own file I/O with direct I/O and picks a backend when it starts:
 io_uring is unavailable on non-Linux hosts, on old kernels, and in containers
 whose seccomp profile blocks it (recent Docker releases block it by default). `roodb_init`
 accepts the same flag. The backend in use is logged at startup.
+
+### Durability
+
+Every commit is appended to the Raft log before it is acknowledged. `--durability` chooses how far that append must have got:
+
+| `--durability` | A commit is acknowledged when... | Survives |
+|----------------|----------------------------------|----------|
+| `os` (default) | its log write has completed | the server crashing or being killed |
+| `fsync` | its log write has been flushed to stable storage | that, and power loss or a kernel crash |
+
+With `os`, a power failure can lose the last commits that were still in the drive's volatile cache. With `fsync`, commits that arrive together share one flush, so the cost per commit falls as load rises. Raft votes are flushed in both modes.
 
 ## SQL Server Protocol (TDS)
 
@@ -211,13 +223,15 @@ listed here.
 
 ```
 data/
-├── sstables/          # LSM SSTable files
-│   └── *.sst          # Individual SSTable files
-├── manifest.json      # SSTable metadata (critical for recovery)
-└── [raft state]       # Raft log entries and vote state (LSM-backed)
+├── *.sst              # LSM table files
+├── MANIFEST           # Which table files exist, by level
+├── LOCK               # Held while a server has the directory open
+└── raft/
+    ├── log-*.seg      # The Raft log (the write-ahead log), in fixed-size segments
+    └── spare.seg      # A prepared segment waiting to be used
 ```
 
-**Important:** The `manifest.json` file tracks all SSTables. Losing it while keeping SSTables results in data loss. Always backup the entire data directory as a unit.
+**Important:** Back up the entire data directory as a unit. `MANIFEST` says which table files are live; the server refuses to start if it is missing while table files are present, or if a file it lists is missing or damaged. The log in `raft/` holds every commit that has not yet been flushed into a table file.
 
 ## Deployment Modes
 

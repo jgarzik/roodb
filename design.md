@@ -359,10 +359,11 @@ pub struct RowChange {
 - `is_leader()`: Check if this node can accept writes
 
 **Storage**:
-- `LsmRaftStorage` (`lsm_storage.rs`): Production storage - persists log/state to LSM, rebuilds catalog on apply
-- `MemStorage` (`storage.rs`): Test-only in-memory storage
-- Log entries stored in LSM, state machine applies changes to storage and rebuilds catalog
-- Vote persistence uses `flush_critical()` (Critical I/O priority) to prevent split-brain
+- `LogStore` (`log_store.rs`): the Raft log on disk, and the server's write-ahead log. Preallocated segment files under `raft/`, written with direct I/O. Log entries, the vote, truncations, the purge point and the commit point are checksummed records in one stream.
+  - One writer task writes everything queued with a single request and then completes the waiting appends: commits that arrive together share a write, and with `--durability fsync` the flush too.
+  - Recovery replays the segments; in the newest one the first record that fails its checksum is the end of the log.
+  - A spare segment is kept ready and purged segments are recycled.
+- `LsmRaftStorage` (`lsm_storage.rs`): the state machine. Applies committed entries to the LSM, rebuilds the catalog on apply, and keeps its own position (last applied, membership) in the LSM.
 
 **Read Path**: Direct to local LSM (no Raft)
 **Write Path**: SQL → Collect RowChanges → Raft propose → Apply to LSM

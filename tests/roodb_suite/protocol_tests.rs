@@ -29,6 +29,7 @@ use roodb::protocol::roodb::resultset::{
     ColumnDefinition41,
 };
 use roodb::protocol::roodb::types::{datatype_to_protocol, datum_to_text_bytes, ColumnType};
+use roodb::raft::{Durability, LogStore, LogStoreConfig};
 use roodb::server::listener::start_test_server;
 use roodb::storage::lsm::{LsmConfig, LsmEngine};
 use roodb::storage::StorageEngine;
@@ -401,6 +402,12 @@ async fn test_server_integration_e2e() {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -420,6 +427,7 @@ async fn test_server_integration_e2e() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
@@ -505,6 +513,12 @@ async fn test_transaction_begin_commit() {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -524,6 +538,7 @@ async fn test_transaction_begin_commit() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
@@ -609,6 +624,12 @@ async fn test_transaction_rollback() {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -628,6 +649,7 @@ async fn test_transaction_rollback() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
@@ -715,6 +737,12 @@ async fn test_autocommit() {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -734,6 +762,7 @@ async fn test_autocommit() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");

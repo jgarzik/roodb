@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
+use crate::raft::log_store::LogStore;
 use crate::raft::lsm_storage::LsmRaftStorage;
 use crate::raft::network::{RaftNetworkFactoryImpl, RaftRpcHandler};
 use crate::raft::types::{Command, CommandResponse, Node, NodeId, Raft};
@@ -62,6 +63,7 @@ impl RaftNode {
         tls_config: RaftTlsConfig,
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
+        log_store: LogStore,
         single_node: bool,
     ) -> Result<Self, RaftNodeError> {
         let config = if single_node {
@@ -88,22 +90,17 @@ impl RaftNode {
         };
         let config = Arc::new(config);
 
-        // Create LSM-backed storage that persists all Raft state
-        let lsm_storage = LsmRaftStorage::new(storage, catalog, single_node)
+        // The state machine applies committed entries to the LSM; the log
+        // store holds the entries themselves.
+        let state_machine = LsmRaftStorage::new(storage, catalog)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
-        let raft = Raft::new(
-            id,
-            config,
-            network.clone(),
-            lsm_storage.clone(),
-            lsm_storage,
-        )
-        .await
-        .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        let raft = Raft::new(id, config, network.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
         Ok(Self {
             id,

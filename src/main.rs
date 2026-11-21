@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use roodb::catalog::Catalog;
 use roodb::io::{IoBackend, IoEngine};
-use roodb::raft::RaftNode;
+use roodb::raft::{Durability, LogStore, LogStoreConfig, RaftNode};
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
 use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
@@ -33,6 +33,10 @@ struct Cli {
     /// File I/O backend: auto (io_uring where available), uring, or posix
     #[arg(long, default_value = "auto", env = "ROODB_IO_BACKEND")]
     io_backend: IoBackend,
+    /// When a commit is acknowledged: os (once written; survives a server
+    /// crash) or fsync (once flushed to stable storage; survives power loss)
+    #[arg(long, default_value = "os", env = "ROODB_DURABILITY")]
+    durability: Durability,
     #[arg(long, default_value = "./certs/server.crt", env = "ROODB_CERT_PATH")]
     cert_path: PathBuf,
     #[arg(long, default_value = "./certs/server.key", env = "ROODB_KEY_PATH")]
@@ -60,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tds_port,
         data_dir,
         io_backend,
+        durability,
         cert_path,
         key_path,
         raft_ca_cert_path,
@@ -92,10 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let io = IoEngine::new(io_backend)?;
     tracing::info!(backend = %io.backend(), "I/O engine started");
     let storage_config = LsmConfig {
-        dir: data_dir,
+        dir: data_dir.clone(),
         ..Default::default()
     };
-    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(io, storage_config).await?);
+    let storage: Arc<dyn StorageEngine> =
+        Arc::new(LsmEngine::open(io.clone(), storage_config).await?);
 
     // Check if database is initialized
     if !is_initialized(&storage).await? {
@@ -105,6 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize catalog with system tables
     let catalog = Arc::new(RwLock::new(Catalog::with_system_tables()));
+
+    // The Raft log: the server's write-ahead log.
+    let log_store = LogStore::open(
+        io.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, durability),
+    )
+    .await?;
+    tracing::info!(%durability, "Raft log opened");
 
     // Initialize Raft node (single-node mode)
     let raft_addr = SocketAddr::new(bind, raft_port);
@@ -116,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
         true,
     )
     .await?;

@@ -11,6 +11,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::catalog::Catalog;
 use crate::protocol::tds::{self, connection::TdsAcceptors};
+use crate::raft::LogStore;
 use crate::raft::RaftNode;
 use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
@@ -197,6 +198,7 @@ pub async fn start_test_server(
     raft_tls_config: RaftTlsConfig,
     storage: Arc<dyn StorageEngine>,
     catalog: Arc<RwLock<Catalog>>,
+    log_store: LogStore,
 ) -> Result<ServerHandle, ServerError> {
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -212,6 +214,7 @@ pub async fn start_test_server(
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
         true,
     )
     .await
