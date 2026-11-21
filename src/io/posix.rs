@@ -18,6 +18,8 @@ const MAX_AUTO_WORKERS: usize = 16;
 
 struct Queues {
     by_urgency: [VecDeque<Op>; Urgency::COUNT],
+    /// Workers currently running a background request.
+    background_running: usize,
     shutdown: bool,
 }
 
@@ -25,6 +27,9 @@ struct Queues {
 pub(crate) struct Shared {
     queues: Mutex<Queues>,
     wake: Condvar,
+    /// Most workers allowed to run background requests at once, so that some
+    /// stay free for work a client or a commit is waiting on.
+    max_background: usize,
 }
 
 impl Shared {
@@ -43,13 +48,31 @@ impl Shared {
     fn next(&self) -> Option<Op> {
         let mut queues = self.queues.lock();
         loop {
-            if let Some(op) = queues.by_urgency.iter_mut().find_map(VecDeque::pop_front) {
-                return Some(op);
+            let background = Urgency::Background as usize;
+            for urgency in 0..Urgency::COUNT {
+                if urgency == background && queues.background_running >= self.max_background {
+                    continue;
+                }
+                if let Some(op) = queues.by_urgency[urgency].pop_front() {
+                    if urgency == background {
+                        queues.background_running += 1;
+                    }
+                    return Some(op);
+                }
             }
             if queues.shutdown {
                 return None;
             }
             self.wake.wait(&mut queues);
+        }
+    }
+
+    /// A worker finished a request of the given urgency.
+    fn finished(&self, urgency: Urgency) {
+        if urgency == Urgency::Background {
+            self.queues.lock().background_running -= 1;
+            // A background request may have been held back by the cap.
+            self.wake.notify_one();
         }
     }
 }
@@ -71,34 +94,47 @@ impl Pool {
         } else {
             workers
         };
+        // With more than one worker, keep at least a quarter of them (and at
+        // least one) away from background work.
+        let max_background = if workers > 1 {
+            workers - (workers / 4).max(1)
+        } else {
+            1
+        };
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues {
                 by_urgency: Default::default(),
+                background_running: 0,
                 shutdown: false,
             }),
             wake: Condvar::new(),
+            max_background,
         });
-        let mut handles = Vec::with_capacity(workers);
+        // Built before any thread is spawned: if a spawn fails, dropping the
+        // pool stops and joins the workers already running.
+        let mut pool = Self {
+            shared,
+            workers: Vec::with_capacity(workers),
+        };
         for i in 0..workers {
-            let shared = shared.clone();
+            let shared = pool.shared.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("roodb-io-{i}"))
                 .spawn(move || {
                     while let Some(mut op) = shared.next() {
+                        let urgency = op.urgency;
                         let result = execute(&mut op);
                         op.file
                             .counters
                             .submits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        shared.finished(urgency);
                         op.complete(result);
                     }
                 })?;
-            handles.push(handle);
+            pool.workers.push(handle);
         }
-        Ok(Self {
-            shared,
-            workers: handles,
-        })
+        Ok(pool)
     }
 
     pub(crate) fn shared(&self) -> Arc<Shared> {

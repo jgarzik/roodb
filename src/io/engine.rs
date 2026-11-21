@@ -180,6 +180,7 @@ pub(crate) struct Counters {
     pub bytes_read: AtomicU64,
     pub bytes_written: AtomicU64,
     pub syncs: AtomicU64,
+    pub registered_files: AtomicU64,
 }
 
 /// A snapshot of the engine counters.
@@ -197,6 +198,8 @@ pub struct IoStats {
     pub bytes_written: u64,
     /// Sync requests, including those attached to a write.
     pub syncs: u64,
+    /// Files currently registered with an io_uring ring.
+    pub registered_files: u64,
 }
 
 /// What a request does.
@@ -361,6 +364,7 @@ impl IoEngine {
             bytes_read: c.bytes_read.load(Ordering::Relaxed),
             bytes_written: c.bytes_written.load(Ordering::Relaxed),
             syncs: c.syncs.load(Ordering::Relaxed),
+            registered_files: c.registered_files.load(Ordering::Relaxed),
         }
     }
 
@@ -421,6 +425,11 @@ fn open_file(path: &Path, options: OpenOptions) -> IoResult<std::fs::File> {
                 path = %path.display(),
                 "filesystem does not support direct I/O; using buffered I/O"
             );
+            // The kernel creates the file before it rejects the flag. For an
+            // exclusive create that file is ours and would make the retry fail.
+            if options.exclusive && !options.read_only {
+                let _ = std::fs::remove_file(path);
+            }
             opts.custom_flags(0).open(path)?
         }
         Err(e) => return Err(e.into()),
@@ -522,7 +531,6 @@ impl File {
         offset: u64,
         urgency: Urgency,
     ) -> IoResult<AlignedBuffer> {
-        self.handle.counters.syncs.fetch_add(1, Ordering::Relaxed);
         self.write(buf, offset, urgency, Some(true)).await
     }
 
@@ -537,7 +545,15 @@ impl File {
         let data_len = buf.len();
         let len = AlignedBuffer::round_up(data_len);
         if len == 0 {
+            // Nothing to write, but a requested sync still has to happen: the
+            // caller may be using it to make earlier writes durable.
+            if let Some(data_only) = sync {
+                self.sync(data_only, urgency).await?;
+            }
             return Ok(buf);
+        }
+        if sync.is_some() {
+            self.handle.counters.syncs.fetch_add(1, Ordering::Relaxed);
         }
         buf.as_mut_slice()[data_len..len].fill(0);
         let done = self

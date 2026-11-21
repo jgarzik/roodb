@@ -362,14 +362,26 @@ impl Reactor {
         match msg {
             Msg::Op(op) => self.pending[op.urgency as usize].push_back(op),
             Msg::Register { fd, reply } => {
-                let _ = reply.send(self.register(fd));
+                let slot = self.register(fd);
+                // The opener may have gone away while we registered its file.
+                // Nobody would ever release the slot, so release it now.
+                if reply.send(slot).is_err() {
+                    if let Some(slot) = slot {
+                        self.unregister(slot);
+                    }
+                }
             }
-            Msg::Unregister(slot) => {
-                let _ = self.ring.submitter().register_files_update(slot, &[-1]);
-                self.free_fixed.push(slot);
-            }
+            Msg::Unregister(slot) => self.unregister(slot),
             Msg::Shutdown => self.shutdown = true,
         }
+    }
+
+    fn unregister(&mut self, slot: u32) {
+        let _ = self.ring.submitter().register_files_update(slot, &[-1]);
+        self.free_fixed.push(slot);
+        self.counters
+            .registered_files
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     fn register(&mut self, fd: RawFd) -> Option<u32> {
@@ -386,6 +398,9 @@ impl Reactor {
                 if fresh {
                     self.next_fixed += 1;
                 }
+                self.counters
+                    .registered_files
+                    .fetch_add(1, Ordering::Relaxed);
                 Some(slot)
             }
             Err(_) => {
@@ -628,6 +643,10 @@ impl Reactor {
                         state.eof = true;
                     }
                     state.done += result as usize;
+                }
+                // A write that makes no progress would be retried forever.
+                OpKind::Write { .. } if result == 0 => {
+                    state.error.get_or_insert(libc::EIO);
                 }
                 OpKind::Write { .. } => state.done += result as usize,
                 OpKind::Sync { .. } => state.synced = true,

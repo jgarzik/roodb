@@ -730,8 +730,8 @@ impl SstableReader {
 
     /// Scan entries in a key range using batched block reads.
     ///
-    /// Instead of reading blocks one at a time, this determines which blocks
-    /// are needed, submits all cache-miss reads in a single batch via read_batch(),
+    /// Works out which blocks are needed, reads the ones not in the cache -
+    /// adjacent blocks as one request per run, all runs in flight together -
     /// then processes entries from the fetched blocks.
     pub async fn scan_range_batched(
         &self,
