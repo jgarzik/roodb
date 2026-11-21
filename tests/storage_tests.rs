@@ -122,7 +122,7 @@ async fn test_sstable_write_read() {
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let path = dir.join("test.sst");
 
     // Write SSTable
@@ -181,7 +181,7 @@ async fn test_sstable_large() {
     cleanup_dir(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let path = dir.join("large.sst");
 
     // Write many entries (enough to span multiple blocks)
@@ -230,7 +230,7 @@ async fn test_lsm_put_get() {
     let dir = test_dir("lsm_basic");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -260,7 +260,7 @@ async fn test_lsm_delete() {
     let dir = test_dir("lsm_delete");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -283,7 +283,7 @@ async fn test_lsm_scan() {
     let dir = test_dir("lsm_scan");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -316,7 +316,7 @@ async fn test_lsm_flush() {
     let dir = test_dir("lsm_flush");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -347,7 +347,7 @@ async fn test_lsm_recovery() {
     let dir = test_dir("lsm_recovery");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: dir.clone(),
         ..Default::default()
@@ -466,7 +466,7 @@ async fn test_lsm_memory_budget() {
     let dir = test_dir("lsm_memory_budget");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     // Small budget: 1MB total → flush threshold = 512KB
     let config = LsmConfig {
         dir: dir.clone(),
@@ -501,7 +501,7 @@ async fn test_lsm_custom_budget() {
     let dir = test_dir("lsm_custom_budget");
     cleanup_dir(&dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     // 8MB budget → flush threshold = 4MB
     let budget = 8 * 1024 * 1024;
     let config = LsmConfig {

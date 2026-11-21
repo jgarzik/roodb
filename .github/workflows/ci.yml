@@ -59,3 +59,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run RooDB test suite
         run: cargo test --release
+
+  # Linux runs io_uring by default; run the suite again on the fallback backend
+  roodb-tests-posix-io:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ROODB_IO_BACKEND: posix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run RooDB test suite on the posix I/O backend
+        run: cargo test --release

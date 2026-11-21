@@ -32,7 +32,7 @@ async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
             .as_nanos()
     ));
     let _ = std::fs::create_dir_all(&path);
-    let factory = IoEngine::new(IoBackend::Auto).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: path,
         ..Default::default()

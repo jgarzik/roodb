@@ -396,7 +396,7 @@ async fn test_server_integration_e2e() {
     cleanup_dir(&data_dir);
 
     // Create storage and catalog
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -500,7 +500,7 @@ async fn test_transaction_begin_commit() {
     let data_dir = test_dir("txn_commit");
     cleanup_dir(&data_dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -604,7 +604,7 @@ async fn test_transaction_rollback() {
     let data_dir = test_dir("txn_rollback");
     cleanup_dir(&data_dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
@@ -710,7 +710,7 @@ async fn test_autocommit() {
     let data_dir = test_dir("autocommit");
     cleanup_dir(&data_dir);
 
-    let factory = IoEngine::new(IoBackend::Posix).unwrap();
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()

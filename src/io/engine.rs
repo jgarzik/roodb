@@ -59,6 +59,17 @@ pub enum IoBackend {
 }
 
 impl IoBackend {
+    /// Environment variable that selects the backend.
+    pub const ENV: &'static str = "ROODB_IO_BACKEND";
+
+    /// The backend named by `ROODB_IO_BACKEND`, or `Auto` if it is not set.
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(Self::ENV) {
+            Ok(value) => value.parse(),
+            Err(_) => Ok(IoBackend::Auto),
+        }
+    }
+
     /// The name used on the command line and in logs.
     pub fn as_str(self) -> &'static str {
         match self {

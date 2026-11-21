@@ -1,8 +1,18 @@
-//! Page-aligned buffers for direct IO
+//! Page-aligned buffers for direct I/O.
 //!
-//! Uses safe Rust by over-allocating a Vec and finding an aligned offset within it.
+//! Alignment is obtained in safe Rust by over-allocating a `Vec` and using the
+//! first aligned address inside it.
+//!
+//! Buffers are recycled: dropping one returns its memory to a process-wide
+//! pool, and the next request for that size class takes it back. I/O-heavy
+//! paths therefore do not hit the allocator, or touch fresh pages, per request.
+//! A buffer from the pool holds whatever its previous user left in it.
 
+use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
 
 use super::error::{IoError, IoResult};
 
@@ -10,11 +20,53 @@ use super::error::{IoError, IoResult};
 /// offsets are all multiples of this.
 pub const PAGE_SIZE: usize = 4096;
 
-/// A buffer aligned to PAGE_SIZE for direct IO operations
+/// Size classes are powers of two pages, from one page to 2 MiB. Larger
+/// buffers are allocated and freed directly.
+const CLASSES: usize = 10;
+/// The pool is split into shards to keep threads off each other's locks.
+const SHARDS: usize = 16;
+/// Idle memory a shard may hold. Beyond it, dropped buffers are freed.
+const SHARD_BUDGET: usize = 8 << 20;
+
+struct Shard {
+    classes: [Mutex<Vec<Vec<u8>>>; CLASSES],
+    bytes: AtomicUsize,
+}
+
+static POOL: [Shard; SHARDS] = [const {
+    Shard {
+        classes: [const { Mutex::new(Vec::new()) }; CLASSES],
+        bytes: AtomicUsize::new(0),
+    }
+}; SHARDS];
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+static POOL_HITS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static MY_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+fn my_shard() -> &'static Shard {
+    let index = MY_SHARD.with(|cell| {
+        if cell.get() == usize::MAX {
+            cell.set(NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS);
+        }
+        cell.get()
+    });
+    &POOL[index]
+}
+
+/// The size class holding `capacity` bytes, if it is small enough to pool.
+fn class_of(capacity: usize) -> Option<usize> {
+    let pages = capacity / PAGE_SIZE;
+    let class = pages.next_power_of_two().trailing_zeros() as usize;
+    (class < CLASSES).then_some(class)
+}
+
+/// A buffer aligned to PAGE_SIZE for direct I/O.
 ///
-/// Direct IO requires buffers to be aligned to the filesystem's block size,
-/// typically 4KB. This struct ensures proper alignment by allocating a Vec
-/// with extra space and finding an aligned offset within it.
+/// `capacity` is the usable size and `len` the amount of valid data. The
+/// bytes between the two are initialised but unspecified.
 pub struct AlignedBuffer {
     /// Backing storage (over-allocated to guarantee alignment)
     backing: Vec<u8>,
@@ -27,9 +79,9 @@ pub struct AlignedBuffer {
 }
 
 impl AlignedBuffer {
-    /// Create a new aligned buffer with the given capacity
-    ///
-    /// Capacity will be rounded up to the nearest PAGE_SIZE multiple.
+    /// Get a buffer with at least the given capacity, rounded up to a whole
+    /// number of pages. The contents are unspecified; use [`Self::zero`] if
+    /// zeros are needed.
     pub fn new(capacity: usize) -> IoResult<Self> {
         let capacity = Self::round_up(capacity);
         if capacity == 0 {
@@ -39,8 +91,22 @@ impl AlignedBuffer {
             });
         }
 
-        // Allocate extra space to guarantee we can find an aligned start
-        let backing = vec![0u8; capacity + PAGE_SIZE - 1];
+        let backing = match class_of(capacity) {
+            Some(class) => {
+                let shard = my_shard();
+                let recycled = shard.classes[class].lock().pop();
+                match recycled {
+                    Some(backing) => {
+                        shard.bytes.fetch_sub(backing.len(), Ordering::Relaxed);
+                        POOL_HITS.fetch_add(1, Ordering::Relaxed);
+                        backing
+                    }
+                    // Extra space guarantees an aligned start inside.
+                    None => vec![0u8; (PAGE_SIZE << class) + PAGE_SIZE - 1],
+                }
+            }
+            None => vec![0u8; capacity + PAGE_SIZE - 1],
+        };
 
         // Find first aligned offset within the backing buffer
         let base_addr = backing.as_ptr() as usize;
@@ -53,6 +119,11 @@ impl AlignedBuffer {
             len: 0,
             capacity,
         })
+    }
+
+    /// Number of allocations served from the pool since the process started.
+    pub fn pool_hits() -> u64 {
+        POOL_HITS.load(Ordering::Relaxed)
     }
 
     /// Create a buffer with exactly one page
@@ -154,6 +225,27 @@ impl AlignedBuffer {
     }
 }
 
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        let backing = std::mem::take(&mut self.backing);
+        let size = backing.len();
+        // Only memory that came from a size class goes back to the pool.
+        let Some(class) = size
+            .checked_sub(PAGE_SIZE - 1)
+            .filter(|usable| usable.is_power_of_two())
+            .and_then(class_of)
+        else {
+            return;
+        };
+        let shard = my_shard();
+        if shard.bytes.load(Ordering::Relaxed) + size > SHARD_BUDGET {
+            return;
+        }
+        shard.bytes.fetch_add(size, Ordering::Relaxed);
+        shard.classes[class].lock().push(backing);
+    }
+}
+
 impl Deref for AlignedBuffer {
     type Target = [u8];
 
@@ -204,5 +296,41 @@ mod tests {
         buf.copy_from_slice(b"hello").unwrap();
         assert_eq!(buf.len(), 5);
         assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn dropped_buffers_are_reused() {
+        let before = AlignedBuffer::pool_hits();
+        for _ in 0..64 {
+            let mut buf = AlignedBuffer::pages(96).unwrap();
+            assert_eq!(buf.capacity(), 96 * PAGE_SIZE);
+            assert!((buf.as_ptr() as usize).is_multiple_of(PAGE_SIZE));
+            buf.as_mut_slice().fill(0xEE);
+        }
+        assert!(
+            AlignedBuffer::pool_hits() > before,
+            "64 allocate/drop rounds never reused a buffer"
+        );
+    }
+
+    #[test]
+    fn capacity_is_what_was_asked_for_not_the_size_class() {
+        // 3 pages come from the 4-page class but must present as 3 pages:
+        // a read fills a buffer to its capacity.
+        let buf = AlignedBuffer::pages(3).unwrap();
+        assert_eq!(buf.capacity(), 3 * PAGE_SIZE);
+        let big = AlignedBuffer::new(5 << 20).unwrap();
+        assert_eq!(big.capacity(), 5 << 20);
+    }
+
+    #[test]
+    fn zero_clears_recycled_contents() {
+        for _ in 0..8 {
+            let mut buf = AlignedBuffer::pages(48).unwrap();
+            buf.as_mut_slice().fill(0x77);
+        }
+        let mut buf = AlignedBuffer::pages(48).unwrap();
+        buf.zero();
+        assert!(buf.as_mut_slice().iter().all(|b| *b == 0));
     }
 }
