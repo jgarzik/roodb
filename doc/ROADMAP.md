@@ -27,19 +27,60 @@ multi-core machines.
 The binary starts as a single-node Raft cluster. Multi-node Raft runs only
 inside the test process.
 
-- Node identity: `--node-id`, a node identity file in the data directory,
-  peer addresses carried in the Raft membership.
-- Forming and changing a cluster: join as learner, promote, remove;
-  persistent RPC connections between nodes.
-- Snapshots for a follower that has fallen behind the log: streamed from a
-  checkpoint, any size (today a snapshot is one message, limited to 4 GiB).
-- Row ID reservations after recovery on a multi-node cluster.
-- Row locks and leadership: every open transaction aborts when its node
-  stops being leader.
-- Test matrix: single node and three nodes, on both I/O backends, through
-  the real binary. Follower killed and rejoining; leader killed and failover;
-  lagging follower caught up by snapshot.
-- admin.md: deployment modes rewritten from what the binary does.
+How a cluster is run (decided): the first node is initialised with
+`roodb_init` and started as today. Every further node starts on an empty
+data directory with `--join host:port` of any member; the cluster gives it
+its node ID, sends it the data, and makes it a voter. The leader is the
+primary; the other nodes are read-only secondaries, as in MySQL Group
+Replication's single-primary mode: they answer reads from their own applied
+state and refuse writes with error 1290.
+
+In order:
+
+- Peer addresses in the Raft membership itself (the node type carries the
+  address), so that every node learns its peers from the replicated
+  membership and from nothing else. The network layer dials what the
+  membership says.
+- Node identity: the node ID kept in the data directory (node 1 written by
+  `roodb_init`; a joiner's written when the cluster assigns it), read at
+  start, and used for row IDs. Flags: `--join`, `--raft-port` (default
+  port + 1000), `--advertise-host` (what peers dial; default the bind
+  address).
+- One Raft configuration for every node, with timers, heartbeats and
+  elections switched at run time: off while the node is the only member, on
+  as soon as there is a second.
+- Joining: a join request to any member (a follower answers with the
+  leader's address); the leader allocates the next node ID through the log,
+  adds the node as a learner, waits for it to catch up, and promotes it. A
+  node that restarts rejoins by itself from its stored identity and the
+  membership it has.
+- Snapshots for a node that is new or has fallen behind the log: a
+  point-in-time view of the storage engine (frozen memtables and table
+  files, held open for the transfer) streamed in chunks of any total size,
+  installed atomically on the receiver. Today a snapshot is the whole
+  keyspace in one message, limited to 4 GiB.
+- Row ID reservations after recovery on a node that is not alone.
+- Primary and secondaries: a session on a secondary is read-only (error
+  1290 on writes, locking reads and DDL); when a node stops being leader
+  its open transactions are rolled back and their locks released; when it
+  becomes leader it accepts writes once it has applied its log.
+- Leaving: `ALTER CLUSTER REMOVE NODE id` on the primary; the removed node
+  stops serving. `SHOW CLUSTER MEMBERS` on any node: ID, address, role
+  (primary, secondary, learner), so that clients and routers can find the
+  primary.
+- Persistent RPC connections between nodes (today one connection per
+  request).
+- Tests through the real binary, on both I/O backends: three nodes formed
+  by joining; writes on the primary read on the secondaries; a secondary
+  killed and restarted catches up; the primary killed, another takes over
+  and no acknowledged commit is lost; a secondary too far behind for the
+  log is caught up by snapshot; a node removed; a write refused on a
+  secondary.
+- Documents: admin.md (deployment modes, cluster operations, new flags,
+  troubleshooting) rewritten from what the binary does; SQL.md (the two
+  statements, error 1290, read-only sessions); design.md and LOCKING.md
+  (Raft section); README.md (replication model); CONTRIBUTING.md (the
+  cluster tests).
 
 ## PRF — Performance pass
 
