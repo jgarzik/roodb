@@ -425,6 +425,14 @@ impl RaftNode {
         if changeset.is_empty() {
             return Ok(());
         }
+        // Refuse what storage cannot hold before it is committed to the log.
+        // (The state machine rejects it too; this saves the round trip.)
+        for change in &changeset.changes {
+            let value_len =
+                change.value.as_ref().map_or(0, Vec::len) + crate::raft::MVCC_HEADER_SIZE;
+            crate::storage::lsm::block::check_entry_size(change.key.len(), value_len)
+                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        }
 
         self.cover_row_ids().await?;
         let cmd = Command::DataChange(changeset);

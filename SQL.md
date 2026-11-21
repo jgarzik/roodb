@@ -908,8 +908,8 @@ by themselves is understood in addition:
 | `BIT` width | 64 |
 | `DECIMAL` precision / scale | 65 / 30 |
 
-Do not insert a row whose primary key exceeds the key limit; see
-[Limitations](#limitations-and-differences-from-mysql).
+A statement that would store a row beyond the key or row limit fails with
+an error ("Key too large" / "Value too large") and changes nothing.
 
 ## Errors
 
@@ -956,9 +956,8 @@ are reported as 1105.
   enforced.
 - `ALTER TABLE` does not rewrite existing rows (see [ALTER TABLE](#alter-table)).
 - `REPLACE` does not replace existing rows.
-- A row whose encoded primary key is larger than 65,535 bytes must not be
-  inserted: the statement fails, and afterwards the server rejects every
-  further write.
+- A row whose encoded primary key is larger than 65,535 bytes is refused
+  (MySQL limits key length per index instead).
 
 **Transactions**
 

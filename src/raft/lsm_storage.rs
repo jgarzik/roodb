@@ -892,6 +892,15 @@ impl LsmRaftStorage {
                 }
             }
         }
+        // An entry the storage engine cannot hold is a reason to reject the
+        // changeset, never to fail the apply: a failed apply stops the state
+        // machine, and the entry would fail again on every replay.
+        for (key, value) in &plan.writes {
+            let value_len = value.as_ref().map_or(0, Vec::len);
+            if let Err(e) = crate::storage::lsm::block::check_entry_size(key.len(), value_len) {
+                return Ok(Err(e.to_string()));
+            }
+        }
         Ok(Ok(plan))
     }
 

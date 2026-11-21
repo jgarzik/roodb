@@ -583,3 +583,40 @@ async fn stored_functions_are_shared_and_survive_a_kill() {
     conn.query_drop("DROP FUNCTION add_one").await.unwrap();
     assert!(other.query_drop("SELECT add_one(1)").await.is_err());
 }
+
+/// A row whose key is too large to store is refused, and the server goes on
+/// working: it is not committed to the log, where applying it would fail
+/// forever.
+#[tokio::test]
+async fn an_oversized_key_is_refused_without_harm() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("CREATE TABLE wide (k TEXT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO wide VALUES ('small', 1)")
+        .await
+        .unwrap();
+    let refused = conn
+        .query_drop("INSERT INTO wide VALUES (REPEAT('k', 70000), 2)")
+        .await;
+    assert!(refused.is_err(), "a 70000-byte key was accepted");
+
+    // Later writes, and schema changes, still work.
+    conn.query_drop("INSERT INTO wide VALUES ('after', 3)")
+        .await
+        .unwrap_or_else(|e| panic!("writes fail after the refusal: {e}\n{}", server.log_tail()));
+    conn.query_drop("CREATE TABLE wide_after (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    drop(conn);
+    server.kill();
+
+    // And the log replays.
+    server.start();
+    let mut conn = connect(&server).await;
+    let mut keys: Vec<String> = conn.query("SELECT k FROM wide").await.unwrap();
+    keys.sort();
+    assert_eq!(keys, ["after", "small"]);
+}
