@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use roodb::io::{IoBackend, IoEngine};
-use roodb::storage::lsm::engine::LsmConfig;
+use roodb::storage::lsm::engine::{CrashPoint, LsmConfig};
 use roodb::storage::lsm::LsmEngine;
 use roodb::storage::{StorageEngine, StorageError};
 
@@ -362,4 +362,144 @@ async fn files_left_by_a_crash_are_removed_and_never_adopted() {
         );
     }
     engine.close().await.unwrap();
+}
+
+/// A delete must keep hiding older versions that sit in deeper levels. The
+/// tombstone used to be discarded as soon as it was compacted once.
+#[tokio::test]
+async fn a_deleted_key_stays_deleted_through_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    // Tiny levels, so a handful of flushes pushes data several levels down.
+    let cfg = LsmConfig {
+        l0_compaction_trigger: 2,
+        level_base_bytes: 16 * 1024,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg.clone()).await.unwrap();
+
+    engine.put(b"victim", b"old value").await.unwrap();
+    for round in 0..12 {
+        for i in 0..200 {
+            engine
+                .put(format!("fill{round:02}-{i:04}").as_bytes(), &[9u8; 100])
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+    assert_eq!(
+        engine.get(b"victim").await.unwrap(),
+        Some(b"old value".to_vec())
+    );
+
+    engine.delete(b"victim").await.unwrap();
+    for round in 12..24 {
+        for i in 0..200 {
+            engine
+                .put(format!("fill{round:02}-{i:04}").as_bytes(), &[9u8; 100])
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+        assert_eq!(
+            engine.get(b"victim").await.unwrap(),
+            None,
+            "deleted key came back after flush round {round}"
+        );
+    }
+    let hits = engine.scan(Some(b"victim"), Some(b"victin")).await.unwrap();
+    assert!(hits.is_empty(), "scan returned the deleted key");
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    assert_eq!(engine.get(b"victim").await.unwrap(), None);
+    assert_eq!(
+        engine.get(b"fill00-0000").await.unwrap(),
+        Some(vec![9u8; 100])
+    );
+    engine.close().await.unwrap();
+}
+
+/// Stop a flush or a compaction at each point where a crash could leave the
+/// directory in a distinct state, then reopen. Everything flushed before the
+/// crash must still be there, and the engine must keep working.
+#[tokio::test]
+async fn reopening_after_a_crash_at_any_point_loses_nothing_flushed() {
+    for point in [
+        CrashPoint::FlushAfterTableWritten,
+        CrashPoint::CompactionAfterOutputWritten,
+        CrashPoint::CompactionAfterManifestSaved,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = LsmConfig {
+            l0_compaction_trigger: 4,
+            ..config(dir.path())
+        };
+
+        // Three clean flushes: three tables in level 0, one short of the
+        // compaction trigger.
+        let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+        for round in 0..2 {
+            for i in 0..300 {
+                engine
+                    .put(format!("r{round}-{i:04}").as_bytes(), &[round as u8; 80])
+                    .await
+                    .unwrap();
+            }
+            engine.flush().await.unwrap();
+        }
+        engine.put(b"r0-0000", b"overwritten").await.unwrap();
+        engine.delete(b"r0-0001").await.unwrap();
+        engine.flush().await.unwrap();
+        engine.close().await.unwrap();
+        drop(engine);
+
+        // One more round with the crash armed. The flush, or the compaction
+        // its table triggers, stops part-way with an error.
+        let armed = LsmConfig {
+            crash_point: Some(point),
+            ..base.clone()
+        };
+        let engine = LsmEngine::open(io(), armed).await.unwrap();
+        for i in 0..300 {
+            engine
+                .put(format!("r2-{i:04}").as_bytes(), &[2u8; 80])
+                .await
+                .unwrap();
+        }
+        let _ = engine.flush().await;
+        drop(engine);
+
+        let engine = LsmEngine::open(io(), base).await.unwrap_or_else(|e| {
+            panic!("{point:?}: reopen failed: {e}");
+        });
+        assert_eq!(
+            engine.get(b"r0-0000").await.unwrap(),
+            Some(b"overwritten".to_vec()),
+            "{point:?}"
+        );
+        assert_eq!(engine.get(b"r0-0001").await.unwrap(), None, "{point:?}");
+        for round in 0..2u8 {
+            for i in 2..300 {
+                assert_eq!(
+                    engine
+                        .get(format!("r{round}-{i:04}").as_bytes())
+                        .await
+                        .unwrap(),
+                    Some(vec![round; 80]),
+                    "{point:?}: r{round}-{i:04}"
+                );
+            }
+        }
+        // And it still takes writes and flushes.
+        engine.put(b"after-crash", b"ok").await.unwrap();
+        engine.flush().await.unwrap();
+        assert_eq!(
+            engine.get(b"after-crash").await.unwrap(),
+            Some(b"ok".to_vec()),
+            "{point:?}"
+        );
+        engine.close().await.unwrap();
+    }
 }

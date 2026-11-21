@@ -3,12 +3,11 @@
 //! The manifest tracks which SSTables exist at each level and their key ranges.
 //! It is stored as JSON for simplicity and human readability.
 
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::io::{AlignedBuffer, IoEngine, OpenOptions, Urgency};
 use crate::storage::error::{StorageError, StorageResult};
 
 /// Manifest file name
@@ -148,41 +147,9 @@ impl Manifest {
         Ok(())
     }
 
-    /// Save manifest to disk using atomic rename
-    ///
-    /// This ensures the manifest is never partially written:
-    /// 1. Write to a temporary file
-    /// 2. fsync the temporary file
-    /// 3. Rename to final path (atomic on POSIX)
-    pub fn save(&self) -> StorageResult<()> {
-        let manifest_path = self.dir.join(MANIFEST_FILE);
-        let temp_path = self.dir.join(format!("{}.tmp", MANIFEST_FILE));
-
-        // Serialize content
-        let content = serde_json::to_string_pretty(&self.data)
-            .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
-
-        // Write to temporary file
-        {
-            let mut file = File::create(&temp_path)?;
-            file.write_all(content.as_bytes())?;
-            // fsync to ensure data is on disk before rename
-            file.sync_all()?;
-        }
-
-        // Atomic rename
-        std::fs::rename(&temp_path, &manifest_path)?;
-
-        // Optionally sync the directory to ensure rename is durable
-        // (Some filesystems require this for full durability)
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = File::open(&self.dir) {
-                let _ = dir.sync_all();
-            }
-        }
-
-        Ok(())
+    /// A copy of the current contents, for [`persist`].
+    pub fn snapshot(&self) -> ManifestData {
+        self.data.clone()
     }
 
     /// Generate next SSTable file name
@@ -251,6 +218,45 @@ impl Manifest {
     }
 }
 
+/// Write a manifest to disk, replacing the previous one atomically:
+/// write a temporary file, make it durable, rename it over the manifest, then
+/// make the rename durable. A crash leaves either the old manifest or the new
+/// one, never a mixture.
+pub async fn persist(io: &IoEngine, dir: &Path, data: &ManifestData) -> StorageResult<()> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let temp_path = dir.join(format!("{MANIFEST_FILE}.tmp"));
+
+    let content = serde_json::to_string_pretty(data)
+        .map_err(|e| StorageError::Manifest(format!("failed to serialize manifest: {}", e)))?;
+
+    // The manifest is a small text file of arbitrary length, so it is written
+    // through the page cache: a whole number of pages first, then cut to size.
+    let options = OpenOptions {
+        direct: false,
+        ..OpenOptions::create_truncate()
+    };
+    let file = io.open(&temp_path, options).await?;
+    let mut buf = AlignedBuffer::new(content.len().max(1))?;
+    buf.copy_from_slice(content.as_bytes())?;
+    file.write_at(buf, 0, Urgency::Critical).await?;
+    file.set_len(content.len() as u64)?;
+    file.sync_all(Urgency::Critical).await?;
+    drop(file);
+
+    std::fs::rename(&temp_path, &manifest_path)?;
+
+    // The rename lives in the directory; sync that too. Not every platform
+    // can open a directory, and where it cannot there is nothing to sync.
+    let dir_options = OpenOptions {
+        direct: false,
+        ..OpenOptions::read_only()
+    };
+    if let Ok(dir_file) = io.open(dir, dir_options).await {
+        dir_file.sync_all(Urgency::Critical).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,8 +274,9 @@ mod tests {
         path
     }
 
-    #[test]
-    fn test_manifest_create_and_save() {
+    #[tokio::test]
+    async fn test_manifest_create_and_save() {
+        let io = IoEngine::new(crate::io::IoBackend::from_env().unwrap()).unwrap();
         let dir = temp_dir("create");
 
         let mut manifest = Manifest::open(&dir).unwrap();
@@ -288,7 +295,10 @@ mod tests {
             },
         );
 
-        manifest.save().unwrap();
+        persist(&io, manifest.dir(), &manifest.snapshot())
+            .await
+            .unwrap();
+        assert!(!dir.join("MANIFEST.tmp").exists());
 
         // Reload and verify
         let manifest2 = Manifest::open(&dir).unwrap();

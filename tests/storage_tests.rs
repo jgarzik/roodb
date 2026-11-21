@@ -471,6 +471,7 @@ async fn test_lsm_memory_budget() {
     let config = LsmConfig {
         dir: dir.clone(),
         total_cache_bytes: 1024 * 1024,
+        ..Default::default()
     };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
@@ -507,6 +508,7 @@ async fn test_lsm_custom_budget() {
     let config = LsmConfig {
         dir: dir.clone(),
         total_cache_bytes: budget,
+        ..Default::default()
     };
 
     let engine = LsmEngine::open(factory, config).await.unwrap();
