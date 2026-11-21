@@ -215,8 +215,17 @@ where
         Ok(())
     }
 
-    /// Run the command loop
+    /// Run the command loop until the client leaves or the connection
+    /// fails. Either way the session ends here: an open transaction is
+    /// rolled back and its temporary tables are dropped. (They are named in
+    /// the shared catalog; a name left behind could never be used again.)
     pub async fn run(&mut self) -> ProtocolResult<()> {
+        let result = self.command_loop().await;
+        self.engine.reset_session(false).await;
+        result
+    }
+
+    async fn command_loop(&mut self) -> ProtocolResult<()> {
         let mut last_cmd_end = Instant::now();
         loop {
             // Reset sequence for each command
@@ -232,7 +241,6 @@ where
                 Ok(p) => p,
                 Err(ProtocolError::ConnectionClosed) => {
                     debug!(connection_id = self.connection_id, "Client disconnected");
-                    self.engine.cleanup_temp_tables().await;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -263,7 +271,6 @@ where
                     continue;
                 }
                 Ok(false) => {
-                    self.engine.cleanup_temp_tables().await;
                     return Ok(()); // Client quit
                 }
                 Err(e) => {
@@ -361,8 +368,11 @@ where
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
-                // Session state is reset; the selected database is kept.
-                self.engine.prepared_stmts.clear();
+                // Session state is reset as if the client had reconnected:
+                // an open transaction is rolled back, temporary tables and
+                // prepared statements go, variables return to their defaults.
+                // The selected database is kept.
+                self.engine.reset_session(false).await;
                 self.param_types.clear();
                 self.engine.send_ok(0, 0).await?;
                 Ok(true)

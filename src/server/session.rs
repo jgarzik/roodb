@@ -267,6 +267,11 @@ impl Session {
         self.pending_changes.extend(changes);
     }
 
+    /// Keep only the pending changes that `keep` accepts.
+    pub fn retain_pending_changes(&mut self, keep: impl FnMut(&RowChange) -> bool) {
+        self.pending_changes.retain(keep);
+    }
+
     /// Take all pending changes (called on COMMIT)
     pub fn take_pending_changes(&mut self) -> Vec<RowChange> {
         std::mem::take(&mut self.pending_changes)

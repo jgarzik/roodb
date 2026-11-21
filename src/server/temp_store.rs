@@ -157,22 +157,46 @@ impl SessionStorage {
             .partition(|change| temp.owns(&change.key))
     }
 
+    /// The key range `[start, end)` of one of this session's temporary
+    /// tables, or `None` if `table` is not one.
+    pub fn key_range(&self, table: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.temp
+            .read()
+            .tables
+            .iter()
+            .find(|(name, _, _)| name == table)
+            .map(|(_, start, end)| (start.clone(), end.clone()))
+    }
+
     /// Check that committing these temporary-table changes would not insert a
-    /// key that is already there. Changes earlier in the list count: deleting
-    /// a row and inserting it again is fine.
+    /// key that is already there, nor take the session over its limit.
+    /// Changes earlier in the list count: deleting a row and inserting it
+    /// again is fine.
     pub fn check(&self, changes: &[RowChange], ignore_duplicates: bool) -> Result<(), String> {
         if changes.is_empty() {
             return Ok(());
         }
         let temp = self.temp.read();
         // Refuse the commit that would take the session over its limit.
-        let growth: usize = changes
-            .iter()
-            .map(|c| {
-                c.key.len() + c.value.as_ref().map_or(0, Vec::len) + crate::raft::MVCC_HEADER_SIZE
-            })
-            .sum();
-        if temp.bytes + growth > TEMP_TABLE_LIMIT_BYTES {
+        // What counts is the size afterwards: an update replaces a row and a
+        // delete frees one, so a full table can still be changed or emptied.
+        let mut sizes: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+        let mut after = temp.bytes;
+        for change in changes {
+            let key = change.key.as_slice();
+            let old = match sizes.get(key) {
+                Some(size) => *size,
+                None => temp.rows.get(key).map_or(0, |row| key.len() + row.len()),
+            };
+            let new = match (&change.op, &change.value) {
+                (ChangeOp::Delete, _) => 0,
+                (_, Some(value)) => key.len() + value.len() + crate::raft::MVCC_HEADER_SIZE,
+                (_, None) => old,
+            };
+            after = after - old + new;
+            sizes.insert(key, new);
+        }
+        if after > TEMP_TABLE_LIMIT_BYTES && after > temp.bytes {
             return Err(format!(
                 "The table '{}' is full: temporary tables of one session may hold {} MiB",
                 changes[0].table,
@@ -235,9 +259,9 @@ impl SessionStorage {
                     temp.insert(change.key, encode_mvcc_row(txn_id, false, &value));
                 }
                 (ChangeOp::Insert | ChangeOp::Update, None) => {}
-                (ChangeOp::Delete, _) => {
-                    temp.insert(change.key, encode_mvcc_row(txn_id, true, &[]));
-                }
+                // No other session reads these rows, so no one needs to be
+                // told that a row was deleted: it is simply removed.
+                (ChangeOp::Delete, _) => temp.remove(&change.key),
             }
         }
     }
@@ -307,6 +331,9 @@ impl StorageEngine for SessionStorage {
             if self.owns(start) {
                 let temp = self.temp.read();
                 let rows = match end {
+                    // An empty or inverted range holds nothing (and a
+                    // BTreeMap panics if asked for one).
+                    Some(end) if start >= end => return Ok(Vec::new()),
                     Some(end) => temp.rows.range(start.to_vec()..end.to_vec()),
                     None => temp.rows.range(start.to_vec()..),
                 };
@@ -482,6 +509,69 @@ mod tests {
                 false,
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_table_can_still_be_changed_and_emptied() {
+        let storage = SessionStorage::new(Arc::new(Untouched));
+        storage.add_table("tmp");
+        // Three rows of 64 MiB: an update of all three would not fit if it
+        // were counted as growth.
+        let rows = |value: u8| -> Vec<RowChange> {
+            (0..3u8)
+                .map(|i| RowChange::insert("tmp", key("tmp", i), vec![value; 64 << 20]))
+                .collect()
+        };
+        let inserted = rows(1);
+        storage.check(&inserted, false).unwrap();
+        storage.apply(1, inserted, false);
+        let updated: Vec<RowChange> = rows(2)
+            .into_iter()
+            .map(|mut change| {
+                change.op = ChangeOp::Update;
+                change
+            })
+            .collect();
+        storage.check(&updated, false).unwrap();
+        storage.apply(2, updated, false);
+
+        // Deleting frees the room at once: nothing is kept for a deleted row.
+        let deleted: Vec<RowChange> = (0..3u8)
+            .map(|i| RowChange::delete("tmp", key("tmp", i)))
+            .collect();
+        storage.check(&deleted, false).unwrap();
+        storage.apply(3, deleted, false);
+        assert_eq!(storage.temp.read().bytes, 0);
+        assert!(storage.temp.read().rows.is_empty());
+        let again = rows(3);
+        storage.check(&again, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_inverted_range_holds_nothing() {
+        let storage = SessionStorage::new(Arc::new(Untouched));
+        storage.add_table("tmp");
+        storage.apply(
+            1,
+            vec![RowChange::insert("tmp", key("tmp", 5), vec![1])],
+            false,
+        );
+        let high = key("tmp", 9);
+        let low = key("tmp", 1);
+        assert!(storage
+            .scan(Some(&high), Some(&low))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .scan(Some(&low), Some(&low))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage.scan(Some(&low), Some(&high)).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

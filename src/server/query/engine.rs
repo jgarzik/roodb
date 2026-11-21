@@ -84,6 +84,16 @@ pub struct QueryEngine {
     pub(crate) out: Box<dyn ResponseSink>,
 }
 
+/// What is left of a DROP TABLE once temporary tables are dealt with.
+enum TempDrop {
+    /// Run this plan (the statement, or what remains of it).
+    Plan(Box<PhysicalPlan>),
+    /// Nothing remains: the statement has been carried out.
+    Done,
+    /// The statement names a table this session cannot see.
+    NoSuchTable(String),
+}
+
 impl QueryEngine {
     /// Create the engine for a new session, reporting results to `out`.
     pub fn new(
@@ -961,43 +971,10 @@ impl QueryEngine {
 
     /// Execute a physical plan and send results
     async fn execute_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
-        // A temporary table lives in this session only: dropping it touches
-        // neither the log nor the system tables.
-        let plan = match plan {
-            PhysicalPlan::DropTable { name, if_exists } => {
-                if self.temp.remove_table(&name) {
-                    let _ = self.catalog.write().drop_table(&name);
-                    return self.send_ok(0, 0).await;
-                }
-                if self.is_foreign_temp_table(&name) {
-                    return self.send_no_such_table(&name).await;
-                }
-                PhysicalPlan::DropTable { name, if_exists }
-            }
-            PhysicalPlan::DropMultipleTables { names, if_exists } => {
-                if let Some(foreign) = names.iter().find(|n| self.is_foreign_temp_table(n)) {
-                    let foreign = foreign.clone();
-                    return self.send_no_such_table(&foreign).await;
-                }
-                // This session's temporary tables are dropped here; whatever
-                // else was named goes the ordinary way.
-                let mut ordinary = Vec::new();
-                for name in names {
-                    if self.temp.remove_table(&name) {
-                        let _ = self.catalog.write().drop_table(&name);
-                    } else {
-                        ordinary.push(name);
-                    }
-                }
-                if ordinary.is_empty() {
-                    return self.send_ok(0, 0).await;
-                }
-                PhysicalPlan::DropMultipleTables {
-                    names: ordinary,
-                    if_exists,
-                }
-            }
-            other => other,
+        let plan = match self.drop_temp_tables(plan) {
+            TempDrop::Plan(plan) => *plan,
+            TempDrop::Done => return self.send_ok(0, 0).await,
+            TempDrop::NoSuchTable(name) => return self.send_no_such_table(&name).await,
         };
 
         // Check if this is a query that returns rows
@@ -1364,6 +1341,64 @@ impl QueryEngine {
                 .map_err(|e| format!("Failed to change {table}: {e}"))?;
         }
         Ok(count)
+    }
+
+    /// Handle the part of a DROP TABLE that concerns temporary tables. One
+    /// of this session's lives in the session only: dropping it touches
+    /// neither the log nor the system tables. Another session's does not
+    /// exist as far as this one can tell.
+    fn drop_temp_tables(&mut self, plan: PhysicalPlan) -> TempDrop {
+        match plan {
+            PhysicalPlan::DropTable { name, if_exists } => {
+                if self.drop_own_temp_table(&name) {
+                    TempDrop::Done
+                } else if !self.is_foreign_temp_table(&name) {
+                    TempDrop::Plan(Box::new(PhysicalPlan::DropTable { name, if_exists }))
+                } else if if_exists {
+                    TempDrop::Done
+                } else {
+                    TempDrop::NoSuchTable(name)
+                }
+            }
+            PhysicalPlan::DropMultipleTables { names, if_exists } => {
+                if !if_exists {
+                    if let Some(foreign) = names.iter().find(|n| self.is_foreign_temp_table(n)) {
+                        return TempDrop::NoSuchTable(foreign.clone());
+                    }
+                }
+                // Whatever else was named goes the ordinary way.
+                let mut ordinary = Vec::new();
+                for name in names {
+                    if !self.drop_own_temp_table(&name) && !self.is_foreign_temp_table(&name) {
+                        ordinary.push(name);
+                    }
+                }
+                if ordinary.is_empty() {
+                    TempDrop::Done
+                } else {
+                    TempDrop::Plan(Box::new(PhysicalPlan::DropMultipleTables {
+                        names: ordinary,
+                        if_exists,
+                    }))
+                }
+            }
+            other => TempDrop::Plan(Box::new(other)),
+        }
+    }
+
+    /// Drop one of this session's temporary tables: its rows, its entry in
+    /// the catalog, and any changes to it that an open transaction has not
+    /// committed yet (they would otherwise be committed as changes to an
+    /// ordinary table of that name). False if the table is not one.
+    fn drop_own_temp_table(&mut self, name: &str) -> bool {
+        let Some((start, end)) = self.temp.key_range(name) else {
+            return false;
+        };
+        self.session
+            .retain_pending_changes(|change| !(start <= change.key && change.key < end));
+        self.temp.remove_table(name);
+        let _ = self.catalog.write().drop_table(name);
+        true
     }
 
     /// Whether `table` is a temporary table that belongs to another session.
@@ -1866,15 +1901,12 @@ impl QueryEngine {
     pub(crate) async fn cleanup_temp_tables(&mut self) {
         // The rows were only ever in this session's memory; dropping them
         // is all there is to do, besides forgetting the tables.
-        let temp_tables = self.temp.clear();
+        let temp_tables = self.temp.table_names();
         if temp_tables.is_empty() {
             return;
         }
-        {
-            let mut catalog = self.catalog.write();
-            for name in &temp_tables {
-                let _ = catalog.drop_table(name);
-            }
+        for name in &temp_tables {
+            self.drop_own_temp_table(name);
         }
 
         debug!(
@@ -2076,6 +2108,21 @@ impl QueryEngine {
                     })
                     .await
                     .map_err(ProtocolError::Internal)?;
+                }
+
+                // A temporary table is known to this session only: its new
+                // definition goes to the catalog and nowhere else. Written to
+                // the system tables it would become an ordinary table that
+                // every session could see.
+                if self.temp.is_temp_table(&old_table_name) {
+                    if new_def.name != old_table_name {
+                        return Err(ProtocolError::Unsupported(
+                            "renaming a temporary table".to_string(),
+                        ));
+                    }
+                    new_def.is_temporary = true;
+                    self.catalog.write().replace_table(&old_table_name, new_def);
+                    return self.send_ok(0, 0).await.map(|_| Some(()));
                 }
 
                 // Persist via Raft (delete old system rows, insert new ones)
@@ -3991,11 +4038,10 @@ impl QueryEngine {
         use crate::catalog::system_tables::SYSTEM_TRIGGERS;
         use crate::executor::encoding::decode_row;
 
-        let upper = sql.to_uppercase();
-        let if_exists = upper.contains("IF EXISTS");
-
         // Extract trigger name: DROP TRIGGER [IF EXISTS] name
-        let statement = sql.trim_end_matches(';').trim();
+        let statement = sql.trim().trim_end_matches(';').trim();
+        let upper = statement.to_uppercase();
+        let if_exists = upper.contains("IF EXISTS");
         let name_part = if if_exists {
             let at = upper.find("EXISTS").map_or(0, |p| p + "EXISTS".len());
             statement.get(at..).unwrap_or("").trim()
@@ -5732,6 +5778,11 @@ impl QueryEngine {
             PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?
         };
 
+        let plan = match self.drop_temp_tables(plan) {
+            TempDrop::Plan(plan) => *plan,
+            TempDrop::Done => return Ok(0),
+            TempDrop::NoSuchTable(name) => return Err(format!("Table '{name}' doesn't exist")),
+        };
         let is_ddl = plan.is_ddl();
         let mvcc = self.mvcc.clone();
 
@@ -5831,6 +5882,8 @@ impl QueryEngine {
         self.cleanup_temp_tables().await;
         self.prepared_stmts.clear();
         self.session.reset();
+        // The reset cleared the session's copy of the stored functions.
+        self.functions_version = None;
     }
 
     /// Transaction status of the session, reported with every result.

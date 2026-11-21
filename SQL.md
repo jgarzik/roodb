@@ -221,6 +221,11 @@ DROP [TEMPORARY] TABLE name
 - Temporary tables take part in transactions like other tables (`ROLLBACK`
   discards uncommitted changes to them), and the primary key is enforced.
 - Triggers and views cannot be created on temporary tables.
+- `ALTER TABLE` on a temporary table changes it for its session only
+  (renaming one is not supported). `DROP TABLE IF EXISTS` naming another
+  session's temporary table succeeds and does nothing.
+- Dropping a temporary table inside a transaction discards the
+  transaction's uncommitted changes to it.
 - `CREATE TEMPORARY TABLE ... AS SELECT` creates the columns but copies no rows.
 
 ### Triggers
@@ -708,6 +713,10 @@ Row locking is planned and will change parts of this section. Today:
   `UPDATE t SET v = 12 WHERE v = 11` changes nothing the second time). A
   second insert of a key the transaction already inserted is detected
   immediately (error 1062); a clash with a committed row only at `COMMIT`.
+- **A session that ends takes its transaction with it.** When a client
+  disconnects, the connection fails, or the connection is reset, the open
+  transaction is rolled back and the session's temporary tables are
+  dropped.
 - **DDL is not transactional.** `CREATE`, `DROP` and `ALTER` take effect
   immediately, are not undone by `ROLLBACK`, and do not commit the open
   transaction.

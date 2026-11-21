@@ -159,3 +159,180 @@ async fn test_trigger_on_system_table_is_refused() {
     assert!(result.is_err(), "a trigger was created on a missing table");
     conn.query_drop("DROP TABLE tt_trg_log").await.unwrap();
 }
+
+/// Things a session does with its own temporary table that used to leak it
+/// into shared storage, or break the session.
+#[tokio::test]
+async fn test_temporary_table_stays_in_its_session() {
+    let server = TestServer::start("temp_table").await;
+    let mut owner = server.connect().await;
+    let mut other = server.connect().await;
+
+    // An empty range is an empty result, not a dead connection.
+    owner
+        .query_drop("CREATE TEMPORARY TABLE tt_own (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    owner
+        .query_drop("INSERT INTO tt_own VALUES (1, 1), (7, 7)")
+        .await
+        .unwrap();
+    let rows: Vec<i32> = owner
+        .query("SELECT id FROM tt_own WHERE id BETWEEN 10 AND 5")
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+    let rows: Vec<i32> = owner
+        .query("SELECT id FROM tt_own WHERE id > 5 AND id < 5")
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+
+    // Deleted rows are gone, and updates and deletes work as usual.
+    owner
+        .query_drop("UPDATE tt_own SET v = v + 1")
+        .await
+        .unwrap();
+    owner
+        .query_drop("DELETE FROM tt_own WHERE id = 1")
+        .await
+        .unwrap();
+    let rows: Vec<(i32, i32)> = owner.query("SELECT id, v FROM tt_own").await.unwrap();
+    assert_eq!(rows, [(7, 8)]);
+
+    // ALTER keeps it temporary: no other session sees it, and nothing is
+    // written to the system tables.
+    owner
+        .query_drop("ALTER TABLE tt_own ADD COLUMN extra INT")
+        .await
+        .unwrap();
+    assert!(other.query_drop("SELECT * FROM tt_own").await.is_err());
+    let columns: Vec<String> = other
+        .query("SELECT column_name FROM system.columns WHERE table_name = 'tt_own'")
+        .await
+        .unwrap();
+    assert!(
+        columns.is_empty(),
+        "temporary columns were stored: {columns:?}"
+    );
+
+    // IF EXISTS means what it says for a table this session cannot see.
+    other
+        .query_drop("DROP TABLE IF EXISTS tt_own")
+        .await
+        .expect("DROP TABLE IF EXISTS on another session's temporary table");
+    other
+        .query_drop("DROP TABLE IF EXISTS tt_own, tt_never_was")
+        .await
+        .expect("DROP TABLE IF EXISTS with a list");
+    let rows: Vec<(i32, i32)> = owner.query("SELECT id, v FROM tt_own").await.unwrap();
+    assert_eq!(rows, [(7, 8)]);
+
+    // Dropped inside a transaction, its uncommitted rows go with it: they
+    // are not committed as rows of an ordinary table of that name.
+    owner.query_drop("BEGIN").await.unwrap();
+    owner
+        .query_drop("INSERT INTO tt_own VALUES (20, 20, 20)")
+        .await
+        .unwrap();
+    owner.query_drop("DROP TABLE tt_own").await.unwrap();
+    owner.query_drop("COMMIT").await.unwrap();
+    other
+        .query_drop("CREATE TABLE tt_own (id INT PRIMARY KEY, v INT, extra INT)")
+        .await
+        .unwrap();
+    let ghosts: Vec<i32> = other.query("SELECT id FROM tt_own").await.unwrap();
+    assert!(
+        ghosts.is_empty(),
+        "temporary rows were committed: {ghosts:?}"
+    );
+    other.query_drop("DROP TABLE tt_own").await.unwrap();
+
+    // Dropped from inside a stored procedure, it is really dropped.
+    owner
+        .query_drop("CREATE TEMPORARY TABLE tt_proc (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    owner
+        .query_drop("INSERT INTO tt_proc VALUES (1)")
+        .await
+        .unwrap();
+    owner
+        .query_drop("CREATE PROCEDURE tt_drop_it() BEGIN DROP TABLE tt_proc; END")
+        .await
+        .unwrap();
+    owner.query_drop("CALL tt_drop_it()").await.unwrap();
+    owner
+        .query_drop("CREATE TEMPORARY TABLE tt_proc (id INT PRIMARY KEY)")
+        .await
+        .expect("the procedure did not drop the temporary table");
+    let rows: Vec<i32> = owner.query("SELECT id FROM tt_proc").await.unwrap();
+    assert!(rows.is_empty());
+    owner.query_drop("DROP PROCEDURE tt_drop_it").await.unwrap();
+}
+
+/// Resetting a connection ends its session: temporary tables go, and what
+/// is stored for everyone (functions) is still there afterwards.
+#[tokio::test]
+async fn test_connection_reset_drops_temporary_tables_and_keeps_functions() {
+    let server = TestServer::start("temp_table").await;
+    let mut conn = server.connect().await;
+    let mut other = server.connect().await;
+    conn.query_drop(
+        "CREATE FUNCTION tt_twice(x BIGINT) RETURNS BIGINT BEGIN \
+         DECLARE y BIGINT; SELECT x * 2 INTO y; RETURN y; END",
+    )
+    .await
+    .unwrap();
+    conn.query_drop("CREATE TEMPORARY TABLE tt_reset (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("BEGIN").await.unwrap();
+    conn.query_drop("INSERT INTO tt_reset VALUES (1)")
+        .await
+        .unwrap();
+
+    conn.reset().await.unwrap();
+
+    let doubled: Option<i64> = conn.query_first("SELECT tt_twice(21)").await.unwrap();
+    assert_eq!(doubled, Some(42));
+    assert!(conn.query_drop("SELECT * FROM tt_reset").await.is_err());
+    other
+        .query_drop("CREATE TABLE tt_reset (id INT PRIMARY KEY)")
+        .await
+        .expect("the name of a reset session's temporary table is still taken");
+    let rows: Vec<i32> = other.query("SELECT id FROM tt_reset").await.unwrap();
+    assert!(rows.is_empty());
+    other.query_drop("DROP TABLE tt_reset").await.unwrap();
+    other.query_drop("DROP FUNCTION tt_twice").await.unwrap();
+}
+
+/// DROP TRIGGER IF EXISTS finds the trigger however the statement is laid
+/// out.
+#[tokio::test]
+async fn test_drop_trigger_if_exists_with_leading_whitespace() {
+    let server = TestServer::start("temp_table").await;
+    let mut conn = server.connect().await;
+    conn.query_drop("CREATE TABLE tt_ws (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE tt_ws_log (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop(
+        "CREATE TRIGGER tt_ws_trg AFTER INSERT ON tt_ws FOR EACH ROW \
+         INSERT INTO tt_ws_log VALUES (NEW.id)",
+    )
+    .await
+    .unwrap();
+    conn.query_drop("\n\tDROP TRIGGER IF EXISTS tt_ws_trg")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO tt_ws VALUES (1)")
+        .await
+        .unwrap();
+    let logged: Vec<i32> = conn.query("SELECT id FROM tt_ws_log").await.unwrap();
+    assert!(logged.is_empty(), "the trigger still fires");
+    conn.query_drop("DROP TABLE tt_ws").await.unwrap();
+    conn.query_drop("DROP TABLE tt_ws_log").await.unwrap();
+}
