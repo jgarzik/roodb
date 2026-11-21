@@ -120,6 +120,10 @@ async fn row_id_task(raft: Raft, node_id: NodeId) {
     let mut last_next = generator.demand().0;
     loop {
         tokio::time::sleep(ROW_ID_POLL).await;
+        // Only a leader's proposal can succeed; a follower hands out no IDs.
+        if !raft.is_leader() {
+            continue;
+        }
         let (next, Some(limit)) = generator.demand() else {
             continue;
         };
@@ -186,7 +190,10 @@ impl RaftNode {
                 enable_tick: false,
                 enable_heartbeat: false,
                 enable_elect: false,
-                purge_batch_size: 1000,
+                // Purge whatever a checkpoint allows. A minimum batch would
+                // leave the log over its budget whenever entries are large:
+                // few of them fill the budget, and too few to purge.
+                purge_batch_size: 1,
                 // Checkpoints are requested by log size (see
                 // `checkpoint_task`), not by entry count, and with no
                 // followers to catch up nothing is kept behind one.

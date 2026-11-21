@@ -313,3 +313,73 @@ async fn a_stop_request_shuts_down_cleanly() {
         .unwrap();
     assert_eq!(count, 201);
 }
+
+/// A table dropped and created again shortly before a kill comes back as the
+/// new table. On restart both statements are replayed together; the second
+/// CREATE must not be taken for a duplicate of the first.
+#[tokio::test]
+async fn a_table_recreated_before_a_kill_is_the_new_one() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, old_col INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO t VALUES (1, 10)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE INDEX idx_old ON t (old_col)")
+        .await
+        .unwrap();
+    conn.query_drop("DROP TABLE t").await.unwrap();
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, new_col VARCHAR(20))")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO t VALUES (2, 'new')")
+        .await
+        .unwrap();
+    // Create, drop, create again: three operations on one name.
+    conn.query_drop("CREATE TABLE u (a INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("DROP TABLE u").await.unwrap();
+    conn.query_drop("CREATE TABLE u (b INT PRIMARY KEY, c INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO u VALUES (5, 6)")
+        .await
+        .unwrap();
+    // And one that ends dropped.
+    conn.query_drop("CREATE TABLE gone (a INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("DROP TABLE gone").await.unwrap();
+    drop(conn);
+    server.kill();
+
+    server.start();
+    let mut conn = connect(&server).await;
+    let rows: Vec<(i32, String)> = conn
+        .query("SELECT id, new_col FROM t")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the re-created table is not usable: {e}\n{}",
+                server.log_tail()
+            )
+        });
+    assert_eq!(rows, [(2, "new".to_string())]);
+    let rows: Vec<(i32, i32)> = conn.query("SELECT b, c FROM u").await.unwrap();
+    assert_eq!(rows, [(5, 6)]);
+    assert!(
+        conn.query_drop("SELECT * FROM gone").await.is_err(),
+        "a dropped table came back"
+    );
+    // The schema is whole enough to keep working with.
+    conn.query_drop("INSERT INTO t VALUES (3, 'more')")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE gone (z INT PRIMARY KEY)")
+        .await
+        .unwrap();
+}

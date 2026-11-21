@@ -162,6 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // server recovers from its log - but stopping in order writes memory out
     // to tables, so the next start has next to nothing to replay.
     tracing::info!("Shutting down");
+    // Flushing can take a while. A second request means "now": everything
+    // acknowledged is already in the log, so exiting here loses nothing.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        tracing::warn!("Second stop request: exiting without flushing");
+        std::process::exit(1);
+    });
     if let Err(e) = raft_node.shutdown().await {
         tracing::warn!(error = %e, "Raft shutdown reported an error");
     }

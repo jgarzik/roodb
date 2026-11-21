@@ -155,6 +155,9 @@ struct ChangesetPlan {
     /// Tables and indexes this changeset creates.
     new_tables: Vec<String>,
     new_indexes: Vec<String>,
+    /// Tables and indexes this changeset drops.
+    dropped_tables: Vec<String>,
+    dropped_indexes: Vec<String>,
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -192,53 +195,9 @@ impl LsmRaftStorage {
         Ok(this)
     }
 
-    /// The highest transaction ID applied, or a bound above it. The
-    /// transaction manager keeps the IDs it hands out ahead of this.
-    pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
-        self.applied_txn_floor.clone()
-    }
-
-    /// The state machine's position as flushed to disk: what a restart would
-    /// resume from. `None` if nothing has been flushed yet.
-    async fn durable_position(&self) -> Result<Option<SnapshotMeta>, StorageError> {
-        let Some(data) = self
-            .storage
-            .get_durable(LAST_APPLIED_KEY)
-            .await
-            .map_err(read_err)?
-        else {
-            return Ok(None);
-        };
-        let last_applied: LogId = bincode::deserialize(&data).map_err(read_err)?;
-        let membership = match self
-            .storage
-            .get_durable(MEMBERSHIP_KEY)
-            .await
-            .map_err(read_err)?
-        {
-            Some(data) => bincode::deserialize(&data).map_err(read_err)?,
-            None => StoredMembership::default(),
-        };
-        Ok(Some(SnapshotMeta {
-            last_log_id: Some(last_applied),
-            last_membership: membership,
-        }))
-    }
-
-    /// Load all cached state from LSM
-    async fn load_cached_state(&self) -> Result<(), StorageError> {
-        // Load last applied
-        if let Some(data) = self.storage.get(LAST_APPLIED_KEY).await.map_err(read_err)? {
-            let log_id: LogId = bincode::deserialize(&data).map_err(read_err)?;
-            *self.cached_last_applied.write() = Some(log_id);
-        }
-
-        // Load membership
-        if let Some(data) = self.storage.get(MEMBERSHIP_KEY).await.map_err(read_err)? {
-            let membership: StoredMembership = bincode::deserialize(&data).map_err(read_err)?;
-            *self.cached_membership.write() = membership;
-        }
-
+    /// Load the bounds on transaction IDs and row IDs from storage. They only
+    /// ever move forward, here as everywhere.
+    async fn load_counters(&self) -> Result<(), StorageError> {
         // Transaction IDs at or below this may be in rows on disk.
         if let Some(data) = self.storage.get(MAX_TXN_KEY).await.map_err(read_err)? {
             let bytes: [u8; 8] = data
@@ -246,8 +205,8 @@ impl LsmRaftStorage {
                 .try_into()
                 .map_err(|_| read_err("stored transaction ID bound is malformed"))?;
             let bound = u64::from_le_bytes(bytes);
-            self.applied_txn_floor.store(bound, Ordering::SeqCst);
-            self.stored_txn_bound.store(bound, Ordering::SeqCst);
+            self.applied_txn_floor.fetch_max(bound, Ordering::SeqCst);
+            self.stored_txn_bound.fetch_max(bound, Ordering::SeqCst);
         }
 
         // Row IDs: resume past what was reserved, and hand none out until a
@@ -269,10 +228,75 @@ impl LsmRaftStorage {
         };
         crate::storage::row_id::generator().restore(reserved);
 
+        Ok(())
+    }
+
+    /// The highest transaction ID applied, or a bound above it. The
+    /// transaction manager keeps the IDs it hands out ahead of this.
+    pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
+        self.applied_txn_floor.clone()
+    }
+
+    /// The state machine's position as flushed to disk: what a restart would
+    /// resume from. `None` if nothing has been flushed yet.
+    async fn durable_position(&self) -> Result<Option<SnapshotMeta>, StorageError> {
+        // The position and the membership are two keys, and a flush can land
+        // between reading one and the other. Read the position again
+        // afterwards and go round if it moved.
+        loop {
+            let Some(position) = self
+                .storage
+                .get_durable(LAST_APPLIED_KEY)
+                .await
+                .map_err(read_err)?
+            else {
+                return Ok(None);
+            };
+            let membership = self
+                .storage
+                .get_durable(MEMBERSHIP_KEY)
+                .await
+                .map_err(read_err)?;
+            let again = self
+                .storage
+                .get_durable(LAST_APPLIED_KEY)
+                .await
+                .map_err(read_err)?;
+            if again.as_deref() != Some(position.as_slice()) {
+                continue;
+            }
+            let last_applied: LogId = bincode::deserialize(&position).map_err(read_err)?;
+            let membership = match membership {
+                Some(data) => bincode::deserialize(&data).map_err(read_err)?,
+                None => StoredMembership::default(),
+            };
+            return Ok(Some(SnapshotMeta {
+                last_log_id: Some(last_applied),
+                last_membership: membership,
+            }));
+        }
+    }
+
+    /// Load all cached state from LSM
+    async fn load_cached_state(&self) -> Result<(), StorageError> {
+        // Load last applied
+        if let Some(data) = self.storage.get(LAST_APPLIED_KEY).await.map_err(read_err)? {
+            let log_id: LogId = bincode::deserialize(&data).map_err(read_err)?;
+            *self.cached_last_applied.write() = Some(log_id);
+        }
+
+        // Load membership
+        if let Some(data) = self.storage.get(MEMBERSHIP_KEY).await.map_err(read_err)? {
+            let membership: StoredMembership = bincode::deserialize(&data).map_err(read_err)?;
+            *self.cached_membership.write() = membership;
+        }
+
+        self.load_counters().await?;
+
         tracing::info!(
             last_applied = ?*self.cached_last_applied.read(),
             txn_id_floor = self.applied_txn_floor.load(Ordering::SeqCst),
-            row_ids_reserved = reserved,
+            row_ids = ?crate::storage::row_id::generator().demand(),
             "Loaded state machine position from LSM"
         );
 
@@ -774,12 +798,21 @@ impl LsmRaftStorage {
                                     _ => None,
                                 });
                         if let Some(name) = name {
-                            let (existing, new) = if change.table == SYSTEM_TABLES {
-                                (existing_tables, &mut plan.new_tables)
+                            let (existing, new, dropped) = if change.table == SYSTEM_TABLES {
+                                (existing_tables, &mut plan.new_tables, &plan.dropped_tables)
                             } else {
-                                (existing_indexes, &mut plan.new_indexes)
+                                (
+                                    existing_indexes,
+                                    &mut plan.new_indexes,
+                                    &plan.dropped_indexes,
+                                )
                             };
-                            if existing.contains(&name) || new.contains(&name) {
+                            // It exists if it existed before and this
+                            // changeset has not dropped it, or if this
+                            // changeset already created it.
+                            let exists = (existing.contains(&name) && !dropped.contains(&name))
+                                || new.contains(&name);
+                            if exists {
                                 tracing::debug!(
                                     table = %change.table,
                                     name = %name,
@@ -811,6 +844,29 @@ impl LsmRaftStorage {
                     ));
                     live.insert(change.key.as_slice(), false);
                     if let Some(value) = value {
+                        // Dropping a table or index frees its name: a later
+                        // CREATE of the same name, in this changeset or a
+                        // following one, is not a duplicate.
+                        if change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES {
+                            let name =
+                                decode_row(value)
+                                    .ok()
+                                    .and_then(|row| match row.values().first() {
+                                        Some(crate::executor::Datum::String(name)) => {
+                                            Some(name.clone())
+                                        }
+                                        _ => None,
+                                    });
+                            if let Some(name) = name {
+                                if change.table == SYSTEM_TABLES {
+                                    plan.new_tables.retain(|n| n != &name);
+                                    plan.dropped_tables.push(name);
+                                } else {
+                                    plan.new_indexes.retain(|n| n != &name);
+                                    plan.dropped_indexes.push(name);
+                                }
+                            }
+                        }
                         plan.tracked.push(TrackedChange {
                             table: change.table.clone(),
                             value: value.clone(),
@@ -840,9 +896,13 @@ impl LsmRaftStorage {
             // Decode row to get table_name (first column)
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
+                    // Several entries are applied per call; for one name the
+                    // last operation is the one that stands.
                     if is_delete {
+                        affected_tables.remove(table_name);
                         dropped_tables.insert(table_name.clone());
                     } else {
+                        dropped_tables.remove(table_name);
                         affected_tables.insert(table_name.clone());
                     }
                 }
@@ -863,8 +923,10 @@ impl LsmRaftStorage {
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(index_name)) = row.values().first() {
                     if is_delete {
+                        affected_indexes.remove(index_name);
                         dropped_indexes.insert(index_name.clone());
                     } else {
+                        dropped_indexes.remove(index_name);
                         affected_indexes.insert(index_name.clone());
                     }
                 }
@@ -971,9 +1033,21 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 EntryPayload::Blank => CommandResponse::Ok(None),
                 EntryPayload::Normal(Command::Noop) => CommandResponse::Ok(None),
                 EntryPayload::Normal(Command::ReserveRowIds { node_id, upto }) => {
-                    batch.push((row_id_key(*node_id), Some(upto.to_le_bytes().to_vec())));
+                    // Reservations can be proposed out of order; the stored
+                    // bound only ever grows, as the one in memory does.
+                    let key = row_id_key(*node_id);
+                    let stored = match self.storage.get(&key).await.map_err(read_err)? {
+                        Some(data) => data
+                            .as_slice()
+                            .try_into()
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| read_err("stored row ID bound is malformed"))?,
+                        None => 0,
+                    };
+                    let bound = stored.max(*upto);
+                    batch.push((key, Some(bound.to_le_bytes().to_vec())));
                     if *node_id == self.node_id {
-                        reserved_row_ids = Some(*upto);
+                        reserved_row_ids = Some(bound);
                     }
                     CommandResponse::Ok(None)
                 }
@@ -992,6 +1066,12 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             );
                             batch = plan.writes;
                             tracked = plan.tracked;
+                            for name in &plan.dropped_tables {
+                                existing_tables.remove(name);
+                            }
+                            for name in &plan.dropped_indexes {
+                                existing_indexes.remove(name);
+                            }
                             existing_tables.extend(plan.new_tables);
                             existing_indexes.extend(plan.new_indexes);
                             CommandResponse::Ok(None)
@@ -1086,66 +1166,43 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     ) -> Result<(), StorageError> {
         let snapshot_data = snapshot.into_inner();
 
-        // Parse snapshot data if present
+        // Everything goes in as one batch - the old data out, the snapshot's
+        // in, and the position - so that storage is never part old state and
+        // part new under either position.
+        let mut batch: Vec<WriteOp> = Vec::new();
+
         if !snapshot_data.is_empty() {
-            // Delete existing user data (preserve Raft metadata)
             let existing_data = self.storage.scan(None, None).await.map_err(read_err)?;
-            let mut deleted_count = 0;
+            let deleted_count = existing_data.len();
             for (key, _) in existing_data {
-                if !key.starts_with(RAFT_PREFIX) {
-                    self.storage.delete(&key).await.map_err(write_err)?;
-                    deleted_count += 1;
+                if !is_position_key(&key) {
+                    batch.push((key, None));
                 }
             }
 
             // Parse snapshot: [count: u64][entries...]
-            if snapshot_data.len() < 8 {
-                return Err(read_err("Invalid snapshot: too short"));
-            }
-            let count = u64::from_le_bytes(
-                snapshot_data[..8]
-                    .try_into()
-                    .map_err(|_| read_err("Invalid snapshot: count parse error"))?,
-            ) as usize;
-            let mut offset = 8;
-
-            // Install each entry
-            let mut installed_count = 0;
+            let truncated = || read_err("Invalid snapshot: truncated");
+            let take = |offset: &mut usize, len: usize| -> Result<&[u8], StorageError> {
+                let end = offset
+                    .checked_add(len)
+                    .filter(|end| *end <= snapshot_data.len())
+                    .ok_or_else(truncated)?;
+                let bytes = &snapshot_data[*offset..end];
+                *offset = end;
+                Ok(bytes)
+            };
+            let mut offset = 0;
+            let count = u64::from_le_bytes(take(&mut offset, 8)?.try_into().expect("8 bytes"));
+            let mut installed_count = 0u64;
             for _ in 0..count {
                 // [key_len: u32][key][value_len: u32][value]
-                if offset + 4 > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated key length"));
-                }
-                let key_len = u32::from_le_bytes(
-                    snapshot_data[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| read_err("Invalid snapshot: key length parse error"))?,
-                ) as usize;
-                offset += 4;
-
-                if offset + key_len > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated key"));
-                }
-                let key = &snapshot_data[offset..offset + key_len];
-                offset += key_len;
-
-                if offset + 4 > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated value length"));
-                }
-                let value_len = u32::from_le_bytes(
-                    snapshot_data[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| read_err("Invalid snapshot: value length parse error"))?,
-                ) as usize;
-                offset += 4;
-
-                if offset + value_len > snapshot_data.len() {
-                    return Err(read_err("Invalid snapshot: truncated value"));
-                }
-                let value = &snapshot_data[offset..offset + value_len];
-                offset += value_len;
-
-                self.storage.put(key, value).await.map_err(write_err)?;
+                let key_len =
+                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
+                let key = take(&mut offset, key_len as usize)?.to_vec();
+                let value_len =
+                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
+                let value = take(&mut offset, value_len as usize)?.to_vec();
+                batch.push((key, Some(value)));
                 installed_count += 1;
             }
 
@@ -1154,27 +1211,26 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 deleted = deleted_count,
                 installed = installed_count,
                 bytes = snapshot_data.len(),
-                "Installed snapshot data"
+                "Installing snapshot data"
             );
         }
 
-        // Update last applied from snapshot metadata
         if let Some(log_id) = meta.last_log_id {
             let data = bincode::serialize(&log_id).map_err(write_err)?;
-            self.storage
-                .put(LAST_APPLIED_KEY, &data)
-                .await
-                .map_err(write_err)?;
+            batch.push((LAST_APPLIED_KEY.to_vec(), Some(data)));
+        }
+        let data = bincode::serialize(&meta.last_membership).map_err(write_err)?;
+        batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+        self.storage.write_batch(batch).await.map_err(write_err)?;
+
+        if let Some(log_id) = meta.last_log_id {
             *self.cached_last_applied.write() = Some(log_id);
         }
-
-        // Update membership from snapshot
-        let data = bincode::serialize(&meta.last_membership).map_err(write_err)?;
-        self.storage
-            .put(MEMBERSHIP_KEY, &data)
-            .await
-            .map_err(write_err)?;
         *self.cached_membership.write() = meta.last_membership.clone();
+
+        // The snapshot's rows carry transaction IDs and row IDs this node
+        // may never have seen; pick up the bounds that came with them.
+        self.load_counters().await?;
 
         // Rebuild catalog from system tables after snapshot install
         self.rebuild_catalog_from_system_tables().await?;
@@ -1209,7 +1265,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
         let user_data: Vec<_> = all_data
             .into_iter()
-            .filter(|(key, _)| !key.starts_with(RAFT_PREFIX))
+            .filter(|(key, _)| !is_position_key(key))
             .collect();
 
         // Serialize snapshot data: [count: u64][entries...]
@@ -1235,8 +1291,14 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
     }
 }
 
-/// Raft metadata key prefix - excluded from snapshots
-const RAFT_PREFIX: &[u8] = b"_raft:";
+/// The keys that say where this node's state machine is. They belong to the
+/// node, not to the data: a snapshot does not carry them and installing one
+/// sets them from the snapshot's own position. Everything else - including
+/// the transaction ID bound and the row ID reservations, which describe the
+/// data - travels with a snapshot.
+fn is_position_key(key: &[u8]) -> bool {
+    key == LAST_APPLIED_KEY || key == MEMBERSHIP_KEY
+}
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
     type SnapshotData = SnapshotData;
