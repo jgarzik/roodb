@@ -22,11 +22,32 @@ use crate::storage::error::StorageResult;
 use crate::storage::traits::{KeyValue, WriteOp};
 use crate::storage::StorageEngine;
 
+/// Most memory one session's temporary tables may hold. They live in the
+/// server's memory, so without a limit one session could exhaust it.
+pub const TEMP_TABLE_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Default)]
 struct TempState {
     /// Key range of each temporary table: `[prefix, end)`.
     tables: Vec<(String, Vec<u8>, Vec<u8>)>,
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Bytes of keys and values in `rows`.
+    bytes: usize,
+}
+
+impl TempState {
+    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.bytes += key.len() + value.len();
+        if let Some(old) = self.rows.insert(key.clone(), value) {
+            self.bytes -= key.len() + old.len();
+        }
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        if let Some(old) = self.rows.remove(key) {
+            self.bytes -= key.len() + old.len();
+        }
+    }
 }
 
 impl TempState {
@@ -95,7 +116,7 @@ impl SessionStorage {
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
-            temp.rows.remove(&key);
+            temp.remove(&key);
         }
         self.has_temp
             .store(!temp.tables.is_empty(), Ordering::Relaxed);
@@ -107,6 +128,7 @@ impl SessionStorage {
         let mut temp = self.temp.write();
         self.has_temp.store(false, Ordering::Relaxed);
         temp.rows.clear();
+        temp.bytes = 0;
         temp.tables.drain(..).map(|(name, _, _)| name).collect()
     }
 
@@ -126,10 +148,27 @@ impl SessionStorage {
     /// key that is already there. Changes earlier in the list count: deleting
     /// a row and inserting it again is fine.
     pub fn check(&self, changes: &[RowChange], ignore_duplicates: bool) -> Result<(), String> {
-        if changes.is_empty() || ignore_duplicates {
+        if changes.is_empty() {
             return Ok(());
         }
         let temp = self.temp.read();
+        // Refuse the commit that would take the session over its limit.
+        let growth: usize = changes
+            .iter()
+            .map(|c| {
+                c.key.len() + c.value.as_ref().map_or(0, Vec::len) + crate::raft::MVCC_HEADER_SIZE
+            })
+            .sum();
+        if temp.bytes + growth > TEMP_TABLE_LIMIT_BYTES {
+            return Err(format!(
+                "The table '{}' is full: temporary tables of one session may hold {} MiB",
+                changes[0].table,
+                TEMP_TABLE_LIMIT_BYTES >> 20
+            ));
+        }
+        if ignore_duplicates {
+            return Ok(());
+        }
         let mut live: std::collections::HashMap<&[u8], bool> = std::collections::HashMap::new();
         for change in changes {
             match change.op {
@@ -177,17 +216,14 @@ impl SessionStorage {
                     if exists && ignore_duplicates {
                         continue;
                     }
-                    temp.rows
-                        .insert(change.key, encode_mvcc_row(txn_id, false, &value));
+                    temp.insert(change.key, encode_mvcc_row(txn_id, false, &value));
                 }
                 (ChangeOp::Update, Some(value)) => {
-                    temp.rows
-                        .insert(change.key, encode_mvcc_row(txn_id, false, &value));
+                    temp.insert(change.key, encode_mvcc_row(txn_id, false, &value));
                 }
                 (ChangeOp::Insert | ChangeOp::Update, None) => {}
                 (ChangeOp::Delete, _) => {
-                    temp.rows
-                        .insert(change.key, encode_mvcc_row(txn_id, true, &[]));
+                    temp.insert(change.key, encode_mvcc_row(txn_id, true, &[]));
                 }
             }
         }
@@ -213,7 +249,7 @@ impl StorageEngine for SessionStorage {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> StorageResult<()> {
         if self.owns(key) {
-            self.temp.write().rows.insert(key.to_vec(), value.to_vec());
+            self.temp.write().insert(key.to_vec(), value.to_vec());
             return Ok(());
         }
         self.shared.put(key, value).await
@@ -221,7 +257,7 @@ impl StorageEngine for SessionStorage {
 
     async fn delete(&self, key: &[u8]) -> StorageResult<()> {
         if self.owns(key) {
-            self.temp.write().rows.remove(key);
+            self.temp.write().remove(key);
             return Ok(());
         }
         self.shared.delete(key).await
@@ -237,9 +273,9 @@ impl StorageEngine for SessionStorage {
             for (key, value) in batch {
                 if temp.owns(&key) {
                     match value {
-                        Some(value) => temp.rows.insert(key, value),
-                        None => temp.rows.remove(&key),
-                    };
+                        Some(value) => temp.insert(key, value),
+                        None => temp.remove(&key),
+                    }
                 } else {
                     shared.push((key, value));
                 }
@@ -402,6 +438,37 @@ mod tests {
             RowChange::insert("tmp", key("tmp", 9), b"y".to_vec()),
         ];
         assert!(storage.check(&twice, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_session_cannot_hold_unlimited_temporary_rows() {
+        let storage = SessionStorage::new(Arc::new(Untouched));
+        storage.add_table("tmp");
+        // 64 MiB at a time: four fit, the fifth does not.
+        for round in 0..5u8 {
+            let big = vec![RowChange::insert(
+                "tmp",
+                key("tmp", round),
+                vec![0u8; 64 * 1024 * 1024 - 1024],
+            )];
+            let checked = storage.check(&big, false);
+            if round < 4 {
+                checked.unwrap();
+                storage.apply(1, big, false);
+            } else {
+                let err = checked.unwrap_err();
+                assert!(err.contains("is full"), "{err}");
+            }
+        }
+        // Dropping the table gives the room back.
+        assert!(storage.remove_table("tmp"));
+        storage.add_table("tmp");
+        storage
+            .check(
+                &[RowChange::insert("tmp", key("tmp", 9), vec![0u8; 1 << 20])],
+                false,
+            )
+            .unwrap();
     }
 
     #[tokio::test]

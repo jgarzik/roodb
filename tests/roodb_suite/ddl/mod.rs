@@ -6,3 +6,4 @@ mod create_index;
 mod create_table;
 mod drop_index;
 mod drop_table;
+mod temp_table;

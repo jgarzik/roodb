@@ -955,12 +955,42 @@ impl QueryEngine {
     async fn execute_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
         // A temporary table lives in this session only: dropping it touches
         // neither the log nor the system tables.
-        if let PhysicalPlan::DropTable { name, .. } = &plan {
-            if self.temp.remove_table(name) {
-                let _ = self.catalog.write().drop_table(name);
-                return self.send_ok(0, 0).await;
+        let plan = match plan {
+            PhysicalPlan::DropTable { name, if_exists } => {
+                if self.temp.remove_table(&name) {
+                    let _ = self.catalog.write().drop_table(&name);
+                    return self.send_ok(0, 0).await;
+                }
+                if self.is_foreign_temp_table(&name) {
+                    return self.send_no_such_table(&name).await;
+                }
+                PhysicalPlan::DropTable { name, if_exists }
             }
-        }
+            PhysicalPlan::DropMultipleTables { names, if_exists } => {
+                if let Some(foreign) = names.iter().find(|n| self.is_foreign_temp_table(n)) {
+                    let foreign = foreign.clone();
+                    return self.send_no_such_table(&foreign).await;
+                }
+                // This session's temporary tables are dropped here; whatever
+                // else was named goes the ordinary way.
+                let mut ordinary = Vec::new();
+                for name in names {
+                    if self.temp.remove_table(&name) {
+                        let _ = self.catalog.write().drop_table(&name);
+                    } else {
+                        ordinary.push(name);
+                    }
+                }
+                if ordinary.is_empty() {
+                    return self.send_ok(0, 0).await;
+                }
+                PhysicalPlan::DropMultipleTables {
+                    names: ordinary,
+                    if_exists,
+                }
+            }
+            other => other,
+        };
 
         // Check if this is a query that returns rows
         let returns_rows = matches!(
@@ -1252,6 +1282,26 @@ impl QueryEngine {
         self.send_ok(0, 0).await
     }
 
+    /// Whether `table` is a temporary table that belongs to another session.
+    /// To this session it does not exist.
+    fn is_foreign_temp_table(&self, table: &str) -> bool {
+        !self.temp.is_temp_table(table)
+            && self
+                .catalog
+                .read()
+                .get_table(table)
+                .is_some_and(|def| def.is_temporary)
+    }
+
+    async fn send_no_such_table(&mut self, table: &str) -> ProtocolResult<()> {
+        self.send_error(
+            codes::ER_NO_SUCH_TABLE,
+            states::NO_SUCH_TABLE,
+            &format!("Table '{table}' doesn't exist"),
+        )
+        .await
+    }
+
     /// Commit a transaction's row changes.
     ///
     /// Changes to ordinary tables go through Raft. Changes to this session's
@@ -1268,6 +1318,12 @@ impl QueryEngine {
         self.temp
             .check(&temporary, ignore_duplicates)
             .map_err(|e| format!("Raft error: {e}"))?;
+        // Another session's temporary table is not this session's to write
+        // to: its rows would go to shared storage, where nothing would ever
+        // remove them.
+        if let Some(change) = shared.iter().find(|c| self.is_foreign_temp_table(&c.table)) {
+            return Err(format!("Table '{}' doesn't exist", change.table));
+        }
         if !shared.is_empty() {
             let changeset = ChangeSet::new_with_changes_ignore(txn_id, shared, ignore_duplicates);
             self.raft_node
@@ -3700,6 +3756,17 @@ impl QueryEngine {
                     .await;
             }
         };
+        // A trigger on a system table would run on every schema or account
+        // change, for whoever makes it.
+        if crate::catalog::system_tables::is_system_table(&def.table_name) {
+            return self
+                .send_error(
+                    codes::ER_UNKNOWN_ERROR,
+                    states::GENERAL_ERROR,
+                    "Triggers cannot be created on system tables",
+                )
+                .await;
+        }
         if self.catalog.read().has_trigger(&def.name) {
             return self
                 .send_error(
