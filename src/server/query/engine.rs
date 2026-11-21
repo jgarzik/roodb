@@ -1636,6 +1636,15 @@ impl QueryEngine {
         changes: Vec<RowChange>,
         ignore_duplicates: bool,
     ) -> Result<(), String> {
+        // Nothing is committed for a transaction that has been rolled back
+        // behind the session's back (its node stopped being the primary
+        // while the statement ran): the locks that made its changes safe
+        // are gone. This holds for a single statement's own transaction as
+        // for an explicit one.
+        if txn_id != 0 && !self.txn_manager.is_active(txn_id) {
+            self.txn_manager.locks().release_all(txn_id);
+            return Err(ROLLED_BACK_BY_FAILOVER.to_string());
+        }
         let (temporary, shared) = self.temp.split(changes);
         self.temp
             .check(&temporary, ignore_duplicates)
@@ -1718,6 +1727,9 @@ impl QueryEngine {
         if !self.txn_manager.is_active(txn_id) {
             self.session.clear_pending_changes();
             self.session.end_transaction();
+            // A statement that was running when the transaction was rolled
+            // back may have taken locks afterwards; let go of those too.
+            self.txn_manager.locks().release_all(txn_id);
             return Err(ROLLED_BACK_BY_FAILOVER.to_string());
         }
         // First, propose any pending changes to Raft
