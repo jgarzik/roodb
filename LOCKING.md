@@ -202,6 +202,24 @@ let mut catalog = self.catalog.write();
 // ... update catalog ...
 ```
 
+### Row locks (`src/txn/lock.rs`)
+
+`LockManager` is the table of row locks that transactions hold on each
+other's behalf: shared and exclusive record locks on row keys, gap locks on
+open key intervals, and insert intentions that wait for gap locks. Requests
+on a record are granted in arrival order; a request that would close a cycle
+of waiting transactions is refused (deadlock), and a wait can time out.
+Everything a transaction holds is released together when it ends.
+
+The whole table is guarded by one `parking_lot::Mutex`, held only to inspect
+or change the table, never while a requester waits: a waiter parks on a
+oneshot channel outside the mutex. No other lock is taken while it is held.
+The locks exist only in memory on the node that granted them; they are not
+replicated.
+
+Statements do not take these locks yet: writers still find conflicts at
+commit. Wiring the statements to the lock manager is in progress.
+
 ## Lock Ordering Rules
 
 1. **Never hold sync locks across await** (except tokio::sync::Mutex)

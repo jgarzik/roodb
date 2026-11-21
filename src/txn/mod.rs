@@ -6,6 +6,7 @@
 //! - PostgreSQL-style timeout handling for resource safety
 //! - Leader/replica awareness for distributed operation
 
+mod lock;
 mod manager;
 mod mvcc_storage;
 mod purge;
@@ -13,6 +14,7 @@ mod read_view;
 mod transaction;
 mod undo_log;
 
+pub use lock::{LockError, LockManager, LockMode};
 pub use manager::TransactionManager;
 pub use mvcc_storage::MvccStorage;
 pub use purge::PurgeTask;
