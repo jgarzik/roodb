@@ -76,8 +76,17 @@ impl RooDbServer {
 
     /// Run the server until the process exits
     pub async fn run(self) -> Result<(), ServerError> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Serve clients until `shutdown` completes, then stop accepting and
+    /// return. Connections already open are left to their tasks.
+    pub async fn run_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.addr).await?;
-        self.accept_loop(listener, std::future::pending()).await
+        self.accept_loop(listener, shutdown).await
     }
 
     /// Run the server with a pre-bound listener and shutdown signal

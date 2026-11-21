@@ -132,6 +132,44 @@ impl ServerProcess {
         child.wait().expect("reap server");
     }
 
+    /// Ask the server to stop (SIGTERM) and wait for it to exit by itself.
+    /// Returns its exit status.
+    #[cfg(unix)]
+    pub fn stop(&mut self) -> std::process::ExitStatus {
+        let mut child = self.child.take().expect("server not running");
+        // SAFETY: sends a signal to a process we started and still own.
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(rc, 0, "kill(SIGTERM) failed");
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("poll server") {
+                return status;
+            }
+            if start.elapsed() > STARTUP_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("server ignored SIGTERM:\n{}", self.log_tail());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Names of the table files in the data directory.
+    pub fn table_files(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.data_dir.path())
+            .expect("read data dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".sst"))
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Connection options for the running server.
     pub fn opts(&self) -> Opts {
         OptsBuilder::default()

@@ -256,3 +256,60 @@ async fn a_kill_mid_stream_loses_nothing_acknowledged() {
         );
     }
 }
+
+/// Asked to stop, the server exits by itself with everything in memory
+/// written out to table files, and comes back with it all.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stop_request_shuts_down_cleanly() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(100))")
+        .await
+        .unwrap();
+    for id in 0..200 {
+        conn.query_drop(format!("INSERT INTO t VALUES ({id}, 'value {id}')"))
+            .await
+            .unwrap();
+    }
+    drop(conn);
+    let before = server.table_files();
+
+    let status = server.stop();
+    assert!(
+        status.success(),
+        "exit status {status}\n{}",
+        server.log_tail()
+    );
+    let after = server.table_files();
+    assert!(
+        after.len() > before.len(),
+        "a clean stop should flush memory to a table file: {before:?} -> {after:?}"
+    );
+
+    server.start();
+    let mut conn = connect(&server).await;
+    let count: i64 = conn
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 200);
+    conn.query_drop("INSERT INTO t VALUES (1000, 'after')")
+        .await
+        .unwrap();
+    drop(conn);
+    // And again, then a kill: mixing the two is fine.
+    assert!(server.stop().success());
+    server.start();
+    server.kill();
+    server.start();
+    let mut conn = connect(&server).await;
+    let count: i64 = conn
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 201);
+}

@@ -146,11 +146,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start RooDB server
     let addr = SocketAddr::new(bind, port);
-    let mut server = RooDbServer::new(addr, tls_config, storage, catalog, raft_node);
+    let mut server = RooDbServer::new(
+        addr,
+        tls_config,
+        storage.clone(),
+        catalog,
+        raft_node.clone(),
+    );
     if let Some(tds_port) = tds_port {
         server = server.enable_tds(SocketAddr::new(bind, tds_port));
     }
-    server.run().await?;
+    server.run_until(shutdown_signal()).await?;
+
+    // Asked to stop. Nothing here is needed for correctness - a killed
+    // server recovers from its log - but stopping in order writes memory out
+    // to tables, so the next start has next to nothing to replay.
+    tracing::info!("Shutting down");
+    if let Err(e) = raft_node.shutdown().await {
+        tracing::warn!(error = %e, "Raft shutdown reported an error");
+    }
+    storage.close().await?;
+    tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Completes when the process is asked to stop: SIGINT or SIGTERM on Unix,
+/// Ctrl-C elsewhere.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            tracing::warn!("cannot listen for termination signals; stop with kill");
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
