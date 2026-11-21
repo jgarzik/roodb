@@ -193,7 +193,10 @@ impl ServerManager {
                 let _ = child.wait();
             }
             state.server_process = None;
-            // TempDirs are cleaned up automatically when dropped
+            // This manager lives in a static, which is never dropped, so the
+            // directories are released here or not at all.
+            state.data_dir = None;
+            state.cert_files = None;
         }
     }
 

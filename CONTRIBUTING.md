@@ -171,7 +171,9 @@ ROODB_IO_BACKEND=posix cargo test --release
 against MySQL 8.0 in Docker, and writes a JSON result file under
 `bench/results/`. It needs `sysbench`, `openssl` and, for the MySQL side,
 `docker`. `bench/compare.sh a.json b.json` compares two result files and
-needs `jq`.
+needs `jq`. The server's data directory for a run is created under
+`$TMPDIR` (default `/tmp`) and removed afterwards; the tests put their data
+there too, so point `TMPDIR` at a volume with room.
 
 ```bash
 bench/run.sh --table-size=100000 --duration=30

@@ -105,7 +105,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-TMPDIR_ROODB="$(mktemp -d /tmp/roodb-bench-XXXX)"
+TMPDIR_ROODB="$(mktemp -d "${TMPDIR:-/tmp}/roodb-bench-XXXX")"
 
 # ─── Build RooDB ──────────────────────────────────────────────────────────────
 if [ "$RUN_ROODB" = true ] && [ "$SKIP_BUILD" = false ]; then
