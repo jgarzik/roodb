@@ -289,7 +289,10 @@ no `--join`, and the option is ignored if given.
 - Every node must be able to reach every other node's Raft port
   (`--raft-port`, by default the client port + 1000) at the address the node
   advertises: its `--bind` address, or `--advertise-host` when it binds to
-  `0.0.0.0` or sits behind another name.
+  `0.0.0.0` or sits behind another name. A node that would advertise
+  `0.0.0.0` is not allowed to join, and a first node that does is told to be
+  restarted with `--advertise-host` before it admits anyone (while it is
+  alone, restarting it with the option is all it takes).
 
 **Primary and secondaries:**
 - The node that leads the cluster is the **primary**: it takes all writes.
@@ -326,6 +329,10 @@ ALTER CLUSTER REMOVE NODE 3;
 -- this node, say)
 ALTER CLUSTER SET PRIMARY 2;
 ```
+
+A node that has lost its data directory must be removed (`ALTER CLUSTER
+REMOVE NODE`) before a new node may join at its address: the cluster will not
+hand the old node's place to a node that has none of what the old one had.
 
 A removed node is told, and stops; one that was down at the time finds out
 when it is started, and refuses to run. Its data directory is of no further use

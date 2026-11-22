@@ -85,6 +85,17 @@ pub struct MembersReply {
     pub members: Vec<NodeId>,
 }
 
+/// Whether `addr` (`host:port`) names no particular host: the "any address"
+/// a server binds to, or nothing at all.
+pub fn is_unspecified(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.is_empty()
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+}
+
 /// Ask the node at `addr` who is in the cluster.
 pub async fn ask_members(tls_config: &RaftTlsConfig, addr: &str) -> Result<MembersReply, String> {
     let connection = RaftNetworkConnection {
@@ -143,6 +154,10 @@ pub async fn notify_removed(tls_config: &RaftTlsConfig, addr: &str) {
 struct JoinRequest {
     /// Where the other nodes can reach its Raft port.
     addr: String,
+    /// A number the asking process made up when it started. A node asks
+    /// again if the answer was lost, with the same number; a node that
+    /// lost its data and starts over asks with a new one.
+    instance: u64,
 }
 
 /// What a member answers to a node asking to join.
@@ -156,6 +171,8 @@ pub enum JoinReply {
     NotLeader {
         leader: Option<String>,
     },
+    /// Will not be done, however often it is asked.
+    Refused(String),
     Failed(String),
 }
 
@@ -165,6 +182,7 @@ pub async fn request_join(
     tls_config: &RaftTlsConfig,
     member: &str,
     own_addr: &str,
+    instance: u64,
 ) -> Result<JoinReply, String> {
     let connection = RaftNetworkConnection {
         target: 0,
@@ -177,6 +195,7 @@ pub async fn request_join(
             MessageType::Join,
             &JoinRequest {
                 addr: own_addr.to_string(),
+                instance,
             },
             std::time::Duration::from_secs(30),
         )
@@ -538,6 +557,12 @@ pub struct RaftRpcHandler {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Held while a snapshot is being received.
     receiving_snapshot: tokio::sync::Mutex<()>,
+    /// Held while a node is being admitted: Raft changes its membership
+    /// one step at a time.
+    admitting: Arc<tokio::sync::Mutex<()>>,
+    /// Nodes admitted by this process: address, the instance that asked,
+    /// and the ID it was given.
+    admitted: parking_lot::Mutex<Vec<(String, u64, NodeId)>>,
 }
 
 impl RaftRpcHandler {
@@ -555,6 +580,8 @@ impl RaftRpcHandler {
             tls_config,
             storage,
             receiving_snapshot: tokio::sync::Mutex::new(()),
+            admitting: Arc::new(tokio::sync::Mutex::new(())),
+            admitted: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -665,13 +692,45 @@ impl RaftRpcHandler {
             });
             return JoinReply::NotLeader { leader };
         }
-        // Asked again by a node that is already in (its first answer may
-        // have been lost): the same answer.
+        // Asked again by the same process (its first answer may have been
+        // lost): the same answer.
+        let asked_before = self
+            .admitted
+            .lock()
+            .iter()
+            .find(|(addr, instance, _)| *addr == request.addr && *instance == request.instance)
+            .map(|(_, _, node_id)| *node_id);
+        if let Some(node_id) = asked_before {
+            return JoinReply::Joined { node_id };
+        }
+        // The address belongs to a member, and it is not that member asking
+        // again: a node that lost its data, started over. It must not be
+        // given the old node's place. The cluster counts that node's vote
+        // and what it had acknowledged; a node with nothing in its place
+        // can cost the cluster writes it has acknowledged.
         if let Some((node_id, _)) = membership
             .nodes()
             .find(|(_, node)| node.addr == request.addr)
         {
-            return JoinReply::Joined { node_id: *node_id };
+            return JoinReply::Refused(format!(
+                "{} is the address of node {node_id}, which is a member already. \
+                 If that node has lost its data, remove it first: \
+                 ALTER CLUSTER REMOVE NODE {node_id}",
+                request.addr
+            ));
+        }
+        // Other nodes are told this node's address as the membership has
+        // it. One that means "any address" would have them call themselves.
+        let own_addr = membership
+            .nodes()
+            .find(|(node, _)| **node == id)
+            .map(|(_, node)| node.addr.clone())
+            .unwrap_or_default();
+        if is_unspecified(&own_addr) {
+            return JoinReply::Refused(format!(
+                "the primary advertises {own_addr:?}, which other nodes cannot reach it at; \
+                 restart it with --advertise-host"
+            ));
         }
 
         let node_id = match self.raft.client_write(Command::AllocNodeId).await {
@@ -692,23 +751,52 @@ impl RaftRpcHandler {
         runtime.heartbeat(true);
         runtime.elect(true);
 
+        self.admitted
+            .lock()
+            .push((request.addr.clone(), request.instance, node_id));
+
         // The node is told its ID now and starts listening; meanwhile it is
         // sent the log (or a snapshot), and made a voter when it has it all.
+        // One node at a time: Raft refuses a change of membership while
+        // another is under way. And until it has worked: the node has been
+        // told it is in.
         let raft = self.raft.clone();
         let node = Node::new(request.addr.clone());
+        let admitting = self.admitting.clone();
         tokio::spawn(async move {
-            if let Err(e) = raft.add_learner(node_id, node, true).await {
-                tracing::error!(node_id, error = %e, "A joining node could not be added");
-                return;
-            }
+            let _one_at_a_time = admitting.lock().await;
             let voters = std::collections::BTreeSet::from([node_id]);
-            match raft
-                .change_membership(openraft::ChangeMembers::AddVoterIds(voters), false)
-                .await
-            {
-                Ok(_) => tracing::info!(node_id, "A node joined the cluster"),
-                Err(e) => {
-                    tracing::error!(node_id, error = %e, "A joining node could not be made a voter");
+            let mut added = false;
+            loop {
+                if !raft.is_leader() {
+                    tracing::error!(
+                        node_id,
+                        "No longer the leader: a joining node was not admitted"
+                    );
+                    return;
+                }
+                let step = if added {
+                    raft.change_membership(
+                        openraft::ChangeMembers::AddVoterIds(voters.clone()),
+                        false,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    raft.add_learner(node_id, node.clone(), true)
+                        .await
+                        .map(|_| ())
+                };
+                match step {
+                    Ok(()) if added => {
+                        tracing::info!(node_id, "A node joined the cluster");
+                        return;
+                    }
+                    Ok(()) => added = true,
+                    Err(e) => {
+                        tracing::warn!(node_id, error = %e, "Admitting a node: will try again");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
                 }
             }
         });

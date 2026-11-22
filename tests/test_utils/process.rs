@@ -103,6 +103,24 @@ impl ServerProcess {
         }
     }
 
+    /// A node that takes this one's place after it lost its data: the same
+    /// addresses, an empty data directory, started with `--join` pointing
+    /// at `member`. Not started yet. (This server must not be running.)
+    pub fn replacement(&self, member: &ServerProcess) -> Self {
+        assert!(
+            self.child.is_none(),
+            "the server it replaces is still running"
+        );
+        Self {
+            data_dir: TempDir::new().expect("data dir"),
+            certs: self.certs.clone(),
+            join: Some(member.raft_addr()),
+            port: self.port,
+            child: None,
+            env: self.env.clone(),
+        }
+    }
+
     /// Where other nodes reach this one.
     pub fn raft_addr(&self) -> String {
         format!("127.0.0.1:{}", self.port + 1000)

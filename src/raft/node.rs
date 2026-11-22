@@ -56,6 +56,7 @@ pub struct RaftNode {
     storage: Arc<dyn StorageEngine>,
     /// What other nodes dial to reach this one, if not `addr`.
     advertised_addr: Option<String>,
+
     /// Signalled when this node learns it has been removed from its
     /// cluster.
     removed: Arc<tokio::sync::Notify>,
@@ -235,6 +236,10 @@ impl RaftNode {
         let state_machine = LsmRaftStorage::new(storage.clone(), catalog, id)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        // A node that restarts as one of several members is not alone,
+        // whatever it was started as. Its stored membership says so, and is
+        // known now; what Raft itself reports is not, until Raft has run.
+        let alone = single_node && state_machine.member_count() <= 1;
         let applied_txn_floor = state_machine.applied_txn_floor();
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
@@ -249,18 +254,6 @@ impl RaftNode {
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
-        // A node that restarts as one of several members is not alone,
-        // whatever it was started as.
-        let alone = {
-            use openraft::async_runtime::WatchReceiver;
-            let members = raft
-                .metrics()
-                .borrow_watched()
-                .membership_config
-                .nodes()
-                .count();
-            single_node && members <= 1
-        };
         if !alone && single_node {
             let runtime = raft.runtime_config();
             runtime.tick(true);
@@ -347,10 +340,45 @@ impl RaftNode {
                 .await
                 .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
             tracing::info!(node_id = self.id, "Formed a single-node cluster");
-            self.wait_until_ready().await?;
-            return self.seed_log().await;
         }
-        self.wait_until_ready().await
+        self.wait_until_ready().await?;
+        // Not "if the cluster was formed just now": a first start can die
+        // between forming the cluster and seeding its log. Asked now, when
+        // the log has been replayed: before that, a seed entry that is in
+        // the log may not have been applied yet.
+        let seeded = self
+            .storage
+            .get(crate::raft::lsm_storage::SEEDED_KEY)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?
+            .is_some();
+        if !seeded {
+            self.seed_log().await?;
+        }
+        self.correct_own_address().await
+    }
+
+    /// Record the address this node is now told to advertise, if the
+    /// membership has another. A node alone can change it freely: nobody
+    /// else has been told the old one.
+    async fn correct_own_address(&self) -> Result<(), RaftNodeError> {
+        let Some(advertised) = &self.advertised_addr else {
+            return Ok(());
+        };
+        let recorded = self
+            .members()
+            .into_iter()
+            .find(|(id, _, _)| *id == self.id)
+            .map(|(_, addr, _)| addr);
+        if recorded.as_deref() == Some(advertised.as_str()) || !self.is_alone() {
+            return Ok(());
+        }
+        let nodes = BTreeMap::from([(self.id, Node::new(advertised.clone()))]);
+        self.raft
+            .change_membership(openraft::ChangeMembers::SetNodes(nodes), false)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        Ok(())
     }
 
     /// Put what storage already holds into the log, as the cluster's first
@@ -564,12 +592,15 @@ impl RaftNode {
         own_addr: &str,
     ) -> Result<NodeId, RaftNodeError> {
         use crate::raft::network::{request_join, JoinReply};
+        // Tells this start of this node from any other that asks from the
+        // same address (see `JoinRequest`).
+        let instance: u64 = rand::random();
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         let mut candidates: Vec<String> = members.to_vec();
         let mut last_error = String::from("no member given");
         loop {
             for member in candidates.clone() {
-                match request_join(tls_config, &member, own_addr).await {
+                match request_join(tls_config, &member, own_addr, instance).await {
                     Ok(JoinReply::Joined { node_id }) => return Ok(node_id),
                     Ok(JoinReply::NotLeader {
                         leader: Some(leader),
@@ -583,6 +614,11 @@ impl RaftNode {
                         last_error = format!("{member} knows no leader yet");
                     }
                     Ok(JoinReply::Failed(e)) => last_error = e,
+                    Ok(JoinReply::Refused(e)) => {
+                        return Err(RaftNodeError::Raft(format!(
+                            "the cluster refused this node: {e}"
+                        )))
+                    }
                     Err(e) => last_error = e,
                 }
             }

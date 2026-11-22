@@ -116,6 +116,7 @@ impl RooDbServer {
         listener: TcpListener,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), ServerError> {
+        self.follow_leadership();
         self.accept_loop(listener, async {
             // A dropped sender also means shutdown.
             let _ = shutdown_rx.await;

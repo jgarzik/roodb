@@ -163,14 +163,57 @@ impl SnapshotView for TableView {
         max_bytes: usize,
     ) -> StorageResult<(Vec<KeyValue>, bool)> {
         let mut after = after.map(<[u8]>::to_vec);
+        // Tables are read only once the position has reached where they
+        // start; `reach` extends that to a table that starts further on
+        // when nothing nearer is left.
+        let mut reach: Option<Vec<u8>> = None;
         loop {
-            // Each table gives its next stretch. A table that stopped short
-            // of its end may hold keys beyond its last one that the others
-            // have already passed, so the merged result is only good up to
-            // the earliest such stopping point.
+            // Tables with anything beyond the position.
+            let remaining: Vec<(usize, &Arc<SstableReader>)> = self
+                .tables
+                .iter()
+                .enumerate()
+                .filter(|(_, table)| {
+                    after
+                        .as_deref()
+                        .is_none_or(|after| table.metadata().max_key.as_slice() > after)
+                })
+                .collect();
+            if remaining.is_empty() {
+                return Ok((Vec::new(), true));
+            }
+            // Of those, the ones to read now, and where the nearest of the
+            // others starts. A database is mostly non-overlapping tables in
+            // key order: reading every table for every chunk would read
+            // the whole of it over and over.
+            let started = |table: &SstableReader| {
+                let min_key = table.metadata().min_key.as_slice();
+                after.as_deref().is_some_and(|after| min_key <= after)
+                    || reach.as_deref().is_some_and(|reach| min_key <= reach)
+            };
+            let next_start: Option<Vec<u8>> = remaining
+                .iter()
+                .filter(|(_, table)| !started(table))
+                .map(|(_, table)| table.metadata().min_key.clone())
+                .min();
+            let chosen: Vec<(usize, &Arc<SstableReader>)> = remaining
+                .iter()
+                .filter(|(_, table)| started(table))
+                .copied()
+                .collect();
+            if chosen.is_empty() {
+                reach = next_start;
+                continue;
+            }
+
+            // Each chosen table gives its next stretch. A table that
+            // stopped short of its end may hold keys beyond its last one
+            // that the others have already passed, so the merged result is
+            // only good up to the earliest such stopping point; and only
+            // short of where the nearest unread table starts.
             let mut merger = MergeIterator::new();
             let mut bound: Option<Vec<u8>> = None;
-            for (priority, table) in self.tables.iter().enumerate() {
+            for (priority, table) in &chosen {
                 let (entries, ended) = table.scan_after(after.as_deref(), max_bytes).await?;
                 if !ended {
                     if let Some((last, _)) = entries.last() {
@@ -179,18 +222,28 @@ impl SnapshotView for TableView {
                         }
                     }
                 }
-                merger.add(entries, priority);
+                merger.add(entries, *priority);
             }
             let mut live = merger.merge_live();
-            let Some(bound) = bound else {
-                return Ok((live, true));
-            };
-            live.retain(|(key, _)| *key <= bound);
-            if !live.is_empty() {
-                return Ok((live, false));
+            if let Some(bound) = &bound {
+                live.retain(|(key, _)| key <= bound);
             }
-            // Everything up to the stopping point was deleted: go on.
-            after = Some(bound);
+            if let Some(next_start) = &next_start {
+                live.retain(|(key, _)| key < next_start);
+            }
+            if !live.is_empty() {
+                let done = bound.is_none() && next_start.is_none();
+                return Ok((live, done));
+            }
+            // Nothing live in what was read: move on.
+            match (bound, next_start) {
+                (Some(bound), Some(next_start)) if bound >= next_start => {
+                    reach = Some(next_start);
+                }
+                (Some(bound), _) => after = Some(bound),
+                (None, Some(next_start)) => reach = Some(next_start),
+                (None, None) => return Ok((Vec::new(), true)),
+            }
         }
     }
 }

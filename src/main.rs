@@ -193,6 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             }
+            if roodb::raft::is_unspecified_address(&advertised_raft_addr) {
+                return Err(format!(
+                    "this node would tell the others to reach it at {advertised_raft_addr}, \
+                     which is no address they can use: give --advertise-host (or bind to \
+                     an address)"
+                )
+                .into());
+            }
             let id = RaftNode::request_membership(&raft_tls_config, &join, &advertised_raft_addr)
                 .await?;
             store_node_id(&data_dir, id)?;

@@ -1773,8 +1773,10 @@ impl QueryEngine {
     async fn roll_back_open_transaction(&mut self) {
         self.session.clear_pending_changes();
         if let Some(txn_id) = self.session.current_txn {
-            if let Err(e) = self.txn_manager.rollback(txn_id).await {
-                warn!(txn_id, error = %e, "Rollback failed");
+            match self.txn_manager.rollback(txn_id).await {
+                // Not found: already rolled back by a change of primary.
+                Ok(()) | Err(crate::txn::TransactionError::NotFound(_)) => {}
+                Err(e) => warn!(txn_id, error = %e, "Rollback failed"),
             }
             self.session.end_transaction();
         }
@@ -1877,7 +1879,9 @@ impl QueryEngine {
 
         if let Some(txn_id) = self.session.current_txn {
             match self.txn_manager.rollback(txn_id).await {
-                Ok(()) => {
+                // Not found: it was rolled back already, when this node
+                // stopped being the primary. That is what was asked for.
+                Ok(()) | Err(crate::txn::TransactionError::NotFound(_)) => {
                     self.session.end_transaction();
                     debug!(
                         connection_id = self.connection_id,

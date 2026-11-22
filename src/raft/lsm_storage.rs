@@ -67,6 +67,9 @@ const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
 /// A bound on the highest transaction ID applied (u64, little endian).
 const MAX_TXN_KEY: &[u8] = b"_raft:sm:max_txn_id";
 
+/// Present once the seed entry has been applied.
+pub const SEEDED_KEY: &[u8] = b"_raft:sm:seeded";
+
 /// The next node ID to hand out. The first node is 1.
 const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 
@@ -219,6 +222,13 @@ impl LsmRaftStorage {
         crate::storage::row_id::generator().restore(reserved);
 
         Ok(())
+    }
+
+    /// How many nodes the cluster has, by the membership this node has
+    /// stored. Known as soon as the state machine is loaded, before Raft
+    /// has started.
+    pub fn member_count(&self) -> usize {
+        self.cached_membership.read().nodes().count()
     }
 
     /// The highest transaction ID applied, or a bound above it. The
@@ -1094,6 +1104,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                     for (key, value) in entries {
                         batch.push((key.clone(), Some(value.clone())));
                     }
+                    batch.push((SEEDED_KEY.to_vec(), Some(vec![1])));
                     seeded = true;
                     CommandResponse::Ok(None)
                 }

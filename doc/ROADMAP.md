@@ -32,6 +32,9 @@ Needs a quiet machine for every measurement.
   to I/O reactor. Registered buffers, reactor wake-up tuning; an own
   proposal batcher above Raft only if measurements call for it.
 - `--durability fsync` at 16 and 64 threads.
+- Deadlock retries in `oltp_read_write` at 16 threads ranged from 2 to 153
+  between runs of builds that should lock alike: find out what decides it,
+  and whether locks are held longer than they need be.
 - The lock manager is one mutex, and gap locks a linear list. With row
   locking, single-thread write throughput measured about the same to 10%
   lower than before it (runs alternated on a shared machine; reads
@@ -356,6 +359,17 @@ finds. Known already, from an audit of SQL.md against a running server:
 ## Appendix — Unordered work
 
 Not yet assigned to a phase.
+
+- The functions that read system-table rows (`row_to_index_def` and its
+  siblings in `catalog/system_tables.rs`) index into the row without
+  checking its length: a malformed row panics the task that applies the
+  log. They should refuse the row instead.
+- Cluster: a member of a cluster of several cannot change the address it
+  advertises (only a node that is alone can); requests between nodes do not
+  check that the node answering is the node that was meant; the first node
+  keeps purging its whole log at each checkpoint after others have joined,
+  so a secondary that is briefly behind may be sent the whole database
+  where a few entries would do.
 
 - **Prepared statements: `SELECT *` column metadata.**
   `handle_stmt_prepare()` derives result columns from the projections in the

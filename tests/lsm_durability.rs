@@ -908,3 +908,55 @@ async fn a_replacement_is_all_or_nothing() {
     assert_eq!(all[0].0, key(1000));
     engine.close().await.unwrap();
 }
+
+/// A view over tables that do not overlap is read one table after another,
+/// and gives the same entries as a scan, also where whole tables' worth of
+/// keys have been deleted.
+#[tokio::test]
+async fn a_view_over_tables_in_key_order_matches_a_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    let key = |n: u32| format!("k{n:05}").into_bytes();
+    // Five ranges, each flushed to a table of its own.
+    for range in 0..5u32 {
+        for n in range * 1000..range * 1000 + 400 {
+            engine
+                .put(&key(n), &value_of(300, range as u8))
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+    // A later table deletes all of the first range, the start of the third
+    // and the end of the last.
+    for n in (0..400).chain(2000..2100).chain(4300..4400) {
+        engine.delete(&key(n)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    let expected = engine.scan(None, None).await.unwrap();
+    assert_eq!(expected.len(), 5 * 400 - 600);
+    let view = engine.snapshot_view().await.unwrap();
+    for chunk_bytes in [1, 8 * 1024, 1 << 20] {
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (chunk, done) = view
+                .next_chunk(after.as_deref(), chunk_bytes)
+                .await
+                .unwrap();
+            if let Some(last) = chunk.last() {
+                after = Some(last.0.clone());
+            }
+            seen.extend(chunk);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            seen == expected,
+            "chunks of {chunk_bytes} bytes differ from a scan"
+        );
+    }
+    engine.close().await.unwrap();
+}

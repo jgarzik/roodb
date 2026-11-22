@@ -216,7 +216,14 @@ async fn another_node_takes_over_when_the_primary_dies() {
         .unwrap();
 
     // The old primary returns. It remembers its cluster, follows the new
-    // primary, and is read-only.
+    // primary, and is read-only. It does not take the role back: the
+    // primary stays who it is.
+    let primary_id = |seen: &[(u64, String, String)]| {
+        seen.iter()
+            .find(|(_, _, role)| role == "PRIMARY")
+            .map(|(id, _, _)| *id)
+    };
+    let before = primary_id(&members(&mut primary).await).expect("a primary");
     first.start();
     let mut returned = connect(&first).await;
     let all: Vec<i32> = (0..=50).collect();
@@ -240,6 +247,13 @@ async fn another_node_takes_over_when_the_primary_dies() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Still the same primary, and it kept its open connection's session:
+    // it was never deposed in between.
+    primary
+        .query_drop("INSERT INTO kept VALUES (51)")
+        .await
+        .unwrap();
+    assert_eq!(primary_id(&members(&mut primary).await), Some(before));
 }
 
 /// A secondary that was down while the primary went on comes back and
@@ -587,6 +601,14 @@ async fn the_primary_role_can_be_moved() {
         .expect_err("a secondary moved the primary role");
     assert_eq!(error_code(&err), 1290, "{err}");
 
+    // A transaction open on the primary when the role moves is rolled
+    // back; its session can say ROLLBACK afterwards without being told off.
+    let mut open = connect(&first).await;
+    open.query_drop("BEGIN").await.unwrap();
+    open.query_drop("INSERT INTO formed VALUES (40)")
+        .await
+        .unwrap();
+
     conn.query_drop("ALTER CLUSTER SET PRIMARY 2")
         .await
         .unwrap();
@@ -632,4 +654,77 @@ async fn the_primary_role_can_be_moved() {
         &[1, 2],
     )
     .await;
+    open.query_drop("ROLLBACK")
+        .await
+        .expect("ROLLBACK of a transaction already rolled back");
+}
+
+/// Two nodes that ask to join at the same moment are both admitted and
+/// both become voting members.
+#[tokio::test]
+async fn nodes_joining_at_once_are_all_admitted() {
+    let mut first = ServerProcess::init(&[]);
+    first.start();
+    let mut second = first.joiner();
+    let mut third = first.joiner();
+    std::thread::scope(|scope| {
+        scope.spawn(|| second.start());
+        scope.spawn(|| third.start());
+    });
+    let mut primary = connect(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let seen = members(&mut primary).await;
+        let voters = seen.iter().filter(|(_, _, role)| role != "LEARNER").count();
+        if seen.len() == 3 && voters == 3 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not all were admitted: {seen:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A node that lost its data cannot simply start over at the same address
+/// and be handed its old place: the cluster still counts on what the old
+/// node had. It is refused until the old node has been removed.
+#[tokio::test]
+async fn a_node_that_lost_its_data_does_not_get_its_old_place() {
+    let [first, second, mut third] = cluster_of_three().await;
+    let mut primary = connect(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut primary)
+        .await
+        .iter()
+        .filter(|(_, _, role)| role == "SECONDARY")
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "the joiners never became voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let lost_id = members(&mut primary)
+        .await
+        .iter()
+        .find(|(_, addr, _)| *addr == third.raft_addr())
+        .map(|(id, _, _)| *id)
+        .expect("the third node is a member");
+    third.kill();
+
+    let mut empty = third.replacement(&first);
+    let log = empty.start_expecting_exit();
+    assert!(
+        log.contains("is a member already"),
+        "the node was not refused, or not told why:\n{log}"
+    );
+
+    // Removed first, the machine can join again, as a new node.
+    primary
+        .query_drop(format!("ALTER CLUSTER REMOVE NODE {lost_id}"))
+        .await
+        .unwrap();
+    let mut again = third.replacement(&first);
+    again.start();
+    let mut conn = connect(&again).await;
+    until_rows(&mut conn, &again, "SELECT id FROM formed", &[1]).await;
+    let _ = &second;
 }
