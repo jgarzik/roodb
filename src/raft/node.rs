@@ -479,6 +479,38 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Hand the primary role to another node. Only the primary can, and
+    /// only to a voting member. Returns when the request has been made; the
+    /// other node takes over within moments, and this one becomes a
+    /// secondary (rolling back its open transactions, as on any change of
+    /// primary).
+    pub async fn transfer_primary(&self, to: NodeId) -> Result<(), RaftNodeError> {
+        if !self.raft.is_leader() {
+            return Err(RaftNodeError::Raft(NOT_PRIMARY.to_string()));
+        }
+        if to == self.id {
+            return Ok(());
+        }
+        match self.members().iter().find(|(id, _, _)| *id == to) {
+            Some((_, _, "SECONDARY")) => {}
+            Some(_) => {
+                return Err(RaftNodeError::Raft(format!(
+                    "Node {to} is still being brought up to date and cannot be the primary yet"
+                )))
+            }
+            None => {
+                return Err(RaftNodeError::Raft(format!(
+                    "Node {to} is not a member of the cluster"
+                )))
+            }
+        }
+        self.raft
+            .trigger()
+            .transfer_leader(to)
+            .await
+            .map_err(|e| RaftNodeError::Raft(e.to_string()))
+    }
+
     /// Call `removed` once, if this node finds that it has been taken out
     /// of its cluster: it is told so by the leader, or sees a membership
     /// it is no longer part of.
@@ -851,29 +883,43 @@ async fn handle_rpc_connection(
     acceptor: TlsAcceptor,
     handler: Arc<RaftRpcHandler>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Requests and answers are small and each is waited for: they must go
+    // out at once, not sit waiting for more to send with them.
+    stream.set_nodelay(true)?;
     let mut tls_stream = acceptor.accept(stream).await?;
 
-    // Read: [msg_type: u8][len: u32][body]
-    let msg_type = tls_stream.read_u8().await?;
-    let len = tls_stream.read_u32().await? as usize;
+    // A peer keeps its connection and sends one request after another.
+    loop {
+        // Read: [msg_type: u8][len: u32][body]
+        let msg_type = match tls_stream.read_u8().await {
+            Ok(msg_type) => msg_type,
+            // The peer has closed the connection between requests, cleanly
+            // or not: either way there is no request to answer.
+            Err(_) => return Ok(()),
+        };
+        let len = tls_stream.read_u32().await? as usize;
 
-    let mut body = vec![0u8; len];
-    tls_stream.read_exact(&mut body).await?;
+        let mut body = vec![0u8; len];
+        tls_stream.read_exact(&mut body).await?;
 
-    // Process request. A snapshot's contents follow its request on the
-    // connection.
-    let response = if RaftRpcHandler::is_snapshot(msg_type) {
-        handler.receive_snapshot(&body, &mut tls_stream).await?
-    } else {
-        handler.handle_request(msg_type, &body).await?
-    };
+        // Process request. A snapshot's contents follow its request on the
+        // connection.
+        let response = if RaftRpcHandler::is_snapshot(msg_type) {
+            handler.receive_snapshot(&body, &mut tls_stream).await?
+        } else {
+            handler.handle_request(msg_type, &body).await?
+        };
 
-    // Write response: [len: u32][body]
-    tls_stream.write_u32(response.len() as u32).await?;
-    tls_stream.write_all(&response).await?;
-    tls_stream.flush().await?;
-
-    Ok(())
+        // Write response: [len: u32][body], as one piece. Written as two,
+        // the second would wait for the peer to acknowledge the first, which
+        // a peer with nothing to send puts off for tens of milliseconds:
+        // longer than the peer waits for an answer.
+        let mut framed = Vec::with_capacity(4 + response.len());
+        framed.extend_from_slice(&(response.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&response);
+        tls_stream.write_all(&framed).await?;
+        tls_stream.flush().await?;
+    }
 }
 
 impl Drop for RaftNode {

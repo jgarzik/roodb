@@ -1672,6 +1672,7 @@ impl QueryEngine {
     }
 
     /// `ALTER CLUSTER REMOVE NODE id`: take a node out of the cluster.
+    /// `ALTER CLUSTER SET PRIMARY id`: hand the primary role to a node.
     async fn try_handle_alter_cluster(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
         let statement = sql.trim().trim_end_matches(';').trim();
         let upper = statement.to_uppercase();
@@ -1679,21 +1680,31 @@ impl QueryEngine {
         if (words.next(), words.next()) != (Some("ALTER"), Some("CLUSTER")) {
             return Ok(None);
         }
-        let id = match (words.next(), words.next(), words.next(), words.next()) {
-            (Some("REMOVE"), Some("NODE"), Some(id), None) => id.parse::<u64>().ok(),
+        /// What an `ALTER CLUSTER` statement asks for.
+        enum Change {
+            Remove(u64),
+            SetPrimary(u64),
+        }
+        let change = match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("REMOVE"), Some("NODE"), Some(id), None) => id.parse().ok().map(Change::Remove),
+            (Some("SET"), Some("PRIMARY"), Some(id), None) => {
+                id.parse().ok().map(Change::SetPrimary)
+            }
             _ => None,
         };
-        let Some(id) = id else {
+        let Some(change) = change else {
             return self
                 .send_error(
                     codes::ER_PARSE_ERROR,
                     states::SYNTAX_ERROR,
-                    "Expected: ALTER CLUSTER REMOVE NODE <node id>",
+                    "Expected: ALTER CLUSTER REMOVE NODE <node id>, \
+                     or ALTER CLUSTER SET PRIMARY <node id>",
                 )
                 .await
                 .map(Some);
         };
-        // Who is in the cluster is the administrator's to decide.
+        // Who is in the cluster, and who leads it, is the administrator's
+        // to decide.
         if self.session.user != "root" {
             return self
                 .send_error(
@@ -1704,7 +1715,11 @@ impl QueryEngine {
                 .await
                 .map(Some);
         }
-        match self.raft_node.remove_member(id).await {
+        let result = match change {
+            Change::Remove(id) => self.raft_node.remove_member(id).await,
+            Change::SetPrimary(id) => self.raft_node.transfer_primary(id).await,
+        };
+        match result {
             Ok(()) => self.send_ok(0, 0).await.map(Some),
             Err(e) => self
                 .send_error(

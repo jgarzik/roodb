@@ -321,6 +321,10 @@ SHOW CLUSTER MEMBERS;
 
 -- on the primary, as root: take node 3 out of the cluster
 ALTER CLUSTER REMOVE NODE 3;
+
+-- on the primary, as root: make node 2 the primary (before maintenance on
+-- this node, say)
+ALTER CLUSTER SET PRIMARY 2;
 ```
 
 A removed node is told, and stops; one that was down at the time finds out

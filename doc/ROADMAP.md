@@ -31,10 +31,6 @@ the primary fails, and nodes can be listed and removed. What is left:
 - On Windows a file that is open cannot be deleted, so a table file that
   compaction retires while a snapshot view holds it stays behind until the
   next start. Retire such files when the last view lets go of them.
-- Moving the primary role to another node on request (today the only way
-  is to stop the primary).
-- Persistent RPC connections between nodes (today one connection per
-  request).
 - admin.md: a troubleshooting section for clusters (no majority, a node
   that cannot be reached at its advertised address, certificates from
   different CAs); README.md: the replication model as it now is.

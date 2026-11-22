@@ -467,6 +467,7 @@ not interpreted; lines that cannot be inserted are skipped.
 | `CHECK TABLE t`, `CHECKSUM TABLE t` | Return a fixed `OK` status row; nothing is checked |
 | `FLUSH ...` | Accepted, no effect |
 | `ALTER CLUSTER REMOVE NODE id` | Takes a node out of the cluster. On the primary, as `root`. The node stops by itself. See [admin.md](admin.md#deployment-modes) |
+| `ALTER CLUSTER SET PRIMARY id` | Hands the primary role to another voting node. On the primary, as `root`. Open transactions on the old primary are rolled back |
 | `LOCK TABLES ...`, `UNLOCK TABLES` | Accepted, no effect |
 | `OPTIMIZE TABLE`, `REPAIR TABLE`, `HANDLER`, `KILL`, `XA` | Not supported |
 

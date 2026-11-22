@@ -139,7 +139,9 @@ impl ServerProcess {
                     .iter()
                     .flat_map(|member| ["--join", member.as_str()]),
             )
-            .stdout(Stdio::null())
+            // The server logs to standard output; panics and fatal errors go
+            // to standard error. Both are wanted when a test fails.
+            .stdout(log.try_clone().expect("clone log handle"))
             .stderr(log);
         for (key, value) in &self.env {
             command.env(key, value);

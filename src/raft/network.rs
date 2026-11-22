@@ -37,6 +37,12 @@ struct SnapshotHeader {
 /// About how much of a snapshot travels in one frame.
 const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// The largest frame of a snapshot that is accepted: one entry of the
+/// largest size storage holds, and room for the rest of a chunk.
+const SNAPSHOT_FRAME_LIMIT: usize = crate::storage::lsm::block::MAX_VALUE_SIZE
+    + crate::storage::lsm::block::MAX_KEY_SIZE
+    + 2 * SNAPSHOT_CHUNK_BYTES;
+
 /// How long a snapshot transfer may make no progress before it is given up.
 const SNAPSHOT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -65,6 +71,7 @@ enum MessageType {
     Removed = 8,
     Members = 9,
     SnapshotStream = 10,
+    TransferLeader = 11,
 }
 
 /// What a node says when asked who is in the cluster.
@@ -84,6 +91,7 @@ pub async fn ask_members(tls_config: &RaftTlsConfig, addr: &str) -> Result<Membe
         target: 0,
         addr: Some(addr.to_string()),
         tls_config: tls_config.clone(),
+        stream: tokio::sync::Mutex::new(None),
     };
     connection
         .send_request(MessageType::Members, &(), std::time::Duration::from_secs(5))
@@ -117,6 +125,7 @@ pub async fn notify_removed(tls_config: &RaftTlsConfig, addr: &str) {
         target: 0,
         addr: Some(addr.to_string()),
         tls_config: tls_config.clone(),
+        stream: tokio::sync::Mutex::new(None),
     };
     for _ in 0..5 {
         let sent: Result<bool, String> = connection
@@ -161,6 +170,7 @@ pub async fn request_join(
         target: 0,
         addr: Some(member.to_string()),
         tls_config: tls_config.clone(),
+        stream: tokio::sync::Mutex::new(None),
     };
     connection
         .send_request(
@@ -187,6 +197,7 @@ impl TryFrom<u8> for MessageType {
             8 => Ok(Self::Removed),
             9 => Ok(Self::Members),
             10 => Ok(Self::SnapshotStream),
+            11 => Ok(Self::TransferLeader),
             _ => Err(()),
         }
     }
@@ -232,19 +243,52 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
             target,
             addr,
             tls_config: self.tls_config.clone(),
+            stream: tokio::sync::Mutex::new(None),
         }
     }
 }
+
+type PeerStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 /// A single network connection to a Raft peer
 pub struct RaftNetworkConnection {
     target: NodeId,
     /// `host:port`; a host name is resolved each time a connection is made.
     addr: Option<String>,
+    /// The connection to the peer, kept between requests. Taken out for the
+    /// length of a request and put back when the request has been answered,
+    /// so a request that fails or is abandoned half way leaves none behind.
+    stream: tokio::sync::Mutex<Option<PeerStream>>,
     tls_config: RaftTlsConfig,
 }
 
 impl RaftNetworkConnection {
+    /// Open a connection to the peer.
+    async fn connect(&self, addr: &str) -> Result<PeerStream, String> {
+        let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        // Each request is waited for: send it at once.
+        stream.set_nodelay(true).map_err(|e| e.to_string())?;
+        let connector = TlsConnector::from(self.tls_config.client_config());
+        // Cluster certificates are issued for this name, whatever the address.
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").map_err(|e| e.to_string())?;
+        connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Send one framed request and read the framed reply.
+    async fn round_trip(stream: &mut PeerStream, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        stream.write_all(request).await?;
+        stream.flush().await?;
+        // Response: [len: u32][body]
+        let len = stream.read_u32().await? as usize;
+        let mut response = vec![0u8; len];
+        stream.read_exact(&mut response).await?;
+        Ok(response)
+    }
+
     /// Send one request and read its reply, giving up after `limit`. A peer
     /// that has stopped answering must not hold up replication to it for
     /// ever: openraft leaves the time limit to the transport.
@@ -288,41 +332,33 @@ impl RaftNetworkConnection {
             .as_deref()
             .ok_or_else(|| fail(&"address not configured"))?;
 
-        // Connect with TLS
-        let stream = TcpStream::connect(addr).await.map_err(|e| fail(&e))?;
-        let connector = TlsConnector::from(self.tls_config.client_config());
-        // Cluster certificates are issued for this name, whatever the address.
-        let server_name =
-            rustls::pki_types::ServerName::try_from("localhost").map_err(|e| fail(&e))?;
-        let mut tls_stream = connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| fail(&e))?;
-
+        // Use the connection kept from the last request, or make one. A kept
+        // connection may have been closed by the peer meanwhile (it
+        // restarted, say); then the request is made once more on a new one.
         let body = bincode::serialize(request).map_err(|e| fail(&e))?;
-
-        // Send: [msg_type: u8][len: u32][body]
         let len = u32::try_from(body.len()).map_err(|_| fail(&"request larger than 4 GiB"))?;
         let mut buf = BytesMut::with_capacity(5 + body.len());
         buf.put_u8(msg_type as u8);
         buf.put_u32(len);
         buf.put_slice(&body);
-        tls_stream.write_all(&buf).await.map_err(|e| fail(&e))?;
-        tls_stream.flush().await.map_err(|e| fail(&e))?;
 
-        // Read response: [len: u32][body]
-        let mut len_buf = [0u8; 4];
-        tls_stream
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| fail(&e))?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut resp_buf = vec![0u8; len];
-        tls_stream
-            .read_exact(&mut resp_buf)
-            .await
-            .map_err(|e| fail(&e))?;
-
+        let kept = self.stream.lock().await.take();
+        let reused = kept.is_some();
+        let mut tls_stream = match kept {
+            Some(stream) => stream,
+            None => self.connect(addr).await.map_err(|e| fail(&e))?,
+        };
+        let resp_buf = match Self::round_trip(&mut tls_stream, &buf).await {
+            Ok(resp) => resp,
+            Err(_) if reused => {
+                tls_stream = self.connect(addr).await.map_err(|e| fail(&e))?;
+                Self::round_trip(&mut tls_stream, &buf)
+                    .await
+                    .map_err(|e| fail(&e))?
+            }
+            Err(e) => return Err(fail(&e)),
+        };
+        *self.stream.lock().await = Some(tls_stream);
         bincode::deserialize(&resp_buf).map_err(|e| fail(&e))
     }
 }
@@ -356,6 +392,16 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         option: RPCOption,
     ) -> Result<VoteResponse, RPCError<TypeConfig>> {
         self.send_request(MessageType::Vote, &req, option.soft_ttl())
+            .await
+            .map_err(|e| RPCError::Unreachable(unreachable(e)))
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        req: openraft::raft::TransferLeaderRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<openraft::raft::TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
+        self.send_request(MessageType::TransferLeader, &req, option.soft_ttl())
             .await
             .map_err(|e| RPCError::Unreachable(unreachable(e)))
     }
@@ -490,6 +536,8 @@ pub struct RaftRpcHandler {
     tls_config: RaftTlsConfig,
     /// Where a snapshot sent to this node is written.
     storage: Arc<dyn crate::storage::StorageEngine>,
+    /// Held while a snapshot is being received.
+    receiving_snapshot: tokio::sync::Mutex<()>,
 }
 
 impl RaftRpcHandler {
@@ -506,6 +554,7 @@ impl RaftRpcHandler {
             removed,
             tls_config,
             storage,
+            receiving_snapshot: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -523,8 +572,19 @@ impl RaftRpcHandler {
     where
         S: tokio::io::AsyncRead + Unpin,
     {
+        use openraft::async_runtime::WatchReceiver;
         use tokio::io::AsyncReadExt;
         let header: SnapshotHeader = bincode::deserialize(header).map_err(|e| e.to_string())?;
+        // A snapshot from a leader this node has already moved on from
+        // would be refused in the end; refuse it before any of it is
+        // written.
+        if header.vote < self.raft.metrics().borrow_watched().vote {
+            return Err("the snapshot comes from a leader that has been superseded".to_string());
+        }
+        // One at a time: a second sender would only fill the disk.
+        let Ok(_receiving) = self.receiving_snapshot.try_lock() else {
+            return Err("another snapshot is being received".to_string());
+        };
         let mut ingest = self
             .storage
             .clone()
@@ -534,6 +594,11 @@ impl RaftRpcHandler {
         loop {
             let frame = async {
                 let len = stream.read_u32().await? as usize;
+                // A frame is a batch of whole entries: about a chunk, or
+                // one entry if that is larger. Nothing honest is bigger.
+                if len > SNAPSHOT_FRAME_LIMIT {
+                    return Err(std::io::Error::other("snapshot frame too large"));
+                }
                 let mut body = vec![0u8; len];
                 stream.read_exact(&mut body).await?;
                 Ok::<_, std::io::Error>(body)
@@ -671,6 +736,17 @@ impl RaftRpcHandler {
                     .await
                     .map_err(|e| e.to_string())?
                     .into();
+                let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
+                Ok(Bytes::from(encoded))
+            }
+            MessageType::TransferLeader => {
+                let req: openraft::raft::TransferLeaderRequest<TypeConfig> =
+                    bincode::deserialize(body).map_err(|e| e.to_string())?;
+                let resp = self
+                    .raft
+                    .handle_transfer_leader(req)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }

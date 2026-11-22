@@ -558,3 +558,78 @@ async fn a_node_removed_while_down_does_not_come_back() {
         .await
         .unwrap();
 }
+
+/// The primary role can be handed to another node on request.
+#[tokio::test]
+async fn the_primary_role_can_be_moved() {
+    let [first, second, third] = cluster_of_three().await;
+    let mut conn = connect(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut conn)
+        .await
+        .iter()
+        .filter(|(_, _, role)| role == "SECONDARY")
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "the joiners never became voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Not to a node that is not there, and not from a secondary.
+    assert!(conn
+        .query_drop("ALTER CLUSTER SET PRIMARY 9")
+        .await
+        .is_err());
+    let mut on_second = connect(&second).await;
+    let err = on_second
+        .query_drop("ALTER CLUSTER SET PRIMARY 2")
+        .await
+        .expect_err("a secondary moved the primary role");
+    assert_eq!(error_code(&err), 1290, "{err}");
+
+    conn.query_drop("ALTER CLUSTER SET PRIMARY 2")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let seen = members(&mut conn).await;
+        if seen
+            .iter()
+            .any(|(id, _, role)| *id == 2 && role == "PRIMARY")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 2 never became primary: {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Node 2 is one of the two joiners; it takes writes now, and the first
+    // node does not.
+    let nodes = [&second, &third];
+    let leader = find_primary(&nodes).await;
+    let mut primary = connect(nodes[leader]).await;
+    primary
+        .query_drop("INSERT INTO formed VALUES (2)")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match conn.query_drop("INSERT INTO formed VALUES (3)").await {
+            Err(e) if error_code(&e) == 1290 => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the old primary still takes writes: {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    until_rows(
+        &mut conn,
+        &first,
+        "SELECT id FROM formed ORDER BY id",
+        &[1, 2],
+    )
+    .await;
+}
