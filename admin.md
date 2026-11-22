@@ -40,6 +40,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 | `--raft-port` | `ROODB_RAFT_PORT` | port + 1000 | Port for traffic between the nodes of a cluster |
 | `--advertise-host` | `ROODB_ADVERTISE_HOST` | the bind address | Host name or address at which other nodes reach this one. Needed when binding to 0.0.0.0 |
 | `--log-budget-mb` | `ROODB_LOG_BUDGET_MB` | 256 | How much log may accumulate before memory is written out to table files and the log shortened. Bounds the log's disk use and the replay work of a restart |
+| `--connection-threads` | `ROODB_CONNECTION_THREADS` | 0 | Threads that serve client connections; 0 means one per core. Each connection is served on one of them, the least busy when it connects |
 | `--log-segment-mb` | `ROODB_LOG_SEGMENT_MB` | 64 | Size of the files the log is kept in; the log is shortened a whole file at a time. Applies to files created from then on |
 | `--join` | `ROODB_JOIN` | (none) | `host:raft-port` of a member of the cluster to join (several, comma-separated). For a node starting on an empty data directory |
 

@@ -28,8 +28,14 @@ Needs a quiet machine for every measurement.
 - `oltp_read_only` (range reads, sorts, aggregates over real rows) is
   behind MySQL at 16 threads (9.5k against 12.1k TPS) and only 1.35x ahead
   at 1 and 64: find what its range queries cost.
-- Point selects are 1.25x to 1.4x ahead of MySQL at 16 and 64 threads (2.5x
-  at one thread): find the limit on the read path.
+- Connections that share a connection thread wait for each other's long
+  computations (a big sort, an aggregate over many rows): have long
+  operators give way at intervals, and consider moving a connection to a
+  quieter thread between statements.
+- Per statement, a point select costs the server about 7 µs of CPU, 3 µs
+  of it in the kernel's socket path. In the rest: the plan and its
+  expressions are cloned for every execution of a prepared statement, and
+  about 9% is malloc/free.
 - Reads from table files are about half the speed of reads from memory.
 - Commit latency at one thread: the hops from session to Raft to log writer
   to I/O reactor. Registered buffers, reactor wake-up tuning; an own

@@ -1,6 +1,7 @@
 //! Server module for RooDB
 
 pub mod auth;
+pub mod conn_threads;
 pub mod context;
 pub mod handler;
 pub mod limits;

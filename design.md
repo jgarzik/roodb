@@ -27,7 +27,9 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 └─────────────────────────────────────┘
 ```
 
-**Tasks vs Threads**: Tasks are lightweight async coroutines (green threads), not OS threads. Thousands of connections share a handful of OS threads. Each connection spawns one task via `tokio::spawn`.
+**Tasks vs Threads**: Tasks are lightweight async coroutines (green threads), not OS threads. Thousands of connections share a handful of OS threads. Each connection is one task.
+
+**Connection threads** (`server/conn_threads.rs`): connections are served on threads of their own, one per core by default (`--connection-threads`), each running an async runtime with its own I/O event loop. A new connection goes to the thread with the fewest open connections and stays there. With one runtime for everything there is one event loop, and for short requests it hands work to the runtime's threads almost one at a time: a few cores were busy however many clients were connected (point selects: about 0.4 million a second at 64 clients, against 1.5 million with a loop per thread). Raft, the storage engine's background work and the accept loop stay on the main runtime; file I/O goes to the I/O engine's own threads from wherever it is asked for. Connections that share a thread take turns between awaits: a statement that computes for long delays the others on its thread, not those on other threads.
 
 **Yielding Behavior**:
 
@@ -415,7 +417,7 @@ pub struct RooDbServer {
 2. Accept connection
 3. Assign connection ID (atomic increment)
 4. Clone shared state
-5. `tokio::spawn(handle_connection(...))`
+5. Hand the connection to a connection thread (`ConnectionThreads::serve`), which runs `handle_connection(...)`
 
 **`handle_connection()`** (`handler.rs`):
 1. STARTTLS handshake (plaintext → TLS)

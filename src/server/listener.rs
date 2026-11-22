@@ -13,6 +13,7 @@ use crate::catalog::Catalog;
 use crate::protocol::tds::{self, connection::TdsAcceptors};
 use crate::raft::LogStore;
 use crate::raft::RaftNode;
+use crate::server::conn_threads::ConnectionThreads;
 use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
 use crate::storage::{set_node_id, StorageEngine};
@@ -37,6 +38,8 @@ pub struct RooDbServer {
     tds_acceptors: TdsAcceptors,
     /// Address of the TDS listener, if enabled
     tds_addr: Option<SocketAddr>,
+    /// How many threads serve connections; 0 means one per core.
+    connection_threads: usize,
     ctx: ServerContext,
 }
 
@@ -60,6 +63,7 @@ impl RooDbServer {
             tls_acceptor: TlsAcceptor::from(tls_config.server_config()),
             tds_acceptors: TdsAcceptors::new(&tls_config),
             tds_addr: None,
+            connection_threads: 0,
             ctx: ServerContext::new(storage, catalog, txn_manager, raft_node),
         }
     }
@@ -67,6 +71,13 @@ impl RooDbServer {
     /// Also accept TDS (SQL Server protocol) clients on `addr`.
     pub fn enable_tds(mut self, addr: SocketAddr) -> Self {
         self.tds_addr = Some(addr);
+        self
+    }
+
+    /// Serve connections on `count` threads (see `conn_threads`); 0, the
+    /// default, means one per core.
+    pub fn connection_threads(mut self, count: usize) -> Self {
+        self.connection_threads = count;
         self
     }
 
@@ -80,8 +91,8 @@ impl RooDbServer {
         self.run_until(std::future::pending()).await
     }
 
-    /// Serve clients until `shutdown` completes, then stop accepting and
-    /// return. Connections already open are left to their tasks.
+    /// Serve clients until `shutdown` completes, then stop accepting,
+    /// close the connections still open, and return.
     pub async fn run_until(
         self,
         shutdown: impl std::future::Future<Output = ()>,
@@ -144,6 +155,11 @@ impl RooDbServer {
             None => None,
         };
 
+        // Dropped when this returns, which stops the threads and with them
+        // the connections still open.
+        let threads = ConnectionThreads::start(self.connection_threads)?;
+        tracing::info!(threads = threads.count(), "Connection threads started");
+
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
@@ -152,23 +168,27 @@ impl RooDbServer {
                         continue;
                     };
                     // Handle connection with STARTTLS (TLS upgrade happens in handler)
-                    tokio::spawn(handle_connection(
-                        stream,
-                        peer_addr,
-                        self.tls_acceptor.clone(),
-                        self.ctx.clone(),
-                    ));
+                    let acceptor = self.tls_acceptor.clone();
+                    let ctx = self.ctx.clone();
+                    let served = threads.serve(stream, move |stream| {
+                        handle_connection(stream, peer_addr, acceptor, ctx)
+                    });
+                    if let Err(e) = served {
+                        tracing::warn!(error = %e, "Could not serve an accepted connection");
+                    }
                 }
                 result = accept_optional(&tds_listener) => {
                     let Some((stream, peer_addr)) = accepted(result).await else {
                         continue;
                     };
-                    tokio::spawn(tds::connection::serve(
-                        stream,
-                        peer_addr,
-                        self.tds_acceptors.clone(),
-                        self.ctx.clone(),
-                    ));
+                    let acceptors = self.tds_acceptors.clone();
+                    let ctx = self.ctx.clone();
+                    let served = threads.serve(stream, move |stream| {
+                        tds::connection::serve(stream, peer_addr, acceptors, ctx)
+                    });
+                    if let Err(e) = served {
+                        tracing::warn!(error = %e, "Could not serve an accepted connection");
+                    }
                 }
                 _ = &mut shutdown => {
                     tracing::info!("RooDB server shutting down");

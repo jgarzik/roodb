@@ -65,6 +65,10 @@ struct Cli {
     /// a whole file at a time.
     #[arg(long, default_value = "64", env = "ROODB_LOG_SEGMENT_MB")]
     log_segment_mb: u64,
+    /// Threads that serve client connections; 0 means one per core. Each
+    /// connection is served on one of them.
+    #[arg(long, default_value = "0", env = "ROODB_CONNECTION_THREADS")]
+    connection_threads: usize,
 }
 
 /// The file in the data directory that holds this node's ID.
@@ -127,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advertise_host,
         log_budget_mb,
         log_segment_mb,
+        connection_threads,
     } = Cli::parse();
 
     tracing::info!(port, ?data_dir, "Starting RooDB");
@@ -271,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tds_port) = tds_port {
         server = server.enable_tds(SocketAddr::new(bind, tds_port));
     }
+    server = server.connection_threads(connection_threads);
     // A node that is taken out of its cluster stops, as if asked to.
     let removed = Arc::new(tokio::sync::Notify::new());
     {
