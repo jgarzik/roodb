@@ -365,6 +365,10 @@ Not yet assigned to a phase.
   siblings in `catalog/system_tables.rs`) index into the row without
   checking its length: a malformed row panics the task that applies the
   log. They should refuse the row instead.
+- Seen once, in a full run of the tests and not in 25 repeats of the crash
+  tests alone: a restarted server (`generated_ids_do_not_repeat_after_a_kill`)
+  answered the harness's TCP probe, and the first real connection was then
+  reset by the peer, with nothing in the server's log. Find what closed it.
 - Cluster: a member of a cluster of several cannot change the address it
   advertises (only a node that is alone can); requests between nodes do not
   check that the node answering is the node that was meant; the first node

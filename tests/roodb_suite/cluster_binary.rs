@@ -91,7 +91,7 @@ fn error_code(e: &mysql_async::Error) -> u16 {
 }
 
 /// Start a cluster of three: the first server and two that join it. Returns
-/// once both joiners hold what the first one has.
+/// once both joiners hold what the first one has and are voting members.
 async fn cluster_of_three() -> [ServerProcess; 3] {
     let mut first = ServerProcess::init(&[]);
     first.start();
@@ -111,6 +111,20 @@ async fn cluster_of_three() -> [ServerProcess; 3] {
     for node in [&second, &third] {
         let mut conn = connect(node).await;
         until_rows(&mut conn, node, "SELECT id FROM formed", &[1]).await;
+    }
+    // And until both have a vote. A node is admitted in steps; a cluster
+    // whose primary dies before the joiners can vote has nobody to choose
+    // another.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while members(&mut primary)
+        .await
+        .iter()
+        .filter(|(_, _, role)| role == "SECONDARY")
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < deadline, "the joiners never became voters");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     [first, second, third]
 }
