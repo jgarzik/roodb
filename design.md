@@ -129,6 +129,7 @@ system tables.
 **Types**:
 - `DataType`: Boolean, TinyInt, SmallInt, Int, BigInt, BigIntUnsigned, Float, Double, Decimal, Varchar(n), Text, Blob, Bit(n) (n = 1..64, held as a u64), Timestamp, Json, Geometry
 - `ColumnDef`: name, data_type, nullable, default, auto_increment
+- AUTO_INCREMENT (`txn/auto_inc.rs`): one counter per table. The primary holds each table's next value in memory and inserts take values from it. Every inserted row of such a table carries the counter's value after it (`RowChange::auto_inc`); applying the row raises the stored counter (key `autoinc:<table>`) to that, so the counter is replicated and there after a restart. The memory copy is loaded from the stored one on first use, and dropped when the table is dropped or the node becomes primary.
 - `TableDef`: name, columns, constraints
 - `Constraint`: PrimaryKey, Unique, ForeignKey, Check
 

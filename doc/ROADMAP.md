@@ -326,6 +326,14 @@ finds. Known already, from an audit of SQL.md against a running server:
   with an index out of bounds.
 
 **Statements**
+- `AUTO_INCREMENT`: `TRUNCATE` does not reset the counter; the
+  `AUTO_INCREMENT=n` table option (CREATE and ALTER) is ignored and
+  `SHOW CREATE TABLE` does not show the counter; no error 1467 when the
+  column's type runs out; `auto_increment_increment` and
+  `auto_increment_offset` are not honoured; unsigned columns above
+  `BIGINT`'s positive range. Check `REPLACE` and `LOAD DATA` draw from the
+  table's counter. An insert into a table with a primary key still takes
+  (and wastes) a generated row ID per row.
 - `REPLACE` never replaces, and is parsed with a regular expression.
 - `UPDATE` and `DELETE` triggers never fire; `BEFORE INSERT` runs after the
   insert; `INSERT ... SELECT` fires nothing.

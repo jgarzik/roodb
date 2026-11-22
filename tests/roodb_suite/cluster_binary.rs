@@ -399,6 +399,16 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
         .query_drop("CREATE TABLE nokey (n INT)")
         .await
         .unwrap();
+    // A table with an AUTO_INCREMENT key: its counter is the cluster's, not
+    // the node's, and carries on under whoever is primary.
+    primary
+        .query_drop("CREATE TABLE counted (id INT AUTO_INCREMENT PRIMARY KEY, n INT)")
+        .await
+        .unwrap();
+    primary
+        .query_drop("INSERT INTO counted (n) VALUES (1), (2), (3)")
+        .await
+        .unwrap();
     for n in 0..30 {
         primary
             .query_drop(format!("INSERT INTO nokey VALUES ({n})"))
@@ -411,6 +421,15 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
     let survivors = [&second, &third];
     let leader = find_primary(&survivors).await;
     let mut primary = connect(survivors[leader]).await;
+    primary
+        .query_drop("INSERT INTO counted (n) VALUES (4), (5)")
+        .await
+        .unwrap();
+    let counted: Vec<i32> = primary
+        .query("SELECT id FROM counted ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(counted, vec![1, 2, 3, 4, 5]);
     for n in 30..60 {
         primary
             .query_drop(format!("INSERT INTO nokey VALUES ({n})"))

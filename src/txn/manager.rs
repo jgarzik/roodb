@@ -48,12 +48,32 @@ pub struct TransactionManager {
     /// Row locks held by the transactions of this node. They are released
     /// here, when a transaction ends, however it ends.
     locks: Arc<LockManager>,
+
+    /// The next AUTO_INCREMENT value of each table.
+    auto_increment: Arc<crate::txn::AutoIncrement>,
 }
 
 impl TransactionManager {
     /// Create a new transaction manager
     pub fn new() -> Self {
         Self::with_applied_floor(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As `with_applied_floor`, sharing the AUTO_INCREMENT counters with
+    /// the state machine, which drops a table's counter with the table.
+    pub fn with_state_machine(
+        applied_floor: Arc<AtomicU64>,
+        auto_increment: Arc<crate::txn::AutoIncrement>,
+    ) -> Self {
+        Self {
+            auto_increment,
+            ..Self::with_applied_floor(applied_floor)
+        }
+    }
+
+    /// The AUTO_INCREMENT counters of this node's tables.
+    pub fn auto_increment(&self) -> &Arc<crate::txn::AutoIncrement> {
+        &self.auto_increment
     }
 
     /// Create a transaction manager whose IDs stay ahead of those the Raft
@@ -69,6 +89,7 @@ impl TransactionManager {
             timeout_config: RwLock::new(TimeoutConfig::default()),
             applied_floor,
             locks: LockManager::new(),
+            auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
         }
     }
 

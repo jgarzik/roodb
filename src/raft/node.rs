@@ -67,6 +67,7 @@ pub struct RaftNode {
     /// Highest transaction ID the state machine has applied (or a bound
     /// above it), for the transaction manager.
     applied_txn_floor: Arc<AtomicU64>,
+    auto_increment: Arc<crate::txn::AutoIncrement>,
     /// Log size, in bytes, above which a checkpoint is requested.
     log_budget: Arc<AtomicU64>,
     /// The task that requests checkpoints.
@@ -255,6 +256,7 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
         let stored_members = state_machine.member_count();
         let applied_txn_floor = state_machine.applied_txn_floor();
+        let auto_increment = state_machine.auto_increment();
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
 
@@ -329,6 +331,7 @@ impl RaftNode {
             removed: Arc::new(tokio::sync::Notify::new()),
             alone,
             applied_txn_floor,
+            auto_increment,
             log_budget,
             checkpointer,
             row_id_reserver: parking_lot::Mutex::new(Some(row_id_reserver)),
@@ -338,6 +341,12 @@ impl RaftNode {
 
     /// The highest transaction ID the state machine has applied, or a bound
     /// above it. Give this to the transaction manager.
+    /// The AUTO_INCREMENT counters the state machine keeps in step with
+    /// what it applies.
+    pub fn auto_increment(&self) -> Arc<crate::txn::AutoIncrement> {
+        self.auto_increment.clone()
+    }
+
     pub fn applied_txn_floor(&self) -> Arc<AtomicU64> {
         self.applied_txn_floor.clone()
     }

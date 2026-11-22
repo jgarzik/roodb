@@ -51,8 +51,9 @@ impl RooDbServer {
     ) -> Self {
         // Transaction IDs continue from where the state machine has got to,
         // not from 1: rows already on disk carry earlier IDs.
-        let txn_manager = Arc::new(TransactionManager::with_applied_floor(
+        let txn_manager = Arc::new(TransactionManager::with_state_machine(
             raft_node.applied_txn_floor(),
+            raft_node.auto_increment(),
         ));
         Self {
             addr,
@@ -99,6 +100,8 @@ impl RooDbServer {
         self.ctx.raft_node.watch_leadership(move |leads| {
             txn_manager.set_leader(leads);
             if leads {
+                // Counters as the previous primary's commits left them.
+                txn_manager.auto_increment().forget_all();
                 tracing::info!("This node is the primary");
             } else {
                 let aborted = txn_manager.abort_all();

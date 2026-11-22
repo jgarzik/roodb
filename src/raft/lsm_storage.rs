@@ -128,6 +128,8 @@ pub struct LsmRaftStorage {
     /// The highest transaction ID applied, or a bound above it; shared with
     /// the transaction manager, which keeps its own IDs ahead of it.
     applied_txn_floor: Arc<AtomicU64>,
+    /// The next AUTO_INCREMENT value of each table, as held in memory.
+    auto_increment: Arc<crate::txn::AutoIncrement>,
     /// The bound as stored: never below `applied_txn_floor`.
     stored_txn_bound: Arc<AtomicU64>,
     /// This node's ID: whose row ID reservations are its own.
@@ -179,6 +181,7 @@ impl LsmRaftStorage {
             cached_membership: Arc::new(RwLock::new(StoredMembership::default())),
             applied_txn_floor: Arc::new(AtomicU64::new(0)),
             stored_txn_bound: Arc::new(AtomicU64::new(0)),
+            auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
             node_id,
         };
 
@@ -229,6 +232,13 @@ impl LsmRaftStorage {
     /// has started.
     pub fn member_count(&self) -> usize {
         self.cached_membership.read().nodes().count()
+    }
+
+    /// The AUTO_INCREMENT counters, shared with the transaction manager:
+    /// inserts take values from them, and applying keeps them in step with
+    /// what is stored.
+    pub fn auto_increment(&self) -> Arc<crate::txn::AutoIncrement> {
+        self.auto_increment.clone()
     }
 
     /// The highest transaction ID applied, or a bound above it. The
@@ -902,6 +912,38 @@ impl LsmRaftStorage {
                         });
                     }
                 }
+            }
+        }
+        // AUTO_INCREMENT counters. A dropped table's counter goes with it;
+        // an inserted row raises its table's stored counter to the value
+        // the row carries.
+        for table in &plan.dropped_tables {
+            plan.writes
+                .push((crate::txn::auto_inc::storage_key(table), None));
+            self.auto_increment.forget(table);
+        }
+        let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for change in &changeset.changes {
+            if let Some(next) = change.auto_inc {
+                let counter = counters.entry(change.table.as_str()).or_insert(0);
+                *counter = (*counter).max(next);
+            }
+        }
+        for (table, next) in counters {
+            let key = crate::txn::auto_inc::storage_key(table);
+            let dropped_here = plan.dropped_tables.iter().any(|dropped| dropped == table);
+            let stored = if dropped_here {
+                None
+            } else {
+                self.storage
+                    .get(&key)
+                    .await
+                    .map_err(read_err)?
+                    .and_then(|stored| crate::txn::auto_inc::decode(&stored))
+            };
+            if stored.is_none_or(|stored| next > stored) {
+                plan.writes.push((key, Some(next.to_le_bytes().to_vec())));
+                self.auto_increment.raise(table, next);
             }
         }
         // An entry the storage engine cannot hold is a reason to reject the

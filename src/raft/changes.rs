@@ -34,6 +34,11 @@ pub struct RowChange {
     /// as a concurrent modification conflict.
     #[serde(default)]
     pub expected_version: Option<u64>,
+    /// For a row inserted into a table with an AUTO_INCREMENT column: the
+    /// table's counter after this row. Applying the row raises the stored
+    /// counter to it.
+    #[serde(default)]
+    pub auto_inc: Option<u64>,
 }
 
 impl RowChange {
@@ -45,7 +50,14 @@ impl RowChange {
             value: Some(value),
             op: ChangeOp::Insert,
             expected_version: None,
+            auto_inc: None,
         }
+    }
+
+    /// Record the table's AUTO_INCREMENT counter after this row.
+    pub fn with_auto_inc(mut self, next: Option<u64>) -> Self {
+        self.auto_inc = next;
+        self
     }
 
     /// Create an UPDATE change
@@ -56,6 +68,7 @@ impl RowChange {
             value: Some(value),
             op: ChangeOp::Update,
             expected_version: None,
+            auto_inc: None,
         }
     }
 
@@ -75,6 +88,7 @@ impl RowChange {
             value: Some(value),
             op: ChangeOp::Update,
             expected_version: Some(expected_version),
+            auto_inc: None,
         }
     }
 
@@ -86,6 +100,7 @@ impl RowChange {
             value: None,
             op: ChangeOp::Delete,
             expected_version: None,
+            auto_inc: None,
         }
     }
 
@@ -101,6 +116,7 @@ impl RowChange {
             value: None,
             op: ChangeOp::Delete,
             expected_version: Some(expected_version),
+            auto_inc: None,
         }
     }
 
@@ -115,6 +131,7 @@ impl RowChange {
             value: Some(value),
             op: ChangeOp::Delete,
             expected_version: None,
+            auto_inc: None,
         }
     }
 

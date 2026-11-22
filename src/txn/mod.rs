@@ -6,6 +6,7 @@
 //! - PostgreSQL-style timeout handling for resource safety
 //! - Leader/replica awareness for distributed operation
 
+pub mod auto_inc;
 mod lock;
 mod manager;
 mod mvcc_storage;
@@ -14,6 +15,7 @@ mod read_view;
 mod transaction;
 mod undo_log;
 
+pub use auto_inc::AutoIncrement;
 pub use lock::{LockError, LockManager, LockMode, DEFAULT_LOCK_WAIT_SECS};
 pub use manager::TransactionManager;
 pub use mvcc_storage::MvccStorage;

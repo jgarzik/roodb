@@ -174,17 +174,38 @@ impl Executor for Insert {
             let row_id = encode_row_id(self.next_local_id, node_id);
             self.next_local_id += 1;
 
-            // Replace NULL values in auto_increment columns with generated ID
-            // Use the low 48 bits (local counter) as the auto_increment value
-            let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
+            // AUTO_INCREMENT: NULL and 0 ask for the table's next value; a
+            // value given explicitly moves the table's counter past it.
+            // `auto_next` is the counter after this row, recorded with the
+            // row so that the stored counter follows.
+            let mut auto_next: Option<u64> = None;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() {
-                    // MySQL: both NULL and 0 trigger auto_increment
-                    let should_generate =
-                        datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
-                    if should_generate {
-                        datums[idx] = super::datum::Datum::Int(auto_id as i64);
-                        self.last_insert_id = auto_id;
+                if idx >= datums.len() {
+                    continue;
+                }
+                let generate =
+                    datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
+                if generate {
+                    let value = match &self.mvcc {
+                        Some(mvcc) => mvcc.take_auto_increment(&self.table).await?,
+                        // Run without storage (unit tests): there is no
+                        // table counter; the row ID's counter stands in.
+                        None => row_id & 0x0000_FFFF_FFFF_FFFF,
+                    };
+                    datums[idx] = super::datum::Datum::Int(value as i64);
+                    // LAST_INSERT_ID() is the first value the statement
+                    // generated.
+                    if self.last_insert_id == 0 {
+                        self.last_insert_id = value;
+                    }
+                    auto_next = Some(value + 1);
+                } else if let super::datum::Datum::Int(given) = datums[idx] {
+                    if given > 0 {
+                        if let Some(mvcc) = &self.mvcc {
+                            mvcc.observe_auto_increment(&self.table, given as u64)
+                                .await?;
+                        }
+                        auto_next = Some(given as u64 + 1);
                     }
                 }
             }
@@ -331,7 +352,9 @@ impl Executor for Insert {
                 )));
             }
 
-            ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+            ctx.add_change(
+                RowChange::insert(&self.table, key.clone(), value.clone()).with_auto_inc(auto_next),
+            );
             // Buffer for read-your-writes within this transaction
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;

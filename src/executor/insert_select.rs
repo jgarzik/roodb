@@ -44,6 +44,9 @@ pub struct InsertSelect {
     mapped_targets: std::collections::HashSet<usize>,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
+    /// Storage, for the table's AUTO_INCREMENT counter (None when run
+    /// without a server).
+    mvcc: Option<std::sync::Arc<crate::txn::MvccStorage>>,
 }
 
 impl InsertSelect {
@@ -58,6 +61,7 @@ impl InsertSelect {
         pk_column_indices: Vec<usize>,
         column_map: Option<Vec<usize>>,
         ignore: bool,
+        mvcc: Option<std::sync::Arc<crate::txn::MvccStorage>>,
     ) -> Self {
         let mapped_targets: std::collections::HashSet<usize> = column_map
             .as_ref()
@@ -76,6 +80,7 @@ impl InsertSelect {
             column_map,
             mapped_targets,
             ignore,
+            mvcc,
         }
     }
 }
@@ -147,12 +152,31 @@ impl Executor for InsertSelect {
             let (local_id, node_id) = allocate_row_id_batch(1);
             let row_id = encode_row_id(local_id, node_id);
 
-            // Replace NULL values in auto_increment columns with generated ID
-            let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
+            // AUTO_INCREMENT, as for INSERT ... VALUES: NULL and 0 ask for
+            // the table's next value; a value given moves the counter.
+            let mut auto_next: Option<u64> = None;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() && datums[idx].is_null() {
-                    datums[idx] = Datum::Int(auto_id as i64);
-                    self.last_insert_id = auto_id;
+                if idx >= datums.len() {
+                    continue;
+                }
+                if datums[idx].is_null() || matches!(datums[idx], Datum::Int(0)) {
+                    let value = match &self.mvcc {
+                        Some(mvcc) => mvcc.take_auto_increment(&self.table).await?,
+                        None => row_id & 0x0000_FFFF_FFFF_FFFF,
+                    };
+                    datums[idx] = Datum::Int(value as i64);
+                    if self.last_insert_id == 0 {
+                        self.last_insert_id = value;
+                    }
+                    auto_next = Some(value + 1);
+                } else if let Datum::Int(given) = datums[idx] {
+                    if given > 0 {
+                        if let Some(mvcc) = &self.mvcc {
+                            mvcc.observe_auto_increment(&self.table, given as u64)
+                                .await?;
+                        }
+                        auto_next = Some(given as u64 + 1);
+                    }
                 }
             }
 
@@ -212,7 +236,9 @@ impl Executor for InsertSelect {
                 )));
             }
 
-            ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+            ctx.add_change(
+                RowChange::insert(&self.table, key.clone(), value.clone()).with_auto_inc(auto_next),
+            );
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
         }

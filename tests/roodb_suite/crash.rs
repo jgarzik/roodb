@@ -163,9 +163,13 @@ async fn generated_ids_do_not_repeat_after_a_kill() {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            newest > highest,
-            "life {life}: AUTO_INCREMENT gave {newest}, not above {highest}"
+        // The table's counter carries on where the committed rows left
+        // it: 30 rows in the first life, one more in each life since.
+        assert_eq!(highest, 30 + life as i64 - 1, "life {life}");
+        assert_eq!(
+            newest,
+            highest + 1,
+            "life {life}: AUTO_INCREMENT did not carry on from {highest}"
         );
 
         // New tables get new rows in the system tables.

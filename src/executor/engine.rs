@@ -738,6 +738,7 @@ impl ExecutorEngine {
                     pk_column_indices,
                     column_map,
                     ignore,
+                    Some(self.mvcc.clone()),
                 )))
             }
 

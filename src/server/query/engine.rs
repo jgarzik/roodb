@@ -1282,9 +1282,13 @@ impl QueryEngine {
                 self.implicit_txns.retain(|id| *id != txn_id);
             }
 
-            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT()
-            self.session
-                .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            // Write DML results to session for LAST_INSERT_ID()/ROW_COUNT().
+            // A statement that generated no value leaves LAST_INSERT_ID()
+            // as it was.
+            if last_insert_id != 0 {
+                self.session
+                    .set_user_variable("__sys_last_insert_id", Datum::Int(last_insert_id as i64));
+            }
             self.session
                 .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
 
@@ -1606,6 +1610,8 @@ impl QueryEngine {
             .retain_pending_changes(|change| !(start <= change.key && change.key < end));
         self.temp.remove_table(name);
         let _ = self.catalog.write().drop_table(name);
+        // Its AUTO_INCREMENT counter was only ever in memory.
+        self.txn_manager.auto_increment().forget(name);
         true
     }
 
