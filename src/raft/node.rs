@@ -691,6 +691,7 @@ impl RaftNode {
             self.alone.clone(),
             self.removed.clone(),
             self.tls_config.clone(),
+            self.storage.clone(),
         ));
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -859,8 +860,13 @@ async fn handle_rpc_connection(
     let mut body = vec![0u8; len];
     tls_stream.read_exact(&mut body).await?;
 
-    // Process request
-    let response = handler.handle_request(msg_type, &body).await?;
+    // Process request. A snapshot's contents follow its request on the
+    // connection.
+    let response = if RaftRpcHandler::is_snapshot(msg_type) {
+        handler.receive_snapshot(&body, &mut tls_stream).await?
+    } else {
+        handler.handle_request(msg_type, &body).await?
+    };
 
     // Write response: [len: u32][body]
     tls_stream.write_u32(response.len() as u32).await?;

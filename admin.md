@@ -305,8 +305,9 @@ no `--join`, and the option is ignored if given.
 - A node that was down restarts on its data directory with no special
   options, follows the current primary and catches up.
 - A node that has been away for longer than the log reaches back, or that
-  joins late, is sent a copy of the data instead. (Today that copy is built
-  in memory and limited to 4 GiB; see `doc/ROADMAP.md`.)
+  joins late, is sent a copy of the data instead: read from the sender's
+  table files a piece at a time while the sender goes on working, and
+  switched to on the receiver in one step once it has all arrived.
 
 **Operating a cluster:**
 

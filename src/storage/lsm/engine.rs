@@ -35,7 +35,7 @@ use crate::storage::lsm::manifest::{persist, Manifest, SstableInfo};
 use crate::storage::lsm::memtable::Memtable;
 use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
-use crate::storage::traits::{KeyValue, StorageEngine, WriteOp};
+use crate::storage::traits::{Ingest, KeyValue, SnapshotView, StorageEngine, WriteOp};
 
 /// Default total memory budget: 128MB (block cache + memtables share this pool)
 pub const DEFAULT_TOTAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
@@ -110,6 +110,157 @@ struct ReadSources {
     frozen: Vec<Arc<Memtable>>,
     /// Tables, newest data first: level 0 newest to oldest, then each level.
     tables: Vec<Arc<SstableReader>>,
+}
+
+/// The table files as they were at one moment. Table files never change,
+/// and a file that compaction deletes meanwhile stays readable through the
+/// handle held here, so the view stays whole for as long as it is kept.
+struct TableView {
+    /// Newest data first.
+    tables: Vec<Arc<SstableReader>>,
+}
+
+#[async_trait]
+impl SnapshotView for TableView {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        for table in &self.tables {
+            if let Some(found) = table.get(key).await? {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn next_chunk(
+        &self,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> StorageResult<(Vec<KeyValue>, bool)> {
+        let mut after = after.map(<[u8]>::to_vec);
+        loop {
+            // Each table gives its next stretch. A table that stopped short
+            // of its end may hold keys beyond its last one that the others
+            // have already passed, so the merged result is only good up to
+            // the earliest such stopping point.
+            let mut merger = MergeIterator::new();
+            let mut bound: Option<Vec<u8>> = None;
+            for (priority, table) in self.tables.iter().enumerate() {
+                let (entries, ended) = table.scan_after(after.as_deref(), max_bytes).await?;
+                if !ended {
+                    if let Some((last, _)) = entries.last() {
+                        if bound.as_ref().is_none_or(|bound| last < bound) {
+                            bound = Some(last.clone());
+                        }
+                    }
+                }
+                merger.add(entries, priority);
+            }
+            let mut live = merger.merge_live();
+            let Some(bound) = bound else {
+                return Ok((live, true));
+            };
+            live.retain(|(key, _)| *key <= bound);
+            if !live.is_empty() {
+                return Ok((live, false));
+            }
+            // Everything up to the stopping point was deleted: go on.
+            after = Some(bound);
+        }
+    }
+}
+
+/// A replacement for everything the engine holds, written as table files
+/// of its own. See `Inner::replace_all`.
+struct TableIngest {
+    engine: Arc<Inner>,
+    /// The file being written: its name, path, writer, first key and size.
+    current: Option<(String, PathBuf, SstableWriter, Vec<u8>, u64)>,
+    last_key: Vec<u8>,
+    finished: Vec<(SstableInfo, PathBuf)>,
+    committed: bool,
+}
+
+/// Size at which an ingested table file is closed and another begun.
+const INGEST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+impl TableIngest {
+    async fn finish_file(&mut self) -> StorageResult<()> {
+        let Some((name, path, writer, min_key, _)) = self.current.take() else {
+            return Ok(());
+        };
+        writer.finish().await?;
+        self.finished.push((
+            SstableInfo {
+                name,
+                min_key,
+                max_key: self.last_key.clone(),
+                size: std::fs::metadata(&path)?.len(),
+            },
+            path,
+        ));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Ingest for TableIngest {
+    async fn add(&mut self, entries: Vec<KeyValue>) -> StorageResult<()> {
+        for (key, value) in entries {
+            check_entry_size(key.len(), value.len())?;
+            if self.current.is_none() {
+                let (name, path) = {
+                    let mut manifest = self.engine.manifest.write();
+                    let name = manifest.next_sstable_name();
+                    let path = manifest.sstable_path(&name);
+                    (name, path)
+                };
+                let writer =
+                    SstableWriter::create(&self.engine.io, &path, Urgency::Background).await?;
+                self.current = Some((name, path, writer, key.clone(), 0));
+            }
+            let (_, _, writer, _, bytes) = self.current.as_mut().expect("just set");
+            *bytes += (key.len() + value.len()) as u64;
+            let full = *bytes >= INGEST_FILE_BYTES;
+            self.last_key.clone_from(&key);
+            writer.add(key, Some(value)).await?;
+            if full {
+                self.finish_file().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn commit(mut self: Box<Self>) -> StorageResult<()> {
+        self.finish_file().await?;
+        let tables = std::mem::take(&mut self.finished);
+        let result = self.engine.replace_all(&tables).await;
+        if let Err(e) = &result {
+            for (info, path) in &tables {
+                self.engine.discard_table(&info.name, path, e);
+            }
+        }
+        self.committed = true;
+        result
+    }
+}
+
+impl Drop for TableIngest {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Abandoned: the files were never listed, so removing them is all
+        // there is to do. (If that fails, the next start removes them.)
+        let unfinished = self.current.take().map(|(_, path, ..)| path);
+        for path in self
+            .finished
+            .iter()
+            .map(|(_, path)| path)
+            .chain(&unfinished)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// LSM-Tree storage engine.
@@ -866,6 +1017,53 @@ impl Inner {
         }
     }
 
+    /// Replace everything the engine holds with `tables` (non-overlapping,
+    /// in key order): one change of the manifest, before which readers and
+    /// a restart see the old contents, and after which they see the new.
+    /// What was in memory is dropped with the old tables.
+    async fn replace_all(&self, tables: &[(SstableInfo, PathBuf)]) -> StorageResult<()> {
+        // No flush or compaction may be under way: it would add tables of
+        // the old contents to the new manifest.
+        let _flushing = self.flush_lock.lock().await;
+        let _compacting = self.compaction_lock.lock().await;
+        for (info, path) in tables {
+            self.register_table(info, path).await?;
+        }
+        let mut retired: Vec<String> = Vec::new();
+        self.commit_manifest(|manifest| {
+            for (level, files) in manifest.levels().to_vec().iter().enumerate() {
+                for file in &files.files {
+                    retired.push(file.name.clone());
+                    manifest.remove_sstable(level as u32, &file.name);
+                }
+            }
+            for (info, _) in tables {
+                manifest.add_sstable(LAST_LEVEL, info.clone());
+            }
+            // Under the manifest lock, as readers take their view: nobody
+            // sees the new tables together with the old memory.
+            *self.memtable.write() = Arc::new(Memtable::new());
+            self.imm_memtables.write().clear();
+        })
+        .await?;
+
+        {
+            let mut readers = self.reader_cache.write();
+            for name in &retired {
+                readers.remove(name.as_str());
+                self.block_cache.invalidate_sstable(name);
+            }
+        }
+        let dir = self.manifest.read().dir().to_path_buf();
+        for name in &retired {
+            if let Err(e) = std::fs::remove_file(dir.join(name)) {
+                tracing::warn!(file = name.as_str(), error = %e, "failed to delete replaced table");
+            }
+        }
+        self.rebalance_cache();
+        Ok(())
+    }
+
     /// Look a key up everywhere, newest data first. `Some(None)` means the
     /// newest entry for the key is a tombstone.
     async fn read_all(&self, key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
@@ -999,6 +1197,23 @@ impl StorageEngine for LsmEngine {
 
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
         self.inner.scan(start, end).await
+    }
+
+    async fn snapshot_view(&self) -> StorageResult<Arc<dyn SnapshotView>> {
+        self.inner.check_open()?;
+        let tables = self.inner.read_sources()?.tables;
+        Ok(Arc::new(TableView { tables }))
+    }
+
+    async fn ingest(self: Arc<Self>) -> StorageResult<Box<dyn Ingest>> {
+        self.inner.check_open()?;
+        Ok(Box::new(TableIngest {
+            engine: self.inner.clone(),
+            current: None,
+            last_key: Vec::new(),
+            finished: Vec::new(),
+            committed: false,
+        }))
     }
 
     async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {

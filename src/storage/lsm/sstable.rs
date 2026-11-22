@@ -645,6 +645,35 @@ impl SstableReader {
             .map(|i| (entries[i].key.clone(), entries[i].is_tombstone())))
     }
 
+    /// Entries after `after` (from the start if `None`), in order, about
+    /// `max_bytes` of them, tombstones included. The flag says whether the
+    /// end of the table was reached. Reads only the blocks it returns
+    /// entries from.
+    pub async fn scan_after(
+        &self,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> StorageResult<(Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)> {
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        let mut block_idx = after.map_or(0, |key| self.find_block(key));
+        while block_idx < self.index.len() {
+            if bytes >= max_bytes && !entries.is_empty() {
+                return Ok((entries, false));
+            }
+            let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
+            for entry in BlockReader::parse_verified(&block)?.into_entries() {
+                if after.is_some_and(|after| entry.key.as_slice() <= after) {
+                    continue;
+                }
+                bytes += entry.key.len() + entry.value.as_ref().map_or(0, Vec::len);
+                entries.push((entry.key, entry.value));
+            }
+            block_idx += 1;
+        }
+        Ok((entries, true))
+    }
+
     /// Scan all entries in the SSTable
     pub async fn scan(&self) -> StorageResult<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         self.scan_range_batched(None, None).await

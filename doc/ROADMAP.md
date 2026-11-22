@@ -28,14 +28,9 @@ Clusters work: nodes join a running server with `--join`, the leader is the
 primary and the others read-only secondaries, another node takes over when
 the primary fails, and nodes can be listed and removed. What is left:
 
-- Snapshots at any size. A node that is new or has fallen behind the log
-  is brought up by a snapshot today, but the snapshot is the whole keyspace
-  held in memory and sent as one message (4 GiB at most), and in a cluster
-  every checkpoint builds one, by scanning everything, whether or not
-  anyone needs it. Instead: a checkpoint in a cluster costs what it costs
-  on a single node; when a node needs the data, a point-in-time view of the
-  storage engine (frozen memtables and table files, held open for the
-  transfer) is streamed in chunks and installed atomically on the receiver.
+- On Windows a file that is open cannot be deleted, so a table file that
+  compaction retires while a snapshot view holds it stays behind until the
+  next start. Retire such files when the last view lets go of them.
 - Moving the primary role to another node on request (today the only way
   is to stop the primary).
 - Persistent RPC connections between nodes (today one connection per

@@ -384,6 +384,7 @@ pub struct RowChange {
 - `LsmRaftStorage` (`lsm_storage.rs`): the state machine. Applies committed entries to the LSM, rebuilds the catalog on apply, and keeps its own position (last applied, membership) in the LSM.
 
 - Cluster membership: every node has an ID, kept in `NODE_ID` in its data directory. The first node is 1; a node started with `--join` asks a member to admit it (`JoinRequest` on the Raft port), the leader allocates the next ID through the log (`Command::AllocNodeId`), adds the node as a learner and promotes it when it has caught up. Peer addresses are part of the replicated membership. A node that is alone runs without timers or elections; they are switched on at run time when a second node is admitted.
+- Snapshots: a snapshot's position is what has been flushed, and its contents are a view of the table files at that moment (`StorageEngine::snapshot_view`), which costs nothing to take; a checkpoint is therefore a flush on a cluster node as on a single one. Only when another node needs the contents are they read, a chunk at a time, and streamed to it (`RaftNetworkConnection::send_snapshot`). The receiver writes them straight into table files of their own (`StorageEngine::ingest`) and switches to them with one manifest change (`Inner::replace_all`), so it holds the old state or the new, never a mixture. The contents are the sender's whole keyspace, the state machine's own records included.
 - Roles: the leader is the primary; every other node is a read-only secondary. `RaftNode::watch_leadership` tells the server when the node starts or stops leading: the transaction manager is told, a node that stops leading rolls back its open transactions (`TransactionManager::abort_all`), and a node that starts leading moves its row ID counter past everything it had reserved before. Sessions refuse writes, DDL and locking reads with error 1290 unless the node leads.
 - `Command::Seed`: the first entry of a new cluster's log carries what `roodb_init` wrote to storage before there was a log, so that the log accounts for everything in storage and a joining node receives it.
 
@@ -507,6 +508,7 @@ Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 **Operations**:
 - `get()`: Check memtable → immutables → SSTables (newest first)
 - `put()`: Insert to memtable; a full memtable is frozen and handed to the background task
+- `snapshot_view()`: the table files as they are at one moment, readable in chunks while the engine goes on changing; `ingest()`: a complete replacement of the contents, written as table files and switched to atomically.
 - `next_key()` / `prev_key()`: the nearest live key after or before a key, found by asking each memtable and table for its own nearest entry (one block read per table) instead of reading the range.
 - `scan()`: Merge all sources, deduplicate by key, skip tombstones. Adjacent blocks are read in runs of up to 1 MiB, all runs in flight together.
 

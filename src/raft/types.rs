@@ -1,7 +1,5 @@
 //! Raft type configuration and aliases
 
-use std::io::Cursor;
-
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
@@ -104,8 +102,19 @@ openraft::declare_raft_types!(
         NodeId = NodeId,
 );
 
-/// What a snapshot's data is carried in.
-pub type SnapshotData = Cursor<Vec<u8>>;
+/// The contents of a snapshot, as far as a node holds them.
+pub enum SnapshotData {
+    /// No contents. A node that is alone checkpoints by flushing, and no
+    /// other node will ever ask for the contents.
+    None,
+    /// On the node that sends it: a view of its storage at the snapshot's
+    /// position. Nothing is copied until the snapshot is sent, and then it
+    /// is read and sent a piece at a time.
+    Stored(std::sync::Arc<dyn crate::storage::traits::SnapshotView>),
+    /// On the node that receives it: the contents, already written out as
+    /// a replacement for everything it holds, waiting to be switched to.
+    Received(Box<dyn crate::storage::traits::Ingest>),
+}
 
 /// Raft instance type alias
 pub type Raft = openraft::Raft<TypeConfig, crate::raft::LsmRaftStorage>;

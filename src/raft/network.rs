@@ -24,13 +24,21 @@ use crate::raft::types::{
 use crate::raft::types::{Command, CommandResponse};
 use crate::tls::RaftTlsConfig;
 
-/// A whole snapshot as it travels between nodes.
+/// What a snapshot sent to another node begins with. The contents follow on
+/// the same connection as a series of frames, each a length and that many
+/// bytes holding a batch of entries in key order, ended by a length of zero;
+/// then the receiver answers.
 #[derive(Serialize, Deserialize)]
-struct SnapshotMessage {
+struct SnapshotHeader {
     vote: Vote,
     meta: SnapshotMeta,
-    data: Vec<u8>,
 }
+
+/// About how much of a snapshot travels in one frame.
+const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// How long a snapshot transfer may make no progress before it is given up.
+const SNAPSHOT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Describe a failed RPC: what was being done, to whom, and why it failed.
 fn describe(
@@ -56,6 +64,7 @@ enum MessageType {
     Join = 7,
     Removed = 8,
     Members = 9,
+    SnapshotStream = 10,
 }
 
 /// What a node says when asked who is in the cluster.
@@ -177,6 +186,7 @@ impl TryFrom<u8> for MessageType {
             7 => Ok(Self::Join),
             8 => Ok(Self::Removed),
             9 => Ok(Self::Members),
+            10 => Ok(Self::SnapshotStream),
             _ => Err(()),
         }
     }
@@ -357,18 +367,114 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse, StreamingError<TypeConfig>> {
-        let message = SnapshotMessage {
+        let SnapshotData::Stored(view) = snapshot.snapshot else {
+            return Err(StreamingError::Unreachable(unreachable(
+                "this node holds no snapshot contents to send".to_string(),
+            )));
+        };
+        let header = SnapshotHeader {
             vote,
             meta: snapshot.meta,
-            data: snapshot.snapshot.into_inner(),
         };
-        // Stop as soon as openraft no longer wants this snapshot sent.
+        // Stop as soon as openraft no longer wants this snapshot sent. The
+        // whole transfer may take as long as it takes; only standing still
+        // is an error.
+        let _ = option;
         tokio::select! {
             closed = cancel => Err(StreamingError::Closed(closed)),
-            result = self.send_request(MessageType::Snapshot, &message, option.soft_ttl()) => {
+            result = self.send_snapshot(&header, view) => {
                 result.map_err(|e| StreamingError::Unreachable(unreachable(e)))
             }
         }
+    }
+}
+
+impl RaftNetworkConnection {
+    /// Send a snapshot: its header, then its contents read from `view` a
+    /// piece at a time, then wait for the receiver's answer.
+    async fn send_snapshot(
+        &self,
+        header: &SnapshotHeader,
+        view: Arc<dyn crate::storage::traits::SnapshotView>,
+    ) -> Result<SnapshotResponse, String> {
+        let operation = "Snapshot";
+        let fail = |err: &dyn std::fmt::Display| {
+            describe(self.target, self.addr.as_deref(), operation, err)
+        };
+        let step = |what: &'static str| {
+            move |_| {
+                describe(
+                    self.target,
+                    self.addr.as_deref(),
+                    operation,
+                    format_args!("stalled while {what}"),
+                )
+            }
+        };
+        let addr = self
+            .addr
+            .as_deref()
+            .ok_or_else(|| fail(&"address not configured"))?;
+        let stream = tokio::time::timeout(SNAPSHOT_STALL, TcpStream::connect(addr))
+            .await
+            .map_err(step("connecting"))?
+            .map_err(|e| fail(&e))?;
+        let connector = TlsConnector::from(self.tls_config.client_config());
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").map_err(|e| fail(&e))?;
+        let mut stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| fail(&e))?;
+
+        let body = bincode::serialize(header).map_err(|e| fail(&e))?;
+        let mut frame = BytesMut::with_capacity(5 + body.len());
+        frame.put_u8(MessageType::SnapshotStream as u8);
+        frame.put_u32(body.len() as u32);
+        frame.put_slice(&body);
+        stream.write_all(&frame).await.map_err(|e| fail(&e))?;
+
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (entries, done) = view
+                .next_chunk(after.as_deref(), SNAPSHOT_CHUNK_BYTES)
+                .await
+                .map_err(|e| fail(&e))?;
+            if let Some((last, _)) = entries.last() {
+                after = Some(last.clone());
+            }
+            if !entries.is_empty() {
+                let body = bincode::serialize(&entries).map_err(|e| fail(&e))?;
+                let len = u32::try_from(body.len())
+                    .map_err(|_| fail(&"snapshot frame larger than 4 GiB"))?;
+                let write = async {
+                    stream.write_u32(len).await?;
+                    stream.write_all(&body).await
+                };
+                tokio::time::timeout(SNAPSHOT_STALL, write)
+                    .await
+                    .map_err(step("sending"))?
+                    .map_err(|e| fail(&e))?;
+            }
+            if done {
+                break;
+            }
+        }
+        stream.write_u32(0).await.map_err(|e| fail(&e))?;
+        stream.flush().await.map_err(|e| fail(&e))?;
+
+        // The receiver switches to the new contents before it answers.
+        let read = async {
+            let len = stream.read_u32().await? as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await?;
+            Ok::<_, std::io::Error>(body)
+        };
+        let body = tokio::time::timeout(SNAPSHOT_STALL * 10, read)
+            .await
+            .map_err(step("waiting for the answer"))?
+            .map_err(|e| fail(&e))?;
+        bincode::deserialize(&body).map_err(|e| fail(&e))
     }
 }
 
@@ -382,6 +488,8 @@ pub struct RaftRpcHandler {
     removed: Arc<tokio::sync::Notify>,
     /// For asking other nodes whether that is true.
     tls_config: RaftTlsConfig,
+    /// Where a snapshot sent to this node is written.
+    storage: Arc<dyn crate::storage::StorageEngine>,
 }
 
 impl RaftRpcHandler {
@@ -390,13 +498,68 @@ impl RaftRpcHandler {
         alone: Arc<std::sync::atomic::AtomicBool>,
         removed: Arc<tokio::sync::Notify>,
         tls_config: RaftTlsConfig,
+        storage: Arc<dyn crate::storage::StorageEngine>,
     ) -> Self {
         Self {
             raft,
             alone,
             removed,
             tls_config,
+            storage,
         }
+    }
+
+    /// Whether a request of this type is a snapshot, whose contents follow
+    /// the request on the connection (see `receive_snapshot`).
+    pub fn is_snapshot(msg_type: u8) -> bool {
+        msg_type == MessageType::SnapshotStream as u8
+    }
+
+    /// Receive a snapshot: `header` has been read; the contents are read
+    /// from `stream`, written out as a replacement for this node's storage,
+    /// and handed to Raft, which switches to them. Returns the answer to
+    /// send back.
+    pub async fn receive_snapshot<S>(&self, header: &[u8], stream: &mut S) -> Result<Bytes, String>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let header: SnapshotHeader = bincode::deserialize(header).map_err(|e| e.to_string())?;
+        let mut ingest = self
+            .storage
+            .clone()
+            .ingest()
+            .await
+            .map_err(|e| e.to_string())?;
+        loop {
+            let frame = async {
+                let len = stream.read_u32().await? as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).await?;
+                Ok::<_, std::io::Error>(body)
+            };
+            let body = tokio::time::timeout(SNAPSHOT_STALL, frame)
+                .await
+                .map_err(|_| "the snapshot stopped arriving".to_string())?
+                .map_err(|e| e.to_string())?;
+            if body.is_empty() {
+                break;
+            }
+            let entries: Vec<(Vec<u8>, Vec<u8>)> =
+                bincode::deserialize(&body).map_err(|e| e.to_string())?;
+            ingest.add(entries).await.map_err(|e| e.to_string())?;
+        }
+        let snapshot = Snapshot {
+            meta: header.meta,
+            snapshot: SnapshotData::Received(ingest),
+        };
+        let response = self
+            .raft
+            .install_full_snapshot(header.vote, snapshot)
+            .await
+            .map_err(|e| e.to_string())?;
+        let encoded = bincode::serialize(&response).map_err(|e| e.to_string())?;
+        Ok(Bytes::from(encoded))
     }
 
     /// This node and the addresses of the other nodes it knows of.
@@ -508,21 +671,6 @@ impl RaftRpcHandler {
                     .await
                     .map_err(|e| e.to_string())?
                     .into();
-                let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
-                Ok(Bytes::from(encoded))
-            }
-            MessageType::Snapshot => {
-                let message: SnapshotMessage =
-                    bincode::deserialize(body).map_err(|e| e.to_string())?;
-                let snapshot = Snapshot {
-                    meta: message.meta,
-                    snapshot: std::io::Cursor::new(message.data),
-                };
-                let resp = self
-                    .raft
-                    .install_full_snapshot(message.vote, snapshot)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 let encoded = bincode::serialize(&resp).map_err(|e| e.to_string())?;
                 Ok(Bytes::from(encoded))
             }

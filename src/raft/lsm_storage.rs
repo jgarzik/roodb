@@ -7,7 +7,6 @@
 // functions here feed directly into openraft trait methods that return them.
 #![allow(clippy::result_large_err)]
 
-use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1231,57 +1230,24 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         meta: &SnapshotMeta,
         snapshot: SnapshotData,
     ) -> Result<(), StorageError> {
-        let snapshot_data = snapshot.into_inner();
-
-        // Everything goes in as one batch - the old data out, the snapshot's
-        // in, and the position - so that storage is never part old state and
-        // part new under either position.
-        let mut batch: Vec<WriteOp> = Vec::new();
-
-        if !snapshot_data.is_empty() {
-            let existing_data = self.storage.scan(None, None).await.map_err(read_err)?;
-            let deleted_count = existing_data.len();
-            for (key, _) in existing_data {
-                if !is_position_key(&key) {
-                    batch.push((key, None));
-                }
+        // The contents arrived as a complete replacement for what this node
+        // holds, already written out; switching to it is one step. It is
+        // the sender's storage as it stood at the snapshot's position, the
+        // state machine's own records (position, membership, counters)
+        // included: they are the same on every node.
+        match snapshot {
+            SnapshotData::Received(ingest) => {
+                ingest.commit().await.map_err(write_err)?;
+                tracing::info!(?meta, "Installing snapshot data");
             }
-
-            // Parse snapshot: [count: u64][entries...]
-            let truncated = || read_err("Invalid snapshot: truncated");
-            let take = |offset: &mut usize, len: usize| -> Result<&[u8], StorageError> {
-                let end = offset
-                    .checked_add(len)
-                    .filter(|end| *end <= snapshot_data.len())
-                    .ok_or_else(truncated)?;
-                let bytes = &snapshot_data[*offset..end];
-                *offset = end;
-                Ok(bytes)
-            };
-            let mut offset = 0;
-            let count = u64::from_le_bytes(take(&mut offset, 8)?.try_into().expect("8 bytes"));
-            let mut installed_count = 0u64;
-            for _ in 0..count {
-                // [key_len: u32][key][value_len: u32][value]
-                let key_len =
-                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
-                let key = take(&mut offset, key_len as usize)?.to_vec();
-                let value_len =
-                    u32::from_le_bytes(take(&mut offset, 4)?.try_into().expect("4 bytes"));
-                let value = take(&mut offset, value_len as usize)?.to_vec();
-                batch.push((key, Some(value)));
-                installed_count += 1;
+            // Only a position: there is nothing to replace.
+            SnapshotData::None => {}
+            SnapshotData::Stored(_) => {
+                return Err(read_err("a snapshot to send cannot be installed"));
             }
-
-            tracing::info!(
-                ?meta,
-                deleted = deleted_count,
-                installed = installed_count,
-                bytes = snapshot_data.len(),
-                "Installing snapshot data"
-            );
         }
 
+        let mut batch: Vec<WriteOp> = Vec::new();
         if let Some(log_id) = meta.last_log_id {
             let data = bincode::serialize(&log_id).map_err(write_err)?;
             batch.push((LAST_APPLIED_KEY.to_vec(), Some(data)));
@@ -1322,52 +1288,31 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             };
             return Ok(Some(Snapshot {
                 meta,
-                snapshot: Cursor::new(Vec::new()),
+                snapshot: SnapshotData::None,
             }));
         }
 
-        // A follower may need the contents. This runs between applies, so
-        // the scan and the position agree.
-        let last_applied = *self.cached_last_applied.read();
-        let membership = self.cached_membership.read().clone();
-
-        // Scan all user data (exclude Raft metadata keys)
-        let all_data = self.storage.scan(None, None).await.map_err(read_err)?;
-        let user_data: Vec<_> = all_data
-            .into_iter()
-            .filter(|(key, _)| !is_position_key(key))
-            .collect();
-
-        // Serialize snapshot data: [count: u64][entries...]
-        let mut snapshot_data = Vec::new();
-        snapshot_data.extend_from_slice(&(user_data.len() as u64).to_le_bytes());
-
-        for (key, value) in &user_data {
-            snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(key);
-            snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            snapshot_data.extend_from_slice(value);
-        }
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
+        // Another node may need the contents. They are what has been
+        // flushed, held still as a view; the position and membership that
+        // go with them are read from the view itself, since they were
+        // flushed in the same batches as the data they describe.
+        let view = self.storage.snapshot_view().await.map_err(read_err)?;
+        let Some(position) = view.get(LAST_APPLIED_KEY).await.map_err(read_err)? else {
+            return Ok(None);
         };
-
+        let last_applied: LogId = bincode::deserialize(&position).map_err(read_err)?;
+        let membership = match view.get(MEMBERSHIP_KEY).await.map_err(read_err)? {
+            Some(data) => bincode::deserialize(&data).map_err(read_err)?,
+            None => StoredMembership::default(),
+        };
         Ok(Some(Snapshot {
-            meta,
-            snapshot: Cursor::new(snapshot_data),
+            meta: SnapshotMeta {
+                last_log_id: Some(last_applied),
+                last_membership: membership,
+            },
+            snapshot: SnapshotData::Stored(view),
         }))
     }
-}
-
-/// The keys that say where this node's state machine is. They belong to the
-/// node, not to the data: a snapshot does not carry them and installing one
-/// sets them from the snapshot's own position. Everything else - including
-/// the transaction ID bound and the row ID reservations, which describe the
-/// data - travels with a snapshot.
-fn is_position_key(key: &[u8]) -> bool {
-    key == LAST_APPLIED_KEY || key == MEMBERSHIP_KEY
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
@@ -1391,7 +1336,7 @@ impl RaftSnapshotBuilder<TypeConfig> for LsmRaftStorage {
         tracing::info!(?meta, "Checkpointed state machine");
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(Vec::new()),
+            snapshot: SnapshotData::None,
         })
     }
 }

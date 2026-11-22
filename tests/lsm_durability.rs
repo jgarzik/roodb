@@ -779,3 +779,132 @@ async fn check_nearest(engine: &LsmEngine) {
         Some(key(10))
     );
 }
+
+/// A view shows the flushed contents as they were when it was taken,
+/// whatever is written, flushed and compacted afterwards, and hands them
+/// out in pieces, in order, without the deleted keys.
+#[tokio::test]
+async fn a_view_holds_a_moment_still() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    let key = |n: u32| format!("k{n:05}").into_bytes();
+    // Three overlapping files: every key, then every third rewritten, then
+    // every fifth deleted.
+    for n in 0..3000 {
+        engine.put(&key(n), &value_of(200, 1)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    for n in (0..3000).step_by(3) {
+        engine.put(&key(n), &value_of(200, 2)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    for n in (0..3000).step_by(5) {
+        engine.delete(&key(n)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    // Not flushed, so not in the view.
+    engine.put(b"k99999", b"in memory").await.unwrap();
+
+    let view = engine.snapshot_view().await.unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..3000)
+        .filter(|n| n % 5 != 0)
+        .map(|n| (key(n), value_of(200, if n % 3 == 0 { 2 } else { 1 })))
+        .collect();
+
+    // The engine moves on: everything is rewritten, flushed and compacted.
+    for n in 0..3000 {
+        engine.put(&key(n), b"later").await.unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    // Read the view in small pieces.
+    let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (chunk, done) = view.next_chunk(after.as_deref(), 16 * 1024).await.unwrap();
+        for pair in &chunk {
+            assert!(
+                seen.last()
+                    .is_none_or(|last: &(Vec<u8>, Vec<u8>)| last.0 < pair.0),
+                "out of order"
+            );
+        }
+        if let Some(last) = chunk.last() {
+            after = Some(last.0.clone());
+        }
+        seen.extend(chunk);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), expected.len());
+    assert!(
+        seen == expected,
+        "the view changed, or lost or gained entries"
+    );
+    assert_eq!(view.get(&key(3)).await.unwrap(), Some(value_of(200, 2)));
+    assert_eq!(view.get(&key(5)).await.unwrap(), None);
+    assert_eq!(view.get(b"k99999").await.unwrap(), None);
+    engine.close().await.unwrap();
+}
+
+/// A replacement of the whole contents takes effect at once or not at all:
+/// abandoned, it leaves everything as it was and no files behind; committed,
+/// the old contents are gone, memory included, and a restart agrees.
+#[tokio::test]
+async fn a_replacement_is_all_or_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = |n: u32| format!("k{n:05}").into_bytes();
+    {
+        let engine = Arc::new(LsmEngine::open(io(), config(dir.path())).await.unwrap());
+        for n in 0..500 {
+            engine.put(&key(n), b"old").await.unwrap();
+        }
+        engine.flush().await.unwrap();
+        engine.put(b"in-memory", b"old").await.unwrap();
+        let before = sst_files(dir.path());
+
+        // Abandoned half way.
+        {
+            let mut ingest = engine.clone().ingest().await.unwrap();
+            ingest
+                .add((1000..1200).map(|n| (key(n), b"new".to_vec())).collect())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            sst_files(dir.path()),
+            before,
+            "an abandoned replacement left files"
+        );
+        assert_eq!(engine.get(&key(1)).await.unwrap(), Some(b"old".to_vec()));
+        assert_eq!(engine.get(&key(1000)).await.unwrap(), None);
+
+        // Committed.
+        let mut ingest = engine.clone().ingest().await.unwrap();
+        for start in (1000..2000).step_by(100) {
+            ingest
+                .add(
+                    (start..start + 100)
+                        .map(|n| (key(n), b"new".to_vec()))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+        ingest.commit().await.unwrap();
+        assert_eq!(engine.get(&key(1)).await.unwrap(), None);
+        assert_eq!(engine.get(b"in-memory").await.unwrap(), None);
+        assert_eq!(engine.get(&key(1500)).await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(engine.scan(None, None).await.unwrap().len(), 1000);
+        // It goes on working as an ordinary engine.
+        engine.put(&key(1500), b"newer").await.unwrap();
+        // Crash: no close.
+    }
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    let all = engine.scan(None, None).await.unwrap();
+    assert_eq!(all.len(), 1000);
+    assert!(all.iter().all(|(_, value)| value == b"new"));
+    assert_eq!(all[0].0, key(1000));
+    engine.close().await.unwrap();
+}

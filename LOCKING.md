@@ -141,6 +141,13 @@ let (memtable_snapshot, imm_snapshot) = {
 table is on disk and in the manifest. Until then its entries stay readable
 from memory; there is no moment when they are in neither place.
 
+**Critical pattern:** Replacing everything (installing a snapshot) holds
+`flush_lock` and `compaction_lock` for its whole length, so that no flush or
+compaction adds tables of the old contents to the new manifest, and empties
+the memtables inside the same manifest change that swaps the tables, under
+the manifest write lock: a reader takes its view under that lock too, and
+sees the old tables with the old memory or the new tables with none.
+
 **Critical pattern:** Flush and compaction do their I/O without the manifest lock.
 
 Each picks its work under a brief `manifest` read lock, reads and writes files
