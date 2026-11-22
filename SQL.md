@@ -146,29 +146,38 @@ ALTER TABLE name operation [, operation ...]
 
 | Operation | |
 |-----------|---|
-| `ADD [COLUMN] column_definition` | Appended as the last column; `FIRST` / `AFTER` are ignored |
-| `DROP [COLUMN] name` | Also removes constraints naming the column |
-| `MODIFY [COLUMN] name type [options]` | |
-| `CHANGE [COLUMN] old new type [options]` | |
-| `RENAME COLUMN old TO new` | |
+| `ADD [COLUMN] column_definition [FIRST \| AFTER column]` | Rows already there read the column as its `DEFAULT`; as the type's own default (`0`, empty) if it has none and is `NOT NULL`; otherwise as `NULL` |
+| `DROP [COLUMN] name` | A unique constraint loses the column; a foreign key naming it is removed |
+| `MODIFY [COLUMN] name type [options] [FIRST \| AFTER column]` | The type may change only as described below |
+| `CHANGE [COLUMN] old new type [options] [FIRST \| AFTER column]` | |
+| `RENAME COLUMN old TO new` | Constraints and indexes follow |
 | `ALTER [COLUMN] name SET DEFAULT value` / `DROP DEFAULT` | |
-| `ADD [CONSTRAINT name] {PRIMARY KEY \| UNIQUE \| FOREIGN KEY \| CHECK} ...`, `ADD {INDEX \| KEY} ...` | Recorded only, as in `CREATE TABLE` |
-| `DROP PRIMARY KEY`, `DROP FOREIGN KEY name`, `DROP INDEX name`, `DROP CONSTRAINT name` | |
+| `ADD [CONSTRAINT name] {UNIQUE \| FOREIGN KEY \| CHECK} ...`, `ADD {INDEX \| KEY} ...` | Recorded only, as in `CREATE TABLE` |
+| `DROP FOREIGN KEY name`, `DROP INDEX name`, `DROP CONSTRAINT name` | |
 | `RENAME TO new_name` | |
 | `ALGORITHM=...`, `LOCK=...` | Accepted, no effect |
 
-**`ALTER TABLE` changes the table definition only; stored rows are not
-rewritten.** On a table that already has rows:
+Adding, dropping, moving and renaming columns change the table's definition
+and no stored row, whatever the table's size: each column has a number, and
+a row holds its values beside their columns' numbers. A dropped column's
+values are simply passed over from then on, and a column added later under
+the same name is a new column that has none of them. The table keeps its
+rows, its indexes and its `AUTO_INCREMENT` counter through every form here,
+`RENAME TO` included.
 
-- after `ADD COLUMN`, existing rows read the new column as `0` / empty, not
-  as its `DEFAULT`;
-- after `DROP COLUMN` of any column but the last, existing rows are read
-  with their values shifted into the wrong columns;
-- adding, dropping or changing the primary key does not re-key existing rows.
+A column's type may be changed to one that every stored value already fits,
+stored the same way: a wider integer (`INT` to `BIGINT`), a longer string
+(`VARCHAR(10)` to `VARCHAR(20)` or `TEXT`), `FLOAT` to `DOUBLE`, or a
+`DECIMAL` with more digits before the point.
 
-Use these forms on empty tables. `RENAME TO` is safe on any table: the
-table keeps its rows, its indexes and its `AUTO_INCREMENT` counter. Other forms (`ENGINE=`, `COMMENT=`,
-`CONVERT TO`, `ORDER BY`, partitioning) are refused.
+**Refused with error 1235 for now**, since they need every row rewritten or
+stored under another key (the online rebuild of a table will do them): a
+change of type other than the above; `ADD PRIMARY KEY`, `DROP PRIMARY KEY`
+and dropping a primary key column; adding an `AUTO_INCREMENT` column, or
+making an existing column `AUTO_INCREMENT`.
+
+Other forms (`ENGINE=`, `COMMENT=`, `CONVERT TO`, `ORDER BY`,
+partitioning) are refused.
 
 `RENAME TABLE a TO b` is not supported.
 
@@ -1048,7 +1057,7 @@ unknown function, duplicate view or procedure) are reported as 1105.
   does not change this.
 - Secondary indexes are metadata: not used by queries, uniqueness not
   enforced.
-- `ALTER TABLE` does not rewrite existing rows (see [ALTER TABLE](#alter-table)).
+- `ALTER TABLE` cannot yet change the primary key, or a column's type to one its values do not already fit (see [ALTER TABLE](#alter-table)).
 - `REPLACE` does not replace existing rows.
 - A row whose encoded primary key is larger than 65,535 bytes is refused
   (MySQL limits key length per index instead).

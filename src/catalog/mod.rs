@@ -56,6 +56,44 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// Whether every value a column of this type can hold is a value of
+    /// `other`, stored the same way: then a column can be given the type
+    /// `other` without touching its rows. The same type, a wider integer,
+    /// a longer string, or more digits before the point.
+    pub fn values_fit(&self, other: &DataType) -> bool {
+        fn integer_width(data_type: &DataType) -> Option<u8> {
+            match data_type {
+                DataType::TinyInt => Some(1),
+                DataType::SmallInt => Some(2),
+                DataType::Int => Some(4),
+                DataType::BigInt => Some(8),
+                _ => None,
+            }
+        }
+        if self == other {
+            return true;
+        }
+        match (self, other) {
+            (DataType::Varchar(from), DataType::Varchar(to)) => from <= to,
+            (DataType::Varchar(_), DataType::Text) => true,
+            (DataType::Float, DataType::Double) => true,
+            (
+                DataType::Decimal {
+                    precision: from,
+                    scale: from_scale,
+                },
+                DataType::Decimal {
+                    precision: to,
+                    scale: to_scale,
+                },
+            ) => from_scale == to_scale && from <= to,
+            _ => match (integer_width(self), integer_width(other)) {
+                (Some(from), Some(to)) => from <= to,
+                _ => false,
+            },
+        }
+    }
+
     /// Check if this type is numeric
     pub fn is_numeric(&self) -> bool {
         matches!(
@@ -110,6 +148,46 @@ impl DataType {
             }
             DataType::Geometry => "GEOMETRY".to_string(),
             DataType::Json => "JSON".to_string(),
+        }
+    }
+}
+
+/// Where a column goes among a table's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnPlace {
+    /// After them all.
+    Last,
+    /// Before them all.
+    First,
+    /// Right after the column of this name.
+    After(String),
+}
+
+/// Why a change to a table's columns cannot be made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterError {
+    /// The table has no column of this name.
+    NoSuchColumn(String),
+    /// The table already has a column of this name.
+    DuplicateColumn(String),
+    /// A table cannot be left without columns.
+    LastColumn,
+    /// The change cannot be made by changing the definition alone: the
+    /// table's rows would have to be rewritten, or stored under other
+    /// keys. What the change is, for the message.
+    NeedsRebuild(String),
+}
+
+impl std::fmt::Display for AlterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlterError::NoSuchColumn(name) => write!(f, "Unknown column '{name}'"),
+            AlterError::DuplicateColumn(name) => write!(f, "Duplicate column name '{name}'"),
+            AlterError::LastColumn => write!(
+                f,
+                "You can't delete all columns with ALTER TABLE; use DROP TABLE instead"
+            ),
+            AlterError::NeedsRebuild(change) => write!(f, "{change}"),
         }
     }
 }
@@ -258,6 +336,136 @@ impl TableDef {
             Some(position) if position < self.columns.len() => self.columns.insert(position, col),
             _ => self.columns.push(col),
         }
+    }
+
+    /// The position of the column of this name (column names do not
+    /// distinguish case).
+    fn column_position(&self, name: &str) -> Result<usize, AlterError> {
+        self.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| AlterError::NoSuchColumn(name.to_string()))
+    }
+
+    /// Where `place` is among the columns, for a column that is not among
+    /// them (yet, or any more).
+    fn place(&self, place: &ColumnPlace) -> Result<usize, AlterError> {
+        match place {
+            ColumnPlace::Last => Ok(self.columns.len()),
+            ColumnPlace::First => Ok(0),
+            ColumnPlace::After(name) => Ok(self.column_position(name)? + 1),
+        }
+    }
+
+    /// Add a column where `place` says. Rows that are already there read
+    /// as the column's `missing` value for it; no row is touched.
+    pub fn alter_add_column(
+        &mut self,
+        col: ColumnDef,
+        place: &ColumnPlace,
+    ) -> Result<(), AlterError> {
+        if self.column_position(&col.name).is_ok() {
+            return Err(AlterError::DuplicateColumn(col.name));
+        }
+        if col.auto_increment {
+            // The rows that are there would each need a number.
+            return Err(AlterError::NeedsRebuild(format!(
+                "adding the AUTO_INCREMENT column '{}'",
+                col.name
+            )));
+        }
+        let position = self.place(place)?;
+        self.add_column(col, Some(position));
+        Ok(())
+    }
+
+    /// Drop a column. Its values stay in the rows that have them and are
+    /// passed over from now on: the column's number is not used again. A
+    /// unique constraint loses the column, and goes when it has no other.
+    pub fn alter_drop_column(&mut self, name: &str) -> Result<(), AlterError> {
+        let position = self.column_position(name)?;
+        let name = self.columns[position].name.clone();
+        let in_key = self
+            .primary_key()
+            .is_some_and(|key| key.iter().any(|column| column.eq_ignore_ascii_case(&name)));
+        if in_key {
+            // The rows are stored under their key.
+            return Err(AlterError::NeedsRebuild(format!(
+                "dropping the primary key column '{name}'"
+            )));
+        }
+        if self.columns.len() == 1 {
+            return Err(AlterError::LastColumn);
+        }
+        self.columns.remove(position);
+        let names = |columns: &[String]| columns.iter().any(|c| c.eq_ignore_ascii_case(&name));
+        for constraint in &mut self.constraints {
+            if let Constraint::Unique(columns) = constraint {
+                columns.retain(|column| !column.eq_ignore_ascii_case(&name));
+            }
+        }
+        self.constraints.retain(|constraint| match constraint {
+            Constraint::Unique(columns) => !columns.is_empty(),
+            Constraint::ForeignKey { columns, .. } => !names(columns),
+            Constraint::PrimaryKey(_) | Constraint::Check(_) => true,
+        });
+        Ok(())
+    }
+
+    /// Give a column another name. Its values are stored under its number,
+    /// so nothing else changes but the constraints that name it.
+    pub fn alter_rename_column(&mut self, old: &str, new: &str) -> Result<(), AlterError> {
+        let position = self.column_position(old)?;
+        if !old.eq_ignore_ascii_case(new) && self.column_position(new).is_ok() {
+            return Err(AlterError::DuplicateColumn(new.to_string()));
+        }
+        let old = std::mem::replace(&mut self.columns[position].name, new.to_string());
+        for constraint in &mut self.constraints {
+            let columns = match constraint {
+                Constraint::PrimaryKey(columns) | Constraint::Unique(columns) => columns,
+                Constraint::ForeignKey { columns, .. } => columns,
+                Constraint::Check(_) => continue,
+            };
+            for column in columns.iter_mut().filter(|c| c.eq_ignore_ascii_case(&old)) {
+                *column = new.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// Move a column to where `place` says, among the others.
+    pub fn alter_move_column(&mut self, name: &str, place: &ColumnPlace) -> Result<(), AlterError> {
+        let position = self.column_position(name)?;
+        if matches!(place, ColumnPlace::After(after) if after.eq_ignore_ascii_case(name)) {
+            return Err(AlterError::NoSuchColumn(name.to_string()));
+        }
+        let column = self.columns.remove(position);
+        match self.place(place) {
+            Ok(to) => {
+                self.columns.insert(to, column);
+                Ok(())
+            }
+            Err(e) => {
+                self.columns.insert(position, column);
+                Err(e)
+            }
+        }
+    }
+
+    /// Give a column another type. Allowed where every value the column's
+    /// rows can hold is stored the same way under the new type; anything
+    /// else means rewriting the rows.
+    pub fn alter_column_type(&mut self, name: &str, data_type: DataType) -> Result<(), AlterError> {
+        let position = self.column_position(name)?;
+        let column = &mut self.columns[position];
+        if !column.data_type.values_fit(&data_type) {
+            return Err(AlterError::NeedsRebuild(format!(
+                "changing column '{}' from {:?} to {:?}",
+                column.name, column.data_type, data_type
+            )));
+        }
+        column.data_type = data_type;
+        Ok(())
     }
 
     /// How the table's rows are stored and read: its columns' numbers, in
@@ -1288,5 +1496,142 @@ mod tests {
         assert!(DataType::Text.is_string());
         assert!(!DataType::Blob.is_string());
         assert!(!DataType::Boolean.is_numeric());
+    }
+
+    #[test]
+    fn columns_change_by_definition_alone() {
+        let mut table = TableDef::new("t")
+            .column(ColumnDef::new("id", DataType::Int).nullable(false))
+            .column(ColumnDef::new("a", DataType::Int))
+            .column(ColumnDef::new("b", DataType::Varchar(10)))
+            .constraint(Constraint::PrimaryKey(vec!["id".to_string()]))
+            .constraint(Constraint::Unique(vec!["a".to_string(), "b".to_string()]));
+        let shape = |table: &TableDef| -> Vec<(String, u32)> {
+            table
+                .columns
+                .iter()
+                .map(|column| (column.name.clone(), column.id))
+                .collect()
+        };
+        let named = |pairs: &[(&str, u32)]| -> Vec<(String, u32)> {
+            pairs
+                .iter()
+                .map(|(name, id)| (name.to_string(), *id))
+                .collect()
+        };
+        assert_eq!(shape(&table), named(&[("id", 1), ("a", 2), ("b", 3)]));
+
+        // Added columns take the next numbers, wherever they are placed.
+        table
+            .alter_add_column(ColumnDef::new("c", DataType::Int), &ColumnPlace::Last)
+            .unwrap();
+        table
+            .alter_add_column(ColumnDef::new("d", DataType::Int), &ColumnPlace::First)
+            .unwrap();
+        table
+            .alter_add_column(
+                ColumnDef::new("e", DataType::Int),
+                &ColumnPlace::After("A".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            shape(&table),
+            named(&[("d", 5), ("id", 1), ("a", 2), ("e", 6), ("b", 3), ("c", 4)])
+        );
+        assert_eq!(
+            table.alter_add_column(ColumnDef::new("B", DataType::Int), &ColumnPlace::Last),
+            Err(AlterError::DuplicateColumn("B".to_string()))
+        );
+        assert!(matches!(
+            table.alter_add_column(
+                ColumnDef::new("n", DataType::Int).auto_increment(),
+                &ColumnPlace::Last
+            ),
+            Err(AlterError::NeedsRebuild(_))
+        ));
+
+        // A dropped column's number is not given out again, and a unique
+        // constraint goes on without it.
+        table.alter_drop_column("A").unwrap();
+        table
+            .alter_add_column(ColumnDef::new("a", DataType::Int), &ColumnPlace::Last)
+            .unwrap();
+        assert_eq!(
+            shape(&table),
+            named(&[("d", 5), ("id", 1), ("e", 6), ("b", 3), ("c", 4), ("a", 7)])
+        );
+        assert!(table
+            .constraints
+            .contains(&Constraint::Unique(vec!["b".to_string()])));
+        assert!(matches!(
+            table.alter_drop_column("id"),
+            Err(AlterError::NeedsRebuild(_))
+        ));
+        assert_eq!(
+            table.alter_drop_column("nope"),
+            Err(AlterError::NoSuchColumn("nope".to_string()))
+        );
+
+        // A renamed column keeps its number, and the constraints follow.
+        table.alter_rename_column("ID", "key").unwrap();
+        table.alter_rename_column("b", "bb").unwrap();
+        assert_eq!(table.primary_key(), Some(&["key".to_string()][..]));
+        assert!(table
+            .constraints
+            .contains(&Constraint::Unique(vec!["bb".to_string()])));
+        assert_eq!(
+            table.alter_rename_column("bb", "C"),
+            Err(AlterError::DuplicateColumn("C".to_string()))
+        );
+
+        // Moved.
+        table.alter_move_column("a", &ColumnPlace::First).unwrap();
+        table
+            .alter_move_column("d", &ColumnPlace::After("c".to_string()))
+            .unwrap();
+        assert_eq!(
+            shape(&table),
+            named(&[
+                ("a", 7),
+                ("key", 1),
+                ("e", 6),
+                ("bb", 3),
+                ("c", 4),
+                ("d", 5)
+            ])
+        );
+        assert!(table
+            .alter_move_column("a", &ColumnPlace::After("nope".to_string()))
+            .is_err());
+        assert_eq!(table.columns[0].name, "a");
+
+        // A type the stored values already fit; one they do not.
+        table
+            .alter_column_type("bb", DataType::Varchar(20))
+            .unwrap();
+        table.alter_column_type("c", DataType::BigInt).unwrap();
+        for (column, data_type) in [
+            ("bb", DataType::Varchar(5)),
+            ("bb", DataType::Int),
+            ("c", DataType::Int),
+            ("c", DataType::BigIntUnsigned),
+        ] {
+            assert!(
+                matches!(
+                    table.alter_column_type(column, data_type.clone()),
+                    Err(AlterError::NeedsRebuild(_))
+                ),
+                "{column} to {data_type:?}"
+            );
+        }
+        // The row shape follows the columns.
+        let ids: Vec<u32> = table
+            .row_shape()
+            .unwrap()
+            .columns()
+            .iter()
+            .map(|column| column.id)
+            .collect();
+        assert_eq!(ids, [7, 1, 6, 3, 4, 5]);
     }
 }

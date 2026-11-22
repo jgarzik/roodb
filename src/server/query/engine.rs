@@ -2460,9 +2460,9 @@ impl QueryEngine {
                 };
 
                 // Apply each operation to the cloned def
-                let mut dropped_indexes = Vec::new();
+                let mut effects = AlterEffects::default();
                 for op in &alter.operations {
-                    self.apply_alter_op(&mut new_def, op, &mut dropped_indexes)?;
+                    self.apply_alter_op(&mut new_def, op, &mut effects)?;
                 }
 
                 // A temporary table is known to this session only: its new
@@ -2496,10 +2496,13 @@ impl QueryEngine {
                     // The table's indexes stay with it, less those dropped
                     // here, and under its new name if it has one.
                     let mut indexes = catalog.table_indexes(&old_table_name);
-                    indexes.retain(|index| !dropped_indexes.contains(&index.name));
+                    indexes.retain(|index| !effects.dropped_indexes.contains(&index.name));
                     for index in &mut indexes {
                         index.table.clone_from(&new_def.name);
+                        effects.apply_to_columns(&mut index.columns);
                     }
+                    // An index all of whose columns were dropped goes too.
+                    indexes.retain(|index| !index.columns.is_empty());
                     indexes
                 };
                 self.persist_alter_table(&old_table_name, new_def, indexes)
@@ -2516,46 +2519,45 @@ impl QueryEngine {
         &self,
         def: &mut crate::catalog::TableDef,
         op: &sqlparser::ast::AlterTableOperation,
-        dropped_indexes: &mut Vec<String>,
+        effects: &mut AlterEffects,
     ) -> ProtocolResult<()> {
         use sqlparser::ast::AlterTableOperation;
 
         match op {
-            AlterTableOperation::AddColumn { column_def, .. } => {
-                let col = crate::sql::resolver::convert_column_def_pub(column_def)?;
-                // Check for duplicate column name
-                if def.get_column(&col.name).is_some() {
-                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
-                        "Duplicate column name '{}'",
+            AlterTableOperation::AddColumn {
+                column_def,
+                column_position,
+                ..
+            } => {
+                let mut col = crate::sql::resolver::convert_column_def_pub(column_def)?;
+                // A key written with the column would re-key the rows.
+                let keyed = column_def.options.iter().any(|option| {
+                    matches!(option.option, sqlparser::ast::ColumnOption::PrimaryKey(_))
+                });
+                if keyed {
+                    return Err(needs_rebuild(format!(
+                        "adding the primary key column '{}'",
                         col.name
-                    ))));
+                    )));
                 }
-                def.columns.push(col);
+                // What the rows that are already there read as for it.
+                col.missing = missing_value(&col)?;
+                def.alter_add_column(col, &column_place(column_position.as_ref()))
+                    .map_err(alter_error)?;
             }
 
             AlterTableOperation::DropColumn { column_names, .. } => {
                 for ident in column_names {
-                    let col_name = ident.value.clone();
-                    let before = def.columns.len();
-                    def.columns
-                        .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
-                    if def.columns.len() == before {
-                        return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
-                            "Can't DROP '{}'; check that column/key exists",
-                            col_name
-                        ))));
-                    }
-                    // Also remove from any constraints referencing this column
-                    def.constraints.retain(|c| match c {
-                        crate::catalog::Constraint::PrimaryKey(cols)
-                        | crate::catalog::Constraint::Unique(cols) => {
-                            !cols.iter().any(|c| c.eq_ignore_ascii_case(&col_name))
+                    def.alter_drop_column(&ident.value).map_err(|e| match e {
+                        // MySQL's words for a column that is not there.
+                        crate::catalog::AlterError::NoSuchColumn(name) => {
+                            ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
+                                "Can't DROP '{name}'; check that column/key exists"
+                            )))
                         }
-                        crate::catalog::Constraint::ForeignKey { columns, .. } => {
-                            !columns.iter().any(|c| c.eq_ignore_ascii_case(&col_name))
-                        }
-                        crate::catalog::Constraint::Check(_) => true,
-                    });
+                        other => alter_error(other),
+                    })?;
+                    effects.dropped_columns.push(ident.value.clone());
                 }
             }
 
@@ -2563,6 +2565,10 @@ impl QueryEngine {
                 let resolved = crate::sql::Resolver::new(&self.catalog.read())
                     .for_session(self.temp.table_names(), self.session.database.clone())
                     .table_constraint(constraint)?;
+                if let Some(crate::catalog::Constraint::PrimaryKey(_)) = resolved {
+                    // The rows are stored under their key.
+                    return Err(needs_rebuild("adding a primary key".to_string()));
+                }
                 if let Some(c) = resolved {
                     def.constraints.push(c);
                 }
@@ -2572,23 +2578,13 @@ impl QueryEngine {
                 col_name,
                 data_type,
                 options,
-                ..
+                column_position,
             } => {
-                let name = col_name.value.clone();
                 let new_type = crate::sql::resolver::convert_data_type(data_type)?;
-                if let Some(col) = def
-                    .columns
-                    .iter_mut()
-                    .find(|c| c.name.eq_ignore_ascii_case(&name))
-                {
-                    col.data_type = new_type;
-                    // Re-apply options
-                    self.apply_column_options(col, options);
-                } else {
-                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
-                        "Unknown column '{}' in '{}'",
-                        name, def.name
-                    ))));
+                self.alter_column(def, &col_name.value, new_type, options)?;
+                if let Some(position) = column_position {
+                    def.alter_move_column(&col_name.value, &column_place(Some(position)))
+                        .map_err(alter_error)?;
                 }
             }
 
@@ -2597,23 +2593,18 @@ impl QueryEngine {
                 new_name,
                 data_type,
                 options,
-                ..
+                column_position,
             } => {
-                let old = old_name.value.clone();
                 let new_type = crate::sql::resolver::convert_data_type(data_type)?;
-                if let Some(col) = def
-                    .columns
-                    .iter_mut()
-                    .find(|c| c.name.eq_ignore_ascii_case(&old))
-                {
-                    col.name = new_name.value.clone();
-                    col.data_type = new_type;
-                    self.apply_column_options(col, options);
-                } else {
-                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
-                        "Unknown column '{}' in '{}'",
-                        old, def.name
-                    ))));
+                self.alter_column(def, &old_name.value, new_type, options)?;
+                def.alter_rename_column(&old_name.value, &new_name.value)
+                    .map_err(alter_error)?;
+                effects
+                    .renamed_columns
+                    .push((old_name.value.clone(), new_name.value.clone()));
+                if let Some(position) = column_position {
+                    def.alter_move_column(&new_name.value, &column_place(Some(position)))
+                        .map_err(alter_error)?;
                 }
             }
 
@@ -2629,24 +2620,16 @@ impl QueryEngine {
                 old_column_name,
                 new_column_name,
             } => {
-                let old = old_column_name.value.clone();
-                if let Some(col) = def
-                    .columns
-                    .iter_mut()
-                    .find(|c| c.name.eq_ignore_ascii_case(&old))
-                {
-                    col.name = new_column_name.value.clone();
-                } else {
-                    return Err(ProtocolError::Sql(crate::sql::SqlError::Parse(format!(
-                        "Unknown column '{}' in '{}'",
-                        old, def.name
-                    ))));
-                }
+                def.alter_rename_column(&old_column_name.value, &new_column_name.value)
+                    .map_err(alter_error)?;
+                effects
+                    .renamed_columns
+                    .push((old_column_name.value.clone(), new_column_name.value.clone()));
             }
 
             AlterTableOperation::DropPrimaryKey { .. } => {
-                def.constraints
-                    .retain(|c| !matches!(c, crate::catalog::Constraint::PrimaryKey(_)));
+                // The rows are stored under their key.
+                return Err(needs_rebuild("dropping the primary key".to_string()));
             }
 
             AlterTableOperation::DropForeignKey { name, .. } => {
@@ -2665,12 +2648,12 @@ impl QueryEngine {
             }
 
             AlterTableOperation::DropIndex { name } => {
-                dropped_indexes.push(name.value.clone());
+                effects.dropped_indexes.push(name.value.clone());
             }
 
             AlterTableOperation::DropConstraint { name, .. } => {
                 // A constraint may be backed by an index of the same name.
-                dropped_indexes.push(name.value.clone());
+                effects.dropped_indexes.push(name.value.clone());
             }
 
             AlterTableOperation::AlterColumn { column_name, op } => {
@@ -2695,10 +2678,14 @@ impl QueryEngine {
                             col.nullable = true;
                         }
                         AlterColumnOperation::SetDataType { data_type, .. } => {
-                            if let Ok(new_type) = crate::sql::resolver::convert_data_type(data_type)
-                            {
-                                col.data_type = new_type;
+                            let new_type = crate::sql::resolver::convert_data_type(data_type)?;
+                            if !col.data_type.values_fit(&new_type) {
+                                return Err(needs_rebuild(format!(
+                                    "changing column '{}' from {:?} to {:?}",
+                                    col.name, col.data_type, new_type
+                                )));
                             }
+                            col.data_type = new_type;
                         }
                         _ => {}
                     }
@@ -2723,6 +2710,37 @@ impl QueryEngine {
             }
         }
 
+        Ok(())
+    }
+
+    /// `MODIFY`/`CHANGE COLUMN`: the column's new type and options.
+    fn alter_column(
+        &self,
+        def: &mut crate::catalog::TableDef,
+        name: &str,
+        new_type: crate::catalog::DataType,
+        options: &[sqlparser::ast::ColumnOption],
+    ) -> ProtocolResult<()> {
+        def.alter_column_type(name, new_type).map_err(alter_error)?;
+        let Some(col) = def
+            .columns
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(alter_error(crate::catalog::AlterError::NoSuchColumn(
+                name.to_string(),
+            )));
+        };
+        let counted = col.auto_increment;
+        self.apply_column_options(col, options);
+        if col.auto_increment && !counted {
+            // The counter would have to start above the values the column
+            // already has, which means reading every row.
+            return Err(needs_rebuild(format!(
+                "making column '{}' AUTO_INCREMENT",
+                col.name
+            )));
+        }
         Ok(())
     }
 
@@ -6270,6 +6288,7 @@ impl QueryEngine {
                 }
             }
             SqlError::Unsupported(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
+            SqlError::NotSupportedYet(_) => (1235, "42000"),
             SqlError::EmptyQuery => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
             SqlError::CommentOnly => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
         };
@@ -6525,6 +6544,89 @@ fn describe_table(td: &crate::catalog::TableDef) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// What an `ALTER TABLE` did that the table's indexes must follow.
+#[derive(Default)]
+struct AlterEffects {
+    /// Indexes dropped by name.
+    dropped_indexes: Vec<String>,
+    /// Columns dropped.
+    dropped_columns: Vec<String>,
+    /// Columns renamed: old name, new name, in the order it was done.
+    renamed_columns: Vec<(String, String)>,
+}
+
+impl AlterEffects {
+    /// Bring a list of column names (an index's) up to date: dropped
+    /// columns leave it, renamed ones take their new names.
+    fn apply_to_columns(&self, columns: &mut Vec<String>) {
+        columns.retain(|column| {
+            !self
+                .dropped_columns
+                .iter()
+                .any(|dropped| dropped.eq_ignore_ascii_case(column))
+        });
+        for (old, new) in &self.renamed_columns {
+            for column in columns.iter_mut().filter(|c| c.eq_ignore_ascii_case(old)) {
+                column.clone_from(new);
+            }
+        }
+    }
+}
+
+/// The error for a change to a table that cannot be made without
+/// rewriting its rows or storing them under other keys (MySQL error 1235,
+/// until the online rebuild of a table does it).
+fn needs_rebuild(change: String) -> ProtocolError {
+    ProtocolError::Sql(crate::sql::SqlError::NotSupportedYet(change))
+}
+
+/// A refused change to a table's columns, as the client is told.
+fn alter_error(e: crate::catalog::AlterError) -> ProtocolError {
+    match e {
+        crate::catalog::AlterError::NeedsRebuild(change) => needs_rebuild(change),
+        other => ProtocolError::Sql(crate::sql::SqlError::Parse(other.to_string())),
+    }
+}
+
+/// Where `ALTER TABLE` says a column goes: `FIRST`, `AFTER column`, or
+/// (saying nothing) after all the others.
+fn column_place(
+    position: Option<&sqlparser::ast::MySQLColumnPosition>,
+) -> crate::catalog::ColumnPlace {
+    use crate::catalog::ColumnPlace;
+    match position {
+        None => ColumnPlace::Last,
+        Some(sqlparser::ast::MySQLColumnPosition::First) => ColumnPlace::First,
+        Some(sqlparser::ast::MySQLColumnPosition::After(column)) => {
+            ColumnPlace::After(column.value.clone())
+        }
+    }
+}
+
+/// What the rows a table already has read as for a column added to it:
+/// the column's default, the type's own default for a column that has
+/// none and cannot be NULL, or nothing (NULL). Encoded as the catalog
+/// keeps it (`ColumnDef::missing`).
+fn missing_value(col: &crate::catalog::ColumnDef) -> ProtocolResult<Option<Vec<u8>>> {
+    let datum = match &col.default {
+        Some(default) => {
+            let literal = crate::sql::resolver::parse_default_value(default);
+            crate::executor::eval::coerce_to_column_type(
+                Datum::from_literal(&literal),
+                &col.data_type,
+            )?
+        }
+        None if col.nullable => Datum::Null,
+        None => Datum::default_for_type(&col.data_type),
+    };
+    if datum.is_null() {
+        return Ok(None);
+    }
+    let mut encoded = Vec::new();
+    crate::executor::encoding::encode_value(&mut encoded, &datum);
+    Ok(Some(encoded))
 }
 
 /// SELECT on every table and view a query reads from, in its FROM clause

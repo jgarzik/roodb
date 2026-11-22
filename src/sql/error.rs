@@ -26,6 +26,9 @@ pub enum SqlError {
     InvalidOperation(String),
     /// Unsupported SQL feature
     Unsupported(String),
+    /// Something MySQL does that this server does not do yet (MySQL error
+    /// 1235); what it is, for the message.
+    NotSupportedYet(String),
     /// Empty query (no SQL statement)
     EmptyQuery,
     /// Comment-only query (should return OK, not error)
@@ -52,6 +55,9 @@ impl fmt::Display for SqlError {
             }
             SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            SqlError::NotSupportedYet(what) => {
+                write!(f, "This version of RooDB doesn't yet support '{}'", what)
+            }
             SqlError::EmptyQuery => write!(f, "Query was empty"),
             SqlError::CommentOnly => write!(f, "Comment-only query"),
         }

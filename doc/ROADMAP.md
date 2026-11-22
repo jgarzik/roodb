@@ -78,13 +78,6 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-2. `ADD`/`DROP`/reorder/rename `COLUMN`, and a change of type that the
-   stored values already fit, as metadata (rows are stored by column ID:
-   `executor/rowcodec.rs`). A change that needs the rows rewritten or
-   re-keyed is refused with error 1235 until step 5 can do it: a type
-   the stored values do not fit, any change of the primary key (dropping
-   a key column included), an `AUTO_INCREMENT` column added to a table
-   with rows.
 3. Metadata locks taken by statements and DDL (the lock manager is
    written: `txn/mdl.rs`); DDL commits implicitly; changesets of rows
    carry the version of the table they were built against
@@ -95,8 +88,12 @@ below changes.
    protected.
 5. The schema-change job runner (its record replicated; a new primary
    carries on; cancelled, and rolled back, when its client goes away),
-   and with it the online rebuild of a table under a new ID: change of
-   primary key and of column type. What step 2 refuses works from here.
+   and with it the online rebuild of a table under a new ID. From here
+   on the changes `ALTER TABLE` refuses with error 1235 work: a column
+   type the stored values do not fit, `ADD`/`DROP PRIMARY KEY` and
+   dropping a key column, and an `AUTO_INCREMENT` column added (or an
+   existing column made one), whose counter starts above the values
+   there.
 6. Forgotten key ranges (`WriteOp::ForgetRange`, a write of a
    `StorageEngine::write_batch`, is written; nothing uses it yet):
    - `DROP TABLE`, `TRUNCATE` (which resets `AUTO_INCREMENT`) and
