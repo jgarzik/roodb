@@ -453,7 +453,10 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
             ),
         }
     }
-    let leader = 0;
+    // Node 1 leads; a moment later it has taken the role up and accepts
+    // writes.
+    let leader = find_primary(&all).await;
+    assert_eq!(leader, 0, "node 1 was made primary");
     let mut primary = connect(all[leader]).await;
     for n in 60..90 {
         primary

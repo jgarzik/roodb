@@ -331,7 +331,9 @@ ALTER CLUSTER REMOVE NODE 3;
 ALTER CLUSTER SET PRIMARY 2;
 ```
 
-`ALTER CLUSTER SET PRIMARY` returns when the named node is the primary. The
+`ALTER CLUSTER SET PRIMARY` returns when the named node is the primary (it
+accepts writes a moment later, once it has taken the role up: until then a
+write gets error 1290, as on any secondary). The
 role is handed over by asking that node to stand for election; if the request
 reaches it late, another node may be elected instead. The statement then
 fails and names the node that leads now: repeat it on that node.
