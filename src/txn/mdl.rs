@@ -151,16 +151,25 @@ struct SessionLocks {
     in_table: Vec<u64>,
 }
 
+/// What one session holds, where a schema change that closes a gate can
+/// look at it. It is only a list: letting go of it runs nothing, so it
+/// does not matter who lets go of it last, or under which lock.
+#[derive(Default)]
+struct SessionState {
+    held: Mutex<SessionLocks>,
+}
+
 /// The locks of one session. A session takes its shared locks through
-/// this, on the fast side whenever the name's gate is open.
+/// this, on the fast side whenever the name's gate is open. When it is
+/// dropped, everything the session held is released.
 pub struct MdlSession {
     locks: Arc<MetadataLocks>,
-    held: Mutex<SessionLocks>,
+    state: Arc<SessionState>,
 }
 
 impl std::fmt::Debug for MdlSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let held = self.held.lock();
+        let held = self.state.held.lock();
         f.debug_struct("MdlSession")
             .field("fast", &held.fast.len())
             .field("in_table", &held.in_table)
@@ -179,7 +188,7 @@ impl MdlSession {
         timeout: Duration,
     ) -> Result<(), MdlError> {
         {
-            let mut held = self.held.lock();
+            let mut held = self.state.held.lock();
             let has = held
                 .fast
                 .iter()
@@ -217,7 +226,7 @@ impl MdlSession {
         timeout: Duration,
     ) -> Result<(), MdlError> {
         {
-            let mut held = self.held.lock();
+            let mut held = self.state.held.lock();
             if !held.in_table.contains(&owner) {
                 held.in_table.push(owner);
             }
@@ -230,7 +239,7 @@ impl MdlSession {
     /// runs in none) ends.
     pub fn release(&self, owner: u64) {
         let (fast, in_table) = {
-            let mut held = self.held.lock();
+            let mut held = self.state.held.lock();
             let mut fast = Vec::new();
             let mut index = 0;
             while index < held.fast.len() {
@@ -254,15 +263,17 @@ impl MdlSession {
 
     /// Whether this session holds nothing, for any owner.
     pub fn is_idle(&self) -> bool {
-        let held = self.held.lock();
+        let held = self.state.held.lock();
         held.fast.is_empty() && held.in_table.is_empty()
     }
 }
 
 impl Drop for MdlSession {
     fn drop(&mut self) {
-        // A session that goes away holds nothing afterwards.
-        let held = std::mem::take(&mut *self.held.lock());
+        // A session that goes away holds nothing afterwards. (Only the
+        // session's owner drops this, never whoever looks through the
+        // sessions: they hold the list, not the session.)
+        let held = std::mem::take(&mut *self.state.held.lock());
         for lock in held.fast {
             lock.gate.leave();
         }
@@ -483,7 +494,7 @@ pub struct MetadataLocks {
     /// Each name's gate. Read to find a gate, written to add one.
     gates: RwLock<HashMap<TableName, Arc<NameGate>>>,
     /// The sessions that may hold locks on the fast side.
-    sessions: Mutex<Vec<Weak<MdlSession>>>,
+    sessions: Mutex<Vec<Weak<SessionState>>>,
     /// Where waits are recorded, so that deadlocks through both kinds of
     /// lock are found.
     row_locks: Arc<LockManager>,
@@ -530,17 +541,20 @@ impl MetadataLocks {
 
     /// The locks of a new session.
     pub fn session(self: &Arc<Self>) -> Arc<MdlSession> {
-        let session = Arc::new(MdlSession {
-            locks: self.clone(),
-            held: Mutex::new(SessionLocks::default()),
-        });
-        let mut sessions = self.sessions.lock();
-        // Sessions that have gone are dropped from the list as it grows.
-        if sessions.len() == sessions.capacity() {
-            sessions.retain(|session| session.strong_count() > 0);
+        let state = Arc::new(SessionState::default());
+        {
+            let mut sessions = self.sessions.lock();
+            // Sessions that have gone are dropped from the list as it
+            // grows.
+            if sessions.len() == sessions.capacity() {
+                sessions.retain(|session| session.strong_count() > 0);
+            }
+            sessions.push(Arc::downgrade(&state));
         }
-        sessions.push(Arc::downgrade(&session));
-        session
+        Arc::new(MdlSession {
+            locks: self.clone(),
+            state,
+        })
     }
 
     /// `name` with its gate, to lock it through a session.
@@ -580,7 +594,7 @@ impl MetadataLocks {
         // Whoever counted itself in before the gate closed did so under
         // its session's mutex, and noted the lock there: asking each
         // session in turn finds them all.
-        let sessions: Vec<Arc<MdlSession>> = {
+        let sessions: Vec<Arc<SessionState>> = {
             let mut sessions = self.sessions.lock();
             sessions.retain(|session| session.strong_count() > 0);
             sessions.iter().filter_map(Weak::upgrade).collect()
@@ -1510,6 +1524,48 @@ mod tests {
                     tokio::task::yield_now().await;
                     inside.store(0, Ordering::SeqCst);
                     session.release(owner);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(m.counts(), (0, 0));
+        assert_eq!(m.target(&name("t")).gate.holders(), 0);
+    }
+
+    /// Sessions that go away, holding locks, while schema changes close
+    /// gates and look through the sessions: nobody is left waiting, and
+    /// nothing is left held. (Whoever looks through the sessions holds
+    /// their lists, never the sessions: a session's release is run by its
+    /// owner alone, with no lock held.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sessions_can_go_away_while_gates_are_closed() {
+        let (_, m) = locks();
+        let mut tasks = Vec::new();
+        for reader in 0..4u64 {
+            let m = m.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..2000u64 {
+                    let owner = 1000 + reader * 10_000 + round;
+                    let session = m.session();
+                    let t = m.target(&name("t"));
+                    // Whether fast or through the table: dropped holding it.
+                    session.lock_shared(owner, &t, SHORT).await.ok();
+                    // Long enough alive to be found by someone looking
+                    // through the sessions, then gone under their hands.
+                    tokio::task::yield_now().await;
+                    drop(session);
+                }
+            }));
+        }
+        for writer in 0..2u64 {
+            let m = m.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..2000u64 {
+                    let owner = 500_000 + writer * 10_000 + round;
+                    m.lock(owner, &name("t"), Exclusive, SHORT).await.ok();
+                    m.release_all(owner);
                 }
             }));
         }

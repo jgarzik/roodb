@@ -93,7 +93,7 @@ Always acquired alone (never nested with other locks).
 | `MetadataLocks::state` | parking_lot::Mutex | Metadata lock table |
 | `MetadataLocks::gates` | parking_lot::RwLock | Each name's gate (fast side); read to find one, written to add or drop one |
 | `MetadataLocks::sessions` | parking_lot::Mutex | The sessions that may hold fast-side locks |
-| `MdlSession::held` | parking_lot::Mutex | One session's fast-side locks; taken by the session, and by whoever closes a gate |
+| `SessionState::held` | parking_lot::Mutex | One session's fast-side locks; taken by the session, and by whoever closes a gate |
 
 Multiple RwLocks but NEVER nested - each acquired/released independently.
 The two lock tables are the exception, in one fixed order (see Metadata
@@ -354,7 +354,11 @@ Closing a gate happens under the metadata lock mutex and takes, in turn,
 `gates` (to find the gate), `sessions`, and each session's `held`. A session
 takes its own `held` only to change its fast-side list and takes nothing
 else while it holds it; it comes to the lock table (to queue, or to release
-what was moved there) only after letting go of it.
+what was moved there) only after letting go of it. What the list of sessions
+holds of a session is its lock list alone (`SessionState`), which has no
+destructor: a session's release (`MdlSession`'s drop) is run only by the
+session's owner, never by a closer that happens to hold the last reference
+while it has the lock table.
 
 ## Lock Ordering Rules
 
