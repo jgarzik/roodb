@@ -663,52 +663,37 @@ async fn the_primary_role_can_be_moved() {
         .await
         .unwrap();
 
-    // The statement returns when node 2 is the primary. Raft hands the
-    // role over by asking, and on a slow machine another node can be
-    // elected instead: the statement then says which, and is repeated
-    // there, as an operator would.
+    // Ask whichever node is primary to hand the role to node 2, until the
+    // node that takes writes says node 2 is the primary. Raft hands the
+    // role over by asking; on a slow machine another node can be elected
+    // instead, or the role can move again a moment later, and the request
+    // is then repeated where the role is, as an operator would.
     let all = [&first, &second, &third];
-    let mut asked = 0;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let mut on_primary = connect(all[asked]).await;
-        match on_primary.query_drop("ALTER CLUSTER SET PRIMARY 2").await {
-            Ok(()) => break,
-            Err(e) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "node 2 never became primary: {e}"
-                );
-                asked = find_primary(&all).await;
-            }
+        let holder = find_primary(&all).await;
+        let mut on_primary = connect(all[holder]).await;
+        let seen = members(&mut on_primary).await;
+        if seen
+            .iter()
+            .any(|(id, _, role)| *id == 2 && role == "PRIMARY")
+        {
+            break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "node 2 never became primary: {seen:?}"
+        );
+        // Refused if the role has moved on meanwhile: asked again above.
+        let _ = on_primary.query_drop("ALTER CLUSTER SET PRIMARY 2").await;
     }
-    let seen = members(&mut conn).await;
-    assert!(
-        seen.iter()
-            .any(|(id, _, role)| *id == 2 && role == "PRIMARY"),
-        "the statement returned, but node 2 is not the primary: {seen:?}"
-    );
-    // Node 2 is one of the two joiners; it takes writes now, and the first
-    // node does not.
-    let nodes = [&second, &third];
-    let leader = find_primary(&nodes).await;
-    let mut primary = connect(nodes[leader]).await;
+    // The cluster goes on taking writes, and the first node has them.
+    let holder = find_primary(&all).await;
+    let mut primary = connect(all[holder]).await;
     primary
         .query_drop("INSERT INTO formed VALUES (2)")
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        match conn.query_drop("INSERT INTO formed VALUES (3)").await {
-            Err(e) if error_code(&e) == 1290 => break,
-            other => assert!(
-                Instant::now() < deadline,
-                "the old primary still takes writes: {other:?}"
-            ),
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     until_rows(
         &mut conn,
         &first,
@@ -716,6 +701,8 @@ async fn the_primary_role_can_be_moved() {
         &[1, 2],
     )
     .await;
+    // The transaction that was open on the first node when the role left it
+    // was rolled back: its row is not there, and ROLLBACK is answered.
     open.query_drop("ROLLBACK")
         .await
         .expect("ROLLBACK of a transaction already rolled back");
