@@ -331,6 +331,11 @@ ALTER CLUSTER REMOVE NODE 3;
 ALTER CLUSTER SET PRIMARY 2;
 ```
 
+`ALTER CLUSTER SET PRIMARY` returns when the named node is the primary. The
+role is handed over by asking that node to stand for election; if the request
+reaches it late, another node may be elected instead. The statement then
+fails and names the node that leads now: repeat it on that node.
+
 A node that has lost its data directory must be removed (`ALTER CLUSTER
 REMOVE NODE`) before a new node may join at its address: the cluster will not
 hand the old node's place to a node that has none of what the old one had.

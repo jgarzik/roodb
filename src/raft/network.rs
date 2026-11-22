@@ -74,6 +74,9 @@ enum MessageType {
     TransferLeader = 11,
 }
 
+/// The least time a request to take over as leader is given to be answered.
+const TRANSFER_LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a node says when asked who is in the cluster.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MembersReply {
@@ -420,7 +423,11 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkConnection {
         req: openraft::raft::TransferLeaderRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<openraft::raft::TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
-        self.send_request(MessageType::TransferLeader, &req, option.soft_ttl())
+        // Sent once, by a leader that lets go as it sends: a request that
+        // is lost to a slow round trip leaves the choice of the next leader
+        // to chance. It is given more time than a heartbeat.
+        let limit = option.soft_ttl().max(TRANSFER_LEADER_TIMEOUT);
+        self.send_request(MessageType::TransferLeader, &req, limit)
             .await
             .map_err(|e| RPCError::Unreachable(unreachable(e)))
     }

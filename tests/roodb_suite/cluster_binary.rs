@@ -642,24 +642,32 @@ async fn the_primary_role_can_be_moved() {
         .await
         .unwrap();
 
-    conn.query_drop("ALTER CLUSTER SET PRIMARY 2")
-        .await
-        .unwrap();
+    // The statement returns when node 2 is the primary. Raft hands the
+    // role over by asking, and on a slow machine another node can be
+    // elected instead: the statement then says which, and is repeated
+    // there, as an operator would.
+    let all = [&first, &second, &third];
+    let mut asked = 0;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let seen = members(&mut conn).await;
-        if seen
-            .iter()
-            .any(|(id, _, role)| *id == 2 && role == "PRIMARY")
-        {
-            break;
+        let mut on_primary = connect(all[asked]).await;
+        match on_primary.query_drop("ALTER CLUSTER SET PRIMARY 2").await {
+            Ok(()) => break,
+            Err(e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "node 2 never became primary: {e}"
+                );
+                asked = find_primary(&all).await;
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "node 2 never became primary: {seen:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let seen = members(&mut conn).await;
+    assert!(
+        seen.iter()
+            .any(|(id, _, role)| *id == 2 && role == "PRIMARY"),
+        "the statement returned, but node 2 is not the primary: {seen:?}"
+    );
     // Node 2 is one of the two joiners; it takes writes now, and the first
     // node does not.
     let nodes = [&second, &third];

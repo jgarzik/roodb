@@ -92,6 +92,10 @@ pub const DEFAULT_LOG_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// How long startup waits for the node to lead and to replay its log.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a node that asked another to take over as leader waits, still
+/// leading, before it asks again.
+const TRANSFER_RETRY: Duration = Duration::from_secs(3);
+
 /// Whether a change of membership was refused only because another is
 /// still under way.
 pub(crate) fn membership_change_in_progress(
@@ -571,10 +575,16 @@ impl RaftNode {
     }
 
     /// Hand the primary role to another node. Only the primary can, and
-    /// only to a voting member. Returns when the request has been made; the
-    /// other node takes over within moments, and this one becomes a
-    /// secondary (rolling back its open transactions, as on any change of
-    /// primary).
+    /// only to a voting member. Returns when that node is the primary; this
+    /// one is then a secondary (and has rolled back its open transactions,
+    /// as on any change of primary).
+    ///
+    /// Raft hands leadership over by asking: the leader lets go and tells
+    /// the other node to stand for election. Usually that node wins. If the
+    /// request reaches it late, this node may keep the role (and asks
+    /// again), or a third node may be elected: that is reported as an
+    /// error naming the node that leads now, where the request can be
+    /// repeated.
     pub async fn transfer_primary(&self, to: NodeId) -> Result<(), RaftNodeError> {
         if !self.raft.is_leader() {
             return Err(RaftNodeError::Raft(NOT_PRIMARY.to_string()));
@@ -595,11 +605,48 @@ impl RaftNode {
                 )))
             }
         }
-        self.raft
-            .trigger()
-            .transfer_leader(to)
-            .await
-            .map_err(|e| RaftNodeError::Raft(e.to_string()))
+        use openraft::async_runtime::WatchReceiver;
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let mut metrics = self.raft.metrics();
+        loop {
+            self.raft
+                .trigger()
+                .transfer_leader(to)
+                .await
+                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+            // Until someone else leads, or this node has led on for long
+            // enough that the request must have come to nothing.
+            let ask_again = tokio::time::Instant::now() + TRANSFER_RETRY;
+            loop {
+                let leader = metrics.borrow_watched().current_leader;
+                match leader {
+                    Some(leader) if leader == to => return Ok(()),
+                    Some(leader) if leader != self.id => {
+                        return Err(RaftNodeError::Raft(format!(
+                            "The primary role went to node {leader}, not node {to}; \
+                             repeat the request on node {leader}"
+                        )))
+                    }
+                    // This node still, or nobody yet.
+                    _ => {}
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(RaftNodeError::Raft(format!(
+                        "Node {to} did not take the primary role"
+                    )));
+                }
+                if now >= ask_again && self.raft.is_leader() {
+                    break;
+                }
+                let wake = if self.raft.is_leader() {
+                    ask_again
+                } else {
+                    deadline
+                };
+                let _ = tokio::time::timeout_at(wake, metrics.changed()).await;
+            }
+        }
     }
 
     /// Call `removed` once, if this node finds that it has been taken out
