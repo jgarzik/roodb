@@ -2,6 +2,7 @@
 //!
 //! O(log n) single-row lookup by primary key using storage get() instead of scan().
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use crate::txn::MvccStorage;
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
-use super::encoding::{decode_row, encode_pk_key};
+use super::encoding::encode_pk_key;
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -23,7 +24,7 @@ pub struct PointGet {
     /// Table name
     table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Primary key value expression
     key_expr: ResolvedExpr,
     /// The key column's type, if known.
@@ -43,7 +44,7 @@ pub struct PointGet {
 impl PointGet {
     pub fn new(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         key_expr: ResolvedExpr,
         key_type: Option<crate::catalog::DataType>,
         mvcc: Arc<MvccStorage>,
@@ -52,7 +53,7 @@ impl PointGet {
     ) -> Self {
         PointGet {
             table,
-            table_id,
+            layout,
             key_expr,
             key_type,
             mvcc,
@@ -79,7 +80,7 @@ impl Executor for PointGet {
         };
 
         // Encode the storage key using PK-based encoding
-        let storage_key = encode_pk_key(self.table_id, &[key_datum]);
+        let storage_key = encode_pk_key(self.layout.id, &[key_datum]);
 
         // Do the O(log n) lookup
         let value = if let Some(ref ctx) = self.txn_context {
@@ -90,7 +91,7 @@ impl Executor for PointGet {
                 use super::context::LockedRow;
                 match ctx.locked_read(&self.mvcc, &storage_key).await? {
                     LockedRow::Row(data) => {
-                        self.result = Some(decode_row(&data)?);
+                        self.result = Some(self.layout.decode(&data)?);
                     }
                     LockedRow::Skipped => {}
                     LockedRow::Missing { new_lock } => {
@@ -101,8 +102,8 @@ impl Executor for PointGet {
                                 .mvcc
                                 .gap_around(
                                     &storage_key,
-                                    &super::encoding::table_key_prefix(self.table_id),
-                                    &super::encoding::table_key_end(self.table_id),
+                                    &super::encoding::table_key_prefix(self.layout.id),
+                                    &super::encoding::table_key_end(self.layout.id),
                                 )
                                 .await?;
                             ctx.lock_gap(&low, &high);
@@ -120,13 +121,13 @@ impl Executor for PointGet {
         };
 
         if let Some(data) = value {
-            let row = decode_row(&data)?;
+            let row = self.layout.decode(&data)?;
 
             // Check buffered writes for this key
             if let Some(ref ctx) = self.txn_context {
                 if let Some(buffered) = ctx.get_buffered(&storage_key) {
                     if let Some(buf_data) = buffered {
-                        self.result = Some(decode_row(buf_data)?);
+                        self.result = Some(self.layout.decode(buf_data)?);
                     }
                     // else: buffered as delete, no result
                     return Ok(());
@@ -138,7 +139,7 @@ impl Executor for PointGet {
             // Not in storage, check buffer for uncommitted insert
             if let Some(ref ctx) = self.txn_context {
                 if let Some(Some(buf_data)) = ctx.get_buffered(&storage_key) {
-                    self.result = Some(decode_row(buf_data)?);
+                    self.result = Some(self.layout.decode(buf_data)?);
                 }
             }
         }

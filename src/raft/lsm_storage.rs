@@ -22,7 +22,7 @@ use crate::catalog::system_tables::{
     SYSTEM_DATABASES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::{Catalog, TableName};
-use crate::executor::encoding::{decode_row, table_of_row_key, TableId};
+use crate::executor::encoding::{table_of_row_key, TableId};
 use crate::raft::changes::{ChangeOp, ChangeSet};
 use crate::raft::types::{
     Command, CommandResponse, LogId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership,
@@ -713,7 +713,7 @@ impl LsmRaftStorage {
         }
         if table == system_table_id(SYSTEM_DATABASES) {
             // Database name changes — update catalog directly
-            if let Ok(row) = decode_row(value) {
+            if let Some(row) = crate::catalog::store::decode_by_id(table, value) {
                 if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
                     let mut catalog = self.catalog.write();
                     if is_delete {
@@ -725,7 +725,7 @@ impl LsmRaftStorage {
             }
         } else if table == system_table_id(SYSTEM_PROCEDURES) {
             // Procedure changes — update catalog directly
-            if let Ok(row) = decode_row(value) {
+            if let Some(row) = crate::catalog::store::decode_by_id(table, value) {
                 if let Some(proc_def) = row_to_procedure_def(&row) {
                     let mut catalog = self.catalog.write();
                     if is_delete {
@@ -737,7 +737,7 @@ impl LsmRaftStorage {
             }
         } else if table == system_table_id(SYSTEM_TRIGGERS) {
             // Trigger changes - update catalog directly
-            if let Ok(row) = decode_row(value) {
+            if let Some(row) = crate::catalog::store::decode_by_id(table, value) {
                 if is_delete {
                     // A trigger's row begins with its database and its name.
                     if let [crate::executor::Datum::String(database), crate::executor::Datum::String(name), ..] =
@@ -751,7 +751,7 @@ impl LsmRaftStorage {
             }
         } else if table == system_table_id(SYSTEM_VIEWS) {
             // View changes — update catalog directly
-            if let Ok(row) = decode_row(value) {
+            if let Some(row) = crate::catalog::store::decode_by_id(table, value) {
                 if let Some(view_def) = row_to_view_def(&row) {
                     let mut catalog = self.catalog.write();
                     if is_delete {

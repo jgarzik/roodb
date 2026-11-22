@@ -2,6 +2,7 @@
 //!
 //! Inserts rows into a table.
 
+use super::rowcodec::TableLayout;
 use async_trait::async_trait;
 
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use crate::txn::MvccStorage;
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
-use super::encoding::{encode_pk_key, encode_row, encode_row_key};
+use super::encoding::{encode_pk_key, encode_row_key};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -30,7 +31,7 @@ pub struct Insert {
     /// Table name
     table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Target columns
     columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
@@ -66,7 +67,7 @@ impl Insert {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         txn_context: Option<TransactionContext>,
@@ -79,7 +80,7 @@ impl Insert {
     ) -> Self {
         Insert {
             table,
-            table_id,
+            layout,
             columns,
             values,
             txn_context,
@@ -193,7 +194,7 @@ impl Executor for Insert {
                     datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
                 if generate {
                     let value = match &self.mvcc {
-                        Some(mvcc) => mvcc.take_auto_increment(self.table_id).await?,
+                        Some(mvcc) => mvcc.take_auto_increment(self.layout.id).await?,
                         // Run without storage (unit tests): there is no
                         // table counter; the row ID's counter stands in.
                         None => row_id & 0x0000_FFFF_FFFF_FFFF,
@@ -208,7 +209,7 @@ impl Executor for Insert {
                 } else if let super::datum::Datum::Int(given) = datums[idx] {
                     if given > 0 {
                         if let Some(mvcc) = &self.mvcc {
-                            mvcc.observe_auto_increment(self.table_id, given as u64)
+                            mvcc.observe_auto_increment(self.layout.id, given as u64)
                                 .await?;
                         }
                         auto_next = Some(given as u64 + 1);
@@ -252,12 +253,12 @@ impl Executor for Insert {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(self.table_id, &pk_values)
+                encode_pk_key(self.layout.id, &pk_values)
             } else {
-                encode_row_key(self.table_id, row_id)
+                encode_row_key(self.layout.id, row_id)
             };
 
-            let value = encode_row(&row);
+            let value = self.layout.encode(&row)?;
 
             // Collect the change for Raft replication.
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
@@ -328,7 +329,7 @@ impl Executor for Insert {
                     }
                 };
                 if let Some(data) = existing_data {
-                    if let Ok(mut existing_row) = super::encoding::decode_row(&data) {
+                    if let Ok(mut existing_row) = self.layout.decode(&data) {
                         // Apply each ON DUPLICATE KEY UPDATE assignment
                         for (col_idx, expr) in &self.on_duplicate {
                             let new_val = evaluate(expr, &existing_row, &self.user_variables)?;
@@ -336,7 +337,7 @@ impl Executor for Insert {
                                 existing_row.set(*col_idx, new_val)?;
                             }
                         }
-                        let updated_value = encode_row(&existing_row);
+                        let updated_value = self.layout.encode(&existing_row)?;
                         ctx.add_change(RowChange::update(key.clone(), updated_value.clone()));
                         ctx.buffer_write(key, updated_value);
                         self.rows_inserted += 1;
@@ -403,6 +404,11 @@ mod tests {
         )
     }
 
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -442,7 +448,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut insert = Insert::new(
             "users".into(),
-            tid("users"),
+            layout("users"),
             columns,
             values,
             Some(txn_context),

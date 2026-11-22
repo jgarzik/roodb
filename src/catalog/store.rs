@@ -8,7 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::executor::encoding::{decode_row, encode_pk_key, encode_row};
+use crate::executor::encoding::encode_pk_key;
+use crate::executor::rowcodec::TableLayout;
 use crate::executor::{Datum, Row};
 use crate::raft::RowChange;
 
@@ -36,17 +37,20 @@ pub fn table_key(name: &TableName) -> Vec<u8> {
 /// The row a table's record is stored as: its name and the encoded record.
 fn table_row(record: &TableRecord) -> Vec<u8> {
     let encoded = bincode::serialize(record).expect("a table definition serialises");
-    encode_row(&Row::new(vec![
-        Datum::String(record.def.name.database.clone()),
-        Datum::String(record.def.name.table.clone()),
-        Datum::Bytes(encoded),
-    ]))
+    encode(
+        SYSTEM_TABLES,
+        &Row::new(vec![
+            Datum::String(record.def.name.database.clone()),
+            Datum::String(record.def.name.table.clone()),
+            Datum::Bytes(encoded),
+        ]),
+    )
 }
 
 /// The record in a row of `system.tables` (the row as changes carry it,
 /// without a version header). `None` if it is not one.
 pub fn decode_table(row: &[u8]) -> Option<TableRecord> {
-    let row = decode_row(row).ok()?;
+    let row = decode(SYSTEM_TABLES, row)?;
     match row.values().get(2)? {
         Datum::Bytes(encoded) => bincode::deserialize(encoded).ok(),
         _ => None,
@@ -97,6 +101,55 @@ pub struct StoredRow {
     pub row: Row,
 }
 
+/// How each system table is stored (its ID and the shape of its rows), by
+/// the table's name.
+fn layouts() -> &'static std::collections::HashMap<String, TableLayout> {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static LAYOUTS: LazyLock<HashMap<String, TableLayout>> = LazyLock::new(|| {
+        super::system_tables::bootstrap_system_tables()
+            .into_iter()
+            .map(|def| {
+                let shape = def.row_shape().expect("a system table's columns");
+                (def.name.table, TableLayout::new(def.id, shape))
+            })
+            .collect()
+    });
+    &LAYOUTS
+}
+
+fn layout(table: &str) -> &'static TableLayout {
+    layouts().get(table).expect("a system table")
+}
+
+/// The bytes a row of a system table is stored as. A row shorter than the
+/// table (one that names only what it is keyed by) is taken to hold
+/// nothing for the rest.
+pub fn encode(table: &str, row: &Row) -> Vec<u8> {
+    let layout = layout(table);
+    let mut values = row.values().to_vec();
+    values.resize(layout.shape.len(), Datum::Null);
+    layout
+        .encode(&Row::new(values))
+        .expect("a row of the table's width")
+}
+
+/// A row of a system table, from the bytes it is stored as (without the
+/// version header). `None` if they are not one.
+pub fn decode(table: &str, bytes: &[u8]) -> Option<Row> {
+    layout(table).decode(bytes).ok()
+}
+
+/// As `decode`, for the system table with this ID. `None` also if no
+/// system table has it.
+pub fn decode_by_id(table: crate::executor::encoding::TableId, bytes: &[u8]) -> Option<Row> {
+    layouts()
+        .values()
+        .find(|layout| layout.id == table)
+        .and_then(|layout| layout.decode(bytes).ok())
+}
+
 /// Which columns of each system table make up its key.
 fn key_columns(table: &str) -> &'static [usize] {
     use std::collections::HashMap;
@@ -143,13 +196,13 @@ pub fn row_key(table: &str, row: &Row) -> Vec<u8> {
 /// The change that adds `row` to a system table. Refused when applied if
 /// a row with its key is there already.
 pub fn insert_row(table: &str, row: &Row) -> RowChange {
-    RowChange::insert(row_key(table, row), encode_row(row))
+    RowChange::insert(row_key(table, row), encode(table, row))
 }
 
 /// The change that stores `row` in a system table, in place of the row
 /// with its key if there is one.
 pub fn put_row(table: &str, row: &Row) -> RowChange {
-    RowChange::update(row_key(table, row), encode_row(row))
+    RowChange::update(row_key(table, row), encode(table, row))
 }
 
 /// The change that removes a stored row from a system table.
@@ -161,7 +214,7 @@ pub fn delete_row(stored: &StoredRow) -> RowChange {
 /// key. (`row` needs only what the catalog looks at when the change is
 /// applied: for most tables, the key columns.)
 pub fn delete_keyed(table: &str, row: &Row) -> RowChange {
-    RowChange::delete_with_value(row_key(table, row), encode_row(row))
+    RowChange::delete_with_value(row_key(table, row), encode(table, row))
 }
 
 /// A row as initialisation stores it, before there is a log: under its
@@ -169,7 +222,7 @@ pub fn delete_keyed(table: &str, row: &Row) -> RowChange {
 pub fn initial_row(table: &str, row: &Row) -> (Vec<u8>, Vec<u8>) {
     (
         row_key(table, row),
-        crate::raft::encode_mvcc_row(0, false, &encode_row(row)),
+        crate::raft::encode_mvcc_row(0, false, &encode(table, row)),
     )
 }
 
@@ -191,7 +244,7 @@ pub async fn scan_rows(
             continue;
         }
         let data = value[MVCC_HEADER_SIZE..].to_vec();
-        if let Ok(row) = decode_row(&data) {
+        if let Some(row) = decode(table, &data) {
             rows.push(StoredRow { key, data, row });
         }
     }

@@ -2,6 +2,7 @@
 //!
 //! Reads rows from a source query executor and inserts them into a table.
 
+use super::rowcodec::TableLayout;
 use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedColumn;
@@ -11,7 +12,7 @@ use crate::storage::row_id::allocate_row_id_batch;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
-use super::encoding::{encode_pk_key, encode_row, encode_row_key};
+use super::encoding::{encode_pk_key, encode_row_key};
 use super::error::ExecutorResult;
 use super::row::Row;
 use super::Executor;
@@ -21,7 +22,7 @@ pub struct InsertSelect {
     /// Table name
     table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Target columns (always ALL table columns)
     columns: Vec<ResolvedColumn>,
     /// Source query executor
@@ -56,7 +57,7 @@ impl InsertSelect {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         columns: Vec<ResolvedColumn>,
         source: Box<dyn Executor>,
         txn_context: Option<TransactionContext>,
@@ -72,7 +73,7 @@ impl InsertSelect {
             .unwrap_or_default();
         InsertSelect {
             table,
-            table_id,
+            layout,
             columns,
             source,
             txn_context,
@@ -165,7 +166,7 @@ impl Executor for InsertSelect {
                 }
                 if datums[idx].is_null() || matches!(datums[idx], Datum::Int(0)) {
                     let value = match &self.mvcc {
-                        Some(mvcc) => mvcc.take_auto_increment(self.table_id).await?,
+                        Some(mvcc) => mvcc.take_auto_increment(self.layout.id).await?,
                         None => row_id & 0x0000_FFFF_FFFF_FFFF,
                     };
                     datums[idx] = Datum::Int(value as i64);
@@ -176,7 +177,7 @@ impl Executor for InsertSelect {
                 } else if let Datum::Int(given) = datums[idx] {
                     if given > 0 {
                         if let Some(mvcc) = &self.mvcc {
-                            mvcc.observe_auto_increment(self.table_id, given as u64)
+                            mvcc.observe_auto_increment(self.layout.id, given as u64)
                                 .await?;
                         }
                         auto_next = Some(given as u64 + 1);
@@ -216,11 +217,11 @@ impl Executor for InsertSelect {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(self.table_id, &pk_values)
+                encode_pk_key(self.layout.id, &pk_values)
             } else {
-                encode_row_key(self.table_id, row_id)
+                encode_row_key(self.layout.id, row_id)
             };
-            let value = encode_row(&row);
+            let value = self.layout.encode(&row)?;
 
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
                 super::error::ExecutorError::Internal(

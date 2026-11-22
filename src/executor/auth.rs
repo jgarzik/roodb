@@ -12,7 +12,6 @@ use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
 use super::datum::Datum;
-use super::encoding::encode_row;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
@@ -358,7 +357,7 @@ impl Executor for AlterUser {
             new_values[2] = password_hash;
         }
         let new_row = Row::new(new_values);
-        let encoded = encode_row(&new_row);
+        let encoded = crate::catalog::store::encode(SYSTEM_USERS, &new_row);
 
         let mut changeset = ChangeSet::new(0);
         changeset.push(RowChange::update(key.clone(), encoded.clone()));
@@ -467,7 +466,7 @@ impl Executor for SetPassword {
             new_values[2] = password_hash;
         }
         let new_row = Row::new(new_values);
-        let encoded = encode_row(&new_row);
+        let encoded = crate::catalog::store::encode(SYSTEM_USERS, &new_row);
 
         let mut changeset = ChangeSet::new(0);
         changeset.push(RowChange::update(key.clone(), encoded.clone()));

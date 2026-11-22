@@ -6,6 +6,7 @@
 //! (system.tables, system.columns, system.indexes). When raft_node is provided, changes
 //! are proposed to Raft and the catalog is updated when apply() processes the changes.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,7 +18,7 @@ use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::storage::row_id::allocate_row_id_batch;
 
 use super::datum::Datum;
-use super::encoding::{encode_row, encode_row_key};
+use super::encoding::encode_row_key;
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
@@ -797,8 +798,6 @@ use super::encoding::encode_pk_key;
 /// streamed into storage.
 pub struct CreateTableAs {
     name: crate::catalog::TableName,
-    /// The new table's ID, once it has been created.
-    table_id: super::encoding::TableId,
     columns: Vec<ColumnDef>,
     constraints: Vec<Constraint>,
     if_not_exists: bool,
@@ -826,7 +825,6 @@ impl CreateTableAs {
     pub fn new(params: CreateTableAsParams) -> Self {
         CreateTableAs {
             name: params.name,
-            table_id: super::encoding::TableId(0),
             columns: params.columns,
             constraints: params.constraints,
             if_not_exists: params.if_not_exists,
@@ -840,10 +838,11 @@ impl CreateTableAs {
     }
 
     /// Create the table definition and register it (DDL phase).
-    /// Returns the PK column indices for row storage, or `None` if the
-    /// table was there already and the statement says `IF NOT EXISTS`:
-    /// then there is nothing to do, and nowhere to put rows.
-    async fn create_table_ddl(&mut self) -> ExecutorResult<Option<Vec<usize>>> {
+    /// Returns how the new table is stored and the PK column indices for
+    /// row storage, or `None` if the table was there already and the
+    /// statement says `IF NOT EXISTS`: then there is nothing to do, and
+    /// nowhere to put rows.
+    async fn create_table_ddl(&mut self) -> ExecutorResult<Option<(TableLayout, Vec<usize>)>> {
         if is_system_table(&self.name) {
             return Err(ExecutorError::Internal(format!(
                 "cannot create system table '{}'",
@@ -891,8 +890,8 @@ impl CreateTableAs {
                 .await
                 .map(super::encoding::TableId)
                 .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
-            self.table_id = id;
             let table_def = table_def.with_id(id);
+            let layout = TableLayout::new(id, table_def.row_shape()?);
             self.catalog
                 .read()
                 .validate_table(&table_def)
@@ -908,17 +907,17 @@ impl CreateTableAs {
                 .propose_changes(changeset)
                 .await
                 .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            Ok(Some((layout, pk_indices)))
         } else {
             // No Raft: update catalog directly
-            self.table_id = super::encoding::local_table_id();
-            let table_def = table_def.with_id(self.table_id);
+            let table_def = table_def.with_id(super::encoding::local_table_id());
+            let layout = TableLayout::new(table_def.id, table_def.row_shape()?);
             let mut catalog = self.catalog.write();
             catalog
                 .create_table(table_def)
                 .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            Ok(Some((layout, pk_indices)))
         }
-
-        Ok(Some(pk_indices))
     }
 }
 
@@ -937,7 +936,7 @@ impl Executor for CreateTableAs {
 
         // Phase 1: Create the table (DDL)
         // If the table already existed (IF NOT EXISTS): 0 rows affected.
-        let Some(pk_indices) = self.create_table_ddl().await? else {
+        let Some((layout, pk_indices)) = self.create_table_ddl().await? else {
             self.done = true;
             return Ok(Some(Row::new(vec![Datum::Int(0)])));
         };
@@ -964,11 +963,11 @@ impl Executor for CreateTableAs {
                     .iter()
                     .filter_map(|&idx| row.get(idx).ok().cloned())
                     .collect();
-                encode_pk_key(self.table_id, &pk_values)
+                encode_pk_key(layout.id, &pk_values)
             } else {
-                encode_row_key(self.table_id, row_id)
+                encode_row_key(layout.id, row_id)
             };
-            let value = encode_row(&row);
+            let value = layout.encode(&row)?;
 
             // Buffer the row change for Raft replication
             if let Some(ref mut ctx) = self.txn_context {

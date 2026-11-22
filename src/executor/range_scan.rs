@@ -3,6 +3,7 @@
 //! Scans a range of rows by primary key bounds using storage scan() with
 //! tight byte-range bounds instead of full table scan.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use crate::txn::MvccStorage;
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
-use super::encoding::{decode_row, encode_pk_key, table_key_end, table_key_prefix};
+use super::encoding::{encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -24,7 +25,7 @@ pub struct RangeScan {
     /// Table name
     table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Start PK bound expression (None = table start)
     start_expr: Option<ResolvedExpr>,
     /// End PK bound expression (None = table end)
@@ -63,7 +64,7 @@ pub struct RangeScanBounds {
 impl RangeScan {
     pub fn new(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         bounds: RangeScanBounds,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
@@ -71,7 +72,7 @@ impl RangeScan {
     ) -> Self {
         RangeScan {
             table,
-            table_id,
+            layout,
             start_expr: bounds.start_expr,
             end_expr: bounds.end_expr,
             inclusive_start: bounds.inclusive_start,
@@ -109,7 +110,7 @@ impl Executor for RangeScan {
             let datum = evaluate(expr, &empty_row, &self.user_variables)?;
             match for_bound(datum, self.inclusive_start, key_type, true) {
                 Bound::At { value, inclusive } => {
-                    let key = encode_pk_key(self.table_id, &[value]);
+                    let key = encode_pk_key(self.layout.id, &[value]);
                     if inclusive {
                         key
                     } else {
@@ -117,14 +118,14 @@ impl Executor for RangeScan {
                         Self::increment_key(key)
                     }
                 }
-                Bound::Open => table_key_prefix(self.table_id),
+                Bound::Open => table_key_prefix(self.layout.id),
                 Bound::Nothing => {
                     empty = true;
-                    table_key_prefix(self.table_id)
+                    table_key_prefix(self.layout.id)
                 }
             }
         } else {
-            table_key_prefix(self.table_id)
+            table_key_prefix(self.layout.id)
         };
 
         // Compute end bound (storage scan end is always exclusive)
@@ -132,7 +133,7 @@ impl Executor for RangeScan {
             let datum = evaluate(expr, &empty_row, &self.user_variables)?;
             match for_bound(datum, self.inclusive_end, key_type, false) {
                 Bound::At { value, inclusive } => {
-                    let key = encode_pk_key(self.table_id, &[value]);
+                    let key = encode_pk_key(self.layout.id, &[value]);
                     if inclusive {
                         // Inclusive end: increment so storage scan includes this key
                         Self::increment_key(key)
@@ -140,14 +141,14 @@ impl Executor for RangeScan {
                         key
                     }
                 }
-                Bound::Open => table_key_end(self.table_id),
+                Bound::Open => table_key_end(self.layout.id),
                 Bound::Nothing => {
                     empty = true;
-                    table_key_end(self.table_id)
+                    table_key_end(self.layout.id)
                 }
             }
         } else {
-            table_key_end(self.table_id)
+            table_key_end(self.layout.id)
         };
         // A bound beyond every value the key column can hold, on the side
         // the range extends from: no row is in the range, and nothing is
@@ -166,8 +167,8 @@ impl Executor for RangeScan {
                     &self.mvcc,
                     &start_key,
                     &end_key,
-                    &table_key_prefix(self.table_id),
-                    &table_key_end(self.table_id),
+                    &table_key_prefix(self.layout.id),
+                    &table_key_end(self.layout.id),
                 )
                 .await?
             } else {
@@ -217,7 +218,7 @@ impl Executor for RangeScan {
 
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
         while self.position < self.raw_pairs.len() {
-            let row = decode_row(&self.raw_pairs[self.position])?;
+            let row = self.layout.decode(&self.raw_pairs[self.position])?;
             self.position += 1;
 
             if let Some(filter) = &self.remaining_filter {

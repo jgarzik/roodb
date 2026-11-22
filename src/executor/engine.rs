@@ -522,15 +522,16 @@ impl ExecutorEngine {
         Ok(has_rows)
     }
 
-    /// The ID of a table the plan names: what the table's keys begin with.
-    fn table_id(
+    /// How a table the plan names is stored: the ID its keys begin with
+    /// and the shape of its rows.
+    fn table_layout(
         &self,
         table: &crate::catalog::TableName,
-    ) -> ExecutorResult<super::encoding::TableId> {
+    ) -> ExecutorResult<super::rowcodec::TableLayout> {
         self.catalog
             .read()
-            .get_table(table)
-            .map(|def| def.id)
+            .table_layout(table)
+            .cloned()
             .ok_or_else(|| ExecutorError::TableNotFound(table.to_string()))
     }
 
@@ -546,7 +547,7 @@ impl ExecutorEngine {
                 let schema_types: Vec<_> = columns.iter().map(|c| c.data_type.clone()).collect();
                 Ok(Box::new(TableScan::with_schema_types(
                     table.clone(),
-                    self.table_id(&table)?,
+                    self.table_layout(&table)?,
                     filter,
                     self.mvcc.clone(),
                     self.txn_context.clone(),
@@ -562,7 +563,7 @@ impl ExecutorEngine {
                 key_type,
             } => Ok(Box::new(PointGet::new(
                 table.clone(),
-                self.table_id(&table)?,
+                self.table_layout(&table)?,
                 key_value,
                 Some(key_type),
                 self.mvcc.clone(),
@@ -581,7 +582,7 @@ impl ExecutorEngine {
                 key_type,
             } => Ok(Box::new(RangeScan::new(
                 table.clone(),
-                self.table_id(&table)?,
+                self.table_layout(&table)?,
                 super::range_scan::RangeScanBounds {
                     start_expr: start_key,
                     end_expr: end_key,
@@ -727,7 +728,7 @@ impl ExecutorEngine {
                 on_duplicate,
             } => Ok(Box::new(Insert::new(
                 table.clone(),
-                self.table_id(&table)?,
+                self.table_layout(&table)?,
                 columns,
                 values,
                 self.txn_context.clone(),
@@ -751,7 +752,7 @@ impl ExecutorEngine {
                 let source_exec = self.build_node(*source)?;
                 Ok(Box::new(InsertSelect::new(
                     table.clone(),
-                    self.table_id(&table)?,
+                    self.table_layout(&table)?,
                     columns,
                     source_exec,
                     self.txn_context.clone(),
@@ -773,7 +774,7 @@ impl ExecutorEngine {
                 limit,
                 pk_column_indices,
             } => Ok(Box::new(Update::new(UpdateParams {
-                table_id: self.table_id(&table)?,
+                layout: self.table_layout(&table)?,
                 table,
                 assignments,
                 filter,
@@ -795,7 +796,7 @@ impl ExecutorEngine {
                 order_by,
                 limit,
             } => Ok(Box::new(Delete::new(DeleteParams {
-                table_id: self.table_id(&table)?,
+                layout: self.table_layout(&table)?,
                 table,
                 filter,
                 key_value,
@@ -1119,7 +1120,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnDef, DataType, TableDef};
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::{encode_pk_key, encode_row};
+    use crate::executor::encoding::encode_pk_key;
     use crate::executor::row::Row;
     use crate::planner::logical::expr::OutputColumn;
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
@@ -1134,6 +1135,15 @@ mod tests {
             name.bytes()
                 .fold(5000, |id, byte| id * 31 + u64::from(byte)),
         )
+    }
+
+    /// A row of one of the tests' tables, as it is stored.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        crate::executor::rowcodec::encode(
+            &crate::executor::rowcodec::RowShape::numbered(row.len()),
+            row,
+        )
+        .unwrap()
     }
 
     struct MockStorage {

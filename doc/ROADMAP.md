@@ -78,9 +78,13 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-2. Columns numbered within their table (never reused); rows by column ID
-   (the codec is written: `executor/rowcodec.rs`); one decoding function
-   for every executor; `ADD`/`DROP`/reorder `COLUMN` as metadata.
+2. `ADD`/`DROP`/reorder/rename `COLUMN`, and a change of type that the
+   stored values already fit, as metadata (rows are stored by column ID:
+   `executor/rowcodec.rs`). A change that needs the rows rewritten or
+   re-keyed is refused with error 1235 until step 5 can do it: a type
+   the stored values do not fit, any change of the primary key (dropping
+   a key column included), an `AUTO_INCREMENT` column added to a table
+   with rows.
 3. Metadata locks taken by statements and DDL (the lock manager is
    written: `txn/mdl.rs`); DDL commits implicitly; changesets of rows
    carry the version of the table they were built against
@@ -89,32 +93,34 @@ below changes.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
-5. Forgotten key ranges (`WriteOp::ForgetRange`, a write of a
+5. The schema-change job runner (its record replicated; a new primary
+   carries on; cancelled, and rolled back, when its client goes away),
+   and with it the online rebuild of a table under a new ID: change of
+   primary key and of column type. What step 2 refuses works from here.
+6. Forgotten key ranges (`WriteOp::ForgetRange`, a write of a
    `StorageEngine::write_batch`, is written; nothing uses it yet):
    - `DROP TABLE`, `TRUNCATE` (which resets `AUTO_INCREMENT`) and
      `DROP DATABASE` in one log entry, in place of a delete marker per
      row.
    - Dropping a table whose rows share level-0 files with other data
      compacts all of level 0: measure a run of drops.
-6. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
+7. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
     naming; `CREATE`/`DROP INDEX` with errors 1061 and 1091; names per
     table; `SHOW INDEX`, `SHOW CREATE TABLE`.
-7. Index entries maintained by every statement that writes, through one
+8. Index entries maintained by every statement that writes, through one
     helper; `UNIQUE` enforced, with MySQL's error text.
-8. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
+9. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
     real statements over that helper (`REPLACE` and `LOAD DATA` are read
     with regular expressions today, and do not take `db.table`).
-9. The schema-change job runner; `CREATE INDEX` on a table with rows,
-    online; cancelled when its client goes away.
-10. Reading through indexes: equality prefix plus range, composite keys,
+10. `CREATE INDEX` on a table with rows, online, through the job runner.
+11. Reading through indexes: equality prefix plus range, composite keys,
     `IN`, index-only reads.
-11. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
+12. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
     indexes.
-12. Statistics that are read: row counts and distinct counts per index;
+13. Statistics that are read: row counts and distinct counts per index;
     the cost model in use.
-13. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
+14. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
     `LIMIT` from index order; `MIN`/`MAX` from an index.
-14. Change of primary key and of column type, online.
 15. Temporary tables: names and IDs in the session, shadowing permanent
     tables (today they are in the catalog's shared name map: another
     session's shows in `SHOW TABLES` and takes the name); indexes;

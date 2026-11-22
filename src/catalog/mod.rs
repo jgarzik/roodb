@@ -11,6 +11,8 @@ pub mod name;
 pub mod store;
 
 pub use name::TableName;
+
+use crate::executor::rowcodec::TableLayout;
 pub mod system_tables;
 
 use serde::{Deserialize, Serialize};
@@ -115,6 +117,19 @@ impl DataType {
 /// Column definition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
+    /// The column's number within its table: what its values are stored
+    /// under in a row. Given when the column joins a table (`0` until
+    /// then), kept for as long as the column exists, and never given to
+    /// another column of the table, so that renaming, moving or dropping a
+    /// column changes no stored row.
+    #[serde(default)]
+    pub id: u32,
+    /// What a row written before this column existed reads as for it: the
+    /// default the column was added with, as an encoded value
+    /// (`encoding::encode_value`). `None` reads as `NULL`, and is what
+    /// every column a table was created with has.
+    #[serde(default)]
+    pub missing: Option<Vec<u8>>,
     /// Column name
     pub name: String,
     /// Data type
@@ -131,6 +146,8 @@ impl ColumnDef {
     /// Create a new column definition
     pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
         Self {
+            id: 0,
+            missing: None,
             name: name.into(),
             data_type,
             nullable: true,
@@ -192,6 +209,10 @@ pub struct TableDef {
     pub version: u64,
     /// The table's name: its database and its name there
     pub name: TableName,
+    /// The number the next column to join the table is given. It only
+    /// rises: a dropped column's number is not given out again.
+    #[serde(default)]
+    pub next_column_id: u32,
     /// Column definitions
     pub columns: Vec<ColumnDef>,
     /// Table constraints
@@ -207,6 +228,7 @@ impl TableDef {
             id: crate::executor::encoding::TableId(0),
             version: 0,
             name: name.into(),
+            next_column_id: 1,
             columns: Vec::new(),
             constraints: Vec::new(),
             is_temporary: false,
@@ -223,8 +245,37 @@ impl TableDef {
     /// Add a column
     #[must_use]
     pub fn column(mut self, col: ColumnDef) -> Self {
-        self.columns.push(col);
+        self.add_column(col, None);
         self
+    }
+
+    /// Add a column to the table, at `position` among its columns or, with
+    /// `None`, after them all. It is given the table's next column number.
+    pub fn add_column(&mut self, mut col: ColumnDef, position: Option<usize>) {
+        col.id = self.next_column_id.max(1);
+        self.next_column_id = col.id + 1;
+        match position {
+            Some(position) if position < self.columns.len() => self.columns.insert(position, col),
+            _ => self.columns.push(col),
+        }
+    }
+
+    /// How the table's rows are stored and read: its columns' numbers, in
+    /// the columns' order, and what each reads as in a row older than it.
+    pub fn row_shape(
+        &self,
+    ) -> crate::executor::ExecutorResult<crate::executor::rowcodec::RowShape> {
+        use crate::executor::rowcodec::{ColumnSlot, RowShape};
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| match &column.missing {
+                None => Ok(ColumnSlot::new(column.id)),
+                Some(encoded) => crate::executor::encoding::decode_datum(encoded)
+                    .map(|(missing, _)| ColumnSlot::added(column.id, missing)),
+            })
+            .collect::<crate::executor::ExecutorResult<Vec<_>>>()?;
+        RowShape::new(columns)
     }
 
     /// Add a constraint
@@ -493,6 +544,9 @@ impl std::error::Error for DatabaseError {}
 pub struct Catalog {
     /// Tables by name
     tables: HashMap<TableName, TableDef>,
+    /// How each table of `tables` is stored, kept beside its definition so
+    /// that it is worked out once per definition, not once per statement.
+    layouts: HashMap<TableName, TableLayout>,
     /// Indexes by name
     indexes: HashMap<String, IndexDef>,
     /// Schema version counter (incremented on DDL operations)
@@ -517,6 +571,7 @@ impl Catalog {
         ]);
         Self {
             tables: HashMap::new(),
+            layouts: HashMap::new(),
             indexes: HashMap::new(),
             schema_version: 0,
             databases,
@@ -538,7 +593,7 @@ impl Catalog {
     pub fn with_system_tables() -> Self {
         let mut catalog = Self::new();
         for table_def in system_tables::bootstrap_system_tables() {
-            catalog.tables.insert(table_def.name.clone(), table_def);
+            catalog.put_table(table_def);
         }
         catalog
     }
@@ -548,7 +603,7 @@ impl Catalog {
     /// This bypasses the normal create_table checks and is used when
     /// rebuilding the catalog cache from system tables on startup.
     pub fn register_table(&mut self, def: TableDef) {
-        self.tables.insert(def.name.clone(), def);
+        self.put_table(def);
     }
 
     /// Register an index directly without validation (for rebuilding from storage)
@@ -562,6 +617,8 @@ impl Catalog {
     /// Clear all non-system tables (for testing or re-initialization)
     pub fn clear_user_tables(&mut self) {
         self.tables
+            .retain(|name, _| system_tables::is_system_table(name));
+        self.layouts
             .retain(|name, _| system_tables::is_system_table(name));
         self.indexes.clear();
     }
@@ -719,7 +776,7 @@ impl Catalog {
         for index in indexes {
             self.indexes.insert(index.name.clone(), index);
         }
-        self.tables.insert(def.name.clone(), def);
+        self.put_table(def);
         self.schema_version += 1;
     }
 
@@ -730,7 +787,7 @@ impl Catalog {
 
     /// Take a table and its indexes out of the catalog, if it is there.
     pub fn unset_table(&mut self, name: &TableName) {
-        self.tables.remove(name);
+        self.take_table(name);
         self.indexes.retain(|_, index| index.table != *name);
         self.schema_version += 1;
     }
@@ -753,7 +810,7 @@ impl Catalog {
         if self.tables.contains_key(&def.name) {
             return Err(CatalogError::TableExists(def.name.to_string()));
         }
-        self.tables.insert(def.name.clone(), def);
+        self.put_table(def);
         self.schema_version += 1;
         Ok(())
     }
@@ -765,15 +822,15 @@ impl Catalog {
     /// changed (RENAME), the old entry is removed and the new one inserted.
     pub fn replace_table(&mut self, old_name: &TableName, def: TableDef) {
         if *old_name != def.name {
-            self.tables.remove(old_name);
+            self.take_table(old_name);
         }
-        self.tables.insert(def.name.clone(), def);
+        self.put_table(def);
         self.schema_version += 1;
     }
 
     /// Drop a table
     pub fn drop_table(&mut self, name: &TableName) -> CatalogResult<()> {
-        if self.tables.remove(name).is_none() {
+        if self.take_table(name).is_none() {
             return Err(CatalogError::TableNotFound(name.to_string()));
         }
         // Also drop all indexes for this table
@@ -787,9 +844,35 @@ impl Catalog {
         self.tables.get(name)
     }
 
-    /// Get a mutable table definition
-    pub fn get_table_mut(&mut self, name: &TableName) -> Option<&mut TableDef> {
-        self.tables.get_mut(name)
+    /// How a table is stored: its ID and the shape of its rows.
+    pub fn table_layout(&self, name: &TableName) -> Option<&TableLayout> {
+        self.layouts.get(name)
+    }
+
+    /// Put a table's definition in the catalog, with its layout, in place
+    /// of whatever was known under its name.
+    fn put_table(&mut self, def: TableDef) {
+        // A definition was validated before it got here; one whose columns
+        // cannot make a shape (a stored default that does not decode)
+        // would have been refused. Should one arrive regardless, the table
+        // is known but cannot be read.
+        match def.row_shape() {
+            Ok(shape) => {
+                self.layouts
+                    .insert(def.name.clone(), TableLayout::new(def.id, shape));
+            }
+            Err(e) => {
+                tracing::error!(table = %def.name, error = %e, "A table's columns give no row shape");
+                self.layouts.remove(&def.name);
+            }
+        }
+        self.tables.insert(def.name.clone(), def);
+    }
+
+    /// Take a table's definition and layout out of the catalog.
+    fn take_table(&mut self, name: &TableName) -> Option<TableDef> {
+        self.layouts.remove(name);
+        self.tables.remove(name)
     }
 
     /// Check if a table exists

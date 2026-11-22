@@ -2,6 +2,7 @@
 //!
 //! Updates rows in a table that match a filter with MVCC support.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
-use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
+use super::encoding::{encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -24,7 +25,7 @@ use super::Executor;
 pub struct Update {
     /// Table name
     table: crate::catalog::TableName,
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Assignments: (column, new_value)
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     /// Optional filter predicate
@@ -54,7 +55,7 @@ pub struct Update {
 pub struct UpdateParams {
     pub table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    pub table_id: crate::executor::encoding::TableId,
+    pub layout: TableLayout,
     pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
@@ -73,7 +74,7 @@ impl Update {
     pub fn new(p: UpdateParams) -> Self {
         Update {
             table: p.table,
-            table_id: p.table_id,
+            layout: p.layout,
             assignments: p.assignments,
             filter: p.filter,
             key_value: p.key_value,
@@ -102,7 +103,7 @@ impl Update {
         row: &Row,
         row_version: u64,
     ) -> ExecutorResult<()> {
-        let new_value = encode_row(row);
+        let new_value = self.layout.encode(row)?;
 
         // Compute new PK-based key from updated row values
         let new_key = if !self.pk_column_indices.is_empty() {
@@ -111,7 +112,7 @@ impl Update {
                 .iter()
                 .map(|&idx| row.get(idx).unwrap().clone())
                 .collect();
-            encode_pk_key(self.table_id, &pk_values)
+            encode_pk_key(self.layout.id, &pk_values)
         } else {
             old_key.clone()
         };
@@ -166,7 +167,7 @@ impl Update {
         let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
             return Ok(());
         };
-        let storage_key = encode_pk_key(self.table_id, &[key_datum]);
+        let storage_key = encode_pk_key(self.layout.id, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
             super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
@@ -191,8 +192,8 @@ impl Update {
                         .mvcc
                         .gap_around(
                             &storage_key,
-                            &table_key_prefix(self.table_id),
-                            &table_key_end(self.table_id),
+                            &table_key_prefix(self.layout.id),
+                            &table_key_end(self.layout.id),
                         )
                         .await?;
                     ctx.lock_gap(&low, &high);
@@ -210,7 +211,7 @@ impl Update {
         let result = ctx.with_own_change(&storage_key, result);
 
         if let Some((data, row_version)) = result {
-            let mut row = decode_row(&data)?;
+            let mut row = self.layout.decode(&data)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -233,8 +234,8 @@ impl Update {
 
     /// Full scan path: scan all rows in the table
     async fn next_full_scan(&mut self) -> ExecutorResult<()> {
-        let prefix = table_key_prefix(self.table_id);
-        let end = table_key_end(self.table_id);
+        let prefix = table_key_prefix(self.layout.id);
+        let end = table_key_end(self.layout.id);
         // The scan reads the whole table, so the whole table is what must
         // not gain rows until this transaction ends (REPEATABLE READ).
         // Locked before reading, so that nothing slips in between.
@@ -300,7 +301,7 @@ impl Update {
                 }
                 None => (value, row_version),
             };
-            let row = decode_row(&value)?;
+            let row = self.layout.decode(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -430,6 +431,20 @@ mod tests {
             name.bytes()
                 .fold(5000, |id, byte| id * 31 + u64::from(byte)),
         )
+    }
+
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
+    /// A row of one of the tests' tables, as it is stored.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        crate::executor::rowcodec::encode(
+            &crate::executor::rowcodec::RowShape::numbered(row.len()),
+            row,
+        )
+        .unwrap()
     }
 
     fn empty_vars() -> UserVariables {
@@ -587,7 +602,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
             table: "users".into(),
-            table_id: tid("users"),
+            layout: layout("users"),
             assignments,
             filter: Some(filter),
             key_value: None,
@@ -666,7 +681,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
             table: "users".into(),
-            table_id: tid("users"),
+            layout: layout("users"),
             assignments,
             filter: Some(filter),
             key_value: None,

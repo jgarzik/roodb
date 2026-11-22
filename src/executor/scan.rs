@@ -2,6 +2,7 @@
 //!
 //! Scans all rows from a table using MVCC-aware storage.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
-use super::encoding::{decode_row, table_key_end, table_key_prefix};
+use super::encoding::{table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -25,7 +26,7 @@ pub struct TableScan {
     /// Table name
     table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Optional filter predicate (pushed down)
     filter: Option<ResolvedExpr>,
     /// MVCC-aware storage
@@ -46,7 +47,7 @@ impl TableScan {
     /// Create a new table scan
     pub fn new(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
@@ -54,7 +55,7 @@ impl TableScan {
     ) -> Self {
         TableScan {
             table,
-            table_id,
+            layout,
             filter,
             mvcc,
             txn_context,
@@ -68,7 +69,7 @@ impl TableScan {
     /// Create a new table scan with schema column types for lazy row padding
     pub fn with_schema_types(
         table: crate::catalog::TableName,
-        table_id: crate::executor::encoding::TableId,
+        layout: TableLayout,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
@@ -77,7 +78,7 @@ impl TableScan {
     ) -> Self {
         TableScan {
             table,
-            table_id,
+            layout,
             filter,
             mvcc,
             txn_context,
@@ -93,8 +94,8 @@ impl TableScan {
 impl Executor for TableScan {
     async fn open(&mut self) -> ExecutorResult<()> {
         // Scan the table — store raw values, decode lazily in next()
-        let prefix = table_key_prefix(self.table_id);
-        let end = table_key_end(self.table_id);
+        let prefix = table_key_prefix(self.layout.id);
+        let end = table_key_end(self.layout.id);
 
         // Use MVCC scan with visibility filtering if we have a transaction context,
         // otherwise fall back to raw storage scan (for DDL or legacy tests)
@@ -148,7 +149,7 @@ impl Executor for TableScan {
         let expected_cols = self.schema_column_types.len();
         // Decode and filter one row at a time (streaming)
         while self.position < self.raw_pairs.len() {
-            let mut row = decode_row(&self.raw_pairs[self.position])?;
+            let mut row = self.layout.decode(&self.raw_pairs[self.position])?;
             self.position += 1;
 
             // Lazy row padding: if the stored row has fewer columns than the
@@ -184,7 +185,7 @@ impl Executor for TableScan {
 mod tests {
     use super::*;
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::{encode_pk_key, encode_row};
+    use crate::executor::encoding::encode_pk_key;
     use crate::server::session::UserVariables;
     use crate::storage::traits::{KeyValue, WriteOp};
     use crate::storage::{StorageEngine, StorageResult};
@@ -199,6 +200,20 @@ mod tests {
             name.bytes()
                 .fold(5000, |id, byte| id * 31 + u64::from(byte)),
         )
+    }
+
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
+    /// A row of one of the tests' tables, as it is stored.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        crate::executor::rowcodec::encode(
+            &crate::executor::rowcodec::RowShape::numbered(row.len()),
+            row,
+        )
+        .unwrap()
     }
 
     fn empty_vars() -> UserVariables {
@@ -289,7 +304,14 @@ mod tests {
     async fn test_table_scan_basic() {
         let mvcc = make_test_mvcc();
         // No txn_context = use inner storage directly (legacy mode)
-        let mut scan = TableScan::new("users".into(), tid("users"), None, mvcc, None, empty_vars());
+        let mut scan = TableScan::new(
+            "users".into(),
+            layout("users"),
+            None,
+            mvcc,
+            None,
+            empty_vars(),
+        );
 
         scan.open().await.unwrap();
 

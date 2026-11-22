@@ -7,11 +7,18 @@ use parking_lot::RwLock;
 
 use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
 use roodb::executor::context::TransactionContext;
-use roodb::executor::encoding::{encode_pk_key, encode_row, TableId};
+use roodb::executor::encoding::{encode_pk_key, TableId};
+use roodb::executor::rowcodec::RowShape;
 
 /// The IDs of the tables these tests set up.
 const USERS: TableId = TableId(5001);
 const NUMS: TableId = TableId(5002);
+
+/// A row of a table as it is stored when the table has the row's columns,
+/// numbered in order.
+fn encode_row(row: &Row) -> Vec<u8> {
+    roodb::executor::rowcodec::encode(&RowShape::numbered(row.len()), row).unwrap()
+}
 use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
 use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};

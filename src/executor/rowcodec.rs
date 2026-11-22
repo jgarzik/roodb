@@ -130,6 +130,13 @@ impl RowShape {
         })
     }
 
+    /// The shape of a table with `count` columns numbered from 1 in their
+    /// order, none added later: what a table has when it is created.
+    pub fn numbered(count: usize) -> Self {
+        let columns = (1..=count as u32).map(ColumnSlot::new).collect();
+        RowShape::new(columns).expect("distinct column numbers")
+    }
+
     /// The number of columns.
     pub fn len(&self) -> usize {
         self.columns.len()
@@ -143,6 +150,41 @@ impl RowShape {
     /// The columns, in the table's order.
     pub fn columns(&self) -> &[ColumnSlot] {
         &self.columns
+    }
+}
+
+/// A table as it is stored: the ID its keys begin with, and the shape of
+/// its rows. What an executor needs to read and write the table's rows.
+#[derive(Debug, Clone)]
+pub struct TableLayout {
+    /// The ID the table's keys begin with.
+    pub id: super::encoding::TableId,
+    /// The shape of its rows.
+    pub shape: std::sync::Arc<RowShape>,
+}
+
+impl TableLayout {
+    /// The layout of the table `id`, whose rows have this shape.
+    pub fn new(id: super::encoding::TableId, shape: RowShape) -> Self {
+        TableLayout {
+            id,
+            shape: std::sync::Arc::new(shape),
+        }
+    }
+
+    /// The layout of a table as it is created, with `columns` columns.
+    pub fn numbered(id: super::encoding::TableId, columns: usize) -> Self {
+        TableLayout::new(id, RowShape::numbered(columns))
+    }
+
+    /// The bytes one of the table's rows is stored as.
+    pub fn encode(&self, row: &Row) -> ExecutorResult<Vec<u8>> {
+        encode(&self.shape, row)
+    }
+
+    /// One of the table's rows, from the bytes it is stored as.
+    pub fn decode(&self, bytes: &[u8]) -> ExecutorResult<Row> {
+        decode(&self.shape, bytes)
     }
 }
 
@@ -397,7 +439,6 @@ fn read_varint(data: &[u8]) -> ExecutorResult<(u32, usize)> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::super::encoding::{decode_row, encode_row};
     use super::*;
 
     /// A shape whose columns all read as NULL where nothing is stored.
@@ -917,11 +958,16 @@ mod tests {
 
     #[test]
     fn bytes_that_are_no_row_are_an_error() {
-        // Nothing at all; an unknown format; the positional format.
+        // Nothing at all; an unknown format; values behind a two-byte
+        // count, as rows were once stored.
         assert_malformed(&[]);
         assert_malformed(&[0x00, 0]);
         assert_malformed(&[0x02, 0]);
-        assert_malformed(&encode_row(&Row::new(vec![Datum::Int(1); 3])));
+        let mut by_position = vec![3, 0];
+        for _ in 0..3 {
+            encode_value(&mut by_position, &Datum::Int(1));
+        }
+        assert_malformed(&by_position);
         // No count; a count that does not end; one that is too long, too
         // large, or not in its shortest form.
         assert_malformed(&[0x01]);
@@ -1129,41 +1175,27 @@ mod tests {
     }
 
     #[test]
-    fn size_beside_the_positional_format() {
-        // sysbench's table: id INT, k INT, c CHAR(120), pad CHAR(60).
+    fn the_size_of_a_row() {
+        // sysbench's table: id INT, k INT, c CHAR(120), pad CHAR(60). The
+        // format byte, the count, and for each value its column's number
+        // before it.
         let row = Row::new(vec![
             Datum::Int(1),
             Datum::Int(50_000),
             Datum::String("c".repeat(120)),
             Datum::String("p".repeat(60)),
         ]);
-        let positional = encode_row(&row).len();
+        let values: usize = row
+            .values()
+            .iter()
+            .map(|value| {
+                let mut bytes = Vec::new();
+                encode_value(&mut bytes, value);
+                bytes.len()
+            })
+            .sum();
         let by_id = encode(&plain(&[1, 2, 3, 4]), &row).unwrap().len();
-        assert_eq!(positional, 210);
+        assert_eq!(by_id, 2 + 4 + values);
         assert_eq!(by_id, 214);
-
-        // In general (fewer than 128 values, IDs below 128): a byte more
-        // for each value, a byte less for each NULL.
-        let mut rng = Prng(7);
-        for _ in 0..200 {
-            let values: Vec<Datum> = (0..rng.below(20))
-                .map(|_| match rng.nullable() {
-                    // The positional format has no geometry of its own.
-                    Datum::Geometry(bytes) => Datum::Bytes(bytes),
-                    other => other,
-                })
-                .collect();
-            let nulls = values.iter().filter(|value| value.is_null()).count();
-            let ids: Vec<u32> = (0..values.len() as u32).collect();
-            let row = Row::new(values);
-            let positional = encode_row(&row).len();
-            let by_id = encode(&plain(&ids), &row).unwrap().len();
-            assert_eq!(by_id + 2 * nulls, positional + row.len());
-            // The positional format still reads what it wrote.
-            assert_identical(
-                decode_row(&encode_row(&row)).unwrap().values(),
-                row.values(),
-            );
-        }
     }
 }

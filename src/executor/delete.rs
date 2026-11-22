@@ -2,6 +2,7 @@
 //!
 //! Deletes rows from a table that match a filter with MVCC support.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use crate::txn::{LockMode, MvccStorage};
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
-use super::encoding::{decode_row, encode_pk_key, table_key_end, table_key_prefix};
+use super::encoding::{encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -23,7 +24,7 @@ use super::Executor;
 pub struct DeleteParams {
     pub table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
-    pub table_id: crate::executor::encoding::TableId,
+    pub layout: TableLayout,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
     /// The key column's type, where `key_value` is set.
@@ -37,7 +38,7 @@ pub struct DeleteParams {
 
 /// Delete executor
 pub struct Delete {
-    table_id: crate::executor::encoding::TableId,
+    layout: TableLayout,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
@@ -63,7 +64,7 @@ impl Delete {
     /// Create a new delete executor
     pub fn new(p: DeleteParams) -> Self {
         Delete {
-            table_id: p.table_id,
+            layout: p.layout,
             filter: p.filter,
             key_value: p.key_value,
             key_type: p.key_type,
@@ -88,7 +89,7 @@ impl Delete {
         let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
             return Ok(());
         };
-        let storage_key = encode_pk_key(self.table_id, &[key_datum]);
+        let storage_key = encode_pk_key(self.layout.id, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
@@ -112,8 +113,8 @@ impl Delete {
                         .mvcc
                         .gap_around(
                             &storage_key,
-                            &table_key_prefix(self.table_id),
-                            &table_key_end(self.table_id),
+                            &table_key_prefix(self.layout.id),
+                            &table_key_end(self.layout.id),
                         )
                         .await?;
                     ctx.lock_gap(&low, &high);
@@ -131,7 +132,7 @@ impl Delete {
         let result = ctx.with_own_change(&storage_key, result);
 
         if let Some((data, row_version)) = result {
-            let row = decode_row(&data)?;
+            let row = self.layout.decode(&data)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -152,8 +153,8 @@ impl Delete {
 
     /// Full scan path: scan all rows in the table
     async fn next_full_scan(&mut self) -> ExecutorResult<()> {
-        let prefix = table_key_prefix(self.table_id);
-        let end = table_key_end(self.table_id);
+        let prefix = table_key_prefix(self.layout.id);
+        let end = table_key_end(self.layout.id);
         // The scan reads the whole table, so the whole table is what must
         // not gain rows until this transaction ends (REPEATABLE READ).
         // Locked before reading, so that nothing slips in between.
@@ -219,7 +220,7 @@ impl Delete {
                 }
                 None => (value, row_version),
             };
-            let row = decode_row(&value)?;
+            let row = self.layout.decode(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -331,7 +332,7 @@ mod tests {
     use super::*;
     use crate::catalog::DataType;
     use crate::executor::datum::Datum;
-    use crate::executor::encoding::{encode_pk_key, encode_row};
+    use crate::executor::encoding::encode_pk_key;
     use crate::planner::logical::{BinaryOp, Literal, ResolvedColumn};
     use crate::server::session::UserVariables;
     use crate::storage::traits::{KeyValue, WriteOp};
@@ -347,6 +348,20 @@ mod tests {
             name.bytes()
                 .fold(5000, |id, byte| id * 31 + u64::from(byte)),
         )
+    }
+
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
+    /// A row of one of the tests' tables, as it is stored.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        crate::executor::rowcodec::encode(
+            &crate::executor::rowcodec::RowShape::numbered(row.len()),
+            row,
+        )
+        .unwrap()
     }
 
     fn empty_vars() -> UserVariables {
@@ -491,7 +506,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
             table: "users".into(),
-            table_id: tid("users"),
+            layout: layout("users"),
             filter: Some(filter),
             key_value: None,
             key_type: None,
@@ -544,7 +559,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
             table: "users".into(),
-            table_id: tid("users"),
+            layout: layout("users"),
             filter: None,
             key_value: None,
             key_type: None,
@@ -612,7 +627,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
             table: "t1".into(),
-            table_id: tid("t1"),
+            layout: layout("t1"),
             filter: None,
             key_value: None,
             key_type: None,
@@ -661,7 +676,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
             table: "t1".into(),
-            table_id: tid("t1"),
+            layout: layout("t1"),
             filter: None,
             key_value: None,
             key_type: None,

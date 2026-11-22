@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
-use super::row::Row;
 
 /// A table's number: what its rows are stored under. Given once, when the
 /// table is created, and never to another table: a table that is renamed
@@ -124,29 +123,9 @@ const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
 const TAG_JSON: u8 = 10;
-/// Written only by `encode_value`: the positional row format (`encode_row`)
+/// Written only by `encode_value`: `encode_datum`
 /// writes a geometry as `TAG_BYTES`.
 const TAG_GEOMETRY: u8 = 11;
-
-/// Encode a row value
-///
-/// Format: [num_cols:u16][datum...]
-/// Each datum: [tag:u8][data...]
-pub fn encode_row(row: &Row) -> Vec<u8> {
-    // Estimate capacity: 2 bytes header + ~10 bytes per datum average
-    let mut buf = Vec::with_capacity(2 + row.len() * 10);
-
-    // Number of columns
-    let num_cols = row.len() as u16;
-    buf.extend_from_slice(&num_cols.to_le_bytes());
-
-    // Encode each datum
-    for datum in row.iter() {
-        encode_datum(&mut buf, datum);
-    }
-
-    buf
-}
 
 /// Encode a single datum
 fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
@@ -258,25 +237,6 @@ pub(crate) fn skip_datum(data: &[u8]) -> ExecutorResult<usize> {
         return Err(ExecutorError::Encoding("datum data too short".to_string()));
     }
     Ok(size)
-}
-
-/// Decode a row value
-pub fn decode_row(data: &[u8]) -> ExecutorResult<Row> {
-    if data.len() < 2 {
-        return Err(ExecutorError::Encoding("row data too short".to_string()));
-    }
-
-    let num_cols = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let mut offset = 2;
-    let mut values = Vec::with_capacity(num_cols);
-
-    for _ in 0..num_cols {
-        let (datum, consumed) = decode_datum(&data[offset..])?;
-        values.push(datum);
-        offset += consumed;
-    }
-
-    Ok(Row::new(values))
 }
 
 /// Decode a single datum, returns (datum, bytes_consumed)
@@ -451,6 +411,29 @@ pub(crate) fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::row::Row;
+
+    /// The values of a row one after another, each as `encode_datum`
+    /// writes it.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for datum in row.iter() {
+            encode_datum(&mut bytes, datum);
+        }
+        bytes
+    }
+
+    /// The values `encode_row` wrote, read back until the bytes end.
+    fn decode_row(mut bytes: &[u8]) -> ExecutorResult<Row> {
+        let mut values = Vec::new();
+        while !bytes.is_empty() {
+            let (datum, used) = decode_datum(bytes)?;
+            assert_eq!(skip_datum(bytes)?, used);
+            values.push(datum);
+            bytes = &bytes[used..];
+        }
+        Ok(Row::new(values))
+    }
 
     #[test]
     fn a_tables_keys_are_together_and_apart_from_other_tables() {
