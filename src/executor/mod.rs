@@ -31,6 +31,7 @@ pub mod procedure;
 pub mod project;
 pub mod range_scan;
 pub mod row;
+pub mod rowcodec;
 pub mod scan;
 pub mod single_row;
 pub mod sort;

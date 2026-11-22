@@ -124,6 +124,9 @@ const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
 const TAG_JSON: u8 = 10;
+/// Written only by `encode_value`: the positional row format (`encode_row`)
+/// writes a geometry as `TAG_BYTES`.
+const TAG_GEOMETRY: u8 = 11;
 
 /// Encode a row value
 ///
@@ -202,6 +205,61 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
     }
 }
 
+/// Encode a single datum such that `decode_datum` gives back the same
+/// variant: as `encode_datum`, except that a geometry keeps its own tag
+/// instead of being written as bytes.
+pub(crate) fn encode_value(buf: &mut Vec<u8>, datum: &Datum) {
+    match datum {
+        Datum::Geometry(b) => {
+            buf.push(TAG_GEOMETRY);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        other => encode_datum(buf, other),
+    }
+}
+
+/// The number of bytes the datum at the start of `data` occupies, without
+/// building it. The tag and the length are checked; what a string or a JSON
+/// document holds is not.
+pub(crate) fn skip_datum(data: &[u8]) -> ExecutorResult<usize> {
+    let Some(&tag) = data.first() else {
+        return Err(ExecutorError::Encoding(
+            "unexpected end of datum".to_string(),
+        ));
+    };
+    let size = match tag {
+        TAG_NULL => 1,
+        TAG_BOOL => 2,
+        TAG_INT | TAG_FLOAT | TAG_UINT | TAG_TIMESTAMP => 9,
+        TAG_BIT => 10,
+        TAG_DECIMAL => 18,
+        TAG_STRING | TAG_BYTES | TAG_JSON | TAG_GEOMETRY => {
+            let Some(header) = data.get(1..5) else {
+                return Err(ExecutorError::Encoding(
+                    "length header too short".to_string(),
+                ));
+            };
+            let len = u32::from_le_bytes(header.try_into().expect("slice is 4 bytes")) as usize;
+            // Compared this way round so that the sum cannot overflow.
+            if data.len() - 5 < len {
+                return Err(ExecutorError::Encoding("datum data too short".to_string()));
+            }
+            return Ok(5 + len);
+        }
+        _ => {
+            return Err(ExecutorError::Encoding(format!(
+                "unknown datum tag: {}",
+                tag
+            )))
+        }
+    };
+    if data.len() < size {
+        return Err(ExecutorError::Encoding("datum data too short".to_string()));
+    }
+    Ok(size)
+}
+
 /// Decode a row value
 pub fn decode_row(data: &[u8]) -> ExecutorResult<Row> {
     if data.len() < 2 {
@@ -222,7 +280,7 @@ pub fn decode_row(data: &[u8]) -> ExecutorResult<Row> {
 }
 
 /// Decode a single datum, returns (datum, bytes_consumed)
-fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
+pub(crate) fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
     if data.is_empty() {
         return Err(ExecutorError::Encoding(
             "unexpected end of datum".to_string(),
@@ -302,6 +360,11 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                 return Err(ExecutorError::Encoding("bytes data too short".to_string()));
             }
             Ok((Datum::Bytes(data[5..5 + len].to_vec()), 5 + len))
+        }
+
+        TAG_GEOMETRY => {
+            let len = skip_datum(data)?;
+            Ok((Datum::Geometry(data[5..len].to_vec()), len))
         }
 
         TAG_UINT => {
