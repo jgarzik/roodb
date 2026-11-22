@@ -10,7 +10,6 @@ multi-core machines.
 
 | Code | Phase |
 |------|-------|
-| PRF | Performance pass |
 | IDX | Secondary and unique indexes; ALTER TABLE done properly |
 | ODB | ODBC and sqlcmd in CI |
 | ACL | Accounts and authorization |
@@ -20,34 +19,6 @@ multi-core machines.
 | MTS | MySQL test suite |
 
 ---
-
-## PRF — Performance pass
-
-Needs a quiet machine for every measurement.
-
-- `oltp_read_only` (range reads, sorts, aggregates over real rows) is
-  behind MySQL at 16 threads (9.5k against 12.1k TPS) and only 1.35x ahead
-  at 1 and 64: find what its range queries cost.
-- Connections that share a connection thread wait for each other's long
-  computations (a big sort, an aggregate over many rows): have long
-  operators give way at intervals, and consider moving a connection to a
-  quieter thread between statements.
-- Per statement, a point select costs the server about 7 µs of CPU, 3 µs
-  of it in the kernel's socket path. In the rest: the plan and its
-  expressions are cloned for every execution of a prepared statement, and
-  about 9% is malloc/free.
-- Reads from table files are about half the speed of reads from memory.
-- Commit latency at one thread: the hops from session to Raft to log writer
-  to I/O reactor. Registered buffers, reactor wake-up tuning; an own
-  proposal batcher above Raft only if measurements call for it.
-- `--durability fsync` at 16 and 64 threads.
-- The lock manager is one mutex, and gap locks a linear list. With row
-  locking, single-thread write throughput measured about the same to 10%
-  lower than before it (runs alternated on a shared machine; reads
-  unchanged): find what the lock path costs per statement.
-- Compaction writes one output table however large; split the output
-  into tables of bounded size.
-- The posix backend on Windows uses buffered I/O.
 
 ## IDX — Secondary and unique indexes; ALTER TABLE done properly
 
@@ -374,6 +345,34 @@ finds. Known already, from an audit of SQL.md against a running server:
 ## Appendix — Unordered work
 
 Not yet assigned to a phase.
+
+**Performance** (what the performance pass left; every measurement needs
+runs alternated on the same machine, which is shared)
+- `oltp_read_write` at 64 clients did not clearly gain from connection
+  threads (13k to 19k TPS between runs, against 17k to 18k before): find
+  whether lock waits or commits waking sessions across threads cost there.
+- Range queries: a 100-row range read costs 35 to 90 µs at one thread
+  (simple, SUM, ORDER BY, DISTINCT): find what they spend it on.
+- Connections that share a connection thread wait for each other's long
+  computations (a big sort, an aggregate over many rows): have long
+  operators give way at intervals, and consider moving a connection to a
+  quieter thread between statements.
+- Per statement, a point select costs the server about 7 µs of CPU, 3 µs
+  of it in the kernel's socket path. In the rest: the plan and its
+  expressions are cloned for every execution of a prepared statement, and
+  about 9% is malloc/free.
+- Reads from table files are about half the speed of reads from memory.
+- Commit latency at one thread: the hops from session to Raft to log writer
+  to I/O reactor. Registered buffers, reactor wake-up tuning; an own
+  proposal batcher above Raft only if measurements call for it.
+- `--durability fsync` at 16 and 64 threads.
+- The lock manager is one mutex, and gap locks a linear list. With row
+  locking, single-thread write throughput measured about the same to 10%
+  lower than before it (runs alternated on a shared machine; reads
+  unchanged): find what the lock path costs per statement.
+- Compaction writes one output table however large; split the output
+  into tables of bounded size.
+- The posix backend on Windows uses buffered I/O.
 
 - The functions that read system-table rows (`row_to_index_def` and its
   siblings in `catalog/system_tables.rs`) index into the row without
