@@ -21,6 +21,24 @@
 //! Like row locks (`lock.rs`), these exist only in the memory of the node
 //! that granted them.
 //!
+//! # The fast side
+//!
+//! Nearly every lock ever taken is a shared one on a table nobody is
+//! changing, and every statement takes one. Those do not go through the
+//! lock table and its mutex. Each name has a **gate** (`NameGate`): one
+//! word holding a count of shared holders and a closed bit. While the gate
+//! is open, a shared lock is that count going up by one and nothing else;
+//! who holds it is known only to the holder's own session (`MdlSession`).
+//!
+//! A request for an exclusive lock closes the gate. From then on shared
+//! requests for the name come to the lock table like any other and queue
+//! behind it. The holders the count stood for are then found (every
+//! session is asked what it holds on that gate) and entered in the lock
+//! table under their own names, so that from the first moment a request
+//! waits, the table says exactly whom it waits for, and deadlocks are
+//! found as before. The gate opens again when the table has nothing left
+//! on the name.
+//!
 //! # Deadlocks
 //!
 //! A transaction can hold a row lock and wait for a metadata lock while
@@ -35,30 +53,221 @@
 //! This table's mutex first, then the row lock manager's. The row lock
 //! manager never calls back into this module, so the reverse order cannot
 //! happen. Neither mutex is held while a request waits.
+//!
+//! Under this table's mutex, closing a gate takes the list of sessions and
+//! then each session's own small mutex in turn. A session holds its mutex
+//! only to change what it holds on the fast side, and takes nothing else
+//! while it does: it never comes to this table with its mutex held.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::lock::LockManager;
 
-/// The name a metadata lock is taken on. Names are compared exactly as
-/// given: the caller settles letter case before locking.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TableName {
-    pub database: String,
-    pub table: String,
+/// The name a metadata lock is taken on: a table's name as the catalog has
+/// it. Names are compared exactly as given: the caller settles letter case
+/// before locking.
+pub use crate::catalog::TableName;
+
+/// The closed bit of a gate's word; the rest of the word counts the shared
+/// holders on the fast side.
+const CLOSED: u64 = 1 << 63;
+
+/// The fast side of the locks on one name: a count of shared holders that
+/// have not been through the lock table, and whether new ones may still
+/// join them.
+#[derive(Debug, Default)]
+pub struct NameGate {
+    word: AtomicU64,
 }
 
-impl TableName {
-    pub fn new(database: impl Into<String>, table: impl Into<String>) -> Self {
-        Self {
-            database: database.into(),
-            table: table.into(),
+impl NameGate {
+    /// Count one more shared holder, unless the gate is closed.
+    fn enter(&self) -> bool {
+        let mut word = self.word.load(Ordering::Relaxed);
+        loop {
+            if word & CLOSED != 0 {
+                return false;
+            }
+            match self.word.compare_exchange_weak(
+                word,
+                word + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => word = now,
+            }
+        }
+    }
+
+    /// Count one shared holder fewer.
+    fn leave(&self) {
+        self.word.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn close(&self) {
+        self.word.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+
+    fn open(&self) {
+        self.word.fetch_and(!CLOSED, Ordering::AcqRel);
+    }
+
+    /// The number of shared holders on the fast side.
+    fn holders(&self) -> u64 {
+        self.word.load(Ordering::Acquire) & !CLOSED
+    }
+}
+
+/// A name to lock, with its gate: what a statement keeps for each table it
+/// uses, so that locking the table again needs no lookup.
+#[derive(Debug, Clone)]
+pub struct MdlTarget {
+    pub name: TableName,
+    gate: Arc<NameGate>,
+}
+
+/// A shared lock one session holds on the fast side.
+struct FastLock {
+    owner: u64,
+    name: TableName,
+    gate: Arc<NameGate>,
+}
+
+#[derive(Default)]
+struct SessionLocks {
+    /// Shared locks held on the fast side, known nowhere else.
+    fast: Vec<FastLock>,
+    /// Owners of this session that hold (or wait for) something in the
+    /// lock table: locks taken there, and fast ones moved there when a
+    /// gate was closed.
+    in_table: Vec<u64>,
+}
+
+/// The locks of one session. A session takes its shared locks through
+/// this, on the fast side whenever the name's gate is open.
+pub struct MdlSession {
+    locks: Arc<MetadataLocks>,
+    held: Mutex<SessionLocks>,
+}
+
+impl std::fmt::Debug for MdlSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.held.lock();
+        f.debug_struct("MdlSession")
+            .field("fast", &held.fast.len())
+            .field("in_table", &held.in_table)
+            .finish()
+    }
+}
+
+impl MdlSession {
+    /// Lock `target` shared for `owner` (a transaction of this session),
+    /// waiting up to `timeout` if a schema change holds the name or waits
+    /// for it. Held until `release(owner)`.
+    pub async fn lock_shared(
+        &self,
+        owner: u64,
+        target: &MdlTarget,
+        timeout: Duration,
+    ) -> Result<(), MdlError> {
+        {
+            let mut held = self.held.lock();
+            let has = held
+                .fast
+                .iter()
+                .any(|lock| lock.owner == owner && Arc::ptr_eq(&lock.gate, &target.gate));
+            if has {
+                return Ok(());
+            }
+            // Counted and noted under the session's mutex, so that whoever
+            // closes the gate and then asks this session what it holds
+            // sees either both or neither.
+            if target.gate.enter() {
+                held.fast.push(FastLock {
+                    owner,
+                    name: target.name.clone(),
+                    gate: target.gate.clone(),
+                });
+                return Ok(());
+            }
+            if !held.in_table.contains(&owner) {
+                held.in_table.push(owner);
+            }
+        }
+        self.locks
+            .lock(owner, &target.name, MdlMode::Shared, timeout)
+            .await
+    }
+
+    /// Lock several names for `owner`, each in the mode given with it, as
+    /// `MetadataLocks::lock_all` does. For the exclusive locks of a schema
+    /// change, and the shared ones it takes with them.
+    pub async fn lock_all(
+        &self,
+        owner: u64,
+        names: &[(TableName, MdlMode)],
+        timeout: Duration,
+    ) -> Result<(), MdlError> {
+        {
+            let mut held = self.held.lock();
+            if !held.in_table.contains(&owner) {
+                held.in_table.push(owner);
+            }
+        }
+        self.locks.lock_all(owner, names, timeout).await
+    }
+
+    /// Release everything `owner` holds, and abandon anything it waits
+    /// for. Called when the transaction (or the statement, for one that
+    /// runs in none) ends.
+    pub fn release(&self, owner: u64) {
+        let (fast, in_table) = {
+            let mut held = self.held.lock();
+            let mut fast = Vec::new();
+            let mut index = 0;
+            while index < held.fast.len() {
+                if held.fast[index].owner == owner {
+                    fast.push(held.fast.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            let before = held.in_table.len();
+            held.in_table.retain(|o| *o != owner);
+            (fast, before != held.in_table.len())
+        };
+        for lock in fast {
+            lock.gate.leave();
+        }
+        if in_table {
+            self.locks.release_all(owner);
+        }
+    }
+
+    /// Whether this session holds nothing, for any owner.
+    pub fn is_idle(&self) -> bool {
+        let held = self.held.lock();
+        held.fast.is_empty() && held.in_table.is_empty()
+    }
+}
+
+impl Drop for MdlSession {
+    fn drop(&mut self) {
+        // A session that goes away holds nothing afterwards.
+        let held = std::mem::take(&mut *self.held.lock());
+        for lock in held.fast {
+            lock.gate.leave();
+        }
+        for owner in held.in_table {
+            self.locks.release_all(owner);
         }
     }
 }
@@ -103,6 +312,9 @@ struct Waiter {
 /// The locks on one name.
 #[derive(Default)]
 struct Table {
+    /// The name's gate, while this entry keeps it closed: from the first
+    /// request for an exclusive lock until the entry goes.
+    closed: Option<Arc<NameGate>>,
     holders: Vec<(u64, MdlMode)>,
     /// Requests that could not be granted at once, oldest first.
     waiters: Vec<Waiter>,
@@ -212,8 +424,20 @@ impl State {
                 table.blockers(waiter.owner, waiter.mode, Some(waiter.id)),
             ));
         }
-        if table.holders.is_empty() && table.waiters.is_empty() {
-            self.tables.remove(name);
+        self.forget_if_idle(name);
+    }
+
+    /// Drop the entry for `name` if nothing is held or waited for on it,
+    /// and open the name's gate again if the entry kept it closed.
+    fn forget_if_idle(&mut self, name: &TableName) {
+        let idle = self
+            .tables
+            .get(name)
+            .is_some_and(|table| table.holders.is_empty() && table.waiters.is_empty());
+        if idle {
+            if let Some(gate) = self.tables.remove(name).and_then(|table| table.closed) {
+                gate.open();
+            }
         }
     }
 
@@ -256,6 +480,10 @@ enum Taken {
 /// The metadata lock table of one node.
 pub struct MetadataLocks {
     state: Mutex<State>,
+    /// Each name's gate. Read to find a gate, written to add one.
+    gates: RwLock<HashMap<TableName, Arc<NameGate>>>,
+    /// The sessions that may hold locks on the fast side.
+    sessions: Mutex<Vec<Weak<MdlSession>>>,
     /// Where waits are recorded, so that deadlocks through both kinds of
     /// lock are found.
     row_locks: Arc<LockManager>,
@@ -294,8 +522,95 @@ impl MetadataLocks {
     pub fn new(row_locks: Arc<LockManager>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            gates: RwLock::new(HashMap::new()),
+            sessions: Mutex::new(Vec::new()),
             row_locks,
         })
+    }
+
+    /// The locks of a new session.
+    pub fn session(self: &Arc<Self>) -> Arc<MdlSession> {
+        let session = Arc::new(MdlSession {
+            locks: self.clone(),
+            held: Mutex::new(SessionLocks::default()),
+        });
+        let mut sessions = self.sessions.lock();
+        // Sessions that have gone are dropped from the list as it grows.
+        if sessions.len() == sessions.capacity() {
+            sessions.retain(|session| session.strong_count() > 0);
+        }
+        sessions.push(Arc::downgrade(&session));
+        session
+    }
+
+    /// `name` with its gate, to lock it through a session.
+    pub fn target(&self, name: &TableName) -> MdlTarget {
+        if let Some(gate) = self.gates.read().get(name) {
+            return MdlTarget {
+                name: name.clone(),
+                gate: gate.clone(),
+            };
+        }
+        let gate = self.gates.write().entry(name.clone()).or_default().clone();
+        MdlTarget {
+            name: name.clone(),
+            gate,
+        }
+    }
+
+    /// The number of names that have a gate.
+    pub fn gates(&self) -> usize {
+        self.gates.read().len()
+    }
+
+    /// Before an exclusive lock on `name` is asked for: close the name's
+    /// gate, so that no shared lock is taken on the fast side from here
+    /// on, and enter those that were in the table under their owners. The
+    /// entry for the name keeps the gate closed until it goes.
+    fn close_gate(&self, state: &mut State, name: &TableName) {
+        if state
+            .tables
+            .get(name)
+            .is_some_and(|table| table.closed.is_some())
+        {
+            return;
+        }
+        let gate = self.target(name).gate;
+        gate.close();
+        // Whoever counted itself in before the gate closed did so under
+        // its session's mutex, and noted the lock there: asking each
+        // session in turn finds them all.
+        let sessions: Vec<Arc<MdlSession>> = {
+            let mut sessions = self.sessions.lock();
+            sessions.retain(|session| session.strong_count() > 0);
+            sessions.iter().filter_map(Weak::upgrade).collect()
+        };
+        for session in sessions {
+            let mut held = session.held.lock();
+            let mut index = 0;
+            while index < held.fast.len() {
+                if !Arc::ptr_eq(&held.fast[index].gate, &gate) {
+                    index += 1;
+                    continue;
+                }
+                let lock = held.fast.swap_remove(index);
+                lock.gate.leave();
+                state.grant(lock.owner, &lock.name, MdlMode::Shared);
+                if !held.in_table.contains(&lock.owner) {
+                    held.in_table.push(lock.owner);
+                }
+            }
+        }
+        state.tables.entry(name.clone()).or_default().closed = Some(gate);
+    }
+
+    /// Drop the gates nobody uses: no holder, no entry in the table, and
+    /// no statement keeping the gate to lock the name again.
+    fn drop_idle_gates(&self, state: &State) {
+        let mut gates = self.gates.write();
+        gates.retain(|name, gate| {
+            Arc::strong_count(gate) > 1 || gate.holders() > 0 || state.tables.contains_key(name)
+        });
     }
 
     /// Lock `name` for `owner`, waiting up to `timeout` for owners that
@@ -383,6 +698,10 @@ impl MetadataLocks {
             state.settle(name, &mut changes);
         }
         self.apply(changes);
+        // Rarely anything: only names a schema change touched come here.
+        if !names.is_empty() {
+            self.drop_idle_gates(&state);
+        }
     }
 
     /// Number of locks held, and of requests waiting.
@@ -408,6 +727,9 @@ impl MetadataLocks {
         let taken;
         let (id, granted) = {
             let mut state = self.state.lock();
+            if mode == MdlMode::Exclusive {
+                self.close_gate(&mut state, name);
+            }
             let (held, blockers) = match state.tables.get(name) {
                 Some(table) => (table.held_by(owner), table.blockers(owner, mode, None)),
                 None => (None, Vec::new()),
@@ -431,6 +753,9 @@ impl MetadataLocks {
             // The wait is recorded with the row locks before the request
             // joins the queue, and refused there if it would close a cycle.
             if !self.row_locks.begin_outside_wait(owner, &blockers) {
+                // Nothing was taken or queued: if the name's gate was
+                // closed for this request alone, it opens again.
+                state.forget_if_idle(name);
                 return Err(MdlError::Deadlock);
             }
             let id = state.next_waiter;
@@ -952,5 +1277,246 @@ mod tests {
         rows.release_all(2);
         m.release_all(2);
         reader.await.unwrap().unwrap();
+    }
+
+    // ---- The fast side ----
+
+    fn target(m: &MetadataLocks, table: &str) -> MdlTarget {
+        m.target(&name(table))
+    }
+
+    /// Shared locks taken through a session, with nothing else going on,
+    /// never reach the lock table; an exclusive request finds them all the
+    /// same, waits for each, and is granted when the last has gone.
+    #[tokio::test]
+    async fn shared_locks_on_the_fast_side_are_found_by_an_exclusive_request() {
+        let (_, m) = locks();
+        let (a, b) = (m.session(), m.session());
+        let t = target(&m, "t");
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        b.lock_shared(2, &t, LONG).await.unwrap();
+        // The same owner again: nothing more is counted.
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        assert_eq!(m.counts(), (0, 0));
+        assert_eq!(t.gate.holders(), 2);
+
+        let writer = spawn_lock(&m, 3, "t", Exclusive);
+        until_waiting(&m, 1).await;
+        // Both holders are in the table now, under their own names.
+        assert_eq!(m.counts(), (2, 1));
+        assert_eq!(t.gate.holders(), 0);
+
+        a.release(1);
+        assert!(!writer.is_finished());
+        b.release(2);
+        writer.await.unwrap().unwrap();
+        assert_eq!(m.counts(), (1, 0));
+        assert!(a.is_idle() && b.is_idle());
+    }
+
+    /// While an exclusive lock is held or waited for, shared requests go
+    /// through the table and wait their turn; once the name is free again,
+    /// they are back on the fast side.
+    #[tokio::test]
+    async fn the_gate_closes_for_a_schema_change_and_opens_after_it() {
+        let (_, m) = locks();
+        let a = m.session();
+        let t = target(&m, "t");
+        m.lock(9, &name("t"), Exclusive, LONG).await.unwrap();
+
+        let reader = {
+            let (a, t) = (a.clone(), t.clone());
+            tokio::spawn(async move { a.lock_shared(1, &t, LONG).await })
+        };
+        until_waiting(&m, 1).await;
+        assert_eq!(t.gate.holders(), 0);
+        m.release_all(9);
+        reader.await.unwrap().unwrap();
+        // Granted by the table, where it stays until it is released.
+        assert_eq!(m.counts(), (1, 0));
+        a.release(1);
+        assert_eq!(m.counts(), (0, 0));
+
+        // Nothing is left on the name: the next shared lock is fast again.
+        a.lock_shared(2, &t, LONG).await.unwrap();
+        assert_eq!(m.counts(), (0, 0));
+        assert_eq!(t.gate.holders(), 1);
+        a.release(2);
+        assert_eq!(t.gate.holders(), 0);
+    }
+
+    /// A request that times out, or is refused, leaves the gate as it
+    /// found it once nothing else is on the name.
+    #[tokio::test]
+    async fn a_failed_exclusive_request_does_not_leave_the_gate_closed() {
+        let (_, m) = locks();
+        let a = m.session();
+        let t = target(&m, "t");
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        assert_eq!(
+            m.lock(2, &name("t"), Exclusive, SHORT).await,
+            Err(MdlError::Timeout)
+        );
+        // The holder was moved to the table and is still there.
+        assert_eq!(m.counts(), (1, 0));
+        a.release(1);
+        assert_eq!(m.counts(), (0, 0));
+        a.lock_shared(3, &t, LONG).await.unwrap();
+        assert_eq!(t.gate.holders(), 1);
+        a.release(3);
+    }
+
+    /// A session that holds a name on the fast side and then asks for it
+    /// exclusively is upgrading: it waits for the other holders only.
+    #[tokio::test]
+    async fn a_fast_holder_upgrades() {
+        let (_, m) = locks();
+        let (a, b) = (m.session(), m.session());
+        let t = target(&m, "t");
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        b.lock_shared(2, &t, LONG).await.unwrap();
+
+        let upgrade = {
+            let a = a.clone();
+            tokio::spawn(async move { a.lock_all(1, &[(name("t"), Exclusive)], LONG).await })
+        };
+        until_waiting(&m, 1).await;
+        b.release(2);
+        upgrade.await.unwrap().unwrap();
+        assert_eq!(m.counts(), (1, 0));
+        a.release(1);
+        assert_eq!(m.counts(), (0, 0));
+        assert!(a.is_idle());
+    }
+
+    /// A cycle through a row lock and a metadata lock held on the fast
+    /// side is found: the holder is named in the table before anyone
+    /// waits for it.
+    #[tokio::test]
+    async fn a_cycle_through_a_fast_holder_is_found() {
+        let (rows, m) = locks();
+        let a = m.session();
+        let t = target(&m, "t");
+        // Owner 1: the table, on the fast side. Owner 2: the row.
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        rows.lock_record(2, b"k", LockMode::Exclusive, LONG)
+            .await
+            .unwrap();
+        // Owner 2 waits for the table...
+        let writer = spawn_lock(&m, 2, "t", Exclusive);
+        until_waiting(&m, 1).await;
+        // ...and owner 1, asking for the row, would close the cycle.
+        assert_eq!(
+            rows.lock_record(1, b"k", LockMode::Exclusive, LONG).await,
+            Err(LockError::Deadlock)
+        );
+        // The victim rolls back; the other goes on.
+        rows.release_all(1);
+        a.release(1);
+        writer.await.unwrap().unwrap();
+        m.release_all(2);
+        rows.release_all(2);
+    }
+
+    /// A session that goes away holds nothing afterwards, on either side.
+    #[tokio::test]
+    async fn a_dropped_session_releases_what_it_held() {
+        let (_, m) = locks();
+        let t = target(&m, "t");
+        let u = target(&m, "u");
+        let a = m.session();
+        a.lock_shared(1, &t, LONG).await.unwrap();
+        a.lock_all(1, &[(name("u"), Exclusive)], LONG)
+            .await
+            .unwrap();
+        assert_eq!(t.gate.holders(), 1);
+        drop(a);
+        assert_eq!(t.gate.holders(), 0);
+        assert_eq!(m.counts(), (0, 0));
+        // Both names can be had at once by another.
+        m.lock_all(2, &[(name("t"), Exclusive), (name("u"), Exclusive)], LONG)
+            .await
+            .unwrap();
+        m.release_all(2);
+        drop((t, u));
+    }
+
+    /// A name's gate is kept only while something uses it.
+    #[tokio::test]
+    async fn gates_do_not_pile_up() {
+        let (_, m) = locks();
+        let a = m.session();
+        for n in 0..50 {
+            let table = format!("t{n}");
+            // Created and dropped: an exclusive lock on a new name.
+            m.lock(1, &name(&table), Exclusive, LONG).await.unwrap();
+            m.release_all(1);
+            // Read once.
+            let t = target(&m, &table);
+            a.lock_shared(2, &t, LONG).await.unwrap();
+            a.release(2);
+        }
+        // The gates made for reading are dropped when a schema change
+        // next releases its locks.
+        m.lock(1, &name("last"), Exclusive, LONG).await.unwrap();
+        m.release_all(1);
+        assert_eq!(m.gates(), 0);
+    }
+
+    /// Readers and writers from several threads: a writer never holds a
+    /// name while a reader does, nor two writers at once, and everyone
+    /// gets through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readers_and_writers_exclude_each_other() {
+        use std::sync::atomic::AtomicI64;
+
+        let (_, m) = locks();
+        // Above zero: that many readers inside. -1: a writer.
+        let inside = Arc::new(AtomicI64::new(0));
+        let mut tasks = Vec::new();
+        for reader in 0..6u64 {
+            let (m, inside) = (m.clone(), inside.clone());
+            tasks.push(tokio::spawn(async move {
+                let session = m.session();
+                for round in 0..300u64 {
+                    let owner = 1000 + reader * 1000 + round;
+                    let t = m.target(&name("t"));
+                    session.lock_shared(owner, &t, LONG).await.unwrap();
+                    assert!(
+                        inside.fetch_add(1, Ordering::SeqCst) >= 0,
+                        "a writer is inside"
+                    );
+                    tokio::task::yield_now().await;
+                    assert!(inside.fetch_sub(1, Ordering::SeqCst) > 0);
+                    session.release(owner);
+                }
+            }));
+        }
+        for writer in 0..2u64 {
+            let (m, inside) = (m.clone(), inside.clone());
+            tasks.push(tokio::spawn(async move {
+                let session = m.session();
+                for round in 0..60u64 {
+                    let owner = 100_000 + writer * 1000 + round;
+                    session
+                        .lock_all(owner, &[(name("t"), Exclusive)], LONG)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        inside.compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst),
+                        Ok(0),
+                        "someone else is inside"
+                    );
+                    tokio::task::yield_now().await;
+                    inside.store(0, Ordering::SeqCst);
+                    session.release(owner);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(m.counts(), (0, 0));
+        assert_eq!(m.target(&name("t")).gate.holders(), 0);
     }
 }

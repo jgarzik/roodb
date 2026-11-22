@@ -91,6 +91,9 @@ Always acquired alone (never nested with other locks).
 | `next_roll_ptr` | AtomicU64 | Roll pointer generation |
 | `LockManager::state` | parking_lot::Mutex | Row lock table, and the wait-for graph of both lock tables |
 | `MetadataLocks::state` | parking_lot::Mutex | Metadata lock table |
+| `MetadataLocks::gates` | parking_lot::RwLock | Each name's gate (fast side); read to find one, written to add or drop one |
+| `MetadataLocks::sessions` | parking_lot::Mutex | The sessions that may hold fast-side locks |
+| `MdlSession::held` | parking_lot::Mutex | One session's fast-side locks; taken by the session, and by whoever closes a gate |
 
 Multiple RwLocks but NEVER nested - each acquired/released independently.
 The two lock tables are the exception, in one fixed order (see Metadata
@@ -303,6 +306,22 @@ these locks yet.
   such statements cannot each hold what the other waits for. If one name
   cannot be had, what the call took is given back and an upgrade it made is
   undone; what the owner held before is untouched.
+- **The fast side.** A shared lock on a name nobody is changing does not
+  go through the lock table. Each name has a gate (`NameGate`): one atomic
+  word, a count of shared holders and a closed bit. A session takes its
+  shared locks through its `MdlSession`: while the gate is open, the count
+  goes up by one and the lock is noted in the session's own list, under the
+  session's own mutex; no shared mutex is taken. A statement keeps the
+  name with its gate (`MdlTarget`), so locking a table again needs no
+  lookup. The first request for an exclusive lock on a name closes its
+  gate, asks every session what it holds on that gate, and enters those
+  locks in the lock table under their owners, where they stay until they
+  are released. From then on shared requests for the name queue in the
+  table like any other, behind the exclusive one. So whenever a request
+  waits, the table names everyone it waits for, and the wait-for graph
+  below is complete. When the table has nothing left on the name, the gate
+  opens. Gates nobody uses are dropped when a schema change releases its
+  locks.
 - **Ending.** `release_all(owner)` releases everything the owner holds and
   abandons a request it is waiting for. A wait can time out
   (`MdlError::Timeout`), and a request whose future is dropped while it
@@ -331,10 +350,16 @@ the row lock manager has heard. The row lock manager never calls into
 while a requester waits (it parks on a oneshot channel), and no other lock
 is taken under either.
 
+Closing a gate happens under the metadata lock mutex and takes, in turn,
+`gates` (to find the gate), `sessions`, and each session's `held`. A session
+takes its own `held` only to change its fast-side list and takes nothing
+else while it holds it; it comes to the lock table (to queue, or to release
+what was moved there) only after letting go of it.
+
 ## Lock Ordering Rules
 
 1. **Never hold sync locks across await** (except tokio::sync::Mutex)
-2. **Catalog acquired alone** - no other locks held when catalog is locked
+2. **Catalog acquired alone** - no other locks held when catalog is locked, and never the catalog itself a second time: a second read lock behind a waiting writer is never granted. A function called while the catalog is held for reading is given the guard's catalog (`&Catalog`), not the lock
 3. **Independent subsystem locks** - txn, storage, raft don't hold each other's locks
 4. **No circular dependencies** - call graph naturally orders acquisitions
 5. **Metadata lock mutex before row lock mutex** - the one place two locks nest inside `src/txn/`; never the reverse
