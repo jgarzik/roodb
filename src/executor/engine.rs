@@ -952,7 +952,6 @@ impl ExecutorEngine {
                         if_exists,
                         self.catalog.clone(),
                         raft_node.clone(),
-                        self.mvcc.clone(),
                     )))
                 } else {
                     Ok(Box::new(DropDatabase::new(

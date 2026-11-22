@@ -107,6 +107,7 @@ Schema metadata cache. The catalog is an in-memory cache of schema metadata, reb
 
 **System Tables** (stored in LSM, replicated via Raft):
 - `system.tables` - one record per table, keyed by its name: its definition (columns, constraints) and its indexes, whole (`catalog/store.rs`). A change to a table replaces that one record, so it is applied whole or not at all; the state machine brings the catalog up to date from the record as each log entry is applied, with nothing else to read and nothing that can fail. Definitions are validated before they are proposed (`Catalog::validate_table`).
+- Every system table's rows are keyed by what they describe (an account by name and host, a view by its name, ...) and carry the version header every stored row has, from initialisation on. `catalog/store.rs` is the one place that builds their keys and reads them; a second row with the same key is refused when it is applied.
 - `system.databases` - databases
 - `system.views`, `system.procedures` (stored procedures and functions), `system.triggers`
 - `system.table_statistics` - optimizer statistics

@@ -45,20 +45,13 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
     ))
 }
 
-/// Extract row data from a value that may be MVCC-wrapped or raw.
-/// Returns None if the row is deleted. Handles both MVCC-wrapped rows
-/// (from normal operations) and raw rows (from roodb_init).
+/// The row in a stored value: what follows the version header. `None` if
+/// the row is deleted (or the value is too short to be a row at all).
 fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
-    if value.len() > MVCC_HEADER_SIZE {
-        // MVCC-wrapped: check deleted flag
-        if is_mvcc_tombstone(value) {
-            return None; // deleted
-        }
-        Some(&value[MVCC_HEADER_SIZE..])
-    } else {
-        // Raw row (from roodb_init, no MVCC header)
-        Some(value)
+    if value.len() < MVCC_HEADER_SIZE || is_mvcc_tombstone(value) {
+        return None;
     }
+    Some(&value[MVCC_HEADER_SIZE..])
 }
 
 // Key prefixes for Raft state in LSM
@@ -538,14 +531,12 @@ impl LsmRaftStorage {
         for change in &changeset.changes {
             match (&change.op, &change.value) {
                 (ChangeOp::Insert | ChangeOp::Update, Some(value)) => {
-                    // A key that holds a live row cannot be inserted again.
-                    // Of the system tables only the table records are keyed
-                    // by what they describe; the others are keyed by row
-                    // IDs, which do not repeat.
+                    // A key that holds a live row cannot be inserted again:
+                    // a row of a user's table, or a row of a system table,
+                    // which is keyed by what it describes (two sessions
+                    // creating the same account, view or database at once).
                     let is_table_record = change.table == SYSTEM_TABLES;
-                    if change.op == ChangeOp::Insert
-                        && (is_table_record || !is_system_table(&change.table))
-                    {
+                    if change.op == ChangeOp::Insert {
                         let exists = match live.get(change.key.as_slice()) {
                             Some(live) => *live,
                             None => self

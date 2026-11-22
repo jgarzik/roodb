@@ -251,30 +251,13 @@ impl Executor for DropTable {
             // The table's triggers go with it. Their rows name the table in
             // the second column. Left behind, they would come back with the
             // next table of this name.
-            for system_table in [SYSTEM_TRIGGERS] {
-                let prefix = super::encoding::table_key_prefix(system_table);
-                let end = super::encoding::table_key_end(system_table);
-                let rows = mvcc
-                    .scan_raw(&prefix, &end)
-                    .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-                for (key, value) in rows {
-                    if crate::raft::is_mvcc_tombstone(&value)
-                        || value.len() <= crate::raft::MVCC_HEADER_SIZE
-                    {
-                        continue;
-                    }
-                    let row_data = &value[crate::raft::MVCC_HEADER_SIZE..];
-                    let Ok(row) = super::encoding::decode_row(row_data) else {
-                        continue;
-                    };
-                    if matches!(row.values().get(1), Some(Datum::String(t)) if t == &self.name) {
-                        changeset.push(RowChange::delete_with_value(
-                            system_table,
-                            key.clone(),
-                            row_data.to_vec(),
-                        ));
-                    }
+            let triggers = crate::catalog::store::scan_rows(mvcc.inner().as_ref(), SYSTEM_TRIGGERS)
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            for trigger in triggers {
+                if matches!(trigger.row.values().get(1), Some(Datum::String(t)) if t == &self.name)
+                {
+                    changeset.push(crate::catalog::store::delete_row(SYSTEM_TRIGGERS, &trigger));
                 }
             }
 
@@ -598,15 +581,9 @@ impl Executor for CreateDatabase {
         if let Some(ref raft_node) = self.raft_node {
             use crate::catalog::system_tables::SYSTEM_DATABASES;
 
-            // Write to system.databases via Raft
-            let start = allocate_row_id_batch(1);
-            let row_id = start;
-
+            // The database's row, under its name
             let row = Row::new(vec![Datum::String(self.name.clone())]);
-            let key = encode_row_key(SYSTEM_DATABASES, row_id);
-            let value = encode_row(&row);
-
-            let change = RowChange::insert(SYSTEM_DATABASES.to_string(), key, value);
+            let change = crate::catalog::store::insert_row(SYSTEM_DATABASES, &row);
             let changeset = ChangeSet::new_with_changes(0, vec![change]);
 
             raft_node
@@ -636,7 +613,6 @@ pub struct DropDatabase {
     if_exists: bool,
     catalog: Arc<RwLock<Catalog>>,
     raft_node: Option<Arc<RaftNode>>,
-    mvcc: Option<Arc<crate::txn::MvccStorage>>,
     done: bool,
 }
 
@@ -647,7 +623,6 @@ impl DropDatabase {
             if_exists,
             catalog,
             raft_node: None,
-            mvcc: None,
             done: false,
         }
     }
@@ -657,14 +632,12 @@ impl DropDatabase {
         if_exists: bool,
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
-        mvcc: Arc<crate::txn::MvccStorage>,
     ) -> Self {
         DropDatabase {
             name,
             if_exists,
             catalog,
             raft_node: Some(raft_node),
-            mvcc: Some(mvcc),
             done: false,
         }
     }
@@ -704,37 +677,13 @@ impl Executor for DropDatabase {
             }
         }
 
-        if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
+        if let Some(ref raft_node) = self.raft_node {
             use crate::catalog::system_tables::SYSTEM_DATABASES;
 
-            // Scan system.databases to find the row to delete
-            let prefix = format!("t:{SYSTEM_DATABASES}:");
-            let end = format!("t:{SYSTEM_DATABASES};\x00");
-
-            let rows = mvcc
-                .scan_raw(prefix.as_bytes(), end.as_bytes())
-                .await
-                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-
+            // The database's row is keyed by its name.
+            let row = Row::new(vec![Datum::String(self.name.clone())]);
             let mut changeset = ChangeSet::new(0);
-            for (key, value) in rows {
-                let row_data = if value.len() > 17 {
-                    &value[17..]
-                } else {
-                    &value
-                };
-                if let Ok(row) = super::encoding::decode_row(row_data) {
-                    if let Some(Datum::String(db_name)) = row.get_opt(0) {
-                        if db_name == &self.name {
-                            changeset.push(RowChange::delete_with_value(
-                                SYSTEM_DATABASES,
-                                key.clone(),
-                                row_data.to_vec(),
-                            ));
-                        }
-                    }
-                }
-            }
+            changeset.push(crate::catalog::store::delete_keyed(SYSTEM_DATABASES, &row));
 
             if !changeset.changes.is_empty() {
                 raft_node

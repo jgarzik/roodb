@@ -78,49 +78,43 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-1. The other system tables (accounts, grants, databases, views, routines,
-   triggers, statistics) keyed by what they describe, not by row IDs, with
-   row headers from initialisation on; duplicates refused when applied;
-   the hand-written scans and header-skipping in `ddl.rs`, `engine.rs` and
-   `auth.rs` behind one module. `CREATE`/`DROP DATABASE` and the account
-   statements still hand their changes back to be proposed a second time.
-2. Object IDs: `AllocIds`; table records with IDs and versions; keys by
+1. Object IDs: `AllocIds`; table records with IDs and versions; keys by
    ID; the `AUTO_INCREMENT` counter and locks by ID. `RENAME TO` becomes
    metadata.
-3. Databases: tables belong to one; `db.table`; `USE` decides what a name
+2. Databases: tables belong to one; `db.table`; `USE` decides what a name
    means; `DROP DATABASE` drops its tables; system tables in `mysql`;
    identifier case as MySQL on Linux (database and table names
    case-sensitive, the rest not).
-4. Rows by column ID; one decoding function for every executor;
+3. Rows by column ID; one decoding function for every executor;
    `ADD`/`DROP`/reorder `COLUMN` as metadata.
-5. Metadata locks; DDL commits implicitly; schema versions checked when a
+4. Metadata locks; DDL commits implicitly; schema versions checked when a
    changeset is applied.
-6. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
+5. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
-7. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
+6. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
    resets `AUTO_INCREMENT`) and `DROP DATABASE` in one log entry.
-8. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
+7. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
     naming; `CREATE`/`DROP INDEX` with errors 1061 and 1091; names per
     table; `SHOW INDEX`, `SHOW CREATE TABLE`.
-9. Index entries maintained by every statement that writes, through one
+8. Index entries maintained by every statement that writes, through one
     helper; `UNIQUE` enforced, with MySQL's error text.
-10. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
+9. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
     real statements over that helper.
-11. The schema-change job runner; `CREATE INDEX` on a table with rows,
+10. The schema-change job runner; `CREATE INDEX` on a table with rows,
     online; cancelled when its client goes away.
-12. Reading through indexes: equality prefix plus range, composite keys,
+11. Reading through indexes: equality prefix plus range, composite keys,
     `IN`, index-only reads.
-13. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
+12. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
     indexes.
-14. Statistics that are read: row counts and distinct counts per index;
+13. Statistics that are read: row counts and distinct counts per index;
     the cost model in use.
-15. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
+14. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
     `LIMIT` from index order; `MIN`/`MAX` from an index.
-16. Change of primary key and of column type, online.
-17. Temporary tables: names and IDs in the session, shadowing permanent
+15. Change of primary key and of column type, online.
+16. Temporary tables: names and IDs in the session, shadowing permanent
     tables; indexes; `RENAME`.
-18. `information_schema` tables for tables, columns and indexes;
+17. `information_schema` tables for tables, columns and indexes;
     `ALTER TABLE ... AUTO_INCREMENT = n`; `RENAME INDEX`.
 
 ## TXN — Transaction semantics
@@ -169,9 +163,6 @@ Driver 18 and `sqlcmd`.
 
 Only `root` can log in, and `root` bypasses every check.
 
-- Account rows in the same format as every other row (today they are read
-  without their row header, so an account created with SQL cannot log in and
-  `CREATE ROLE` inserts duplicates).
 - `CREATE USER`, `ALTER USER`, `DROP USER`, `SET PASSWORD`, `SHOW GRANTS`,
   roles; `mysql_native_password`; account statements commit implicitly.
 - The privilege model: database-level grants that do not depend on the

@@ -1004,11 +1004,15 @@ async fn compaction_of_tables_larger_than_a_stretch_keeps_the_data() {
     engine.close().await.unwrap();
 }
 
-/// Initialisation stores its rows under generated row IDs, and records how
-/// far the IDs have been used: a server that starts on this storage hands
-/// out IDs above them, not the same ones again.
+/// Initialisation stores its rows as the server stores rows: each under
+/// the key of what it describes, with a version header. And it records
+/// where the row ID counter stands, for the server to start above.
 #[tokio::test]
-async fn initialisation_records_the_row_ids_it_used() {
+async fn initialisation_writes_rows_the_server_reads() {
+    use roodb::catalog::store::scan_rows;
+    use roodb::catalog::system_tables::{SYSTEM_DATABASES, SYSTEM_GRANTS, SYSTEM_USERS};
+    use roodb::executor::Datum;
+
     let dir = tempfile::tempdir().unwrap();
     let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(engine);
@@ -1016,22 +1020,32 @@ async fn initialisation_records_the_row_ids_it_used() {
         .await
         .unwrap();
 
-    let rows = storage.scan(Some(b"t:"), Some(b"t;")).await.unwrap();
-    assert!(rows.len() >= 4, "root, its grant and two databases");
-    let highest = rows
-        .iter()
-        .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()))
-        .max()
-        .unwrap();
+    let first = |table: &'static str| {
+        let storage = storage.clone();
+        async move {
+            let mut names: Vec<String> = scan_rows(storage.as_ref(), table)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|stored| match stored.row.values().first() {
+                    Some(Datum::String(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    };
+    assert_eq!(first(SYSTEM_USERS).await, ["root"]);
+    assert_eq!(first(SYSTEM_GRANTS).await, ["root"]);
+    assert_eq!(first(SYSTEM_DATABASES).await, ["default", "test"]);
+
     let bound = storage
         .get(roodb::raft::ROW_ID_KEY)
         .await
         .unwrap()
         .map(|stored| u64::from_le_bytes(stored.as_slice().try_into().unwrap()))
         .expect("no row ID bound was recorded");
-    assert!(
-        bound > highest,
-        "IDs up to {highest} are in use, but the recorded bound is {bound}"
-    );
+    assert!(bound >= 1);
     storage.close().await.unwrap();
 }

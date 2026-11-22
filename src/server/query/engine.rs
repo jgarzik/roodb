@@ -227,6 +227,9 @@ enum TempDrop {
     Done,
     /// The statement names a table this session cannot see.
     NoSuchTable(String),
+    /// The statement names an index this session cannot see (it belongs to
+    /// another session's temporary table).
+    NoSuchIndex(String),
 }
 
 impl QueryEngine {
@@ -1134,21 +1137,11 @@ impl QueryEngine {
             TempDrop::Plan(plan) => *plan,
             TempDrop::Done => return self.send_ok(0, 0).await,
             TempDrop::NoSuchTable(name) => return self.send_no_such_table(&name).await,
-        };
-
-        // An index of another session's temporary table does not exist as
-        // far as this session can tell.
-        if let PhysicalPlan::DropIndex { name } = &plan {
-            let table = self
-                .catalog
-                .read()
-                .get_index(name)
-                .map(|index| index.table.clone());
-            if table.is_some_and(|table| self.is_foreign_temp_table(&table)) {
-                let message = crate::executor::ExecutorError::CantDropKey(name.clone()).to_string();
+            TempDrop::NoSuchIndex(name) => {
+                let message = crate::executor::ExecutorError::CantDropKey(name).to_string();
                 return self.send_error(1091, "42000", &message).await;
             }
-        }
+        };
 
         // Check if this is a query that returns rows
         let returns_rows = matches!(
@@ -1540,23 +1533,13 @@ impl QueryEngine {
         table: &str,
         matches: impl Fn(&[Datum]) -> bool,
     ) -> Result<usize, String> {
-        use crate::raft::{is_mvcc_tombstone, RowChange, MVCC_HEADER_SIZE};
-
-        let rows = self
-            .storage
-            .scan(Some(&table_key_prefix(table)), Some(&table_key_end(table)))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), table)
             .await
             .map_err(|e| format!("Failed to read {table}: {e}"))?;
         let mut changeset = ChangeSet::new(0);
-        for (key, value) in rows {
-            if value.len() <= MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
-                continue;
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
-            if let Ok(row) = decode_row(row_data) {
-                if matches(row.values()) {
-                    changeset.push(RowChange::delete_with_value(table, key, row_data.to_vec()));
-                }
+        for stored in &rows {
+            if matches(stored.row.values()) {
+                changeset.push(crate::catalog::store::delete_row(table, stored));
             }
         }
         let count = changeset.changes.len();
@@ -1606,6 +1589,20 @@ impl QueryEngine {
                         names: ordinary,
                         if_exists,
                     }))
+                }
+            }
+            PhysicalPlan::DropIndex { name } => {
+                // An index of another session's temporary table does not
+                // exist as far as this session can tell.
+                let table = self
+                    .catalog
+                    .read()
+                    .get_index(&name)
+                    .map(|index| index.table.clone());
+                if table.is_some_and(|table| self.is_foreign_temp_table(&table)) {
+                    TempDrop::NoSuchIndex(name)
+                } else {
+                    TempDrop::Plan(Box::new(PhysicalPlan::DropIndex { name }))
                 }
             }
             other => TempDrop::Plan(Box::new(other)),
@@ -4068,9 +4065,6 @@ impl QueryEngine {
     ) -> ProtocolResult<()> {
         use crate::catalog::system_tables::{view_def_to_row, SYSTEM_VIEWS};
         use crate::catalog::ViewDef;
-        use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::raft::RowChange;
-        use crate::storage::row_id::allocate_row_id_batch;
 
         let view_name = view_name.trim_matches('`').to_string();
 
@@ -4144,12 +4138,11 @@ impl QueryEngine {
             query_sql: query_sql.to_string(),
         };
 
-        let local_id = allocate_row_id_batch(1);
-        let row_id = local_id;
-        let view_row = view_def_to_row(&view_def);
-        let key = encode_row_key(SYSTEM_VIEWS, row_id);
-        let value = encode_row(&view_row);
-        changes.push(RowChange::insert(SYSTEM_VIEWS, key, value));
+        // The view's row, under its name.
+        changes.push(crate::catalog::store::insert_row(
+            SYSTEM_VIEWS,
+            &view_def_to_row(&view_def),
+        ));
 
         let changeset = ChangeSet::new_with_changes(0, changes);
         match self.raft_node.propose_changes(changeset).await {
@@ -4222,34 +4215,17 @@ impl QueryEngine {
         view_name: &str,
     ) -> ProtocolResult<Option<crate::raft::RowChange>> {
         use crate::catalog::system_tables::SYSTEM_VIEWS;
-        use crate::executor::encoding::decode_row;
-        use crate::raft::RowChange;
 
-        let prefix = format!("t:{SYSTEM_VIEWS}:");
-        let end = format!("t:{SYSTEM_VIEWS};\x00");
-
-        let rows = self
-            .mvcc
-            .scan_raw(prefix.as_bytes(), end.as_bytes())
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_VIEWS)
             .await
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
-
-        for (key, value) in rows {
-            let row_data = if value.len() > 17 {
-                &value[17..]
-            } else {
-                &value
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(Datum::String(name)) = row.values().first() {
-                    if name.eq_ignore_ascii_case(view_name) {
-                        return Ok(Some(RowChange::delete_with_value(
-                            SYSTEM_VIEWS,
-                            key,
-                            row_data.to_vec(),
-                        )));
-                    }
-                }
+        for stored in &rows {
+            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(view_name))
+            {
+                return Ok(Some(crate::catalog::store::delete_row(
+                    SYSTEM_VIEWS,
+                    stored,
+                )));
             }
         }
         Ok(None)
@@ -4268,8 +4244,6 @@ impl QueryEngine {
     async fn handle_create_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
         use crate::catalog::system_tables::{trigger_def_to_row, SYSTEM_TRIGGERS};
         use crate::catalog::TriggerDef;
-        use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::storage::row_id::allocate_row_id_batch;
 
         let def = match TriggerDef::from_create_sql(sql) {
             Ok(def) => def,
@@ -4318,11 +4292,13 @@ impl QueryEngine {
 
         // A trigger is schema: it is stored in a system table through Raft
         // like the rest, and the catalog picks it up when that is applied.
-        let local_id = allocate_row_id_batch(1);
-        let key = encode_row_key(SYSTEM_TRIGGERS, local_id);
-        let value = encode_row(&trigger_def_to_row(&def));
-        let changeset =
-            ChangeSet::new_with_changes(0, vec![RowChange::insert(SYSTEM_TRIGGERS, key, value)]);
+        let changeset = ChangeSet::new_with_changes(
+            0,
+            vec![crate::catalog::store::insert_row(
+                SYSTEM_TRIGGERS,
+                &trigger_def_to_row(&def),
+            )],
+        );
         match self.raft_node.propose_changes(changeset).await {
             Ok(()) => self.send_ok(0, 0).await,
             Err(e) => {
@@ -4644,17 +4620,8 @@ impl QueryEngine {
 
         // Write to system.procedures via Raft
         use crate::catalog::system_tables::procedure_def_to_row;
-        use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::storage::row_id::allocate_row_id_batch;
-
-        let local_id = allocate_row_id_batch(1);
-        let row_id = local_id;
-        let proc_row = procedure_def_to_row(&proc_def);
-        let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
-        let value = encode_row(&proc_row);
-
-        use crate::raft::RowChange;
-        let change = RowChange::insert(SYSTEM_PROCEDURES, key, value);
+        let change =
+            crate::catalog::store::insert_row(SYSTEM_PROCEDURES, &procedure_def_to_row(&proc_def));
         let changeset = ChangeSet::new_with_changes(0, vec![change]);
 
         match self.raft_node.propose_changes(changeset).await {
@@ -4966,17 +4933,8 @@ impl QueryEngine {
 
         // Store via Raft (reuse procedure storage)
         use crate::catalog::system_tables::procedure_def_to_row;
-        use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::raft::RowChange;
-        use crate::storage::row_id::allocate_row_id_batch;
-
-        let local_id = allocate_row_id_batch(1);
-        let row_id = local_id;
-        let proc_row = procedure_def_to_row(&proc_def);
-        let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
-        let value = encode_row(&proc_row);
-
-        let change = RowChange::insert(SYSTEM_PROCEDURES, key, value);
+        let change =
+            crate::catalog::store::insert_row(SYSTEM_PROCEDURES, &procedure_def_to_row(&proc_def));
         let changeset = ChangeSet::new_with_changes(0, vec![change]);
         self.raft_node
             .propose_changes(changeset)
@@ -5015,36 +4973,15 @@ impl QueryEngine {
                 .await;
         }
 
-        // Scan system.procedures to find the row to delete
-        use crate::executor::encoding::decode_row;
-        use crate::raft::RowChange;
-
-        let prefix = format!("t:{SYSTEM_PROCEDURES}:");
-        let end = format!("t:{SYSTEM_PROCEDURES};\x00");
-
-        let rows = self
-            .mvcc
-            .scan_raw(prefix.as_bytes(), end.as_bytes())
+        // The routine's row, whatever the case its name was stored in
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_PROCEDURES)
             .await
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
-
         let mut changeset = ChangeSet::new(0);
-        for (key, value) in rows {
-            let row_data = if value.len() > 17 {
-                &value[17..]
-            } else {
-                &value
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(Datum::String(name)) = row.values().first() {
-                    if name.eq_ignore_ascii_case(&proc_name) {
-                        changeset.push(RowChange::delete_with_value(
-                            SYSTEM_PROCEDURES,
-                            key,
-                            row_data.to_vec(),
-                        ));
-                    }
-                }
+        for stored in &rows {
+            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(&proc_name))
+            {
+                changeset.push(crate::catalog::store::delete_row(SYSTEM_PROCEDURES, stored));
             }
         }
 
@@ -6091,6 +6028,9 @@ impl QueryEngine {
             TempDrop::Plan(plan) => *plan,
             TempDrop::Done => return Ok(0),
             TempDrop::NoSuchTable(name) => return Err(format!("Table '{name}' doesn't exist")),
+            TempDrop::NoSuchIndex(name) => {
+                return Err(crate::executor::ExecutorError::CantDropKey(name).to_string())
+            }
         };
         let is_ddl = plan.is_ddl();
         if !is_ddl {

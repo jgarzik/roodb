@@ -140,6 +140,13 @@ pub fn delete_row(table: &str, stored: &StoredRow) -> RowChange {
     RowChange::delete_with_value(table, stored.key.clone(), stored.data.clone())
 }
 
+/// The change that removes from a system table the row that has `row`'s
+/// key. (`row` needs only what the catalog looks at when the change is
+/// applied: for most tables, the key columns.)
+pub fn delete_keyed(table: &str, row: &Row) -> RowChange {
+    RowChange::delete_with_value(table, row_key(table, row), encode_row(row))
+}
+
 /// A row as initialisation stores it, before there is a log: under its
 /// key, with the header every stored row has (written by no transaction).
 pub fn initial_row(table: &str, row: &Row) -> (Vec<u8>, Vec<u8>) {
