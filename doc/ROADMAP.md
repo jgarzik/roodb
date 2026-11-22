@@ -10,35 +10,156 @@ multi-core machines.
 
 | Code | Phase |
 |------|-------|
-| IDX | Secondary and unique indexes; ALTER TABLE done properly |
+| IDX | Indexes, table identity, ALTER TABLE, databases |
+| TXN | Transaction semantics |
+| COL | Character sets and collations |
+| FKC | Foreign keys and CHECK |
 | ODB | ODBC and sqlcmd in CI |
 | ACL | Accounts and authorization |
-| TXN | Transaction semantics |
 | MIG | Data directory format versions and migration |
 | WIN | Windows installer and service |
 | MTS | MySQL test suite |
 
 ---
 
-## IDX — Secondary and unique indexes; ALTER TABLE done properly
+## IDX — Indexes, table identity, ALTER TABLE, databases
 
-`CREATE INDEX` records metadata only. A `UNIQUE` constraint other than the
-primary key is not enforced.
+`CREATE INDEX` records metadata only; a `UNIQUE` constraint other than the
+primary key is not enforced; `ALTER TABLE` corrupts rows; a database is
+only a label. Old data directories are re-initialised: every stored format
+below changes.
 
-- Index entries stored and maintained on every write; `UNIQUE` enforced;
-  the planner uses indexes for lookups and ranges.
-- Locking on index records and gaps, as InnoDB does it, so that a statement
-  that finds its rows through an index locks only those.
-- `ALTER TABLE` without corrupting rows, at any table size:
-  - a stable table ID in every key, so that renaming a table is a change of
-    metadata (today `RENAME TO` leaves the rows behind under the old name);
-  - rows that carry their schema version, so that `ADD COLUMN` and
-    `DROP COLUMN` need no rewrite (today `DROP COLUMN` shifts values into
-    the wrong columns, and `ADD COLUMN` ignores the default for old rows);
-  - re-keying when the primary key changes;
-  - renaming a temporary table.
-- `CREATE INDEX` with a name already taken, and `DROP INDEX` of an index
-  that does not exist, report an error.
+**Design**
+
+- *Identity.* Databases, tables and indexes have numeric IDs that are never
+  reused (`Command::AllocIds`, one replicated counter; IDs below 1024 are
+  the system's). Columns and indexes are numbered within their table.
+  Every table has a schema version, raised by every change to it.
+- *Keys.* `[t][table_id][index_id][columns...]`, no names. Index 0 is the
+  row itself, keyed by the primary key (or, lacking one, by the first
+  `UNIQUE NOT NULL` index, or a hidden row ID). Every other index entry is
+  `[columns][primary key]` with nothing stored under it, unique or not.
+  All types are encoded so that bytes sort as values do, descending columns
+  inverted, strings through their column's collation (binary only, until
+  COL).
+- *Uniqueness.* The index columns' prefix is locked, then read as it stands
+  now for a live entry; `NULL`s never conflict. Checked by the statement
+  under its lock and again when the change is applied.
+- *Rows.* Values are stored by column ID. Adding, dropping, renaming and
+  reordering columns, and renaming tables, change metadata only; a column
+  added later reads as the default it was added with.
+- *Catalog.* One record per table (columns, indexes and their states,
+  options), in system tables with real primary keys, under database `mysql`;
+  `information_schema` is answered from memory. The catalog is updated as
+  each log entry is applied, by code that cannot fail: everything is
+  validated before it is proposed.
+- *Metadata locks.* A statement holds a shared lock on each table it names
+  until its transaction ends; a change of schema holds it exclusively.
+  Changesets carry the schema versions they were built against, and are
+  refused if those have moved. DDL commits the open transaction first.
+- *Online changes.* A new index is first maintained by writers without
+  being enforced or used, then back-filled in batches through the log by a
+  job the primary runs (each batch conditional on the rows it read), then
+  checked (unique) and made public. The job's record is replicated: a new
+  primary carries on; a client that goes away cancels its job, which is
+  rolled back. A change of primary key, or of a column's type where values
+  must be converted, builds the table again under a new ID the same way
+  and switches.
+- *Dropping.* Dropping a table, index or database, and `TRUNCATE`, change
+  metadata in one log entry. The data is a key range the storage engine is
+  told to forget: it is filtered from reads, snapshots and compaction, and
+  its files are removed.
+- *Locking.* A statement that finds rows through an index locks the index
+  entries it read and the gaps between them, then the rows, as InnoDB does.
+- *Planner.* Chooses among the primary key and the indexes by cost, from
+  statistics `ANALYZE TABLE` stores: equalities on a key prefix plus a
+  range, `IN` lists, index-only reads, order from an index. `UPDATE` and
+  `DELETE` use the same paths.
+
+**Steps, in order** (each is deleted when done)
+
+1. Key encoding that sorts as values do, for every type; descending;
+   prefixes; the collation hook.
+2. Hidden row IDs from one counter for the cluster, so that insertion
+   order survives a change of primary.
+3. Catalog store: typed system records with real keys and row headers; the
+   catalog updated per log entry by code that cannot fail; one path for
+   startup, seed and snapshot; DDL proposed once.
+4. Object IDs: `AllocIds`; table records with IDs and versions; keys by
+   ID; the `AUTO_INCREMENT` counter and locks by ID. `RENAME TO` becomes
+   metadata.
+5. Databases: tables belong to one; `db.table`; `USE` decides what a name
+   means; `DROP DATABASE` drops its tables; system tables in `mysql`;
+   identifier case as MySQL on Linux (database and table names
+   case-sensitive, the rest not).
+6. Rows by column ID; one decoding function for every executor;
+   `ADD`/`DROP`/reorder `COLUMN` as metadata.
+7. Metadata locks; DDL commits implicitly; schema versions checked when a
+   changeset is applied.
+8. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
+   executor, with MySQL's error codes, privileges, and system tables
+   protected.
+9. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
+   resets `AUTO_INCREMENT`) and `DROP DATABASE` in one log entry.
+10. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
+    naming; `CREATE`/`DROP INDEX` with errors 1061 and 1091; names per
+    table; `SHOW INDEX`, `SHOW CREATE TABLE`.
+11. Index entries maintained by every statement that writes, through one
+    helper; `UNIQUE` enforced, with MySQL's error text.
+12. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
+    real statements over that helper.
+13. The schema-change job runner; `CREATE INDEX` on a table with rows,
+    online; cancelled when its client goes away.
+14. Reading through indexes: equality prefix plus range, composite keys,
+    `IN`, index-only reads.
+15. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
+    indexes.
+16. Statistics that are read: row counts and distinct counts per index;
+    the cost model in use.
+17. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
+    `LIMIT` from index order; `MIN`/`MAX` from an index.
+18. Change of primary key and of column type, online.
+19. Temporary tables: names and IDs in the session, shadowing permanent
+    tables; indexes; `RENAME`.
+20. `information_schema` tables for tables, columns and indexes;
+    `ALTER TABLE ... AUTO_INCREMENT = n`; `RENAME INDEX`.
+
+## TXN — Transaction semantics
+
+- Removal of the markers deleted rows and index entries leave behind, once
+  no reader can need them (first: unique checks and gap searches read past
+  them, and slow down as they pile up); old row versions kept for readers
+  and removed likewise.
+- `REPEATABLE READ`: one snapshot for the whole transaction. Today every
+  statement takes a new one.
+- `UPDATE` and `DELETE` find rows the same transaction inserted.
+- `INSERT ... SELECT` takes locks and waits for them.
+- Savepoints; `COMMIT WORK`, `AND CHAIN`.
+- `SERIALIZABLE`.
+- `LOCK TABLES`, `GET_LOCK`.
+
+## COL — Character sets and collations
+
+Strings compare as raw bytes everywhere. MySQL's default collation
+(`utf8mb4_0900_ai_ci`) ignores case and accents.
+
+- Collations behind the hook IDX leaves in the key encoding:
+  `utf8mb4_0900_ai_ci` as the default, `utf8mb4_bin`, the `general_ci`
+  family; used by comparison, `ORDER BY`, `GROUP BY`, `DISTINCT`, `LIKE`
+  and keys alike.
+- `CHARACTER SET` / `COLLATE` on columns, tables, databases and
+  expressions; `PAD SPACE` and `NO PAD`.
+- Changing a column's collation rebuilds the indexes on it, online.
+
+## FKC — Foreign keys and CHECK
+
+Both are stored and never enforced.
+
+- `FOREIGN KEY`: checked on insert, update and delete of either side;
+  `RESTRICT`, `CASCADE`, `SET NULL`, `NO ACTION`; references kept by table
+  and column ID; the indexes MySQL requires on both sides;
+  `foreign_key_checks`.
+- `CHECK` constraints, with MySQL's error codes.
 
 ## ODB — ODBC and sqlcmd in CI
 
@@ -68,18 +189,6 @@ Only `root` can log in, and `root` bypasses every check.
   - Definer and invoker rights for views, procedures and triggers.
 - admin.md: the User Management and Privilege System sections describe the
   intended interface; rewrite them from what works.
-
-## TXN — Transaction semantics
-
-- `REPEATABLE READ`: one snapshot for the whole transaction. Today every
-  statement takes a new one.
-- `UPDATE` and `DELETE` find rows the same transaction inserted.
-- `INSERT ... SELECT` takes locks and waits for them.
-- Savepoints; `COMMIT WORK`, `AND CHAIN`.
-- Statements that commit implicitly in MySQL (DDL) do so here.
-- `SERIALIZABLE`.
-- `LOCK TABLES`, `GET_LOCK`.
-- Removal of old row versions and of the markers of deleted rows.
 
 ## MIG — Data directory format versions and migration
 
