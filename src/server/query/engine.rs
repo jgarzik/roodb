@@ -371,7 +371,7 @@ impl QueryEngine {
                 .resolve(parsed_stmt.clone())
                 .map_err(PlanError::Sql)?;
 
-            let required_privileges = self.extract_required_privileges(&resolved);
+            let required_privileges = self.extract_required_privileges(&resolved, &catalog_guard);
 
             TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
 
@@ -860,7 +860,7 @@ impl QueryEngine {
                 .map_err(PlanError::Sql)?;
 
             // Extract required privileges from resolved statement before consuming it
-            let required_privileges = self.extract_required_privileges(&resolved);
+            let required_privileges = self.extract_required_privileges(&resolved, &catalog_guard);
 
             // Type check
             TypeChecker::check(&resolved).map_err(PlanError::Sql)?;
@@ -930,10 +930,14 @@ impl QueryEngine {
         result
     }
 
-    /// Extract required privileges from a resolved statement
+    /// Extract required privileges from a resolved statement. `catalog` is
+    /// the catalog the statement was resolved against, which the caller
+    /// holds for reading: it must not be locked again here (a second read
+    /// behind a waiting writer would never be granted).
     fn extract_required_privileges(
         &self,
         stmt: &crate::planner::logical::ResolvedStatement,
+        catalog: &Catalog,
     ) -> Vec<RequiredPrivilege> {
         use crate::planner::logical::ResolvedStatement;
 
@@ -958,7 +962,7 @@ impl QueryEngine {
             // INSERT on the table, and SELECT on what the rows come from
             ResolvedStatement::InsertSelect { table, source, .. } => {
                 let mut privs = vec![RequiredPrivilege::insert(&table.database, &table.table)];
-                privs.extend(self.extract_required_privileges(source));
+                privs.extend(self.extract_required_privileges(source, catalog));
                 privs
             }
             ResolvedStatement::Update { table, .. } => {
@@ -969,7 +973,7 @@ impl QueryEngine {
             }
             ResolvedStatement::CreateTableAs { name, source, .. } => {
                 let mut privs = vec![RequiredPrivilege::create_table(&name.database)];
-                privs.extend(self.extract_required_privileges(source));
+                privs.extend(self.extract_required_privileges(source, catalog));
                 privs
             }
             ResolvedStatement::CreateTable { name, .. }
@@ -997,11 +1001,7 @@ impl QueryEngine {
                 // table. (For an index that does not exist the statement
                 // fails whatever the privileges; the session's database
                 // stands in.)
-                let table = self
-                    .catalog
-                    .read()
-                    .get_index(name)
-                    .map(|index| index.table.clone());
+                let table = catalog.get_index(name).map(|index| index.table.clone());
                 match table {
                     Some(table) => {
                         vec![RequiredPrivilege::create_index(
@@ -1051,11 +1051,13 @@ impl QueryEngine {
             ResolvedStatement::Union { left, right, .. } => {
                 let mut privs = select_from(left);
                 // Recursively extract privileges from right side (may be nested Union)
-                privs.extend(self.extract_required_privileges(right));
+                privs.extend(self.extract_required_privileges(right, catalog));
                 privs
             }
             // EXPLAIN - same privileges as inner statement
-            ResolvedStatement::Explain { inner } => self.extract_required_privileges(inner),
+            ResolvedStatement::Explain { inner } => {
+                self.extract_required_privileges(inner, catalog)
+            }
         }
     }
 
