@@ -696,11 +696,16 @@ mysql -h 127.0.0.1 -P 3307 -u root -p -e "SELECT COUNT(*) FROM mydb.mytable"
 
 ### Cluster Issues
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| "Not leader" | Write sent to follower | Redirect write to leader node |
-| Election not completing | Network partition or <quorum nodes | Check network connectivity, verify quorum |
-| Node won't rejoin | Stale state | Clear data directory, rejoin as new node |
+| Symptom | Cause | Solution |
+|---------|-------|----------|
+| Error 1290 on a write | The statement was sent to a secondary | Send writes to the primary: `SHOW CLUSTER MEMBERS` on any node names it |
+| Error 3101 on `COMMIT` | The primary changed while the transaction was open | Run the transaction again on the current primary |
+| Every node refuses writes; `SHOW CLUSTER MEMBERS` shows no `PRIMARY` | Fewer than a majority of the members are up or can reach each other, so none can be elected | Bring nodes back or restore the network. If nodes are gone for good, the cluster cannot recover by itself: restore from a backup |
+| A node started with `--join` waits and then fails with "could not join the cluster" | The member it was pointed at is unreachable, or the cluster has no primary to admit it | Check the address (the member's Raft port, not its client port), the firewall, and that the cluster has a primary |
+| A node joins but never leaves `LEARNER`, or the others log that it is unreachable | The others cannot reach it at the address it advertises (shown by `SHOW CLUSTER MEMBERS`) | Start it with `--advertise-host` set to a name or address the other nodes can reach; a node bound to `0.0.0.0` advertises exactly that unless told otherwise |
+| Nodes log TLS errors about each other's certificates | The nodes' certificates are not all signed by the CA given with `--raft-ca-cert-path` | Issue every node's certificate from the same CA |
+| A node refuses to start: "this node has been removed from its cluster" | It was removed with `ALTER CLUSTER REMOVE NODE` | Empty its data directory and start it with `--join` |
+| A node that was away for long takes a while to accept reads again | It is being sent a copy of the data, because the log no longer reaches back far enough | Wait; `SHOW CLUSTER MEMBERS` shows it as a member throughout |
 
 ### Data Issues
 

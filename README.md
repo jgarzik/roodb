@@ -85,13 +85,17 @@ The source layout and the path of a statement through the code are in
 describes each module.
 
 **Replication Model**:
-- Leader accepts all writes, replicates via Raft
-- Replicas serve read-only queries from local storage
+- A server starts as a cluster of one; further nodes join it with `--join`
+  and are sent the data
+- The leader is the primary and takes all writes, replicated via Raft; the
+  other nodes are read-only secondaries that answer reads from their own
+  state
+- When the primary fails, another node takes over; no acknowledged commit
+  is lost
 - Schema stored in system tables, replicated like data
 - Raft log serves as the write-ahead log
 
-The `roodb` binary starts as a single-node Raft cluster; further nodes join
-it with `--join` (see [admin.md](admin.md#deployment-modes)).
+See [admin.md](admin.md#deployment-modes) for running a cluster.
 
 ## Test Suite
 

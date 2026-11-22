@@ -723,6 +723,11 @@ impl SstableReader {
         Ok(results)
     }
 
+    /// The name of the table's file.
+    pub fn file_name(&self) -> &str {
+        &self.cache_name
+    }
+
     /// Get SSTable metadata
     pub fn metadata(&self) -> &SstableMetadata {
         &self.metadata

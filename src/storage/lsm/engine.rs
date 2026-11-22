@@ -118,6 +118,32 @@ struct ReadSources {
 struct TableView {
     /// Newest data first.
     tables: Vec<Arc<SstableReader>>,
+    /// The files behind `tables`, and the engine they belong to.
+    paths: Vec<PathBuf>,
+    engine: Weak<Inner>,
+}
+
+impl Drop for TableView {
+    fn drop(&mut self) {
+        // Where an open file cannot be deleted (Windows), a table that
+        // compaction retired while this view held it open is still on
+        // disk. Now that the view lets go, delete what is no longer listed.
+        // (Elsewhere the file is long gone and there is nothing to do.)
+        self.tables.clear();
+        let Some(engine) = self.engine.upgrade() else {
+            return;
+        };
+        let readers = engine.reader_cache.read();
+        for path in &self.paths {
+            let listed = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| readers.contains_key(name));
+            if !listed {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1202,7 +1228,16 @@ impl StorageEngine for LsmEngine {
     async fn snapshot_view(&self) -> StorageResult<Arc<dyn SnapshotView>> {
         self.inner.check_open()?;
         let tables = self.inner.read_sources()?.tables;
-        Ok(Arc::new(TableView { tables }))
+        let dir = self.inner.manifest.read().dir().to_path_buf();
+        let paths = tables
+            .iter()
+            .map(|table| dir.join(table.file_name()))
+            .collect();
+        Ok(Arc::new(TableView {
+            tables,
+            paths,
+            engine: Arc::downgrade(&self.inner),
+        }))
     }
 
     async fn ingest(self: Arc<Self>) -> StorageResult<Box<dyn Ingest>> {

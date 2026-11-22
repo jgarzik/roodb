@@ -10,7 +10,6 @@ multi-core machines.
 
 | Code | Phase |
 |------|-------|
-| CLU | Cluster mode in the server binary |
 | PRF | Performance pass |
 | IDX | Secondary and unique indexes; ALTER TABLE done properly |
 | ODB | ODBC and sqlcmd in CI |
@@ -21,19 +20,6 @@ multi-core machines.
 | MTS | MySQL test suite |
 
 ---
-
-## CLU — Cluster mode in the server binary
-
-Clusters work: nodes join a running server with `--join`, the leader is the
-primary and the others read-only secondaries, another node takes over when
-the primary fails, and nodes can be listed and removed. What is left:
-
-- On Windows a file that is open cannot be deleted, so a table file that
-  compaction retires while a snapshot view holds it stays behind until the
-  next start. Retire such files when the last view lets go of them.
-- admin.md: a troubleshooting section for clusters (no majority, a node
-  that cannot be reached at its advertised address, certificates from
-  different CAs); README.md: the replication model as it now is.
 
 ## PRF — Performance pass
 
