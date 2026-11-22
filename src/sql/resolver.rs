@@ -1819,7 +1819,9 @@ impl<'a> Resolver<'a> {
                             alias_name.unwrap_or_else(|| table_name.table.clone());
                         return Ok(ResolvedTableRef {
                             name: table_name.table.clone(),
-                            table: None,
+                            // The view, in its database: what a
+                            // privilege to read it is held on.
+                            table: Some(table_name),
                             alias: Some(effective_alias),
                             columns,
                             inner_query: Some(Box::new(inner_select)),

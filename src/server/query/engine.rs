@@ -938,23 +938,28 @@ impl QueryEngine {
         use crate::planner::logical::ResolvedStatement;
 
         // A table's privileges are those of the database it is in; `db` is
-        // for what a statement names without a table (and for what is not
-        // a stored table: a derived table, a view's expansion).
+        // for what a statement names without a table.
         let db = self.session.database.as_deref().unwrap_or("");
-        let select_on =
-            |table_ref: &crate::planner::logical::ResolvedTableRef| match &table_ref.table {
-                Some(table) => RequiredPrivilege::select(&table.database, &table.table),
-                None => RequiredPrivilege::select(db, &table_ref.name),
-            };
+        let select_from = |select: &crate::planner::logical::ResolvedSelect| {
+            let mut required = Vec::new();
+            select_privileges(select, &mut required);
+            required
+        };
 
         match stmt {
             ResolvedStatement::Select(select) => {
-                // SELECT requires SELECT privilege on all tables in FROM clause
-                select.from.iter().map(select_on).collect()
+                // SELECT requires SELECT privilege on every table and view
+                // it reads from
+                select_from(select)
             }
-            ResolvedStatement::Insert { table, .. }
-            | ResolvedStatement::InsertSelect { table, .. } => {
+            ResolvedStatement::Insert { table, .. } => {
                 vec![RequiredPrivilege::insert(&table.database, &table.table)]
+            }
+            // INSERT on the table, and SELECT on what the rows come from
+            ResolvedStatement::InsertSelect { table, source, .. } => {
+                let mut privs = vec![RequiredPrivilege::insert(&table.database, &table.table)];
+                privs.extend(self.extract_required_privileges(source));
+                privs
             }
             ResolvedStatement::Update { table, .. } => {
                 vec![RequiredPrivilege::update(&table.database, &table.table)]
@@ -962,8 +967,12 @@ impl QueryEngine {
             ResolvedStatement::Delete { table, .. } => {
                 vec![RequiredPrivilege::delete(&table.database, &table.table)]
             }
+            ResolvedStatement::CreateTableAs { name, source, .. } => {
+                let mut privs = vec![RequiredPrivilege::create_table(&name.database)];
+                privs.extend(self.extract_required_privileges(source));
+                privs
+            }
             ResolvedStatement::CreateTable { name, .. }
-            | ResolvedStatement::CreateTableAs { name, .. }
             | ResolvedStatement::CreateView { name, .. } => {
                 vec![RequiredPrivilege::create_table(&name.database)]
             }
@@ -983,12 +992,28 @@ impl QueryEngine {
                     &table.table,
                 )]
             }
-            ResolvedStatement::DropIndex { .. } => {
-                // DROP INDEX requires INDEX privilege at database level
-                vec![RequiredPrivilege::new(
-                    Privilege::Index,
-                    PrivilegeObject::Database(db.to_string()),
-                )]
+            ResolvedStatement::DropIndex { name } => {
+                // DROP INDEX requires the INDEX privilege on the index's
+                // table. (For an index that does not exist the statement
+                // fails whatever the privileges; the session's database
+                // stands in.)
+                let table = self
+                    .catalog
+                    .read()
+                    .get_index(name)
+                    .map(|index| index.table.clone());
+                match table {
+                    Some(table) => {
+                        vec![RequiredPrivilege::create_index(
+                            &table.database,
+                            &table.table,
+                        )]
+                    }
+                    None => vec![RequiredPrivilege::new(
+                        Privilege::Index,
+                        PrivilegeObject::Database(db.to_string()),
+                    )],
+                }
             }
             // Auth commands require global privileges (checked separately)
             ResolvedStatement::CreateUser { .. }
@@ -1004,9 +1029,19 @@ impl QueryEngine {
                 // Users can always see their own grants
                 vec![]
             }
-            // Database DDL - requires CREATE privilege (root bypasses anyway)
-            ResolvedStatement::CreateDatabase { .. } | ResolvedStatement::DropDatabase { .. } => {
-                vec![]
+            // CREATE DATABASE needs CREATE on the database, DROP DATABASE
+            // (which drops everything in it) DROP on it, as in MySQL.
+            ResolvedStatement::CreateDatabase { name, .. } => {
+                vec![RequiredPrivilege::new(
+                    Privilege::Create,
+                    PrivilegeObject::Database(name.clone()),
+                )]
+            }
+            ResolvedStatement::DropDatabase { name, .. } => {
+                vec![RequiredPrivilege::new(
+                    Privilege::Drop,
+                    PrivilegeObject::Database(name.clone()),
+                )]
             }
             // ANALYZE TABLE - no special privileges needed (root bypasses anyway)
             ResolvedStatement::AnalyzeTable { .. } => {
@@ -1014,7 +1049,7 @@ impl QueryEngine {
             }
             // UNION - requires SELECT on both sides' tables
             ResolvedStatement::Union { left, right, .. } => {
-                let mut privs: Vec<_> = left.from.iter().map(select_on).collect();
+                let mut privs = select_from(left);
                 // Recursively extract privileges from right side (may be nested Union)
                 privs.extend(self.extract_required_privileges(right));
                 privs
@@ -6488,6 +6523,30 @@ fn describe_table(td: &crate::catalog::TableDef) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// SELECT on every table and view a query reads from, in its FROM clause
+/// and its joins. A view needs the privilege on the view itself, in the
+/// view's database; a derived table or a WITH query needs it on what it
+/// reads from in turn.
+fn select_privileges(
+    select: &crate::planner::logical::ResolvedSelect,
+    required: &mut Vec<RequiredPrivilege>,
+) {
+    let refs = select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table));
+    for table_ref in refs {
+        match (&table_ref.table, &table_ref.inner_query) {
+            (Some(table), _) => {
+                required.push(RequiredPrivilege::select(&table.database, &table.table));
+            }
+            (None, Some(inner)) => select_privileges(inner, required),
+            // DUAL
+            (None, None) => {}
+        }
+    }
 }
 
 /// The parts of a name as written in a statement's text: `t`, `db.t`,

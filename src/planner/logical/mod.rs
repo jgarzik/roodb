@@ -319,8 +319,9 @@ pub struct ResolvedTableRef {
     /// What the query calls it when it gives no alias: the table's own
     /// name, or the name of the CTE or derived table.
     pub name: String,
-    /// The stored table it is, with its database; `None` for what is not
-    /// one (a CTE, a derived table, a view's expansion, DUAL).
+    /// The table or view it is, with its database; `None` for what is
+    /// neither (a CTE, a derived table, DUAL). A view also has its query
+    /// in `inner_query`, which is what is read.
     pub table: Option<TableName>,
     pub alias: Option<String>,
     pub columns: Vec<(String, DataType, bool)>, // (name, type, nullable)

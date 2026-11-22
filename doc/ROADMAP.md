@@ -188,6 +188,12 @@ Only `root` can log in, and `root` bypasses every check.
 - Enforcement at one choke point for planned statements, and in every
   statement handled outside the planner (ALTER, views, procedures,
   functions, triggers, databases, `LOAD DATA`, `SET GLOBAL`).
+  - Tables read by a subquery inside an expression (`WHERE x IN (SELECT
+    ...)`, the select list) are not checked: only those of `FROM`, joins,
+    derived tables and source queries are.
+  - `DROP INDEX` of an index that does not exist is checked against the
+    session's database; with index names per table (IDX) it names its
+    table.
   - System tables are written through SQL statements only.
   - `LOAD DATA INFILE` needs the `FILE` privilege.
   - Locking reads need `SELECT` and one of `UPDATE`, `DELETE`,
