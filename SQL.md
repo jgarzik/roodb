@@ -112,9 +112,9 @@ copies the rows.
 | `NOT NULL` | Enforced for a single-row `INSERT` (error 1048). In a multi-row `INSERT`, in `INSERT IGNORE` and in `UPDATE`, a `NULL` is replaced by the column default or the type's zero value (`0`, `''`) instead of being refused. |
 | `DEFAULT value` | Literal defaults are applied when a column is omitted and for the `DEFAULT` keyword in `VALUES`. `DEFAULT CURRENT_TIMESTAMP` is accepted but does not work: an `INSERT` that omits the column fails with a type error. |
 | `AUTO_INCREMENT` | When the column is omitted, `NULL` or `0`, the table's next number is generated. Each table counts for itself, from 1. A value given explicitly moves the counter past it. A number once generated is not generated again, also when its insert is rolled back or ignored. The counter survives restarts and is the same on every node of a cluster. `LAST_INSERT_ID()` is the first number the session's last generating statement produced. Not yet: `TRUNCATE` does not reset the counter, and the `AUTO_INCREMENT=` table option is ignored. |
-| `UNIQUE` (table-level) | Recorded in `system.constraints`, **not enforced**. A column-level `UNIQUE` is ignored entirely. |
-| `FOREIGN KEY` (table-level) | Recorded in `system.constraints`, **not enforced**: no check on insert, update, delete or `DROP TABLE` of the referenced table. Naming a referenced table that does not exist leaves a table that cannot be used. A column-level `REFERENCES` clause is ignored. |
-| `CHECK` (table-level) | Recorded in `system.constraints`, **not enforced**. A column-level `CHECK` is ignored. |
+| `UNIQUE` (table-level) | Recorded with the table (shown by `SHOW CREATE TABLE`), **not enforced**. A column-level `UNIQUE` is ignored entirely. |
+| `FOREIGN KEY` (table-level) | Recorded with the table (shown by `SHOW CREATE TABLE`), **not enforced**: no check on insert, update, delete or `DROP TABLE` of the referenced table. Naming a referenced table or column that does not exist is refused. A column-level `REFERENCES` clause is ignored. |
+| `CHECK` (table-level) | Recorded with the table (shown by `SHOW CREATE TABLE`), **not enforced**. A column-level `CHECK` is ignored. |
 | `KEY` / `INDEX` / `UNIQUE KEY` inside `CREATE TABLE` | Accepted and ignored (no index entry is recorded). |
 | Generated columns (`GENERATED ALWAYS AS`) | Accepted; the expression is not evaluated (the column reads `NULL`). |
 | `ON UPDATE CURRENT_TIMESTAMP` | Accepted and ignored. |
@@ -175,12 +175,14 @@ CREATE [UNIQUE] INDEX name ON table (column, ...)
 DROP INDEX name [ON table]
 ```
 
-Secondary indexes are **metadata only**. `CREATE INDEX` records the index in
-`system.indexes` (shown by `SHOW INDEX`); it does not build an index
+Secondary indexes are **metadata only**. `CREATE INDEX` records the index
+with its table (shown by `SHOW INDEX`); it does not build an index
 structure, is not used by queries, and `UNIQUE` is not enforced. Only the
 primary key speeds up lookups. Index names are global. Prefix lengths
 (`col(10)`) and `FULLTEXT` / `SPATIAL` indexes are refused. Creating an
-index whose name exists, and dropping one that does not, succeed silently.
+index whose name exists fails with error 1061; dropping one that does not
+exist fails with error 1091. A table's indexes stay with it through
+`ALTER TABLE`, including `RENAME TO`.
 
 ### Views
 
@@ -915,10 +917,7 @@ with `SELECT`:
 
 | Table | Columns |
 |-------|---------|
-| `system.tables` | `table_name` |
-| `system.columns` | `table_name`, `column_name`, `ordinal`, `data_type`, `nullable`, `default_value`, `auto_increment` |
-| `system.indexes` | `index_name`, `table_name`, `columns`, `is_unique` |
-| `system.constraints` | `table_name`, `ordinal`, `constraint_type` (`PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK`), `columns`, `ref_table`, `ref_columns`, `check_expr`, `constraint_name` |
+| `system.tables` | `table_name`, `definition` (the table's columns, constraints and indexes, encoded: read them with `DESCRIBE`, `SHOW CREATE TABLE` and `SHOW INDEX`) |
 | `system.views` | `view_name`, `query_sql` |
 | `system.triggers` | `trigger_name`, `table_name`, `create_sql` |
 | `system.procedures` | `procedure_name`, `params_json`, `body_sql`, `returns_type` (set for functions) |
@@ -984,7 +983,9 @@ returns most often:
 | 1050 | 42S01 | Table already exists |
 | 1051 | 42S02 | `DROP TABLE` of an unknown table |
 | 1054 | 42S22 | Unknown column |
+| 1061 | 42000 | An index of that name exists |
 | 1062 | 23000 | Duplicate primary key |
+| 1091 | 42000 | No such index to drop |
 | 1064 | 42000 | Syntax error |
 | 1065 | HY000 | Empty query |
 | 1105 | HY000 | General error. Used for unsupported statements and expressions, and most errors in views, procedures, functions and triggers |

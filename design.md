@@ -106,7 +106,7 @@ protocol front-end (RooDbConnection / TdsConnection)
 Schema metadata cache. The catalog is an in-memory cache of schema metadata, rebuilt from system tables on startup.
 
 **System Tables** (stored in LSM, replicated via Raft):
-- `system.tables`, `system.columns`, `system.indexes`, `system.constraints` - table definitions
+- `system.tables` - one record per table, keyed by its name: its definition (columns, constraints) and its indexes, whole (`catalog/store.rs`). A change to a table replaces that one record, so it is applied whole or not at all; the state machine brings the catalog up to date from the record as each log entry is applied, with nothing else to read and nothing that can fail. Definitions are validated before they are proposed (`Catalog::validate_table`).
 - `system.databases` - databases
 - `system.views`, `system.procedures` (stored procedures and functions), `system.triggers`
 - `system.table_statistics` - optimizer statistics

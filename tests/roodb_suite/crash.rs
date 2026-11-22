@@ -626,9 +626,12 @@ async fn dropped_schema_objects_stay_dropped_after_a_kill() {
         "the dropped database came back: {databases:?}"
     );
     let indexes: Vec<String> = conn
-        .query("SELECT index_name FROM system.indexes WHERE table_name = 'idx_t'")
+        .query::<mysql_async::Row, _>("SHOW INDEX FROM idx_t")
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>(2).unwrap())
+        .collect();
     assert!(
         indexes.iter().any(|i| i == "idx_kept"),
         "idx_kept is missing: {indexes:?}"

@@ -6,13 +6,14 @@
 //! Schema is persisted in system tables (system.tables, system.columns, system.indexes)
 //! and the Catalog is a cache rebuilt from those tables on startup.
 
+pub mod store;
 pub mod system_tables;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// SQL data types supported by the database
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
     /// Boolean (true/false)
     Boolean,
@@ -108,7 +109,7 @@ impl DataType {
 }
 
 /// Column definition
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     /// Column name
     pub name: String,
@@ -157,7 +158,7 @@ impl ColumnDef {
 }
 
 /// Table constraint
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constraint {
     /// Primary key constraint
     PrimaryKey(Vec<String>),
@@ -175,7 +176,7 @@ pub enum Constraint {
 }
 
 /// Table definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     /// Table name
     pub name: String,
@@ -234,7 +235,7 @@ impl TableDef {
 }
 
 /// Index definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDef {
     /// Index name
     pub name: String,
@@ -594,8 +595,12 @@ impl Catalog {
 
     // ============ Table operations ============
 
-    /// Create a table
-    pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {
+    /// Whether `def` is a definition the catalog can hold: its constraints
+    /// name columns it has, and its foreign keys tables and columns that
+    /// exist (the table itself counts, for a key that refers to its own
+    /// table). Checked before a definition is proposed; what is applied
+    /// from the log is taken as it is.
+    pub fn validate_table(&self, def: &TableDef) -> CatalogResult<()> {
         // Validate table name
         if def.name.is_empty() {
             return Err(CatalogError::InvalidName(
@@ -630,7 +635,12 @@ impl Catalog {
                 ..
             } = constraint
             {
-                if let Some(ref_def) = self.tables.get(ref_table) {
+                let ref_def = if *ref_table == def.name {
+                    Some(def)
+                } else {
+                    self.tables.get(ref_table)
+                };
+                if let Some(ref_def) = ref_def {
                     for rc in ref_columns {
                         if ref_def.get_column(rc).is_none() {
                             return Err(CatalogError::InvalidConstraint(format!(
@@ -648,6 +658,43 @@ impl Catalog {
             }
         }
 
+        Ok(())
+    }
+
+    /// Put a table and its indexes in the catalog as the log says they
+    /// are, replacing whatever was known of the table. Cannot fail: what
+    /// the log holds was validated before it was proposed.
+    pub fn set_table(&mut self, def: TableDef, indexes: Vec<IndexDef>) {
+        self.indexes.retain(|_, index| index.table != def.name);
+        for index in indexes {
+            self.indexes.insert(index.name.clone(), index);
+        }
+        self.tables.insert(def.name.clone(), def);
+        self.schema_version += 1;
+    }
+
+    /// Take a table and its indexes out of the catalog, if it is there.
+    pub fn unset_table(&mut self, name: &str) {
+        self.tables.remove(name);
+        self.indexes.retain(|_, index| index.table != name);
+        self.schema_version += 1;
+    }
+
+    /// The indexes of a table, by name.
+    pub fn table_indexes(&self, table: &str) -> Vec<IndexDef> {
+        let mut indexes: Vec<IndexDef> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table)
+            .cloned()
+            .collect();
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        indexes
+    }
+
+    /// Create a table
+    pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {
+        self.validate_table(&def)?;
         if self.tables.contains_key(&def.name) {
             return Err(CatalogError::TableExists(def.name.clone()));
         }

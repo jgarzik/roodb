@@ -78,9 +78,12 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-1. Catalog store: typed system records with real keys and row headers; the
-   catalog updated per log entry by code that cannot fail; one path for
-   startup, seed and snapshot; DDL proposed once.
+1. The other system tables (accounts, grants, databases, views, routines,
+   triggers, statistics) keyed by what they describe, not by row IDs, with
+   row headers from initialisation on; duplicates refused when applied;
+   the hand-written scans and header-skipping in `ddl.rs`, `engine.rs` and
+   `auth.rs` behind one module. `CREATE`/`DROP DATABASE` and the account
+   statements still hand their changes back to be proposed a second time.
 2. Object IDs: `AllocIds`; table records with IDs and versions; keys by
    ID; the `AUTO_INCREMENT` counter and locks by ID. `RENAME TO` becomes
    metadata.

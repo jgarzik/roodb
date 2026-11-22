@@ -208,7 +208,7 @@ async fn test_temporary_table_stays_in_its_session() {
         .unwrap();
     assert!(other.query_drop("SELECT * FROM tt_own").await.is_err());
     let columns: Vec<String> = other
-        .query("SELECT column_name FROM system.columns WHERE table_name = 'tt_own'")
+        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_own'")
         .await
         .unwrap();
     assert!(

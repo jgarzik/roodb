@@ -919,7 +919,6 @@ impl ExecutorEngine {
                         name,
                         self.catalog.clone(),
                         raft_node.clone(),
-                        self.mvcc.clone(),
                     )))
                 } else {
                     Ok(Box::new(DropIndex::new(name, self.catalog.clone())))

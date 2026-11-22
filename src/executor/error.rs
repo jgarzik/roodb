@@ -55,6 +55,12 @@ pub enum ExecutorError {
     /// Duplicate key violation (MySQL error 1062)
     DuplicateKey(String),
 
+    /// An index of this name exists already (MySQL error 1061)
+    DuplicateKeyName(String),
+
+    /// There is no index of this name to drop (MySQL error 1091)
+    CantDropKey(String),
+
     /// Waiting for a row lock would have completed a deadlock (MySQL error
     /// 1213). The transaction is rolled back.
     LockDeadlock,
@@ -101,6 +107,12 @@ impl fmt::Display for ExecutorError {
             }
             ExecutorError::NullValue(context) => write!(f, "null value in {}", context),
             ExecutorError::TableNotFound(name) => write!(f, "table not found: {}", name),
+            ExecutorError::DuplicateKeyName(name) => write!(f, "Duplicate key name '{}'", name),
+            ExecutorError::CantDropKey(name) => write!(
+                f,
+                "Can't DROP '{}'; check that column/key exists",
+                name
+            ),
             ExecutorError::Encoding(msg) => write!(f, "encoding error: {}", msg),
             ExecutorError::InvalidArgumentForLogarithm(msg) => write!(f, "{}", msg),
             ExecutorError::TruncatedWrongValue(msg) => write!(f, "{}", msg),

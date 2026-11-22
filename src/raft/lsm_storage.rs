@@ -16,10 +16,10 @@ use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend};
 use parking_lot::RwLock;
 
+use crate::catalog::store::{decode_table, table_of_key, TableRecord};
 use crate::catalog::system_tables::{
-    is_system_table, row_to_index_def, row_to_procedure_def, row_to_trigger_def, row_to_view_def,
-    rows_to_constraints, rows_to_table_def, SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_DATABASES,
-    SYSTEM_INDEXES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
+    is_system_table, row_to_procedure_def, row_to_trigger_def, row_to_view_def, SYSTEM_DATABASES,
+    SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
@@ -142,12 +142,19 @@ struct TrackedChange {
 struct ChangesetPlan {
     writes: Vec<WriteOp>,
     tracked: Vec<TrackedChange>,
-    /// Tables and indexes this changeset creates.
-    new_tables: Vec<String>,
-    new_indexes: Vec<String>,
-    /// Tables and indexes this changeset drops.
+    /// What the changeset does to tables, in order: the catalog follows
+    /// once the changeset is written.
+    catalog: Vec<CatalogOp>,
+    /// Tables this changeset drops (and does not create again).
     dropped_tables: Vec<String>,
-    dropped_indexes: Vec<String>,
+}
+
+/// A change to a table as the catalog sees it.
+enum CatalogOp {
+    /// The table is now this.
+    Set(Box<TableRecord>),
+    /// The table is gone.
+    Unset(String),
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -314,269 +321,27 @@ impl LsmRaftStorage {
     ///
     /// Called after apply() when system.tables/columns/indexes changes are detected.
     /// Scans storage to reconstruct TableDef/IndexDef and updates catalog.
-    async fn rebuild_catalog_for_tables(
-        &self,
-        affected_tables: &std::collections::HashSet<String>,
-        dropped_tables: &std::collections::HashSet<String>,
-    ) -> Result<(), StorageError> {
-        use crate::catalog::TableDef;
-
-        // First, scan storage to collect table definitions (no lock held)
-        let mut table_defs: Vec<(String, TableDef)> = Vec::new();
-
-        for table_name in affected_tables {
-            if is_system_table(table_name) || dropped_tables.contains(table_name) {
-                continue;
-            }
-
-            // Scan system.columns for this table to rebuild TableDef
-            let prefix = table_key_prefix(SYSTEM_COLUMNS);
-            let end = table_key_end(SYSTEM_COLUMNS);
-            let rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
-                .await
-                .map_err(read_err)?;
-
-            // Collect column rows for this table
-            let mut column_rows = Vec::new();
-            for (_key, value) in rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    // Check if this row belongs to the table we're rebuilding
-                    if let Some(crate::executor::Datum::String(tbl)) = row.values().first() {
-                        if tbl == table_name {
-                            column_rows.push(row);
-                        }
-                    }
-                }
-            }
-
-            if !column_rows.is_empty() {
-                // Rebuild TableDef from column rows
-                if let Some(mut table_def) = rows_to_table_def(table_name, &column_rows) {
-                    // Scan for constraints for this table
-                    let prefix = table_key_prefix(SYSTEM_CONSTRAINTS);
-                    let end = table_key_end(SYSTEM_CONSTRAINTS);
-                    let constraint_data = self
-                        .storage
-                        .scan(Some(&prefix), Some(&end))
-                        .await
-                        .map_err(read_err)?;
-
-                    let mut constraint_rows = Vec::new();
-                    for (_key, value) in constraint_data {
-                        let Some(row_data) = extract_row_data(&value) else {
-                            continue;
-                        };
-                        if let Ok(row) = decode_row(row_data) {
-                            if let Some(crate::executor::Datum::String(tbl)) = row.values().first()
-                            {
-                                if tbl == table_name {
-                                    constraint_rows.push(row);
-                                }
-                            }
-                        }
-                    }
-
-                    // Attach constraints to table def
-                    let constraints = rows_to_constraints(&constraint_rows);
-                    for constraint in constraints {
-                        table_def = table_def.constraint(constraint);
-                    }
-
-                    tracing::debug!(table = %table_name, columns = column_rows.len(), constraints = constraint_rows.len(), "Rebuilding table in catalog (Raft apply)");
-                    table_defs.push((table_name.clone(), table_def));
-                }
-            }
-        }
-
-        // Now acquire lock and update catalog (no await after this)
-        let mut catalog = self.catalog.write();
-
-        // Handle dropped tables
-        for table_name in dropped_tables {
-            if !is_system_table(table_name) {
-                tracing::debug!(table = %table_name, "Removing table from catalog (Raft apply)");
-                // Ignore error if table doesn't exist (may have been dropped already)
-                let _ = catalog.drop_table(table_name);
-            }
-        }
-
-        // Apply table definitions
-        for (table_name, table_def) in table_defs {
-            // Remove existing and recreate (handles both create and modify)
-            let _ = catalog.drop_table(&table_name);
-            if let Err(e) = catalog.create_table(table_def) {
-                tracing::warn!(table = %table_name, error = %e, "Failed to create table in catalog");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Rebuild index catalog entries for affected indexes
-    async fn rebuild_catalog_for_indexes(
-        &self,
-        affected_indexes: &std::collections::HashSet<String>,
-        dropped_indexes: &std::collections::HashSet<String>,
-    ) -> Result<(), StorageError> {
-        use crate::catalog::IndexDef;
-
-        // First, scan storage to collect index definitions (no lock held)
-        let mut index_defs: Vec<IndexDef> = Vec::new();
-
-        for index_name in affected_indexes {
-            if dropped_indexes.contains(index_name) {
-                continue;
-            }
-
-            // Scan system.indexes to find this index
-            let prefix = table_key_prefix(SYSTEM_INDEXES);
-            let end = table_key_end(SYSTEM_INDEXES);
-            let rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
-                .await
-                .map_err(read_err)?;
-
-            for (_key, value) in rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(crate::executor::Datum::String(idx_name)) = row.values().first() {
-                        if idx_name == index_name {
-                            if let Some(index_def) = row_to_index_def(&row) {
-                                tracing::debug!(index = %index_name, "Creating index in catalog (Raft apply)");
-                                index_defs.push(index_def);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Now acquire lock and update catalog (no await after this)
-        let mut catalog = self.catalog.write();
-
-        // Handle dropped indexes
-        for index_name in dropped_indexes {
-            tracing::debug!(index = %index_name, "Removing index from catalog (Raft apply)");
-            let _ = catalog.drop_index(index_name);
-        }
-
-        // Apply index definitions
-        for index_def in index_defs {
-            let _ = catalog.create_index(index_def);
-        }
-
-        Ok(())
-    }
-
-    /// Rebuild the entire catalog from the system tables: at startup, and after
-    /// a snapshot has replaced the data.
     async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
-        use crate::catalog::{IndexDef, TableDef};
-
-        let mut table_defs: Vec<TableDef> = Vec::new();
-        let mut index_defs: Vec<IndexDef> = Vec::new();
-
-        // Scan system.columns to rebuild all tables
-        let prefix = table_key_prefix(SYSTEM_COLUMNS);
-        let end = table_key_end(SYSTEM_COLUMNS);
-        let column_rows = self
+        // Every table's record: its definition and its indexes.
+        let mut records: Vec<TableRecord> = Vec::new();
+        let prefix = table_key_prefix(SYSTEM_TABLES);
+        let end = table_key_end(SYSTEM_TABLES);
+        let table_rows = self
             .storage
             .scan(Some(&prefix), Some(&end))
             .await
             .map_err(read_err)?;
-
-        // Group columns by table name
-        let mut columns_by_table: std::collections::HashMap<
-            String,
-            Vec<crate::executor::row::Row>,
-        > = std::collections::HashMap::new();
-
-        for (_key, value) in column_rows {
+        for (key, value) in table_rows {
             let Some(row_data) = extract_row_data(&value) else {
                 continue;
             };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
-                    if !is_system_table(table_name) {
-                        columns_by_table
-                            .entry(table_name.clone())
-                            .or_default()
-                            .push(row);
-                    }
-                }
-            }
-        }
-
-        // Scan system.constraints to rebuild constraints
-        let prefix = table_key_prefix(SYSTEM_CONSTRAINTS);
-        let end = table_key_end(SYSTEM_CONSTRAINTS);
-        let constraint_rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(read_err)?;
-
-        // Group constraints by table name
-        let mut constraints_by_table: std::collections::HashMap<
-            String,
-            Vec<crate::executor::row::Row>,
-        > = std::collections::HashMap::new();
-
-        for (_key, value) in constraint_rows {
-            let Some(row_data) = extract_row_data(&value) else {
-                continue;
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
-                    if !is_system_table(table_name) {
-                        constraints_by_table
-                            .entry(table_name.clone())
-                            .or_default()
-                            .push(row);
-                    }
-                }
-            }
-        }
-
-        // Build TableDef for each table (with constraints)
-        for (table_name, column_rows) in columns_by_table {
-            if let Some(mut table_def) = rows_to_table_def(&table_name, &column_rows) {
-                // Attach constraints if any
-                if let Some(constraint_rows) = constraints_by_table.get(&table_name) {
-                    let constraints = rows_to_constraints(constraint_rows);
-                    for constraint in constraints {
-                        table_def = table_def.constraint(constraint);
-                    }
-                }
-                table_defs.push(table_def);
-            }
-        }
-
-        // Scan system.indexes to rebuild all indexes
-        let prefix = table_key_prefix(SYSTEM_INDEXES);
-        let end = table_key_end(SYSTEM_INDEXES);
-        let index_rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
-            .await
-            .map_err(read_err)?;
-
-        for (_key, value) in index_rows {
-            let Some(row_data) = extract_row_data(&value) else {
-                continue;
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(index_def) = row_to_index_def(&row) {
-                    index_defs.push(index_def);
+            match decode_table(row_data) {
+                Some(record) => records.push(record),
+                None => {
+                    return Err(read_err(format!(
+                        "the stored definition of table {:?} cannot be read",
+                        table_of_key(&key).unwrap_or_default()
+                    )))
                 }
             }
         }
@@ -683,19 +448,13 @@ impl LsmRaftStorage {
             .map(|t| t.to_string())
             .collect();
         for table_name in existing_tables {
-            let _ = catalog.drop_table(&table_name);
+            catalog.unset_table(&table_name);
         }
 
-        // Add tables from snapshot
-        for table_def in table_defs {
-            tracing::debug!(table = %table_def.name, "Rebuilding table from snapshot");
-            let _ = catalog.create_table(table_def);
-        }
-
-        // Add indexes from snapshot
-        for index_def in index_defs {
-            tracing::debug!(index = %index_def.name, "Rebuilding index from snapshot");
-            let _ = catalog.create_index(index_def);
+        // Tables and their indexes, as stored
+        for record in records {
+            tracing::debug!(table = %record.def.name, "Rebuilding table from storage");
+            catalog.set_table(record.def, record.indexes);
         }
 
         // Rebuild databases
@@ -738,8 +497,6 @@ impl LsmRaftStorage {
     async fn plan_changeset(
         &self,
         changeset: &ChangeSet,
-        existing_tables: &std::collections::HashSet<String>,
-        existing_indexes: &std::collections::HashSet<String>,
     ) -> Result<Result<ChangesetPlan, String>, StorageError> {
         // Version checks see storage as it was before this changeset, which
         // is what the executors saw when they read the rows.
@@ -781,7 +538,14 @@ impl LsmRaftStorage {
         for change in &changeset.changes {
             match (&change.op, &change.value) {
                 (ChangeOp::Insert | ChangeOp::Update, Some(value)) => {
-                    if change.op == ChangeOp::Insert && !is_system_table(&change.table) {
+                    // A key that holds a live row cannot be inserted again.
+                    // Of the system tables only the table records are keyed
+                    // by what they describe; the others are keyed by row
+                    // IDs, which do not repeat.
+                    let is_table_record = change.table == SYSTEM_TABLES;
+                    if change.op == ChangeOp::Insert
+                        && (is_table_record || !is_system_table(&change.table))
+                    {
                         let exists = match live.get(change.key.as_slice()) {
                             Some(live) => *live,
                             None => self
@@ -792,6 +556,15 @@ impl LsmRaftStorage {
                                 .is_some_and(|row| !is_mvcc_tombstone(&row)),
                         };
                         if exists {
+                            if is_table_record {
+                                // Two sessions raced to create the table:
+                                // the second is told, as if it had found
+                                // the table there.
+                                return Ok(Err(format!(
+                                    "Table '{}' already exists",
+                                    table_of_key(&change.key).unwrap_or_default()
+                                )));
+                            }
                             if changeset.ignore_duplicates {
                                 // INSERT IGNORE: skip this row.
                                 continue;
@@ -807,44 +580,15 @@ impl LsmRaftStorage {
                         }
                     }
 
-                    // Two sessions can race to create the same table or
-                    // index; the second creation is dropped.
-                    if change.op == ChangeOp::Insert
-                        && (change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES)
-                    {
-                        let name =
-                            decode_row(value)
-                                .ok()
-                                .and_then(|row| match row.values().first() {
-                                    Some(crate::executor::Datum::String(name)) => {
-                                        Some(name.clone())
-                                    }
-                                    _ => None,
-                                });
-                        if let Some(name) = name {
-                            let (existing, new, dropped) = if change.table == SYSTEM_TABLES {
-                                (existing_tables, &mut plan.new_tables, &plan.dropped_tables)
-                            } else {
-                                (
-                                    existing_indexes,
-                                    &mut plan.new_indexes,
-                                    &plan.dropped_indexes,
-                                )
-                            };
-                            // It exists if it existed before and this
-                            // changeset has not dropped it, or if this
-                            // changeset already created it.
-                            let exists = (existing.contains(&name) && !dropped.contains(&name))
-                                || new.contains(&name);
-                            if exists {
-                                tracing::debug!(
-                                    table = %change.table,
-                                    name = %name,
-                                    "Skipping duplicate CREATE in apply()"
-                                );
-                                continue;
+                    if is_table_record {
+                        match decode_table(value) {
+                            Some(record) => plan.catalog.push(CatalogOp::Set(Box::new(record))),
+                            None => {
+                                return Ok(Err(
+                                    "a table definition in the changeset cannot be read"
+                                        .to_string(),
+                                ))
                             }
-                            new.push(name);
                         }
                     }
 
@@ -853,11 +597,13 @@ impl LsmRaftStorage {
                         Some(encode_mvcc_row(changeset.txn_id, false, value)),
                     ));
                     live.insert(change.key.as_slice(), true);
-                    plan.tracked.push(TrackedChange {
-                        table: change.table.clone(),
-                        value: value.clone(),
-                        is_delete: false,
-                    });
+                    if !is_table_record {
+                        plan.tracked.push(TrackedChange {
+                            table: change.table.clone(),
+                            value: value.clone(),
+                            is_delete: false,
+                        });
+                    }
                 }
                 // An insert or update with no value changes nothing.
                 (ChangeOp::Insert | ChangeOp::Update, None) => {}
@@ -867,30 +613,11 @@ impl LsmRaftStorage {
                         Some(encode_mvcc_row(changeset.txn_id, true, &[])),
                     ));
                     live.insert(change.key.as_slice(), false);
-                    if let Some(value) = value {
-                        // Dropping a table or index frees its name: a later
-                        // CREATE of the same name, in this changeset or a
-                        // following one, is not a duplicate.
-                        if change.table == SYSTEM_TABLES || change.table == SYSTEM_INDEXES {
-                            let name =
-                                decode_row(value)
-                                    .ok()
-                                    .and_then(|row| match row.values().first() {
-                                        Some(crate::executor::Datum::String(name)) => {
-                                            Some(name.clone())
-                                        }
-                                        _ => None,
-                                    });
-                            if let Some(name) = name {
-                                if change.table == SYSTEM_TABLES {
-                                    plan.new_tables.retain(|n| n != &name);
-                                    plan.dropped_tables.push(name);
-                                } else {
-                                    plan.new_indexes.retain(|n| n != &name);
-                                    plan.dropped_indexes.push(name);
-                                }
-                            }
+                    if change.table == SYSTEM_TABLES {
+                        if let Some(name) = table_of_key(&change.key) {
+                            plan.catalog.push(CatalogOp::Unset(name));
                         }
+                    } else if let Some(value) = value {
                         plan.tracked.push(TrackedChange {
                             table: change.table.clone(),
                             value: value.clone(),
@@ -898,6 +625,17 @@ impl LsmRaftStorage {
                         });
                     }
                 }
+            }
+        }
+        // Tables the changeset leaves dropped: the last word on each name.
+        for op in &plan.catalog {
+            match op {
+                CatalogOp::Unset(name) => {
+                    if !plan.dropped_tables.contains(name) {
+                        plan.dropped_tables.push(name.clone());
+                    }
+                }
+                CatalogOp::Set(record) => plan.dropped_tables.retain(|n| *n != record.def.name),
             }
         }
         // AUTO_INCREMENT counters. A dropped table's counter goes with it;
@@ -944,59 +682,11 @@ impl LsmRaftStorage {
         Ok(Ok(plan))
     }
 
-    /// Helper to track system table changes for catalog rebuild
-    #[allow(clippy::too_many_arguments)]
-    fn track_system_table_change(
-        &self,
-        table: &str,
-        value: &[u8],
-        is_delete: bool,
-        affected_tables: &mut std::collections::HashSet<String>,
-        dropped_tables: &mut std::collections::HashSet<String>,
-        affected_indexes: &mut std::collections::HashSet<String>,
-        dropped_indexes: &mut std::collections::HashSet<String>,
-    ) {
-        // Only process system tables
-        if table == SYSTEM_TABLES {
-            // Decode row to get table_name (first column)
-            if let Ok(row) = decode_row(value) {
-                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
-                    // Several entries are applied per call; for one name the
-                    // last operation is the one that stands.
-                    if is_delete {
-                        affected_tables.remove(table_name);
-                        dropped_tables.insert(table_name.clone());
-                    } else {
-                        dropped_tables.remove(table_name);
-                        affected_tables.insert(table_name.clone());
-                    }
-                }
-            }
-        } else if table == SYSTEM_COLUMNS {
-            // Decode row to get table_name (first column)
-            if let Ok(row) = decode_row(value) {
-                if let Some(crate::executor::Datum::String(table_name)) = row.values().first() {
-                    // Column changes affect the table definition
-                    if !is_delete {
-                        affected_tables.insert(table_name.clone());
-                    }
-                    // Note: For column deletes during DROP TABLE, the table is already marked dropped
-                }
-            }
-        } else if table == SYSTEM_INDEXES {
-            // Decode row to get index_name (first column)
-            if let Ok(row) = decode_row(value) {
-                if let Some(crate::executor::Datum::String(index_name)) = row.values().first() {
-                    if is_delete {
-                        affected_indexes.remove(index_name);
-                        dropped_indexes.insert(index_name.clone());
-                    } else {
-                        dropped_indexes.remove(index_name);
-                        affected_indexes.insert(index_name.clone());
-                    }
-                }
-            }
-        } else if table == SYSTEM_DATABASES {
+    /// Bring the catalog up to date with a change to one of the system
+    /// tables that hold databases, procedures, triggers and views. (Tables
+    /// follow from their records: see `CatalogOp`.)
+    fn track_system_table_change(&self, table: &str, value: &[u8], is_delete: bool) {
+        if table == SYSTEM_DATABASES {
             // Database name changes — update catalog directly
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
@@ -1063,8 +753,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             + Unpin
             + OptionalSend,
     {
-        use std::collections::HashSet;
-
         // Take everything openraft has ready; each entry comes with the
         // channel its client is waiting on (none on followers).
         let mut entries = Vec::new();
@@ -1077,20 +765,6 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let start = std::time::Instant::now();
         let mut results = Vec::new();
 
-        // Track system table changes for catalog updates
-        let mut affected_tables: HashSet<String> = HashSet::new();
-        let mut dropped_tables: HashSet<String> = HashSet::new();
-        let mut affected_indexes: HashSet<String> = HashSet::new();
-        let mut dropped_indexes: HashSet<String> = HashSet::new();
-
-        // PERFORMANCE: Snapshot existing table/index names once before the loop.
-        // This avoids repeated catalog lock acquisitions for duplicate DDL detection.
-        // We'll add newly created names to these sets as we process them.
-        let (mut existing_tables, mut existing_indexes) = {
-            let catalog = self.catalog.read();
-            (catalog.table_names(), catalog.index_names())
-        };
-
         for entry in entries {
             let log_id = entry.log_id();
 
@@ -1101,6 +775,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             // restart resume from that position by replaying the log.
             let mut batch: Vec<WriteOp> = Vec::new();
             let mut tracked: Vec<TrackedChange> = Vec::new();
+            let mut catalog_ops: Vec<CatalogOp> = Vec::new();
             let mut membership_change = None;
             let mut new_txn_id = None;
             let mut reserved_row_ids = None;
@@ -1151,10 +826,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                     CommandResponse::Ok(Some(next.to_le_bytes().to_vec()))
                 }
                 EntryPayload::Normal(Command::DataChange(changeset)) => {
-                    match self
-                        .plan_changeset(changeset, &existing_tables, &existing_indexes)
-                        .await?
-                    {
+                    match self.plan_changeset(changeset).await? {
                         Ok(plan) => {
                             new_txn_id = Some(changeset.txn_id);
                             tracing::debug!(
@@ -1165,14 +837,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             );
                             batch = plan.writes;
                             tracked = plan.tracked;
-                            for name in &plan.dropped_tables {
-                                existing_tables.remove(name);
-                            }
-                            for name in &plan.dropped_indexes {
-                                existing_indexes.remove(name);
-                            }
-                            existing_tables.extend(plan.new_tables);
-                            existing_indexes.extend(plan.new_indexes);
+                            catalog_ops = plan.catalog;
                             CommandResponse::Ok(None)
                         }
                         Err(message) => {
@@ -1225,31 +890,24 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             if let Some(membership) = membership_change {
                 *self.cached_membership.write() = membership;
             }
+            // The catalog follows each entry as it is written: the next
+            // entry is checked against the catalog this one leaves.
+            if !catalog_ops.is_empty() {
+                let mut catalog = self.catalog.write();
+                for op in catalog_ops {
+                    match op {
+                        CatalogOp::Set(record) => catalog.set_table(record.def, record.indexes),
+                        CatalogOp::Unset(name) => catalog.unset_table(&name),
+                    }
+                }
+            }
             for change in tracked {
-                self.track_system_table_change(
-                    &change.table,
-                    &change.value,
-                    change.is_delete,
-                    &mut affected_tables,
-                    &mut dropped_tables,
-                    &mut affected_indexes,
-                    &mut dropped_indexes,
-                );
+                self.track_system_table_change(&change.table, &change.value, change.is_delete);
             }
             results.push(response);
         }
 
         tracing::debug!(target: "roodb::perf", elapsed_us = start.elapsed().as_micros() as u64, entries = results.len(), "raft_apply");
-
-        // Rebuild catalog for affected system table entries
-        if !affected_tables.is_empty() || !dropped_tables.is_empty() {
-            self.rebuild_catalog_for_tables(&affected_tables, &dropped_tables)
-                .await?;
-        }
-        if !affected_indexes.is_empty() || !dropped_indexes.is_empty() {
-            self.rebuild_catalog_for_indexes(&affected_indexes, &dropped_indexes)
-                .await?;
-        }
 
         for (response, responder) in results.into_iter().zip(responders) {
             if let Some(responder) = responder {

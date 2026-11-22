@@ -2462,22 +2462,6 @@ impl QueryEngine {
                     self.apply_alter_op(&mut new_def, op, &mut dropped_indexes)?;
                 }
 
-                // Indexes dropped here are dropped as DROP INDEX drops them:
-                // by deleting their rows in system.indexes.
-                if !dropped_indexes.is_empty() {
-                    let table = old_table_name.clone();
-                    self.delete_system_rows(crate::catalog::system_tables::SYSTEM_INDEXES, |row| {
-                        match (row.first(), row.get(1)) {
-                            (Some(Datum::String(index)), Some(Datum::String(on))) => {
-                                *on == table && dropped_indexes.contains(index)
-                            }
-                            _ => false,
-                        }
-                    })
-                    .await
-                    .map_err(ProtocolError::Internal)?;
-                }
-
                 // A temporary table is known to this session only: its new
                 // definition goes to the catalog and nowhere else. Written to
                 // the system tables it would become an ordinary table that
@@ -2493,8 +2477,30 @@ impl QueryEngine {
                     return self.send_ok(0, 0).await.map(|_| Some(()));
                 }
 
-                // Persist via Raft (delete old system rows, insert new ones)
-                self.persist_alter_table(&old_table_name, &new_def).await?;
+                // The new definition is checked here, before it is proposed:
+                // what is in the log is applied as it is.
+                let indexes = {
+                    let catalog = self.catalog.read();
+                    catalog
+                        .validate_table(&new_def)
+                        .map_err(|e| ProtocolError::Internal(e.to_string()))?;
+                    if new_def.name != old_table_name && catalog.table_exists(&new_def.name) {
+                        return Err(ProtocolError::Internal(format!(
+                            "Table '{}' already exists",
+                            new_def.name
+                        )));
+                    }
+                    // The table's indexes stay with it, less those dropped
+                    // here, and under its new name if it has one.
+                    let mut indexes = catalog.table_indexes(&old_table_name);
+                    indexes.retain(|index| !dropped_indexes.contains(&index.name));
+                    for index in &mut indexes {
+                        index.table.clone_from(&new_def.name);
+                    }
+                    indexes
+                };
+                self.persist_alter_table(&old_table_name, new_def, indexes)
+                    .await?;
 
                 self.send_ok(0, 0).await.map(|_| Some(()))
             }
@@ -2752,165 +2758,31 @@ impl QueryEngine {
         }
     }
 
-    /// Persist ALTER TABLE changes to system tables via Raft.
-    ///
-    /// Pattern: delete old system.columns/constraints rows, insert new ones.
-    /// For RENAME, also updates system.tables row.
+    /// Replace a table's record with its new definition: one change, so
+    /// the alteration is applied whole or not at all. A renamed table's
+    /// record moves to its new name.
     async fn persist_alter_table(
         &mut self,
         old_table_name: &str,
-        new_def: &crate::catalog::TableDef,
+        def: crate::catalog::TableDef,
+        indexes: Vec<crate::catalog::IndexDef>,
     ) -> ProtocolResult<()> {
-        use crate::catalog::system_tables::{
-            table_def_to_columns_rows, table_def_to_constraints_rows, table_def_to_tables_row,
-            SYSTEM_COLUMNS, SYSTEM_CONSTRAINTS, SYSTEM_TABLES,
-        };
-        use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::raft::RowChange;
-        use crate::storage::row_id::allocate_row_id_batch;
+        use crate::catalog::store;
 
+        let record = store::TableRecord { def, indexes };
         let mut changeset = ChangeSet::new(0);
-
-        // Scan and delete old system.tables row (for RENAME, or to reinsert)
-        let renamed = old_table_name != new_def.name;
-
-        // Delete old system.columns rows matching old_table_name
-        {
-            let prefix = format!("t:{SYSTEM_COLUMNS}:");
-            let end = format!("t:{SYSTEM_COLUMNS};\x00");
-            let rows = self
-                .mvcc
-                .scan_raw(prefix.as_bytes(), end.as_bytes())
-                .await
-                .map_err(|e| ProtocolError::Internal(format!("scan system.columns: {}", e)))?;
-
-            for (key, value) in rows {
-                let row_data = if value.len() > 17 {
-                    &value[17..]
-                } else {
-                    &value
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(Datum::String(tname)) = row.values().first() {
-                        if tname == old_table_name {
-                            changeset.push(RowChange::delete_with_value(
-                                SYSTEM_COLUMNS,
-                                key,
-                                row_data.to_vec(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Delete old system.constraints rows matching old_table_name
-        {
-            let prefix = format!("t:{SYSTEM_CONSTRAINTS}:");
-            let end = format!("t:{SYSTEM_CONSTRAINTS};\x00");
-            let rows = self
-                .mvcc
-                .scan_raw(prefix.as_bytes(), end.as_bytes())
-                .await
-                .map_err(|e| ProtocolError::Internal(format!("scan system.constraints: {}", e)))?;
-
-            for (key, value) in rows {
-                let row_data = if value.len() > 17 {
-                    &value[17..]
-                } else {
-                    &value
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(Datum::String(tname)) = row.values().first() {
-                        if tname == old_table_name {
-                            changeset.push(RowChange::delete_with_value(
-                                SYSTEM_CONSTRAINTS,
-                                key,
-                                row_data.to_vec(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // If renamed, delete old system.tables row and insert new one
-        if renamed {
-            let prefix = format!("t:{SYSTEM_TABLES}:");
-            let end = format!("t:{SYSTEM_TABLES};\x00");
-            let rows = self
-                .mvcc
-                .scan_raw(prefix.as_bytes(), end.as_bytes())
-                .await
-                .map_err(|e| ProtocolError::Internal(format!("scan system.tables: {}", e)))?;
-
-            for (key, value) in rows {
-                let row_data = if value.len() > 17 {
-                    &value[17..]
-                } else {
-                    &value
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(Datum::String(tname)) = row.values().first() {
-                        if tname == old_table_name {
-                            changeset.push(RowChange::delete_with_value(
-                                SYSTEM_TABLES,
-                                key,
-                                row_data.to_vec(),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Insert new system.tables row
-            let table_row = table_def_to_tables_row(new_def);
-            let mut next_local = allocate_row_id_batch(1);
-            let row_id = next_local;
-            next_local += 1;
-            let _ = next_local; // suppress unused warning
-            let key = encode_row_key(SYSTEM_TABLES, row_id);
-            let value = encode_row(&table_row);
-            changeset.push(RowChange::insert(SYSTEM_TABLES, key, value));
-        }
-
-        // Insert new system.columns rows from modified def
-        let column_rows = table_def_to_columns_rows(new_def);
-        let constraint_rows = table_def_to_constraints_rows(new_def);
-        let total_ids = column_rows.len() as u64 + constraint_rows.len() as u64;
-
-        if total_ids > 0 {
-            let mut next_local = allocate_row_id_batch(total_ids);
-
-            for col_row in column_rows {
-                let row_id = next_local;
-                next_local += 1;
-                let key = encode_row_key(SYSTEM_COLUMNS, row_id);
-                let value = encode_row(&col_row);
-                changeset.push(RowChange::insert(SYSTEM_COLUMNS, key, value));
-            }
-
-            for constraint_row in constraint_rows {
-                let row_id = next_local;
-                next_local += 1;
-                let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
-                let value = encode_row(&constraint_row);
-                changeset.push(RowChange::insert(SYSTEM_CONSTRAINTS, key, value));
-            }
-        }
-
-        if changeset.changes.is_empty() {
-            // No system table changes — just update catalog directly
-            let mut catalog = self.catalog.write();
-            catalog.replace_table(old_table_name, new_def.clone());
+        if old_table_name == record.def.name {
+            changeset.push(store::replace_table(&record));
         } else {
-            // Propose via Raft — catalog is updated synchronously in apply()
-            self.raft_node
-                .propose_changes(changeset)
-                .await
-                .map_err(|e| ProtocolError::Internal(format!("Raft propose ALTER TABLE: {}", e)))?;
+            changeset.push(store::drop_table(old_table_name));
+            changeset.push(store::create_table(&record));
         }
-
+        // The catalog is updated when the change is applied, before the
+        // proposal returns.
+        self.raft_node
+            .propose_changes(changeset)
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Raft propose ALTER TABLE: {}", e)))?;
         Ok(())
     }
 
@@ -6447,6 +6319,10 @@ impl QueryEngine {
                     )
                 } else if let crate::executor::ExecutorError::LockDeadlock = exec_err {
                     (codes::ER_LOCK_DEADLOCK, "40001", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::DuplicateKeyName(_) = exec_err {
+                    (1061, "42000", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::CantDropKey(_) = exec_err {
+                    (1091, "42000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::LockNoWait = exec_err {
                     (3572, states::GENERAL_ERROR, exec_err.to_string())
                 } else if let crate::executor::ExecutorError::LockWaitTimeout = exec_err {

@@ -411,7 +411,7 @@ When `roodb_init` runs on an empty data directory:
 2. Grants `ALL PRIVILEGES ON *.*` with `GRANT OPTION` to root
 3. Writes schema version marker
 
-System tables (`system.tables`, `system.columns`, etc.) are created by the catalog at server startup, not by initialization.
+System tables (`system.tables`, `system.users`, etc.) are created by the catalog at server startup, not by initialization.
 
 ## User Management
 
@@ -582,10 +582,7 @@ Query system tables for metadata (read-only, managed by SQL commands):
 
 | Table | Contents |
 |-------|----------|
-| `system.tables` | Table definitions |
-| `system.columns` | Column definitions |
-| `system.indexes` | Index definitions |
-| `system.constraints` | Table constraints |
+| `system.tables` | Table definitions: one encoded record per table (columns, constraints, indexes). Read them with `DESCRIBE`, `SHOW CREATE TABLE`, `SHOW INDEX` |
 | `system.databases` | Databases |
 | `system.views` | View definitions |
 | `system.procedures` | Stored procedures and functions |

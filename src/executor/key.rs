@@ -148,6 +148,34 @@ fn encode_bytes(key: &mut Vec<u8>, bytes: &[u8]) {
     key.extend_from_slice(&[0x00, 0x01]);
 }
 
+/// The string that a key part written with `KeyPart::PLAIN` holds, if the
+/// part is a present string in the binary collation. The reverse of
+/// `encode_part` for that case.
+pub fn decode_string(part: &[u8]) -> Option<String> {
+    let (&presence, mut rest) = part.split_first()?;
+    if presence != PRESENT {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(rest.len());
+    loop {
+        let (&byte, after) = rest.split_first()?;
+        if byte != 0x00 {
+            bytes.push(byte);
+            rest = after;
+            continue;
+        }
+        let (&next, after) = after.split_first()?;
+        match next {
+            0x01 => return String::from_utf8(bytes).ok(),
+            0xFF => {
+                bytes.push(0x00);
+                rest = after;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// A decimal, whatever its scale: 1.5 and 1.50 give the same bytes.
 ///
 /// A sign byte; then, for a non-zero value, the number of digits before the
