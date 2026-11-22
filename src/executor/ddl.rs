@@ -840,8 +840,10 @@ impl CreateTableAs {
     }
 
     /// Create the table definition and register it (DDL phase).
-    /// Returns the PK column indices for row storage.
-    async fn create_table_ddl(&mut self) -> ExecutorResult<Vec<usize>> {
+    /// Returns the PK column indices for row storage, or `None` if the
+    /// table was there already and the statement says `IF NOT EXISTS`:
+    /// then there is nothing to do, and nowhere to put rows.
+    async fn create_table_ddl(&mut self) -> ExecutorResult<Option<Vec<usize>>> {
         if is_system_table(&self.name) {
             return Err(ExecutorError::Internal(format!(
                 "cannot create system table '{}'",
@@ -854,7 +856,7 @@ impl CreateTableAs {
             let catalog = self.catalog.read();
             if catalog.get_table(&self.name).is_some() {
                 if self.if_not_exists {
-                    return Ok(vec![]);
+                    return Ok(None);
                 }
                 return Err(ExecutorError::Internal(format!(
                     "table '{}' already exists",
@@ -916,7 +918,7 @@ impl CreateTableAs {
                 .map_err(|e| ExecutorError::Internal(e.to_string()))?;
         }
 
-        Ok(pk_indices)
+        Ok(Some(pk_indices))
     }
 }
 
@@ -934,16 +936,11 @@ impl Executor for CreateTableAs {
         }
 
         // Phase 1: Create the table (DDL)
-        let pk_indices = self.create_table_ddl().await?;
-
-        // If table already existed (IF NOT EXISTS), return 0 rows affected
-        {
-            let catalog = self.catalog.read();
-            if catalog.get_table(&self.name).is_none() && self.if_not_exists {
-                self.done = true;
-                return Ok(Some(Row::new(vec![Datum::Int(0)])));
-            }
-        }
+        // If the table already existed (IF NOT EXISTS): 0 rows affected.
+        let Some(pk_indices) = self.create_table_ddl().await? else {
+            self.done = true;
+            return Ok(Some(Row::new(vec![Datum::Int(0)])));
+        };
 
         // Phase 2: Stream rows from source SELECT into the new table
         // Allocate row IDs in batches for performance

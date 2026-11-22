@@ -116,7 +116,8 @@ CREATE TABLE name [(column definitions)] AS SELECT ...
 Table options (`ENGINE=`, `DEFAULT CHARSET=`, `COLLATE=`, `COMMENT=`,
 `AUTO_INCREMENT=`) and column `COMMENT` are accepted and ignored.
 `CREATE TABLE ... AS SELECT` creates the table from the query's columns and
-copies the rows.
+copies the rows. With `IF NOT EXISTS` and a table that is already there, nothing
+is done: the query's rows are not stored.
 
 **Constraints and column options:**
 

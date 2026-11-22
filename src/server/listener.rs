@@ -280,8 +280,6 @@ pub async fn start_test_server(
     .await
     .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
-    // Set node ID for globally unique row ID generation
-
     raft_node
         .start_rpc_server()
         .await

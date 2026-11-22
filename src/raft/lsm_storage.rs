@@ -314,10 +314,9 @@ impl LsmRaftStorage {
         &self.storage
     }
 
-    /// Rebuild catalog entries for tables affected by system table changes
-    ///
-    /// Called after apply() when system.tables/columns/indexes changes are detected.
-    /// Scans storage to reconstruct TableDef/IndexDef and updates catalog.
+    /// Rebuild the whole catalog from what the system tables hold: at
+    /// start, and after a snapshot has replaced the stored data. (While
+    /// the log is applied, the catalog follows each entry instead.)
     async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
         use crate::catalog::store::scan_rows;
         use crate::executor::Datum;

@@ -263,13 +263,93 @@ pub fn for_lookup(datum: Datum, column: &DataType, toward: Toward) -> Lookup {
             None => convert(datum, column),
         };
     }
+    if matches!(column, DataType::Decimal { .. }) {
+        // A decimal key orders by value whatever its scale, so the value
+        // is looked up as it is, never rounded to the column's scale: 2.5
+        // then lies between the keys 2 and 3, and equals neither.
+        return match exact_decimal(&datum) {
+            Some(Ok(decimal)) => Lookup::Exact(decimal),
+            Some(Err(side)) => Lookup::Beyond(side),
+            None => convert(datum, column),
+        };
+    }
     convert(datum, column)
+}
+
+/// A number as a decimal of exactly its value. `Err` says on which side
+/// of every decimal it lies when it is too large to be one; `None` is for
+/// what is not a number (or is one already in the column's own kind).
+fn exact_decimal(datum: &Datum) -> Option<Result<Datum, Ordering>> {
+    let text = match datum {
+        Datum::Float(value) if value.is_finite() => value.to_string(),
+        Datum::Float(value) if value.is_infinite() => {
+            return Some(Err(if *value > 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }))
+        }
+        Datum::String(text) => number_in(text)?.to_string(),
+        _ => return None,
+    };
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.as_str()),
+    };
+    let beyond = if negative {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let fraction = fraction.trim_end_matches('0');
+    let Ok(scale) = u8::try_from(fraction.len()) else {
+        // More digits after the point than a decimal carries: not one this
+        // function can give exactly.
+        return None;
+    };
+    match format!("{whole}{fraction}").parse::<i128>() {
+        Ok(value) => Some(Ok(Datum::Decimal {
+            value: if negative { -value } else { value },
+            scale,
+        })),
+        Err(_) => Some(Err(beyond)),
+    }
+}
+
+/// The number a string is compared as: its text, if that is a plain
+/// number (digits, an optional point, no exponent), otherwise the number
+/// it begins with as floating point (none: zero), as MySQL reads it.
+fn number_in(text: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let text = text.trim();
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let plain = !unsigned.is_empty()
+        && unsigned.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && unsigned.matches('.').count() <= 1
+        && unsigned.chars().any(|c| c.is_ascii_digit());
+    if plain {
+        return Some(std::borrow::Cow::Borrowed(
+            text.strip_prefix('+').unwrap_or(text),
+        ));
+    }
+    // The longest prefix that reads as a number.
+    let value = (0..=text.len())
+        .rev()
+        .filter(|&end| text.is_char_boundary(end))
+        .find_map(|end| text[..end].parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    Some(std::borrow::Cow::Owned(value.to_string()))
 }
 
 /// The value to look a single row up by, in the key column's type; `None`
 /// if the column cannot hold the value, so that no row has it. Without a
 /// type (executors run without a catalog) the value is taken as it is.
 pub fn for_point(datum: Datum, column: Option<&DataType>) -> Option<Datum> {
+    // Nothing equals NULL.
+    if datum.is_null() {
+        return None;
+    }
     match column {
         None => Some(datum),
         Some(column) => match for_lookup(datum, column, Toward::Above) {
@@ -294,6 +374,10 @@ pub enum Bound {
 /// whether the range includes it, in the key column's type. A lower bound
 /// of `> 2.5` on an integer column is `>= 3`.
 pub fn for_bound(value: Datum, inclusive: bool, column: Option<&DataType>, lower: bool) -> Bound {
+    // No key is above, below or equal to NULL.
+    if value.is_null() {
+        return Bound::Nothing;
+    }
     let Some(column) = column else {
         return Bound::At { value, inclusive };
     };
@@ -357,6 +441,12 @@ fn whole_number(datum: &Datum, toward: Toward) -> Option<(i128, bool)> {
             };
             Some((whole, moved == *value))
         }
+        // A string is compared with a number as the number it reads as.
+        Datum::String(_) => match exact_decimal(datum)? {
+            Ok(decimal) => whole_number(&decimal, toward),
+            Err(Ordering::Less) => Some((i128::MIN, false)),
+            Err(_) => Some((i128::MAX, false)),
+        },
         Datum::Decimal { value, scale } => {
             let unit = 10i128.checked_pow(u32::from(*scale))?;
             let below = value.div_euclid(unit);
@@ -592,5 +682,82 @@ mod tests {
             for_lookup(Datum::Int(-3), &DataType::Double, Above),
             Lookup::Exact(Datum::Float(-3.0))
         );
+    }
+
+    #[test]
+    fn a_number_is_looked_up_in_a_decimal_key_as_itself() {
+        let column = DataType::Decimal {
+            precision: 10,
+            scale: 0,
+        };
+        let decimal = |value, scale| Datum::Decimal { value, scale };
+        // Not rounded to the column's scale.
+        assert_eq!(
+            for_lookup(Datum::Float(2.5), &column, Toward::Above),
+            Lookup::Exact(decimal(25, 1))
+        );
+        assert_eq!(
+            for_lookup(Datum::Float(-0.125), &column, Toward::Below),
+            Lookup::Exact(decimal(-125, 3))
+        );
+        assert_eq!(
+            for_lookup(Datum::Float(3.0), &column, Toward::Above),
+            Lookup::Exact(decimal(3, 0))
+        );
+        assert_eq!(
+            for_lookup(Datum::String(" 1.50 ".into()), &column, Toward::Above),
+            Lookup::Exact(decimal(15, 1))
+        );
+        // Too large to be a decimal: beyond them all.
+        assert_eq!(
+            for_lookup(Datum::Float(1.0e300), &column, Toward::Above),
+            Lookup::Beyond(Ordering::Greater)
+        );
+        assert_eq!(
+            for_lookup(Datum::Float(f64::NEG_INFINITY), &column, Toward::Above),
+            Lookup::Beyond(Ordering::Less)
+        );
+        // 2.5 sorts between the keys 2 and 3.
+        let (two, half, three) = (
+            key_of(&decimal(2, 0)),
+            key_of(&decimal(25, 1)),
+            key_of(&decimal(3, 0)),
+        );
+        assert!(two < half && half < three);
+    }
+
+    #[test]
+    fn a_string_is_looked_up_in_an_integer_key_as_the_number_it_reads_as() {
+        let lookup =
+            |text: &str, toward| for_lookup(Datum::String(text.into()), &DataType::Int, toward);
+        assert_eq!(lookup("3", Toward::Above), Lookup::Exact(Datum::Int(3)));
+        assert_eq!(lookup("3.0", Toward::Above), Lookup::Exact(Datum::Int(3)));
+        assert_eq!(lookup("-7", Toward::Below), Lookup::Exact(Datum::Int(-7)));
+        assert_eq!(lookup("2.7", Toward::Above), Lookup::Nearest(Datum::Int(3)));
+        assert_eq!(lookup("2.7", Toward::Below), Lookup::Nearest(Datum::Int(2)));
+        // As MySQL reads a string: the number it begins with, or zero.
+        assert_eq!(
+            lookup("12abc", Toward::Above),
+            Lookup::Exact(Datum::Int(12))
+        );
+        assert_eq!(lookup("1e2", Toward::Above), Lookup::Exact(Datum::Int(100)));
+        assert_eq!(lookup("abc", Toward::Above), Lookup::Exact(Datum::Int(0)));
+        assert_eq!(
+            lookup("99999999999999999999999999", Toward::Above),
+            Lookup::Beyond(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn null_is_no_key_and_bounds_nothing() {
+        assert_eq!(for_point(Datum::Null, Some(&DataType::Int)), None);
+        assert_eq!(for_point(Datum::Null, None), None);
+        for lower in [true, false] {
+            assert_eq!(
+                for_bound(Datum::Null, true, Some(&DataType::Int), lower),
+                Bound::Nothing
+            );
+            assert_eq!(for_bound(Datum::Null, false, None, lower), Bound::Nothing);
+        }
     }
 }

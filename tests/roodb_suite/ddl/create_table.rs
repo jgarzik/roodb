@@ -252,3 +252,38 @@ async fn test_create_table_if_not_exists() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// `CREATE TABLE IF NOT EXISTS ... AS SELECT` on a table that exists does
+/// nothing: the table is not created again, and the selected rows are not
+/// stored anywhere.
+#[tokio::test]
+async fn create_table_if_not_exists_as_select_leaves_an_existing_table_alone() {
+    let server = TestServer::start("ctas_ine").await;
+    let mut conn = server.connect().await;
+    conn.query_drop("CREATE TABLE ctas_ine (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO ctas_ine VALUES (7)")
+        .await
+        .unwrap();
+
+    let result = conn
+        .query_iter("CREATE TABLE IF NOT EXISTS ctas_ine AS SELECT 1 AS id")
+        .await
+        .expect("CREATE TABLE IF NOT EXISTS ... AS SELECT failed");
+    assert_eq!(result.affected_rows(), 0, "rows were reported as inserted");
+    drop(result);
+    let rows: Vec<i32> = conn.query("SELECT id FROM ctas_ine").await.unwrap();
+    assert_eq!(rows, [7]);
+
+    // A table that is not there is made and filled.
+    conn.query_drop("CREATE TABLE IF NOT EXISTS ctas_ine_new AS SELECT 1 AS id")
+        .await
+        .unwrap();
+    let rows: Vec<i32> = conn.query("SELECT id FROM ctas_ine_new").await.unwrap();
+    assert_eq!(rows, [1]);
+
+    conn.query_drop("DROP TABLE ctas_ine").await.unwrap();
+    conn.query_drop("DROP TABLE ctas_ine_new").await.unwrap();
+    server.shutdown().await;
+}

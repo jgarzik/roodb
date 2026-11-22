@@ -251,8 +251,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raft_node.set_advertised_addr(advertised_raft_addr);
     raft_node.set_log_budget(log_budget_mb.max(1) << 20);
 
-    // Set node ID for globally unique row ID generation
-
     raft_node.start_rpc_server().await?;
     if raft_node.is_alone() {
         raft_node.bootstrap_single_node().await?;

@@ -3,8 +3,9 @@
 //! The catalog stores metadata about database schema including
 //! table definitions, column types, constraints, and indexes.
 //!
-//! Schema is persisted in system tables (system.tables, system.columns, system.indexes)
-//! and the Catalog is a cache rebuilt from those tables on startup.
+//! Schema is persisted in the system tables (the tables of the database
+//! `mysql`: one record per table in `mysql.tables`, with its columns and
+//! indexes), and the Catalog is a cache rebuilt from those tables on startup.
 
 pub mod name;
 pub mod store;
