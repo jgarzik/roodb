@@ -12,6 +12,13 @@
 //!   let go.
 //! - The manifest is replaced atomically. Files it does not list are deleted
 //!   at startup.
+//!
+//! Forgotten ranges (`drop_range`): a key range can be given up as a whole,
+//! which is how a dropped table's rows go. The range is listed in the
+//! manifest, and from then on every read leaves its keys out and so does
+//! every table written. The compaction task removes tables that hold nothing
+//! else, rewrites those that hold other keys too, and takes the range off the
+//! list once no memtable and no table can hold one of its keys.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,7 +39,9 @@ use crate::storage::lsm::compaction::{
     apply_compaction, execute_compaction, pick_compaction, CompactionJob, CompactionLimits,
     L0_COMPACTION_TRIGGER, L1_BASE_SIZE, LAST_LEVEL,
 };
-use crate::storage::lsm::manifest::{persist, Manifest, SstableInfo};
+use crate::storage::lsm::manifest::{
+    forgotten_range, is_forgotten, persist, ForgottenRange, Manifest, SstableInfo,
+};
 use crate::storage::lsm::memtable::Memtable;
 use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
@@ -72,6 +81,12 @@ pub enum CrashPoint {
     /// The manifest lists the compaction's output; its inputs are not yet
     /// deleted.
     CompactionAfterManifestSaved,
+    /// The manifest lists a forgotten range; nothing else has been done
+    /// about it.
+    DropRangeAfterRangeSaved,
+    /// The tables that held nothing but forgotten keys are off the manifest;
+    /// their files are not yet deleted.
+    DropRangeAfterTablesUnlisted,
 }
 
 /// LSM-Tree storage engine configuration
@@ -111,14 +126,24 @@ struct ReadSources {
     frozen: Vec<Arc<Memtable>>,
     /// Tables, newest data first: level 0 newest to oldest, then each level.
     tables: Vec<Arc<SstableReader>>,
+    /// The forgotten ranges at that instant: keys in them are not to be
+    /// returned, whichever of the sources holds them.
+    forgotten: Vec<ForgottenRange>,
 }
 
 /// The table files as they were at one moment. Table files never change,
 /// and a file that compaction deletes meanwhile stays readable through the
 /// handle held here, so the view stays whole for as long as it is kept.
+///
+/// The same goes for forgotten ranges. The view leaves out the keys of the
+/// ranges listed when it was taken. A range forgotten afterwards is not the
+/// view's concern: it goes on showing all of that range's keys, from the
+/// files it holds, though the engine has unlisted and deleted them.
 struct TableView {
     /// Newest data first.
     tables: Vec<Arc<SstableReader>>,
+    /// The forgotten ranges listed when the view was taken.
+    forgotten: Vec<ForgottenRange>,
     /// The files behind `tables`, and the engine they belong to.
     paths: Vec<PathBuf>,
     engine: Weak<Inner>,
@@ -127,8 +152,8 @@ struct TableView {
 impl Drop for TableView {
     fn drop(&mut self) {
         // Where an open file cannot be deleted (Windows), a table that
-        // compaction retired while this view held it open is still on
-        // disk. Now that the view lets go, delete what is no longer listed.
+        // was retired - compacted, replaced, or forgotten - while this view
+        // held it open is still on disk. Now that the view lets go, delete what is no longer listed.
         // (Elsewhere the file is long gone and there is nothing to do.)
         self.tables.clear();
         let Some(engine) = self.engine.upgrade() else {
@@ -150,6 +175,9 @@ impl Drop for TableView {
 #[async_trait]
 impl SnapshotView for TableView {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        if is_forgotten(&self.forgotten, key) {
+            return Ok(None);
+        }
         for table in &self.tables {
             if let Some(found) = table.get(key).await? {
                 return Ok(found);
@@ -165,7 +193,8 @@ impl SnapshotView for TableView {
     ) -> StorageResult<(Vec<KeyValue>, bool)> {
         let mut after = after.map(<[u8]>::to_vec);
         loop {
-            let (entries, done) = merged_chunk(&self.tables, after.as_deref(), max_bytes).await?;
+            let (entries, done) =
+                merged_chunk(&self.tables, after.as_deref(), max_bytes, &self.forgotten).await?;
             let last = entries.last().map(|(key, _)| key.clone());
             let live: Vec<KeyValue> = entries
                 .into_iter()
@@ -206,6 +235,9 @@ impl TableIngest {
                 min_key,
                 max_key: self.last_key.clone(),
                 size: std::fs::metadata(&path)?.len(),
+                // The replacement starts with no range forgotten, and any
+                // forgotten later is numbered above this.
+                filtered_seq: 0,
             },
             path,
         ));
@@ -335,6 +367,12 @@ impl LsmEngine {
     /// Open the engine on a directory, creating it if needed.
     pub async fn open(io: IoEngine, config: LsmConfig) -> StorageResult<Self> {
         let inner = Arc::new(Inner::open(io, config).await?);
+        // Ranges forgotten before the last shutdown or crash may still have
+        // tables to be removed or rewritten: nothing else would wake the
+        // compaction task for them.
+        if inner.compaction_due() {
+            inner.compact_work.notify_one();
+        }
         let workers = vec![
             tokio::spawn(background_task(
                 Arc::downgrade(&inner),
@@ -556,14 +594,14 @@ impl Inner {
         let _writing = self.manifest_io.lock().await;
         let (dir, data, before) = {
             let mut manifest = self.manifest.write();
-            let before = manifest.levels_snapshot();
+            let before = manifest.state_snapshot();
             change(&mut manifest);
             (manifest.dir().to_path_buf(), manifest.snapshot(), before)
         };
         let result = persist(&self.io, &dir, &data).await;
         if let Err(e) = &result {
             if !matches!(e, StorageError::ManifestNotSynced(_)) {
-                self.manifest.write().restore_levels(before);
+                self.manifest.write().restore_state(before);
             }
         }
         result
@@ -621,8 +659,20 @@ impl Inner {
     }
 
     /// Write one frozen memtable out as a level-0 table.
+    ///
+    /// Keys in a forgotten range are left out. A range that is listed only
+    /// after this has looked is numbered above what the table records, so
+    /// the table counts as possibly holding its keys and is dealt with by
+    /// the compaction task.
     async fn flush_memtable(&self, mem: &Memtable, urgency: Urgency) -> StorageResult<()> {
-        let entries = mem.iter();
+        let mut entries = mem.iter();
+        let (forgotten, filtered_seq) = {
+            let manifest = self.manifest.read();
+            (manifest.forgotten().to_vec(), manifest.forgotten_seq())
+        };
+        if !forgotten.is_empty() {
+            entries.retain(|(key, _)| !is_forgotten(&forgotten, key));
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -633,7 +683,7 @@ impl Inner {
             (name, path)
         };
         let result = self
-            .write_level0_table(entries, &name, &path, urgency)
+            .write_level0_table(entries, filtered_seq, &name, &path, urgency)
             .await;
         if let Err(e) = &result {
             self.discard_table(&name, &path, e);
@@ -644,6 +694,7 @@ impl Inner {
     async fn write_level0_table(
         &self,
         entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        filtered_seq: u64,
         name: &str,
         path: &std::path::Path,
         urgency: Urgency,
@@ -666,32 +717,36 @@ impl Inner {
             min_key,
             max_key,
             size: std::fs::metadata(path)?.len(),
+            filtered_seq,
         };
         self.register_table(&info, path).await?;
         self.commit_manifest(|manifest| manifest.add_sstable(0, info))
             .await
     }
 
-    /// Whether any level is over its limit.
+    /// Whether the compaction task has work: a level is over its limit, or
+    /// forgotten ranges are listed.
     fn compaction_due(&self) -> bool {
-        let manifest = self.manifest.read();
-        (0..LAST_LEVEL).any(|level| self.limits.needs_compaction(&manifest, level))
+        self.limits.work_due(&self.manifest.read())
     }
 
-    /// Run compactions until no level is over its limit. A background run
-    /// stops early when the engine is shutting down.
+    /// Run compactions until no level is over its limit and no table may
+    /// hold forgotten keys, then retire the forgotten ranges that nothing
+    /// holds any more. A background run stops early when the engine is
+    /// shutting down.
     async fn compact(&self, background: bool) -> StorageResult<()> {
         let _compacting = self.compaction_lock.lock().await;
         loop {
             if background && self.stopping.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            self.remove_forgotten_tables().await?;
             let job = {
                 let mut manifest = self.manifest.write();
                 pick_compaction(&mut manifest, &self.limits)
             };
             let Some(job) = job else {
-                return Ok(());
+                return self.retire_forgotten().await;
             };
             tracing::debug!(
                 source = job.source_level,
@@ -709,23 +764,141 @@ impl Inner {
             installed?;
             self.crash_at(CrashPoint::CompactionAfterManifestSaved)?;
 
-            {
-                let mut readers = self.reader_cache.write();
-                for name in job.input_names() {
-                    readers.remove(name);
-                    self.block_cache.invalidate_sstable(name);
-                }
-            }
-            let dir = self.manifest.read().dir().to_path_buf();
-            for name in job.input_names() {
-                // A reader that captured this table before the manifest
-                // changed keeps its open handle and can finish. If the delete
-                // fails the file is unlisted and startup will remove it.
-                if let Err(e) = std::fs::remove_file(dir.join(name)) {
-                    tracing::warn!(file = name, error = %e, "failed to delete compacted table");
-                }
+            self.delete_unlisted(job.input_names());
+        }
+    }
+
+    /// Let go of tables the manifest no longer lists, and delete their
+    /// files.
+    fn delete_unlisted<'a>(&self, names: impl Iterator<Item = &'a str> + Clone) {
+        {
+            let mut readers = self.reader_cache.write();
+            for name in names.clone() {
+                readers.remove(name);
+                self.block_cache.invalidate_sstable(name);
             }
         }
+        let dir = self.manifest.read().dir().to_path_buf();
+        for name in names {
+            // A reader or a view that captured this table before the
+            // manifest changed keeps its open handle and can finish. If the
+            // delete fails the file is unlisted and startup will remove it
+            // (or the view that holds it open, when it lets go).
+            if let Err(e) = std::fs::remove_file(dir.join(name)) {
+                tracing::warn!(file = name, error = %e, "failed to delete retired table");
+            }
+        }
+    }
+
+    /// Take the tables that hold nothing but forgotten keys off the manifest
+    /// and delete their files. Called with the compaction lock held, so none
+    /// of them is being compacted into something else meanwhile.
+    async fn remove_forgotten_tables(&self) -> StorageResult<()> {
+        let doomed: Vec<(u32, String)> = {
+            let manifest = self.manifest.read();
+            let forgotten = manifest.forgotten();
+            manifest
+                .levels()
+                .iter()
+                .flat_map(|level| level.files.iter().map(|file| (level.level, file)))
+                .filter(|(_, file)| {
+                    forgotten
+                        .iter()
+                        .any(|range| range.covers(&file.min_key, &file.max_key))
+                })
+                .map(|(level, file)| (level, file.name.clone()))
+                .collect()
+        };
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(tables = doomed.len(), "removing forgotten tables");
+        // Unlisted, durably, before any file goes: a crash from here on
+        // leaves unlisted files, which startup deletes.
+        self.commit_manifest(|manifest| {
+            for (level, name) in &doomed {
+                manifest.remove_sstable(*level, name);
+            }
+        })
+        .await?;
+        self.crash_at(CrashPoint::DropRangeAfterTablesUnlisted)?;
+        self.delete_unlisted(doomed.iter().map(|(_, name)| name.as_str()));
+        Ok(())
+    }
+
+    /// Whether a memtable holds a key of `range`.
+    fn in_memory(&self, range: &ForgottenRange) -> bool {
+        self.memtable.read().has_any_in(&range.start, &range.end)
+            || self
+                .imm_memtables
+                .read()
+                .iter()
+                .any(|memtable| memtable.has_any_in(&range.start, &range.end))
+    }
+
+    /// Take forgotten ranges off the manifest once nothing holds their keys:
+    /// then there is nothing left that could bring them back, and nothing
+    /// for the range to hide.
+    ///
+    /// Called with the compaction lock held, and does nothing while a flush
+    /// is under way: either could be about to list a table written before
+    /// the range was known, with the range's keys in it. A flush wakes the
+    /// compaction task when it is done, which brings this round again.
+    async fn retire_forgotten(&self) -> StorageResult<()> {
+        if self.manifest.read().forgotten().is_empty() {
+            return Ok(());
+        }
+        let Ok(_flushing) = self.flush_lock.try_lock() else {
+            return Ok(());
+        };
+        let any = {
+            let manifest = self.manifest.read();
+            manifest
+                .forgotten()
+                .iter()
+                .any(|range| manifest.can_retire(range, |range| self.in_memory(range)))
+        };
+        if !any {
+            return Ok(());
+        }
+        self.commit_manifest(|manifest| manifest.retire_forgotten(|range| self.in_memory(range)))
+            .await
+    }
+
+    /// Forget every key in `[start, end)`.
+    ///
+    /// The range is listed in the manifest, durably, before this returns:
+    /// from then on reads leave its keys out, whatever still holds them, and
+    /// so does a restart. What is in memory goes at once. Tables are left to
+    /// the compaction task.
+    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        self.check_open()?;
+        if start >= end {
+            return Ok(());
+        }
+        // A repeat (the Raft log replays) finds the range listed and has
+        // nothing to write, unless the range has been retired meanwhile: then
+        // it is listed again, in case the replay brought keys back first.
+        if !self.manifest.read().forgets_all_of(start, end) {
+            self.commit_manifest(|manifest| manifest.forget(start, end))
+                .await?;
+        }
+        self.crash_at(CrashPoint::DropRangeAfterRangeSaved)?;
+
+        // Memtables are given up as they are, frozen ones too: a frozen
+        // memtable being written out right now may already have been read,
+        // and its table is then one of those the compaction task sees to.
+        let (active, frozen) = {
+            let active = self.memtable.read();
+            (Arc::clone(&active), self.imm_memtables.read().clone())
+        };
+        active.remove_range(start, end);
+        for memtable in &frozen {
+            memtable.remove_range(start, end);
+        }
+        self.rebalance_cache();
+        self.compact_work.notify_one();
+        Ok(())
     }
 
     /// Write a compaction's output and install it in the manifest.
@@ -907,6 +1080,7 @@ impl Inner {
         let active = self.memtable.read();
         let frozen = self.imm_memtables.read().clone();
         let readers = self.reader_cache.read();
+        let forgotten = manifest.forgotten().to_vec();
 
         let mut tables = Vec::new();
         for (level_num, level) in manifest.levels().iter().enumerate() {
@@ -933,6 +1107,7 @@ impl Inner {
             active: Arc::clone(&active),
             frozen,
             tables,
+            forgotten,
         })
     }
 
@@ -945,6 +1120,10 @@ impl Inner {
     /// The search stops at `bound`: a key at or past `bound` going forward,
     /// or before it going backward, is not an answer, and nothing beyond it
     /// is looked at.
+    ///
+    /// A forgotten range is stepped over whole: when the nearest key lies in
+    /// one, every source standing in the range moves to its first entry on
+    /// the far side.
     async fn seek(
         &self,
         key: &[u8],
@@ -983,6 +1162,18 @@ impl Inner {
                 (Source::Table(table), false) => table.prev_before(from).await,
             }
         }
+        /// The source's nearest entry on the far side of `range`.
+        async fn leave(
+            source: Source<'_>,
+            range: &ForgottenRange,
+            forward: bool,
+        ) -> StorageResult<Option<Found>> {
+            match (source, forward) {
+                (Source::Memory(memtable), true) => Ok(memtable.first_from(&range.end)),
+                (Source::Table(table), true) => table.first_from(&range.end).await,
+                (_, false) => step(source, &range.start, false).await,
+            }
+        }
         let mut cursors: Vec<(Source<'_>, Option<Found>)> = Vec::new();
         cursors.push((Source::Memory(&sources.active), None));
         for memtable in sources.frozen.iter().rev() {
@@ -1016,6 +1207,16 @@ impl Inner {
             if !within(&found) {
                 return Ok(None);
             }
+            if let Some(range) = forgotten_range(&sources.forgotten, &found) {
+                // The nearest key is the first any source has in this
+                // direction, so a source not yet beyond the range is in it.
+                for (source, at) in &mut cursors {
+                    if at.as_ref().is_some_and(|(k, _)| range.contains(k)) {
+                        *at = leave(*source, range, forward).await?;
+                    }
+                }
+                continue;
+            }
             if !deleted {
                 return Ok(Some(found));
             }
@@ -1032,6 +1233,12 @@ impl Inner {
     /// in key order): one change of the manifest, before which readers and
     /// a restart see the old contents, and after which they see the new.
     /// What was in memory is dropped with the old tables.
+    ///
+    /// The forgotten ranges go too. The new contents come from a view,
+    /// which left out the keys of every range forgotten before it was taken,
+    /// so there is nothing here for those ranges to hide; and a range
+    /// forgotten after the view was taken is forgotten again when the log is
+    /// replayed from the view's position, which lists it anew.
     async fn replace_all(&self, tables: &[(SstableInfo, PathBuf)]) -> StorageResult<()> {
         // No flush or compaction may be under way: it would add tables of
         // the old contents to the new manifest.
@@ -1051,6 +1258,7 @@ impl Inner {
             for (info, _) in tables {
                 manifest.add_sstable(LAST_LEVEL, info.clone());
             }
+            manifest.clear_forgotten();
             // Under the manifest lock, as readers take their view: nobody
             // sees the new tables together with the old memory.
             *self.memtable.write() = Arc::new(Memtable::new());
@@ -1058,19 +1266,7 @@ impl Inner {
         })
         .await?;
 
-        {
-            let mut readers = self.reader_cache.write();
-            for name in &retired {
-                readers.remove(name.as_str());
-                self.block_cache.invalidate_sstable(name);
-            }
-        }
-        let dir = self.manifest.read().dir().to_path_buf();
-        for name in &retired {
-            if let Err(e) = std::fs::remove_file(dir.join(name)) {
-                tracing::warn!(file = name.as_str(), error = %e, "failed to delete replaced table");
-            }
-        }
+        self.delete_unlisted(retired.iter().map(String::as_str));
         self.rebalance_cache();
         Ok(())
     }
@@ -1137,6 +1333,9 @@ impl Inner {
 impl Inner {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.check_open()?;
+        if self.manifest.read().is_forgotten(key) {
+            return Ok(None);
+        }
         // A tombstone and a key that was never written read the same.
         Ok(self.read_all(key).await?.flatten())
     }
@@ -1163,7 +1362,10 @@ impl Inner {
         }
 
         // Merge, dedup, and strip tombstones in O(n log k)
-        let result: Vec<KeyValue> = merger.merge_live();
+        let mut result: Vec<KeyValue> = merger.merge_live();
+        if !sources.forgotten.is_empty() {
+            result.retain(|(key, _)| !is_forgotten(&sources.forgotten, key));
+        }
 
         let io_ns = t_start.elapsed().as_nanos() as u64 - lock_ns;
         tracing::debug!(
@@ -1186,6 +1388,9 @@ impl StorageEngine for LsmEngine {
 
     async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.inner.check_open()?;
+        if self.inner.manifest.read().is_forgotten(key) {
+            return Ok(None);
+        }
         for table in self.inner.tables_for(key)? {
             if let Some(result) = table.get(key).await? {
                 return Ok(result);
@@ -1212,7 +1417,9 @@ impl StorageEngine for LsmEngine {
 
     async fn snapshot_view(&self) -> StorageResult<Arc<dyn SnapshotView>> {
         self.inner.check_open()?;
-        let tables = self.inner.read_sources()?.tables;
+        let ReadSources {
+            tables, forgotten, ..
+        } = self.inner.read_sources()?;
         let dir = self.inner.manifest.read().dir().to_path_buf();
         let paths = tables
             .iter()
@@ -1220,6 +1427,7 @@ impl StorageEngine for LsmEngine {
             .collect();
         Ok(Arc::new(TableView {
             tables,
+            forgotten,
             paths,
             engine: Arc::downgrade(&self.inner),
         }))
@@ -1234,6 +1442,10 @@ impl StorageEngine for LsmEngine {
             finished: Vec::new(),
             committed: false,
         }))
+    }
+
+    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        self.inner.drop_range(start, end).await
     }
 
     async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
@@ -1266,5 +1478,159 @@ impl StorageEngine for LsmEngine {
         // holds a handle to it; let the next one in.
         self.inner.dir_lock.lock().take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::IoBackend;
+
+    /// Keys of three tables side by side, `a:`, `b:` and `c:`, spread over
+    /// the active memtable, a frozen memtable and tables in several levels.
+    /// Forgetting `b:` removes its keys from every kind of read at once,
+    /// wherever they are, and nothing else. (A frozen memtable can only be
+    /// held still from in here, which is why this test is.)
+    #[tokio::test]
+    async fn a_forgotten_range_vanishes_from_memory_and_every_level() {
+        const PER_ROUND: u32 = 150;
+        let dir = tempfile::tempdir().unwrap();
+        let config = LsmConfig {
+            dir: dir.path().to_path_buf(),
+            // Tiny levels: a few flushes spread the data over several.
+            l0_compaction_trigger: 2,
+            level_base_bytes: 16 * 1024,
+            ..Default::default()
+        };
+        let io = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
+        let engine = LsmEngine::open(io.clone(), config.clone()).await.unwrap();
+        let key =
+            |table: char, round: u32, n: u32| format!("{table}:{round:02}-{n:04}").into_bytes();
+        let write_round = |round: u32| {
+            let engine = &engine;
+            async move {
+                for n in 0..PER_ROUND {
+                    for table in ['a', 'b', 'c'] {
+                        let value = [round as u8; 100];
+                        engine.put(&key(table, round, n), &value).await.unwrap();
+                    }
+                }
+            }
+        };
+
+        // The keys on either side of the range, in a table: the last one
+        // before its start, and its end, which is not part of it.
+        engine.put(b"b9", b"before").await.unwrap();
+        engine.put(b"b;", b"end").await.unwrap();
+        for round in 0..7 {
+            write_round(round).await;
+            engine.flush().await.unwrap();
+        }
+        let levels_in_use = {
+            let manifest = engine.inner.manifest.read();
+            manifest
+                .levels()
+                .iter()
+                .filter(|level| !level.files.is_empty())
+                .count()
+        };
+        assert!(levels_in_use >= 2, "the tables are all in one level");
+        // A frozen memtable, which stays frozen: nothing wakes the flusher.
+        write_round(7).await;
+        engine.inner.rotate(0);
+        assert_eq!(engine.inner.imm_memtables.read().len(), 1);
+        // And the active one, with neighbours of its own and the first key
+        // of the range.
+        write_round(8).await;
+        engine.put(b"b9z", b"before").await.unwrap();
+        engine.put(b"b:", b"first").await.unwrap();
+        engine.put(b"b;0", b"after").await.unwrap();
+
+        engine.drop_range(b"b:", b"b;").await.unwrap();
+
+        let frozen = engine.inner.imm_memtables.read().clone();
+        assert_eq!(frozen.len(), 1, "the frozen memtable was flushed");
+        assert!(!frozen[0].has_any_in(b"b:", b"b;"));
+        assert!(frozen[0].has_any_in(b"a:", b"a;"));
+
+        assert_eq!(engine.get(b"b:").await.unwrap(), None);
+        for round in 0..9 {
+            for n in (0..PER_ROUND).step_by(7) {
+                assert_eq!(
+                    engine.get(&key('b', round, n)).await.unwrap(),
+                    None,
+                    "round {round}"
+                );
+                for table in ['a', 'c'] {
+                    assert_eq!(
+                        engine.get(&key(table, round, n)).await.unwrap(),
+                        Some(vec![round as u8; 100]),
+                        "{table} round {round}"
+                    );
+                }
+            }
+        }
+        assert!(engine
+            .scan(Some(b"b:"), Some(b"b;"))
+            .await
+            .unwrap()
+            .is_empty());
+        let all = engine.scan(None, None).await.unwrap();
+        assert_eq!(all.len(), 2 * 9 * PER_ROUND as usize + 4);
+        assert!(all
+            .iter()
+            .all(|(k, _)| !(b"b:"[..] <= k[..] && k[..] < b"b;"[..])));
+        let around: Vec<&[u8]> = all
+            .iter()
+            .map(|(k, _)| k.as_slice())
+            .filter(|k| k.starts_with(b"b"))
+            .collect();
+        assert_eq!(around, [&b"b9"[..], b"b9z", b"b;", b"b;0"]);
+
+        // The nearest key on either side is found across the range, from
+        // outside it and from inside it, in both directions.
+        let (low, high) = (&b"a"[..], &b"z"[..]);
+        let next = |from: Vec<u8>, high: &'static [u8]| {
+            let engine = &engine;
+            async move { engine.next_key(&from, high).await.unwrap() }
+        };
+        let prev = |from: Vec<u8>, low: &'static [u8]| {
+            let engine = &engine;
+            async move { engine.prev_key(&from, low).await.unwrap() }
+        };
+        assert_eq!(next(b"b9".to_vec(), high).await, Some(b"b9z".to_vec()));
+        assert_eq!(next(b"b9z".to_vec(), high).await, Some(b"b;".to_vec()));
+        assert_eq!(next(b"b:".to_vec(), high).await, Some(b"b;".to_vec()));
+        assert_eq!(next(key('b', 4, 10), high).await, Some(b"b;".to_vec()));
+        assert_eq!(next(b"b;".to_vec(), high).await, Some(b"b;0".to_vec()));
+        assert_eq!(prev(b"b;0".to_vec(), low).await, Some(b"b;".to_vec()));
+        assert_eq!(prev(b"b;".to_vec(), low).await, Some(b"b9z".to_vec()));
+        assert_eq!(prev(key('b', 4, 10), low).await, Some(b"b9z".to_vec()));
+        assert_eq!(prev(b"b:".to_vec(), low).await, Some(b"b9z".to_vec()));
+        assert_eq!(prev(b"b9z".to_vec(), low).await, Some(b"b9".to_vec()));
+        // A search bounded inside the range finds nothing there.
+        assert_eq!(next(b"b9z".to_vec(), b"b:5").await, None);
+        assert_eq!(prev(b"b;".to_vec(), b"b:5").await, None);
+        assert_eq!(next(b"b9z".to_vec(), b"b;").await, None);
+        assert_eq!(prev(b"b;".to_vec(), b"b:").await, None);
+
+        // The same once everything is in tables, and after a restart.
+        engine.flush().await.unwrap();
+        assert!(engine
+            .scan(Some(b"b:"), Some(b"b;"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(engine.scan(None, None).await.unwrap() == all);
+        assert_eq!(next(b"b9z".to_vec(), high).await, Some(b"b;".to_vec()));
+        assert_eq!(prev(b"b;".to_vec(), low).await, Some(b"b9z".to_vec()));
+        engine.close().await.unwrap();
+        drop(engine);
+
+        let engine = LsmEngine::open(io, config).await.unwrap();
+        assert!(engine.scan(None, None).await.unwrap() == all);
+        assert_eq!(engine.get(&key('b', 0, 0)).await.unwrap(), None);
+        assert_eq!(engine.get(&key('b', 8, 0)).await.unwrap(), None);
+        engine.close().await.unwrap();
     }
 }

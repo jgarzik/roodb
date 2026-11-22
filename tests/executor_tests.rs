@@ -59,6 +59,12 @@ impl StorageEngine for MockStorage {
         Ok(())
     }
 
+    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        let mut data = self.data.lock().unwrap();
+        data.retain(|(k, _)| k.as_slice() < start || k.as_slice() >= end);
+        Ok(())
+    }
+
     async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.get(key).await
     }

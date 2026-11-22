@@ -135,6 +135,16 @@ pub trait StorageEngine: Send + Sync {
     /// what reaches disk holds either all of a batch or none of it.
     async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()>;
 
+    /// Forget every key in `[start, end)`, now and for good: the caller
+    /// guarantees nothing will be written there again.
+    ///
+    /// When this returns, no read finds a key of the range any more, nor
+    /// does a view taken from now on, and that survives a restart. The space
+    /// the keys took is given back in the background. Calling it again with
+    /// the same or an overlapping range is harmless. A view taken earlier
+    /// is unaffected: it goes on showing the keys it had.
+    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()>;
+
     /// Scan a range of keys
     ///
     /// Returns key-value pairs in sorted order where `start <= key < end`.

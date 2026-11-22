@@ -607,7 +607,24 @@ impl SstableReader {
     /// The first entry after `key`: its key, and whether it is a tombstone.
     /// Reads one block, or two when `key` is the last of its block.
     pub async fn next_after(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, bool)>> {
-        if self.index.is_empty() || key >= self.metadata.max_key.as_slice() {
+        self.first_beyond(key, false).await
+    }
+
+    /// The first entry at or after `key`: its key, and whether it is a
+    /// tombstone. Reads one block, or two when the block `key` falls in has
+    /// nothing that far on.
+    pub async fn first_from(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, bool)>> {
+        self.first_beyond(key, true).await
+    }
+
+    /// The first entry after `key`, or at it if `inclusive`.
+    async fn first_beyond(
+        &self,
+        key: &[u8],
+        inclusive: bool,
+    ) -> StorageResult<Option<(Vec<u8>, bool)>> {
+        let max_key = self.metadata.max_key.as_slice();
+        if self.index.is_empty() || key > max_key || (key == max_key && !inclusive) {
             return Ok(None);
         }
         let mut block_idx = self.find_block(key);
@@ -615,7 +632,9 @@ impl SstableReader {
             let block = self.fetch_blocks(&[block_idx]).await?.remove(0);
             let reader = BlockReader::parse_verified(&block)?;
             let entries = reader.entries();
-            let at = entries.partition_point(|entry| entry.key.as_slice() <= key);
+            let at = entries.partition_point(|entry| {
+                entry.key.as_slice() < key || (!inclusive && entry.key.as_slice() == key)
+            });
             if let Some(entry) = entries.get(at) {
                 return Ok(Some((entry.key.clone(), entry.is_tombstone())));
             }

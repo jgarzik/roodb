@@ -223,6 +223,10 @@ mod tests {
             Ok(())
         }
 
+        async fn drop_range(&self, _start: &[u8], _end: &[u8]) -> StorageResult<()> {
+            Ok(())
+        }
+
         async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
             self.get(key).await
         }

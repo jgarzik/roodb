@@ -13,12 +13,17 @@
 //! Deletion markers (tombstones) are carried down with the data. One is
 //! dropped only when nothing below the output could still hold an older value
 //! of that key; dropping it earlier would bring the deleted value back.
+//!
+//! Compaction is also what removes the keys of forgotten ranges (see
+//! `Manifest::forget`) from tables that hold other keys as well: every merge
+//! leaves them out, and a table that may hold some is compacted for that
+//! reason alone, whatever its level's size.
 
 use std::path::PathBuf;
 
 use crate::io::{IoEngine, Urgency};
 use crate::storage::error::StorageResult;
-use crate::storage::lsm::manifest::{Manifest, SstableInfo};
+use crate::storage::lsm::manifest::{is_forgotten, ForgottenRange, Manifest, SstableInfo};
 use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 
@@ -69,12 +74,24 @@ impl CompactionLimits {
         }
         manifest.level_size(level) > self.max_level_bytes(level)
     }
+
+    /// Whether the compaction task has anything to do: a level is over its
+    /// limit, or forgotten ranges are listed (their tables are to be removed
+    /// or rewritten, and the ranges retired once that is done).
+    pub fn work_due(&self, manifest: &Manifest) -> bool {
+        !manifest.forgotten().is_empty()
+            || (0..LAST_LEVEL).any(|level| self.needs_compaction(manifest, level))
+    }
 }
 
-/// One compaction: inputs from two adjacent levels, one output.
+/// One compaction: inputs from two adjacent levels, one output. A job that
+/// only rewrites a table to rid it of forgotten keys has one input, and its
+/// output stays in the same level.
 #[derive(Debug)]
 pub struct CompactionJob {
     pub source_level: u32,
+    /// The level below the source; or the source level itself when a table
+    /// is rewritten in place.
     pub target_level: u32,
     /// Files taken from the source level.
     pub source_files: Vec<SstableInfo>,
@@ -88,11 +105,17 @@ pub struct CompactionJob {
     /// Nothing below the target level overlaps this job's key range, so
     /// tombstones have nothing left to hide and can be dropped.
     pub drop_tombstones: bool,
+    /// The forgotten ranges listed when the job was picked. Their keys are
+    /// left out of the output.
+    pub forgotten: Vec<ForgottenRange>,
+    /// The number of the newest forgotten range at that moment: what the
+    /// output records as [`SstableInfo::filtered_seq`].
+    pub filtered_seq: u64,
 }
 
 impl CompactionJob {
     /// Names of every input file.
-    pub fn input_names(&self) -> impl Iterator<Item = &str> {
+    pub fn input_names(&self) -> impl Iterator<Item = &str> + Clone {
         self.source_files
             .iter()
             .chain(&self.target_files)
@@ -102,36 +125,78 @@ impl CompactionJob {
 
 /// Choose the next compaction, if any level is due. Level 0 goes first: its
 /// files are the ones every read has to search.
+///
+/// When no level is due, a table that may hold keys of a forgotten range is
+/// chosen instead, so that those keys do not stay on disk until the table
+/// happens to be compacted for its size. (Tables that hold nothing else are
+/// not compacted but simply removed; the engine does that before it asks.)
 pub fn pick_compaction(
     manifest: &mut Manifest,
     limits: &CompactionLimits,
 ) -> Option<CompactionJob> {
-    let source_level = (0..LAST_LEVEL).find(|&level| limits.needs_compaction(manifest, level))?;
-    let target_level = source_level + 1;
+    if let Some(source_level) =
+        (0..LAST_LEVEL).find(|&level| limits.needs_compaction(manifest, level))
+    {
+        let source_files: Vec<SstableInfo> = if source_level == 0 {
+            level_zero_newest_first(manifest)
+        } else {
+            // The largest file: the most relief for the level.
+            vec![manifest
+                .get_level(source_level)
+                .iter()
+                .max_by_key(|f| f.size)?
+                .clone()]
+        };
+        return build_job(manifest, source_level, source_level + 1, source_files);
+    }
 
-    let source_files: Vec<SstableInfo> = if source_level == 0 {
-        // All of level 0, newest first (files are appended as they are flushed).
-        manifest.get_level(0).iter().rev().cloned().collect()
+    let (level, table) = manifest.levels().iter().find_map(|level| {
+        let table = level.files.iter().find(|f| manifest.holds_forgotten(f))?;
+        Some((level.level, table.clone()))
+    })?;
+    if level == 0 {
+        // A level-0 table cannot be taken out on its own: the others may
+        // hold older values of its keys, and what leaves level 0 counts as
+        // older than what stays. All of level 0 goes down together.
+        let source_files = level_zero_newest_first(manifest);
+        build_job(manifest, 0, 1, source_files)
     } else {
-        // The largest file: the most relief for the level.
-        vec![manifest
-            .get_level(source_level)
-            .iter()
-            .max_by_key(|f| f.size)?
-            .clone()]
-    };
+        // Deeper tables do not overlap their level's other tables, and what
+        // comes out covers no more than what went in: rewrite it where it is.
+        build_job(manifest, level, level, vec![table])
+    }
+}
+
+/// All of level 0, newest first (files are appended as they are flushed).
+fn level_zero_newest_first(manifest: &Manifest) -> Vec<SstableInfo> {
+    manifest.get_level(0).iter().rev().cloned().collect()
+}
+
+/// A job that merges `source_files` of `source_level` with the files they
+/// overlap in `target_level`; or, when the two levels are the same, rewrites
+/// them on their own.
+fn build_job(
+    manifest: &mut Manifest,
+    source_level: u32,
+    target_level: u32,
+    source_files: Vec<SstableInfo>,
+) -> Option<CompactionJob> {
     if source_files.is_empty() {
         return None;
     }
 
     let (min_key, max_key) = find_key_range(&source_files);
     let overlaps = |f: &SstableInfo| ranges_overlap(&f.min_key, &f.max_key, &min_key, &max_key);
-    let target_files: Vec<SstableInfo> = manifest
-        .get_level(target_level)
-        .iter()
-        .filter(|f| overlaps(f))
-        .cloned()
-        .collect();
+    let target_files: Vec<SstableInfo> = if target_level == source_level {
+        Vec::new()
+    } else {
+        manifest
+            .get_level(target_level)
+            .iter()
+            .filter(|f| overlaps(f))
+            .cloned()
+            .collect()
+    };
 
     // The output covers the union of the inputs' ranges. If any deeper file
     // overlaps that, it may hold an older value that a tombstone must go on
@@ -167,6 +232,8 @@ pub fn pick_compaction(
         output_path,
         input_paths,
         drop_tombstones: !deeper_overlap,
+        forgotten: manifest.forgotten().to_vec(),
+        filtered_seq: manifest.forgotten_seq(),
     })
 }
 
@@ -179,10 +246,39 @@ const COMPACTION_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// tables hold a key, the first of them decides. The flag says whether
 /// these were the last.
 ///
+/// Keys in one of the `forgotten` ranges are left out, as if no table held
+/// them.
+pub(crate) async fn merged_chunk(
+    tables: &[std::sync::Arc<SstableReader>],
+    after: Option<&[u8]>,
+    max_bytes: usize,
+    forgotten: &[ForgottenRange],
+) -> StorageResult<(Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)> {
+    if forgotten.is_empty() {
+        return merged_stretch(tables, after, max_bytes).await;
+    }
+    let mut after = after.map(<[u8]>::to_vec);
+    loop {
+        let (mut entries, done) = merged_stretch(tables, after.as_deref(), max_bytes).await?;
+        let last = entries.last().map(|(key, _)| key.clone());
+        entries.retain(|(key, _)| !is_forgotten(forgotten, key));
+        if !entries.is_empty() || done {
+            return Ok((entries, done));
+        }
+        // Everything in this stretch was forgotten: go on from its end.
+        match last {
+            Some(last) => after = Some(last),
+            None => return Ok((entries, true)),
+        }
+    }
+}
+
+/// [`merged_chunk`] before forgotten keys are left out.
+///
 /// Only the tables the stretch can come from are read. Tables are mostly
 /// non-overlapping and in key order; reading every table for every stretch
 /// would read the whole of them over and over.
-pub(crate) async fn merged_chunk(
+async fn merged_stretch(
     tables: &[std::sync::Arc<SstableReader>],
     after: Option<&[u8]>,
     max_bytes: usize,
@@ -260,8 +356,9 @@ pub(crate) async fn merged_chunk(
     }
 }
 
-/// Merge the inputs and write the output table. Returns `None` if nothing is
-/// left to write (every entry was a tombstone with nothing to hide).
+/// Merge the inputs and write the output table, leaving out the keys of the
+/// job's forgotten ranges. Returns `None` if nothing is left to write (every
+/// entry was forgotten, or a tombstone with nothing to hide).
 ///
 /// The inputs are read and the output written a stretch at a time: what a
 /// compaction holds in memory does not grow with the size of its tables.
@@ -280,8 +377,13 @@ pub async fn execute_compaction(
     let mut max_key: Vec<u8> = Vec::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
-        let (entries, done) =
-            merged_chunk(&inputs, after.as_deref(), COMPACTION_CHUNK_BYTES).await?;
+        let (entries, done) = merged_chunk(
+            &inputs,
+            after.as_deref(),
+            COMPACTION_CHUNK_BYTES,
+            &job.forgotten,
+        )
+        .await?;
         if let Some((last, _)) = entries.last() {
             after = Some(last.clone());
         }
@@ -317,6 +419,7 @@ pub async fn execute_compaction(
         min_key,
         max_key,
         size,
+        filtered_seq: job.filtered_seq,
     }))
 }
 
@@ -367,6 +470,7 @@ mod tests {
             min_key: min.as_bytes().to_vec(),
             max_key: max.as_bytes().to_vec(),
             size,
+            filtered_seq: 0,
         }
     }
 
@@ -469,6 +573,57 @@ mod tests {
         let l2: Vec<&str> = m.get_level(2).iter().map(|f| f.name.as_str()).collect();
         assert_eq!(l1, ["small.sst"]);
         assert_eq!(l2, ["aside.sst", "out.sst"]);
+    }
+
+    #[test]
+    fn a_table_that_may_hold_forgotten_keys_is_picked_without_a_size_trigger() {
+        let limits = CompactionLimits::default();
+
+        // In a deeper level - the last one included - the table is
+        // rewritten where it is, alone.
+        for level in [1, 3, LAST_LEVEL] {
+            let (_dir, mut m) = manifest();
+            m.add_sstable(level, info("aside.sst", "a", "c", 100));
+            m.add_sstable(level, info("part.sst", "k", "n", 100));
+            m.add_sstable(level, info("other.sst", "q", "z", 100));
+            assert!(pick_compaction(&mut m, &limits).is_none());
+            assert!(!limits.work_due(&m));
+
+            m.forget(b"m", b"p");
+            assert!(limits.work_due(&m));
+            let job = pick_compaction(&mut m, &limits).unwrap();
+            assert_eq!((job.source_level, job.target_level), (level, level));
+            assert_eq!(job.input_names().collect::<Vec<_>>(), ["part.sst"]);
+            assert_eq!(job.forgotten, m.forgotten());
+            assert_eq!(job.filtered_seq, 1);
+            assert!(job.drop_tombstones);
+
+            // The output is known to be rid of the range: nothing more to
+            // pick, though it still spans the range.
+            let mut out = info("out.sst", "k", "q", 90);
+            out.filtered_seq = job.filtered_seq;
+            apply_compaction(&mut m, &job, Some(out));
+            assert_eq!(m.level_count(level), 3);
+            assert!(pick_compaction(&mut m, &limits).is_none());
+        }
+
+        // Tombstones in a rewritten table go on hiding what lies deeper.
+        let (_dir, mut m) = manifest();
+        m.add_sstable(2, info("part.sst", "k", "n", 100));
+        m.add_sstable(4, info("deep.sst", "j", "l", 100));
+        m.forget(b"m", b"p");
+        assert!(!pick_compaction(&mut m, &limits).unwrap().drop_tombstones);
+
+        // In level 0 the whole level goes down, newest first.
+        let (_dir, mut m) = manifest();
+        m.add_sstable(0, info("old.sst", "a", "n", 100));
+        m.add_sstable(0, info("new.sst", "a", "c", 100));
+        m.add_sstable(1, info("l1.sst", "b", "d", 100));
+        m.forget(b"m", b"p");
+        let job = pick_compaction(&mut m, &limits).unwrap();
+        assert_eq!((job.source_level, job.target_level), (0, 1));
+        let names: Vec<&str> = job.input_names().collect();
+        assert_eq!(names, ["new.sst", "old.sst", "l1.sst"]);
     }
 
     #[test]

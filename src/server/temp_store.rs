@@ -324,6 +324,34 @@ impl StorageEngine for SessionStorage {
         self.shared.write_batch(shared).await
     }
 
+    /// Like a scan, a range belongs to whichever side its start key lives
+    /// on: ranges are those of one table at a time. This session's rows in
+    /// the range go in either case. The shared engine is told only when the
+    /// range is not one of this session's temporary tables: a temporary
+    /// table hides a shared table of the same name, whose keys are the same,
+    /// and dropping the one must not empty the other.
+    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        if start >= end {
+            return Ok(());
+        }
+        if self.has_temp.load(Ordering::Relaxed) {
+            use std::ops::Bound::{Excluded, Included};
+            let mut temp = self.temp.write();
+            let keys: Vec<Vec<u8>> = temp
+                .rows
+                .range::<[u8], _>((Included(start), Excluded(end)))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                temp.remove(&key);
+            }
+            if temp.owns(start) {
+                return Ok(());
+            }
+        }
+        self.shared.drop_range(start, end).await
+    }
+
     /// A scan is served from wherever its start key lives: scans are made
     /// over one table at a time.
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>> {
@@ -413,6 +441,9 @@ mod tests {
         }
         async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
             panic!("temporary rows written to shared storage: {batch:?}");
+        }
+        async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
+            panic!("range dropped from shared storage: {start:?}..{end:?}");
         }
         async fn scan(
             &self,
@@ -642,5 +673,47 @@ mod tests {
             storage.get(&key("b", 1)).await.unwrap(),
             Some(b"shared".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_range_of_a_temporary_table_stays_in_the_session() {
+        let storage = SessionStorage::new(Arc::new(Untouched));
+        storage.add_table("a");
+        storage.add_table("b");
+        storage.apply(
+            1,
+            vec![
+                RowChange::insert("a", key("a", 1), b"a".to_vec()),
+                RowChange::insert("a", key("a", 2), b"a".to_vec()),
+                RowChange::insert("b", key("b", 1), b"b".to_vec()),
+            ],
+            false,
+        );
+        let before = storage.temp.read().bytes;
+        // The shared engine is not told: it would panic.
+        storage
+            .drop_range(&table_key_prefix("a"), &table_key_end("a"))
+            .await
+            .unwrap();
+        assert_eq!(storage.get(&key("a", 1)).await.unwrap(), None);
+        assert_eq!(storage.get(&key("a", 2)).await.unwrap(), None);
+        assert!(storage.get(&key("b", 1)).await.unwrap().is_some());
+        assert!(storage.temp.read().bytes < before);
+        // Empty and inverted ranges hold nothing.
+        storage
+            .drop_range(&table_key_end("b"), &table_key_prefix("b"))
+            .await
+            .unwrap();
+        assert!(storage.get(&key("b", 1)).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "range dropped from shared storage")]
+    async fn a_dropped_range_elsewhere_goes_to_the_shared_engine() {
+        let storage = SessionStorage::new(Arc::new(Untouched));
+        storage.add_table("a");
+        let _ = storage
+            .drop_range(&table_key_prefix("other"), &table_key_end("other"))
+            .await;
     }
 }

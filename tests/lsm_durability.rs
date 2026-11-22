@@ -1049,3 +1049,631 @@ async fn initialisation_writes_rows_the_server_reads() {
     assert!(bound >= 1);
     storage.close().await.unwrap();
 }
+
+// Forgotten ranges. The tests keep three tables' worth of keys side by side,
+// `a:`, `b:` and `c:`, and forget `b:`, which is `[b:, b;)`.
+
+const B_START: &[u8] = b"b:";
+const B_END: &[u8] = b"b;";
+
+fn tkey(table: char, n: u32) -> Vec<u8> {
+    format!("{table}:{n:05}").into_bytes()
+}
+
+fn tvalue(table: char, n: u32) -> Vec<u8> {
+    value_of(120, (table as u32 + n) as u8)
+}
+
+/// Write keys `range` of each of `tables`.
+async fn put_keys(engine: &LsmEngine, tables: &[char], range: std::ops::Range<u32>) {
+    for n in range {
+        for &table in tables {
+            engine
+                .put(&tkey(table, n), &tvalue(table, n))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Every key of `a:` and `c:` in `range` is there, and none of `b:`.
+async fn check_only_b_is_gone(engine: &LsmEngine, range: std::ops::Range<u32>, when: &str) {
+    for n in range.clone() {
+        assert_eq!(engine.get(&tkey('b', n)).await.unwrap(), None, "{when}");
+        for table in ['a', 'c'] {
+            assert_eq!(
+                engine.get(&tkey(table, n)).await.unwrap(),
+                Some(tvalue(table, n)),
+                "{when}: {table}:{n}"
+            );
+        }
+    }
+    let in_range = engine.scan(Some(B_START), Some(B_END)).await.unwrap();
+    assert!(in_range.is_empty(), "{when}: a scan found forgotten keys");
+    let all = engine.scan(None, None).await.unwrap();
+    assert!(
+        all.iter()
+            .all(|(key, _)| key.as_slice() < B_START || key.as_slice() >= B_END),
+        "{when}: a scan of everything found forgotten keys"
+    );
+    for table in ['a', 'c'] {
+        let count = all.iter().filter(|(key, _)| key[0] == table as u8).count();
+        assert_eq!(count, range.len(), "{when}: keys of {table}:");
+    }
+}
+
+/// What the manifest on disk says.
+fn manifest_on_disk(dir: &Path) -> roodb::storage::lsm::manifest::ManifestData {
+    let text = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// Names of the tables the manifest on disk lists.
+fn listed_tables(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = manifest_on_disk(dir)
+        .levels
+        .iter()
+        .flat_map(|level| level.files.iter().map(|file| file.name.clone()))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Wait for the engine's background work to bring something about.
+async fn wait_for(what: &str, reached: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !reached() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the engine's background work never got as far as: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Everything a view holds, read in small pieces.
+async fn read_view(view: &dyn roodb::storage::traits::SnapshotView) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut seen = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (chunk, done) = view.next_chunk(after.as_deref(), 8 * 1024).await.unwrap();
+        if let Some(last) = chunk.last() {
+            after = Some(last.0.clone());
+        }
+        seen.extend(chunk);
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// A forgotten range is gone from every read at once - keys in memory and
+/// keys in tables alike - while its neighbours on both sides stay. It stays
+/// gone over a restart, forgetting it again changes nothing, and the keys
+/// next to it can be written and read as before.
+#[tokio::test]
+async fn a_forgotten_range_is_gone_and_stays_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        l0_compaction_trigger: 2,
+        level_base_bytes: 16 * 1024,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg.clone()).await.unwrap();
+    // The last key before the range, and the key that ends it.
+    engine.put(b"b9", b"before").await.unwrap();
+    engine.put(B_END, b"end").await.unwrap();
+    for round in 0..6 {
+        put_keys(&engine, &['a', 'b', 'c'], round * 100..(round + 1) * 100).await;
+        engine.flush().await.unwrap();
+    }
+    // Still in memory.
+    put_keys(&engine, &['a', 'b', 'c'], 600..700).await;
+    engine.put(B_START, b"first of the range").await.unwrap();
+
+    engine.drop_range(B_START, B_END).await.unwrap();
+
+    check_only_b_is_gone(&engine, 0..700, "after the drop").await;
+    assert_eq!(engine.get(B_START).await.unwrap(), None);
+    assert_eq!(engine.get(b"b9").await.unwrap(), Some(b"before".to_vec()));
+    assert_eq!(engine.get(B_END).await.unwrap(), Some(b"end".to_vec()));
+    // The nearest keys are found across the gap, from either side and from
+    // inside it.
+    assert_eq!(
+        engine.next_key(b"b9", b"z").await.unwrap(),
+        Some(B_END.to_vec())
+    );
+    assert_eq!(
+        engine.next_key(&tkey('b', 300), b"z").await.unwrap(),
+        Some(B_END.to_vec())
+    );
+    assert_eq!(
+        engine.prev_key(B_END, b"a").await.unwrap(),
+        Some(b"b9".to_vec())
+    );
+    assert_eq!(
+        engine.prev_key(&tkey('b', 300), b"a").await.unwrap(),
+        Some(b"b9".to_vec())
+    );
+    assert_eq!(engine.next_key(b"b9", B_END).await.unwrap(), None);
+    assert_eq!(engine.prev_key(B_END, B_START).await.unwrap(), None);
+
+    // Again, with the same range and with ones that overlap it: harmless.
+    engine.drop_range(B_START, B_END).await.unwrap();
+    engine.drop_range(b"b:00100", b"b:00200").await.unwrap();
+    engine.drop_range(b"b:00650", B_END).await.unwrap();
+    // An empty range and an inverted one hold nothing.
+    engine.drop_range(b"a:", b"a:").await.unwrap();
+    engine.drop_range(b"c;", b"a:").await.unwrap();
+    check_only_b_is_gone(&engine, 0..700, "after repeating the drop").await;
+
+    // The ranges on both sides take writes as before.
+    put_keys(&engine, &['a', 'c'], 700..800).await;
+    engine.put(b"b9z", b"new neighbour").await.unwrap();
+    engine.put(b"b;0", b"new neighbour").await.unwrap();
+    check_only_b_is_gone(&engine, 0..800, "after writing next to it").await;
+    engine.flush().await.unwrap();
+    check_only_b_is_gone(&engine, 0..800, "after a flush").await;
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg.clone()).await.unwrap();
+    check_only_b_is_gone(&engine, 0..800, "after a restart").await;
+    assert_eq!(engine.get(b"b9").await.unwrap(), Some(b"before".to_vec()));
+    assert_eq!(
+        engine.get(b"b9z").await.unwrap(),
+        Some(b"new neighbour".to_vec())
+    );
+    assert_eq!(engine.get(B_END).await.unwrap(), Some(b"end".to_vec()));
+    assert_eq!(
+        engine.get(b"b;0").await.unwrap(),
+        Some(b"new neighbour".to_vec())
+    );
+    // The log replays the drop after a restart.
+    engine.drop_range(B_START, B_END).await.unwrap();
+    check_only_b_is_gone(&engine, 0..800, "after a replayed drop").await;
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    check_only_b_is_gone(&engine, 0..800, "after a second restart").await;
+    engine.close().await.unwrap();
+}
+
+/// Stop at each point where a crash while forgetting a range leaves the
+/// directory in a distinct state - the range recorded and nothing else done;
+/// tables unlisted but their files still there; everything done - and
+/// reopen. The range is gone, its neighbours are not, the files end up
+/// deleted and the engine goes on working.
+#[tokio::test]
+async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
+    for point in [
+        Some(CrashPoint::DropRangeAfterRangeSaved),
+        Some(CrashPoint::DropRangeAfterTablesUnlisted),
+        None,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = config(dir.path());
+
+        // Two tables of nothing but `b:` keys and one with all three kinds:
+        // three tables in level 0, one short of the compaction trigger.
+        let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+        put_keys(&engine, &['b'], 0..200).await;
+        engine.flush().await.unwrap();
+        put_keys(&engine, &['b'], 200..400).await;
+        engine.flush().await.unwrap();
+        let only_b = sst_files(dir.path());
+        assert_eq!(only_b.len(), 2);
+        put_keys(&engine, &['a', 'b', 'c'], 400..600).await;
+        engine.flush().await.unwrap();
+        engine.close().await.unwrap();
+        drop(engine);
+        assert_eq!(sst_files(dir.path()).len(), 3);
+
+        let armed = LsmConfig {
+            crash_point: point,
+            ..base.clone()
+        };
+        let engine = LsmEngine::open(io(), armed).await.unwrap();
+        let dropped = engine.drop_range(B_START, B_END).await;
+        match point {
+            Some(CrashPoint::DropRangeAfterRangeSaved) => {
+                assert!(dropped.is_err(), "the crash point did not stop the drop");
+                assert_eq!(manifest_on_disk(dir.path()).forgotten.len(), 1);
+                assert_eq!(listed_tables(dir.path()).len(), 3);
+            }
+            Some(_) => {
+                dropped.unwrap();
+                wait_for("the tables of the range are off the manifest", || {
+                    let listed = listed_tables(dir.path());
+                    only_b.iter().all(|name| !listed.contains(name))
+                })
+                .await;
+                // The crash came before their files were deleted.
+                let on_disk = sst_files(dir.path());
+                assert!(
+                    only_b.iter().all(|name| on_disk.contains(name)),
+                    "{point:?}"
+                );
+            }
+            None => {
+                dropped.unwrap();
+                wait_for("the range is retired", || {
+                    manifest_on_disk(dir.path()).forgotten.is_empty()
+                })
+                .await;
+            }
+        }
+        // Crash: no close.
+        drop(engine);
+
+        let engine = LsmEngine::open(io(), base.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{point:?}: reopen failed: {e}"));
+        let when = format!("{point:?}, reopened");
+        for n in (0..400).step_by(13) {
+            assert_eq!(engine.get(&tkey('b', n)).await.unwrap(), None, "{when}");
+        }
+        check_only_b_is_gone(&engine, 400..600, &when).await;
+
+        // What was left undone is finished after the restart.
+        wait_for("the range is retired after the restart", || {
+            manifest_on_disk(dir.path()).forgotten.is_empty()
+        })
+        .await;
+        let on_disk = sst_files(dir.path());
+        assert!(
+            only_b.iter().all(|name| !on_disk.contains(name)),
+            "{point:?}: {on_disk:?}"
+        );
+        assert_eq!(on_disk, listed_tables(dir.path()), "{point:?}");
+        // The range is no longer listed, so nothing hides its keys now:
+        // they are gone from the tables themselves.
+        check_only_b_is_gone(&engine, 400..600, &format!("{point:?}, retired")).await;
+
+        // And it still takes writes and flushes, next to the range too.
+        put_keys(&engine, &['a', 'c'], 600..700).await;
+        engine.flush().await.unwrap();
+        check_only_b_is_gone(&engine, 400..700, &format!("{point:?}, written")).await;
+        engine.close().await.unwrap();
+        drop(engine);
+
+        let engine = LsmEngine::open(io(), base).await.unwrap();
+        check_only_b_is_gone(&engine, 400..700, &format!("{point:?}, closed")).await;
+        engine.close().await.unwrap();
+    }
+}
+
+/// The space forgotten ranges took is given back: tables that held nothing
+/// else are deleted, tables that held other keys too are rewritten without
+/// them, in every level, and once nothing holds a range's keys it comes off
+/// the manifest.
+#[tokio::test]
+async fn the_space_of_forgotten_ranges_is_given_back() {
+    // Each group of keys has its own `a:`, `b:` and `c:`, so that tables of
+    // different groups do not overlap and compaction leaves them spread
+    // over several levels. Forgetting every group's `b:` is one range each.
+    fn gkey(group: u32, table: char, n: u32) -> Vec<u8> {
+        format!("{group:02}{table}:{n:04}").into_bytes()
+    }
+    async fn put_group(engine: &LsmEngine, group: u32, tables: &[char]) {
+        for n in 0..100 {
+            for &table in tables {
+                engine
+                    .put(&gkey(group, table, n), &tvalue(table, n))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    fn table_bytes(dir: &Path) -> u64 {
+        manifest_on_disk(dir)
+            .levels
+            .iter()
+            .flat_map(|level| &level.files)
+            .map(|file| file.size)
+            .sum()
+    }
+    const MIXED: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 30, 31];
+    const ONLY_B: [u32; 2] = [20, 21];
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        l0_compaction_trigger: 4,
+        // Level 2 has room for one of the compacted tables, not for two.
+        level_base_bytes: 32 * 1024,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg.clone()).await.unwrap();
+    // Eight tables holding all three kinds of key, compacted down.
+    for group in 0..8 {
+        put_group(&engine, group, &['a', 'b', 'c']).await;
+        engine.flush().await.unwrap();
+    }
+    let compacted = manifest_on_disk(dir.path());
+    assert!(compacted.levels[0].files.is_empty());
+    let deep_levels = compacted
+        .levels
+        .iter()
+        .filter(|level| !level.files.is_empty())
+        .count();
+    assert!(deep_levels >= 2, "the tables are all in one level");
+    // Then two tables of nothing but `b:` keys and one more with all three,
+    // which stay in level 0; and some of it in memory.
+    let before = sst_files(dir.path());
+    for group in ONLY_B {
+        put_group(&engine, group, &['b']).await;
+        engine.flush().await.unwrap();
+    }
+    let only_b: Vec<String> = sst_files(dir.path())
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect();
+    assert_eq!(only_b.len(), 2);
+    put_group(&engine, 30, &['a', 'b', 'c']).await;
+    engine.flush().await.unwrap();
+    assert_eq!(manifest_on_disk(dir.path()).levels[0].files.len(), 3);
+    put_group(&engine, 31, &['a', 'b', 'c']).await;
+    let bytes_before = table_bytes(dir.path());
+
+    for group in MIXED.into_iter().chain(ONLY_B) {
+        let (start, end) = (format!("{group:02}b:"), format!("{group:02}b;"));
+        engine
+            .drop_range(start.as_bytes(), end.as_bytes())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        manifest_on_disk(dir.path()).forgotten_seq,
+        12,
+        "the ranges were not all recorded"
+    );
+
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = MIXED
+        .into_iter()
+        .flat_map(|group| {
+            ['a', 'c'].into_iter().flat_map(move |table| {
+                (0..100).map(move |n| (gkey(group, table, n), tvalue(table, n)))
+            })
+        })
+        .collect();
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "right after the drop"
+    );
+
+    wait_for("every range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    let on_disk = sst_files(dir.path());
+    assert!(
+        only_b.iter().all(|name| !on_disk.contains(name)),
+        "tables of nothing but forgotten keys are still there: {on_disk:?}"
+    );
+    assert_eq!(on_disk, listed_tables(dir.path()));
+    let bytes_after = table_bytes(dir.path());
+    assert!(
+        bytes_after < bytes_before,
+        "{bytes_before} bytes of tables before, {bytes_after} after"
+    );
+    // With the ranges off the list nothing hides their keys: that none is
+    // found means none is left, in memory or in any table.
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "once retired"
+    );
+    for group in MIXED.into_iter().chain(ONLY_B) {
+        assert_eq!(engine.get(&gkey(group, 'b', 50)).await.unwrap(), None);
+    }
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "after a restart"
+    );
+    engine.close().await.unwrap();
+}
+
+/// Ranges are forgotten while memtables fill, are flushed and are compacted
+/// all around them. However a drop falls among those - before a memtable is
+/// read for its flush, while its table is being written, while a compaction
+/// that took the keys in is running - no forgotten key comes back once its
+/// range has been retired, and no other key is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
+    const GROUPS: u32 = 120;
+    fn gkey(group: u32, table: char, n: u32) -> Vec<u8> {
+        format!("{group:03}{table}:{n:04}").into_bytes()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        // Small memtables and small levels: flushes and compactions the
+        // whole time, in the background and from the flusher below.
+        total_cache_bytes: 256 * 1024,
+        l0_compaction_trigger: 2,
+        level_base_bytes: 64 * 1024,
+        ..config(dir.path())
+    };
+    let engine = Arc::new(LsmEngine::open(io(), cfg.clone()).await.unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let flusher = {
+        let engine = engine.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                engine.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    for group in 0..GROUPS {
+        for n in 0..60 {
+            let batch = ['a', 'b', 'c']
+                .into_iter()
+                .map(|table| (gkey(group, table, n), Some(tvalue(table, n))))
+                .collect();
+            engine.write_batch(batch).await.unwrap();
+            if n % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        // The group before last loses its `b:`; the last one is still
+        // being written around it.
+        if let Some(victim) = group.checked_sub(1) {
+            let (start, end) = (format!("{victim:03}b:"), format!("{victim:03}b;"));
+            engine
+                .drop_range(start.as_bytes(), end.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(engine.get(&gkey(victim, 'b', 30)).await.unwrap(), None);
+        }
+    }
+    let last = GROUPS - 1;
+    engine
+        .drop_range(
+            format!("{last:03}b:").as_bytes(),
+            format!("{last:03}b;").as_bytes(),
+        )
+        .await
+        .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    flusher.await.unwrap();
+
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..GROUPS)
+        .flat_map(|group| {
+            ['a', 'c'].into_iter().flat_map(move |table| {
+                (0..60).map(move |n| (gkey(group, table, n), tvalue(table, n)))
+            })
+        })
+        .collect();
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "with the ranges still listed"
+    );
+    engine.flush().await.unwrap();
+    wait_for("every range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert_eq!(manifest_on_disk(dir.path()).forgotten_seq, GROUPS as u64);
+    // Nothing hides the keys any more.
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "with the ranges retired"
+    );
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert!(
+        engine.scan(None, None).await.unwrap() == expected,
+        "after a restart"
+    );
+    engine.close().await.unwrap();
+}
+
+/// A view taken after a range was forgotten does not show its keys. A view
+/// taken before goes on showing all of them, also once the engine has
+/// deleted the tables that held them.
+#[tokio::test]
+async fn a_view_and_a_forgotten_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    put_keys(&engine, &['b'], 0..300).await;
+    engine.flush().await.unwrap();
+    put_keys(&engine, &['a', 'b', 'c'], 300..600).await;
+    engine.flush().await.unwrap();
+    let everything = engine.scan(None, None).await.unwrap();
+    assert_eq!(everything.len(), 300 + 3 * 300);
+
+    let before = engine.snapshot_view().await.unwrap();
+    engine.drop_range(B_START, B_END).await.unwrap();
+    let after = engine.snapshot_view().await.unwrap();
+    let remaining = engine.scan(None, None).await.unwrap();
+    assert_eq!(remaining.len(), 2 * 300);
+
+    // Read the later view at once, while the tables may still hold the
+    // keys, and again when they no longer do.
+    assert!(read_view(after.as_ref()).await == remaining);
+    assert_eq!(after.get(&tkey('b', 10)).await.unwrap(), None);
+    assert_eq!(after.get(&tkey('b', 400)).await.unwrap(), None);
+    assert_eq!(
+        after.get(&tkey('a', 400)).await.unwrap(),
+        Some(tvalue('a', 400))
+    );
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert!(read_view(after.as_ref()).await == remaining);
+    assert!(read_view(engine.snapshot_view().await.unwrap().as_ref()).await == remaining);
+
+    // The earlier view is the moment before the drop, whole.
+    assert!(read_view(before.as_ref()).await == everything);
+    assert_eq!(
+        before.get(&tkey('b', 10)).await.unwrap(),
+        Some(tvalue('b', 10))
+    );
+    assert_eq!(
+        before.get(&tkey('b', 400)).await.unwrap(),
+        Some(tvalue('b', 400))
+    );
+    drop(before);
+    drop(after);
+    assert_eq!(sst_files(dir.path()), listed_tables(dir.path()));
+    engine.close().await.unwrap();
+}
+
+/// Replacing the whole contents starts afresh: ranges forgotten before do
+/// not hide what the replacement brings. A range forgotten afterwards is
+/// removed from the replacement's tables like any other.
+#[tokio::test]
+async fn a_replacement_clears_the_forgotten_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(LsmEngine::open(io(), config(dir.path())).await.unwrap());
+    put_keys(&engine, &['a', 'b', 'c'], 0..300).await;
+    engine.flush().await.unwrap();
+    engine.drop_range(B_START, B_END).await.unwrap();
+    check_only_b_is_gone(&engine, 0..300, "after the drop").await;
+
+    // A snapshot from a node that had not yet forgotten the range.
+    let mut ingest = engine.clone().ingest().await.unwrap();
+    for table in ['a', 'b', 'c'] {
+        ingest
+            .add(
+                (0..300)
+                    .map(|n| (tkey(table, n), b"replaced".to_vec()))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+    }
+    ingest.commit().await.unwrap();
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert_eq!(
+        engine.get(&tkey('b', 7)).await.unwrap(),
+        Some(b"replaced".to_vec())
+    );
+    assert_eq!(engine.scan(None, None).await.unwrap().len(), 900);
+
+    // The log is replayed from the snapshot's position and forgets it again.
+    engine.drop_range(B_START, B_END).await.unwrap();
+    assert_eq!(engine.get(&tkey('b', 7)).await.unwrap(), None);
+    assert_eq!(engine.scan(None, None).await.unwrap().len(), 600);
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert_eq!(engine.get(&tkey('b', 7)).await.unwrap(), None);
+    let all = engine.scan(None, None).await.unwrap();
+    assert_eq!(all.len(), 600);
+    assert!(all.iter().all(|(_, value)| value == b"replaced"));
+    engine.close().await.unwrap();
+}

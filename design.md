@@ -496,7 +496,7 @@ LSM-Tree storage engine.
 
 **Writes**: `put`, `delete` and `write_batch` insert into the active memtable under a shared lock held for the whole batch; freezing a memtable takes the lock exclusively. A frozen memtable, and therefore every table on disk, holds whole batches only. Keys are limited to 65,535 bytes and values to 1 GiB, checked before any of a batch is applied.
 
-**Background work**: one task writes frozen memtables out (oldest first) and then compacts. Writers pause when four frozen memtables are waiting.
+**Background work**: one task writes frozen memtables out (oldest first) and then compacts. The compaction task also clears away what forgotten ranges leave behind. Writers pause when four frozen memtables are waiting.
 
 **SSTable** (`lsm/sstable.rs`), format 3. Every region is a whole number of 4 KiB pages:
 ```
@@ -522,6 +522,7 @@ Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 - `snapshot_view()`: the table files as they are at one moment, readable in chunks while the engine goes on changing; `ingest()`: a complete replacement of the contents, written as table files and switched to atomically.
 - `next_key()` / `prev_key()`: the nearest live key after or before a key, found by asking each memtable and table for its own nearest entry (one block read per table) instead of reading the range.
 - `scan()`: Merge all sources, deduplicate by key, skip tombstones. Adjacent blocks are read in runs of up to 1 MiB, all runs in flight together.
+- `drop_range(start, end)`: forget every key in `[start, end)` for good; see Forgotten ranges below.
 
 **Bloom Filters** (`lsm/bloom.rs`): Per-SSTable Bloom filters for accelerating point lookups, sized for the keys the table actually holds. Avoids reading SSTables that definitely don't contain a key.
 
@@ -539,8 +540,19 @@ Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 - Process: pick a level over its limit → merge its files with the overlapping files one level down → write one new SSTable → update manifest → delete inputs
 - The merge reads its inputs and writes its output about 4 MiB at a time (`merged_chunk`, shared with the snapshot view), so a compaction's memory does not grow with its tables
 - Tombstones are carried down and dropped only when no deeper table overlaps the output's key range
+- Keys of forgotten ranges are left out of every output. When no level is over its limit, a table that may still hold such keys is compacted anyway: all of L0 into L1 if it is in L0, otherwise that table alone, rewritten in its own level (the last level included)
 
-**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level, with a layout version. Replaced atomically (temp file → fsync → rename → fsync directory).
+**Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level and the forgotten ranges, with a layout version (3). Replaced atomically (temp file → fsync → rename → fsync directory). A directory written with another version is refused.
+
+**Forgotten ranges** (`StorageEngine::drop_range`): a key range `[start, end)` that the engine is told to forget, on the caller's promise that nothing is written there again. It is how a whole table's or index's rows can go without a delete marker per row. Nothing above the storage engine calls it yet.
+- *Record*: the range is added to the manifest's `forgotten` list (sorted, disjoint; a range that overlaps listed ones is merged with them) and the manifest is replaced before `drop_range` returns. Each range gets the next number from `forgotten_seq`, a counter that never goes back. A repeat of a range that is still listed changes nothing, so a replay by the Raft log is harmless; if the range has been retired meanwhile it is listed again under a new number.
+- *Reads*: `get`, `get_durable`, `scan`, `next_key` and `prev_key` leave out keys in a listed range, wherever they are held; `next_key`/`prev_key` step over a range in one move per source. The check is a binary search of a list that is normally empty.
+- *Memory*: `drop_range` removes the range's entries from the active and the frozen memtables at once.
+- *Flush and compaction*: every table written leaves out the keys of the ranges listed at that moment and records the counter's value as `filtered_seq`. A table may still hold keys of a range only if its key span overlaps the range and its `filtered_seq` is below the range's number; this is what tells a table that was rewritten around a range (and still spans it) from one that has yet to be.
+- *Space*: the compaction task, woken by `drop_range` (and at startup if ranges are listed), takes tables lying wholly inside a listed range off the manifest and deletes their files, with no merge, then compacts the tables that may hold the range's keys among others. Files are retired as compaction retires its inputs: unlisted durably first, then deleted; a file a snapshot view still holds open stays readable through that handle.
+- *Retirement*: a range leaves the list once no table may hold its keys and no memtable does. This is checked only by the compaction task and only while no flush is under way, since a flush or compaction in progress may be about to list a table written before the range was known. After that nothing is left that could bring the keys back, and the list stays short.
+- *Snapshots*: a view taken after `drop_range` leaves the range out (it keeps the list as it was when taken). A view taken before is unaffected: it goes on showing all of the range's keys from the files it holds. `ingest()` clears the list when it commits: the incoming contents were produced by a view that had already left out what was forgotten before it, and anything forgotten after the view's position is forgotten again when the log is replayed from there. Ingested tables get `filtered_seq` 0.
+- *Crash safety*: the range is durable before anything is removed. A crash after that leaves the range listed, and startup carries on; a crash after tables were unlisted leaves files the manifest does not list, which startup deletes.
 
 **Crash safety**: a table is written and synced, then listed in the manifest, and only then is its source (a memtable, or the tables a compaction replaced) released. At startup, table files the manifest does not list are deleted, and a listed table that is missing or fails its checksums stops startup.
 

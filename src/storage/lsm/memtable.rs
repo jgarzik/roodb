@@ -97,6 +97,39 @@ impl Memtable {
             .map(|entry| (entry.key().clone(), entry.value().is_none()))
     }
 
+    /// The first entry at or after `key`: its key, and whether it is a
+    /// tombstone.
+    pub fn first_from(&self, key: &[u8]) -> Option<(Vec<u8>, bool)> {
+        self.data
+            .lower_bound(Bound::Included(key))
+            .map(|entry| (entry.key().clone(), entry.value().is_none()))
+    }
+
+    /// Whether any entry, tombstones included, has a key in `[start, end)`.
+    pub fn has_any_in(&self, start: &[u8], end: &[u8]) -> bool {
+        self.data
+            .lower_bound(Bound::Included(start))
+            .is_some_and(|entry| entry.key().as_slice() < end)
+    }
+
+    /// Remove every entry, tombstones included, with a key in
+    /// `[start, end)`. Unlike a delete this leaves nothing behind to hide
+    /// older values elsewhere: it is for ranges the engine forgets as a
+    /// whole.
+    pub fn remove_range(&self, start: &[u8], end: &[u8]) {
+        let mut next = self.data.lower_bound(Bound::Included(start));
+        while let Some(entry) = next {
+            if entry.key().as_slice() >= end {
+                break;
+            }
+            next = entry.next();
+            if entry.remove() {
+                let size = entry.key().len() + entry.value().as_ref().map_or(0, Vec::len) + 16;
+                self.size.fetch_sub(size, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Get all entries in sorted order (for flushing to SSTable)
     pub fn iter(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         self.data
@@ -178,6 +211,35 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (b"b".to_vec(), Some(b"2".to_vec())));
         assert_eq!(result[1], (b"c".to_vec(), None)); // Tombstone
+    }
+
+    #[test]
+    fn a_range_is_removed_and_its_neighbours_stay() {
+        let mem = Memtable::new();
+        for key in [&b"a"[..], b"b", b"ba", b"bz", b"c", b"d"] {
+            mem.put(key, b"value");
+        }
+        mem.delete(b"bb");
+        let full = mem.size();
+        assert!(mem.has_any_in(b"b", b"c"));
+        assert!(!mem.has_any_in(b"ab", b"b"));
+        assert!(!mem.has_any_in(b"e", b"f"));
+
+        mem.remove_range(b"b", b"c");
+        let keys: Vec<Vec<u8>> = mem.iter().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, [b"a".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+        assert!(!mem.has_any_in(b"b", b"c"));
+        assert!(mem.size() < full);
+        assert_eq!(mem.get(b"bb"), None, "the tombstone goes too");
+
+        assert_eq!(mem.first_from(b"b"), Some((b"c".to_vec(), false)));
+        assert_eq!(mem.first_from(b"c"), Some((b"c".to_vec(), false)));
+        assert_eq!(mem.first_from(b"e"), None);
+
+        // Removing everything brings the size back to nothing.
+        mem.remove_range(b"", b"z");
+        assert!(mem.is_empty());
+        assert_eq!(mem.size(), 0);
     }
 
     #[test]
