@@ -39,7 +39,8 @@ Needs a quiet machine for every measurement.
   locking, single-thread write throughput measured about the same to 10%
   lower than before it (runs alternated on a shared machine; reads
   unchanged): find what the lock path costs per statement.
-- Compaction reads its inputs whole into memory; make it streaming.
+- Compaction writes one output table however large; split the output
+  into tables of bounded size.
 - The posix backend on Windows uses buffered I/O.
 
 ## IDX — Secondary and unique indexes; ALTER TABLE done properly

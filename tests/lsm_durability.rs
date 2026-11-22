@@ -960,3 +960,46 @@ async fn a_view_over_tables_in_key_order_matches_a_scan() {
     }
     engine.close().await.unwrap();
 }
+
+/// Compaction works through its inputs a stretch at a time. Tables larger
+/// than a stretch, overlapping, with overwrites and deletes between them,
+/// come out as the same data.
+#[tokio::test]
+async fn compaction_of_tables_larger_than_a_stretch_keeps_the_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        l0_compaction_trigger: 2,
+        level_base_bytes: 64 * 1024,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+    for round in 0..10u32 {
+        // Every round rewrites most keys, so the tables overlap throughout.
+        for n in 0..3000u32 {
+            let key = format!("k{n:05}").into_bytes();
+            if (n + round) % 7 == 0 {
+                engine.delete(&key).await.unwrap();
+                model.remove(&key);
+            } else if (n + round) % 3 != 0 {
+                let value = value_of(900 + (n % 200) as usize, (round + n) as u8);
+                engine.put(&key, &value).await.unwrap();
+                model.insert(key, value);
+            }
+        }
+        engine.flush().await.unwrap();
+    }
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+    assert!(engine.scan(None, None).await.unwrap() == expected);
+    engine.close().await.unwrap();
+
+    // And after a restart, when everything is read from the tables.
+    let cfg = LsmConfig {
+        l0_compaction_trigger: 2,
+        level_base_bytes: 64 * 1024,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == expected);
+    engine.close().await.unwrap();
+}

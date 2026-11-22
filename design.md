@@ -527,6 +527,7 @@ Entry: | Key Len (2B) | Val Len (4B) | Key | Value |
 - L1 base: 10MB
 - Deepest level: 6
 - Process: pick a level over its limit → merge its files with the overlapping files one level down → write one new SSTable → update manifest → delete inputs
+- The merge reads its inputs and writes its output about 4 MiB at a time (`merged_chunk`, shared with the snapshot view), so a compaction's memory does not grow with its tables
 - Tombstones are carried down and dropped only when no deeper table overlaps the output's key range
 
 **Manifest** (`lsm/manifest.rs`): JSON file tracking SSTable metadata per level, with a layout version. Replaced atomically (temp file → fsync → rename → fsync directory).

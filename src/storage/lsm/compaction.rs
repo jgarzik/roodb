@@ -170,32 +170,145 @@ pub fn pick_compaction(
     })
 }
 
+/// About how much of the inputs a compaction holds in memory at a time.
+const COMPACTION_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// The next stretch of the merge of `tables` (newest data first): entries
+/// with keys greater than `after` (from the start if `None`), in key order,
+/// about `max_bytes` of them, deleted keys included as `None`. Where several
+/// tables hold a key, the first of them decides. The flag says whether
+/// these were the last.
+///
+/// Only the tables the stretch can come from are read. Tables are mostly
+/// non-overlapping and in key order; reading every table for every stretch
+/// would read the whole of them over and over.
+pub(crate) async fn merged_chunk(
+    tables: &[std::sync::Arc<SstableReader>],
+    after: Option<&[u8]>,
+    max_bytes: usize,
+) -> StorageResult<(Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)> {
+    // Tables are read only once the position has reached where they start;
+    // `reach` extends that to a table that starts further on when nothing
+    // nearer is left.
+    let mut reach: Option<Vec<u8>> = None;
+    loop {
+        // Tables with anything beyond the position.
+        let remaining: Vec<(usize, &std::sync::Arc<SstableReader>)> = tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| {
+                after.is_none_or(|after| table.metadata().max_key.as_slice() > after)
+            })
+            .collect();
+        if remaining.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let started = |table: &SstableReader| {
+            let min_key = table.metadata().min_key.as_slice();
+            after.is_some_and(|after| min_key <= after)
+                || reach.as_deref().is_some_and(|reach| min_key <= reach)
+        };
+        let next_start: Option<Vec<u8>> = remaining
+            .iter()
+            .filter(|(_, table)| !started(table))
+            .map(|(_, table)| table.metadata().min_key.clone())
+            .min();
+        let chosen: Vec<(usize, &std::sync::Arc<SstableReader>)> = remaining
+            .iter()
+            .filter(|(_, table)| started(table))
+            .copied()
+            .collect();
+        if chosen.is_empty() {
+            reach = next_start;
+            continue;
+        }
+
+        // Each chosen table gives its next stretch. A table that stopped
+        // short of its end may hold keys beyond its last one that the
+        // others have already passed, so the merge is only good up to the
+        // earliest such stopping point; and only short of where the nearest
+        // unread table starts.
+        let mut merger = MergeIterator::new();
+        let mut bound: Option<Vec<u8>> = None;
+        for (priority, table) in &chosen {
+            let (entries, ended) = table.scan_after(after, max_bytes).await?;
+            if !ended {
+                if let Some((last, _)) = entries.last() {
+                    if bound.as_ref().is_none_or(|bound| last < bound) {
+                        bound = Some(last.clone());
+                    }
+                }
+            }
+            merger.add(entries, *priority);
+        }
+        let mut merged = merger.merge();
+        if let Some(bound) = &bound {
+            merged.retain(|(key, _)| key <= bound);
+        }
+        if let Some(next_start) = &next_start {
+            merged.retain(|(key, _)| key < next_start);
+        }
+        if !merged.is_empty() {
+            let done = bound.is_none() && next_start.is_none();
+            return Ok((merged, done));
+        }
+        // Nothing before the nearest unread table: read that one too.
+        match next_start {
+            Some(next_start) => reach = Some(next_start),
+            None => return Ok((Vec::new(), true)),
+        }
+    }
+}
+
 /// Merge the inputs and write the output table. Returns `None` if nothing is
 /// left to write (every entry was a tombstone with nothing to hide).
+///
+/// The inputs are read and the output written a stretch at a time: what a
+/// compaction holds in memory does not grow with the size of its tables.
 pub async fn execute_compaction(
     engine: &IoEngine,
     job: &CompactionJob,
 ) -> StorageResult<Option<SstableInfo>> {
-    let mut merger = MergeIterator::new();
-    for (priority, path) in job.input_paths.iter().enumerate() {
+    let mut inputs = Vec::with_capacity(job.input_paths.len());
+    for path in &job.input_paths {
         let reader = SstableReader::open(engine, path, Urgency::Background).await?;
-        merger.add(reader.scan().await?, priority);
+        inputs.push(std::sync::Arc::new(reader));
     }
 
-    let mut merged = merger.merge();
-    if job.drop_tombstones {
-        merged.retain(|(_, value)| value.is_some());
+    let mut writer: Option<SstableWriter> = None;
+    let mut min_key: Option<Vec<u8>> = None;
+    let mut max_key: Vec<u8> = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (entries, done) =
+            merged_chunk(&inputs, after.as_deref(), COMPACTION_CHUNK_BYTES).await?;
+        if let Some((last, _)) = entries.last() {
+            after = Some(last.clone());
+        }
+        for (key, value) in entries {
+            if job.drop_tombstones && value.is_none() {
+                continue;
+            }
+            if writer.is_none() {
+                writer = Some(
+                    SstableWriter::create(engine, &job.output_path, Urgency::Background).await?,
+                );
+                min_key = Some(key.clone());
+            }
+            max_key.clone_from(&key);
+            writer
+                .as_mut()
+                .expect("created above")
+                .add(key, value)
+                .await?;
+        }
+        if done {
+            break;
+        }
     }
-    let (Some(first), Some(last)) = (merged.first(), merged.last()) else {
+    let (Some(writer), Some(min_key)) = (writer, min_key) else {
         return Ok(None);
     };
-    let min_key = first.0.clone();
-    let max_key = last.0.clone();
-
-    let mut writer = SstableWriter::create(engine, &job.output_path, Urgency::Background).await?;
-    for (key, value) in merged {
-        writer.add(key, value).await?;
-    }
     writer.finish().await?;
 
     let size = std::fs::metadata(&job.output_path)?.len();
