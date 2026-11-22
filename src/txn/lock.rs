@@ -27,6 +27,10 @@
 //! The locks exist only in the memory of the node that holds them. They
 //! protect changes that have not been committed, which exist only on that
 //! node too; nothing here is replicated.
+//!
+//! A transaction can also wait outside this table, for a metadata lock
+//! (`mdl.rs`). Those waits are recorded here as well, so that the search for
+//! a deadlock follows every wait there is, whichever table it is in.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -87,6 +91,9 @@ struct State {
     waiters: Vec<Waiter>,
     /// Keys each transaction holds record locks on, for release.
     held: HashMap<u64, HashSet<Vec<u8>>>,
+    /// Waits outside this table: the transactions each waiting transaction
+    /// is waiting for. Kept up to date by the metadata locks.
+    outside: HashMap<u64, Vec<u64>>,
     next_waiter: u64,
 }
 
@@ -162,6 +169,9 @@ impl State {
             // A transaction waits for at most one thing at a time.
             if let Some(waiter) = self.waiters.iter().find(|w| w.txn == txn) {
                 stack.extend(self.blockers(txn, &waiter.key, &waiter.wanted, Some(waiter.id)));
+            }
+            if let Some(blockers) = self.outside.get(&txn) {
+                stack.extend(blockers);
             }
         }
         false
@@ -473,6 +483,33 @@ impl LockManager {
         if had_gaps || !keys.is_empty() || waiting != state.waiters.len() {
             state.wake();
         }
+    }
+
+    /// Record that `txn` is about to wait, outside this table, for
+    /// `blockers`. Refused (`false`, and nothing recorded) if that wait
+    /// would close a cycle of waiting transactions, through this table, the
+    /// waits recorded from outside, or both.
+    pub(crate) fn begin_outside_wait(&self, txn: u64, blockers: &[u64]) -> bool {
+        let mut state = self.state.lock();
+        if state.closes_cycle(txn, blockers) {
+            return false;
+        }
+        state.outside.insert(txn, blockers.to_vec());
+        true
+    }
+
+    /// Bring the waits recorded from outside up to date in one step: the
+    /// transactions in `ended` wait no longer, and each one in `waits` now
+    /// waits for the transactions listed with it.
+    pub(crate) fn update_outside_waits(&self, ended: &[u64], waits: Vec<(u64, Vec<u64>)>) {
+        if ended.is_empty() && waits.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        for txn in ended {
+            state.outside.remove(txn);
+        }
+        state.outside.extend(waits);
     }
 
     /// Number of record locks held, gap locks held, and requests waiting.

@@ -89,8 +89,12 @@ Always acquired alone (never nested with other locks).
 | `undo_log.records` | parking_lot::RwLock | Undo records |
 | `undo_log.roll_ptr_index` | parking_lot::RwLock | Roll pointer lookup |
 | `next_roll_ptr` | AtomicU64 | Roll pointer generation |
+| `LockManager::state` | parking_lot::Mutex | Row lock table, and the wait-for graph of both lock tables |
+| `MetadataLocks::state` | parking_lot::Mutex | Metadata lock table |
 
 Multiple RwLocks but NEVER nested - each acquired/released independently.
+The two lock tables are the exception, in one fixed order (see Metadata
+locks below).
 
 ### Storage (`src/storage/lsm/`)
 
@@ -262,12 +266,70 @@ each read as it stands after it is locked. `NOWAIT` and `SKIP LOCKED` use
 runs in an implicit one that ends, releasing its locks, when the result has
 been sent.
 
+### Metadata locks (`src/txn/mdl.rs`)
+
+`MetadataLocks` is the table of locks that transactions hold on table
+names, so that a table is not changed or dropped under a statement that is
+using it. It is a module with its own tests; the server does not take
+these locks yet.
+
+- **What is locked** is a name, `TableName { database, table }`, not a
+  table: a name nothing is stored under yet can be locked (`CREATE TABLE`,
+  the new name of a `RENAME`). The same table name in two databases is two
+  locks. Names are compared exactly as given.
+- **Modes.** `Shared`, for a statement that uses the table, held until its
+  transaction ends; `Exclusive`, for a schema change. Shared is compatible
+  with shared; exclusive with nothing held by another owner. The owner is a
+  transaction ID, the same one that owns row locks.
+- **Re-entrant.** An owner that holds a name in a mode that covers the
+  request is not made to wait. An owner that holds it shared and asks for
+  exclusive is upgrading: it waits for the other holders only, not for
+  requests queued before its own (they are waiting for it).
+- **Fair to writers.** Requests on a name are granted in arrival order, and
+  a request is not let past an earlier one it conflicts with. A waiting
+  exclusive request therefore holds back shared requests that arrive after
+  it, although they are compatible with what is held: a stream of readers
+  cannot starve a schema change.
+- **Several names at once** (`lock_all`, for `RENAME a TO b`, `DROP TABLE
+  a, b`) are taken in sorted order whatever order they are given in, so two
+  such statements cannot each hold what the other waits for. If one name
+  cannot be had, what the call took is given back and an upgrade it made is
+  undone; what the owner held before is untouched.
+- **Ending.** `release_all(owner)` releases everything the owner holds and
+  abandons a request it is waiting for. A wait can time out
+  (`MdlError::Timeout`), and a request whose future is dropped while it
+  waits leaves the queue; either lets through those that waited behind it.
+
+**Deadlocks across both lock tables.** A transaction can hold a row lock and
+wait for a metadata lock while another holds the metadata lock and waits
+for the row. There is one wait-for graph for both kinds of lock, and it
+lives in the row lock manager: before a metadata request joins its queue,
+the wait is recorded there (`LockManager::begin_outside_wait`: owner, and
+the owners it waits for), and whenever the metadata lock table changes, the
+waits of the requests still queued on the names that changed are brought up
+to date in one step (`LockManager::update_outside_waits`). The search for a
+cycle (`closes_cycle`) follows row waits and these recorded waits alike, and
+runs under the row lock mutex whichever kind of lock is being asked for. The
+request that would close the cycle is the one refused: `MdlError::Deadlock`
+if it is a metadata request, `LockError::Deadlock` if it is a row request.
+
+**Mutex order.** The metadata lock table is guarded by one
+`parking_lot::Mutex`, the row lock table by another. The order is metadata
+lock mutex first, then row lock mutex: `MetadataLocks` calls the two hooks
+above with its own mutex held, so that the recorded waits change in the same
+order as the table they describe, and a granted requester is told only after
+the row lock manager has heard. The row lock manager never calls into
+`MetadataLocks`, so the reverse order does not occur. Neither mutex is held
+while a requester waits (it parks on a oneshot channel), and no other lock
+is taken under either.
+
 ## Lock Ordering Rules
 
 1. **Never hold sync locks across await** (except tokio::sync::Mutex)
 2. **Catalog acquired alone** - no other locks held when catalog is locked
 3. **Independent subsystem locks** - txn, storage, raft don't hold each other's locks
 4. **No circular dependencies** - call graph naturally orders acquisitions
+5. **Metadata lock mutex before row lock mutex** - the one place two locks nest inside `src/txn/`; never the reverse
 
 ## Atomic Ordering Guidelines
 
