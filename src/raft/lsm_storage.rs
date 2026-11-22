@@ -582,6 +582,14 @@ impl LsmRaftStorage {
 
                     if is_table_record {
                         match decode_table(value) {
+                            // A temporary table belongs to one session on
+                            // one node. Its definition is never stored.
+                            Some(record) if record.def.is_temporary => {
+                                return Ok(Err(format!(
+                                    "'{}' is a temporary table: its definition is not stored",
+                                    record.def.name
+                                )))
+                            }
                             Some(record) => plan.catalog.push(CatalogOp::Set(Box::new(record))),
                             None => {
                                 return Ok(Err(

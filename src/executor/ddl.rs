@@ -404,7 +404,12 @@ impl Executor for CreateIndex {
             index_def = index_def.unique();
         }
 
-        if let Some(ref raft_node) = self.raft_node {
+        if def.is_temporary {
+            // A temporary table is known to its session and nowhere else:
+            // its index goes to the catalog, never to the log.
+            indexes.push(index_def);
+            self.catalog.write().set_table(def, indexes);
+        } else if let Some(ref raft_node) = self.raft_node {
             // The index is part of the table's record.
             indexes.push(index_def);
             let record = crate::catalog::store::TableRecord { def, indexes };
@@ -499,12 +504,17 @@ impl Executor for DropIndex {
                     indexes,
                 }
             };
-            let mut changeset = ChangeSet::new(0);
-            changeset.push(crate::catalog::store::replace_table(&record));
-            raft_node
-                .propose_changes(changeset)
-                .await
-                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            if record.def.is_temporary {
+                // A temporary table's indexes live in the catalog only.
+                self.catalog.write().set_table(record.def, record.indexes);
+            } else {
+                let mut changeset = ChangeSet::new(0);
+                changeset.push(crate::catalog::store::replace_table(&record));
+                raft_node
+                    .propose_changes(changeset)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            }
         } else {
             // No Raft - update catalog directly (for tests without Raft)
             let mut catalog = self.catalog.write();

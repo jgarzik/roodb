@@ -336,3 +336,52 @@ async fn test_drop_trigger_if_exists_with_leading_whitespace() {
     conn.query_drop("DROP TABLE tt_ws").await.unwrap();
     conn.query_drop("DROP TABLE tt_ws_log").await.unwrap();
 }
+
+/// An index on a temporary table stays with the table, in its session:
+/// nothing about either is stored, and no other session can see or drop
+/// the index.
+#[tokio::test]
+async fn an_index_on_a_temporary_table_stays_in_its_session() {
+    let server = TestServer::start("temp_index").await;
+    let mut owner = server.connect().await;
+    let mut other = server.connect().await;
+    owner
+        .query_drop("CREATE TEMPORARY TABLE tt_idx (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    owner
+        .query_drop("CREATE INDEX tt_idx_v ON tt_idx (v)")
+        .await
+        .unwrap();
+    owner
+        .query_drop("INSERT INTO tt_idx VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    // Not stored, and not there for anyone else.
+    let stored: Vec<String> = other
+        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_idx'")
+        .await
+        .unwrap();
+    assert!(
+        stored.is_empty(),
+        "a temporary table was stored: {stored:?}"
+    );
+    assert!(other.query_drop("SELECT * FROM tt_idx").await.is_err());
+    assert!(other.query_drop("DROP INDEX tt_idx_v").await.is_err());
+
+    // Still the owner's, index and all.
+    let rows: Vec<(i32, i32)> = owner.query("SELECT id, v FROM tt_idx").await.unwrap();
+    assert_eq!(rows, [(1, 10)]);
+    owner.query_drop("DROP INDEX tt_idx_v").await.unwrap();
+    let stored: Vec<String> = other
+        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_idx'")
+        .await
+        .unwrap();
+    assert!(
+        stored.is_empty(),
+        "a temporary table was stored: {stored:?}"
+    );
+    owner.query_drop("DROP TABLE tt_idx").await.unwrap();
+    server.shutdown().await;
+}

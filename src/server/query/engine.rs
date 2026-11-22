@@ -1136,6 +1136,20 @@ impl QueryEngine {
             TempDrop::NoSuchTable(name) => return self.send_no_such_table(&name).await,
         };
 
+        // An index of another session's temporary table does not exist as
+        // far as this session can tell.
+        if let PhysicalPlan::DropIndex { name } = &plan {
+            let table = self
+                .catalog
+                .read()
+                .get_index(name)
+                .map(|index| index.table.clone());
+            if table.is_some_and(|table| self.is_foreign_temp_table(&table)) {
+                let message = crate::executor::ExecutorError::CantDropKey(name.clone()).to_string();
+                return self.send_error(1091, "42000", &message).await;
+            }
+        }
+
         // Check if this is a query that returns rows
         let returns_rows = matches!(
             plan,

@@ -69,6 +69,110 @@ pub fn drop_table(name: &str) -> RowChange {
     RowChange::delete(SYSTEM_TABLES, table_key(name))
 }
 
+/// A row of a system table, as stored.
+#[derive(Debug, Clone)]
+pub struct StoredRow {
+    /// The row's key.
+    pub key: Vec<u8>,
+    /// The row's bytes, without the version header.
+    pub data: Vec<u8>,
+    /// The row.
+    pub row: Row,
+}
+
+/// Which columns of each system table make up its key.
+fn key_columns(table: &str) -> &'static [usize] {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static KEYS: LazyLock<HashMap<String, Vec<usize>>> = LazyLock::new(|| {
+        super::system_tables::bootstrap_system_tables()
+            .into_iter()
+            .map(|def| {
+                // The primary key, or for a table that has none, its unique
+                // constraint.
+                let columns = def.primary_key().map(<[String]>::to_vec).or_else(|| {
+                    def.constraints
+                        .iter()
+                        .find_map(|constraint| match constraint {
+                            super::Constraint::Unique(columns) => Some(columns.clone()),
+                            _ => None,
+                        })
+                });
+                let indexes = columns
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|column| def.get_column_index(column))
+                    .collect();
+                (def.name, indexes)
+            })
+            .collect()
+    });
+    KEYS.get(table)
+        .map(Vec::as_slice)
+        .expect("a system table with a key")
+}
+
+/// The key a row of a system table is stored under: the table's key
+/// columns, as the row has them.
+pub fn row_key(table: &str, row: &Row) -> Vec<u8> {
+    let values: Vec<Datum> = key_columns(table)
+        .iter()
+        .map(|&column| row.values().get(column).cloned().unwrap_or(Datum::Null))
+        .collect();
+    encode_pk_key(table, &values)
+}
+
+/// The change that adds `row` to a system table. Refused when applied if
+/// a row with its key is there already.
+pub fn insert_row(table: &str, row: &Row) -> RowChange {
+    RowChange::insert(table, row_key(table, row), encode_row(row))
+}
+
+/// The change that stores `row` in a system table, in place of the row
+/// with its key if there is one.
+pub fn put_row(table: &str, row: &Row) -> RowChange {
+    RowChange::update(table, row_key(table, row), encode_row(row))
+}
+
+/// The change that removes a stored row from a system table.
+pub fn delete_row(table: &str, stored: &StoredRow) -> RowChange {
+    RowChange::delete_with_value(table, stored.key.clone(), stored.data.clone())
+}
+
+/// A row as initialisation stores it, before there is a log: under its
+/// key, with the header every stored row has (written by no transaction).
+pub fn initial_row(table: &str, row: &Row) -> (Vec<u8>, Vec<u8>) {
+    (
+        row_key(table, row),
+        crate::raft::encode_mvcc_row(0, false, &encode_row(row)),
+    )
+}
+
+/// The live rows of a system table.
+pub async fn scan_rows(
+    storage: &dyn crate::storage::StorageEngine,
+    table: &str,
+) -> crate::storage::StorageResult<Vec<StoredRow>> {
+    use crate::executor::encoding::{table_key_end, table_key_prefix};
+    use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
+
+    let stored = storage
+        .scan(Some(&table_key_prefix(table)), Some(&table_key_end(table)))
+        .await?;
+    let mut rows = Vec::with_capacity(stored.len());
+    for (key, value) in stored {
+        if value.len() < MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
+            continue;
+        }
+        let data = value[MVCC_HEADER_SIZE..].to_vec();
+        if let Ok(row) = decode_row(&data) {
+            rows.push(StoredRow { key, data, row });
+        }
+    }
+    Ok(rows)
+}
+
 /// The table a key of `system.tables` belongs to.
 pub fn table_of_key(key: &[u8]) -> Option<String> {
     let prefix = crate::executor::encoding::table_key_prefix(SYSTEM_TABLES);
