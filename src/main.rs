@@ -91,7 +91,12 @@ fn store_node_id(data_dir: &std::path::Path, id: u64) -> std::io::Result<()> {
     writeln!(file, "{id}")?;
     file.sync_all()?;
     std::fs::rename(&temporary, &path)?;
-    std::fs::File::open(data_dir)?.sync_all()
+    // Not every platform can open a directory (Windows cannot, this way);
+    // where it cannot, a rename is as durable as it is going to get.
+    match std::fs::File::open(data_dir) {
+        Ok(dir) => dir.sync_all(),
+        Err(_) => Ok(()),
+    }
 }
 
 #[tokio::main]

@@ -91,6 +91,23 @@ pub const DEFAULT_LOG_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// How long startup waits for the node to lead and to replay its log.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Whether a change of membership was refused only because another is
+/// still under way.
+pub(crate) fn membership_change_in_progress(
+    error: &openraft::error::RaftError<
+        crate::raft::TypeConfig,
+        openraft::error::ClientWriteError<crate::raft::TypeConfig>,
+    >,
+) -> bool {
+    use openraft::error::{ChangeMembershipError, ClientWriteError};
+    matches!(
+        error.api_error(),
+        Some(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::InProgress(_)
+        ))
+    )
+}
+
 /// How often the log size is looked at.
 const CHECKPOINT_POLL: Duration = Duration::from_millis(250);
 
@@ -236,10 +253,7 @@ impl RaftNode {
         let state_machine = LsmRaftStorage::new(storage.clone(), catalog, id)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
-        // A node that restarts as one of several members is not alone,
-        // whatever it was started as. Its stored membership says so, and is
-        // known now; what Raft itself reports is not, until Raft has run.
-        let alone = single_node && state_machine.member_count() <= 1;
+        let stored_members = state_machine.member_count();
         let applied_txn_floor = state_machine.applied_txn_floor();
 
         let network = RaftNetworkFactoryImpl::new(tls_config.clone());
@@ -254,6 +268,35 @@ impl RaftNode {
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
 
+        // A node that restarts as one of several members is not alone,
+        // whatever it was started as. Raft says how many there are once it
+        // has read its log: the membership may have changed in entries the
+        // state machine had not flushed when the node last stopped. (Until
+        // then a node started alone does nothing by itself: its timers are
+        // off.)
+        let alone = single_node && stored_members <= 1 && {
+            use openraft::async_runtime::WatchReceiver;
+            let initialized = raft
+                .is_initialized()
+                .await
+                .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+            let mut members = 0;
+            if initialized {
+                let mut metrics = raft.metrics();
+                let loaded = metrics.wait_until(|m| m.membership_config.nodes().next().is_some());
+                tokio::time::timeout(READY_TIMEOUT, loaded)
+                    .await
+                    .map_err(|_| RaftNodeError::Raft("Raft did not load its membership".into()))?
+                    .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+                members = raft
+                    .metrics()
+                    .borrow_watched()
+                    .membership_config
+                    .nodes()
+                    .count();
+            }
+            members <= 1
+        };
         if !alone && single_node {
             let runtime = raft.runtime_config();
             runtime.tick(true);
@@ -490,10 +533,21 @@ impl RaftNode {
             }
             ChangeMembers::RemoveVoters(ids)
         };
-        self.raft
-            .change_membership(change, false)
-            .await
-            .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
+        // Raft changes its membership one step at a time, and admitting a
+        // node takes two: a removal asked for meanwhile waits its turn.
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match self.raft.change_membership(change.clone(), false).await {
+                Ok(_) => break,
+                Err(e)
+                    if membership_change_in_progress(&e)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(RaftNodeError::Raft(e.to_string())),
+            }
+        }
         tracing::info!(node_id = id, "A node was removed from the cluster");
         // The node is told, so that it stops instead of calling elections
         // nobody will answer.

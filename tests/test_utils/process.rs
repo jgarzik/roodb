@@ -280,6 +280,7 @@ impl ServerProcess {
     }
 
     /// Names of the table files in the data directory.
+    #[cfg(unix)]
     pub fn table_files(&self) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(self.data_dir.path())
             .expect("read data dir")
