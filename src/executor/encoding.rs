@@ -9,56 +9,19 @@ use super::row::Row;
 
 /// Encode a table row key using primary key value(s)
 ///
-/// Format: `t:{table_name}:r:{pk_bytes}` where pk_bytes is order-preserving encoding
-/// of the PK column values. For integer PKs, uses big-endian with sign bit flipped
-/// for correct sort order. For string PKs, uses null-terminated encoding.
+/// Format: `t:{table_name}:r:{pk_bytes}` where pk_bytes are the primary key
+/// values as key parts (see `key`): bytes that sort as the values do. The
+/// values must be in the key columns' types (a stored row's are; a
+/// looked-up value goes through `key::for_lookup` first).
 pub fn encode_pk_key(table: &str, pk_values: &[Datum]) -> Vec<u8> {
     let mut key = Vec::with_capacity(table.len() + 16);
     key.extend_from_slice(b"t:");
     key.extend_from_slice(table.as_bytes());
     key.extend_from_slice(b":r:");
     for val in pk_values {
-        encode_comparable_datum(&mut key, val);
+        super::key::encode_part(&mut key, val, &super::key::KeyPart::PLAIN);
     }
     key
-}
-
-/// Encode a datum in order-preserving binary format for use as storage key.
-///
-/// Integer: flip sign bit of big-endian i64 so negative < positive in byte order.
-/// String: append 0x00 0x01 terminator (0x00 bytes in string escaped as 0x00 0xFF).
-/// Other types: fall back to tag + raw encoding.
-fn encode_comparable_datum(buf: &mut Vec<u8>, datum: &Datum) {
-    match datum {
-        Datum::Int(i) => {
-            // Flip sign bit for correct byte-order comparison
-            let v = (*i as u64) ^ (1u64 << 63);
-            buf.extend_from_slice(&v.to_be_bytes());
-        }
-        Datum::UnsignedInt(u) => {
-            // Big-endian for order-preserving comparison.
-            // Unsigned values are always >= 0, so no sign-bit flip needed —
-            // just straight BE gives correct byte ordering.
-            buf.extend_from_slice(&u.to_be_bytes());
-        }
-        Datum::String(s) => {
-            // Null-terminated encoding: escape 0x00 bytes
-            for &b in s.as_bytes() {
-                if b == 0x00 {
-                    buf.push(0x00);
-                    buf.push(0xFF);
-                } else {
-                    buf.push(b);
-                }
-            }
-            buf.push(0x00);
-            buf.push(0x01); // terminator
-        }
-        _ => {
-            // For other types, use a simple tag+value encoding
-            encode_datum(buf, datum);
-        }
-    }
 }
 
 /// Encode a table row key (legacy format with auto-generated row ID)

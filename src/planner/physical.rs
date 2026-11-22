@@ -28,6 +28,9 @@ pub enum PhysicalPlan {
         columns: Vec<OutputColumn>,
         /// Primary key value to look up
         key_value: ResolvedExpr,
+        /// The key column's type: the value is put in it before it is
+        /// looked up.
+        key_type: DataType,
     },
 
     /// Range scan by primary key bounds (scans only matching PK range instead of full table)
@@ -44,6 +47,8 @@ pub enum PhysicalPlan {
         inclusive_end: bool,
         /// Any remaining filter predicates that couldn't be pushed to storage bounds
         remaining_filter: Option<ResolvedExpr>,
+        /// The key column's type: the bounds are put in it.
+        key_type: DataType,
     },
 
     /// Filter rows based on a predicate
@@ -161,6 +166,8 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        /// The key column's type, where `key_value` is set.
+        key_type: Option<DataType>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
         /// Primary key column indices (positions in the full table row)
@@ -173,6 +180,8 @@ pub enum PhysicalPlan {
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        /// The key column's type, where `key_value` is set.
+        key_type: Option<DataType>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
     },
@@ -902,6 +911,19 @@ impl PhysicalPlanner {
         Self::plan_node(logical, catalog)
     }
 
+    /// The type of the table's primary key column, if the key is a single
+    /// column.
+    fn single_key_type(table_name: &str, catalog: &Catalog) -> Option<DataType> {
+        let table_def = catalog.get_table(table_name)?;
+        let pk_cols = table_def.primary_key()?;
+        if pk_cols.len() != 1 {
+            return None;
+        }
+        table_def
+            .get_column(&pk_cols[0])
+            .map(|column| column.data_type.clone())
+    }
+
     /// Check if a filter expression is a point lookup on the primary key.
     /// Returns the key value expression if it is.
     pub fn extract_point_get(
@@ -1142,16 +1164,24 @@ impl PhysicalPlanner {
             } => {
                 // Try to convert to PointGet if filter is PK equality lookup
                 if let Some(ref f) = filter {
-                    if let Some(key_value) = Self::extract_point_get(&table, f, catalog) {
+                    let key_type = Self::single_key_type(&table, catalog);
+                    if let (Some(key_value), Some(key_type)) = (
+                        Self::extract_point_get(&table, f, catalog),
+                        key_type.clone(),
+                    ) {
                         return Ok(PhysicalPlan::PointGet {
                             table,
                             columns,
                             key_value,
+                            key_type,
                         });
                     }
                     // Try to convert to RangeScan if filter is PK range
-                    if let Some(rb) = Self::extract_range_scan(&table, f, catalog) {
+                    if let (Some(rb), Some(key_type)) =
+                        (Self::extract_range_scan(&table, f, catalog), key_type)
+                    {
                         return Ok(PhysicalPlan::RangeScan {
+                            key_type,
                             table,
                             columns,
                             start_key: rb.start_key,
@@ -1337,11 +1367,15 @@ impl PhysicalPlanner {
                 } else {
                     vec![]
                 };
+                let key_type = key_value
+                    .as_ref()
+                    .and_then(|_| Self::single_key_type(&table, catalog));
                 Ok(PhysicalPlan::Update {
                     table,
                     assignments,
                     filter,
                     key_value,
+                    key_type,
                     order_by,
                     limit,
                     pk_column_indices,
@@ -1361,10 +1395,14 @@ impl PhysicalPlanner {
                 } else {
                     None
                 };
+                let key_type = key_value
+                    .as_ref()
+                    .and_then(|_| Self::single_key_type(&table, catalog));
                 Ok(PhysicalPlan::Delete {
                     table,
                     filter,
                     key_value,
+                    key_type,
                     order_by,
                     limit,
                 })

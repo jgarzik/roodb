@@ -30,6 +30,7 @@ pub struct Update {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    key_type: Option<crate::catalog::DataType>,
     /// ORDER BY expressions for UPDATE ... ORDER BY ... LIMIT
     order_by: Vec<(ResolvedExpr, bool)>,
     /// LIMIT for UPDATE ... LIMIT n
@@ -54,6 +55,8 @@ pub struct UpdateParams {
     pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
+    /// The key column's type, where `key_value` is set.
+    pub key_type: Option<crate::catalog::DataType>,
     pub order_by: Vec<(ResolvedExpr, bool)>,
     pub limit: Option<usize>,
     pub pk_column_indices: Vec<usize>,
@@ -70,6 +73,7 @@ impl Update {
             assignments: p.assignments,
             filter: p.filter,
             key_value: p.key_value,
+            key_type: p.key_type,
             order_by: p.order_by,
             limit: p.limit,
             pk_column_indices: p.pk_column_indices,
@@ -162,6 +166,11 @@ impl Update {
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
         let key_datum = evaluate(key_expr, &Row::empty(), &self.user_variables)?;
+        // In the key column's type. A value the column cannot hold is the
+        // key of no row: nothing to change, and nothing to lock.
+        let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
+            return Ok(());
+        };
         let storage_key = encode_pk_key(&self.table, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
@@ -574,6 +583,7 @@ mod tests {
             assignments,
             filter: Some(filter),
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             pk_column_indices: vec![0], // id is PK at index 0
@@ -651,6 +661,7 @@ mod tests {
             assignments,
             filter: Some(filter),
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             pk_column_indices: vec![0], // id is PK at index 0

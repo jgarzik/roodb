@@ -33,6 +33,8 @@ pub struct RangeScan {
     inclusive_end: bool,
     /// Remaining filter predicate not pushed to storage bounds
     remaining_filter: Option<ResolvedExpr>,
+    /// The key column's type, if known.
+    key_type: Option<crate::catalog::DataType>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context
@@ -52,6 +54,8 @@ pub struct RangeScanBounds {
     pub inclusive_start: bool,
     pub inclusive_end: bool,
     pub remaining_filter: Option<ResolvedExpr>,
+    /// The key column's type, if known: the bounds are put in it.
+    pub key_type: Option<crate::catalog::DataType>,
 }
 
 impl RangeScan {
@@ -69,6 +73,7 @@ impl RangeScan {
             inclusive_start: bounds.inclusive_start,
             inclusive_end: bounds.inclusive_end,
             remaining_filter: bounds.remaining_filter,
+            key_type: bounds.key_type,
             mvcc,
             txn_context,
             raw_pairs: Vec::new(),
@@ -91,15 +96,28 @@ impl Executor for RangeScan {
     async fn open(&mut self) -> ExecutorResult<()> {
         let empty_row = Row::empty();
 
-        // Compute start bound
+        use super::key::{for_bound, Bound};
+        let key_type = self.key_type.as_ref();
+
+        // Compute start bound, in the key column's type
+        let mut empty = false;
         let start_key = if let Some(ref expr) = self.start_expr {
             let datum = evaluate(expr, &empty_row, &self.user_variables)?;
-            let key = encode_pk_key(&self.table, &[datum]);
-            if self.inclusive_start {
-                key
-            } else {
-                // Exclusive start: increment to skip the exact match
-                Self::increment_key(key)
+            match for_bound(datum, self.inclusive_start, key_type, true) {
+                Bound::At { value, inclusive } => {
+                    let key = encode_pk_key(&self.table, &[value]);
+                    if inclusive {
+                        key
+                    } else {
+                        // Exclusive start: increment to skip the exact match
+                        Self::increment_key(key)
+                    }
+                }
+                Bound::Open => table_key_prefix(&self.table),
+                Bound::Nothing => {
+                    empty = true;
+                    table_key_prefix(&self.table)
+                }
             }
         } else {
             table_key_prefix(&self.table)
@@ -108,16 +126,33 @@ impl Executor for RangeScan {
         // Compute end bound (storage scan end is always exclusive)
         let end_key = if let Some(ref expr) = self.end_expr {
             let datum = evaluate(expr, &empty_row, &self.user_variables)?;
-            let key = encode_pk_key(&self.table, &[datum]);
-            if self.inclusive_end {
-                // Inclusive end: increment so storage scan includes this key
-                Self::increment_key(key)
-            } else {
-                key
+            match for_bound(datum, self.inclusive_end, key_type, false) {
+                Bound::At { value, inclusive } => {
+                    let key = encode_pk_key(&self.table, &[value]);
+                    if inclusive {
+                        // Inclusive end: increment so storage scan includes this key
+                        Self::increment_key(key)
+                    } else {
+                        key
+                    }
+                }
+                Bound::Open => table_key_end(&self.table),
+                Bound::Nothing => {
+                    empty = true;
+                    table_key_end(&self.table)
+                }
             }
         } else {
             table_key_end(&self.table)
         };
+        // A bound beyond every value the key column can hold, on the side
+        // the range extends from: no row is in the range, and nothing is
+        // read or locked.
+        if empty || start_key >= end_key {
+            self.raw_pairs = Vec::new();
+            self.position = 0;
+            return Ok(());
+        }
 
         // MVCC scan with tight bounds
         let kv_pairs = if let Some(ref ctx) = self.txn_context {

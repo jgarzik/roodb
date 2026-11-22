@@ -521,8 +521,11 @@ units (`DAY_HOUR`, `HOUR_MINUTE`, ...).
 - **A number is not converted for comparison with a string**:
   `1 = '1'` is false and `WHERE int_column = '1'` matches nothing. Compare
   like with like, or `CAST`. (Arithmetic does convert: `1 + '1'` is `2`.)
-- A primary-key lookup matches only when the literal has the key's type:
-  `WHERE int_pk = 1.0` finds no row.
+- A value compared with a single-column primary key is put in the key's
+  type first, as MySQL does: `WHERE int_pk = 1.0` and `WHERE int_pk = '1'`
+  find row 1, `WHERE int_pk > 2.5` starts at 3. Keys of every type
+  (`DOUBLE`, `DECIMAL`, `TIMESTAMP`, ...) are stored in the order of their
+  values, so ranges on them work.
 - `LIKE`: `%` matches any run of characters, `_` one character; `\` or the
   `ESCAPE` character quotes them.
 

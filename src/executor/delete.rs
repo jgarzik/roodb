@@ -24,6 +24,8 @@ pub struct DeleteParams {
     pub table: String,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
+    /// The key column's type, where `key_value` is set.
+    pub key_type: Option<crate::catalog::DataType>,
     pub order_by: Vec<(ResolvedExpr, bool)>,
     pub limit: Option<usize>,
     pub mvcc: Arc<MvccStorage>,
@@ -39,6 +41,7 @@ pub struct Delete {
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    key_type: Option<crate::catalog::DataType>,
     /// ORDER BY expressions for DELETE ... ORDER BY ... LIMIT
     order_by: Vec<(ResolvedExpr, bool)>,
     /// Optional LIMIT
@@ -62,6 +65,7 @@ impl Delete {
             table: p.table,
             filter: p.filter,
             key_value: p.key_value,
+            key_type: p.key_type,
             order_by: p.order_by,
             limit: p.limit,
             mvcc: p.mvcc,
@@ -78,6 +82,11 @@ impl Delete {
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
         let key_datum = evaluate(key_expr, &Row::empty(), &self.user_variables)?;
+        // In the key column's type. A value the column cannot hold is the
+        // key of no row: nothing to change, and nothing to lock.
+        let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
+            return Ok(());
+        };
         let storage_key = encode_pk_key(&self.table, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
@@ -476,6 +485,7 @@ mod tests {
             table: "users".to_string(),
             filter: Some(filter),
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             mvcc,
@@ -527,6 +537,7 @@ mod tests {
             table: "users".to_string(),
             filter: None,
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             mvcc,
@@ -593,6 +604,7 @@ mod tests {
             table: "t1".to_string(),
             filter: None,
             key_value: None,
+            key_type: None,
             order_by: vec![(order_col, true)], // ASC
             limit: Some(2),
             mvcc,
@@ -640,6 +652,7 @@ mod tests {
             table: "t1".to_string(),
             filter: None,
             key_value: None,
+            key_type: None,
             order_by: vec![(order_col, false)], // DESC
             limit: Some(1),
             mvcc,

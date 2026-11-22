@@ -23,6 +23,7 @@ pub mod insert;
 pub mod insert_select;
 pub mod join;
 pub mod json;
+pub mod key;
 pub mod limit;
 pub mod multi_exec;
 pub mod point_get;

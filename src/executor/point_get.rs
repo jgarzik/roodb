@@ -24,6 +24,8 @@ pub struct PointGet {
     table: String,
     /// Primary key value expression
     key_expr: ResolvedExpr,
+    /// The key column's type, if known.
+    key_type: Option<crate::catalog::DataType>,
     /// MVCC-aware storage
     mvcc: Arc<MvccStorage>,
     /// Transaction context
@@ -40,6 +42,7 @@ impl PointGet {
     pub fn new(
         table: String,
         key_expr: ResolvedExpr,
+        key_type: Option<crate::catalog::DataType>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
         user_variables: UserVariables,
@@ -47,6 +50,7 @@ impl PointGet {
         PointGet {
             table,
             key_expr,
+            key_type,
             mvcc,
             txn_context,
             result: None,
@@ -63,6 +67,12 @@ impl Executor for PointGet {
         // Use an empty row since the key expression is a literal
         let empty_row = Row::empty();
         let key_datum = evaluate(&self.key_expr, &empty_row, &self.user_variables)?;
+        // In the key column's type. A value the column cannot hold (2.5 in
+        // an integer column) is the key of no row.
+        let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
+            self.result = None;
+            return Ok(());
+        };
 
         // Encode the storage key using PK-based encoding
         let storage_key = encode_pk_key(&self.table, &[key_datum]);

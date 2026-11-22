@@ -486,6 +486,7 @@ async fn test_delete_with_filter() {
             result_type: DataType::Boolean,
         }),
         key_value: None,
+        key_type: None,
         order_by: vec![],
         limit: None,
     };
