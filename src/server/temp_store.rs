@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::executor::encoding::{table_key_end, table_key_prefix};
+use crate::executor::encoding::{table_range, TableId};
 use crate::raft::{encode_mvcc_row, is_mvcc_tombstone, ChangeOp, RowChange};
 use crate::storage::error::StorageResult;
 use crate::storage::traits::{KeyValue, WriteOp};
@@ -82,13 +82,11 @@ impl SessionStorage {
     }
 
     /// Start keeping `table`'s rows in this session.
-    pub fn add_table(&self, table: &str) {
+    pub fn add_table(&self, table: &str, id: TableId) {
         let mut temp = self.temp.write();
-        temp.tables.push((
-            table.to_string(),
-            table_key_prefix(table),
-            table_key_end(table),
-        ));
+        // Everything stored under the table's ID: its rows and its indexes.
+        let (start, end) = table_range(id);
+        temp.tables.push((table.to_string(), start, end));
         self.has_temp.store(true, Ordering::Relaxed);
     }
 
@@ -386,6 +384,15 @@ impl StorageEngine for SessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::encoding::{table_key_end, table_key_prefix};
+
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
 
     /// A shared engine that must never be touched for temporary rows.
     struct Untouched;
@@ -423,7 +430,7 @@ mod tests {
     }
 
     fn key(table: &str, id: u8) -> Vec<u8> {
-        let mut key = table_key_prefix(table);
+        let mut key = table_key_prefix(tid(table));
         key.push(id);
         key
     }
@@ -437,7 +444,7 @@ mod tests {
             Some(b"shared".to_vec())
         );
 
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         assert!(storage.is_temp_table("tmp"));
         assert_eq!(storage.get(&key("tmp", 1)).await.unwrap(), None);
 
@@ -453,7 +460,10 @@ mod tests {
         storage.apply(7, temp, false);
 
         let rows = storage
-            .scan(Some(&table_key_prefix("tmp")), Some(&table_key_end("tmp")))
+            .scan(
+                Some(&table_key_prefix(tid("tmp"))),
+                Some(&table_key_end(tid("tmp"))),
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -476,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn duplicates_are_refused_and_deletes_free_the_key() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         storage.apply(
             1,
             vec![RowChange::insert("tmp", key("tmp", 1), b"a".to_vec())],
@@ -513,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_cannot_hold_unlimited_temporary_rows() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         // 64 MiB at a time: four fit, the fifth does not.
         for round in 0..5u8 {
             let big = vec![RowChange::insert(
@@ -532,7 +542,7 @@ mod tests {
         }
         // Dropping the table gives the room back.
         assert!(storage.remove_table("tmp"));
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         storage
             .check(
                 &[RowChange::insert("tmp", key("tmp", 9), vec![0u8; 1 << 20])],
@@ -544,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_table_can_still_be_changed_and_emptied() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         // Three rows of 64 MiB: an update of all three would not fit if it
         // were counted as growth.
         let rows = |value: u8| -> Vec<RowChange> {
@@ -580,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_or_inverted_range_holds_nothing() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp");
+        storage.add_table("tmp", tid("tmp"));
         storage.apply(
             1,
             vec![RowChange::insert("tmp", key("tmp", 5), vec![1])],
@@ -607,8 +617,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_table_drops_its_rows_only() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a");
-        storage.add_table("b");
+        storage.add_table("a", tid("a"));
+        storage.add_table("b", tid("b"));
         storage.apply(
             1,
             vec![

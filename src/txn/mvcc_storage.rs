@@ -42,7 +42,10 @@ pub struct MvccStorage {
 
 impl MvccStorage {
     /// Take the next AUTO_INCREMENT value of `table`.
-    pub async fn take_auto_increment(&self, table: &str) -> StorageResult<u64> {
+    pub async fn take_auto_increment(
+        &self,
+        table: crate::executor::encoding::TableId,
+    ) -> StorageResult<u64> {
         self.txn_manager
             .auto_increment()
             .take(self.inner.as_ref(), table)
@@ -51,7 +54,11 @@ impl MvccStorage {
 
     /// A row of `table` was given `value` for its AUTO_INCREMENT column
     /// explicitly: later generated values are greater.
-    pub async fn observe_auto_increment(&self, table: &str, value: u64) -> StorageResult<()> {
+    pub async fn observe_auto_increment(
+        &self,
+        table: crate::executor::encoding::TableId,
+        value: u64,
+    ) -> StorageResult<()> {
         self.txn_manager
             .auto_increment()
             .observe(self.inner.as_ref(), table, value)

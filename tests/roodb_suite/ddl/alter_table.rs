@@ -167,3 +167,61 @@ async fn index_names_are_checked() {
     conn.query_drop("DROP TABLE idx_chk").await.unwrap();
     server.shutdown().await;
 }
+
+/// A renamed table is the same table: its rows, its keys and its
+/// AUTO_INCREMENT counter go with it, and its old name is free.
+#[tokio::test]
+async fn a_renamed_table_keeps_its_rows_and_its_counter() {
+    let server = TestServer::start("alter_rename_rows").await;
+    let mut conn = server.connect().await;
+    conn.query_drop("CREATE TABLE ren_a (id INT AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO ren_a (v) VALUES (10), (20), (30)")
+        .await
+        .unwrap();
+    conn.query_drop("ALTER TABLE ren_a RENAME TO ren_b")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, v FROM ren_b ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 10), (2, 20), (3, 30)]);
+    let by_key: Option<i32> = conn
+        .query_first("SELECT v FROM ren_b WHERE id = 2")
+        .await
+        .unwrap();
+    assert_eq!(by_key, Some(20));
+    conn.query_drop("UPDATE ren_b SET v = 21 WHERE id = 2")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO ren_b (v) VALUES (40)")
+        .await
+        .unwrap();
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, v FROM ren_b ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 10), (2, 21), (3, 30), (4, 40)]);
+    assert!(conn.query_drop("SELECT * FROM ren_a").await.is_err());
+
+    // The old name is another table's to take, and that table is empty and
+    // counts from 1.
+    conn.query_drop("CREATE TABLE ren_a (id INT AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO ren_a (v) VALUES (99)")
+        .await
+        .unwrap();
+    let rows: Vec<(i32, i32)> = conn.query("SELECT id, v FROM ren_a").await.unwrap();
+    assert_eq!(rows, [(1, 99)]);
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, v FROM ren_b ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    conn.query_drop("DROP TABLE ren_a, ren_b").await.unwrap();
+    server.shutdown().await;
+}

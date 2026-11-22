@@ -7,7 +7,11 @@ use parking_lot::RwLock;
 
 use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
 use roodb::executor::context::TransactionContext;
-use roodb::executor::encoding::{encode_pk_key, encode_row};
+use roodb::executor::encoding::{encode_pk_key, encode_row, TableId};
+
+/// The IDs of the tables these tests set up.
+const USERS: TableId = TableId(5001);
+const NUMS: TableId = TableId(5002);
 use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
 use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
@@ -110,15 +114,15 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
     // Encode with MVCC headers (txn_id=0 = committed)
     let initial = vec![
         (
-            encode_pk_key("users", &[Datum::Int(1)]),
+            encode_pk_key(USERS, &[Datum::Int(1)]),
             encode_with_mvcc_header(0, &encode_row(&row1)),
         ),
         (
-            encode_pk_key("users", &[Datum::Int(2)]),
+            encode_pk_key(USERS, &[Datum::Int(2)]),
             encode_with_mvcc_header(0, &encode_row(&row2)),
         ),
         (
-            encode_pk_key("users", &[Datum::Int(3)]),
+            encode_pk_key(USERS, &[Datum::Int(3)]),
             encode_with_mvcc_header(0, &encode_row(&row3)),
         ),
     ];
@@ -135,6 +139,7 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
         let mut cat = catalog.write();
         cat.create_table(
             TableDef::new("users")
+                .with_id(USERS)
                 .column(ColumnDef::new("id", DataType::Int).nullable(false))
                 .column(ColumnDef::new("name", DataType::Varchar(100)))
                 .constraint(Constraint::PrimaryKey(vec!["id".to_string()])),
@@ -563,9 +568,9 @@ async fn test_distinct() {
     let row3 = Row::new(vec![Datum::Int(2)]);
 
     let initial = vec![
-        (encode_pk_key("nums", &[Datum::Int(1)]), encode_row(&row1)),
-        (encode_pk_key("nums", &[Datum::Int(2)]), encode_row(&row2)),
-        (encode_pk_key("nums", &[Datum::Int(3)]), encode_row(&row3)),
+        (encode_pk_key(NUMS, &[Datum::Int(1)]), encode_row(&row1)),
+        (encode_pk_key(NUMS, &[Datum::Int(2)]), encode_row(&row2)),
+        (encode_pk_key(NUMS, &[Datum::Int(3)]), encode_row(&row3)),
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
@@ -578,8 +583,12 @@ async fn test_distinct() {
 
     {
         let mut cat = catalog.write();
-        cat.create_table(TableDef::new("nums").column(ColumnDef::new("n", DataType::Int)))
-            .unwrap();
+        cat.create_table(
+            TableDef::new("nums")
+                .with_id(NUMS)
+                .column(ColumnDef::new("n", DataType::Int)),
+        )
+        .unwrap();
     }
 
     let engine = ExecutorEngine::new(mvcc, catalog, None, UserVariables::default());

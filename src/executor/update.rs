@@ -24,6 +24,7 @@ use super::Executor;
 pub struct Update {
     /// Table name
     table: String,
+    table_id: crate::executor::encoding::TableId,
     /// Assignments: (column, new_value)
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     /// Optional filter predicate
@@ -52,6 +53,8 @@ pub struct Update {
 /// Parameters for creating an Update executor.
 pub struct UpdateParams {
     pub table: String,
+    /// The table's ID: what its keys begin with
+    pub table_id: crate::executor::encoding::TableId,
     pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
@@ -70,6 +73,7 @@ impl Update {
     pub fn new(p: UpdateParams) -> Self {
         Update {
             table: p.table,
+            table_id: p.table_id,
             assignments: p.assignments,
             filter: p.filter,
             key_value: p.key_value,
@@ -107,7 +111,7 @@ impl Update {
                 .iter()
                 .map(|&idx| row.get(idx).unwrap().clone())
                 .collect();
-            encode_pk_key(&self.table, &pk_values)
+            encode_pk_key(self.table_id, &pk_values)
         } else {
             old_key.clone()
         };
@@ -171,7 +175,7 @@ impl Update {
         let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
             return Ok(());
         };
-        let storage_key = encode_pk_key(&self.table, &[key_datum]);
+        let storage_key = encode_pk_key(self.table_id, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
             super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
@@ -196,8 +200,8 @@ impl Update {
                         .mvcc
                         .gap_around(
                             &storage_key,
-                            &table_key_prefix(&self.table),
-                            &table_key_end(&self.table),
+                            &table_key_prefix(self.table_id),
+                            &table_key_end(self.table_id),
                         )
                         .await?;
                     ctx.lock_gap(&low, &high);
@@ -238,8 +242,8 @@ impl Update {
 
     /// Full scan path: scan all rows in the table
     async fn next_full_scan(&mut self) -> ExecutorResult<()> {
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
+        let prefix = table_key_prefix(self.table_id);
+        let end = table_key_end(self.table_id);
         // The scan reads the whole table, so the whole table is what must
         // not gain rows until this transaction ends (REPEATABLE READ).
         // Locked before reading, so that nothing slips in between.
@@ -429,6 +433,14 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -531,11 +543,11 @@ mod tests {
 
         let initial = vec![
             (
-                encode_pk_key("users", &[Datum::Int(1)]),
+                encode_pk_key(tid("users"), &[Datum::Int(1)]),
                 encode_with_mvcc_header(0, &encode_row(&row1)),
             ),
             (
-                encode_pk_key("users", &[Datum::Int(2)]),
+                encode_pk_key(tid("users"), &[Datum::Int(2)]),
                 encode_with_mvcc_header(0, &encode_row(&row2)),
             ),
         ];
@@ -580,6 +592,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
             table: "users".to_string(),
+            table_id: tid("users"),
             assignments,
             filter: Some(filter),
             key_value: None,
@@ -615,7 +628,7 @@ mod tests {
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
 
         let initial = vec![(
-            encode_pk_key("users", &[Datum::Int(1)]),
+            encode_pk_key(tid("users"), &[Datum::Int(1)]),
             encode_with_mvcc_header(0, &encode_row(&row1)),
         )];
 
@@ -658,6 +671,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
             table: "users".to_string(),
+            table_id: tid("users"),
             assignments,
             filter: Some(filter),
             key_value: None,
@@ -680,8 +694,14 @@ mod tests {
         // PK changed: should produce DELETE(old_key) + INSERT(new_key) = 2 changes
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].op, ChangeOp::Delete);
-        assert_eq!(changes[0].key, encode_pk_key("users", &[Datum::Int(1)]));
+        assert_eq!(
+            changes[0].key,
+            encode_pk_key(tid("users"), &[Datum::Int(1)])
+        );
         assert_eq!(changes[1].op, ChangeOp::Insert);
-        assert_eq!(changes[1].key, encode_pk_key("users", &[Datum::Int(10)]));
+        assert_eq!(
+            changes[1].key,
+            encode_pk_key(tid("users"), &[Datum::Int(10)])
+        );
     }
 }

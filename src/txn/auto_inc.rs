@@ -14,13 +14,14 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 
+use crate::executor::encoding::TableId;
 use crate::storage::{StorageEngine, StorageResult};
 
 /// Where a table's counter is stored: the next value, eight bytes,
 /// little-endian. A key of its own, outside every table's rows.
-pub fn storage_key(table: &str) -> Vec<u8> {
+pub fn storage_key(table: TableId) -> Vec<u8> {
     let mut key = b"autoinc:".to_vec();
-    key.extend_from_slice(table.as_bytes());
+    key.extend_from_slice(&table.0.to_be_bytes());
     key
 }
 
@@ -32,7 +33,7 @@ pub fn decode(stored: &[u8]) -> Option<u64> {
 /// The next AUTO_INCREMENT value of each table inserted into so far.
 #[derive(Debug, Default)]
 pub struct AutoIncrement {
-    next: Mutex<HashMap<String, u64>>,
+    next: Mutex<HashMap<TableId, u64>>,
 }
 
 impl AutoIncrement {
@@ -45,11 +46,11 @@ impl AutoIncrement {
     async fn with_counter<T>(
         &self,
         storage: &dyn StorageEngine,
-        table: &str,
+        table: TableId,
         with: impl Fn(&mut u64) -> T,
     ) -> StorageResult<T> {
         loop {
-            if let Some(counter) = self.next.lock().get_mut(table) {
+            if let Some(counter) = self.next.lock().get_mut(&table) {
                 return Ok(with(counter));
             }
             let stored = storage
@@ -57,15 +58,12 @@ impl AutoIncrement {
                 .await?
                 .and_then(|stored| decode(&stored))
                 .unwrap_or(1);
-            self.next
-                .lock()
-                .entry(table.to_string())
-                .or_insert(stored.max(1));
+            self.next.lock().entry(table).or_insert(stored.max(1));
         }
     }
 
     /// Take the table's next value.
-    pub async fn take(&self, storage: &dyn StorageEngine, table: &str) -> StorageResult<u64> {
+    pub async fn take(&self, storage: &dyn StorageEngine, table: TableId) -> StorageResult<u64> {
         self.with_counter(storage, table, |counter| {
             let value = *counter;
             *counter += 1;
@@ -78,7 +76,7 @@ impl AutoIncrement {
     pub async fn observe(
         &self,
         storage: &dyn StorageEngine,
-        table: &str,
+        table: TableId,
         value: u64,
     ) -> StorageResult<()> {
         self.with_counter(storage, table, |counter| {
@@ -91,16 +89,16 @@ impl AutoIncrement {
     /// memory is not left behind it. (It is behind only on a node that has
     /// just become primary and loaded the counter before it had applied
     /// everything the previous primary committed.)
-    pub fn raise(&self, table: &str, next: u64) {
-        if let Some(counter) = self.next.lock().get_mut(table) {
+    pub fn raise(&self, table: TableId, next: u64) {
+        if let Some(counter) = self.next.lock().get_mut(&table) {
             *counter = (*counter).max(next);
         }
     }
 
     /// Forget the table's counter: the table is gone, and one created under
     /// its name starts from what is stored for it (nothing: 1).
-    pub fn forget(&self, table: &str) {
-        self.next.lock().remove(table);
+    pub fn forget(&self, table: TableId) {
+        self.next.lock().remove(&table);
     }
 
     /// Forget every counter. For a node that has just become primary: the

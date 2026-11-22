@@ -12,7 +12,7 @@ use crate::executor::encoding::{decode_row, encode_pk_key, encode_row};
 use crate::executor::{Datum, Row};
 use crate::raft::RowChange;
 
-use super::system_tables::SYSTEM_TABLES;
+use super::system_tables::{system_table_id, SYSTEM_TABLES};
 use super::{IndexDef, TableDef};
 
 /// What is stored of a table.
@@ -24,7 +24,10 @@ pub struct TableRecord {
 
 /// The key of a table's record.
 pub fn table_key(name: &str) -> Vec<u8> {
-    encode_pk_key(SYSTEM_TABLES, &[Datum::String(name.to_string())])
+    encode_pk_key(
+        system_table_id(SYSTEM_TABLES),
+        &[Datum::String(name.to_string())],
+    )
 }
 
 /// The row a table's record is stored as: its name and the encoded record.
@@ -120,7 +123,7 @@ pub fn row_key(table: &str, row: &Row) -> Vec<u8> {
         .iter()
         .map(|&column| row.values().get(column).cloned().unwrap_or(Datum::Null))
         .collect();
-    encode_pk_key(table, &values)
+    encode_pk_key(system_table_id(table), &values)
 }
 
 /// The change that adds `row` to a system table. Refused when applied if
@@ -164,8 +167,9 @@ pub async fn scan_rows(
     use crate::executor::encoding::{table_key_end, table_key_prefix};
     use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
 
+    let id = system_table_id(table);
     let stored = storage
-        .scan(Some(&table_key_prefix(table)), Some(&table_key_end(table)))
+        .scan(Some(&table_key_prefix(id)), Some(&table_key_end(id)))
         .await?;
     let mut rows = Vec::with_capacity(stored.len());
     for (key, value) in stored {
@@ -182,7 +186,7 @@ pub async fn scan_rows(
 
 /// The table a key of `system.tables` belongs to.
 pub fn table_of_key(key: &[u8]) -> Option<String> {
-    let prefix = crate::executor::encoding::table_key_prefix(SYSTEM_TABLES);
+    let prefix = crate::executor::encoding::table_key_prefix(system_table_id(SYSTEM_TABLES));
     let part = key.strip_prefix(prefix.as_slice())?;
     crate::executor::key::decode_string(part)
 }

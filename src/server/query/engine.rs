@@ -10,7 +10,6 @@ use tracing::{debug, warn};
 use super::{OkInfo, QueryError, ResponseSink, Status};
 use crate::catalog::system_tables::SYSTEM_PROCEDURES;
 use crate::catalog::{Catalog, ParamMode, ProcedureDef, ProcedureParam};
-use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
 use crate::executor::engine::ExecutorEngine;
 use crate::executor::{Datum, Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
@@ -1023,13 +1022,8 @@ impl QueryEngine {
             return Ok(());
         }
 
-        // Scan system.grants to get user's grants
-        let prefix = table_key_prefix(SYSTEM_GRANTS);
-        let end = table_key_end(SYSTEM_GRANTS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        // The user's grants, from system.grants
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_GRANTS)
             .await
             .map_err(|e| format!("Failed to query grants: {}", e))?;
 
@@ -1037,14 +1031,9 @@ impl QueryEngine {
         let mut user_grants = Vec::new();
         let client_host = self.client_ip.to_string();
 
-        for (_key, value) in rows {
-            use crate::raft::{is_mvcc_tombstone, MVCC_HEADER_SIZE};
-            // Skip short rows or MVCC tombstones
-            if value.len() <= MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
-                continue;
-            }
-            let row_data = &value[MVCC_HEADER_SIZE..];
-            if let Ok(row) = decode_row(row_data) {
+        for stored in rows {
+            {
+                let row = stored.row;
                 // system.grants columns: grantee, grantee_host, grantee_type, privilege,
                 // object_type, database_name, table_name, with_grant_option, granted_by, granted_at
                 let values = row.values();
@@ -1620,9 +1609,11 @@ impl QueryEngine {
         self.session
             .retain_pending_changes(|change| !(start <= change.key && change.key < end));
         self.temp.remove_table(name);
-        let _ = self.catalog.write().drop_table(name);
         // Its AUTO_INCREMENT counter was only ever in memory.
-        self.txn_manager.auto_increment().forget(name);
+        if let Some(id) = self.catalog.read().get_table(name).map(|def| def.id) {
+            self.txn_manager.auto_increment().forget(id);
+        }
+        let _ = self.catalog.write().drop_table(name);
         true
     }
 
@@ -2363,7 +2354,10 @@ impl QueryEngine {
         };
 
         // Build TableDef with is_temporary flag
-        let mut table_def = crate::catalog::TableDef::new(&name);
+        // Its ID is this process's own: a temporary table's rows never
+        // leave the session.
+        let table_id = crate::executor::encoding::local_table_id();
+        let mut table_def = crate::catalog::TableDef::new(&name).with_id(table_id);
         table_def.is_temporary = true;
         for col in &columns {
             table_def = table_def.column(col.clone());
@@ -2398,7 +2392,7 @@ impl QueryEngine {
         }
 
         // Its rows are kept in this session from here on.
-        self.temp.add_table(&name);
+        self.temp.add_table(&name, table_id);
 
         self.send_ok(0, 0).await.map(|_| Some(()))
     }
@@ -4315,7 +4309,6 @@ impl QueryEngine {
     /// Handle DROP TRIGGER: delete its row from system.triggers through Raft.
     async fn handle_drop_trigger_sql(&mut self, sql: &str) -> ProtocolResult<()> {
         use crate::catalog::system_tables::SYSTEM_TRIGGERS;
-        use crate::executor::encoding::decode_row;
 
         // Extract trigger name: DROP TRIGGER [IF EXISTS] name
         let statement = sql.trim().trim_end_matches(';').trim();
@@ -4340,30 +4333,14 @@ impl QueryEngine {
         }
 
         // Find the trigger's row.
-        let prefix = crate::executor::encoding::table_key_prefix(SYSTEM_TRIGGERS);
-        let end = crate::executor::encoding::table_key_end(SYSTEM_TRIGGERS);
-        let rows = self
-            .mvcc
-            .scan_raw(&prefix, &end)
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_TRIGGERS)
             .await
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
         let mut changes = Vec::new();
-        for (key, value) in rows {
-            if crate::raft::is_mvcc_tombstone(&value)
-                || value.len() <= crate::raft::MVCC_HEADER_SIZE
+        for stored in &rows {
+            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name == trigger_name)
             {
-                continue;
-            }
-            let row_data = &value[crate::raft::MVCC_HEADER_SIZE..];
-            if let Ok(row) = decode_row(row_data) {
-                if matches!(row.values().first(), Some(Datum::String(name)) if name == trigger_name)
-                {
-                    changes.push(RowChange::delete_with_value(
-                        SYSTEM_TRIGGERS,
-                        key,
-                        row_data.to_vec(),
-                    ));
-                }
+                changes.push(crate::catalog::store::delete_row(SYSTEM_TRIGGERS, stored));
             }
         }
 

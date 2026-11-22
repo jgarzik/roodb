@@ -22,6 +22,8 @@ use super::Executor;
 pub struct PointGet {
     /// Table name
     table: String,
+    /// The table's ID: what its keys begin with
+    table_id: crate::executor::encoding::TableId,
     /// Primary key value expression
     key_expr: ResolvedExpr,
     /// The key column's type, if known.
@@ -41,6 +43,7 @@ pub struct PointGet {
 impl PointGet {
     pub fn new(
         table: String,
+        table_id: crate::executor::encoding::TableId,
         key_expr: ResolvedExpr,
         key_type: Option<crate::catalog::DataType>,
         mvcc: Arc<MvccStorage>,
@@ -49,6 +52,7 @@ impl PointGet {
     ) -> Self {
         PointGet {
             table,
+            table_id,
             key_expr,
             key_type,
             mvcc,
@@ -75,7 +79,7 @@ impl Executor for PointGet {
         };
 
         // Encode the storage key using PK-based encoding
-        let storage_key = encode_pk_key(&self.table, &[key_datum]);
+        let storage_key = encode_pk_key(self.table_id, &[key_datum]);
 
         // Do the O(log n) lookup
         let value = if let Some(ref ctx) = self.txn_context {
@@ -97,8 +101,8 @@ impl Executor for PointGet {
                                 .mvcc
                                 .gap_around(
                                     &storage_key,
-                                    &super::encoding::table_key_prefix(&self.table),
-                                    &super::encoding::table_key_end(&self.table),
+                                    &super::encoding::table_key_prefix(self.table_id),
+                                    &super::encoding::table_key_end(self.table_id),
                                 )
                                 .await?;
                             ctx.lock_gap(&low, &high);

@@ -29,6 +29,8 @@ use super::Executor;
 pub struct Insert {
     /// Table name
     table: String,
+    /// The table's ID: what its keys begin with
+    table_id: crate::executor::encoding::TableId,
     /// Target columns
     columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
@@ -64,6 +66,7 @@ impl Insert {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: String,
+        table_id: crate::executor::encoding::TableId,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         txn_context: Option<TransactionContext>,
@@ -76,6 +79,7 @@ impl Insert {
     ) -> Self {
         Insert {
             table,
+            table_id,
             columns,
             values,
             txn_context,
@@ -189,7 +193,7 @@ impl Executor for Insert {
                     datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
                 if generate {
                     let value = match &self.mvcc {
-                        Some(mvcc) => mvcc.take_auto_increment(&self.table).await?,
+                        Some(mvcc) => mvcc.take_auto_increment(self.table_id).await?,
                         // Run without storage (unit tests): there is no
                         // table counter; the row ID's counter stands in.
                         None => row_id & 0x0000_FFFF_FFFF_FFFF,
@@ -204,7 +208,7 @@ impl Executor for Insert {
                 } else if let super::datum::Datum::Int(given) = datums[idx] {
                     if given > 0 {
                         if let Some(mvcc) = &self.mvcc {
-                            mvcc.observe_auto_increment(&self.table, given as u64)
+                            mvcc.observe_auto_increment(self.table_id, given as u64)
                                 .await?;
                         }
                         auto_next = Some(given as u64 + 1);
@@ -248,9 +252,9 @@ impl Executor for Insert {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(&self.table, &pk_values)
+                encode_pk_key(self.table_id, &pk_values)
             } else {
-                encode_row_key(&self.table, row_id)
+                encode_row_key(self.table_id, row_id)
             };
 
             let value = encode_row(&row);
@@ -397,6 +401,14 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -436,6 +448,7 @@ mod tests {
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut insert = Insert::new(
             "users".to_string(),
+            tid("users"),
             columns,
             values,
             Some(txn_context),

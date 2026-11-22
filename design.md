@@ -145,6 +145,8 @@ system tables.
 
 Volcano-style query execution. Each operator implements iterator protocol.
 
+**Keys** (`encoding.rs`): every table has a number, its ID, given once when it is created (`Command::AllocIds`, one counter for the cluster; the system tables have fixed IDs below 1024, and a session's temporary tables take IDs from a range of their own that never leaves the process). A table's keys are `t`, the table ID, an index ID (0 for the rows themselves), then the key values: so a table's rows are together, a renamed table keeps them, and a table created under a dropped table's name has none of the old one's. The `AUTO_INCREMENT` counter is stored under the table's ID too.
+
 **Values in keys** (`key.rs`): storage compares keys as bytes, so each value of a key is written as bytes that sort as the values do: a presence byte (`NULL` first), then integers big-endian with the sign bit flipped, floats by their bits arranged to sort, decimals as sign, magnitude and digits (the same bytes whatever the scale), strings and bytes escaped and terminated so that no value's bytes begin another's. A part can be descending (bytes inverted), a prefix of the value, and strings pass through a `Collation` (binary, for now). A value looked up by key is first put in the key column's type (`for_lookup`): `2.5` against an integer key is no key at all for `=`, and the next whole key for a range bound.
 
 **Trait**:

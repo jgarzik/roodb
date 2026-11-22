@@ -20,6 +20,8 @@ use super::Executor;
 pub struct InsertSelect {
     /// Table name
     table: String,
+    /// The table's ID: what its keys begin with
+    table_id: crate::executor::encoding::TableId,
     /// Target columns (always ALL table columns)
     columns: Vec<ResolvedColumn>,
     /// Source query executor
@@ -54,6 +56,7 @@ impl InsertSelect {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: String,
+        table_id: crate::executor::encoding::TableId,
         columns: Vec<ResolvedColumn>,
         source: Box<dyn Executor>,
         txn_context: Option<TransactionContext>,
@@ -69,6 +72,7 @@ impl InsertSelect {
             .unwrap_or_default();
         InsertSelect {
             table,
+            table_id,
             columns,
             source,
             txn_context,
@@ -161,7 +165,7 @@ impl Executor for InsertSelect {
                 }
                 if datums[idx].is_null() || matches!(datums[idx], Datum::Int(0)) {
                     let value = match &self.mvcc {
-                        Some(mvcc) => mvcc.take_auto_increment(&self.table).await?,
+                        Some(mvcc) => mvcc.take_auto_increment(self.table_id).await?,
                         None => row_id & 0x0000_FFFF_FFFF_FFFF,
                     };
                     datums[idx] = Datum::Int(value as i64);
@@ -172,7 +176,7 @@ impl Executor for InsertSelect {
                 } else if let Datum::Int(given) = datums[idx] {
                     if given > 0 {
                         if let Some(mvcc) = &self.mvcc {
-                            mvcc.observe_auto_increment(&self.table, given as u64)
+                            mvcc.observe_auto_increment(self.table_id, given as u64)
                                 .await?;
                         }
                         auto_next = Some(given as u64 + 1);
@@ -212,9 +216,9 @@ impl Executor for InsertSelect {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(&self.table, &pk_values)
+                encode_pk_key(self.table_id, &pk_values)
             } else {
-                encode_row_key(&self.table, row_id)
+                encode_row_key(self.table_id, row_id)
             };
             let value = encode_row(&row);
 

@@ -4,6 +4,7 @@
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
 use super::{ColumnDef, Constraint, DataType, ProcedureDef, ProcedureParam, TableDef, ViewDef};
+use crate::executor::encoding::TableId;
 use crate::executor::{Datum, Row};
 
 /// System table names
@@ -176,7 +177,9 @@ pub fn row_to_trigger_def(row: &Row) -> Option<crate::catalog::TriggerDef> {
 }
 
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
-    vec![
+    // Each has a fixed table ID, by its place here: new tables go at the
+    // end, and none is ever removed from the middle.
+    [
         tables_table_def(),
         users_table_def(),
         grants_table_def(),
@@ -188,6 +191,28 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         views_table_def(),
         triggers_table_def(),
     ]
+    .into_iter()
+    .zip(1..)
+    .map(|(def, id)| def.with_id(TableId(id)))
+    .collect()
+}
+
+/// Table IDs below this belong to the system's own tables; the tables
+/// users create are numbered from here.
+pub const FIRST_USER_TABLE_ID: u64 = 1024;
+
+/// The fixed ID of a system table.
+pub fn system_table_id(name: &str) -> TableId {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static IDS: LazyLock<HashMap<String, TableId>> = LazyLock::new(|| {
+        bootstrap_system_tables()
+            .into_iter()
+            .map(|def| (def.name, def.id))
+            .collect()
+    });
+    *IDS.get(name).expect("a system table")
 }
 
 /// Convert a DataType to its string representation for storage

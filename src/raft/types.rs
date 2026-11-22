@@ -40,6 +40,10 @@ pub enum Command {
     /// Hand out the next node ID. The response carries it. IDs are never
     /// reused, also not after a node has left.
     AllocNodeId,
+    /// Hand out `count` consecutive object IDs (tables, and what else is
+    /// numbered like them). The response carries the first. An ID is given
+    /// once: one that goes unused is not given again.
+    AllocIds { count: u64 },
 }
 
 // ============ MVCC header layout constants ============
@@ -92,6 +96,7 @@ impl std::fmt::Display for Command {
             }
             Command::Seed(entries) => write!(f, "Seed({} entries)", entries.len()),
             Command::AllocNodeId => f.write_str("AllocNodeId"),
+            Command::AllocIds { count } => write!(f, "AllocIds({count})"),
         }
     }
 }

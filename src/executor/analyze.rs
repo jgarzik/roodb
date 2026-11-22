@@ -61,8 +61,14 @@ impl Executor for AnalyzeTable {
         }
 
         // Scan table data to count rows and sum sizes
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
+        let table_id = self
+            .catalog
+            .read()
+            .get_table(&self.table)
+            .map(|def| def.id)
+            .ok_or_else(|| ExecutorError::TableNotFound(self.table.clone()))?;
+        let prefix = table_key_prefix(table_id);
+        let end = table_key_end(table_id);
 
         let rows = self
             .mvcc

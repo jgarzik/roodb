@@ -522,6 +522,15 @@ impl ExecutorEngine {
         Ok(has_rows)
     }
 
+    /// The ID of a table the plan names: what the table's keys begin with.
+    fn table_id(&self, table: &str) -> ExecutorResult<super::encoding::TableId> {
+        self.catalog
+            .read()
+            .get_table(table)
+            .map(|def| def.id)
+            .ok_or_else(|| ExecutorError::TableNotFound(table.to_string()))
+    }
+
     fn build_node(&self, plan: PhysicalPlan) -> ExecutorResult<Box<dyn Executor>> {
         match plan {
             PhysicalPlan::SingleRow => Ok(Box::new(SingleRow::new())),
@@ -533,7 +542,8 @@ impl ExecutorEngine {
             } => {
                 let schema_types: Vec<_> = columns.iter().map(|c| c.data_type.clone()).collect();
                 Ok(Box::new(TableScan::with_schema_types(
-                    table,
+                    table.clone(),
+                    self.table_id(&table)?,
                     filter,
                     self.mvcc.clone(),
                     self.txn_context.clone(),
@@ -548,7 +558,8 @@ impl ExecutorEngine {
                 key_value,
                 key_type,
             } => Ok(Box::new(PointGet::new(
-                table,
+                table.clone(),
+                self.table_id(&table)?,
                 key_value,
                 Some(key_type),
                 self.mvcc.clone(),
@@ -566,7 +577,8 @@ impl ExecutorEngine {
                 remaining_filter,
                 key_type,
             } => Ok(Box::new(RangeScan::new(
-                table,
+                table.clone(),
+                self.table_id(&table)?,
                 super::range_scan::RangeScanBounds {
                     start_expr: start_key,
                     end_expr: end_key,
@@ -711,7 +723,8 @@ impl ExecutorEngine {
                 ignore,
                 on_duplicate,
             } => Ok(Box::new(Insert::new(
-                table,
+                table.clone(),
+                self.table_id(&table)?,
                 columns,
                 values,
                 self.txn_context.clone(),
@@ -734,7 +747,8 @@ impl ExecutorEngine {
             } => {
                 let source_exec = self.build_node(*source)?;
                 Ok(Box::new(InsertSelect::new(
-                    table,
+                    table.clone(),
+                    self.table_id(&table)?,
                     columns,
                     source_exec,
                     self.txn_context.clone(),
@@ -756,6 +770,7 @@ impl ExecutorEngine {
                 limit,
                 pk_column_indices,
             } => Ok(Box::new(Update::new(UpdateParams {
+                table_id: self.table_id(&table)?,
                 table,
                 assignments,
                 filter,
@@ -777,6 +792,7 @@ impl ExecutorEngine {
                 order_by,
                 limit,
             } => Ok(Box::new(Delete::new(DeleteParams {
+                table_id: self.table_id(&table)?,
                 table,
                 filter,
                 key_value,
@@ -1108,6 +1124,14 @@ mod tests {
     use crate::txn::TransactionManager;
     use std::sync::Mutex;
 
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
     struct MockStorage {
         data: Mutex<Vec<KeyValue>>,
     }
@@ -1190,9 +1214,18 @@ mod tests {
         let row3 = Row::new(vec![Datum::Int(3), Datum::String("carol".to_string())]);
 
         let initial = vec![
-            (encode_pk_key("users", &[Datum::Int(1)]), encode_row(&row1)),
-            (encode_pk_key("users", &[Datum::Int(2)]), encode_row(&row2)),
-            (encode_pk_key("users", &[Datum::Int(3)]), encode_row(&row3)),
+            (
+                encode_pk_key(tid("users"), &[Datum::Int(1)]),
+                encode_row(&row1),
+            ),
+            (
+                encode_pk_key(tid("users"), &[Datum::Int(2)]),
+                encode_row(&row2),
+            ),
+            (
+                encode_pk_key(tid("users"), &[Datum::Int(3)]),
+                encode_row(&row3),
+            ),
         ];
 
         let storage = Arc::new(MockStorage::new(initial));
@@ -1208,6 +1241,7 @@ mod tests {
             let mut cat = catalog.write();
             cat.create_table(
                 TableDef::new("users")
+                    .with_id(tid("users"))
                     .column(ColumnDef::new("id", DataType::Int).nullable(false))
                     .column(ColumnDef::new("name", DataType::Varchar(100))),
             )

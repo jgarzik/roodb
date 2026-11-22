@@ -993,6 +993,20 @@ impl RaftNode {
         Ok(resp.data)
     }
 
+    /// Take `count` consecutive object IDs from the cluster's counter and
+    /// return the first. A table gets its ID this way before its record is
+    /// proposed: the ID is part of every key of the table.
+    pub async fn alloc_ids(&self, count: u64) -> Result<u64, RaftNodeError> {
+        match self.write(Command::AllocIds { count }).await? {
+            CommandResponse::Ok(Some(bytes)) if bytes.len() == 8 => {
+                Ok(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+            }
+            other => Err(RaftNodeError::Raft(format!(
+                "no object ID was allocated: {other:?}"
+            ))),
+        }
+    }
+
     /// Check if this node is the leader
     ///
     /// Returns true if this node can accept writes (is the Raft leader).

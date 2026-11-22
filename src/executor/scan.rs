@@ -24,6 +24,8 @@ use super::Executor;
 pub struct TableScan {
     /// Table name
     table: String,
+    /// The table's ID: what its keys begin with
+    table_id: crate::executor::encoding::TableId,
     /// Optional filter predicate (pushed down)
     filter: Option<ResolvedExpr>,
     /// MVCC-aware storage
@@ -44,6 +46,7 @@ impl TableScan {
     /// Create a new table scan
     pub fn new(
         table: String,
+        table_id: crate::executor::encoding::TableId,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
@@ -51,6 +54,7 @@ impl TableScan {
     ) -> Self {
         TableScan {
             table,
+            table_id,
             filter,
             mvcc,
             txn_context,
@@ -64,6 +68,7 @@ impl TableScan {
     /// Create a new table scan with schema column types for lazy row padding
     pub fn with_schema_types(
         table: String,
+        table_id: crate::executor::encoding::TableId,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
         txn_context: Option<TransactionContext>,
@@ -72,6 +77,7 @@ impl TableScan {
     ) -> Self {
         TableScan {
             table,
+            table_id,
             filter,
             mvcc,
             txn_context,
@@ -87,8 +93,8 @@ impl TableScan {
 impl Executor for TableScan {
     async fn open(&mut self) -> ExecutorResult<()> {
         // Scan the table — store raw values, decode lazily in next()
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
+        let prefix = table_key_prefix(self.table_id);
+        let end = table_key_end(self.table_id);
 
         // Use MVCC scan with visibility filtering if we have a transaction context,
         // otherwise fall back to raw storage scan (for DDL or legacy tests)
@@ -187,6 +193,14 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -255,8 +269,14 @@ mod tests {
         let row2 = Row::new(vec![Datum::Int(2), Datum::String("bob".to_string())]);
 
         let data = vec![
-            (encode_pk_key("users", &[Datum::Int(1)]), encode_row(&row1)),
-            (encode_pk_key("users", &[Datum::Int(2)]), encode_row(&row2)),
+            (
+                encode_pk_key(tid("users"), &[Datum::Int(1)]),
+                encode_row(&row1),
+            ),
+            (
+                encode_pk_key(tid("users"), &[Datum::Int(2)]),
+                encode_row(&row2),
+            ),
         ];
 
         let storage = Arc::new(MockStorage { data }) as Arc<dyn StorageEngine>;
@@ -268,7 +288,14 @@ mod tests {
     async fn test_table_scan_basic() {
         let mvcc = make_test_mvcc();
         // No txn_context = use inner storage directly (legacy mode)
-        let mut scan = TableScan::new("users".to_string(), None, mvcc, None, empty_vars());
+        let mut scan = TableScan::new(
+            "users".to_string(),
+            tid("users"),
+            None,
+            mvcc,
+            None,
+            empty_vars(),
+        );
 
         scan.open().await.unwrap();
 

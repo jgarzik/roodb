@@ -126,6 +126,14 @@ impl Executor for CreateTable {
         }
 
         if let Some(ref raft_node) = self.raft_node {
+            // The table's ID, from the cluster's counter: every key of the
+            // table begins with it.
+            let id = raft_node
+                .alloc_ids(1)
+                .await
+                .map(super::encoding::TableId)
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            let table_def = table_def.with_id(id);
             // Checked here, before it is proposed: what is in the log is
             // applied as it is.
             self.catalog
@@ -147,6 +155,7 @@ impl Executor for CreateTable {
             // the proposal returned.
         } else {
             // No Raft - update catalog directly (for tests without Raft)
+            let table_def = table_def.with_id(super::encoding::local_table_id());
             let mut catalog = self.catalog.write();
             catalog
                 .create_table(table_def)
@@ -230,17 +239,20 @@ impl Executor for DropTable {
             )));
         }
 
-        // Check if table exists (catalog read)
-        {
+        // The table, if it exists (catalog read)
+        let table_id = {
             let catalog = self.catalog.read();
-            if catalog.get_table(&self.name).is_none() {
-                if self.if_exists {
-                    self.done = true;
-                    return Ok(Some(Row::new(vec![Datum::Int(0)])));
+            match catalog.get_table(&self.name) {
+                Some(def) => def.id,
+                None => {
+                    if self.if_exists {
+                        self.done = true;
+                        return Ok(Some(Row::new(vec![Datum::Int(0)])));
+                    }
+                    return Err(ExecutorError::TableNotFound(self.name.clone()));
                 }
-                return Err(ExecutorError::TableNotFound(self.name.clone()));
             }
-        }
+        };
 
         if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
             // The table's record goes; with it, its definition and its
@@ -262,8 +274,8 @@ impl Executor for DropTable {
             }
 
             // Delete all user data rows for this table
-            let prefix = super::encoding::table_key_prefix(&self.name);
-            let end = super::encoding::table_key_end(&self.name);
+            let prefix = super::encoding::table_key_prefix(table_id);
+            let end = super::encoding::table_key_end(table_id);
             let data_rows = mvcc
                 .scan_raw(&prefix, &end)
                 .await
@@ -720,6 +732,8 @@ use super::encoding::encode_pk_key;
 /// streamed into storage.
 pub struct CreateTableAs {
     name: String,
+    /// The new table's ID, once it has been created.
+    table_id: super::encoding::TableId,
     columns: Vec<ColumnDef>,
     constraints: Vec<Constraint>,
     if_not_exists: bool,
@@ -747,6 +761,7 @@ impl CreateTableAs {
     pub fn new(params: CreateTableAsParams) -> Self {
         CreateTableAs {
             name: params.name,
+            table_id: super::encoding::TableId(0),
             columns: params.columns,
             constraints: params.constraints,
             if_not_exists: params.if_not_exists,
@@ -803,7 +818,14 @@ impl CreateTableAs {
         };
 
         if let Some(ref raft_node) = self.raft_node {
-            // Raft path: the new table's record
+            // Raft path: the new table's ID, then its record
+            let id = raft_node
+                .alloc_ids(1)
+                .await
+                .map(super::encoding::TableId)
+                .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
+            self.table_id = id;
+            let table_def = table_def.with_id(id);
             self.catalog
                 .read()
                 .validate_table(&table_def)
@@ -821,6 +843,8 @@ impl CreateTableAs {
                 .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
         } else {
             // No Raft: update catalog directly
+            self.table_id = super::encoding::local_table_id();
+            let table_def = table_def.with_id(self.table_id);
             let mut catalog = self.catalog.write();
             catalog
                 .create_table(table_def)
@@ -878,9 +902,9 @@ impl Executor for CreateTableAs {
                     .iter()
                     .filter_map(|&idx| row.get(idx).ok().cloned())
                     .collect();
-                encode_pk_key(&self.name, &pk_values)
+                encode_pk_key(self.table_id, &pk_values)
             } else {
-                encode_row_key(&self.name, row_id)
+                encode_row_key(self.table_id, row_id)
             };
             let value = encode_row(&row);
 

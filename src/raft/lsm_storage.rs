@@ -22,7 +22,7 @@ use crate::catalog::system_tables::{
     SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
-use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
+use crate::executor::encoding::{decode_row, table_of_row_key, TableId};
 use crate::raft::changes::{ChangeOp, ChangeSet};
 use crate::raft::types::{
     Command, CommandResponse, LogId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership,
@@ -45,15 +45,6 @@ fn extract_row_version(encoded: &[u8]) -> Option<u64> {
     ))
 }
 
-/// The row in a stored value: what follows the version header. `None` if
-/// the row is deleted (or the value is too short to be a row at all).
-fn extract_row_data(value: &[u8]) -> Option<&[u8]> {
-    if value.len() < MVCC_HEADER_SIZE || is_mvcc_tombstone(value) {
-        return None;
-    }
-    Some(&value[MVCC_HEADER_SIZE..])
-}
-
 // Key prefixes for Raft state in LSM
 const LAST_APPLIED_KEY: &[u8] = b"_raft:sm:last_applied";
 const MEMBERSHIP_KEY: &[u8] = b"_raft:sm:membership";
@@ -69,6 +60,9 @@ const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 /// Keys with this prefix are the state machine's own bookkeeping; every
 /// other key is data.
 pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
+
+/// The next object ID to hand out (u64, little endian).
+const NEXT_OBJECT_ID_KEY: &[u8] = b"_raft:sm:next_object_id";
 
 /// The reserved row ID bound of the cluster (u64, little endian): no row ID
 /// below it is handed out again. Written first by initialisation, for the
@@ -138,8 +132,8 @@ struct ChangesetPlan {
     /// What the changeset does to tables, in order: the catalog follows
     /// once the changeset is written.
     catalog: Vec<CatalogOp>,
-    /// Tables this changeset drops (and does not create again).
-    dropped_tables: Vec<String>,
+    /// Tables this changeset drops, by ID.
+    dropped_tables: Vec<TableId>,
 }
 
 /// A change to a table as the catalog sees it.
@@ -315,120 +309,56 @@ impl LsmRaftStorage {
     /// Called after apply() when system.tables/columns/indexes changes are detected.
     /// Scans storage to reconstruct TableDef/IndexDef and updates catalog.
     async fn rebuild_catalog_from_system_tables(&self) -> Result<(), StorageError> {
+        use crate::catalog::store::scan_rows;
+        use crate::executor::Datum;
+
         // Every table's record: its definition and its indexes.
         let mut records: Vec<TableRecord> = Vec::new();
-        let prefix = table_key_prefix(SYSTEM_TABLES);
-        let end = table_key_end(SYSTEM_TABLES);
-        let table_rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        for stored in scan_rows(self.storage.as_ref(), SYSTEM_TABLES)
             .await
-            .map_err(read_err)?;
-        for (key, value) in table_rows {
-            let Some(row_data) = extract_row_data(&value) else {
-                continue;
-            };
-            match decode_table(row_data) {
+            .map_err(read_err)?
+        {
+            match decode_table(&stored.data) {
                 Some(record) => records.push(record),
                 None => {
                     return Err(read_err(format!(
                         "the stored definition of table {:?} cannot be read",
-                        table_of_key(&key).unwrap_or_default()
+                        table_of_key(&stored.key).unwrap_or_default()
                     )))
                 }
             }
         }
 
-        // Scan system.databases to rebuild database list
-        let mut database_names: Vec<String> = Vec::new();
-        {
-            let prefix = table_key_prefix(SYSTEM_DATABASES);
-            let end = table_key_end(SYSTEM_DATABASES);
-            let db_rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
+        let database_names: Vec<String> = scan_rows(self.storage.as_ref(), SYSTEM_DATABASES)
+            .await
+            .map_err(read_err)?
+            .into_iter()
+            .filter_map(|stored| match stored.row.values().first() {
+                Some(Datum::String(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let view_defs: Vec<crate::catalog::ViewDef> =
+            scan_rows(self.storage.as_ref(), SYSTEM_VIEWS)
                 .await
-                .map_err(read_err)?;
-
-            for (_key, value) in db_rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
-                        database_names.push(db_name.clone());
-                    }
-                }
-            }
-        }
-
-        // Scan system.views to rebuild views
-        let mut view_defs: Vec<crate::catalog::ViewDef> = Vec::new();
-        {
-            let prefix = table_key_prefix(SYSTEM_VIEWS);
-            let end = table_key_end(SYSTEM_VIEWS);
-            let view_rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
+                .map_err(read_err)?
+                .iter()
+                .filter_map(|stored| row_to_view_def(&stored.row))
+                .collect();
+        let procedure_defs: Vec<crate::catalog::ProcedureDef> =
+            scan_rows(self.storage.as_ref(), SYSTEM_PROCEDURES)
                 .await
-                .map_err(read_err)?;
-
-            for (_key, value) in view_rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(view_def) = row_to_view_def(&row) {
-                        view_defs.push(view_def);
-                    }
-                }
-            }
-        }
-
-        // Scan system.procedures to rebuild stored procedures
-        let mut procedure_defs: Vec<crate::catalog::ProcedureDef> = Vec::new();
-        {
-            let prefix = table_key_prefix(SYSTEM_PROCEDURES);
-            let end = table_key_end(SYSTEM_PROCEDURES);
-            let proc_rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
+                .map_err(read_err)?
+                .iter()
+                .filter_map(|stored| row_to_procedure_def(&stored.row))
+                .collect();
+        let trigger_defs: Vec<crate::catalog::TriggerDef> =
+            scan_rows(self.storage.as_ref(), SYSTEM_TRIGGERS)
                 .await
-                .map_err(read_err)?;
-
-            for (_key, value) in proc_rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(proc_def) = row_to_procedure_def(&row) {
-                        procedure_defs.push(proc_def);
-                    }
-                }
-            }
-        }
-
-        // Scan system.triggers to rebuild triggers
-        let mut trigger_defs: Vec<crate::catalog::TriggerDef> = Vec::new();
-        {
-            let prefix = table_key_prefix(SYSTEM_TRIGGERS);
-            let end = table_key_end(SYSTEM_TRIGGERS);
-            let rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
-                .await
-                .map_err(read_err)?;
-            for (_key, value) in rows {
-                let Some(row_data) = extract_row_data(&value) else {
-                    continue;
-                };
-                if let Ok(row) = decode_row(row_data) {
-                    if let Some(trigger) = row_to_trigger_def(&row) {
-                        trigger_defs.push(trigger);
-                    }
-                }
-            }
-        }
+                .map_err(read_err)?
+                .iter()
+                .filter_map(|stored| row_to_trigger_def(&stored.row))
+                .collect();
 
         // Update catalog (clear and rebuild)
         let mut catalog = self.catalog.write();
@@ -626,36 +556,43 @@ impl LsmRaftStorage {
                 }
             }
         }
-        // Tables the changeset leaves dropped: the last word on each name.
+        // Tables the changeset leaves dropped: those whose record it removes
+        // without storing a record of the same ID again (a renamed table's
+        // record moves; the table stays).
+        let mut kept: Vec<TableId> = Vec::new();
         for op in &plan.catalog {
-            match op {
-                CatalogOp::Unset(name) => {
-                    if !plan.dropped_tables.contains(name) {
-                        plan.dropped_tables.push(name.clone());
-                    }
+            if let CatalogOp::Set(record) = op {
+                kept.push(record.def.id);
+            }
+        }
+        for op in &plan.catalog {
+            let CatalogOp::Unset(name) = op else { continue };
+            let id = self.catalog.read().get_table(name).map(|def| def.id);
+            if let Some(id) = id {
+                if !kept.contains(&id) && !plan.dropped_tables.contains(&id) {
+                    plan.dropped_tables.push(id);
                 }
-                CatalogOp::Set(record) => plan.dropped_tables.retain(|n| *n != record.def.name),
             }
         }
         // AUTO_INCREMENT counters. A dropped table's counter goes with it;
         // an inserted row raises its table's stored counter to the value
-        // the row carries.
+        // the row carries. (A row's table is the ID its key begins with.)
         for table in &plan.dropped_tables {
             plan.writes
-                .push((crate::txn::auto_inc::storage_key(table), None));
-            self.auto_increment.forget(table);
+                .push((crate::txn::auto_inc::storage_key(*table), None));
+            self.auto_increment.forget(*table);
         }
-        let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        let mut counters: std::collections::BTreeMap<TableId, u64> =
+            std::collections::BTreeMap::new();
         for change in &changeset.changes {
-            if let Some(next) = change.auto_inc {
-                let counter = counters.entry(change.table.as_str()).or_insert(0);
+            if let (Some(next), Some(table)) = (change.auto_inc, table_of_row_key(&change.key)) {
+                let counter = counters.entry(table).or_insert(0);
                 *counter = (*counter).max(next);
             }
         }
         for (table, next) in counters {
             let key = crate::txn::auto_inc::storage_key(table);
-            let dropped_here = plan.dropped_tables.iter().any(|dropped| dropped == table);
-            let stored = if dropped_here {
+            let stored = if plan.dropped_tables.contains(&table) {
                 None
             } else {
                 self.storage
@@ -808,6 +745,26 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                     batch.push((SEEDED_KEY.to_vec(), Some(vec![1])));
                     seeded = true;
                     CommandResponse::Ok(None)
+                }
+                EntryPayload::Normal(Command::AllocIds { count }) => {
+                    let next = match self
+                        .storage
+                        .get(NEXT_OBJECT_ID_KEY)
+                        .await
+                        .map_err(read_err)?
+                    {
+                        Some(data) => data
+                            .as_slice()
+                            .try_into()
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| read_err("stored object ID counter is malformed"))?,
+                        None => crate::catalog::system_tables::FIRST_USER_TABLE_ID,
+                    };
+                    batch.push((
+                        NEXT_OBJECT_ID_KEY.to_vec(),
+                        Some(next.saturating_add(*count).to_le_bytes().to_vec()),
+                    ));
+                    CommandResponse::Ok(Some(next.to_le_bytes().to_vec()))
                 }
                 EntryPayload::Normal(Command::AllocNodeId) => {
                     let next = match self.storage.get(NEXT_NODE_ID_KEY).await.map_err(read_err)? {

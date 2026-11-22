@@ -178,6 +178,9 @@ pub enum Constraint {
 /// Table definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
+    /// The table's number: what its rows are stored under. Assigned when
+    /// the table is created and never changed; `TableId(0)` until then.
+    pub id: crate::executor::encoding::TableId,
     /// Table name
     pub name: String,
     /// Column definitions
@@ -192,11 +195,19 @@ impl TableDef {
     /// Create a new table definition
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            id: crate::executor::encoding::TableId(0),
             name: name.into(),
             columns: Vec::new(),
             constraints: Vec::new(),
             is_temporary: false,
         }
+    }
+
+    /// Give the table its number.
+    #[must_use]
+    pub fn with_id(mut self, id: crate::executor::encoding::TableId) -> Self {
+        self.id = id;
+        self
     }
 
     /// Add a column

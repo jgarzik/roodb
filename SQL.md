@@ -148,11 +148,10 @@ rewritten.** On a table that already has rows:
   as its `DEFAULT`;
 - after `DROP COLUMN` of any column but the last, existing rows are read
   with their values shifted into the wrong columns;
-- after `RENAME TO`, the rows stay behind under the old name: the renamed
-  table reads as empty;
 - adding, dropping or changing the primary key does not re-key existing rows.
 
-Use these forms on empty tables. Other forms (`ENGINE=`, `COMMENT=`,
+Use these forms on empty tables. `RENAME TO` is safe on any table: the
+table keeps its rows, its indexes and its `AUTO_INCREMENT` counter. Other forms (`ENGINE=`, `COMMENT=`,
 `CONVERT TO`, `ORDER BY`, partitioning) are refused.
 
 `RENAME TABLE a TO b` is not supported.

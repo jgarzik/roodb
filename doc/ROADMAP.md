@@ -78,43 +78,43 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-1. Object IDs: `AllocIds`; table records with IDs and versions; keys by
-   ID; the `AUTO_INCREMENT` counter and locks by ID. `RENAME TO` becomes
-   metadata.
-2. Databases: tables belong to one; `db.table`; `USE` decides what a name
+1. Databases: tables belong to one; `db.table`; `USE` decides what a name
    means; `DROP DATABASE` drops its tables; system tables in `mysql`;
    identifier case as MySQL on Linux (database and table names
    case-sensitive, the rest not).
-3. Rows by column ID; one decoding function for every executor;
-   `ADD`/`DROP`/reorder `COLUMN` as metadata.
-4. Metadata locks; DDL commits implicitly; schema versions checked when a
-   changeset is applied.
-5. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
+2. Columns numbered within their table (never reused); rows by column ID
+   (the codec is written: `executor/rowcodec.rs`); one decoding function
+   for every executor; `ADD`/`DROP`/reorder `COLUMN` as metadata.
+3. Metadata locks taken by statements and DDL (the lock manager is
+   written: `txn/mdl.rs`); DDL commits implicitly; a schema version per
+   table, raised by every change to it and checked when a changeset is
+   applied.
+4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
-6. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
+5. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
    resets `AUTO_INCREMENT`) and `DROP DATABASE` in one log entry.
-7. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
+6. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
     naming; `CREATE`/`DROP INDEX` with errors 1061 and 1091; names per
     table; `SHOW INDEX`, `SHOW CREATE TABLE`.
-8. Index entries maintained by every statement that writes, through one
+7. Index entries maintained by every statement that writes, through one
     helper; `UNIQUE` enforced, with MySQL's error text.
-9. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
+8. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
     real statements over that helper.
-10. The schema-change job runner; `CREATE INDEX` on a table with rows,
+9. The schema-change job runner; `CREATE INDEX` on a table with rows,
     online; cancelled when its client goes away.
-11. Reading through indexes: equality prefix plus range, composite keys,
+10. Reading through indexes: equality prefix plus range, composite keys,
     `IN`, index-only reads.
-12. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
+11. Locks on index entries and their gaps; `UPDATE` and `DELETE` through
     indexes.
-13. Statistics that are read: row counts and distinct counts per index;
+12. Statistics that are read: row counts and distinct counts per index;
     the cost model in use.
-14. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
+13. `EXPLAIN` that reports what will be done; index hints; `ORDER BY` and
     `LIMIT` from index order; `MIN`/`MAX` from an index.
-15. Change of primary key and of column type, online.
-16. Temporary tables: names and IDs in the session, shadowing permanent
+14. Change of primary key and of column type, online.
+15. Temporary tables: names and IDs in the session, shadowing permanent
     tables; indexes; `RENAME`.
-17. `information_schema` tables for tables, columns and indexes;
+16. `information_schema` tables for tables, columns and indexes;
     `ALTER TABLE ... AUTO_INCREMENT = n`; `RENAME INDEX`.
 
 ## TXN — Transaction semantics
