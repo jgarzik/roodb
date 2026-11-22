@@ -1003,3 +1003,35 @@ async fn compaction_of_tables_larger_than_a_stretch_keeps_the_data() {
     assert!(engine.scan(None, None).await.unwrap() == expected);
     engine.close().await.unwrap();
 }
+
+/// Initialisation stores its rows under generated row IDs, and records how
+/// far the IDs have been used: a server that starts on this storage hands
+/// out IDs above them, not the same ones again.
+#[tokio::test]
+async fn initialisation_records_the_row_ids_it_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    let storage: Arc<dyn StorageEngine> = Arc::new(engine);
+    roodb::init::initialize_database(&storage, "secret")
+        .await
+        .unwrap();
+
+    let rows = storage.scan(Some(b"t:"), Some(b"t;")).await.unwrap();
+    assert!(rows.len() >= 4, "root, its grant and two databases");
+    let highest = rows
+        .iter()
+        .map(|(key, _)| u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()))
+        .max()
+        .unwrap();
+    let bound = storage
+        .get(roodb::raft::ROW_ID_KEY)
+        .await
+        .unwrap()
+        .map(|stored| u64::from_le_bytes(stored.as_slice().try_into().unwrap()))
+        .expect("no row ID bound was recorded");
+    assert!(
+        bound > highest,
+        "IDs up to {highest} are in use, but the recorded bound is {bound}"
+    );
+    storage.close().await.unwrap();
+}

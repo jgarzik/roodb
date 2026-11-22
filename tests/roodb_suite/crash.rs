@@ -679,3 +679,39 @@ async fn an_oversized_key_is_refused_without_harm() {
     keys.sort();
     assert_eq!(keys, ["after", "small"]);
 }
+
+/// What `roodb_init` wrote (the root account, its grant, the databases
+/// `default` and `test`) is stored under generated row IDs. The server must
+/// not hand those IDs out again: its first system rows would overwrite
+/// them.
+#[tokio::test]
+async fn rows_written_at_initialisation_are_not_overwritten() {
+    let mut server = ServerProcess::init(&[]);
+    server.start();
+    let mut conn = connect(&server).await;
+    for n in 0..8 {
+        conn.query_drop(format!("CREATE DATABASE init_db{n}"))
+            .await
+            .unwrap();
+    }
+    let databases = |rows: Vec<String>| {
+        let mut rows = rows;
+        rows.retain(|name| !name.contains("schema"));
+        rows.sort();
+        rows
+    };
+    let mut expected: Vec<String> = (0..8).map(|n| format!("init_db{n}")).collect();
+    expected.extend(["default".to_string(), "test".to_string()]);
+    expected.sort();
+    let seen: Vec<String> = conn.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases(seen), expected);
+    drop(conn);
+
+    // After a restart everything is read back from storage: the databases
+    // are all there, and root can still log in.
+    server.kill();
+    server.start();
+    let mut conn = connect(&server).await;
+    let seen: Vec<String> = conn.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases(seen), expected);
+}

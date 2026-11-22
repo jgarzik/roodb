@@ -176,6 +176,15 @@ pub async fn initialize_database(
         .await
         .map_err(|e| InitError::Storage(e.to_string()))?;
 
+    // The row IDs used above are taken: the server starts above them.
+    // (A row ID no longer says which node gave it out, so nothing else
+    // keeps the server's first IDs apart from these.)
+    let used = crate::storage::row_id::generator().current();
+    storage
+        .put(crate::raft::ROW_ID_KEY, &used.to_le_bytes())
+        .await
+        .map_err(|e| InitError::Storage(e.to_string()))?;
+
     // Write schema version marker
     write_schema_version(storage, CURRENT_SCHEMA_VERSION)
         .await

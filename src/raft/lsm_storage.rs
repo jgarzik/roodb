@@ -77,8 +77,10 @@ const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 /// other key is data.
 pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
 
-/// The reserved row ID bound of the cluster (u64, little endian).
-const ROW_ID_KEY: &[u8] = b"_raft:sm:row_id";
+/// The reserved row ID bound of the cluster (u64, little endian): no row ID
+/// below it is handed out again. Written first by initialisation, for the
+/// IDs its rows use, then raised by `Command::ReserveRowIds`.
+pub const ROW_ID_KEY: &[u8] = b"_raft:sm:row_id";
 
 /// The stored bound is moved this far past the ID that crosses it, so that it
 /// is rewritten once per this many transactions rather than once per entry.

@@ -482,6 +482,18 @@ impl RaftNode {
                         // have been used: go past everything it reserved,
                         // and reserve afresh before any is handed out.
                         let Some(node) = node.upgrade() else { return };
+                        // "Everything reserved" must include what the
+                        // previous leader reserved last: an entry of this
+                        // node's own term is committed and applied first,
+                        // and with it everything before it in the log.
+                        if let Err(e) = node.raft.client_write(Command::Noop).await {
+                            tracing::warn!(error = %e, "Lost the lead before taking it up");
+                            led = None;
+                            if metrics.changed().await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         crate::storage::row_id::generator().skip_reserved();
                         if let Err(e) = reserve_row_ids(&node.raft, ROW_ID_MIN_BLOCK).await {
                             tracing::warn!(error = %e, "Could not reserve row IDs on becoming leader");
