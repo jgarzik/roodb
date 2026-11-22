@@ -117,8 +117,10 @@ cargo test --release test_name                       # one test, any binary
 - `ddl/`, `dml/`, `queries/`, `types/`, `errors/`, `edge_cases/`, `prepared/`,
   `auth/`: SQL tests through the `mysql_async` client. They share one server:
   the first test starts a single `roodb` process (after `roodb_init`) with
-  both listeners enabled, and every test connects to it. Tests therefore use
-  table names of their own. A test that needs a differently configured server
+  both listeners enabled, and every test connects to it. A new server has no
+  databases of its own to work in, so the harness creates one, `test`
+  (`test_utils::create_test_database`), and connections start in it. Tests
+  therefore use table names of their own. A test that needs a differently configured server
   cannot use the shared one.
 - `tds/`: the same server through the `tiberius` client. Every scenario runs
   over both transports, TDS 7.x and TDS 8.0. `tds/raw.rs` is a small

@@ -19,7 +19,7 @@ use super::Executor;
 /// INSERT ... SELECT executor
 pub struct InsertSelect {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     table_id: crate::executor::encoding::TableId,
     /// Target columns (always ALL table columns)
@@ -55,7 +55,7 @@ impl InsertSelect {
     /// Create a new INSERT ... SELECT executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         columns: Vec<ResolvedColumn>,
         source: Box<dyn Executor>,

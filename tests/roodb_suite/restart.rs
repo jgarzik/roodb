@@ -62,11 +62,15 @@ async fn start(dir: &PathBuf, first_boot: bool) -> (ServerHandle, Arc<dyn Storag
     .await
     .expect("start server");
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
     (handle, storage, port)
 }
 
 async fn connect(port: u16) -> Conn {
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))

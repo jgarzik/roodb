@@ -132,12 +132,15 @@ impl TransactionContext {
     }
 
     /// Whether this statement is a locking read of `table`.
-    pub fn read_locks(&self, table: &str) -> bool {
+    pub fn read_locks(&self, table: &crate::catalog::TableName) -> bool {
         self.locks
             .as_ref()
             .and_then(|locks| locks.read.as_ref())
             .is_some_and(|read| {
-                read.of.is_empty() || read.of.iter().any(|t| t.eq_ignore_ascii_case(table))
+                // `OF` names tables as the query wrote them; `table` is the
+                // catalog's name, with its database.
+                // (by the table's own name, or the name it has in the query).
+                read.of.is_empty() || read.of.iter().any(|t| t.eq_ignore_ascii_case(&table.table))
             })
     }
 

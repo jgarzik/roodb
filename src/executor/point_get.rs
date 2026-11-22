@@ -21,7 +21,7 @@ use super::Executor;
 /// Point get executor - single-row lookup by primary key
 pub struct PointGet {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     table_id: crate::executor::encoding::TableId,
     /// Primary key value expression
@@ -42,7 +42,7 @@ pub struct PointGet {
 
 impl PointGet {
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         key_expr: ResolvedExpr,
         key_type: Option<crate::catalog::DataType>,

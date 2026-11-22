@@ -434,12 +434,16 @@ async fn test_server_integration_e2e() {
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     // Build client with TLS (accept invalid certs for self-signed)
     // Set max_allowed_packet and wait_timeout to avoid init queries for @@variables
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
 
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -545,9 +549,13 @@ async fn test_transaction_begin_commit() {
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -656,9 +664,13 @@ async fn test_transaction_rollback() {
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -769,9 +781,13 @@ async fn test_autocommit() {
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))

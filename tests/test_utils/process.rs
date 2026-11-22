@@ -22,6 +22,10 @@ pub struct ServerProcess {
     child: Option<Child>,
     /// Extra environment for the server, e.g. `ROODB_DURABILITY`.
     env: Vec<(String, String)>,
+    /// Whether the tests' database is still to be created: on a server
+    /// that began its own cluster, when it first starts. (A node that
+    /// joins a cluster gets the database with the rest of the data.)
+    needs_test_database: bool,
 }
 
 /// Ports already handed to a server of this test process. A port is only
@@ -86,6 +90,7 @@ impl ServerProcess {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            needs_test_database: true,
         }
     }
 
@@ -100,6 +105,7 @@ impl ServerProcess {
             port: free_port(),
             child: None,
             env: self.env.clone(),
+            needs_test_database: false,
         }
     }
 
@@ -118,6 +124,7 @@ impl ServerProcess {
             port: self.port,
             child: None,
             env: self.env.clone(),
+            needs_test_database: false,
         }
     }
 
@@ -218,6 +225,15 @@ impl ServerProcess {
             );
         }
         self.child = Some(child);
+        if self.needs_test_database {
+            if let Err(e) = super::create_test_database(self.port, STARTUP_TIMEOUT) {
+                panic!(
+                    "could not create the test database: {e}\n{}",
+                    self.log_tail()
+                );
+            }
+            self.needs_test_database = false;
+        }
     }
 
     /// The last part of the server's log, for failure messages.
@@ -299,6 +315,7 @@ impl ServerProcess {
     /// Connection options for the running server.
     pub fn opts(&self) -> Opts {
         OptsBuilder::default()
+            .db_name(Some("test"))
             .ip_or_hostname("127.0.0.1")
             .tcp_port(self.port)
             .user(Some("root"))

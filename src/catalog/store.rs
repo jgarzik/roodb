@@ -13,7 +13,7 @@ use crate::executor::{Datum, Row};
 use crate::raft::RowChange;
 
 use super::system_tables::{system_table_id, SYSTEM_TABLES};
-use super::{IndexDef, TableDef};
+use super::{IndexDef, TableDef, TableName};
 
 /// What is stored of a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,10 +23,13 @@ pub struct TableRecord {
 }
 
 /// The key of a table's record.
-pub fn table_key(name: &str) -> Vec<u8> {
+pub fn table_key(name: &TableName) -> Vec<u8> {
     encode_pk_key(
         system_table_id(SYSTEM_TABLES),
-        &[Datum::String(name.to_string())],
+        &[
+            Datum::String(name.database.clone()),
+            Datum::String(name.table.clone()),
+        ],
     )
 }
 
@@ -34,7 +37,8 @@ pub fn table_key(name: &str) -> Vec<u8> {
 fn table_row(record: &TableRecord) -> Vec<u8> {
     let encoded = bincode::serialize(record).expect("a table definition serialises");
     encode_row(&Row::new(vec![
-        Datum::String(record.def.name.clone()),
+        Datum::String(record.def.name.database.clone()),
+        Datum::String(record.def.name.table.clone()),
         Datum::Bytes(encoded),
     ]))
 }
@@ -43,7 +47,7 @@ fn table_row(record: &TableRecord) -> Vec<u8> {
 /// without a version header). `None` if it is not one.
 pub fn decode_table(row: &[u8]) -> Option<TableRecord> {
     let row = decode_row(row).ok()?;
-    match row.values().get(1)? {
+    match row.values().get(2)? {
         Datum::Bytes(encoded) => bincode::deserialize(encoded).ok(),
         _ => None,
     }
@@ -57,14 +61,20 @@ pub fn create_table(record: &TableRecord) -> RowChange {
 /// The change that replaces a table's record with `record`. It means the
 /// table with `record`'s ID: if the name has come to mean another table by
 /// the time the change is applied, or none, it is refused.
+///
+/// `record` is the table as it was read, with the changes made to it: it
+/// is stored as the next version of that table, and refused if the table
+/// has been changed by someone else since it was read.
 pub fn replace_table(record: &TableRecord) -> RowChange {
-    RowChange::update(table_key(&record.def.name), table_row(record))
+    let mut next = record.clone();
+    next.def.version += 1;
+    RowChange::update(table_key(&next.def.name), table_row(&next))
 }
 
 /// The change that removes a table's record. It means the table with this
 /// ID: if the name has come to mean another table by the time the change
 /// is applied, or none, it is refused.
-pub fn drop_table(name: &str, id: crate::executor::encoding::TableId) -> RowChange {
+pub fn drop_table(name: &TableName, id: crate::executor::encoding::TableId) -> RowChange {
     RowChange::delete_with_value(table_key(name), id.0.to_le_bytes().to_vec())
 }
 
@@ -111,7 +121,7 @@ fn key_columns(table: &str) -> &'static [usize] {
                     .iter()
                     .filter_map(|column| def.get_column_index(column))
                     .collect();
-                (def.name, indexes)
+                (def.name.table, indexes)
             })
             .collect()
     });
@@ -189,10 +199,13 @@ pub async fn scan_rows(
 }
 
 /// The table a key of `system.tables` belongs to.
-pub fn table_of_key(key: &[u8]) -> Option<String> {
+pub fn table_of_key(key: &[u8]) -> Option<TableName> {
+    use crate::executor::key::decode_string_part;
     let prefix = crate::executor::encoding::table_key_prefix(system_table_id(SYSTEM_TABLES));
-    let part = key.strip_prefix(prefix.as_slice())?;
-    crate::executor::key::decode_string(part)
+    let parts = key.strip_prefix(prefix.as_slice())?;
+    let (database, rest) = decode_string_part(parts)?;
+    let (table, _) = decode_string_part(rest)?;
+    Some(TableName::new(database, table))
 }
 
 #[cfg(test)]
@@ -202,23 +215,37 @@ mod tests {
 
     #[test]
     fn a_record_survives_being_stored() {
-        let def = TableDef::new("orders")
+        let def = TableDef::new(TableName::new("shop", "orders"))
             .column(ColumnDef::new("id", DataType::Int).nullable(false))
             .column(ColumnDef::new("note", DataType::Varchar(40)))
             .constraint(Constraint::PrimaryKey(vec!["id".to_string()]));
         let record = TableRecord {
             def,
-            indexes: vec![IndexDef::new("by_note", "orders", vec!["note".to_string()])],
+            indexes: vec![IndexDef::new(
+                "by_note",
+                TableName::new("shop", "orders"),
+                vec!["note".to_string()],
+            )],
         };
         let change = create_table(&record);
-        assert_eq!(table_of_key(&change.key).as_deref(), Some("orders"));
+        assert_eq!(
+            table_of_key(&change.key),
+            Some(TableName::new("shop", "orders"))
+        );
         let back = decode_table(change.value.as_deref().unwrap()).unwrap();
-        assert_eq!(back.def.name, "orders");
+        assert_eq!(back.def.name, TableName::new("shop", "orders"));
         assert_eq!(back.def.columns.len(), 2);
         assert_eq!(back.def.primary_key(), Some(&["id".to_string()][..]));
         assert_eq!(back.indexes.len(), 1);
         assert_eq!(back.indexes[0].name, "by_note");
-        // A name with bytes the key encoding escapes comes back whole.
-        assert_eq!(table_of_key(&table_key("a\0b")).as_deref(), Some("a\0b"));
+        // Names with a dot, or with bytes the key encoding escapes, come
+        // back whole, each part its own.
+        for name in [
+            TableName::new("a.b", "c"),
+            TableName::new("a", "b.c"),
+            TableName::new("a\0b", "c\0"),
+        ] {
+            assert_eq!(table_of_key(&table_key(&name)), Some(name));
+        }
     }
 }

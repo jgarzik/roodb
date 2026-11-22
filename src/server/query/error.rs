@@ -82,6 +82,28 @@ pub enum ProtocolError {
     Internal(String),
 }
 
+impl ProtocolError {
+    /// Whether this is the failure of one statement, which the client is
+    /// told and after which the session goes on, as opposed to a failure
+    /// of the connection itself.
+    pub fn fails_statement_only(&self) -> bool {
+        match self {
+            ProtocolError::Unsupported(_)
+            | ProtocolError::Sql(_)
+            | ProtocolError::Planner(_)
+            | ProtocolError::Executor(_)
+            | ProtocolError::Transaction(_)
+            | ProtocolError::Raft(_)
+            | ProtocolError::Internal(_) => true,
+            ProtocolError::Io(_)
+            | ProtocolError::InvalidPacket(_)
+            | ProtocolError::AuthFailed(_)
+            | ProtocolError::ConnectionClosed
+            | ProtocolError::Tls(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

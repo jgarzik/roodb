@@ -51,8 +51,10 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 - `TransactionManager` - MVCC coordination
 - `RaftNode` - consensus and replication
 
+**Statement failures**: a statement that fails is reported to the client and the session goes on (`QueryEngine::handle_statement`, the one entry both protocols use for a client's statement); only a failure of the connection itself (I/O, framing, TLS, login) ends it. `handle_query` underneath returns a statement's failure to its caller, which a procedure running the statements of its body needs.
+
 **Per-Connection State**:
-- `Session` - user, database, transaction state, isolation level
+- `Session` - user, current database (none until one is selected, on the MySQL protocol), transaction state, isolation level
 - `PacketReader`/`PacketWriter` - protocol framing
 - Connection ID (atomic counter)
 
@@ -106,12 +108,14 @@ protocol front-end (RooDbConnection / TdsConnection)
 Schema metadata cache. The catalog is an in-memory cache of schema metadata, rebuilt from system tables on startup.
 
 **System Tables** (stored in LSM, replicated via Raft):
-- `system.tables` - one record per table, keyed by its name: its definition (columns, constraints) and its indexes, whole (`catalog/store.rs`). A change to a table replaces that one record, so it is applied whole or not at all; the state machine brings the catalog up to date from the record as each log entry is applied, with nothing else to read and nothing that can fail. Definitions are validated before they are proposed (`Catalog::validate_table`).
+- The system tables are the tables of the database `mysql` (`catalog/system_tables.rs`); `information_schema` exists as a name and holds nothing. Every other database is a row of `mysql.databases`.
+- A table, view, routine or trigger belongs to a database. The catalog, the plans and the executors name a table by `TableName { database, table }` (`catalog/name.rs`), never by one string: a dot in either part is part of that name. The resolver turns a name as written into a `TableName` (`Resolver::canonical`): the session's current database for a name without one (error 1046 if there is none), error 1049 for a database that does not exist. A view's query is resolved in the view's database; a procedure's or trigger's body is run with the session's database set to its own for the duration.
+- `mysql.tables` - one record per table, keyed by its database and name: its definition (columns, constraints) and its indexes, whole (`catalog/store.rs`). A change to a table replaces that one record, so it is applied whole or not at all; the state machine brings the catalog up to date from the record as each log entry is applied, with nothing else to read and nothing that can fail. Definitions are validated before they are proposed (`Catalog::validate_table`). A replacement must be the next version (`TableDef::version`) of the record that is stored, and a drop must carry the stored record's ID; otherwise the change is refused. So two statements that each read a table and changed it cannot silently undo one another, and since the check reads what is stored and not the in-memory catalog (which also holds each node's sessions' temporary tables), every node decides the same.
 - Every system table's rows are keyed by what they describe (an account by name and host, a view by its name, ...) and carry the version header every stored row has, from initialisation on. `catalog/store.rs` is the one place that builds their keys and reads them; a second row with the same key is refused when it is applied.
-- `system.databases` - databases
-- `system.views`, `system.procedures` (stored procedures and functions), `system.triggers`
-- `system.table_statistics` - optimizer statistics
-- `system.users`, `system.grants`, `system.roles`, `system.role_grants` - accounts and privileges
+- `mysql.databases` - databases
+- `mysql.views`, `mysql.procedures` (stored procedures and functions), `mysql.triggers`
+- `mysql.table_statistics` - optimizer statistics
+- `mysql.users`, `mysql.grants`, `mysql.roles`, `mysql.role_grants` - accounts and privileges
 
 The system tables are the only durable copy of the schema. A schema statement
 writes rows to them through Raft; the catalog changes when those rows are
@@ -186,13 +190,13 @@ pub trait Executor: Send {
 | `DropTable` | DDL | System table deletes |
 | `CreateIndex` | DDL | Index metadata + backfill |
 | `DropIndex` | DDL | Index metadata removal |
-| `CreateUser` | Auth | `system.users` insert |
-| `AlterUser` | Auth | `system.users` update |
-| `DropUser` | Auth | `system.users` + `system.grants` delete |
-| `Grant` | Auth | `system.grants` insert |
-| `Revoke` | Auth | `system.grants` delete |
-| `SetPassword` | Auth | `system.users` update |
-| `ShowGrants` | Auth | `system.grants` query |
+| `CreateUser` | Auth | `mysql.users` insert |
+| `AlterUser` | Auth | `mysql.users` update |
+| `DropUser` | Auth | `mysql.users` + `mysql.grants` delete |
+| `Grant` | Auth | `mysql.grants` insert |
+| `Revoke` | Auth | `mysql.grants` delete |
+| `SetPassword` | Auth | `mysql.users` update |
+| `ShowGrants` | Auth | `mysql.grants` query |
 
 **Expression Eval** (`eval.rs`): Recursive evaluation of `ResolvedExpr` against `Row`. Handles literals, column refs, binary ops, functions, IS NULL, IN list, BETWEEN.
 
@@ -256,8 +260,9 @@ reactor so they cannot fill a ring.
 
 Initialization module (`roodb_init` binary). Run before first server startup.
 
-- Creates root user with SHA1(SHA1(password)) hash in `system.users`
-- Grants ALL PRIVILEGES on `*.*` with GRANT OPTION in `system.grants`
+- Creates no databases: a new server has `mysql` and `information_schema` only
+- Creates root user with SHA1(SHA1(password)) hash in `mysql.users`
+- Grants ALL PRIVILEGES on `*.*` with GRANT OPTION in `mysql.grants`
 - Writes schema version marker to storage
 - Direct storage writes (bypasses Raft — pre-cluster bootstrap)
 - Password via env: `ROODB_ROOT_PASSWORD` (direct) or `ROODB_ROOT_PASSWORD_FILE` (Docker secrets)
@@ -472,7 +477,7 @@ SQL parsing and semantic analysis.
 - MySQL-compatible privilege checking with hierarchical scope: global (`*.*`), database (`db.*`), table (`db.table`)
 - `Privilege` enum: All, Select, Insert, Update, Delete, Create, Drop, Alter, Index, GrantOption
 - `HostPattern`: MySQL-style `'user'@'host'` wildcard matching with specificity ranking
-- `check_privilege()` / `check_privileges()`: Verify grants from `system.users` / `system.grants`
+- `check_privilege()` / `check_privileges()`: Verify grants from `mysql.users` / `mysql.grants`
 
 ### `storage/`
 

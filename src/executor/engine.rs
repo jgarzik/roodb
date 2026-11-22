@@ -523,7 +523,10 @@ impl ExecutorEngine {
     }
 
     /// The ID of a table the plan names: what the table's keys begin with.
-    fn table_id(&self, table: &str) -> ExecutorResult<super::encoding::TableId> {
+    fn table_id(
+        &self,
+        table: &crate::catalog::TableName,
+    ) -> ExecutorResult<super::encoding::TableId> {
         self.catalog
             .read()
             .get_table(table)
@@ -968,6 +971,7 @@ impl ExecutorEngine {
                         if_exists,
                         self.catalog.clone(),
                         raft_node.clone(),
+                        self.mvcc.clone(),
                     )))
                 } else {
                     Ok(Box::new(DropDatabase::new(
@@ -1265,7 +1269,7 @@ mod tests {
         let (engine, _) = setup_test_env();
 
         let plan = PhysicalPlan::TableScan {
-            table: "users".to_string(),
+            table: "users".into(),
             columns: vec![
                 OutputColumn {
                     id: 0,
@@ -1301,7 +1305,7 @@ mod tests {
 
         // SELECT id FROM users WHERE id > 1
         let scan = PhysicalPlan::TableScan {
-            table: "users".to_string(),
+            table: "users".into(),
             columns: vec![
                 OutputColumn {
                     id: 0,
@@ -1366,7 +1370,7 @@ mod tests {
         let (engine, _) = setup_test_env();
 
         let scan = PhysicalPlan::TableScan {
-            table: "users".to_string(),
+            table: "users".into(),
             columns: vec![OutputColumn {
                 id: 0,
                 name: "id".to_string(),

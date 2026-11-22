@@ -21,7 +21,7 @@ use super::Executor;
 
 /// ANALYZE TABLE executor
 pub struct AnalyzeTable {
-    table: String,
+    table: crate::catalog::TableName,
     mvcc: Arc<MvccStorage>,
     catalog: Arc<RwLock<Catalog>>,
     raft_node: Arc<RaftNode>,
@@ -31,7 +31,7 @@ pub struct AnalyzeTable {
 
 impl AnalyzeTable {
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         mvcc: Arc<MvccStorage>,
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
@@ -56,7 +56,7 @@ impl Executor for AnalyzeTable {
         {
             let catalog = self.catalog.read();
             if catalog.get_table(&self.table).is_none() {
-                return Err(ExecutorError::TableNotFound(self.table.clone()));
+                return Err(ExecutorError::TableNotFound(self.table.to_string()));
             }
         }
 
@@ -66,7 +66,7 @@ impl Executor for AnalyzeTable {
             .read()
             .get_table(&self.table)
             .map(|def| def.id)
-            .ok_or_else(|| ExecutorError::TableNotFound(self.table.clone()))?;
+            .ok_or_else(|| ExecutorError::TableNotFound(self.table.to_string()))?;
         let prefix = table_key_prefix(table_id);
         let end = table_key_end(table_id);
 
@@ -103,7 +103,8 @@ impl Executor for AnalyzeTable {
         // The table's statistics row, keyed by the table's name: this one
         // takes the place of the last.
         let stats_row = Row::new(vec![
-            Datum::String(self.table.clone()),
+            Datum::String(self.table.database.clone()),
+            Datum::String(self.table.table.clone()),
             Datum::Int(row_count),
             Datum::Int(data_size),
             Datum::Timestamp(now),
@@ -121,8 +122,9 @@ impl Executor for AnalyzeTable {
             .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
 
         // Build MySQL-format result row: (Table, Op, Msg_type, Msg_text)
+        // (MySQL shows the table as `database.table` here.)
         self.result_row = Some(Row::new(vec![
-            Datum::String(self.table.clone()),
+            Datum::String(self.table.to_string()),
             Datum::String("analyze".to_string()),
             Datum::String("status".to_string()),
             Datum::String("OK".to_string()),

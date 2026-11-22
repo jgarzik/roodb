@@ -28,6 +28,38 @@ async fn test_raw_login_and_batch() {
     server.shutdown().await;
 }
 
+/// A login that names no database starts in the system's (TDS has no
+/// session without one); a login to a database that does not exist is
+/// refused.
+#[tokio::test]
+async fn test_login_database() {
+    let server = TestServer::start("tds_raw_db").await;
+    let mut client = RawTds::connect(&server).await;
+    let tokens = client
+        .login_with(&login7_into("root", "", 0x7400_0004, None))
+        .await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    // A system table is found by its bare name, and a table of the tests'
+    // database is not.
+    let tokens = client
+        .batch("SELECT username FROM users WHERE username = 'root'")
+        .await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("CREATE TABLE test.tds_raw_db (id INT)").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("SELECT id FROM tds_raw_db").await;
+    assert!(!errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("DROP TABLE test.tds_raw_db").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+
+    let mut client = RawTds::connect(&server).await;
+    let tokens = client
+        .login_with(&login7_into("root", "", 0x7400_0004, Some("no_such_db")))
+        .await;
+    assert!(!errors(&tokens).is_empty(), "{tokens:?}");
+    server.shutdown().await;
+}
+
 /// Drivers on a strict connection send TDS version 8.0 in LOGIN7 and
 /// still get LOGINACK 7.4.
 #[tokio::test]

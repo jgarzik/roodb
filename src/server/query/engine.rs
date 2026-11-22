@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 
 use super::{OkInfo, QueryError, ResponseSink, Status};
 use crate::catalog::system_tables::SYSTEM_PROCEDURES;
+use crate::catalog::TableName;
 use crate::catalog::{Catalog, ParamMode, ProcedureDef, ProcedureParam};
 use crate::executor::engine::ExecutorEngine;
 use crate::executor::{Datum, Executor, TransactionContext};
@@ -41,7 +42,7 @@ enum PlanError {
 
 /// Info extracted from INSERT plans for trigger firing
 struct InsertTriggerInfo {
-    table_name: String,
+    table_name: TableName,
     column_names: Vec<String>,
     values: Vec<Vec<crate::planner::logical::ResolvedExpr>>,
 }
@@ -74,7 +75,7 @@ pub struct QueryEngine {
     temp: Arc<SessionStorage>,
     /// Catalog version the session's copy of the stored functions was taken
     /// at (see `sync_functions`).
-    functions_version: Option<u64>,
+    functions_seen: Option<(u64, Option<String>)>,
     /// Whether BEGIN inside a transaction commits it and starts another
     /// (MySQL), or opens a nested level (the TDS front-end: in T-SQL only
     /// the outermost COMMIT commits).
@@ -225,7 +226,7 @@ enum TempDrop {
     /// Nothing remains: the statement has been carried out.
     Done,
     /// The statement names a table this session cannot see.
-    NoSuchTable(String),
+    NoSuchTable(TableName),
     /// The statement names an index this session cannot see (it belongs to
     /// another session's temporary table).
     NoSuchIndex(String),
@@ -255,7 +256,7 @@ impl QueryEngine {
             prepared_stmts: PreparedStatementManager::new(),
             mvcc,
             temp,
-            functions_version: None,
+            functions_seen: None,
             begin_commits_open: true,
             nested_begins: 0,
             read_lock: None,
@@ -366,7 +367,7 @@ impl QueryEngine {
             let schema_version = catalog_guard.schema_version();
 
             let resolved = Resolver::new_with_placeholders(&catalog_guard)
-                .for_session(self.temp.table_names())
+                .for_session(self.temp.table_names(), self.session.database.clone())
                 .resolve(parsed_stmt.clone())
                 .map_err(PlanError::Sql)?;
 
@@ -427,7 +428,7 @@ impl QueryEngine {
         columns: &[crate::planner::logical::OutputColumn],
         executor: &mut dyn Executor,
     ) -> ProtocolResult<()> {
-        let schema = self.session.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("");
         self.out.begin_result_set(columns, schema);
 
         let mut row_error = None;
@@ -483,6 +484,22 @@ impl QueryEngine {
         Box::pin(async move { self.handle_query_inner(sql).await })
     }
 
+    /// Carry out a statement a client sent. If the statement fails, the
+    /// client is told and the session goes on: only a failure of the
+    /// connection itself is returned. (`handle_query` returns a statement's
+    /// failure to its caller, which a procedure running a statement of its
+    /// body needs.)
+    pub(crate) async fn handle_statement(&mut self, sql: &str) -> ProtocolResult<()> {
+        match self.handle_query(sql).await {
+            Err(e) if e.fails_statement_only() => {
+                debug!(error = %e, "Statement failed");
+                self.abandon_implicit_txn().await;
+                self.send_error_from_protocol_error(&e).await
+            }
+            result => result,
+        }
+    }
+
     /// Inner implementation of handle_query (separated to allow boxing for recursion)
     async fn handle_query_inner(&mut self, sql: &str) -> ProtocolResult<()> {
         // Clear warnings at the start of each statement
@@ -502,11 +519,6 @@ impl QueryEngine {
 
         // Check for SHOW commands
         if let Some(()) = self.try_handle_show_command(sql).await? {
-            return Ok(());
-        }
-
-        // Check for DROP DATABASE (text intercept since sqlparser doesn't support DROP DATABASE)
-        if let Some(()) = self.try_handle_drop_database(sql).await? {
             return Ok(());
         }
 
@@ -666,8 +678,10 @@ impl QueryEngine {
                         .map(|m| m.as_str().to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 };
-                let db = self.session.database.as_deref().unwrap_or("test");
-                let qualified = format!("{}.{}", db, table_name);
+                let qualified = match self.session.database.as_deref() {
+                    Some(db) => format!("{}.{}", db, table_name),
+                    None => table_name.clone(),
+                };
                 return self
                     .send_custom_result_set(
                         &["Table", "Op", "Msg_type", "Msg_text"],
@@ -841,7 +855,7 @@ impl QueryEngine {
             let catalog_guard = self.catalog.read();
 
             let resolved = Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names())
+                .for_session(self.temp.table_names(), self.session.database.clone())
                 .resolve(stmt)
                 .map_err(PlanError::Sql)?;
 
@@ -923,45 +937,51 @@ impl QueryEngine {
     ) -> Vec<RequiredPrivilege> {
         use crate::planner::logical::ResolvedStatement;
 
-        // Use "default" database for privilege checks - tables don't have explicit db prefix
-        let db = self.session.database.as_deref().unwrap_or("default");
+        // A table's privileges are those of the database it is in; `db` is
+        // for what a statement names without a table (and for what is not
+        // a stored table: a derived table, a view's expansion).
+        let db = self.session.database.as_deref().unwrap_or("");
+        let select_on =
+            |table_ref: &crate::planner::logical::ResolvedTableRef| match &table_ref.table {
+                Some(table) => RequiredPrivilege::select(&table.database, &table.table),
+                None => RequiredPrivilege::select(db, &table_ref.name),
+            };
 
         match stmt {
             ResolvedStatement::Select(select) => {
                 // SELECT requires SELECT privilege on all tables in FROM clause
-                select
-                    .from
-                    .iter()
-                    .map(|table_ref| RequiredPrivilege::select(db, &table_ref.name))
-                    .collect()
+                select.from.iter().map(select_on).collect()
             }
             ResolvedStatement::Insert { table, .. }
             | ResolvedStatement::InsertSelect { table, .. } => {
-                vec![RequiredPrivilege::insert(db, table)]
+                vec![RequiredPrivilege::insert(&table.database, &table.table)]
             }
             ResolvedStatement::Update { table, .. } => {
-                vec![RequiredPrivilege::update(db, table)]
+                vec![RequiredPrivilege::update(&table.database, &table.table)]
             }
             ResolvedStatement::Delete { table, .. } => {
-                vec![RequiredPrivilege::delete(db, table)]
+                vec![RequiredPrivilege::delete(&table.database, &table.table)]
             }
-            ResolvedStatement::CreateTable { .. }
-            | ResolvedStatement::CreateTableAs { .. }
-            | ResolvedStatement::CreateView { .. } => {
-                vec![RequiredPrivilege::create_table(db)]
+            ResolvedStatement::CreateTable { name, .. }
+            | ResolvedStatement::CreateTableAs { name, .. }
+            | ResolvedStatement::CreateView { name, .. } => {
+                vec![RequiredPrivilege::create_table(&name.database)]
             }
             ResolvedStatement::DropView { .. } => {
                 vec![] // Views don't need special privileges
             }
             ResolvedStatement::DropTable { name, .. } => {
-                vec![RequiredPrivilege::drop_table(db, name)]
+                vec![RequiredPrivilege::drop_table(&name.database, &name.table)]
             }
             ResolvedStatement::DropMultipleTables { names, .. } => names
                 .iter()
-                .map(|name| RequiredPrivilege::drop_table(db, name))
+                .map(|name| RequiredPrivilege::drop_table(&name.database, &name.table))
                 .collect(),
             ResolvedStatement::CreateIndex { table, .. } => {
-                vec![RequiredPrivilege::create_index(db, table)]
+                vec![RequiredPrivilege::create_index(
+                    &table.database,
+                    &table.table,
+                )]
             }
             ResolvedStatement::DropIndex { .. } => {
                 // DROP INDEX requires INDEX privilege at database level
@@ -994,11 +1014,7 @@ impl QueryEngine {
             }
             // UNION - requires SELECT on both sides' tables
             ResolvedStatement::Union { left, right, .. } => {
-                let mut privs: Vec<_> = left
-                    .from
-                    .iter()
-                    .map(|t| RequiredPrivilege::select(db, &t.name))
-                    .collect();
+                let mut privs: Vec<_> = left.from.iter().map(select_on).collect();
                 // Recursively extract privileges from right side (may be nested Union)
                 privs.extend(self.extract_required_privileges(right));
                 privs
@@ -1308,7 +1324,7 @@ impl QueryEngine {
         columns: &[crate::planner::logical::OutputColumn],
         rows: Vec<crate::executor::row::Row>,
     ) -> ProtocolResult<()> {
-        let schema = self.session.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("");
         self.out.begin_result_set(columns, schema);
         for row in &rows {
             self.out.row(row);
@@ -1484,25 +1500,36 @@ impl QueryEngine {
     /// has changed, so a function is callable from every session and after a
     /// restart, not only where and when it was created.
     fn sync_functions(&mut self) {
-        let (version, functions) = {
+        let (seen, functions) = {
             let catalog = self.catalog.read();
             let version = catalog.schema_version();
-            if self.functions_version == Some(version) {
+            let seen = (version, self.session.database.clone());
+            if self.functions_seen.as_ref() == Some(&seen) {
                 return;
             }
+            // Each function under `database.name`, and those of the
+            // session's database under their own names as well.
+            let current = self.session.database.as_deref();
             let functions: Vec<(String, String, String)> = catalog
                 .functions()
-                .map(|f| {
+                .flat_map(|f| {
                     let params = f
                         .params
                         .iter()
                         .map(|p| p.name.as_str())
                         .collect::<Vec<_>>()
                         .join(",");
-                    (f.name.to_lowercase(), f.body_sql.clone(), params)
+                    let qualified = (
+                        format!("{}.{}", f.database, f.name),
+                        f.body_sql.clone(),
+                        params.clone(),
+                    );
+                    let own = (current == Some(f.database.as_str()))
+                        .then(|| (f.name.clone(), f.body_sql.clone(), params));
+                    std::iter::once(qualified).chain(own)
                 })
                 .collect();
-            (version, functions)
+            (seen, functions)
         };
         let vars = self.session.user_variables();
         let mut vars = vars.write();
@@ -1511,34 +1538,7 @@ impl QueryEngine {
             vars.insert(format!("__udf_{name}_params"), Datum::String(params));
             vars.insert(format!("__udf_{name}"), Datum::String(body));
         }
-        self.functions_version = Some(version);
-    }
-
-    /// Delete the rows of a system table that `matches`, through Raft, and
-    /// return how many there were. The catalog changes when the deletion is
-    /// applied, so the change is the same on every node and after a restart.
-    async fn delete_system_rows(
-        &self,
-        table: &str,
-        matches: impl Fn(&[Datum]) -> bool,
-    ) -> Result<usize, String> {
-        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), table)
-            .await
-            .map_err(|e| format!("Failed to read {table}: {e}"))?;
-        let mut changeset = ChangeSet::new(0);
-        for stored in &rows {
-            if matches(stored.row.values()) {
-                changeset.push(crate::catalog::store::delete_row(stored));
-            }
-        }
-        let count = changeset.changes.len();
-        if count > 0 {
-            self.raft_node
-                .propose_changes(changeset)
-                .await
-                .map_err(|e| format!("Failed to change {table}: {e}"))?;
-        }
-        Ok(count)
+        self.functions_seen = Some(seen);
     }
 
     /// Handle the part of a DROP TABLE that concerns temporary tables. One
@@ -1602,7 +1602,7 @@ impl QueryEngine {
     /// the catalog, and any changes to it that an open transaction has not
     /// committed yet (they would otherwise be committed as changes to an
     /// ordinary table of that name). False if the table is not one.
-    fn drop_own_temp_table(&mut self, name: &str) -> bool {
+    fn drop_own_temp_table(&mut self, name: &TableName) -> bool {
         let Some((start, end)) = self.temp.key_range(name) else {
             return false;
         };
@@ -1617,9 +1617,46 @@ impl QueryEngine {
         true
     }
 
+    /// The name the catalog knows a table by, for a name as a statement
+    /// wrote it: with the session's current database for a name written
+    /// without one. With no database selected that is an error, as in
+    /// MySQL (1046).
+    fn table_name(&self, written: &str) -> ProtocolResult<TableName> {
+        self.table_name_parts(&name_parts(written))
+    }
+
+    /// As `table_name`, for a name the parser read.
+    fn object_name(&self, name: &sqlparser::ast::ObjectName) -> ProtocolResult<TableName> {
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .map(|part| match part.as_ident() {
+                Some(ident) => ident.value.clone(),
+                None => part.to_string(),
+            })
+            .collect();
+        self.table_name_parts(&parts)
+    }
+
+    /// The database and name of a routine or trigger, for its name as a
+    /// statement wrote it. Routine names do not distinguish case; a
+    /// trigger's does.
+    fn routine_name(&self, written: &str) -> ProtocolResult<(String, String)> {
+        let name = self.table_name(written)?;
+        Ok((name.database, name.table.to_lowercase()))
+    }
+
+    fn table_name_parts(&self, parts: &[String]) -> ProtocolResult<TableName> {
+        // As the resolver names a table, with its errors.
+        crate::sql::Resolver::new(&self.catalog.read())
+            .for_session(Vec::new(), self.session.database.clone())
+            .canonical_parts(parts)
+            .map_err(ProtocolError::Sql)
+    }
+
     /// Whether `table` is a temporary table that belongs to another session.
     /// To this session it does not exist.
-    fn is_foreign_temp_table(&self, table: &str) -> bool {
+    fn is_foreign_temp_table(&self, table: &TableName) -> bool {
         !self.temp.is_temp_table(table)
             && self
                 .catalog
@@ -1628,7 +1665,7 @@ impl QueryEngine {
                 .is_some_and(|def| def.is_temporary)
     }
 
-    async fn send_no_such_table(&mut self, table: &str) -> ProtocolResult<()> {
+    async fn send_no_such_table(&mut self, table: &TableName) -> ProtocolResult<()> {
         self.send_error(
             codes::ER_NO_SUCH_TABLE,
             states::NO_SUCH_TABLE,
@@ -1964,92 +2001,6 @@ impl QueryEngine {
         self.send_ok(0, 0).await
     }
 
-    /// Try to handle DROP DATABASE command via text intercept
-    async fn try_handle_drop_database(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
-        let sql_trimmed = sql.trim().trim_end_matches(';').trim();
-        let sql_upper = sql_trimmed.to_uppercase();
-
-        if !sql_upper.starts_with("DROP DATABASE") && !sql_upper.starts_with("DROP SCHEMA") {
-            return Ok(None);
-        }
-
-        // Parse: DROP DATABASE [IF EXISTS] name
-        let if_exists = sql_upper.contains("IF EXISTS");
-        let name_part = if if_exists {
-            sql_upper
-                .replace("DROP DATABASE IF EXISTS", "")
-                .replace("DROP SCHEMA IF EXISTS", "")
-        } else {
-            sql_upper
-                .replace("DROP DATABASE", "")
-                .replace("DROP SCHEMA", "")
-        };
-
-        let db_name = name_part
-            .trim()
-            .trim_matches('`')
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
-
-        if db_name.is_empty() {
-            return self
-                .send_error(
-                    codes::ER_SYNTAX_ERROR,
-                    states::SYNTAX_ERROR,
-                    "DROP DATABASE requires a database name",
-                )
-                .await
-                .map(|_| Some(()));
-        }
-
-        if db_name == "DEFAULT" || db_name == "default" {
-            return self
-                .send_error(
-                    codes::ER_UNKNOWN_ERROR,
-                    states::GENERAL_ERROR,
-                    "Cannot drop the 'default' database",
-                )
-                .await
-                .map(|_| Some(()));
-        }
-
-        let exists = {
-            let catalog = self.catalog.read();
-            catalog.database_exists(&db_name.to_lowercase())
-        };
-
-        if !exists {
-            if if_exists {
-                return self.send_ok(0, 0).await.map(Some);
-            }
-            return self
-                .send_error(
-                    codes::ER_BAD_DB_ERROR,
-                    states::GENERAL_ERROR,
-                    &format!("Can't drop database '{}'; database doesn't exist", db_name),
-                )
-                .await
-                .map(|_| Some(()));
-        }
-
-        // Delete its row in system.databases; the catalog follows when that
-        // is applied, here and after a restart.
-        let db_name = db_name.to_lowercase();
-        let dropped = self
-            .delete_system_rows(crate::catalog::system_tables::SYSTEM_DATABASES, |row| {
-                matches!(row.first(), Some(Datum::String(name)) if name.to_lowercase() == db_name)
-            })
-            .await;
-        match dropped {
-            Ok(_) => self.send_ok(0, 0).await.map(Some),
-            Err(e) => self
-                .send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &e)
-                .await
-                .map(Some),
-        }
-    }
-
     /// Handle UNION queries by parsing with sqlparser, executing each side,
     /// and concatenating results.
     async fn try_handle_union(&mut self, sql: &str) -> ProtocolResult<Option<()>> {
@@ -2101,7 +2052,7 @@ impl QueryEngine {
             let catalog_guard = self.catalog.read();
             let stmt = crate::sql::Parser::parse_one(first_sql).map_err(ProtocolError::Sql)?;
             let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names())
+                .for_session(self.temp.table_names(), self.session.database.clone())
                 .resolve(stmt)
                 .map_err(ProtocolError::Sql)?;
             crate::sql::TypeChecker::check(&resolved).map_err(ProtocolError::Sql)?;
@@ -2150,7 +2101,7 @@ impl QueryEngine {
                     Err(_) => continue,
                 };
                 match crate::sql::Resolver::new(&catalog_guard)
-                    .for_session(self.temp.table_names())
+                    .for_session(self.temp.table_names(), self.session.database.clone())
                     .resolve(stmt)
                 {
                     Ok(resolved) => {
@@ -2325,7 +2276,8 @@ impl QueryEngine {
         // Resolve the CREATE TABLE (drop catalog guard before await)
         let resolved = {
             let catalog = self.catalog.read();
-            let resolver = crate::sql::Resolver::new(&catalog).for_session(self.temp.table_names());
+            let resolver = crate::sql::Resolver::new(&catalog)
+                .for_session(self.temp.table_names(), self.session.database.clone());
             resolver.resolve(stmt).map_err(|e| e.to_string())
         };
         let resolved = match resolved {
@@ -2450,7 +2402,7 @@ impl QueryEngine {
 
         match &ast[0] {
             sqlparser::ast::Statement::AlterTable(alter) => {
-                let table_name = alter.name.to_string();
+                let table_name = self.object_name(&alter.name)?;
                 if self.is_foreign_temp_table(&table_name) {
                     self.send_no_such_table(&table_name).await?;
                     return Ok(Some(()));
@@ -2464,7 +2416,7 @@ impl QueryEngine {
                         .get_table(&table_name)
                         .ok_or_else(|| {
                             ProtocolError::Sql(crate::sql::SqlError::TableNotFound(
-                                table_name.clone(),
+                                table_name.to_string(),
                             ))
                         })?
                         .clone()
@@ -2571,7 +2523,9 @@ impl QueryEngine {
             }
 
             AlterTableOperation::AddConstraint { constraint, .. } => {
-                let resolved = crate::sql::resolver::convert_table_constraint_pub(constraint)?;
+                let resolved = crate::sql::Resolver::new(&self.catalog.read())
+                    .for_session(self.temp.table_names(), self.session.database.clone())
+                    .table_constraint(constraint)?;
                 if let Some(c) = resolved {
                     def.constraints.push(c);
                 }
@@ -2629,7 +2583,7 @@ impl QueryEngine {
             AlterTableOperation::RenameTable { table_name } => {
                 let new_name = match table_name {
                     sqlparser::ast::RenameTableNameKind::As(name)
-                    | sqlparser::ast::RenameTableNameKind::To(name) => name.to_string(),
+                    | sqlparser::ast::RenameTableNameKind::To(name) => self.object_name(name)?,
                 };
                 def.name = new_name;
             }
@@ -2777,7 +2731,7 @@ impl QueryEngine {
     /// record moves to its new name.
     async fn persist_alter_table(
         &mut self,
-        old_table_name: &str,
+        old_table_name: &TableName,
         def: crate::catalog::TableDef,
         indexes: Vec<crate::catalog::IndexDef>,
     ) -> ProtocolResult<()> {
@@ -2785,7 +2739,7 @@ impl QueryEngine {
 
         let record = store::TableRecord { def, indexes };
         let mut changeset = ChangeSet::new(0);
-        if old_table_name == record.def.name {
+        if *old_table_name == record.def.name {
             changeset.push(store::replace_table(&record));
         } else {
             changeset.push(store::drop_table(old_table_name, record.def.id));
@@ -2932,7 +2886,7 @@ impl QueryEngine {
             return self
                 .send_error(
                     codes::ER_BAD_DB_ERROR,
-                    states::GENERAL_ERROR,
+                    "42000",
                     &format!("Unknown database '{}'", db_name),
                 )
                 .await
@@ -2963,7 +2917,7 @@ impl QueryEngine {
             })
             .collect();
 
-        let schema = self.session.database.as_deref().unwrap_or("default");
+        let schema = self.session.database.as_deref().unwrap_or("");
         self.out.begin_result_set(&columns, schema);
         for row_data in rows {
             let row = crate::executor::row::Row::new(
@@ -3031,16 +2985,14 @@ impl QueryEngine {
             || sql_upper.starts_with("SHOW TABLES;")
             || sql_upper.starts_with("SHOW FULL TABLES")
         {
-            let db = self
-                .session
-                .database
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let Some(db) = self.session.database.clone() else {
+                return Err(ProtocolError::Sql(crate::sql::SqlError::NoDatabaseSelected));
+            };
             let tables = {
                 let catalog = self.catalog.read();
                 let mut tables = catalog.get_tables_in_database(&db);
                 // Include views in SHOW TABLES output
-                tables.extend(catalog.get_view_names());
+                tables.extend(catalog.get_views_in_database(&db));
                 tables.sort();
                 tables
             };
@@ -3059,6 +3011,7 @@ impl QueryEngine {
                 .trim_matches('\'')
                 .trim_matches('"');
 
+            let table_name = &self.table_name(table_name)?;
             let result = {
                 let catalog = self.catalog.read();
                 catalog.get_table(table_name).map(reconstruct_create_table)
@@ -3066,7 +3019,7 @@ impl QueryEngine {
 
             match result {
                 Some(ddl) => {
-                    let rows = vec![vec![table_name.to_string(), ddl]];
+                    let rows = vec![vec![table_name.table.clone(), ddl]];
                     self.send_custom_result_set(&["Table", "Create Table"], &rows)
                         .await
                         .map(Some)
@@ -3080,9 +3033,9 @@ impl QueryEngine {
                     if let Some(vd) = view_def {
                         let create_view = format!(
                             "CREATE ALGORITHM=UNDEFINED VIEW `{}` AS {}",
-                            vd.name, vd.query_sql
+                            vd.name.table, vd.query_sql
                         );
-                        let rows = vec![vec![table_name.to_string(), create_view]];
+                        let rows = vec![vec![table_name.table.clone(), create_view]];
                         self.send_custom_result_set(&["View", "Create View"], &rows)
                             .await
                             .map(Some)
@@ -3110,6 +3063,10 @@ impl QueryEngine {
                 .trim_end_matches(';')
                 .trim_matches('`');
 
+            // Shown under the table's own name; looked up under the
+            // catalog's.
+            let table_name = &self.table_name(table_name)?;
+            let shown = table_name.table.clone();
             let rows = {
                 let catalog = self.catalog.read();
                 let indexes = catalog.get_indexes_for_table(table_name);
@@ -3117,7 +3074,7 @@ impl QueryEngine {
                 for idx in &indexes {
                     for (seq, col) in idx.columns.iter().enumerate() {
                         rows.push(vec![
-                            table_name.to_string(),
+                            shown.clone(),
                             if idx.unique { "0" } else { "1" }.to_string(),
                             idx.name.clone(),
                             (seq + 1).to_string(),
@@ -3129,7 +3086,7 @@ impl QueryEngine {
                     if let Some(pk_cols) = table_def.primary_key() {
                         for (seq, col) in pk_cols.iter().enumerate() {
                             rows.push(vec![
-                                table_name.to_string(),
+                                shown.clone(),
                                 "0".to_string(),
                                 "PRIMARY".to_string(),
                                 (seq + 1).to_string(),
@@ -3198,6 +3155,7 @@ impl QueryEngine {
                     .trim_matches('"')
             };
 
+            let table_name = &self.table_name(table_name)?;
             let result = {
                 let catalog = self.catalog.read();
                 catalog.get_table(table_name).map(describe_table)
@@ -3403,11 +3361,6 @@ impl QueryEngine {
             } else {
                 None
             };
-            let db = self
-                .session
-                .database
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
             let procs = {
                 let catalog = self.catalog.read();
                 catalog
@@ -3436,7 +3389,7 @@ impl QueryEngine {
                     "PROCEDURE"
                 };
                 rows.push(vec![
-                    db.clone(),
+                    proc.database.clone(),
                     proc.name.clone(),
                     type_str.to_string(),
                     "root@localhost".to_string(),
@@ -3481,9 +3434,11 @@ impl QueryEngine {
                 .trim_matches('`')
                 .trim_matches('\'')
                 .trim_matches('"');
+            let (database, proc_name) = self.routine_name(proc_name)?;
+            let proc_name = proc_name.as_str();
             let proc_def = {
                 let catalog = self.catalog.read();
-                catalog.get_procedure(proc_name).cloned()
+                catalog.get_procedure(&database, proc_name).cloned()
             };
             match proc_def {
                 Some(def) => {
@@ -3634,11 +3589,7 @@ impl QueryEngine {
 
         // INFORMATION_SCHEMA.TABLES
         if upper.contains("INFORMATION_SCHEMA.TABLES") {
-            let db = self
-                .session
-                .database
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let db = self.session.database.clone().unwrap_or_default();
             let tables = {
                 let catalog = self.catalog.read();
                 catalog.get_tables_in_database(&db)
@@ -3800,7 +3751,8 @@ impl QueryEngine {
             let datum = (|| -> Option<Datum> {
                 let val_stmt = Parser::parse_one(&scope_expr).ok()?;
                 let catalog = self.catalog.read();
-                let resolver = Resolver::new(&catalog).for_session(self.temp.table_names());
+                let resolver = Resolver::new(&catalog)
+                    .for_session(self.temp.table_names(), self.session.database.clone());
                 let resolved = resolver.resolve(val_stmt).ok()?;
 
                 if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
@@ -3857,7 +3809,8 @@ impl QueryEngine {
             let datum = (|| -> Option<Datum> {
                 let val_stmt = Parser::parse_one(&scope_expr).ok()?;
                 let catalog = self.catalog.read();
-                let resolver = Resolver::new(&catalog).for_session(self.temp.table_names());
+                let resolver = Resolver::new(&catalog)
+                    .for_session(self.temp.table_names(), self.session.database.clone());
                 let resolved = resolver.resolve(val_stmt).ok()?;
 
                 if let crate::planner::logical::ResolvedStatement::Select(sel) = resolved {
@@ -4069,7 +4022,7 @@ impl QueryEngine {
         use crate::catalog::system_tables::{view_def_to_row, SYSTEM_VIEWS};
         use crate::catalog::ViewDef;
 
-        let view_name = view_name.trim_matches('`').to_string();
+        let view_name = self.table_name(view_name)?;
 
         // Validate the view query parses correctly
         if let Err(e) = crate::sql::Parser::parse_one(query_sql) {
@@ -4091,12 +4044,19 @@ impl QueryEngine {
                 let Ok(stmt) = crate::sql::Parser::parse_one(query_sql) else {
                     return false;
                 };
-                let resolver = crate::sql::Resolver::new(&catalog);
-                let resolver = if hide_temp {
-                    resolver.for_session(Vec::new())
+                // With every temporary table in sight, or with none.
+                let visible: Vec<TableName> = if hide_temp {
+                    Vec::new()
                 } else {
-                    resolver
+                    catalog
+                        .list_tables()
+                        .into_iter()
+                        .filter(|name| catalog.get_table(name).is_some_and(|def| def.is_temporary))
+                        .cloned()
+                        .collect()
                 };
+                let resolver = crate::sql::Resolver::new(&catalog)
+                    .for_session(visible, self.session.database.clone());
                 resolver.resolve(stmt).is_ok()
             };
             resolves(false) && !resolves(true)
@@ -4170,7 +4130,7 @@ impl QueryEngine {
         let mut changeset = ChangeSet::new(0);
 
         for raw_name in names {
-            let view_name = raw_name.trim_matches('`').to_string();
+            let view_name = self.table_name(raw_name)?;
 
             let exists = {
                 let catalog = self.catalog.read();
@@ -4215,7 +4175,7 @@ impl QueryEngine {
     /// Scan system.views for a row matching the given view name and return a delete RowChange.
     async fn find_view_row_for_delete(
         &self,
-        view_name: &str,
+        view_name: &TableName,
     ) -> ProtocolResult<Option<crate::raft::RowChange>> {
         use crate::catalog::system_tables::SYSTEM_VIEWS;
 
@@ -4223,8 +4183,12 @@ impl QueryEngine {
             .await
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
         for stored in &rows {
-            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(view_name))
-            {
+            let is_the_view = matches!(
+                stored.row.values(),
+                [Datum::String(database), Datum::String(view), ..]
+                    if *database == view_name.database && *view == view_name.table
+            );
+            if is_the_view {
                 return Ok(Some(crate::catalog::store::delete_row(stored)));
             }
         }
@@ -4245,7 +4209,7 @@ impl QueryEngine {
         use crate::catalog::system_tables::{trigger_def_to_row, SYSTEM_TRIGGERS};
         use crate::catalog::TriggerDef;
 
-        let def = match TriggerDef::from_create_sql(sql) {
+        let mut def = match TriggerDef::from_create_sql(sql) {
             Ok(def) => def,
             Err(message) => {
                 return self
@@ -4253,6 +4217,9 @@ impl QueryEngine {
                     .await;
             }
         };
+        // The table as the catalog knows it: in the session's database
+        // unless the statement names another.
+        def.table_name = self.table_name(&def.table_name.table)?;
         // A trigger on a system table would run on every schema or account
         // change, for whoever makes it.
         if crate::catalog::system_tables::is_system_table(&def.table_name) {
@@ -4280,7 +4247,12 @@ impl QueryEngine {
                 )
                 .await;
         }
-        if self.catalog.read().has_trigger(&def.name) {
+        // A trigger is named within its table's database.
+        if self
+            .catalog
+            .read()
+            .has_trigger(&def.table_name.database, &def.name)
+        {
             return self
                 .send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -4326,7 +4298,9 @@ impl QueryEngine {
         } else {
             statement.get("DROP TRIGGER ".len()..).unwrap_or("").trim()
         };
-        let trigger_name = name_part.trim_matches('`').trim_matches('"');
+        // `[database.]trigger`: a trigger is named within a database.
+        let named = self.table_name(name_part.trim_matches('"'))?;
+        let (database, trigger_name) = (named.database.as_str(), named.table.as_str());
 
         if trigger_name.is_empty() {
             return self
@@ -4344,8 +4318,12 @@ impl QueryEngine {
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
         let mut changes = Vec::new();
         for stored in &rows {
-            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name == trigger_name)
-            {
+            let is_the_trigger = matches!(
+                stored.row.values(),
+                [Datum::String(in_database), Datum::String(name), ..]
+                    if in_database == database && name == trigger_name
+            );
+            if is_the_trigger {
                 changes.push(crate::catalog::store::delete_row(stored));
             }
         }
@@ -4482,9 +4460,15 @@ impl QueryEngine {
                 let substituted = substitute_new_refs(&trigger.body, &new_values);
 
                 // Execute the substituted statement through the full pipeline
+                // (in the trigger's database, which is its table's, whatever
+                // the database of the session that changed the table).
                 let sql = substituted.to_string();
-                self.execute_sql_silent(&sql)
-                    .await
+                let callers = self.session.database.clone();
+                self.session
+                    .set_database(Some(trigger.table_name.database.clone()));
+                let result = self.execute_sql_silent(&sql).await;
+                self.session.set_database(callers);
+                result
                     .map_err(|e| ProtocolError::Sql(crate::sql::SqlError::InvalidOperation(e)))?;
             }
         }
@@ -4553,7 +4537,7 @@ impl QueryEngine {
         ast_body: &sqlparser::ast::ConditionalStatements,
         raw_sql: &str,
     ) -> ProtocolResult<()> {
-        let proc_name = name.to_string().to_lowercase();
+        let (database, proc_name) = self.routine_name(&name.to_string())?;
 
         // Convert sqlparser params to our ProcedureParam
         let our_params: Vec<ProcedureParam> = params
@@ -4582,19 +4566,20 @@ impl QueryEngine {
         // Check if procedure already exists
         let exists = {
             let catalog = self.catalog.read();
-            catalog.procedure_exists(&proc_name)
+            catalog.procedure_exists(&database, &proc_name)
         };
         if exists {
             return self
                 .send_error(
-                    codes::ER_UNKNOWN_ERROR,
-                    states::GENERAL_ERROR,
-                    &format!("Procedure '{}' already exists", proc_name),
+                    1304,
+                    "42000",
+                    &format!("PROCEDURE {} already exists", proc_name),
                 )
                 .await;
         }
 
         let proc_def = ProcedureDef {
+            database,
             name: proc_name.clone(),
             params: our_params,
             body_sql,
@@ -4871,7 +4856,7 @@ impl QueryEngine {
     async fn handle_create_function_text(&mut self, sql: &str) -> ProtocolResult<()> {
         // Parse: CREATE FUNCTION name(params) RETURNS type BEGIN ... END
         let re = regex::Regex::new(
-            r"(?is)CREATE\s+FUNCTION\s+(\w+)\s*\(([^)]*)\)\s+RETURNS\s+(\w+)\s+(BEGIN\b.+\bEND)",
+            r"(?is)CREATE\s+FUNCTION\s+((?:`[^`]+`|\w+)(?:\s*\.\s*(?:`[^`]+`|\w+))?)\s*\(([^)]*)\)\s+RETURNS\s+(\w+)\s+(BEGIN\b.+\bEND)",
         )
         .unwrap();
 
@@ -4888,7 +4873,7 @@ impl QueryEngine {
             }
         };
 
-        let func_name = caps.get(1).unwrap().as_str().to_lowercase();
+        let (database, func_name) = self.routine_name(caps.get(1).unwrap().as_str())?;
         let params_str = caps.get(2).unwrap().as_str();
         let returns_type = caps.get(3).unwrap().as_str().to_string();
         let body_sql = caps.get(4).unwrap().as_str().to_string();
@@ -4907,7 +4892,19 @@ impl QueryEngine {
             })
             .collect();
 
+        // A function and a procedure of one database share its names.
+        if self.catalog.read().procedure_exists(&database, &func_name) {
+            return self
+                .send_error(
+                    1304,
+                    "42000",
+                    &format!("FUNCTION {} already exists", func_name),
+                )
+                .await;
+        }
+
         let proc_def = ProcedureDef {
+            database,
             name: func_name.clone(),
             params: our_params,
             body_sql: body_sql.clone(),
@@ -4936,12 +4933,12 @@ impl QueryEngine {
         proc_name: &str,
         if_exists: bool,
     ) -> ProtocolResult<()> {
-        let proc_name = proc_name.to_lowercase();
+        let (database, proc_name) = self.routine_name(proc_name)?;
 
         // Check if procedure exists
         let exists = {
             let catalog = self.catalog.read();
-            catalog.procedure_exists(&proc_name)
+            catalog.procedure_exists(&database, &proc_name)
         };
         if !exists {
             if if_exists {
@@ -4949,21 +4946,25 @@ impl QueryEngine {
             }
             return self
                 .send_error(
-                    codes::ER_UNKNOWN_ERROR,
-                    states::GENERAL_ERROR,
-                    &format!("Procedure '{}' does not exist", proc_name),
+                    1305,
+                    "42000",
+                    &format!("PROCEDURE {}.{} does not exist", database, proc_name),
                 )
                 .await;
         }
 
-        // The routine's row, whatever the case its name was stored in
+        // The routine's row
         let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_PROCEDURES)
             .await
             .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?;
         let mut changeset = ChangeSet::new(0);
         for stored in &rows {
-            if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(&proc_name))
-            {
+            let is_the_routine = matches!(
+                stored.row.values(),
+                [Datum::String(in_database), Datum::String(name), ..]
+                    if *in_database == database && *name == proc_name
+            );
+            if is_the_routine {
                 changeset.push(crate::catalog::store::delete_row(stored));
             }
         }
@@ -4991,29 +4992,42 @@ impl QueryEngine {
         proc_name: &str,
         call_args: &[sqlparser::ast::Expr],
     ) -> ProtocolResult<()> {
-        use crate::executor::procedure::{build_procedure_context, propagate_out_params};
-
         // Look up procedure in catalog
+        let (database, proc_name) = self.routine_name(proc_name)?;
         let proc_def = {
             let catalog = self.catalog.read();
-            catalog.get_procedure(proc_name).cloned()
+            catalog.get_procedure(&database, &proc_name).cloned()
         };
-        let proc_def = match proc_def {
-            Some(def) => def,
-            None => {
-                return self
-                    .send_error(
-                        codes::ER_UNKNOWN_ERROR,
-                        states::GENERAL_ERROR,
-                        &format!("Procedure '{}' does not exist", proc_name),
-                    )
-                    .await;
-            }
+        let Some(proc_def) = proc_def else {
+            return self
+                .send_error(
+                    1305,
+                    "42000",
+                    &format!("PROCEDURE {}.{} does not exist", database, proc_name),
+                )
+                .await;
         };
+
+        // The body runs in the procedure's database, whatever the
+        // caller's: the names it uses mean what they meant to its author.
+        let callers = self.session.database.clone();
+        self.session.set_database(Some(database));
+        let result = self.run_procedure(&proc_def, call_args).await;
+        self.session.set_database(callers);
+        result
+    }
+
+    /// Run a procedure's body with the arguments of a CALL.
+    async fn run_procedure(
+        &mut self,
+        proc_def: &ProcedureDef,
+        call_args: &[sqlparser::ast::Expr],
+    ) -> ProtocolResult<()> {
+        use crate::executor::procedure::{build_procedure_context, propagate_out_params};
 
         // Build context: validate arg count, bind IN/INOUT params, OUT = Null
         let user_vars = self.session.user_variables();
-        let mut ctx = match build_procedure_context(&proc_def, call_args, &user_vars) {
+        let mut ctx = match build_procedure_context(proc_def, call_args, &user_vars) {
             Ok(c) => c,
             Err(e) => {
                 let code = if e.contains("Out of range value") {
@@ -5060,7 +5074,7 @@ impl QueryEngine {
         }
 
         // Propagate OUT/INOUT params back to user variables
-        propagate_out_params(&proc_def, call_args, &ctx, &user_vars);
+        propagate_out_params(proc_def, call_args, &ctx, &user_vars);
 
         // Final OK; any result sets the body produced precede it
         self.send_ok(ctx.rows_affected, 0).await
@@ -5917,7 +5931,7 @@ impl QueryEngine {
         let plan = {
             let catalog_guard = self.catalog.read();
             let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names())
+                .for_session(self.temp.table_names(), self.session.database.clone())
                 .resolve(stmt)
                 .map_err(|e| e.to_string())?;
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
@@ -5998,7 +6012,7 @@ impl QueryEngine {
         let plan = {
             let catalog_guard = self.catalog.read();
             let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names())
+                .for_session(self.temp.table_names(), self.session.database.clone())
                 .resolve(stmt)
                 .map_err(|e| e.to_string())?;
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
@@ -6119,7 +6133,7 @@ impl QueryEngine {
         self.prepared_stmts.clear();
         self.session.reset();
         // The reset cleared the session's copy of the stored functions.
-        self.functions_version = None;
+        self.functions_seen = None;
         self.session.lock_wait_timeout = self.txn_manager.locks().default_wait();
     }
 
@@ -6186,6 +6200,8 @@ impl QueryEngine {
         let (code, state) = match e {
             SqlError::Parse(_) => (codes::ER_SYNTAX_ERROR, states::SYNTAX_ERROR),
             SqlError::TableNotFound(_) => (codes::ER_NO_SUCH_TABLE, states::NO_SUCH_TABLE),
+            SqlError::NoDatabaseSelected => (1046, "3D000"),
+            SqlError::UnknownDatabase(_) => (codes::ER_BAD_DB_ERROR, "42000"),
             SqlError::ColumnNotFound(_) => (codes::ER_BAD_FIELD_ERROR, "42S22"),
             SqlError::AmbiguousColumn(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::TypeMismatch { .. } => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
@@ -6256,6 +6272,10 @@ impl QueryEngine {
                     )
                 } else if let crate::executor::ExecutorError::LockDeadlock = exec_err {
                     (codes::ER_LOCK_DEADLOCK, "40001", exec_err.to_string())
+                } else if let crate::executor::ExecutorError::DatabaseExists(_) = exec_err {
+                    (1007, states::GENERAL_ERROR, exec_err.to_string())
+                } else if let crate::executor::ExecutorError::DatabaseNotFound(_) = exec_err {
+                    (1008, states::GENERAL_ERROR, exec_err.to_string())
                 } else if let crate::executor::ExecutorError::DuplicateKeyName(_) = exec_err {
                     (1061, "42000", exec_err.to_string())
                 } else if let crate::executor::ExecutorError::CantDropKey(_) = exec_err {
@@ -6401,7 +6421,7 @@ fn reconstruct_create_table(td: &crate::catalog::TableDef) -> String {
 
     format!(
         "CREATE TABLE `{}` (\n  {}\n) ENGINE=RooDB DEFAULT CHARSET=utf8mb4",
-        td.name,
+        td.name.table,
         parts.join(",\n  ")
     )
 }
@@ -6468,4 +6488,27 @@ fn describe_table(td: &crate::catalog::TableDef) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// The parts of a name as written in a statement's text: `t`, `db.t`,
+/// with or without backquotes. A dot inside backquotes is part of the name;
+/// a doubled backquote inside them is one backquote.
+fn name_parts(written: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quoted = false;
+    let mut chars = written.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' if quoted && chars.peek() == Some(&'`') => {
+                chars.next();
+                part.push('`');
+            }
+            '`' => quoted = !quoted,
+            '.' if !quoted => parts.push(std::mem::take(&mut part).trim().to_string()),
+            c => part.push(c),
+        }
+    }
+    parts.push(part.trim().to_string());
+    parts
 }

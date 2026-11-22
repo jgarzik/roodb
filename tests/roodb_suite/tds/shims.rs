@@ -163,7 +163,7 @@ async fn test_session_options_and_probes() {
         assert_eq!(row.len(), 6, "{name}");
         let cells: Vec<String> = row.cells().map(|(_, data)| format!("{data:?}")).collect();
         assert!(
-            cells[2].contains("default"),
+            cells[2].contains(crate::test_utils::TEST_DATABASE),
             "{name}: DB_NAME() = {}",
             cells[2]
         );

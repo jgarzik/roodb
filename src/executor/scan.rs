@@ -23,7 +23,7 @@ use super::Executor;
 /// Table scan executor (streaming: decodes rows lazily in next())
 pub struct TableScan {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     table_id: crate::executor::encoding::TableId,
     /// Optional filter predicate (pushed down)
@@ -45,7 +45,7 @@ pub struct TableScan {
 impl TableScan {
     /// Create a new table scan
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
@@ -67,7 +67,7 @@ impl TableScan {
 
     /// Create a new table scan with schema column types for lazy row padding
     pub fn with_schema_types(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         filter: Option<ResolvedExpr>,
         mvcc: Arc<MvccStorage>,
@@ -292,14 +292,7 @@ mod tests {
     async fn test_table_scan_basic() {
         let mvcc = make_test_mvcc();
         // No txn_context = use inner storage directly (legacy mode)
-        let mut scan = TableScan::new(
-            "users".to_string(),
-            tid("users"),
-            None,
-            mvcc,
-            None,
-            empty_vars(),
-        );
+        let mut scan = TableScan::new("users".into(), tid("users"), None, mvcc, None, empty_vars());
 
         scan.open().await.unwrap();
 

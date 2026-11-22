@@ -37,6 +37,7 @@ pub async fn connect_as(
     config.host("127.0.0.1");
     config.port(server.tds_port());
     config.authentication(AuthMethod::sql_server(user, password));
+    config.database(crate::test_utils::TEST_DATABASE);
     config.encryption(encryption);
     config.trust_cert();
 

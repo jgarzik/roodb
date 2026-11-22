@@ -166,7 +166,7 @@ async fn test_table_scan_all_rows() {
     let (engine, _) = setup_test_env();
 
     let plan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,
@@ -202,7 +202,7 @@ async fn test_table_scan_with_filter() {
 
     // SELECT * FROM users WHERE id > 1
     let plan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -244,7 +244,7 @@ async fn test_project_single_column() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,
@@ -299,7 +299,7 @@ async fn test_sort_descending() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -345,7 +345,7 @@ async fn test_limit_offset() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -381,7 +381,7 @@ async fn test_count_aggregate() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -425,7 +425,7 @@ async fn test_insert() {
 
     // INSERT INTO users (id, name) VALUES (10, 'dave')
     let plan = PhysicalPlan::Insert {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             ResolvedColumn {
                 table: "users".to_string(),
@@ -481,7 +481,7 @@ async fn test_delete_with_filter() {
 
     // DELETE FROM users WHERE id = 2
     let plan = PhysicalPlan::Delete {
-        table: "users".to_string(),
+        table: "users".into(),
         filter: Some(ResolvedExpr::BinaryOp {
             left: Box::new(ResolvedExpr::Column(ResolvedColumn {
                 table: "users".to_string(),
@@ -530,7 +530,7 @@ async fn test_create_and_drop_table() {
 
     // CREATE TABLE test (id INT)
     let create_plan = PhysicalPlan::CreateTable {
-        name: "test".to_string(),
+        name: "test".into(),
         columns: vec![ColumnDef::new("id", DataType::Int)],
         constraints: vec![],
         if_not_exists: false,
@@ -544,12 +544,12 @@ async fn test_create_and_drop_table() {
     // Verify table exists
     {
         let cat = catalog.read();
-        assert!(cat.get_table("test").is_some());
+        assert!(cat.get_table(&"test".into()).is_some());
     }
 
     // DROP TABLE test
     let drop_plan = PhysicalPlan::DropTable {
-        name: "test".to_string(),
+        name: "test".into(),
         if_exists: false,
     };
 
@@ -561,7 +561,7 @@ async fn test_create_and_drop_table() {
     // Verify table is gone
     {
         let cat = catalog.read();
-        assert!(cat.get_table("test").is_none());
+        assert!(cat.get_table(&"test".into()).is_none());
     }
 }
 
@@ -600,7 +600,7 @@ async fn test_distinct() {
     let engine = ExecutorEngine::new(mvcc, catalog, None, UserVariables::default());
 
     let scan = PhysicalPlan::TableScan {
-        table: "nums".to_string(),
+        table: "nums".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "n".to_string(),
@@ -634,7 +634,7 @@ async fn test_full_query_pipeline() {
 
     // SELECT name FROM users WHERE id > 1 ORDER BY id DESC LIMIT 1
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,

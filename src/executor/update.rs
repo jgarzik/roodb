@@ -23,7 +23,7 @@ use super::Executor;
 /// Update executor
 pub struct Update {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     table_id: crate::executor::encoding::TableId,
     /// Assignments: (column, new_value)
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
@@ -52,7 +52,7 @@ pub struct Update {
 
 /// Parameters for creating an Update executor.
 pub struct UpdateParams {
-    pub table: String,
+    pub table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     pub table_id: crate::executor::encoding::TableId,
     pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
@@ -588,7 +588,7 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
-            table: "users".to_string(),
+            table: "users".into(),
             table_id: tid("users"),
             assignments,
             filter: Some(filter),
@@ -667,7 +667,7 @@ mod tests {
 
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
-            table: "users".to_string(),
+            table: "users".into(),
             table_id: tid("users"),
             assignments,
             filter: Some(filter),

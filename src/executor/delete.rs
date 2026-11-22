@@ -21,7 +21,7 @@ use super::Executor;
 
 /// Parameters for creating a Delete executor.
 pub struct DeleteParams {
-    pub table: String,
+    pub table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     pub table_id: crate::executor::encoding::TableId,
     pub filter: Option<ResolvedExpr>,
@@ -492,7 +492,7 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
-            table: "users".to_string(),
+            table: "users".into(),
             table_id: tid("users"),
             filter: Some(filter),
             key_value: None,
@@ -545,7 +545,7 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
-            table: "users".to_string(),
+            table: "users".into(),
             table_id: tid("users"),
             filter: None,
             key_value: None,
@@ -613,7 +613,7 @@ mod tests {
 
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
-            table: "t1".to_string(),
+            table: "t1".into(),
             table_id: tid("t1"),
             filter: None,
             key_value: None,
@@ -662,7 +662,7 @@ mod tests {
 
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut delete = Delete::new(DeleteParams {
-            table: "t1".to_string(),
+            table: "t1".into(),
             table_id: tid("t1"),
             filter: None,
             key_value: None,

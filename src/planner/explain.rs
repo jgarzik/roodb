@@ -240,6 +240,7 @@ impl ExplainOutput {
             }
 
             PhysicalPlan::DropMultipleTables { names, .. } => {
+                let names: Vec<String> = names.iter().map(ToString::to_string).collect();
                 writeln!(out, "{}DropMultipleTables: {}", prefix, names.join(", ")).unwrap();
             }
 

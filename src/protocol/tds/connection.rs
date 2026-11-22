@@ -80,7 +80,9 @@ const MAX_CACHED_STATEMENT: usize = 64 * 1024;
 const MAX_NEGOTIATED_PACKET_SIZE: usize = 16 * 1024;
 
 /// Database reported to clients that did not select one
-const DEFAULT_DATABASE: &str = "default";
+/// Where a login that names no database lands: TDS has no session without
+/// a database.
+const DEFAULT_DATABASE: &str = crate::catalog::system_tables::SYSTEM_DATABASE;
 
 /// Product version reported to probes, matching PRELOGIN and LOGINACK
 const PRODUCT_VERSION: &str = "16.0.1000";
@@ -345,7 +347,13 @@ async fn establish(
     // T-SQL transactions nest; see `QueryEngine::handle_begin`.
     engine.begin_commits_open = false;
     engine.session.set_user(login.username.clone());
-    if !login.database.is_empty() {
+    // A TDS session is always in some database: the one the login asks
+    // for, or the server's default one.
+    if login.database.is_empty() {
+        engine
+            .session
+            .set_database(Some(DEFAULT_DATABASE.to_string()));
+    } else {
         engine.session.set_database(Some(login.database.clone()));
     }
 
@@ -638,11 +646,12 @@ impl TdsConnection {
         Ok(())
     }
 
-    /// Execute SQL, reporting results through the sink. An error here is
-    /// one the engine could not turn into a statement error; the client is
-    /// told before the connection is given up.
+    /// Execute SQL, reporting results through the sink. A statement that
+    /// fails is reported to the client by the engine; an error here is a
+    /// failure of the connection, which the client is told, if it can be,
+    /// before the connection is given up.
     async fn execute(&mut self, sql: &str) -> Result<(), TdsError> {
-        if let Err(e) = self.engine.handle_query(sql).await {
+        if let Err(e) = self.engine.handle_statement(sql).await {
             let _ = self.engine.send_error_from_protocol_error(&e).await;
             let _ = self.sink().finish(false).await;
             return Err(e.into());

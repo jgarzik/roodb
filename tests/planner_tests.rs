@@ -240,7 +240,7 @@ fn test_plan_insert() {
 
     match physical {
         PhysicalPlan::Insert { table, values, .. } => {
-            assert_eq!(table, "users");
+            assert_eq!(table.table, "users");
             assert_eq!(values.len(), 1);
         }
         _ => panic!("Expected Insert"),
@@ -260,7 +260,7 @@ fn test_plan_update() {
             key_value,
             ..
         } => {
-            assert_eq!(table, "users");
+            assert_eq!(table.table, "users");
             assert_eq!(assignments.len(), 1);
             assert!(filter.is_some());
             assert!(
@@ -284,7 +284,7 @@ fn test_plan_delete() {
             key_value,
             ..
         } => {
-            assert_eq!(table, "users");
+            assert_eq!(table.table, "users");
             assert!(filter.is_some());
             assert!(
                 key_value.is_some(),
@@ -309,7 +309,7 @@ fn test_plan_create_table() {
 
     match physical {
         PhysicalPlan::CreateTable { name, columns, .. } => {
-            assert_eq!(name, "test");
+            assert_eq!(name.table, "test");
             assert_eq!(columns.len(), 2);
         }
         _ => panic!("Expected CreateTable"),
@@ -328,7 +328,7 @@ fn test_plan_drop_table() {
 
     match physical {
         PhysicalPlan::DropTable { name, if_exists } => {
-            assert_eq!(name, "users");
+            assert_eq!(name.table, "users");
             assert!(if_exists);
         }
         _ => panic!("Expected DropTable"),

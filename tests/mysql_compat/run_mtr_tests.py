@@ -423,45 +423,19 @@ class RooDbServer:
 def reset_test_db(certs, port):
     """Reset the test database between tests.
 
-    RooDB doesn't scope tables to databases, so we need to explicitly
-    drop all user tables, not just recreate the database.
+    Dropping a database drops everything in it, so a test starts with an
+    empty `test`. (A new server has no `test` database: the first call
+    creates it.)
     """
     cmd = [
         MYSQLTEST_BIN,
         f"--host={HOST}", f"--port={port}", f"--user={USER}",
         f"--password={PASSWORD}", "--ssl-mode=REQUIRED",
         f"--ssl-ca={certs.ca_cert}",
-        "--database=test",
     ]
-    # First get list of all tables
-    result = subprocess.run(
-        cmd,
-        input="SHOW TABLES;\n",
-        capture_output=True, text=True, timeout=10,
-    )
-    # Parse table names from output (skip header line)
-    tables = []
-    if result.returncode == 0:
-        for line in result.stdout.strip().split('\n'):
-            name = line.strip()
-            # Skip header, empty lines, system tables, and invalid names
-            if (name and not name.startswith('Tables_in_')
-                    and not name.startswith('system.')
-                    and '`' not in name):
-                tables.append(name)
-
-    # Drop all user tables, then recreate the database.
-    # Also brute-force drop common test table names (t1-t9) in case SHOW TABLES missed them.
-    drop_sql = ""
-    for table in tables:
-        drop_sql += f"DROP TABLE IF EXISTS `{table}`;\n"
-    for i in range(1, 10):
-        drop_sql += f"DROP TABLE IF EXISTS t{i};\n"
-    drop_sql += "DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n"
-
     subprocess.run(
-        cmd[:len(cmd)-1],  # Remove --database=test since we're dropping it
-        input=drop_sql,
+        cmd,
+        input="DROP DATABASE IF EXISTS test;\nCREATE DATABASE test;\n",
         capture_output=True, text=True, timeout=10,
     )
 

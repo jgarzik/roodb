@@ -11,6 +11,11 @@ pub enum SqlError {
     Parse(String),
     /// Table not found during resolution
     TableNotFound(String),
+    /// A table was named without a database, and the session has selected
+    /// none (MySQL error 1046)
+    NoDatabaseSelected,
+    /// A statement names a database that does not exist (MySQL error 1049)
+    UnknownDatabase(String),
     /// Column not found during resolution
     ColumnNotFound(String),
     /// Column is ambiguous (exists in multiple tables)
@@ -32,6 +37,8 @@ impl fmt::Display for SqlError {
         match self {
             SqlError::Parse(msg) => write!(f, "Parse error: {}", msg),
             SqlError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
+            SqlError::NoDatabaseSelected => write!(f, "No database selected"),
+            SqlError::UnknownDatabase(name) => write!(f, "Unknown database '{}'", name),
             SqlError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
             SqlError::AmbiguousColumn(name) => {
                 write!(f, "Column '{}' is ambiguous", name)

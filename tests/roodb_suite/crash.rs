@@ -683,10 +683,8 @@ async fn an_oversized_key_is_refused_without_harm() {
     assert_eq!(keys, ["after", "small"]);
 }
 
-/// What `roodb_init` wrote (the root account, its grant, the databases
-/// `default` and `test`) is stored under generated row IDs. The server must
-/// not hand those IDs out again: its first system rows would overwrite
-/// them.
+/// What `roodb_init` wrote (the root account, its grant) must not be
+/// overwritten by the first system rows the server writes itself.
 #[tokio::test]
 async fn rows_written_at_initialisation_are_not_overwritten() {
     let mut server = ServerProcess::init(&[]);
@@ -704,7 +702,8 @@ async fn rows_written_at_initialisation_are_not_overwritten() {
         rows
     };
     let mut expected: Vec<String> = (0..8).map(|n| format!("init_db{n}")).collect();
-    expected.extend(["default".to_string(), "test".to_string()]);
+    // (with the system's own database, and the one the harness made).
+    expected.extend(["mysql".to_string(), "test".to_string()]);
     expected.sort();
     let seen: Vec<String> = conn.query("SHOW DATABASES").await.unwrap();
     assert_eq!(databases(seen), expected);

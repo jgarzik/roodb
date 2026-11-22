@@ -55,6 +55,12 @@ pub enum ExecutorError {
     /// Duplicate key violation (MySQL error 1062)
     DuplicateKey(String),
 
+    /// A database of this name exists already (MySQL error 1007)
+    DatabaseExists(String),
+
+    /// There is no database of this name to drop (MySQL error 1008)
+    DatabaseNotFound(String),
+
     /// An index of this name exists already (MySQL error 1061)
     DuplicateKeyName(String),
 
@@ -107,6 +113,12 @@ impl fmt::Display for ExecutorError {
             }
             ExecutorError::NullValue(context) => write!(f, "null value in {}", context),
             ExecutorError::TableNotFound(name) => write!(f, "table not found: {}", name),
+            ExecutorError::DatabaseExists(name) => {
+                write!(f, "Can't create database '{}'; database exists", name)
+            }
+            ExecutorError::DatabaseNotFound(name) => {
+                write!(f, "Can't drop database '{}'; database doesn't exist", name)
+            }
             ExecutorError::DuplicateKeyName(name) => write!(f, "Duplicate key name '{}'", name),
             ExecutorError::CantDropKey(name) => write!(
                 f,

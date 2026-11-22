@@ -143,7 +143,7 @@ async fn test_trigger_on_system_table_is_refused() {
         .unwrap();
     let result = conn
         .query_drop(
-            "CREATE TRIGGER tt_sys_trg AFTER INSERT ON system.tables FOR EACH ROW \
+            "CREATE TRIGGER tt_sys_trg AFTER INSERT ON mysql.tables FOR EACH ROW \
              INSERT INTO tt_trg_log VALUES (1)",
         )
         .await;
@@ -208,7 +208,7 @@ async fn test_temporary_table_stays_in_its_session() {
         .unwrap();
     assert!(other.query_drop("SELECT * FROM tt_own").await.is_err());
     let columns: Vec<String> = other
-        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_own'")
+        .query("SELECT table_name FROM mysql.tables WHERE table_name = 'tt_own'")
         .await
         .unwrap();
     assert!(
@@ -360,7 +360,7 @@ async fn an_index_on_a_temporary_table_stays_in_its_session() {
 
     // Not stored, and not there for anyone else.
     let stored: Vec<String> = other
-        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_idx'")
+        .query("SELECT table_name FROM mysql.tables WHERE table_name = 'tt_idx'")
         .await
         .unwrap();
     assert!(
@@ -375,7 +375,7 @@ async fn an_index_on_a_temporary_table_stays_in_its_session() {
     assert_eq!(rows, [(1, 10)]);
     owner.query_drop("DROP INDEX tt_idx_v").await.unwrap();
     let stored: Vec<String> = other
-        .query("SELECT table_name FROM system.tables WHERE table_name = 'tt_idx'")
+        .query("SELECT table_name FROM mysql.tables WHERE table_name = 'tt_idx'")
         .await
         .unwrap();
     assert!(

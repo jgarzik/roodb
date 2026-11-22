@@ -185,6 +185,19 @@ start_roodb() {
     ROODB_PID=$!
 
     wait_for_port 127.0.0.1 "$ROODB_PORT" "RooDB"
+
+    # A new server has no databases but its own: make the benchmark's.
+    echo -n "Creating database $BENCH_DB..."
+    for i in $(seq 1 60); do
+        if mysql -h 127.0.0.1 -P "$ROODB_PORT" -u root -p"$BENCH_PASSWORD" \
+            -e "CREATE DATABASE IF NOT EXISTS $BENCH_DB" &>/dev/null; then
+            echo " done"
+            return 0
+        fi
+        sleep 1
+    done
+    echo " FAILED"
+    return 1
 }
 
 # ─── Start MySQL ──────────────────────────────────────────────────────────────

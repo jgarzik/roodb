@@ -9,6 +9,7 @@ pub mod expr;
 pub use builder::LogicalPlanBuilder;
 pub use expr::{AggregateFunc, ColumnId, OutputColumn};
 
+use crate::catalog::TableName;
 use crate::catalog::{ColumnDef, Constraint, DataType};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 
@@ -315,7 +316,12 @@ pub enum ResolvedSelectItem {
 /// Resolved table reference
 #[derive(Debug, Clone)]
 pub struct ResolvedTableRef {
+    /// What the query calls it when it gives no alias: the table's own
+    /// name, or the name of the CTE or derived table.
     pub name: String,
+    /// The stored table it is, with its database; `None` for what is not
+    /// one (a CTE, a derived table, a view's expansion, DUAL).
+    pub table: Option<TableName>,
     pub alias: Option<String>,
     pub columns: Vec<(String, DataType, bool)>, // (name, type, nullable)
     /// Set for derived tables (subquery in FROM) and view expansions
@@ -364,19 +370,22 @@ pub struct ResolvedSelect {
 pub enum ResolvedStatement {
     /// CREATE TABLE (passthrough, no resolution needed)
     CreateTable {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
     },
     /// DROP TABLE
-    DropTable { name: String, if_exists: bool },
+    DropTable { name: TableName, if_exists: bool },
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables { names: Vec<String>, if_exists: bool },
+    DropMultipleTables {
+        names: Vec<TableName>,
+        if_exists: bool,
+    },
     /// CREATE INDEX
     CreateIndex {
         name: String,
-        table: String,
+        table: TableName,
         columns: Vec<(String, usize)>, // (name, index)
         unique: bool,
     },
@@ -388,7 +397,7 @@ pub enum ResolvedStatement {
     DropDatabase { name: String, if_exists: bool },
     /// INSERT with resolved columns
     Insert {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
@@ -397,7 +406,7 @@ pub enum ResolvedStatement {
     },
     /// INSERT ... SELECT with resolved source query
     InsertSelect {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         source: Box<ResolvedStatement>,
         /// Maps source column index → target column index for partial column lists.
@@ -407,7 +416,7 @@ pub enum ResolvedStatement {
     },
     /// UPDATE with resolved assignments
     Update {
-        table: String,
+        table: TableName,
         table_columns: Vec<(String, DataType, bool)>,
         assignments: Vec<ResolvedAssignment>,
         filter: Option<ResolvedExpr>,
@@ -416,7 +425,7 @@ pub enum ResolvedStatement {
     },
     /// DELETE with resolved filter
     Delete {
-        table: String,
+        table: TableName,
         table_columns: Vec<(String, DataType, bool)>,
         filter: Option<ResolvedExpr>,
         order_by: Vec<(ResolvedExpr, bool)>, // (expr, ascending)
@@ -432,7 +441,7 @@ pub enum ResolvedStatement {
     },
     /// CREATE TABLE ... SELECT (CTAS) — source can be Select or Union
     CreateTableAs {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -486,17 +495,17 @@ pub enum ResolvedStatement {
         for_user: Option<(String, HostPattern)>,
     },
     /// ANALYZE TABLE
-    AnalyzeTable { table: String },
+    AnalyzeTable { table: TableName },
     /// EXPLAIN statement
     Explain { inner: Box<ResolvedStatement> },
     /// CREATE VIEW
     CreateView {
-        name: String,
+        name: TableName,
         query_sql: String,
         or_replace: bool,
     },
     /// DROP VIEW
-    DropView { name: String, if_exists: bool },
+    DropView { name: TableName, if_exists: bool },
 }
 
 /// Logical plan node
@@ -504,7 +513,7 @@ pub enum ResolvedStatement {
 pub enum LogicalPlan {
     /// Table scan - read all rows from a table
     Scan {
-        table: String,
+        table: TableName,
         columns: Vec<OutputColumn>,
         /// Optional pushed-down filter predicate
         filter: Option<ResolvedExpr>,
@@ -581,7 +590,7 @@ pub enum LogicalPlan {
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         ignore: bool,
@@ -590,7 +599,7 @@ pub enum LogicalPlan {
 
     /// INSERT ... SELECT — insert rows from a source query
     InsertSelect {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         source: Box<LogicalPlan>,
         /// Maps source column index → target column index for partial column lists.
@@ -601,7 +610,7 @@ pub enum LogicalPlan {
 
     /// UPDATE rows in a table
     Update {
-        table: String,
+        table: TableName,
         /// (column, new value)
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
@@ -611,7 +620,7 @@ pub enum LogicalPlan {
 
     /// DELETE rows from a table
     Delete {
-        table: String,
+        table: TableName,
         filter: Option<ResolvedExpr>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
@@ -620,7 +629,7 @@ pub enum LogicalPlan {
     // ============ DDL Operations (passthrough) ============
     /// CREATE TABLE
     CreateTable {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -628,7 +637,7 @@ pub enum LogicalPlan {
 
     /// CREATE TABLE ... SELECT
     CreateTableAs {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -636,15 +645,18 @@ pub enum LogicalPlan {
     },
 
     /// DROP TABLE
-    DropTable { name: String, if_exists: bool },
+    DropTable { name: TableName, if_exists: bool },
 
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables { names: Vec<String>, if_exists: bool },
+    DropMultipleTables {
+        names: Vec<TableName>,
+        if_exists: bool,
+    },
 
     /// CREATE INDEX
     CreateIndex {
         name: String,
-        table: String,
+        table: TableName,
         columns: Vec<(String, usize)>,
         unique: bool,
     },
@@ -660,13 +672,13 @@ pub enum LogicalPlan {
 
     /// CREATE VIEW
     CreateView {
-        name: String,
+        name: TableName,
         query_sql: String,
         or_replace: bool,
     },
 
     /// DROP VIEW
-    DropView { name: String, if_exists: bool },
+    DropView { name: TableName, if_exists: bool },
 
     // ============ Auth Operations ============
     /// CREATE USER
@@ -721,7 +733,7 @@ pub enum LogicalPlan {
     },
 
     /// ANALYZE TABLE
-    AnalyzeTable { table: String },
+    AnalyzeTable { table: TableName },
 
     /// EXPLAIN — wraps the inner plan for EXPLAIN output
     Explain { inner: Box<LogicalPlan> },

@@ -17,15 +17,14 @@ collects the behaviour most likely to surprise.
 - Comments: `-- text`, `# text`, `/* text */`. MySQL conditional comments
   `/*!NNNNN code */` are executed when `NNNNN` is at most `80045`, and
   `/*! code */` always.
-- Table names are case-sensitive. Column names are matched without regard
-  to case. Function names and keywords are case-insensitive.
-- Column names may be quoted with backticks. **Table names may not**: the
-  backticks become part of the name (`CREATE TABLE \`t\`` creates a table
-  that `SELECT * FROM t` does not find).
-- There is one table namespace for the whole server. A table name cannot be
-  qualified with a database name (`db.t` is taken as a table literally named
-  `db.t`); the only qualified names are the `system.*` tables. See
-  [Databases](#databases).
+- Database, table, view and trigger names are case-sensitive, as in MySQL
+  on Linux. Column names are matched without regard to case. Function,
+  procedure and keyword names are case-insensitive.
+- Names may be quoted with backticks; a dot inside the quotes is part of
+  the name (`` `a.b` `` is one name).
+- A table, view, trigger, procedure or function belongs to a database and
+  is named `database.name`, or `name` alone for one in the session's
+  current database. See [Databases](#databases).
 - Double-quoted text is a string literal, as in MySQL's default mode.
 
 ## Data Types
@@ -75,12 +74,28 @@ USE name
 SHOW DATABASES
 ```
 
-A new server has the databases `default` and `test`; a session starts in
-`default` unless the client selects another. Databases are names only: they
-can be created, listed, selected with `USE` and reported by `DATABASE()`,
-but **all tables live in one shared namespace** and are visible whichever
-database is selected. `SHOW TABLES FROM db` lists every table. `default`
-cannot be dropped. `CREATE SCHEMA` is not accepted (`DROP SCHEMA` is).
+A new server has no databases but its own: `mysql`, which holds the
+[system tables](#system-tables), and `information_schema`. Neither can be
+dropped. Create the databases you need.
+
+A database holds tables, views, triggers, procedures and functions. The
+same name in two databases is two objects. `DROP DATABASE` drops everything
+in the database with it, as one change: all of it goes or none of it.
+
+A session's current database is the one the client named when it logged in,
+or the one last selected with `USE`; `DATABASE()` reports it. A MySQL
+session that named none has none (`DATABASE()` is `NULL`), and then a name
+written without a database is an error (1046, `No database selected`); a
+TDS session that named none starts in `mysql`, since that protocol has no
+session without a database. Logging in to, selecting or naming a database
+that does not exist is error 1049 (`Unknown database`).
+
+A view's query, a procedure's body and a trigger's body are read in the
+database the view, procedure or trigger belongs to, whatever the current
+database of the session that uses it.
+
+`CREATE DATABASE` of an existing name is error 1007, `DROP DATABASE` of a
+missing one 1008. `CREATE SCHEMA` is not accepted (`DROP SCHEMA` is).
 `CHARACTER SET` and similar options on `CREATE DATABASE` are ignored.
 
 ### CREATE TABLE
@@ -190,7 +205,7 @@ CREATE [OR REPLACE] VIEW name AS select_statement
 DROP VIEW [IF EXISTS] name [, name ...]
 ```
 
-A view stores its query text (`system.views`) and is expanded when used in
+A view stores its query text (`mysql.views`) and is expanded when used in
 `FROM`; it survives restarts. Views can be queried, joined, and defined on
 other views. They are read-only: `INSERT`, `UPDATE` and `DELETE` on a view
 fail. The query is only checked for syntax at creation, so a view on a
@@ -237,9 +252,11 @@ CREATE TRIGGER name {BEFORE | AFTER} {INSERT | UPDATE | DELETE} ON table
 DROP TRIGGER [IF EXISTS] name
 ```
 
-Triggers are stored in `system.triggers` and survive restarts. Trigger names
-are global; creating a second trigger with an existing name is refused.
-The table must exist, and cannot be a `system.*` table or a temporary table.
+Triggers are stored in `mysql.triggers` and survive restarts. A trigger
+belongs to its table's database and is named within it (`DROP TRIGGER
+[db.]name`); creating a second trigger of a name the database already has
+is refused. Its body runs in that database.
+The table must exist, and cannot be a `mysql.*` table or a temporary table.
 
 What actually runs:
 
@@ -254,7 +271,7 @@ replaced by the inserted value; `OLD` is not available. A trigger cannot
 change the row (`SET NEW.col = ...` makes the insert fail). If the trigger
 statement fails, the `INSERT` fails. Inside a transaction the trigger's
 changes commit or roll back with it. There is no `SHOW TRIGGERS` or
-`SHOW CREATE TRIGGER`; query `system.triggers`.
+`SHOW CREATE TRIGGER`; query `mysql.triggers`.
 
 ### Stored procedures
 
@@ -267,8 +284,12 @@ SHOW PROCEDURE STATUS [LIKE 'pattern']
 SHOW CREATE PROCEDURE name
 ```
 
-Procedures are stored in `system.procedures`, are visible to every session
-and survive restarts. Procedures and functions share one namespace. `OUT`
+Procedures are stored in `mysql.procedures`, are visible to every session
+and survive restarts. A procedure belongs to a database (`CALL db.p()`, or
+`CALL p()` for one in the current database), and its body runs in that
+database. A database's procedures and functions share their names: creating
+one that exists is error 1304, calling or dropping one that does not is
+1305. `OUT`
 and `INOUT` arguments must be user variables (`@v`) to receive a value.
 
 Statements supported inside a body:
@@ -310,8 +331,10 @@ SHOW FUNCTION STATUS [LIKE 'pattern']
 SHOW CREATE FUNCTION name
 ```
 
-Functions are stored in `system.procedures`, callable from any session, in
-any expression, and survive restarts. The accepted form is narrow:
+Functions are stored in `mysql.procedures`, callable from any session, in
+any expression, and survive restarts. A function belongs to a database:
+`f()` is one of the current database, `db.f()` one of another. The accepted
+form is narrow:
 
 - parameter types and the return type must be a single word (`INT`,
   `BIGINT`, `TEXT`; not `VARCHAR(20)`);
@@ -777,7 +800,7 @@ supported.
 
 ## Users and Privileges
 
-Accounts are rows of `system.users`; grants are rows of `system.grants`.
+Accounts are rows of `mysql.users`; grants are rows of `mysql.grants`.
 The `root` account is created by `roodb_init` (see [admin.md](admin.md))
 and bypasses all privilege checks.
 
@@ -793,7 +816,7 @@ and bypasses all privilege checks.
 In practice, `root` is the only account that can be used. For a non-root
 session the server checks `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
 `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX` and `DROP INDEX` against
-`system.grants`, with the host pattern matched against the client address;
+`mysql.grants`, with the host pattern matched against the client address;
 other statements (views, procedures, functions, triggers, `ALTER TABLE`,
 `CREATE/DROP DATABASE`, `GRANT` itself, `LOAD DATA`) are not checked.
 
@@ -911,23 +934,23 @@ variable. The text must be a quoted literal (not a variable).
 
 ## System Tables
 
-Schema and accounts are stored in `system.*` tables, which can be queried
+Schema and accounts are stored in `mysql.*` tables, which can be queried
 with `SELECT`:
 
 | Table | Columns |
 |-------|---------|
-| `system.tables` | `table_name`, `definition` (the table's columns, constraints and indexes, encoded: read them with `DESCRIBE`, `SHOW CREATE TABLE` and `SHOW INDEX`) |
-| `system.views` | `view_name`, `query_sql` |
-| `system.triggers` | `trigger_name`, `table_name`, `create_sql` |
-| `system.procedures` | `procedure_name`, `params_json`, `body_sql`, `returns_type` (set for functions) |
-| `system.databases` | `database_name` |
-| `system.table_statistics` | `table_name`, `row_count`, `data_size`, `last_analyzed` |
-| `system.users` | `username`, `host`, `password_hash`, `auth_plugin`, `ssl_subject`, `ssl_issuer`, `account_locked`, `password_expired`, `created_at`, `updated_at` |
-| `system.grants` | `grantee`, `grantee_host`, `grantee_type`, `privilege`, `object_type`, `database_name`, `table_name`, `with_grant_option`, `granted_by`, `granted_at` |
-| `system.roles` | `role_name`, `created_at` |
-| `system.role_grants` | `username`, `host`, `role_name`, `with_admin_option`, `granted_at` |
+| `mysql.tables` | `database_name`, `table_name`, `definition` (the table's columns, constraints and indexes, encoded: read them with `DESCRIBE`, `SHOW CREATE TABLE` and `SHOW INDEX`) |
+| `mysql.views` | `database_name`, `view_name`, `query_sql` |
+| `mysql.triggers` | `database_name`, `trigger_name`, `table_name`, `create_sql` |
+| `mysql.procedures` | `database_name`, `procedure_name`, `params_json`, `body_sql`, `returns_type` (set for functions) |
+| `mysql.databases` | `database_name` (the databases that were created; the system's own are not listed) |
+| `mysql.table_statistics` | `database_name`, `table_name`, `row_count`, `data_size`, `last_analyzed` |
+| `mysql.users` | `username`, `host`, `password_hash`, `auth_plugin`, `ssl_subject`, `ssl_issuer`, `account_locked`, `password_expired`, `created_at`, `updated_at` |
+| `mysql.grants` | `grantee`, `grantee_host`, `grantee_type`, `privilege`, `object_type`, `database_name`, `table_name`, `with_grant_option`, `granted_by`, `granted_at` |
+| `mysql.roles` | `role_name`, `created_at` |
+| `mysql.role_grants` | `username`, `host`, `role_name`, `with_admin_option`, `granted_at` |
 
-Temporary tables are not listed in `system.tables`. The system tables are
+Temporary tables are not listed in `mysql.tables`. The system tables are
 not protected against `INSERT`, `UPDATE` and `DELETE`; do not write to
 them directly.
 
@@ -978,11 +1001,16 @@ returns most often:
 |------|----------|---------|
 | 1045 | 28000 | Access denied (login or privilege) |
 | 1048 | 23000 | Column cannot be `NULL` |
-| 1049 | HY000 | Unknown database |
+| 1007 | HY000 | `CREATE DATABASE` of a database that exists |
+| 1008 | HY000 | `DROP DATABASE` of a database that does not exist |
+| 1046 | 3D000 | A name without a database, and no database selected |
+| 1049 | 42000 | Unknown database |
 | 1050 | 42S01 | Table already exists |
 | 1051 | 42S02 | `DROP TABLE` of an unknown table |
 | 1054 | 42S22 | Unknown column |
 | 1061 | 42000 | An index of that name exists |
+| 1304 | 42000 | A procedure or function of that name exists in the database |
+| 1305 | 42000 | No such procedure |
 | 1062 | 23000 | Duplicate primary key |
 | 1091 | 42000 | No such index to drop |
 | 1064 | 42000 | Syntax error |
@@ -1055,9 +1083,6 @@ unknown function, duplicate view or procedure) are reported as 1105.
 
 **Schema objects and names**
 
-- One table namespace; databases are labels only and `db.table` does not
-  work.
-- Table names cannot be backtick-quoted and are case-sensitive.
 - Only `INSERT ... VALUES` fires triggers; `UPDATE` and `DELETE` triggers
   never fire; trigger bodies are one statement; `BEFORE` triggers run after
   the insert and cannot modify the row.

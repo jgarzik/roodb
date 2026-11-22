@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::catalog::system_tables::{SYSTEM_DATABASES, SYSTEM_GRANTS, SYSTEM_USERS};
+use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
 use crate::executor::{Datum, Row};
 use crate::protocol::roodb::auth::compute_password_hash;
 use crate::sql::Privilege;
@@ -132,14 +132,11 @@ pub async fn initialize_database(
 
     // Each row under its key, with the header every stored row has.
     use crate::catalog::store::initial_row;
-    let default_db_row = Row::new(vec![Datum::String("default".to_string())]);
-    let test_db_row = Row::new(vec![Datum::String("test".to_string())]);
     for (table, row) in [
         (SYSTEM_USERS, &user_row),
         (SYSTEM_GRANTS, &grant_row),
-        // The databases a new server has: "default" and "test"
-        (SYSTEM_DATABASES, &default_db_row),
-        (SYSTEM_DATABASES, &test_db_row),
+        // (No databases: a new server has the system's own, and those
+        // its users create.)
     ] {
         let (key, value) = initial_row(table, row);
         storage

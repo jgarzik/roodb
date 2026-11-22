@@ -535,7 +535,7 @@ async fn a_change_meant_for_another_table_of_the_name_is_refused() {
         }
     };
     let propose = |change| node.propose_changes(ChangeSet::new_with_changes(0, vec![change]));
-    let id_now = || catalog.read().get_table("racing").map(|def| def.id);
+    let id_now = || catalog.read().get_table(&"racing".into()).map(|def| def.id);
 
     // The table as it is: ID 7001.
     propose(store::create_table(&record(7001, &["a"])))
@@ -544,21 +544,63 @@ async fn a_change_meant_for_another_table_of_the_name_is_refused() {
     assert_eq!(id_now(), Some(TableId(7001)));
 
     // Changes prepared against an earlier table of the name (ID 7000).
-    assert!(propose(store::drop_table("racing", TableId(7000)))
+    assert!(propose(store::drop_table(&"racing".into(), TableId(7000)))
         .await
         .is_err());
     assert!(propose(store::replace_table(&record(7000, &["a", "b"])))
         .await
         .is_err());
     assert_eq!(id_now(), Some(TableId(7001)));
-    assert_eq!(catalog.read().get_table("racing").unwrap().columns.len(), 1);
+    assert_eq!(
+        catalog
+            .read()
+            .get_table(&"racing".into())
+            .unwrap()
+            .columns
+            .len(),
+        1
+    );
 
     // Changes that mean this table go through.
     propose(store::replace_table(&record(7001, &["a", "b"])))
         .await
         .unwrap();
-    assert_eq!(catalog.read().get_table("racing").unwrap().columns.len(), 2);
-    propose(store::drop_table("racing", TableId(7001)))
+    assert_eq!(
+        catalog
+            .read()
+            .get_table(&"racing".into())
+            .unwrap()
+            .columns
+            .len(),
+        2
+    );
+
+    // Two statements read the table at the same moment and each changed
+    // it. The first to be applied stands; the second was made from a
+    // definition that is no longer the table's, and is refused instead of
+    // silently undoing the first.
+    let read = || TableRecord {
+        def: catalog.read().get_table(&"racing".into()).unwrap().clone(),
+        indexes: Vec::new(),
+    };
+    let (mut one, mut other) = (read(), read());
+    one.def = one.def.column(ColumnDef::new("c", DataType::Int));
+    other.def = other.def.column(ColumnDef::new("d", DataType::Int));
+    propose(store::replace_table(&one)).await.unwrap();
+    assert!(propose(store::replace_table(&other)).await.is_err());
+    let columns = || -> Vec<String> {
+        let catalog = catalog.read();
+        let def = catalog.get_table(&"racing".into()).unwrap();
+        def.columns.iter().map(|c| c.name.clone()).collect()
+    };
+    assert_eq!(columns(), ["a", "b", "c"]);
+    // Made again from the table as it now is, the second goes through.
+    let mut other = read();
+    other.def = other.def.column(ColumnDef::new("d", DataType::Int));
+    propose(store::replace_table(&other)).await.unwrap();
+    assert_eq!(columns(), ["a", "b", "c", "d"]);
+
+    propose(store::drop_table(&"racing".into(), TableId(7001)))
         .await
         .unwrap();
     assert_eq!(id_now(), None);
@@ -567,7 +609,7 @@ async fn a_change_meant_for_another_table_of_the_name_is_refused() {
     assert!(propose(store::replace_table(&record(7001, &["a"])))
         .await
         .is_err());
-    assert!(propose(store::drop_table("racing", TableId(7001)))
+    assert!(propose(store::drop_table(&"racing".into(), TableId(7001)))
         .await
         .is_err());
 

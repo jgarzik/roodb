@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast as sp;
 
+use crate::catalog::TableName;
 use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::planner::logical::{
     BinaryOp, BooleanTestType, JoinType, Literal, ResolvedAssignment, ResolvedColumn, ResolvedExpr,
@@ -31,10 +32,13 @@ pub struct Resolver<'a> {
     view_depth: Cell<usize>,
     /// CTE definitions (WITH ... AS) — populated at resolve_query time
     ctes: std::cell::RefCell<std::collections::HashMap<String, ResolvedSelect>>,
+    /// The database the session is in (`USE`), which a table named without
+    /// one belongs to. Only looked at when resolving for a session.
+    database: Option<String>,
     /// The temporary tables of the session being resolved for. When set, any
     /// other temporary table in the catalog belongs to another session and
     /// is not found.
-    session_temp_tables: Option<Vec<String>>,
+    session_temp_tables: Option<Vec<TableName>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -47,6 +51,7 @@ impl<'a> Resolver<'a> {
             view_depth: Cell::new(0),
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_temp_tables: None,
+            database: None,
         }
     }
 
@@ -59,21 +64,82 @@ impl<'a> Resolver<'a> {
             view_depth: Cell::new(0),
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_temp_tables: None,
+            database: None,
         }
     }
 
     /// Resolve on behalf of a session that owns these temporary tables. No
     /// other temporary table can then be named, in any part of a statement.
-    pub fn for_session(mut self, temp_tables: Vec<String>) -> Self {
+    pub fn for_session(mut self, temp_tables: Vec<TableName>, database: Option<String>) -> Self {
         self.session_temp_tables = Some(temp_tables);
+        self.database = database;
         self
     }
 
+    /// The name a table is known by in the catalog: its database and its
+    /// name there. A name written without a database belongs to the
+    /// session's current one; with none selected that is an error, as in
+    /// MySQL. (A resolver not working for a session - tests, tools - takes
+    /// a bare name as a name in no database.)
+    pub fn canonical(&self, name: &sp::ObjectName) -> SqlResult<TableName> {
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .map(|part| match part.as_ident() {
+                Some(ident) => ident.value.clone(),
+                None => part.to_string(),
+            })
+            .collect();
+        self.canonical_parts(&parts)
+    }
+
+    /// As `canonical`, for the parts of a name: `[table]` or
+    /// `[database, table]`. A dot inside a part is part of the name.
+    pub fn canonical_parts(&self, parts: &[String]) -> SqlResult<TableName> {
+        match parts {
+            [table] => match (&self.session_temp_tables, &self.database) {
+                // Not for a session: in no database.
+                (None, _) => Ok(TableName::bare(table.clone())),
+                (Some(_), Some(database)) => self.in_database(database, table),
+                (Some(_), None) => Err(SqlError::NoDatabaseSelected),
+            },
+            [database, table] => self.in_database(database, table),
+            _ => Err(SqlError::Parse(format!(
+                "Incorrect table name '{}'",
+                parts.join(".")
+            ))),
+        }
+    }
+
+    /// The name of `table` in `database`, which must exist (for a session;
+    /// a resolver that works for none has no databases to speak of).
+    fn in_database(&self, database: &str, table: &str) -> SqlResult<TableName> {
+        if self.session_temp_tables.is_some() && !self.catalog.database_exists(database) {
+            return Err(SqlError::UnknownDatabase(database.to_string()));
+        }
+        Ok(TableName::new(database, table))
+    }
+
+    /// A table constraint as the catalog holds it (CREATE TABLE, ALTER
+    /// TABLE ... ADD CONSTRAINT). A table a foreign key refers to is named
+    /// as any table in a statement is.
+    pub fn table_constraint(
+        &self,
+        constraint: &sp::TableConstraint,
+    ) -> SqlResult<Option<Constraint>> {
+        convert_table_constraint(constraint, &|name| self.canonical(name))
+    }
+
+    /// The stored table a FROM-clause reference stands for, if it is one.
+    fn table_of(&self, table_ref: &ResolvedTableRef) -> Option<&'a crate::catalog::TableDef> {
+        table_ref.table.as_ref().and_then(|name| self.table(name))
+    }
+
     /// Look a table up as this session sees it.
-    fn table(&self, name: &str) -> Option<&'a crate::catalog::TableDef> {
+    fn table(&self, name: &TableName) -> Option<&'a crate::catalog::TableDef> {
         let def = self.catalog.get_table(name)?;
         match &self.session_temp_tables {
-            Some(owned) if def.is_temporary && !owned.iter().any(|t| t == name) => None,
+            Some(owned) if def.is_temporary && !owned.contains(name) => None,
             _ => Some(def),
         }
     }
@@ -102,7 +168,7 @@ impl<'a> Resolver<'a> {
 
             // CREATE VIEW
             sp::Statement::CreateView(cv) => {
-                let name = cv.name.to_string();
+                let name = self.canonical(&cv.name)?;
                 let or_replace = cv.or_replace;
                 let query_sql = cv.query.to_string();
                 Ok(ResolvedStatement::CreateView {
@@ -140,33 +206,31 @@ impl<'a> Resolver<'a> {
                 if_not_exists,
                 ..
             } => Ok(ResolvedStatement::CreateDatabase {
-                name: db_name.to_string(),
+                name: database_name(&db_name),
                 if_not_exists,
             }),
 
             // ANALYZE TABLE
             sp::Statement::Analyze(analyze) => {
-                let table = analyze
-                    .table_name
-                    .as_ref()
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
+                let table = match analyze.table_name.as_ref() {
+                    Some(name) => self.canonical(name)?,
+                    None => return Err(SqlError::Parse("a table name is required".to_string())),
+                };
                 // Verify table exists
                 self.table(&table)
-                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+                    .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
                 Ok(ResolvedStatement::AnalyzeTable { table })
             }
 
             // TRUNCATE TABLE — resolve as DELETE with no filter (deletes all rows)
             sp::Statement::Truncate(truncate) => {
-                let table = truncate
-                    .table_names
-                    .first()
-                    .map(|t| t.name.to_string())
-                    .unwrap_or_default();
+                let table = match truncate.table_names.first() {
+                    Some(target) => self.canonical(&target.name)?,
+                    None => return Err(SqlError::Parse("a table name is required".to_string())),
+                };
                 // Verify table exists
                 self.table(&table)
-                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+                    .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
                 Ok(ResolvedStatement::Delete {
                     table: table.clone(),
                     table_columns: self
@@ -198,7 +262,7 @@ impl<'a> Resolver<'a> {
 
     /// Resolve CREATE TABLE
     fn resolve_create_table(&self, create: &sp::CreateTable) -> SqlResult<ResolvedStatement> {
-        let name = create.name.to_string();
+        let name = self.canonical(&create.name)?;
         let if_not_exists = create.if_not_exists;
 
         let mut columns = Vec::new();
@@ -217,7 +281,7 @@ impl<'a> Resolver<'a> {
         }
 
         for constraint in &create.constraints {
-            if let Some(c) = convert_table_constraint(constraint)? {
+            if let Some(c) = self.table_constraint(constraint)? {
                 constraints.push(c);
             }
         }
@@ -315,24 +379,41 @@ impl<'a> Resolver<'a> {
         if names.is_empty() {
             return Err(SqlError::Parse("DROP requires a name".to_string()));
         }
-        let name = names[0].to_string();
-
+        // Tables and views are named within a database; an index is named
+        // within its table.
         match object_type {
-            sp::ObjectType::View => Ok(ResolvedStatement::DropView { name, if_exists }),
+            sp::ObjectType::View => Ok(ResolvedStatement::DropView {
+                name: self.canonical(&names[0])?,
+                if_exists,
+            }),
             sp::ObjectType::Table => {
                 if names.len() > 1 {
                     // Multi-table DROP: DROP TABLE t1, t2, t3
-                    let table_names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+                    let table_names: Vec<TableName> = names
+                        .iter()
+                        .map(|n| self.canonical(n))
+                        .collect::<SqlResult<_>>()?;
                     Ok(ResolvedStatement::DropMultipleTables {
                         names: table_names,
                         if_exists,
                     })
                 } else {
-                    Ok(ResolvedStatement::DropTable { name, if_exists })
+                    Ok(ResolvedStatement::DropTable {
+                        name: self.canonical(&names[0])?,
+                        if_exists,
+                    })
                 }
             }
-            sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex { name }),
-            sp::ObjectType::Schema => Ok(ResolvedStatement::DropDatabase { name, if_exists }),
+            // An index is named within its table; a database by itself.
+            sp::ObjectType::Index => Ok(ResolvedStatement::DropIndex {
+                name: names[0].to_string(),
+            }),
+            sp::ObjectType::Schema | sp::ObjectType::Database => {
+                Ok(ResolvedStatement::DropDatabase {
+                    name: database_name(&names[0]),
+                    if_exists,
+                })
+            }
             _ => Err(SqlError::Unsupported(format!("DROP {:?}", object_type))),
         }
     }
@@ -345,13 +426,13 @@ impl<'a> Resolver<'a> {
             .map(|n| n.to_string())
             .ok_or_else(|| SqlError::Parse("CREATE INDEX requires a name".to_string()))?;
 
-        let table = create.table_name.to_string();
+        let table = self.canonical(&create.table_name)?;
         let unique = create.unique;
 
         // Resolve column indices
         let table_def = self
             .table(&table)
-            .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+            .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
 
         let mut resolved_cols = Vec::new();
         for col_expr in &create.columns {
@@ -372,11 +453,18 @@ impl<'a> Resolver<'a> {
 
     /// Resolve INSERT statement
     fn resolve_insert(&self, insert: &sp::Insert) -> SqlResult<ResolvedStatement> {
-        let table = insert.table.to_string();
+        let table = match &insert.table {
+            sp::TableObject::TableName(name) => self.canonical(name)?,
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "INSERT into {other}: not a table"
+                )))
+            }
+        };
 
         let table_def = self
             .table(&table)
-            .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+            .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
 
         // Handle INSERT ... SET syntax by converting to INSERT ... VALUES
         if !insert.assignments.is_empty() {
@@ -398,7 +486,7 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .enumerate()
                     .map(|(idx, col_def)| ResolvedColumn {
-                        table: table.clone(),
+                        table: table.table.clone(),
                         name: col_def.name.clone(),
                         index: idx,
                         data_type: col_def.data_type.clone(),
@@ -468,7 +556,7 @@ impl<'a> Resolver<'a> {
         }
 
         // Build scope for expression resolution
-        let scope = Scope::single_table(&table, table_def);
+        let scope = Scope::single_table(&table.table, table_def);
 
         // Resolve all columns for the output (always includes all table columns)
         // Auto-increment columns are treated as nullable for INSERT purposes
@@ -476,7 +564,7 @@ impl<'a> Resolver<'a> {
         let mut resolved_columns = Vec::new();
         for (idx, col_def) in table_def.columns.iter().enumerate() {
             resolved_columns.push(ResolvedColumn {
-                table: table.clone(),
+                table: table.table.clone(),
                 name: col_def.name.clone(),
                 index: idx,
                 data_type: col_def.data_type.clone(),
@@ -601,10 +689,10 @@ impl<'a> Resolver<'a> {
     fn resolve_insert_set(
         &self,
         insert: &sp::Insert,
-        table: &str,
+        table: &TableName,
         table_def: &crate::catalog::TableDef,
     ) -> SqlResult<ResolvedStatement> {
-        let scope = Scope::single_table(table, table_def);
+        let scope = Scope::single_table(&table.table, table_def);
 
         // Build resolved columns for all table columns
         let mut resolved_columns = Vec::new();
@@ -654,7 +742,7 @@ impl<'a> Resolver<'a> {
         }
 
         Ok(ResolvedStatement::Insert {
-            table: table.to_string(),
+            table: table.clone(),
             columns: resolved_columns,
             values: vec![full_row],
             ignore: insert.ignore,
@@ -672,27 +760,31 @@ impl<'a> Resolver<'a> {
         limit: &Option<sp::Expr>,
     ) -> SqlResult<ResolvedStatement> {
         let table_name = match &table.relation {
-            sp::TableFactor::Table { name, .. } => name.to_string(),
+            sp::TableFactor::Table { name, .. } => self.canonical(name)?,
             _ => return Err(SqlError::Unsupported("Complex UPDATE table".to_string())),
         };
 
         let table_def = self
             .table(&table_name)
-            .ok_or_else(|| SqlError::TableNotFound(table_name.clone()))?;
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
 
         // Handle UPDATE with JOIN: rewrite JOIN ON condition to IN-subquery filter
         let join_filter = if !table.joins.is_empty() {
             let mut combined_filter: Option<ResolvedExpr> = None;
             for join in &table.joins {
                 let joined_table_name = match &join.relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    sp::TableFactor::Table { name, .. } => self.canonical(name)?,
                     _ => continue,
                 };
                 let joined_def = self
                     .table(&joined_table_name)
-                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.to_string()))?;
                 if let Some(on_expr) = extract_join_condition(&join.join_operator) {
-                    let pairs = extract_equijoin_pairs(on_expr, &table_name, &joined_table_name);
+                    let pairs = extract_equijoin_pairs(
+                        on_expr,
+                        &table_name.table,
+                        &joined_table_name.table,
+                    );
                     let joined_cols: Vec<_> = joined_def
                         .columns
                         .iter()
@@ -712,7 +804,7 @@ impl<'a> Resolver<'a> {
                             .get_column_index(joined_col)
                             .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
                         let target_ref = ResolvedExpr::Column(ResolvedColumn {
-                            table: table_name.clone(),
+                            table: table_name.table.clone(),
                             name: target_col.clone(),
                             index: ti,
                             data_type: tc.data_type.clone(),
@@ -721,7 +813,7 @@ impl<'a> Resolver<'a> {
                             is_outer_ref: false,
                         });
                         let subquery_col = ResolvedExpr::Column(ResolvedColumn {
-                            table: joined_table_name.clone(),
+                            table: joined_table_name.table.clone(),
                             name: joined_col.clone(),
                             index: ji,
                             data_type: jc.data_type.clone(),
@@ -736,7 +828,8 @@ impl<'a> Resolver<'a> {
                                 alias: Some(joined_col.clone()),
                             }],
                             from: vec![ResolvedTableRef {
-                                name: joined_table_name.clone(),
+                                name: joined_table_name.table.clone(),
+                                table: Some(joined_table_name.clone()),
                                 alias: None,
                                 columns: joined_cols.clone(),
                                 inner_query: None,
@@ -771,7 +864,7 @@ impl<'a> Resolver<'a> {
             None
         };
 
-        let scope = Scope::single_table(&table_name, table_def);
+        let scope = Scope::single_table(&table_name.table, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -782,18 +875,18 @@ impl<'a> Resolver<'a> {
 
         // Resolve assignments (use multi-table scope if JOINs present)
         let assign_scope = if !table.joins.is_empty() {
-            let mut ms = Scope::single_table(&table_name, table_def);
+            let mut ms = Scope::single_table(&table_name.table, table_def);
             for join in &table.joins {
                 if let sp::TableFactor::Table { name, .. } = &join.relation {
-                    let jt = name.to_string();
+                    let jt = self.canonical(name)?;
                     if let Some(jd) = self.table(&jt) {
-                        ms.add_table(&jt, &jt, jd);
+                        ms.add_table(&jt.table, &jt.table, jd);
                     }
                 }
             }
             ms
         } else {
-            Scope::single_table(&table_name, table_def)
+            Scope::single_table(&table_name.table, table_def)
         };
 
         let mut resolved_assignments = Vec::new();
@@ -807,7 +900,7 @@ impl<'a> Resolver<'a> {
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
 
             let column = ResolvedColumn {
-                table: table_name.clone(),
+                table: table_name.table.clone(),
                 name: col_name,
                 index: idx,
                 data_type: col_def.data_type.clone(),
@@ -880,7 +973,7 @@ impl<'a> Resolver<'a> {
         };
 
         let table_name = match &from_tables[0].relation {
-            sp::TableFactor::Table { name, .. } => name.to_string(),
+            sp::TableFactor::Table { name, .. } => self.canonical(name)?,
             _ => return Err(SqlError::Unsupported("Complex DELETE table".to_string())),
         };
 
@@ -888,27 +981,32 @@ impl<'a> Resolver<'a> {
         // Rewrite join condition into an IN-subquery filter that only references
         // the target table: WHERE t1.a IN (SELECT t2.a FROM t2)
         let join_filter = if !delete.tables.is_empty() && !from_tables[0].joins.is_empty() {
-            let target = delete.tables[0].to_string();
+            let target = self.canonical(&delete.tables[0])?;
             let mut combined_filter: Option<ResolvedExpr> = None;
 
             for join in &from_tables[0].joins {
                 let joined_table_name = match &join.relation {
-                    sp::TableFactor::Table { name, .. } => name.to_string(),
+                    sp::TableFactor::Table { name, .. } => self.canonical(name)?,
                     _ => continue,
                 };
                 let joined_def = self
                     .table(&joined_table_name)
-                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.clone()))?;
+                    .ok_or_else(|| SqlError::TableNotFound(joined_table_name.to_string()))?;
 
                 if let Some(on_expr) = extract_join_condition(&join.join_operator) {
                     let target_def = self
                         .table(&target)
-                        .ok_or_else(|| SqlError::TableNotFound(target.clone()))?;
-                    let mut multi_scope = Scope::single_table(&target, target_def);
-                    multi_scope.add_table(&joined_table_name, &joined_table_name, joined_def);
+                        .ok_or_else(|| SqlError::TableNotFound(target.to_string()))?;
+                    let mut multi_scope = Scope::single_table(&target.table, target_def);
+                    multi_scope.add_table(
+                        &joined_table_name.table,
+                        &joined_table_name.table,
+                        joined_def,
+                    );
 
                     // Extract equi-join pairs from the ON condition
-                    let pairs = extract_equijoin_pairs(on_expr, &target, &joined_table_name);
+                    let pairs =
+                        extract_equijoin_pairs(on_expr, &target.table, &joined_table_name.table);
 
                     let joined_cols: Vec<_> = joined_def
                         .columns
@@ -931,7 +1029,7 @@ impl<'a> Resolver<'a> {
                             .ok_or_else(|| SqlError::ColumnNotFound(joined_col.clone()))?;
 
                         let target_ref = ResolvedExpr::Column(ResolvedColumn {
-                            table: target.clone(),
+                            table: target.table.clone(),
                             name: target_col.clone(),
                             index: target_col_idx,
                             data_type: target_col_def.data_type.clone(),
@@ -940,7 +1038,7 @@ impl<'a> Resolver<'a> {
                             is_outer_ref: false,
                         });
                         let subquery_col = ResolvedExpr::Column(ResolvedColumn {
-                            table: joined_table_name.clone(),
+                            table: joined_table_name.table.clone(),
                             name: joined_col.clone(),
                             index: joined_col_idx,
                             data_type: joined_col_def.data_type.clone(),
@@ -956,7 +1054,8 @@ impl<'a> Resolver<'a> {
                                 alias: Some(joined_col.clone()),
                             }],
                             from: vec![ResolvedTableRef {
-                                name: joined_table_name.clone(),
+                                name: joined_table_name.table.clone(),
+                                table: Some(joined_table_name.clone()),
                                 alias: None,
                                 columns: joined_cols.clone(),
                                 inner_query: None,
@@ -994,16 +1093,16 @@ impl<'a> Resolver<'a> {
 
         // For multi-table DELETE, target is delete.tables[0]; else use FROM table
         let target_table = if !delete.tables.is_empty() {
-            delete.tables[0].to_string()
+            self.canonical(&delete.tables[0])?
         } else {
             table_name.clone()
         };
 
         let table_def = self
             .table(&target_table)
-            .ok_or_else(|| SqlError::TableNotFound(target_table.clone()))?;
+            .ok_or_else(|| SqlError::TableNotFound(target_table.to_string()))?;
 
-        let scope = Scope::single_table(&target_table, table_def);
+        let scope = Scope::single_table(&target_table.table, table_def);
 
         // Get table column info
         let table_columns: Vec<_> = table_def
@@ -1202,7 +1301,7 @@ impl<'a> Resolver<'a> {
                     .unwrap_or_else(|| table_ref.name.clone());
                 if table_ref.inner_query.is_some() {
                     scope.add_derived_table(&alias, &table_ref.columns);
-                } else if let Some(table_def) = self.table(&table_ref.name) {
+                } else if let Some(table_def) = self.table_of(table_ref) {
                     scope.add_table(&alias, &table_ref.name, table_def);
                 }
             }
@@ -1214,7 +1313,7 @@ impl<'a> Resolver<'a> {
                     .unwrap_or_else(|| join.table.name.clone());
                 if join.table.inner_query.is_some() {
                     scope.add_derived_table(&alias, &join.table.columns);
-                } else if let Some(table_def) = self.table(&join.table.name) {
+                } else if let Some(table_def) = self.table_of(&join.table) {
                     scope.add_table(&alias, &join.table.name, table_def);
                 }
             }
@@ -1407,7 +1506,7 @@ impl<'a> Resolver<'a> {
                         scope.add_derived_table(&alias, &table_ref.columns);
                     } else {
                         let table_def = self
-                            .table(&table_ref.name)
+                            .table_of(&table_ref)
                             .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
                         scope.add_table(&alias, &table_ref.name, table_def);
                     }
@@ -1439,7 +1538,7 @@ impl<'a> Resolver<'a> {
                             scope.add_derived_table(&alias, &table_ref.columns);
                         } else {
                             let table_def = self
-                                .table(&table_ref.name)
+                                .table_of(&table_ref)
                                 .ok_or_else(|| SqlError::TableNotFound(table_ref.name.clone()))?;
                             scope.add_table(&alias, &table_ref.name, table_def);
                         }
@@ -1591,28 +1690,27 @@ impl<'a> Resolver<'a> {
     fn resolve_table_factor(&self, table: &sp::TableFactor) -> SqlResult<ResolvedTableRef> {
         match table {
             sp::TableFactor::Table { name, alias, .. } => {
-                let table_name = name.to_string();
+                // A name written without a database may be DUAL or a CTE;
+                // otherwise it is a table or view of the current database.
+                let written = match name.0.as_slice() {
+                    [only] => Some(match only.as_ident() {
+                        Some(ident) => ident.value.clone(),
+                        None => only.to_string(),
+                    }),
+                    _ => None,
+                };
+                let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                 // MySQL DUAL pseudo-table: FROM DUAL is equivalent to no FROM
-                if table_name.eq_ignore_ascii_case("dual") {
+                if written
+                    .as_deref()
+                    .is_some_and(|w| w.eq_ignore_ascii_case("dual"))
+                {
                     return Ok(ResolvedTableRef {
                         name: "dual".to_string(),
-                        alias: alias.as_ref().map(|a| a.name.value.clone()),
+                        table: None,
+                        alias: alias_name,
                         columns: vec![],
-                        inner_query: None,
-                    });
-                }
-
-                // Check physical table first
-                if let Some(table_def) = self.table(&table_name) {
-                    return Ok(ResolvedTableRef {
-                        name: table_name,
-                        alias: alias.as_ref().map(|a| a.name.value.clone()),
-                        columns: table_def
-                            .columns
-                            .iter()
-                            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-                            .collect(),
                         inner_query: None,
                     });
                 }
@@ -1620,7 +1718,10 @@ impl<'a> Resolver<'a> {
                 // Check CTE definitions
                 {
                     let ctes = self.ctes.borrow();
-                    if let Some(cte_select) = ctes.get(&table_name.to_lowercase()) {
+                    let cte_select = written
+                        .as_ref()
+                        .and_then(|w| ctes.get(&w.to_lowercase()).or_else(|| ctes.get(w)));
+                    if let (Some(cte_select), Some(written)) = (cte_select, written.as_ref()) {
                         let columns: Vec<_> = cte_select
                             .columns
                             .iter()
@@ -1640,15 +1741,30 @@ impl<'a> Resolver<'a> {
                             })
                             .collect();
                         return Ok(ResolvedTableRef {
-                            name: alias
-                                .as_ref()
-                                .map(|a| a.name.value.clone())
-                                .unwrap_or(table_name),
-                            alias: alias.as_ref().map(|a| a.name.value.clone()),
+                            name: alias_name.clone().unwrap_or_else(|| written.clone()),
+                            table: None,
+                            alias: alias_name,
                             columns,
                             inner_query: Some(Box::new(cte_select.clone())),
                         });
                     }
+                }
+
+                let table_name = self.canonical(name)?;
+
+                // A physical table
+                if let Some(table_def) = self.table(&table_name) {
+                    return Ok(ResolvedTableRef {
+                        name: table_name.table.clone(),
+                        table: Some(table_name),
+                        alias: alias_name,
+                        columns: table_def
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                            .collect(),
+                        inner_query: None,
+                    });
                 }
 
                 // Fall back to view — expand view query as a derived table
@@ -1660,16 +1776,28 @@ impl<'a> Resolver<'a> {
                             depth
                         )));
                     }
-                    self.view_depth.set(depth + 1);
+                    // The view's query is read in the view's database,
+                    // whatever the session's: the names in it mean what
+                    // they meant when the view was made. The query's own
+                    // WITH names are not the view's to see.
+                    let within = Resolver {
+                        catalog: self.catalog,
+                        placeholder_mode: self.placeholder_mode,
+                        placeholder_counter: Cell::new(self.placeholder_counter.get()),
+                        view_depth: Cell::new(depth + 1),
+                        ctes: Default::default(),
+                        database: Some(view_def.name.database.clone()),
+                        session_temp_tables: self.session_temp_tables.clone(),
+                    };
 
                     let view_sql = view_def.query_sql.clone();
                     let view_stmt = crate::sql::Parser::parse_one(&view_sql).map_err(|e| {
                         SqlError::Parse(format!("Invalid view '{}': {}", table_name, e))
                     })?;
                     if let sp::Statement::Query(query) = view_stmt {
-                        let mut inner_select = self.resolve_select_body(query.body.as_ref())?;
+                        let mut inner_select = within.resolve_select_body(query.body.as_ref())?;
                         // Apply ORDER BY and LIMIT/OFFSET from the view's query
-                        self.resolve_query_order_limit(&mut inner_select, &query)?;
+                        within.resolve_query_order_limit(&mut inner_select, &query)?;
                         let columns: Vec<(String, DataType, bool)> = inner_select
                             .columns
                             .iter()
@@ -1687,22 +1815,19 @@ impl<'a> Resolver<'a> {
                                 }
                             })
                             .collect();
-                        let effective_alias = alias
-                            .as_ref()
-                            .map(|a| a.name.value.clone())
-                            .unwrap_or_else(|| table_name.clone());
-                        self.view_depth.set(self.view_depth.get() - 1);
+                        let effective_alias =
+                            alias_name.unwrap_or_else(|| table_name.table.clone());
                         return Ok(ResolvedTableRef {
-                            name: table_name,
+                            name: table_name.table.clone(),
+                            table: None,
                             alias: Some(effective_alias),
                             columns,
                             inner_query: Some(Box::new(inner_select)),
                         });
                     }
-                    self.view_depth.set(self.view_depth.get() - 1);
                 }
 
-                Err(SqlError::TableNotFound(table_name))
+                Err(SqlError::TableNotFound(table_name.to_string()))
             }
             // Derived table (subquery in FROM clause)
             sp::TableFactor::Derived {
@@ -1739,6 +1864,7 @@ impl<'a> Resolver<'a> {
                     .collect();
                 Ok(ResolvedTableRef {
                     name: alias_name.clone(),
+                    table: None,
                     alias: Some(alias_name),
                     columns,
                     inner_query: Some(Box::new(inner_select)),
@@ -1796,7 +1922,7 @@ impl<'a> Resolver<'a> {
                 let table_info = scope
                     .tables
                     .get(&table)
-                    .ok_or_else(|| SqlError::TableNotFound(table.clone()))?;
+                    .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
 
                 let columns: Vec<_> = table_info
                     .columns
@@ -2021,7 +2147,16 @@ impl<'a> Resolver<'a> {
                 })
             }
             sp::Expr::Function(func) => {
-                let name = func.name.to_string().to_uppercase();
+                // A function's name does not distinguish case; the name of
+                // the database a stored function is called through does.
+                let name = match func.name.0.as_slice() {
+                    [database, function] => format!(
+                        "{}.{}",
+                        database_name(&sp::ObjectName(vec![database.clone()])),
+                        function.to_string().to_uppercase()
+                    ),
+                    _ => func.name.to_string().to_uppercase(),
+                };
                 let distinct = matches!(
                     func.args,
                     sp::FunctionArguments::List(sp::FunctionArgumentList {
@@ -2912,6 +3047,18 @@ fn convert_grant_objects(objects: &sp::GrantObjects) -> SqlResult<PrivilegeObjec
     }
 }
 
+/// A database's name as a statement gives it: what is inside the quotes,
+/// if it is quoted.
+fn database_name(name: &sp::ObjectName) -> String {
+    match name.0.as_slice() {
+        [only] => match only.as_ident() {
+            Some(ident) => ident.value.clone(),
+            None => only.to_string(),
+        },
+        _ => name.to_string(),
+    }
+}
+
 // ============ Scope ============
 
 /// Scope for name resolution. Has optional outer scope for correlated subqueries.
@@ -2961,6 +3108,7 @@ impl Scope {
     }
 
     fn add_table(&mut self, alias: &str, _real_name: &str, table_def: &crate::catalog::TableDef) {
+        // A table is referred to by its own name, without its database.
         let column_offset = self.total_columns;
         let num_columns = table_def.columns.len();
 
@@ -3033,13 +3181,6 @@ fn derive_columns_from_select(select: &ResolvedSelect) -> Vec<ColumnDef> {
 /// Public wrapper for convert_column_def (used by ALTER TABLE handler)
 pub fn convert_column_def_pub(col: &sp::ColumnDef) -> SqlResult<ColumnDef> {
     convert_column_def(col)
-}
-
-/// Public wrapper for convert_table_constraint (used by ALTER TABLE handler)
-pub fn convert_table_constraint_pub(
-    constraint: &sp::TableConstraint,
-) -> SqlResult<Option<Constraint>> {
-    convert_table_constraint(constraint)
 }
 
 /// Convert column definition
@@ -3354,8 +3495,12 @@ fn extract_varchar_length(len: &Option<sp::CharacterLength>) -> Option<u32> {
     })
 }
 
-/// Convert table constraint
-fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Option<Constraint>> {
+/// Convert table constraint. `qualify` gives the catalog name of a table
+/// the constraint refers to.
+fn convert_table_constraint(
+    constraint: &sp::TableConstraint,
+    qualify: &dyn Fn(&sp::ObjectName) -> SqlResult<TableName>,
+) -> SqlResult<Option<Constraint>> {
     match constraint {
         sp::TableConstraint::PrimaryKey(pk) => {
             let cols: Vec<String> = pk
@@ -3383,7 +3528,7 @@ fn convert_table_constraint(constraint: &sp::TableConstraint) -> SqlResult<Optio
             Ok(Some(Constraint::ForeignKey {
                 name: fk.name.as_ref().map(|n| n.value.clone()),
                 columns: cols,
-                ref_table: fk.foreign_table.to_string(),
+                ref_table: qualify(&fk.foreign_table)?,
                 ref_columns: ref_cols,
             }))
         }

@@ -28,7 +28,7 @@ use super::Executor;
 /// all IDs at once in open() (1 atomic per INSERT statement).
 pub struct Insert {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     table_id: crate::executor::encoding::TableId,
     /// Target columns
@@ -65,7 +65,7 @@ impl Insert {
     /// Create a new insert executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
@@ -441,7 +441,7 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut insert = Insert::new(
-            "users".to_string(),
+            "users".into(),
             tid("users"),
             columns,
             values,

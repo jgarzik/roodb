@@ -16,6 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
+use crate::catalog::TableName;
 use crate::executor::encoding::{table_range, TableId};
 use crate::raft::{encode_mvcc_row, is_mvcc_tombstone, ChangeOp, RowChange};
 use crate::storage::error::StorageResult;
@@ -29,7 +30,7 @@ pub const TEMP_TABLE_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Default)]
 struct TempState {
     /// Key range of each temporary table: `[prefix, end)`.
-    tables: Vec<(String, Vec<u8>, Vec<u8>)>,
+    tables: Vec<(TableName, Vec<u8>, Vec<u8>)>,
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Bytes of keys and values in `rows`.
     bytes: usize,
@@ -56,7 +57,7 @@ impl TempState {
         self.tables
             .iter()
             .find(|(_, prefix, end)| key >= prefix.as_slice() && key < end.as_slice())
-            .map_or("?", |(name, _, _)| name.as_str())
+            .map_or("?", |(name, _, _)| name.table.as_str())
     }
 
     fn owns(&self, key: &[u8]) -> bool {
@@ -90,16 +91,16 @@ impl SessionStorage {
     }
 
     /// Start keeping `table`'s rows in this session.
-    pub fn add_table(&self, table: &str, id: TableId) {
+    pub fn add_table(&self, table: &TableName, id: TableId) {
         let mut temp = self.temp.write();
         // Everything stored under the table's ID: its rows and its indexes.
         let (start, end) = table_range(id);
-        temp.tables.push((table.to_string(), start, end));
+        temp.tables.push((table.clone(), start, end));
         self.has_temp.store(true, Ordering::Relaxed);
     }
 
     /// Names of this session's temporary tables.
-    pub fn table_names(&self) -> Vec<String> {
+    pub fn table_names(&self) -> Vec<TableName> {
         if !self.has_temp.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -112,7 +113,7 @@ impl SessionStorage {
     }
 
     /// Whether `table` is one of this session's temporary tables.
-    pub fn is_temp_table(&self, table: &str) -> bool {
+    pub fn is_temp_table(&self, table: &TableName) -> bool {
         self.has_temp.load(Ordering::Relaxed)
             && self
                 .temp
@@ -123,7 +124,7 @@ impl SessionStorage {
     }
 
     /// Drop a temporary table and its rows. Returns false if it was not one.
-    pub fn remove_table(&self, table: &str) -> bool {
+    pub fn remove_table(&self, table: &TableName) -> bool {
         let mut temp = self.temp.write();
         let Some(position) = temp.tables.iter().position(|(name, _, _)| name == table) else {
             return false;
@@ -143,7 +144,7 @@ impl SessionStorage {
     }
 
     /// Drop every temporary table. Returns their names.
-    pub fn clear(&self) -> Vec<String> {
+    pub fn clear(&self) -> Vec<TableName> {
         let mut temp = self.temp.write();
         self.has_temp.store(false, Ordering::Relaxed);
         temp.rows.clear();
@@ -165,7 +166,7 @@ impl SessionStorage {
 
     /// The key range `[start, end)` of one of this session's temporary
     /// tables, or `None` if `table` is not one.
-    pub fn key_range(&self, table: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    pub fn key_range(&self, table: &TableName) -> Option<(Vec<u8>, Vec<u8>)> {
         self.temp
             .read()
             .tables
@@ -484,8 +485,8 @@ mod tests {
             Some(b"shared".to_vec())
         );
 
-        storage.add_table("tmp", tid("tmp"));
-        assert!(storage.is_temp_table("tmp"));
+        storage.add_table(&"tmp".into(), tid("tmp"));
+        assert!(storage.is_temp_table(&"tmp".into()));
         assert_eq!(storage.get(&key("tmp", 1)).await.unwrap(), None);
 
         let changes = vec![
@@ -516,7 +517,7 @@ mod tests {
         assert_eq!(storage.get_durable(&key("tmp", 1)).await.unwrap(), None);
 
         // A table whose name merely starts the same is not temporary.
-        assert!(!storage.is_temp_table("tmp2"));
+        assert!(!storage.is_temp_table(&"tmp2".into()));
         assert_eq!(
             storage.get(&key("tmp2", 1)).await.unwrap(),
             Some(b"shared".to_vec())
@@ -526,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn duplicates_are_refused_and_deletes_free_the_key() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp", tid("tmp"));
+        storage.add_table(&"tmp".into(), tid("tmp"));
         storage.apply(
             1,
             vec![RowChange::insert(key("tmp", 1), b"a".to_vec())],
@@ -563,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_cannot_hold_unlimited_temporary_rows() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp", tid("tmp"));
+        storage.add_table(&"tmp".into(), tid("tmp"));
         // 64 MiB at a time: four fit, the fifth does not.
         for round in 0..5u8 {
             let big = vec![RowChange::insert(
@@ -580,8 +581,8 @@ mod tests {
             }
         }
         // Dropping the table gives the room back.
-        assert!(storage.remove_table("tmp"));
-        storage.add_table("tmp", tid("tmp"));
+        assert!(storage.remove_table(&"tmp".into()));
+        storage.add_table(&"tmp".into(), tid("tmp"));
         storage
             .check(
                 &[RowChange::insert(key("tmp", 9), vec![0u8; 1 << 20])],
@@ -593,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_table_can_still_be_changed_and_emptied() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp", tid("tmp"));
+        storage.add_table(&"tmp".into(), tid("tmp"));
         // Three rows of 64 MiB: an update of all three would not fit if it
         // were counted as growth.
         let rows = |value: u8| -> Vec<RowChange> {
@@ -627,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_or_inverted_range_holds_nothing() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("tmp", tid("tmp"));
+        storage.add_table(&"tmp".into(), tid("tmp"));
         storage.apply(1, vec![RowChange::insert(key("tmp", 5), vec![1])], false);
         let high = key("tmp", 9);
         let low = key("tmp", 1);
@@ -650,8 +651,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_table_drops_its_rows_only() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a", tid("a"));
-        storage.add_table("b", tid("b"));
+        storage.add_table(&"a".into(), tid("a"));
+        storage.add_table(&"b".into(), tid("b"));
         storage.apply(
             1,
             vec![
@@ -660,9 +661,9 @@ mod tests {
             ],
             false,
         );
-        assert!(storage.remove_table("a"));
-        assert!(!storage.remove_table("a"));
-        assert!(!storage.is_temp_table("a"));
+        assert!(storage.remove_table(&"a".into()));
+        assert!(!storage.remove_table(&"a".into()));
+        assert!(!storage.is_temp_table(&"a".into()));
         assert!(storage.get(&key("b", 1)).await.unwrap().is_some());
         // `a` is an ordinary name again.
         assert_eq!(
@@ -670,7 +671,7 @@ mod tests {
             Some(b"shared".to_vec())
         );
 
-        assert_eq!(storage.clear(), ["b"]);
+        assert_eq!(storage.clear(), [TableName::from("b")]);
         assert_eq!(
             storage.get(&key("b", 1)).await.unwrap(),
             Some(b"shared".to_vec())
@@ -680,8 +681,8 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_range_of_a_temporary_table_stays_in_the_session() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a", tid("a"));
-        storage.add_table("b", tid("b"));
+        storage.add_table(&"a".into(), tid("a"));
+        storage.add_table(&"b".into(), tid("b"));
         storage.apply(
             1,
             vec![
@@ -713,7 +714,7 @@ mod tests {
     #[should_panic(expected = "range dropped from shared storage")]
     async fn a_dropped_range_elsewhere_goes_to_the_shared_engine() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a", tid("a"));
+        storage.add_table(&"a".into(), tid("a"));
         let _ = storage
             .drop_range(
                 &table_key_prefix(tid("other")),

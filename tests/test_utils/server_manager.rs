@@ -155,6 +155,7 @@ impl ServerManager {
         // Build connection options
         let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
         let opts: Opts = OptsBuilder::default()
+            .db_name(Some("test"))
             .ip_or_hostname("127.0.0.1")
             .tcp_port(state.port)
             .user(Some("root"))
@@ -175,6 +176,11 @@ impl ServerManager {
                     panic!("Server failed to start within {:?}: {}", STARTUP_TIMEOUT, e);
                 }
             }
+        }
+
+        // The database the tests connect to.
+        if let Err(e) = super::create_test_database(state.port, STARTUP_TIMEOUT) {
+            panic!("could not create the test database: {e}");
         }
 
         state.server_process = Some(server_process);

@@ -6,7 +6,10 @@
 //! Schema is persisted in system tables (system.tables, system.columns, system.indexes)
 //! and the Catalog is a cache rebuilt from those tables on startup.
 
+pub mod name;
 pub mod store;
+
+pub use name::TableName;
 pub mod system_tables;
 
 use serde::{Deserialize, Serialize};
@@ -168,7 +171,7 @@ pub enum Constraint {
     ForeignKey {
         name: Option<String>,
         columns: Vec<String>,
-        ref_table: String,
+        ref_table: TableName,
         ref_columns: Vec<String>,
     },
     /// Check constraint (expression as string)
@@ -181,8 +184,13 @@ pub struct TableDef {
     /// The table's number: what its rows are stored under. Assigned when
     /// the table is created and never changed; `TableId(0)` until then.
     pub id: crate::executor::encoding::TableId,
-    /// Table name
-    pub name: String,
+    /// How many times the table's definition has been changed since it was
+    /// created. A change is stored as the next version of the definition
+    /// it was made from, or not at all.
+    #[serde(default)]
+    pub version: u64,
+    /// The table's name: its database and its name there
+    pub name: TableName,
     /// Column definitions
     pub columns: Vec<ColumnDef>,
     /// Table constraints
@@ -193,9 +201,10 @@ pub struct TableDef {
 
 impl TableDef {
     /// Create a new table definition
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<TableName>) -> Self {
         Self {
             id: crate::executor::encoding::TableId(0),
+            version: 0,
             name: name.into(),
             columns: Vec::new(),
             constraints: Vec::new(),
@@ -251,7 +260,7 @@ pub struct IndexDef {
     /// Index name
     pub name: String,
     /// Table this index belongs to
-    pub table: String,
+    pub table: TableName,
     /// Columns in the index
     pub columns: Vec<String>,
     /// Whether this is a unique index
@@ -260,7 +269,7 @@ pub struct IndexDef {
 
 impl IndexDef {
     /// Create a new index definition
-    pub fn new(name: impl Into<String>, table: impl Into<String>, columns: Vec<String>) -> Self {
+    pub fn new(name: impl Into<String>, table: impl Into<TableName>, columns: Vec<String>) -> Self {
         Self {
             name: name.into(),
             table: table.into(),
@@ -296,6 +305,11 @@ pub struct ProcedureParam {
 /// Stored procedure / function definition
 #[derive(Debug, Clone)]
 pub struct ProcedureDef {
+    /// The database the routine is in. Its body runs with this as the
+    /// default database, whatever the caller's is.
+    pub database: String,
+    /// The routine's name within its database, in lower case (routine
+    /// names do not distinguish case).
     pub name: String,
     pub params: Vec<ProcedureParam>,
     pub body_sql: String,
@@ -306,7 +320,7 @@ pub struct ProcedureDef {
 /// View definition
 #[derive(Debug, Clone)]
 pub struct ViewDef {
-    pub name: String,
+    pub name: TableName,
     pub query_sql: String,
 }
 
@@ -329,7 +343,7 @@ pub enum TriggerEvent {
 #[derive(Debug, Clone)]
 pub struct TriggerDef {
     pub name: String,
-    pub table_name: String,
+    pub table_name: TableName,
     pub timing: TriggerTiming,
     pub event: TriggerEvent,
     /// The trigger body as a parsed sqlparser Statement
@@ -360,7 +374,10 @@ impl TriggerDef {
             return Err("Invalid CREATE TRIGGER syntax".to_string());
         }
         let name = tokens[2].trim_matches('`').to_string();
-        let table_name = tokens[6].trim_matches('`').to_string();
+        // As written (quotes, database and all): whoever creates the
+        // trigger works out which table that is, since the statement's
+        // text does not carry the session's database.
+        let table_name = TableName::bare(tokens[6]);
         let timing = match tokens[3].to_uppercase().as_str() {
             "BEFORE" => TriggerTiming::Before,
             "AFTER" => TriggerTiming::After,
@@ -474,7 +491,7 @@ impl std::error::Error for DatabaseError {}
 #[derive(Debug, Default)]
 pub struct Catalog {
     /// Tables by name
-    tables: HashMap<String, TableDef>,
+    tables: HashMap<TableName, TableDef>,
     /// Indexes by name
     indexes: HashMap<String, IndexDef>,
     /// Schema version counter (incremented on DDL operations)
@@ -482,18 +499,21 @@ pub struct Catalog {
     /// Known databases
     databases: HashSet<String>,
     /// Stored procedures by name
-    procedures: HashMap<String, ProcedureDef>,
+    procedures: HashMap<(String, String), ProcedureDef>,
     /// Views by name
-    views: HashMap<String, ViewDef>,
+    views: HashMap<TableName, ViewDef>,
     /// Triggers by name
-    triggers: HashMap<String, TriggerDef>,
+    triggers: HashMap<(String, String), TriggerDef>,
 }
 
 impl Catalog {
     /// Create a new empty catalog
     pub fn new() -> Self {
-        let mut databases = HashSet::new();
-        databases.insert("default".to_string());
+        // The databases every server has. The rest are created.
+        let databases = HashSet::from([
+            system_tables::SYSTEM_DATABASE.to_string(),
+            system_tables::INFORMATION_SCHEMA.to_string(),
+        ]);
         Self {
             tables: HashMap::new(),
             indexes: HashMap::new(),
@@ -566,9 +586,11 @@ impl Catalog {
         Ok(())
     }
 
-    /// Check if a database exists
+    /// Check if a database exists. (`information_schema` in any case, as
+    /// MySQL has it.)
     pub fn database_exists(&self, name: &str) -> bool {
         self.databases.contains(name)
+            || name.eq_ignore_ascii_case(system_tables::INFORMATION_SCHEMA)
     }
 
     /// List all databases (sorted)
@@ -583,15 +605,27 @@ impl Catalog {
     /// Currently returns all non-system user tables (since tables don't have
     /// database prefixes yet). When qualified names are added, this will filter
     /// by database prefix.
-    pub fn get_tables_in_database(&self, _db: &str) -> Vec<String> {
+    pub fn get_tables_in_database(&self, db: &str) -> Vec<String> {
         let mut tables: Vec<String> = self
             .tables
             .keys()
-            .filter(|name| !system_tables::is_system_table(name))
-            .cloned()
+            .filter(|name| name.is_in(db))
+            .map(|name| name.table.clone())
             .collect();
         tables.sort();
         tables
+    }
+
+    /// The views of a database, by their names within it.
+    pub fn get_views_in_database(&self, db: &str) -> Vec<String> {
+        let mut views: Vec<String> = self
+            .views
+            .keys()
+            .filter(|name| name.is_in(db))
+            .map(|name| name.table.clone())
+            .collect();
+        views.sort();
+        views
     }
 
     /// Register a database directly (for rebuilding from storage)
@@ -599,9 +633,10 @@ impl Catalog {
         self.databases.insert(name);
     }
 
-    /// Clear all non-default databases (for re-initialization)
+    /// Clear the databases that were created (for re-initialization)
     pub fn clear_user_databases(&mut self) {
-        self.databases.retain(|name| name == "default");
+        self.databases
+            .retain(|name| system_tables::is_system_database(name));
     }
 
     // ============ Table operations ============
@@ -613,7 +648,7 @@ impl Catalog {
     /// from the log is taken as it is.
     pub fn validate_table(&self, def: &TableDef) -> CatalogResult<()> {
         // Validate table name
-        if def.name.is_empty() {
+        if def.name.table.is_empty() {
             return Err(CatalogError::InvalidName(
                 "Table name cannot be empty".into(),
             ));
@@ -633,7 +668,10 @@ impl Catalog {
             }
             for col in cols {
                 if def.get_column(col).is_none() {
-                    return Err(CatalogError::ColumnNotFound(def.name.clone(), col.clone()));
+                    return Err(CatalogError::ColumnNotFound(
+                        def.name.to_string(),
+                        col.clone(),
+                    ));
                 }
             }
         }
@@ -690,18 +728,18 @@ impl Catalog {
     }
 
     /// Take a table and its indexes out of the catalog, if it is there.
-    pub fn unset_table(&mut self, name: &str) {
+    pub fn unset_table(&mut self, name: &TableName) {
         self.tables.remove(name);
-        self.indexes.retain(|_, index| index.table != name);
+        self.indexes.retain(|_, index| index.table != *name);
         self.schema_version += 1;
     }
 
     /// The indexes of a table, by name.
-    pub fn table_indexes(&self, table: &str) -> Vec<IndexDef> {
+    pub fn table_indexes(&self, table: &TableName) -> Vec<IndexDef> {
         let mut indexes: Vec<IndexDef> = self
             .indexes
             .values()
-            .filter(|index| index.table == table)
+            .filter(|index| index.table == *table)
             .cloned()
             .collect();
         indexes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -712,7 +750,7 @@ impl Catalog {
     pub fn create_table(&mut self, def: TableDef) -> CatalogResult<()> {
         self.validate_table(&def)?;
         if self.tables.contains_key(&def.name) {
-            return Err(CatalogError::TableExists(def.name.clone()));
+            return Err(CatalogError::TableExists(def.name.to_string()));
         }
         self.tables.insert(def.name.clone(), def);
         self.schema_version += 1;
@@ -724,8 +762,8 @@ impl Catalog {
     /// Swaps the entire table definition after applying ALTER operations.
     /// The old definition is replaced with the new one. If the table name
     /// changed (RENAME), the old entry is removed and the new one inserted.
-    pub fn replace_table(&mut self, old_name: &str, def: TableDef) {
-        if old_name != def.name {
+    pub fn replace_table(&mut self, old_name: &TableName, def: TableDef) {
+        if *old_name != def.name {
             self.tables.remove(old_name);
         }
         self.tables.insert(def.name.clone(), def);
@@ -733,38 +771,38 @@ impl Catalog {
     }
 
     /// Drop a table
-    pub fn drop_table(&mut self, name: &str) -> CatalogResult<()> {
+    pub fn drop_table(&mut self, name: &TableName) -> CatalogResult<()> {
         if self.tables.remove(name).is_none() {
             return Err(CatalogError::TableNotFound(name.to_string()));
         }
         // Also drop all indexes for this table
-        self.indexes.retain(|_, idx| idx.table != name);
+        self.indexes.retain(|_, idx| idx.table != *name);
         self.schema_version += 1;
         Ok(())
     }
 
     /// Get a table definition
-    pub fn get_table(&self, name: &str) -> Option<&TableDef> {
+    pub fn get_table(&self, name: &TableName) -> Option<&TableDef> {
         self.tables.get(name)
     }
 
     /// Get a mutable table definition
-    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut TableDef> {
+    pub fn get_table_mut(&mut self, name: &TableName) -> Option<&mut TableDef> {
         self.tables.get_mut(name)
     }
 
     /// Check if a table exists
-    pub fn table_exists(&self, name: &str) -> bool {
+    pub fn table_exists(&self, name: &TableName) -> bool {
         self.tables.contains_key(name)
     }
 
     /// List all table names
-    pub fn list_tables(&self) -> Vec<&str> {
-        self.tables.keys().map(|s| s.as_str()).collect()
+    pub fn list_tables(&self) -> Vec<&TableName> {
+        self.tables.keys().collect()
     }
 
     /// Get all table names as a HashSet (for efficient duplicate checking)
-    pub fn table_names(&self) -> std::collections::HashSet<String> {
+    pub fn table_names(&self) -> std::collections::HashSet<TableName> {
         self.tables.keys().cloned().collect()
     }
 
@@ -779,10 +817,13 @@ impl Catalog {
         let table = self
             .tables
             .get(&def.table)
-            .ok_or_else(|| CatalogError::TableNotFound(def.table.clone()))?;
+            .ok_or_else(|| CatalogError::TableNotFound(def.table.to_string()))?;
         for col in &def.columns {
             if table.get_column(col).is_none() {
-                return Err(CatalogError::ColumnNotFound(def.table.clone(), col.clone()));
+                return Err(CatalogError::ColumnNotFound(
+                    def.table.to_string(),
+                    col.clone(),
+                ));
             }
         }
 
@@ -809,10 +850,10 @@ impl Catalog {
     }
 
     /// Get all indexes for a table
-    pub fn get_indexes_for_table(&self, table: &str) -> Vec<&IndexDef> {
+    pub fn get_indexes_for_table(&self, table: &TableName) -> Vec<&IndexDef> {
         self.indexes
             .values()
-            .filter(|idx| idx.table == table)
+            .filter(|idx| idx.table == *table)
             .collect()
     }
 
@@ -825,17 +866,19 @@ impl Catalog {
                 "Procedure name cannot be empty".into(),
             ));
         }
-        if self.procedures.contains_key(&def.name) {
+        let key = (def.database.clone(), def.name.clone());
+        if self.procedures.contains_key(&key) {
             return Err(CatalogError::ProcedureExists(def.name.clone()));
         }
-        self.procedures.insert(def.name.clone(), def);
+        self.procedures.insert(key, def);
         self.schema_version += 1;
         Ok(())
     }
 
     /// Drop a stored procedure
-    pub fn drop_procedure(&mut self, name: &str) -> CatalogResult<()> {
-        if self.procedures.remove(name).is_none() {
+    pub fn drop_procedure(&mut self, database: &str, name: &str) -> CatalogResult<()> {
+        let key = (database.to_string(), name.to_string());
+        if self.procedures.remove(&key).is_none() {
             return Err(CatalogError::ProcedureNotFound(name.to_string()));
         }
         self.schema_version += 1;
@@ -843,13 +886,15 @@ impl Catalog {
     }
 
     /// Get a stored procedure definition
-    pub fn get_procedure(&self, name: &str) -> Option<&ProcedureDef> {
-        self.procedures.get(name)
+    pub fn get_procedure(&self, database: &str, name: &str) -> Option<&ProcedureDef> {
+        self.procedures
+            .get(&(database.to_string(), name.to_string()))
     }
 
     /// Register a procedure directly (for rebuilding from storage)
     pub fn register_procedure(&mut self, def: ProcedureDef) {
-        self.procedures.insert(def.name.clone(), def);
+        self.procedures
+            .insert((def.database.clone(), def.name.clone()), def);
         self.schema_version += 1;
     }
 
@@ -861,8 +906,8 @@ impl Catalog {
     }
 
     /// Check if a procedure exists
-    pub fn procedure_exists(&self, name: &str) -> bool {
-        self.procedures.contains_key(name)
+    pub fn procedure_exists(&self, database: &str, name: &str) -> bool {
+        self.get_procedure(database, name).is_some()
     }
 
     /// Clear all procedures (for re-initialization)
@@ -880,7 +925,7 @@ impl Catalog {
     /// Create a view
     pub fn create_view(&mut self, def: ViewDef) -> CatalogResult<()> {
         if self.views.contains_key(&def.name) {
-            return Err(CatalogError::ViewExists(def.name.clone()));
+            return Err(CatalogError::ViewExists(def.name.to_string()));
         }
         self.views.insert(def.name.clone(), def);
         self.schema_version += 1;
@@ -894,7 +939,7 @@ impl Catalog {
     }
 
     /// Drop a view
-    pub fn drop_view(&mut self, name: &str, if_exists: bool) -> CatalogResult<()> {
+    pub fn drop_view(&mut self, name: &TableName, if_exists: bool) -> CatalogResult<()> {
         match self.views.remove(name) {
             Some(_) => {
                 self.schema_version += 1;
@@ -906,12 +951,12 @@ impl Catalog {
     }
 
     /// Get a view definition
-    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+    pub fn get_view(&self, name: &TableName) -> Option<&ViewDef> {
         self.views.get(name)
     }
 
     /// Check if a view exists
-    pub fn view_exists(&self, name: &str) -> bool {
+    pub fn view_exists(&self, name: &TableName) -> bool {
         self.views.contains_key(name)
     }
 
@@ -926,21 +971,24 @@ impl Catalog {
     }
 
     /// Get all view names in current database
-    pub fn get_view_names(&self) -> Vec<String> {
+    pub fn get_view_names(&self) -> Vec<TableName> {
         self.views.keys().cloned().collect()
     }
 
     // ============ Trigger operations ============
 
-    /// Create a trigger
+    /// Create a trigger. It is in its table's database, and named within
+    /// it.
     pub fn create_trigger(&mut self, def: TriggerDef) {
-        self.triggers.insert(def.name.clone(), def);
+        self.triggers
+            .insert((def.table_name.database.clone(), def.name.clone()), def);
         self.schema_version += 1;
     }
 
     /// Drop a trigger
-    pub fn drop_trigger(&mut self, name: &str) -> CatalogResult<()> {
-        if self.triggers.remove(name).is_none() {
+    pub fn drop_trigger(&mut self, database: &str, name: &str) -> CatalogResult<()> {
+        let key = (database.to_string(), name.to_string());
+        if self.triggers.remove(&key).is_none() {
             return Err(CatalogError::ViewNotFound(format!(
                 "Trigger '{}' not found",
                 name
@@ -950,9 +998,10 @@ impl Catalog {
         Ok(())
     }
 
-    /// Whether a trigger of this name exists.
-    pub fn has_trigger(&self, name: &str) -> bool {
-        self.triggers.contains_key(name)
+    /// Whether `database` has a trigger of this name.
+    pub fn has_trigger(&self, database: &str, name: &str) -> bool {
+        self.triggers
+            .contains_key(&(database.to_string(), name.to_string()))
     }
 
     /// Forget every trigger (before rebuilding them from the system tables).
@@ -962,21 +1011,21 @@ impl Catalog {
     }
 
     /// Forget the triggers of one table (when it is dropped).
-    pub fn drop_triggers_of_table(&mut self, table_name: &str) {
-        self.triggers.retain(|_, t| t.table_name != table_name);
+    pub fn drop_triggers_of_table(&mut self, table_name: &TableName) {
+        self.triggers.retain(|_, t| t.table_name != *table_name);
         self.schema_version += 1;
     }
 
     /// Get triggers for a specific table, timing, and event
     pub fn get_triggers(
         &self,
-        table_name: &str,
+        table_name: &TableName,
         timing: TriggerTiming,
         event: TriggerEvent,
     ) -> Vec<&TriggerDef> {
         self.triggers
             .values()
-            .filter(|t| t.table_name == table_name && t.timing == timing && t.event == event)
+            .filter(|t| t.table_name == *table_name && t.timing == timing && t.event == event)
             .collect()
     }
 }
@@ -996,7 +1045,7 @@ mod tests {
 
         // Create table
         catalog.create_table(table).unwrap();
-        assert!(catalog.table_exists("users"));
+        assert!(catalog.table_exists(&"users".into()));
 
         // Duplicate should fail
         let table2 = TableDef::new("users");
@@ -1006,22 +1055,22 @@ mod tests {
         ));
 
         // Get table
-        let t = catalog.get_table("users").unwrap();
+        let t = catalog.get_table(&"users".into()).unwrap();
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.primary_key(), Some(&["id".to_string()][..]));
 
         // List tables
         let tables = catalog.list_tables();
         assert_eq!(tables.len(), 1);
-        assert!(tables.contains(&"users"));
+        assert!(tables.contains(&&"users".into()));
 
         // Drop table
-        catalog.drop_table("users").unwrap();
-        assert!(!catalog.table_exists("users"));
+        catalog.drop_table(&"users".into()).unwrap();
+        assert!(!catalog.table_exists(&"users".into()));
 
         // Drop non-existent should fail
         assert!(matches!(
-            catalog.drop_table("users"),
+            catalog.drop_table(&"users".into()),
             Err(CatalogError::TableNotFound(_))
         ));
     }
@@ -1064,7 +1113,7 @@ mod tests {
             .constraint(Constraint::ForeignKey {
                 name: Some("fk_user".to_string()),
                 columns: vec!["user_id".to_string()],
-                ref_table: "users".to_string(),
+                ref_table: "users".into(),
                 ref_columns: vec!["id".to_string()],
             })
             .constraint(Constraint::Unique(vec![
@@ -1105,7 +1154,7 @@ mod tests {
         catalog.create_index(idx2).unwrap();
 
         // Get indexes for table
-        let indexes = catalog.get_indexes_for_table("users");
+        let indexes = catalog.get_indexes_for_table(&"users".into());
         assert_eq!(indexes.len(), 2);
 
         // Duplicate index should fail
@@ -1140,8 +1189,8 @@ mod tests {
         ));
 
         // Drop table should also drop its indexes
-        catalog.drop_table("users").unwrap();
-        let indexes = catalog.get_indexes_for_table("users");
+        catalog.drop_table(&"users".into()).unwrap();
+        let indexes = catalog.get_indexes_for_table(&"users".into());
         assert!(indexes.is_empty());
     }
 

@@ -274,7 +274,7 @@ mod tests {
 
     fn make_scan() -> LogicalPlan {
         LogicalPlan::Scan {
-            table: "test".to_string(),
+            table: "test".into(),
             columns: vec![OutputColumn {
                 id: 0,
                 name: "id".to_string(),

@@ -21,7 +21,7 @@ use crate::catalog::system_tables::{
     is_system_table, row_to_procedure_def, row_to_trigger_def, row_to_view_def, system_table_id,
     SYSTEM_DATABASES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableName};
 use crate::executor::encoding::{decode_row, table_of_row_key, TableId};
 use crate::raft::changes::{ChangeOp, ChangeSet};
 use crate::raft::types::{
@@ -60,6 +60,13 @@ const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 /// Keys with this prefix are the state machine's own bookkeeping; every
 /// other key is data.
 pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
+
+/// The table a record's key names, for a message.
+fn record_label(key: &[u8]) -> String {
+    table_of_key(key)
+        .map(|name| name.to_string())
+        .unwrap_or_default()
+}
 
 /// The next object ID to hand out (u64, little endian).
 const NEXT_OBJECT_ID_KEY: &[u8] = b"_raft:sm:next_object_id";
@@ -134,6 +141,9 @@ struct ChangesetPlan {
     catalog: Vec<CatalogOp>,
     /// Tables this changeset drops, by ID.
     dropped_tables: Vec<TableId>,
+    /// The IDs of the tables whose records it removes (a renamed table's
+    /// record is removed and stored again under the new name).
+    unset_ids: Vec<TableId>,
 }
 
 /// A change to a table as the catalog sees it.
@@ -141,7 +151,7 @@ enum CatalogOp {
     /// The table is now this.
     Set(Box<TableRecord>),
     /// The table is gone.
-    Unset(String),
+    Unset(TableName),
 }
 
 impl std::fmt::Debug for LsmRaftStorage {
@@ -323,7 +333,9 @@ impl LsmRaftStorage {
                 None => {
                     return Err(read_err(format!(
                         "the stored definition of table {:?} cannot be read",
-                        table_of_key(&stored.key).unwrap_or_default()
+                        table_of_key(&stored.key)
+                            .map(|name| name.to_string())
+                            .unwrap_or_default()
                     )))
                 }
             }
@@ -364,11 +376,11 @@ impl LsmRaftStorage {
         let mut catalog = self.catalog.write();
 
         // Clear existing user tables/indexes (keep system tables)
-        let existing_tables: Vec<String> = catalog
+        let existing_tables: Vec<TableName> = catalog
             .list_tables()
-            .iter()
+            .into_iter()
             .filter(|t| !is_system_table(t))
-            .map(|t| t.to_string())
+            .cloned()
             .collect();
         for table_name in existing_tables {
             catalog.unset_table(&table_name);
@@ -410,12 +422,26 @@ impl LsmRaftStorage {
         Ok(())
     }
 
+    /// The table record stored under `key` now, if there is a live one.
+    /// What the log has stored is the same on every node; the catalog in
+    /// memory is not (it also holds each node's sessions' temporary
+    /// tables), so decisions about a change are made from what is stored.
+    async fn stored_table(&self, key: &[u8]) -> Result<Option<TableRecord>, StorageError> {
+        let Some(value) = self.storage.get(key).await.map_err(read_err)? else {
+            return Ok(None);
+        };
+        if value.len() < MVCC_HEADER_SIZE || is_mvcc_tombstone(&value) {
+            return Ok(None);
+        }
+        Ok(decode_table(&value[MVCC_HEADER_SIZE..]))
+    }
+
     /// What to call a change's table in a message: its name, if the
     /// catalog knows the table.
     fn table_label(&self, change: &crate::raft::RowChange) -> String {
         match change.table() {
             Some(id) => match self.catalog.read().table_by_id(id) {
-                Some(def) => def.name.clone(),
+                Some(def) => def.name.to_string(),
                 None => format!("table {id}"),
             },
             None => "?".to_string(),
@@ -496,7 +522,9 @@ impl LsmRaftStorage {
                                 // the table there.
                                 return Ok(Err(format!(
                                     "Table '{}' already exists",
-                                    table_of_key(&change.key).unwrap_or_default()
+                                    table_of_key(&change.key)
+                                        .map(|name| name.to_string())
+                                        .unwrap_or_default()
                                 )));
                             }
                             if changeset.ignore_duplicates {
@@ -520,13 +548,24 @@ impl LsmRaftStorage {
                         // none (it was dropped, or dropped and created
                         // again, while this change was being prepared), the
                         // change is not for the table that is there.
+                        // And it must be the next version of the record
+                        // that is there: two statements that each read
+                        // the table and changed it would otherwise undo
+                        // one another, the later one silently.
                         if change.op == ChangeOp::Update {
-                            let meant = decode_table(value).map(|record| record.def.id);
-                            let name = table_of_key(&change.key).unwrap_or_default();
-                            let there = self.catalog.read().get_table(&name).map(|def| def.id);
-                            if meant.is_none() || meant != there {
+                            let meant = decode_table(value);
+                            let there = self.stored_table(&change.key).await?;
+                            let follows = match (&meant, &there) {
+                                (Some(meant), Some(there)) => {
+                                    meant.def.id == there.def.id
+                                        && meant.def.version == there.def.version + 1
+                                }
+                                _ => false,
+                            };
+                            if !follows {
                                 return Ok(Err(format!(
-                                    "Table '{name}' was dropped or replaced by another statement"
+                                    "Table '{}' was changed, dropped or replaced by another statement",
+                                    record_label(&change.key)
                                 )));
                             }
                         }
@@ -573,15 +612,23 @@ impl LsmRaftStorage {
                     if change.table() == Some(system_table_id(SYSTEM_TABLES)) {
                         // A drop means the table with the ID it carries, as
                         // a replacement does.
-                        let name = table_of_key(&change.key).unwrap_or_default();
                         let meant = value
                             .as_deref()
                             .and_then(crate::catalog::store::dropped_table_id);
-                        let there = self.catalog.read().get_table(&name).map(|def| def.id);
+                        let there = self
+                            .stored_table(&change.key)
+                            .await?
+                            .map(|record| record.def.id);
+                        let Some(name) = table_of_key(&change.key) else {
+                            return Ok(Err("a table record's key cannot be read".to_string()));
+                        };
                         if meant.is_none() || meant != there {
                             return Ok(Err(format!(
                                 "Table '{name}' was dropped or replaced by another statement"
                             )));
+                        }
+                        if let Some(id) = there {
+                            plan.unset_ids.push(id);
                         }
                         plan.catalog.push(CatalogOp::Unset(name));
                     } else if let (Some(value), Some(table)) = (value, change.table()) {
@@ -603,13 +650,9 @@ impl LsmRaftStorage {
                 kept.push(record.def.id);
             }
         }
-        for op in &plan.catalog {
-            let CatalogOp::Unset(name) = op else { continue };
-            let id = self.catalog.read().get_table(name).map(|def| def.id);
-            if let Some(id) = id {
-                if !kept.contains(&id) && !plan.dropped_tables.contains(&id) {
-                    plan.dropped_tables.push(id);
-                }
+        for id in std::mem::take(&mut plan.unset_ids) {
+            if !kept.contains(&id) && !plan.dropped_tables.contains(&id) {
+                plan.dropped_tables.push(id);
             }
         }
         // AUTO_INCREMENT counters. A dropped table's counter goes with it;
@@ -682,7 +725,7 @@ impl LsmRaftStorage {
                 if let Some(proc_def) = row_to_procedure_def(&row) {
                     let mut catalog = self.catalog.write();
                     if is_delete {
-                        let _ = catalog.drop_procedure(&proc_def.name);
+                        let _ = catalog.drop_procedure(&proc_def.database, &proc_def.name);
                     } else {
                         catalog.register_procedure(proc_def);
                     }
@@ -692,8 +735,11 @@ impl LsmRaftStorage {
             // Trigger changes - update catalog directly
             if let Ok(row) = decode_row(value) {
                 if is_delete {
-                    if let Some(crate::executor::Datum::String(name)) = row.values().first() {
-                        let _ = self.catalog.write().drop_trigger(name);
+                    // A trigger's row begins with its database and its name.
+                    if let [crate::executor::Datum::String(database), crate::executor::Datum::String(name), ..] =
+                        row.values()
+                    {
+                        let _ = self.catalog.write().drop_trigger(database, name);
                     }
                 } else if let Some(trigger) = row_to_trigger_def(&row) {
                     self.catalog.write().create_trigger(trigger);

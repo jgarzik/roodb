@@ -152,6 +152,12 @@ fn encode_bytes(key: &mut Vec<u8>, bytes: &[u8]) {
 /// part is a present string in the binary collation. The reverse of
 /// `encode_part` for that case.
 pub fn decode_string(part: &[u8]) -> Option<String> {
+    decode_string_part(part).map(|(text, _)| text)
+}
+
+/// As `decode_string`, for a part that other parts may follow: the string,
+/// and the bytes after it.
+pub fn decode_string_part(part: &[u8]) -> Option<(String, &[u8])> {
     let (&presence, mut rest) = part.split_first()?;
     if presence != PRESENT {
         return None;
@@ -166,7 +172,7 @@ pub fn decode_string(part: &[u8]) -> Option<String> {
         }
         let (&next, after) = after.split_first()?;
         match next {
-            0x01 => return String::from_utf8(bytes).ok(),
+            0x01 => return String::from_utf8(bytes).ok().map(|text| (text, after)),
             0xFF => {
                 bytes.push(0x00);
                 rest = after;

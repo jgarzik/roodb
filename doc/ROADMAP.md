@@ -31,7 +31,7 @@ below changes.
 
 **Design**
 
-- *Identity.* Databases, tables and indexes have numeric IDs that are never
+- *Identity.* Tables and indexes have numeric IDs that are never
   reused (`Command::AllocIds`, one replicated counter; IDs below 1024 are
   the system's). Columns and indexes are numbered within their table.
   Every table has a schema version, raised by every change to it.
@@ -78,17 +78,14 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-1. Databases: tables belong to one; `db.table`; `USE` decides what a name
-   means; `DROP DATABASE` drops its tables; system tables in `mysql`;
-   identifier case as MySQL on Linux (database and table names
-   case-sensitive, the rest not).
 2. Columns numbered within their table (never reused); rows by column ID
    (the codec is written: `executor/rowcodec.rs`); one decoding function
    for every executor; `ADD`/`DROP`/reorder `COLUMN` as metadata.
 3. Metadata locks taken by statements and DDL (the lock manager is
-   written: `txn/mdl.rs`); DDL commits implicitly; a schema version per
-   table, raised by every change to it and checked when a changeset is
-   applied.
+   written: `txn/mdl.rs`); DDL commits implicitly; changesets of rows
+   carry the version of the table they were built against
+   (`TableDef::version`, which a change to the definition already raises
+   and checks) and are refused if it has moved.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
@@ -114,7 +111,8 @@ below changes.
 7. Index entries maintained by every statement that writes, through one
     helper; `UNIQUE` enforced, with MySQL's error text.
 8. `REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` and `LOAD DATA` as
-    real statements over that helper.
+    real statements over that helper (`REPLACE` and `LOAD DATA` are read
+    with regular expressions today, and do not take `db.table`).
 9. The schema-change job runner; `CREATE INDEX` on a table with rows,
     online; cancelled when its client goes away.
 10. Reading through indexes: equality prefix plus range, composite keys,
@@ -127,8 +125,13 @@ below changes.
     `LIMIT` from index order; `MIN`/`MAX` from an index.
 14. Change of primary key and of column type, online.
 15. Temporary tables: names and IDs in the session, shadowing permanent
-    tables; indexes; `RENAME`.
-16. `information_schema` tables for tables, columns and indexes;
+    tables (today they are in the catalog's shared name map: another
+    session's shows in `SHOW TABLES` and takes the name); indexes;
+    `RENAME`.
+16. `information_schema` tables for tables, columns and indexes, of
+    every database (today a few are answered from the statement's text,
+    for the session's database only); `CHECK TABLE` and the other
+    statements read from text take `db.table`;
     `ALTER TABLE ... AUTO_INCREMENT = n`; `RENAME INDEX`.
 
 ## TXN — Transaction semantics
@@ -434,15 +437,12 @@ finds. Known already, from an audit of SQL.md against a running server:
   table that cannot be used.
 - A table can be created under the name of a view.
 - `DEFAULT CURRENT_TIMESTAMP` makes inserts fail.
-- Backticks around a table name become part of the name.
-- `db.table` is not understood; all databases share one table namespace.
 - `LOAD DATA` works for one-column tables only.
 
 **Stored routines**
 - Local variables are substituted as text, inside string literals too.
 - `CONTINUE HANDLER` cannot set a local variable.
-- `CREATE FUNCTION` accepts a name already taken; `IF` in a function body
-  returns NULL.
+- `IF` in a function body returns NULL.
 
 **Session and metadata**
 - `SHOW WARNINGS` is always empty; `SHOW VARIABLES` and `SHOW PROCESSLIST`

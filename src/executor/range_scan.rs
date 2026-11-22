@@ -22,7 +22,7 @@ use super::Executor;
 /// Range scan executor — scans only the PK range instead of the full table.
 pub struct RangeScan {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// The table's ID: what its keys begin with
     table_id: crate::executor::encoding::TableId,
     /// Start PK bound expression (None = table start)
@@ -62,7 +62,7 @@ pub struct RangeScanBounds {
 
 impl RangeScan {
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         table_id: crate::executor::encoding::TableId,
         bounds: RangeScanBounds,
         mvcc: Arc<MvccStorage>,

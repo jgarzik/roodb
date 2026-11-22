@@ -1038,7 +1038,8 @@ async fn initialisation_writes_rows_the_server_reads() {
     };
     assert_eq!(first(SYSTEM_USERS).await, ["root"]);
     assert_eq!(first(SYSTEM_GRANTS).await, ["root"]);
-    assert_eq!(first(SYSTEM_DATABASES).await, ["default", "test"]);
+    // No databases but the system's own, which are not stored.
+    assert!(first(SYSTEM_DATABASES).await.is_empty());
 
     let bound = storage
         .get(roodb::raft::ROW_ID_KEY)

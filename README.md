@@ -57,7 +57,9 @@ ROODB_ROOT_PASSWORD=secret ./target/release/roodb_init --data-dir ./data
 ### Connect with Client
 
 ```bash
-mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
+# A new server has no databases but its own: create one to work in
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED -e "CREATE DATABASE app"
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED app
 ```
 
 ### Run Tests

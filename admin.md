@@ -14,8 +14,9 @@ ROODB_ROOT_PASSWORD=changeme ./roodb_init --data-dir ./data
 # 3. Start server
 ./roodb
 
-# 4. Connect via MySQL client
-mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
+# 4. Connect via MySQL client, and create a database to work in
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED -e "CREATE DATABASE app"
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED app
 ```
 
 ## Server Configuration
@@ -155,7 +156,8 @@ a second port. It is off unless `--tds-port` (or `ROODB_TDS_PORT`) is set:
 ```
 
 The TDS port must differ from the client port and the Raft port. Accounts,
-databases and data are the same as on the main port.
+databases and data are the same as on the main port. A TDS login that names
+no database starts in `mysql`.
 
 ### Transports and encryption
 
@@ -411,7 +413,9 @@ When `roodb_init` runs on an empty data directory:
 2. Grants `ALL PRIVILEGES ON *.*` with `GRANT OPTION` to root
 3. Writes schema version marker
 
-System tables (`system.tables`, `system.users`, etc.) are created by the catalog at server startup, not by initialization.
+System tables (`mysql.tables`, `mysql.users`, etc.) are created by the catalog at server startup, not by initialization.
+
+No databases are created. A new server has `mysql` (the system tables) and `information_schema`; create the ones you need (`CREATE DATABASE app`) before clients log in to them: a login that names a database that does not exist is refused (error 1049).
 
 ## User Management
 
@@ -582,16 +586,16 @@ Query system tables for metadata (read-only, managed by SQL commands):
 
 | Table | Contents |
 |-------|----------|
-| `system.tables` | Table definitions: one encoded record per table (columns, constraints, indexes). Read them with `DESCRIBE`, `SHOW CREATE TABLE`, `SHOW INDEX` |
-| `system.databases` | Databases |
-| `system.views` | View definitions |
-| `system.procedures` | Stored procedures and functions |
-| `system.triggers` | Trigger definitions |
-| `system.table_statistics` | Optimizer statistics |
-| `system.users` | User accounts |
-| `system.grants` | Privileges |
-| `system.roles` | Role definitions |
-| `system.role_grants` | Role-to-user assignments |
+| `mysql.tables` | Table definitions: one encoded record per table (columns, constraints, indexes). Read them with `DESCRIBE`, `SHOW CREATE TABLE`, `SHOW INDEX` |
+| `mysql.databases` | Databases |
+| `mysql.views` | View definitions |
+| `mysql.procedures` | Stored procedures and functions |
+| `mysql.triggers` | Trigger definitions |
+| `mysql.table_statistics` | Optimizer statistics |
+| `mysql.users` | User accounts |
+| `mysql.grants` | Privileges |
+| `mysql.roles` | Role definitions |
+| `mysql.role_grants` | Role-to-user assignments |
 
 **Lock monitoring:** `SHOW STATUS LIKE 'Innodb_row_lock_current_waits'` reports how many statements are waiting for a row lock right now; `Roodb_row_locks` and `Roodb_gap_locks` report how many locks are held. `innodb_lock_wait_timeout` (seconds, default 50) bounds a wait; set it per session, or with `SET GLOBAL` for sessions that connect afterwards.
 

@@ -25,7 +25,7 @@ use super::Executor;
 /// CREATE TABLE executor
 pub struct CreateTable {
     /// Table name
-    name: String,
+    name: crate::catalog::TableName,
     /// Column definitions
     columns: Vec<ColumnDef>,
     /// Constraints
@@ -43,7 +43,7 @@ pub struct CreateTable {
 impl CreateTable {
     /// Create a new CREATE TABLE executor
     pub fn new(
-        name: String,
+        name: crate::catalog::TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -62,7 +62,7 @@ impl CreateTable {
 
     /// Create a new CREATE TABLE executor with Raft replication
     pub fn with_raft(
-        name: String,
+        name: crate::catalog::TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -171,10 +171,48 @@ impl Executor for CreateTable {
     }
 }
 
+/// The changes that drop a table: its record (and with it its definition
+/// and its indexes), its triggers, and its rows. `triggers` is what
+/// `system.triggers` holds.
+async fn drop_table_changes(
+    mvcc: &crate::txn::MvccStorage,
+    name: &crate::catalog::TableName,
+    id: super::encoding::TableId,
+    triggers: &[crate::catalog::store::StoredRow],
+    changeset: &mut ChangeSet,
+) -> ExecutorResult<()> {
+    changeset.push(crate::catalog::store::drop_table(name, id));
+
+    // Left behind, its triggers would come back with the next table of
+    // this name. Their rows name the table after the trigger's own name.
+    for trigger in triggers {
+        let on_this_table = matches!(
+            trigger.row.values(),
+            [Datum::String(database), _, Datum::String(table), ..]
+                if *database == name.database && *table == name.table
+        );
+        if on_this_table {
+            changeset.push(crate::catalog::store::delete_row(trigger));
+        }
+    }
+
+    // Everything stored under the table's ID.
+    let prefix = super::encoding::table_key_prefix(id);
+    let end = super::encoding::table_key_end(id);
+    let data_rows = mvcc
+        .scan_raw(&prefix, &end)
+        .await
+        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+    for (key, _value) in data_rows {
+        changeset.push(RowChange::delete(key));
+    }
+    Ok(())
+}
+
 /// DROP TABLE executor
 pub struct DropTable {
     /// Table name
-    name: String,
+    name: crate::catalog::TableName,
     /// IF EXISTS flag
     if_exists: bool,
     /// Catalog reference
@@ -189,7 +227,11 @@ pub struct DropTable {
 
 impl DropTable {
     /// Create a new DROP TABLE executor
-    pub fn new(name: String, if_exists: bool, catalog: Arc<RwLock<Catalog>>) -> Self {
+    pub fn new(
+        name: crate::catalog::TableName,
+        if_exists: bool,
+        catalog: Arc<RwLock<Catalog>>,
+    ) -> Self {
         DropTable {
             name,
             if_exists,
@@ -202,7 +244,7 @@ impl DropTable {
 
     /// Create a new DROP TABLE executor with Raft replication
     pub fn with_raft(
-        name: String,
+        name: crate::catalog::TableName,
         if_exists: bool,
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
@@ -249,41 +291,17 @@ impl Executor for DropTable {
                         self.done = true;
                         return Ok(Some(Row::new(vec![Datum::Int(0)])));
                     }
-                    return Err(ExecutorError::TableNotFound(self.name.clone()));
+                    return Err(ExecutorError::TableNotFound(self.name.to_string()));
                 }
             }
         };
 
         if let (Some(ref raft_node), Some(ref mvcc)) = (&self.raft_node, &self.mvcc) {
-            // The table's record goes; with it, its definition and its
-            // indexes.
             let mut changeset = ChangeSet::new(0);
-            changeset.push(crate::catalog::store::drop_table(&self.name, table_id));
-
-            // The table's triggers go with it. Their rows name the table in
-            // the second column. Left behind, they would come back with the
-            // next table of this name.
             let triggers = crate::catalog::store::scan_rows(mvcc.inner().as_ref(), SYSTEM_TRIGGERS)
                 .await
                 .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-            for trigger in triggers {
-                if matches!(trigger.row.values().get(1), Some(Datum::String(t)) if t == &self.name)
-                {
-                    changeset.push(crate::catalog::store::delete_row(&trigger));
-                }
-            }
-
-            // Delete all user data rows for this table
-            let prefix = super::encoding::table_key_prefix(table_id);
-            let end = super::encoding::table_key_end(table_id);
-            let data_rows = mvcc
-                .scan_raw(&prefix, &end)
-                .await
-                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-
-            for (key, _value) in data_rows {
-                changeset.push(RowChange::delete(key.clone()));
-            }
+            drop_table_changes(mvcc, &self.name, table_id, &triggers, &mut changeset).await?;
 
             // Propose to Raft - catalog is updated synchronously in apply()
             raft_node
@@ -313,7 +331,7 @@ pub struct CreateIndex {
     /// Index name
     name: String,
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
     /// Column names and indices
     columns: Vec<(String, usize)>,
     /// Whether index is unique
@@ -330,7 +348,7 @@ impl CreateIndex {
     /// Create a new CREATE INDEX executor
     pub fn new(
         name: String,
-        table: String,
+        table: crate::catalog::TableName,
         columns: Vec<(String, usize)>,
         unique: bool,
         catalog: Arc<RwLock<Catalog>>,
@@ -349,7 +367,7 @@ impl CreateIndex {
     /// Create a new CREATE INDEX executor with Raft replication
     pub fn with_raft(
         name: String,
-        table: String,
+        table: crate::catalog::TableName,
         columns: Vec<(String, usize)>,
         unique: bool,
         catalog: Arc<RwLock<Catalog>>,
@@ -384,7 +402,7 @@ impl Executor for CreateIndex {
         let (def, mut indexes) = {
             let catalog = self.catalog.read();
             let Some(def) = catalog.get_table(&self.table) else {
-                return Err(ExecutorError::TableNotFound(self.table.clone()));
+                return Err(ExecutorError::TableNotFound(self.table.to_string()));
             };
             if catalog.get_index(&self.name).is_some() {
                 return Err(ExecutorError::DuplicateKeyName(self.name.clone()));
@@ -490,7 +508,7 @@ impl Executor for DropIndex {
                 };
                 let table = index.table.clone();
                 let Some(def) = catalog.get_table(&table) else {
-                    return Err(ExecutorError::TableNotFound(table));
+                    return Err(ExecutorError::TableNotFound(table.to_string()));
                 };
                 let mut indexes = catalog.table_indexes(&table);
                 indexes.retain(|index| index.name != self.name);
@@ -583,10 +601,7 @@ impl Executor for CreateDatabase {
                     self.done = true;
                     return Ok(Some(Row::new(vec![Datum::Int(0)])));
                 }
-                return Err(ExecutorError::Internal(format!(
-                    "Can't create database '{}'; database exists",
-                    self.name
-                )));
+                return Err(ExecutorError::DatabaseExists(self.name.clone()));
             }
         }
 
@@ -625,6 +640,7 @@ pub struct DropDatabase {
     if_exists: bool,
     catalog: Arc<RwLock<Catalog>>,
     raft_node: Option<Arc<RaftNode>>,
+    mvcc: Option<Arc<crate::txn::MvccStorage>>,
     done: bool,
 }
 
@@ -635,6 +651,7 @@ impl DropDatabase {
             if_exists,
             catalog,
             raft_node: None,
+            mvcc: None,
             done: false,
         }
     }
@@ -644,12 +661,14 @@ impl DropDatabase {
         if_exists: bool,
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
+        mvcc: Arc<crate::txn::MvccStorage>,
     ) -> Self {
         DropDatabase {
             name,
             if_exists,
             catalog,
             raft_node: Some(raft_node),
+            mvcc: Some(mvcc),
             done: false,
         }
     }
@@ -667,52 +686,98 @@ impl Executor for DropDatabase {
             return Ok(None);
         }
 
-        // Prevent dropping the "default" database
-        if self.name == "default" {
-            return Err(ExecutorError::Internal(
-                "Cannot drop the 'default' database".to_string(),
-            ));
+        // The system's own databases stay.
+        if crate::catalog::system_tables::is_system_database(&self.name) {
+            return Err(ExecutorError::Internal(format!(
+                "cannot drop the system database '{}'",
+                self.name
+            )));
         }
 
-        // Check if database exists
-        {
+        // The database, and the tables it holds. (A temporary table belongs
+        // to its session, not to the database it is named in.)
+        let tables: Vec<(crate::catalog::TableName, super::encoding::TableId)> = {
             let catalog = self.catalog.read();
             if !catalog.database_exists(&self.name) {
                 if self.if_exists {
                     self.done = true;
                     return Ok(Some(Row::new(vec![Datum::Int(0)])));
                 }
-                return Err(ExecutorError::Internal(format!(
-                    "Can't drop database '{}'; database doesn't exist",
-                    self.name
-                )));
+                return Err(ExecutorError::DatabaseNotFound(self.name.clone()));
             }
-        }
+            catalog
+                .list_tables()
+                .into_iter()
+                .filter(|name| name.is_in(&self.name))
+                .filter_map(|name| catalog.get_table(name))
+                .filter(|def| !def.is_temporary)
+                .map(|def| (def.name.clone(), def.id))
+                .collect()
+        };
 
-        if let Some(ref raft_node) = self.raft_node {
-            use crate::catalog::system_tables::SYSTEM_DATABASES;
+        if let (Some(raft_node), Some(mvcc)) = (&self.raft_node, &self.mvcc) {
+            use crate::catalog::store::{delete_keyed, delete_row, scan_rows};
+            use crate::catalog::system_tables::{
+                SYSTEM_DATABASES, SYSTEM_PROCEDURES, SYSTEM_VIEWS,
+            };
+            let internal = |e: crate::storage::StorageError| ExecutorError::Internal(e.to_string());
 
-            // The database's row is keyed by its name.
-            let row = Row::new(vec![Datum::String(self.name.clone())]);
+            // One change set: the database goes with everything in it, or
+            // nothing goes.
             let mut changeset = ChangeSet::new(0);
-            changeset.push(crate::catalog::store::delete_keyed(SYSTEM_DATABASES, &row));
-
-            if !changeset.changes.is_empty() {
-                raft_node
-                    .propose_changes(changeset)
-                    .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+            let triggers = scan_rows(mvcc.inner().as_ref(), SYSTEM_TRIGGERS)
+                .await
+                .map_err(internal)?;
+            for (name, id) in &tables {
+                drop_table_changes(mvcc, name, *id, &triggers, &mut changeset).await?;
             }
+            // Its views: their rows begin with the database's name.
+            for view in scan_rows(mvcc.inner().as_ref(), SYSTEM_VIEWS)
+                .await
+                .map_err(internal)?
+            {
+                if matches!(view.row.values().first(), Some(Datum::String(database)) if *database == self.name)
+                {
+                    changeset.push(delete_row(&view));
+                }
+            }
+            // Its routines likewise.
+            for routine in scan_rows(mvcc.inner().as_ref(), SYSTEM_PROCEDURES)
+                .await
+                .map_err(internal)?
+            {
+                if matches!(routine.row.values().first(), Some(Datum::String(database)) if *database == self.name)
+                {
+                    changeset.push(delete_row(&routine));
+                }
+            }
+            // The database's own row is keyed by its name.
+            let row = Row::new(vec![Datum::String(self.name.clone())]);
+            changeset.push(delete_keyed(SYSTEM_DATABASES, &row));
+
+            raft_node
+                .propose_changes(changeset)
+                .await
+                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
         } else {
             // Direct catalog update (no Raft)
             let mut catalog = self.catalog.write();
+            for (name, _) in &tables {
+                let _ = catalog.drop_table(name);
+            }
+            for view in catalog.get_views_in_database(&self.name) {
+                let _ = catalog.drop_view(
+                    &crate::catalog::TableName::new(self.name.clone(), view),
+                    true,
+                );
+            }
             catalog
                 .drop_database(&self.name)
                 .map_err(|e| ExecutorError::Internal(e.to_string()))?;
         }
 
         self.done = true;
-        Ok(Some(Row::new(vec![Datum::Int(0)])))
+        Ok(Some(Row::new(vec![Datum::Int(tables.len() as i64)])))
     }
 
     async fn close(&mut self) -> ExecutorResult<()> {
@@ -731,7 +796,7 @@ use super::encoding::encode_pk_key;
 /// The table is created via Raft first, then rows from the source SELECT are
 /// streamed into storage.
 pub struct CreateTableAs {
-    name: String,
+    name: crate::catalog::TableName,
     /// The new table's ID, once it has been created.
     table_id: super::encoding::TableId,
     columns: Vec<ColumnDef>,
@@ -747,7 +812,7 @@ pub struct CreateTableAs {
 
 /// Parameters for creating a CreateTableAs executor.
 pub struct CreateTableAsParams {
-    pub name: String,
+    pub name: crate::catalog::TableName,
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<Constraint>,
     pub if_not_exists: bool,
@@ -1003,13 +1068,8 @@ mod tests {
         ];
         let constraints = vec![Constraint::PrimaryKey(vec!["id".to_string()])];
 
-        let mut create = CreateTable::new(
-            "users".to_string(),
-            columns,
-            constraints,
-            false,
-            catalog.clone(),
-        );
+        let mut create =
+            CreateTable::new("users".into(), columns, constraints, false, catalog.clone());
         create.open().await.unwrap();
 
         let result = create.next().await.unwrap();
@@ -1019,7 +1079,7 @@ mod tests {
 
         // Verify table exists
         let cat = catalog.read();
-        assert!(cat.get_table("users").is_some());
+        assert!(cat.get_table(&"users".into()).is_some());
     }
 
     #[tokio::test]
@@ -1029,7 +1089,7 @@ mod tests {
         // Create table first time
         let columns = vec![ColumnDef::new("id", DataType::Int)];
         let mut create1 = CreateTable::new(
-            "users".to_string(),
+            "users".into(),
             columns.clone(),
             vec![],
             false,
@@ -1040,7 +1100,7 @@ mod tests {
 
         // Try to create again with IF NOT EXISTS
         let mut create2 = CreateTable::new(
-            "users".to_string(),
+            "users".into(),
             columns,
             vec![],
             true, // if_not_exists
@@ -1063,13 +1123,13 @@ mod tests {
         }
 
         // Drop it
-        let mut drop = DropTable::new("users".to_string(), false, catalog.clone());
+        let mut drop = DropTable::new("users".into(), false, catalog.clone());
         drop.open().await.unwrap();
         drop.next().await.unwrap();
 
         // Verify table is gone
         let cat = catalog.read();
-        assert!(cat.get_table("users").is_none());
+        assert!(cat.get_table(&"users".into()).is_none());
     }
 
     #[tokio::test]
@@ -1077,7 +1137,7 @@ mod tests {
         let catalog = Arc::new(RwLock::new(Catalog::new()));
 
         // Try to drop non-existent table with IF EXISTS
-        let mut drop = DropTable::new("nonexistent".to_string(), true, catalog.clone());
+        let mut drop = DropTable::new("nonexistent".into(), true, catalog.clone());
         drop.open().await.unwrap();
         let result = drop.next().await.unwrap();
         assert!(result.is_some()); // Should succeed silently
