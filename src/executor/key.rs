@@ -289,7 +289,7 @@ fn exact_decimal(datum: &Datum) -> Option<Result<Datum, Ordering>> {
                 Ordering::Less
             }))
         }
-        Datum::String(text) => number_in(text)?.to_string(),
+        Datum::String(text) => number_in(text).into_owned(),
         _ => return None,
     };
     let (negative, digits) = match text.strip_prefix('-') {
@@ -317,29 +317,57 @@ fn exact_decimal(datum: &Datum) -> Option<Result<Datum, Ordering>> {
     }
 }
 
-/// The number a string is compared as: its text, if that is a plain
-/// number (digits, an optional point, no exponent), otherwise the number
-/// it begins with as floating point (none: zero), as MySQL reads it.
-fn number_in(text: &str) -> Option<std::borrow::Cow<'_, str>> {
-    let text = text.trim();
-    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
-    let plain = !unsigned.is_empty()
-        && unsigned.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && unsigned.matches('.').count() <= 1
-        && unsigned.chars().any(|c| c.is_ascii_digit());
-    if plain {
-        return Some(std::borrow::Cow::Borrowed(
-            text.strip_prefix('+').unwrap_or(text),
-        ));
+/// The longest beginning of `text` that is a number: an optional sign,
+/// digits with an optional point among them, and an exponent if one is
+/// written out in full. Empty if `text` does not begin with a number. One
+/// pass over the text, however long it is.
+fn numeric_prefix(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let digits = |from: usize| {
+        bytes[from..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    };
+    let mut end = usize::from(matches!(bytes.first(), Some(b'-' | b'+')));
+    let whole = digits(end);
+    end += whole;
+    let mut fraction = 0;
+    if bytes.get(end) == Some(&b'.') {
+        fraction = digits(end + 1);
+        // A point with no digit on either side is not part of a number.
+        if whole + fraction > 0 {
+            end += 1 + fraction;
+        }
     }
-    // The longest prefix that reads as a number.
-    let value = (0..=text.len())
-        .rev()
-        .filter(|&end| text.is_char_boundary(end))
-        .find_map(|end| text[..end].parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0);
-    Some(std::borrow::Cow::Owned(value.to_string()))
+    if whole + fraction == 0 {
+        return "";
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(bytes.get(end + 1), Some(b'-' | b'+')));
+        let exponent = digits(end + 1 + sign);
+        if exponent > 0 {
+            end += 1 + sign + exponent;
+        }
+    }
+    &text[..end]
+}
+
+/// The number a string is compared as, as MySQL reads it: the number it
+/// begins with, or zero if it begins with none. Written without an
+/// exponent, it is given digit for digit; with one, as the floating-point
+/// value it reads as (`inf` if that is beyond them).
+fn number_in(text: &str) -> std::borrow::Cow<'_, str> {
+    let number = numeric_prefix(text.trim_start());
+    let number = number.strip_prefix('+').unwrap_or(number);
+    if number.is_empty() {
+        return std::borrow::Cow::Borrowed("0");
+    }
+    if !number.contains(['e', 'E']) {
+        return std::borrow::Cow::Borrowed(number);
+    }
+    let value = number.parse::<f64>().unwrap_or(0.0);
+    std::borrow::Cow::Owned(value.to_string())
 }
 
 /// The value to look a single row up by, in the key column's type; `None`
@@ -759,5 +787,56 @@ mod tests {
             );
             assert_eq!(for_bound(Datum::Null, false, None, lower), Bound::Nothing);
         }
+    }
+
+    #[test]
+    fn the_number_a_string_begins_with() {
+        for (text, number) in [
+            ("12abc", "12"),
+            ("-7.5e2x", "-7.5e2"),
+            ("+3", "+3"),
+            (".5", ".5"),
+            ("5.", "5."),
+            ("1e", "1"),
+            ("1e+", "1"),
+            ("1E-3 ", "1E-3"),
+            ("1.2.3", "1.2"),
+            ("", ""),
+            ("-", ""),
+            (".", ""),
+            ("-.e5", ""),
+            ("abc", ""),
+            ("nan", ""),
+            ("inf", ""),
+            ("é1", ""),
+        ] {
+            assert_eq!(numeric_prefix(text), number, "{text:?}");
+        }
+        for (text, number) in [
+            ("  12abc", "12"),
+            ("+3", "3"),
+            ("abc", "0"),
+            ("", "0"),
+            ("1e2", "100"),
+            ("-1.5E1x", "-15"),
+            ("1e999", "inf"),
+            ("-1e999", "-inf"),
+        ] {
+            assert_eq!(number_in(text), number, "{text:?}");
+        }
+        let int =
+            |text: &str| for_lookup(Datum::String(text.into()), &DataType::Int, Toward::Above);
+        assert_eq!(int("1e999"), Lookup::Beyond(Ordering::Greater));
+        assert_eq!(int("-1e999"), Lookup::Beyond(Ordering::Less));
+        assert_eq!(int(".5"), Lookup::Nearest(Datum::Int(1)));
+        assert_eq!(int("5."), Lookup::Exact(Datum::Int(5)));
+        // A long string is read once: a megabyte of digits with a letter
+        // at the end is its digits.
+        let long = format!("{}x", "7".repeat(1 << 20));
+        assert_eq!(numeric_prefix(&long).len(), 1 << 20);
+        assert_eq!(
+            for_lookup(Datum::String(long), &DataType::Int, Toward::Above),
+            Lookup::Beyond(Ordering::Greater)
+        );
     }
 }
