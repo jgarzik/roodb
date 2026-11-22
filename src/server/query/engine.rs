@@ -1528,7 +1528,7 @@ impl QueryEngine {
         let mut changeset = ChangeSet::new(0);
         for stored in &rows {
             if matches(stored.row.values()) {
-                changeset.push(crate::catalog::store::delete_row(table, stored));
+                changeset.push(crate::catalog::store::delete_row(stored));
             }
         }
         let count = changeset.changes.len();
@@ -1665,8 +1665,17 @@ impl QueryEngine {
         // Another session's temporary table is not this session's to write
         // to: its rows would go to shared storage, where nothing would ever
         // remove them.
-        if let Some(change) = shared.iter().find(|c| self.is_foreign_temp_table(&c.table)) {
-            return Err(format!("Table '{}' doesn't exist", change.table));
+        // (What is left after this session's own temporary tables were
+        // taken out, and still belongs to a temporary table, is another
+        // session's.)
+        let foreign = shared.iter().find_map(|change| {
+            let id = change.table()?;
+            let catalog = self.catalog.read();
+            let def = catalog.table_by_id(id)?;
+            def.is_temporary.then(|| def.name.clone())
+        });
+        if let Some(name) = foreign {
+            return Err(format!("Table '{name}' doesn't exist"));
         }
         if !shared.is_empty() {
             let changeset = ChangeSet::new_with_changes_ignore(txn_id, shared, ignore_duplicates);
@@ -4216,10 +4225,7 @@ impl QueryEngine {
         for stored in &rows {
             if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(view_name))
             {
-                return Ok(Some(crate::catalog::store::delete_row(
-                    SYSTEM_VIEWS,
-                    stored,
-                )));
+                return Ok(Some(crate::catalog::store::delete_row(stored)));
             }
         }
         Ok(None)
@@ -4340,7 +4346,7 @@ impl QueryEngine {
         for stored in &rows {
             if matches!(stored.row.values().first(), Some(Datum::String(name)) if name == trigger_name)
             {
-                changes.push(crate::catalog::store::delete_row(SYSTEM_TRIGGERS, stored));
+                changes.push(crate::catalog::store::delete_row(stored));
             }
         }
 
@@ -4958,7 +4964,7 @@ impl QueryEngine {
         for stored in &rows {
             if matches!(stored.row.values().first(), Some(Datum::String(name)) if name.eq_ignore_ascii_case(&proc_name))
             {
-                changeset.push(crate::catalog::store::delete_row(SYSTEM_PROCEDURES, stored));
+                changeset.push(crate::catalog::store::delete_row(stored));
             }
         }
 

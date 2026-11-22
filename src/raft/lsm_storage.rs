@@ -18,8 +18,8 @@ use parking_lot::RwLock;
 
 use crate::catalog::store::{decode_table, table_of_key, TableRecord};
 use crate::catalog::system_tables::{
-    is_system_table, row_to_procedure_def, row_to_trigger_def, row_to_view_def, SYSTEM_DATABASES,
-    SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
+    is_system_table, row_to_procedure_def, row_to_trigger_def, row_to_view_def, system_table_id,
+    SYSTEM_DATABASES, SYSTEM_PROCEDURES, SYSTEM_TABLES, SYSTEM_TRIGGERS, SYSTEM_VIEWS,
 };
 use crate::catalog::Catalog;
 use crate::executor::encoding::{decode_row, table_of_row_key, TableId};
@@ -119,7 +119,7 @@ pub struct LsmRaftStorage {
 /// A change to a system table, noted so the catalog can follow once the
 /// change has been written.
 struct TrackedChange {
-    table: String,
+    table: TableId,
     value: Vec<u8>,
     is_delete: bool,
 }
@@ -410,6 +410,18 @@ impl LsmRaftStorage {
         Ok(())
     }
 
+    /// What to call a change's table in a message: its name, if the
+    /// catalog knows the table.
+    fn table_label(&self, change: &crate::raft::RowChange) -> String {
+        match change.table() {
+            Some(id) => match self.catalog.read().table_by_id(id) {
+                Some(def) => def.name.clone(),
+                None => format!("table {id}"),
+            },
+            None => "?".to_string(),
+        }
+    }
+
     /// Work out what a changeset writes, without writing anything.
     ///
     /// Every check runs first: the version checks against what is stored now,
@@ -432,23 +444,23 @@ impl LsmRaftStorage {
                     let current_version = extract_row_version(&current).unwrap_or(0);
                     if current_version != expected_version {
                         tracing::warn!(
-                            table = %change.table,
+                            table = %self.table_label(change),
                             expected = expected_version,
                             actual = current_version,
                             "OCC conflict: row was modified by another transaction"
                         );
                         return Ok(Err(format!(
                             "Write conflict: row in '{}' was modified by another transaction (expected version {}, found {})",
-                            change.table, expected_version, current_version
+                            self.table_label(change), expected_version, current_version
                         )));
                     }
                 }
                 // A row that is already gone is fine to delete, not to update.
                 None if change.op == ChangeOp::Update => {
-                    tracing::warn!(table = %change.table, "OCC conflict: row no longer exists");
+                    tracing::warn!(table = %self.table_label(change), "OCC conflict: row no longer exists");
                     return Ok(Err(format!(
                         "Write conflict: row in '{}' no longer exists",
-                        change.table
+                        self.table_label(change)
                     )));
                 }
                 None => {}
@@ -465,7 +477,8 @@ impl LsmRaftStorage {
                     // a row of a user's table, or a row of a system table,
                     // which is keyed by what it describes (two sessions
                     // creating the same account, view or database at once).
-                    let is_table_record = change.table == SYSTEM_TABLES;
+                    let table = change.table();
+                    let is_table_record = table == Some(system_table_id(SYSTEM_TABLES));
                     if change.op == ChangeOp::Insert {
                         let exists = match live.get(change.key.as_slice()) {
                             Some(live) => *live,
@@ -491,12 +504,12 @@ impl LsmRaftStorage {
                                 continue;
                             }
                             tracing::warn!(
-                                table = %change.table,
+                                table = %self.table_label(change),
                                 "INSERT conflict: row already exists with this key"
                             );
                             return Ok(Err(format!(
                                 "Duplicate key: row in '{}' already exists",
-                                change.table
+                                self.table_label(change)
                             )));
                         }
                     }
@@ -541,9 +554,9 @@ impl LsmRaftStorage {
                         Some(encode_mvcc_row(changeset.txn_id, false, value)),
                     ));
                     live.insert(change.key.as_slice(), true);
-                    if !is_table_record {
+                    if let (false, Some(table)) = (is_table_record, table) {
                         plan.tracked.push(TrackedChange {
-                            table: change.table.clone(),
+                            table,
                             value: value.clone(),
                             is_delete: false,
                         });
@@ -557,7 +570,7 @@ impl LsmRaftStorage {
                         Some(encode_mvcc_row(changeset.txn_id, true, &[])),
                     ));
                     live.insert(change.key.as_slice(), false);
-                    if change.table == SYSTEM_TABLES {
+                    if change.table() == Some(system_table_id(SYSTEM_TABLES)) {
                         // A drop means the table with the ID it carries, as
                         // a replacement does.
                         let name = table_of_key(&change.key).unwrap_or_default();
@@ -571,9 +584,9 @@ impl LsmRaftStorage {
                             )));
                         }
                         plan.catalog.push(CatalogOp::Unset(name));
-                    } else if let Some(value) = value {
+                    } else if let (Some(value), Some(table)) = (value, change.table()) {
                         plan.tracked.push(TrackedChange {
-                            table: change.table.clone(),
+                            table,
                             value: value.clone(),
                             is_delete: true,
                         });
@@ -646,8 +659,12 @@ impl LsmRaftStorage {
     /// Bring the catalog up to date with a change to one of the system
     /// tables that hold databases, procedures, triggers and views. (Tables
     /// follow from their records: see `CatalogOp`.)
-    fn track_system_table_change(&self, table: &str, value: &[u8], is_delete: bool) {
-        if table == SYSTEM_DATABASES {
+    fn track_system_table_change(&self, table: TableId, value: &[u8], is_delete: bool) {
+        // Only the system's own tables are the catalog's concern.
+        if table.0 >= crate::catalog::system_tables::FIRST_USER_TABLE_ID {
+            return;
+        }
+        if table == system_table_id(SYSTEM_DATABASES) {
             // Database name changes — update catalog directly
             if let Ok(row) = decode_row(value) {
                 if let Some(crate::executor::Datum::String(db_name)) = row.values().first() {
@@ -659,7 +676,7 @@ impl LsmRaftStorage {
                     }
                 }
             }
-        } else if table == SYSTEM_PROCEDURES {
+        } else if table == system_table_id(SYSTEM_PROCEDURES) {
             // Procedure changes — update catalog directly
             if let Ok(row) = decode_row(value) {
                 if let Some(proc_def) = row_to_procedure_def(&row) {
@@ -671,7 +688,7 @@ impl LsmRaftStorage {
                     }
                 }
             }
-        } else if table == SYSTEM_TRIGGERS {
+        } else if table == system_table_id(SYSTEM_TRIGGERS) {
             // Trigger changes - update catalog directly
             if let Ok(row) = decode_row(value) {
                 if is_delete {
@@ -682,7 +699,7 @@ impl LsmRaftStorage {
                     self.catalog.write().create_trigger(trigger);
                 }
             }
-        } else if table == SYSTEM_VIEWS {
+        } else if table == system_table_id(SYSTEM_VIEWS) {
             // View changes — update catalog directly
             if let Ok(row) = decode_row(value) {
                 if let Some(view_def) = row_to_view_def(&row) {
@@ -883,7 +900,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 }
             }
             for change in tracked {
-                self.track_system_table_change(&change.table, &change.value, change.is_delete);
+                self.track_system_table_change(change.table, &change.value, change.is_delete);
             }
             results.push(response);
         }

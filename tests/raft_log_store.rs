@@ -35,7 +35,6 @@ fn id(index: u64) -> LogId {
 fn entry_sized(index: u64, payload: usize) -> Entry {
     let value: Vec<u8> = (0..payload).map(|i| (index as usize + i) as u8).collect();
     let changes = vec![RowChange::insert(
-        "t",
         format!("key{index:08}").into_bytes(),
         value,
     )];
@@ -710,7 +709,7 @@ async fn entries_reusing_truncated_indexes_stay_readable() {
             log_id::<TypeConfig>(2, 2, index),
             Command::DataChange(ChangeSet::new_with_changes(
                 index + 5000,
-                vec![RowChange::insert("t", vec![1], vec![9u8; 500])],
+                vec![RowChange::insert(vec![1], vec![9u8; 500])],
             )),
         )
     };
@@ -795,7 +794,7 @@ async fn truncation_across_a_purged_segment_boundary_reopens() {
             log_id::<TypeConfig>(2, 2, index),
             Command::DataChange(ChangeSet::new_with_changes(
                 index + 9000,
-                vec![RowChange::insert("t", vec![2], vec![3u8; 1000])],
+                vec![RowChange::insert(vec![2], vec![3u8; 1000])],
             )),
         )
     };

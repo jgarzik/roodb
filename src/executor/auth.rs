@@ -217,7 +217,7 @@ impl Executor for DropUser {
             if uname.as_ref() == Some(&self.username) && host.as_deref() == Some(self.host.as_str())
             {
                 // Mark for deletion
-                changeset.push(RowChange::delete(SYSTEM_USERS, key.clone()));
+                changeset.push(RowChange::delete(key.clone()));
                 found = true;
                 break;
             }
@@ -246,7 +246,7 @@ impl Executor for DropUser {
                 if grantee.as_ref() == Some(&self.username)
                     && grantee_host.as_deref() == Some(self.host.as_str())
                 {
-                    changeset.push(RowChange::delete(SYSTEM_GRANTS, key.clone()));
+                    changeset.push(RowChange::delete(key.clone()));
                 }
             }
 
@@ -361,11 +361,7 @@ impl Executor for AlterUser {
         let encoded = encode_row(&new_row);
 
         let mut changeset = ChangeSet::new(0);
-        changeset.push(RowChange::update(
-            SYSTEM_USERS,
-            key.clone(),
-            encoded.clone(),
-        ));
+        changeset.push(RowChange::update(key.clone(), encoded.clone()));
 
         self.raft_node
             .propose_changes(changeset)
@@ -474,11 +470,7 @@ impl Executor for SetPassword {
         let encoded = encode_row(&new_row);
 
         let mut changeset = ChangeSet::new(0);
-        changeset.push(RowChange::update(
-            SYSTEM_USERS,
-            key.clone(),
-            encoded.clone(),
-        ));
+        changeset.push(RowChange::update(key.clone(), encoded.clone()));
 
         self.raft_node
             .propose_changes(changeset)
@@ -721,7 +713,7 @@ impl Executor for Revoke {
                     .map(|p| privs_to_revoke.contains(p))
                     .unwrap_or(false)
             {
-                changeset.push(RowChange::delete(SYSTEM_GRANTS, key.clone()));
+                changeset.push(RowChange::delete(key.clone()));
                 count += 1;
             }
         }

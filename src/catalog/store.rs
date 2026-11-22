@@ -51,29 +51,21 @@ pub fn decode_table(row: &[u8]) -> Option<TableRecord> {
 
 /// The change that stores a new table.
 pub fn create_table(record: &TableRecord) -> RowChange {
-    RowChange::insert(
-        SYSTEM_TABLES,
-        table_key(&record.def.name),
-        table_row(record),
-    )
+    RowChange::insert(table_key(&record.def.name), table_row(record))
 }
 
 /// The change that replaces a table's record with `record`. It means the
 /// table with `record`'s ID: if the name has come to mean another table by
 /// the time the change is applied, or none, it is refused.
 pub fn replace_table(record: &TableRecord) -> RowChange {
-    RowChange::update(
-        SYSTEM_TABLES,
-        table_key(&record.def.name),
-        table_row(record),
-    )
+    RowChange::update(table_key(&record.def.name), table_row(record))
 }
 
 /// The change that removes a table's record. It means the table with this
 /// ID: if the name has come to mean another table by the time the change
 /// is applied, or none, it is refused.
 pub fn drop_table(name: &str, id: crate::executor::encoding::TableId) -> RowChange {
-    RowChange::delete_with_value(SYSTEM_TABLES, table_key(name), id.0.to_le_bytes().to_vec())
+    RowChange::delete_with_value(table_key(name), id.0.to_le_bytes().to_vec())
 }
 
 /// The ID a `drop_table` change says it means.
@@ -141,25 +133,25 @@ pub fn row_key(table: &str, row: &Row) -> Vec<u8> {
 /// The change that adds `row` to a system table. Refused when applied if
 /// a row with its key is there already.
 pub fn insert_row(table: &str, row: &Row) -> RowChange {
-    RowChange::insert(table, row_key(table, row), encode_row(row))
+    RowChange::insert(row_key(table, row), encode_row(row))
 }
 
 /// The change that stores `row` in a system table, in place of the row
 /// with its key if there is one.
 pub fn put_row(table: &str, row: &Row) -> RowChange {
-    RowChange::update(table, row_key(table, row), encode_row(row))
+    RowChange::update(row_key(table, row), encode_row(row))
 }
 
 /// The change that removes a stored row from a system table.
-pub fn delete_row(table: &str, stored: &StoredRow) -> RowChange {
-    RowChange::delete_with_value(table, stored.key.clone(), stored.data.clone())
+pub fn delete_row(stored: &StoredRow) -> RowChange {
+    RowChange::delete_with_value(stored.key.clone(), stored.data.clone())
 }
 
 /// The change that removes from a system table the row that has `row`'s
 /// key. (`row` needs only what the catalog looks at when the change is
 /// applied: for most tables, the key columns.)
 pub fn delete_keyed(table: &str, row: &Row) -> RowChange {
-    RowChange::delete_with_value(table, row_key(table, row), encode_row(row))
+    RowChange::delete_with_value(row_key(table, row), encode_row(row))
 }
 
 /// A row as initialisation stores it, before there is a log: under its

@@ -269,7 +269,7 @@ impl Executor for DropTable {
             for trigger in triggers {
                 if matches!(trigger.row.values().get(1), Some(Datum::String(t)) if t == &self.name)
                 {
-                    changeset.push(crate::catalog::store::delete_row(SYSTEM_TRIGGERS, &trigger));
+                    changeset.push(crate::catalog::store::delete_row(&trigger));
                 }
             }
 
@@ -282,7 +282,7 @@ impl Executor for DropTable {
                 .map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
             for (key, _value) in data_rows {
-                changeset.push(RowChange::delete(&self.name, key.clone()));
+                changeset.push(RowChange::delete(key.clone()));
             }
 
             // Propose to Raft - catalog is updated synchronously in apply()
@@ -910,7 +910,7 @@ impl Executor for CreateTableAs {
 
             // Buffer the row change for Raft replication
             if let Some(ref mut ctx) = self.txn_context {
-                ctx.add_change(RowChange::insert(&self.name, key.clone(), value.clone()));
+                ctx.add_change(RowChange::insert(key.clone(), value.clone()));
                 ctx.buffer_write(key, value);
             }
             self.rows_inserted += 1;

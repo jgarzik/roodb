@@ -684,6 +684,11 @@ impl Catalog {
         self.schema_version += 1;
     }
 
+    /// The table with this ID, if the catalog has it.
+    pub fn table_by_id(&self, id: crate::executor::encoding::TableId) -> Option<&TableDef> {
+        self.tables.values().find(|def| def.id == id)
+    }
+
     /// Take a table and its indexes out of the catalog, if it is there.
     pub fn unset_table(&mut self, name: &str) {
         self.tables.remove(name);

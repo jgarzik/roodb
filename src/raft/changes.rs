@@ -19,8 +19,6 @@ pub enum ChangeOp {
 /// A single row change to be replicated
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowChange {
-    /// Table name (including "system." prefix for system tables)
-    pub table: String,
     /// Encoded row key
     pub key: Vec<u8>,
     /// Encoded row value (None for DELETE)
@@ -42,10 +40,16 @@ pub struct RowChange {
 }
 
 impl RowChange {
+    /// The table the row belongs to: the ID its key begins with. `None`
+    /// for a key that is not a table's (there are none in what the server
+    /// writes; tests of the log write such keys).
+    pub fn table(&self) -> Option<crate::executor::encoding::TableId> {
+        crate::executor::encoding::table_of_row_key(&self.key)
+    }
+
     /// Create an INSERT change
-    pub fn insert(table: impl Into<String>, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn insert(key: Vec<u8>, value: Vec<u8>) -> Self {
         Self {
-            table: table.into(),
             key,
             value: Some(value),
             op: ChangeOp::Insert,
@@ -61,9 +65,8 @@ impl RowChange {
     }
 
     /// Create an UPDATE change
-    pub fn update(table: impl Into<String>, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn update(key: Vec<u8>, value: Vec<u8>) -> Self {
         Self {
-            table: table.into(),
             key,
             value: Some(value),
             op: ChangeOp::Update,
@@ -76,14 +79,8 @@ impl RowChange {
     ///
     /// The expected_version is the txn_id of the row version we read.
     /// apply() will reject the update if the row has been modified since.
-    pub fn update_with_version(
-        table: impl Into<String>,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        expected_version: u64,
-    ) -> Self {
+    pub fn update_with_version(key: Vec<u8>, value: Vec<u8>, expected_version: u64) -> Self {
         Self {
-            table: table.into(),
             key,
             value: Some(value),
             op: ChangeOp::Update,
@@ -93,9 +90,8 @@ impl RowChange {
     }
 
     /// Create a DELETE change
-    pub fn delete(table: impl Into<String>, key: Vec<u8>) -> Self {
+    pub fn delete(key: Vec<u8>) -> Self {
         Self {
-            table: table.into(),
             key,
             value: None,
             op: ChangeOp::Delete,
@@ -105,13 +101,8 @@ impl RowChange {
     }
 
     /// Create a DELETE change with OCC version check
-    pub fn delete_with_version(
-        table: impl Into<String>,
-        key: Vec<u8>,
-        expected_version: u64,
-    ) -> Self {
+    pub fn delete_with_version(key: Vec<u8>, expected_version: u64) -> Self {
         Self {
-            table: table.into(),
             key,
             value: None,
             op: ChangeOp::Delete,
@@ -124,20 +115,14 @@ impl RowChange {
     ///
     /// Used for system table deletes where the row data is needed to identify
     /// what table/index is being dropped (for catalog rebuild in apply()).
-    pub fn delete_with_value(table: impl Into<String>, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn delete_with_value(key: Vec<u8>, value: Vec<u8>) -> Self {
         Self {
-            table: table.into(),
             key,
             value: Some(value),
             op: ChangeOp::Delete,
             expected_version: None,
             auto_inc: None,
         }
-    }
-
-    /// Check if this is a system table change
-    pub fn is_system_change(&self) -> bool {
-        self.table.starts_with("system.")
     }
 }
 
@@ -221,24 +206,24 @@ mod tests {
 
     #[test]
     fn test_row_change_insert() {
-        let change = RowChange::insert("users", vec![1, 2, 3], vec![4, 5, 6]);
-        assert_eq!(change.table, "users");
+        let change = RowChange::insert(vec![1, 2, 3], vec![4, 5, 6]);
         assert_eq!(change.op, ChangeOp::Insert);
         assert!(change.value.is_some());
-        assert!(!change.is_system_change());
     }
 
     #[test]
     fn test_row_change_delete() {
-        let change = RowChange::delete("users", vec![1, 2, 3]);
+        let change = RowChange::delete(vec![1, 2, 3]);
         assert_eq!(change.op, ChangeOp::Delete);
         assert!(change.value.is_none());
     }
 
     #[test]
-    fn test_system_change() {
-        let change = RowChange::insert("system.tables", vec![1], vec![2]);
-        assert!(change.is_system_change());
+    fn a_change_belongs_to_the_table_its_key_begins_with() {
+        use crate::executor::encoding::{encode_row_key, TableId};
+        let change = RowChange::insert(encode_row_key(TableId(1234), 7), vec![2]);
+        assert_eq!(change.table(), Some(TableId(1234)));
+        assert_eq!(RowChange::insert(vec![1], vec![2]).table(), None);
     }
 
     #[test]
@@ -246,8 +231,8 @@ mod tests {
         let mut cs = ChangeSet::new(42);
         assert!(cs.is_empty());
 
-        cs.push(RowChange::insert("users", vec![1], vec![2]));
-        cs.push(RowChange::delete("users", vec![3]));
+        cs.push(RowChange::insert(vec![1], vec![2]));
+        cs.push(RowChange::delete(vec![3]));
 
         assert_eq!(cs.len(), 2);
         assert_eq!(cs.txn_id, 42);
@@ -255,11 +240,10 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let change = RowChange::insert("users", vec![1, 2], vec![3, 4]);
+        let change = RowChange::insert(vec![1, 2], vec![3, 4]);
         let serialized = bincode::serialize(&change).unwrap();
         let deserialized: RowChange = bincode::deserialize(&serialized).unwrap();
 
-        assert_eq!(change.table, deserialized.table);
         assert_eq!(change.key, deserialized.key);
         assert_eq!(change.value, deserialized.value);
         assert_eq!(change.op, deserialized.op);
@@ -268,8 +252,8 @@ mod tests {
     #[test]
     fn test_changeset_serialization() {
         let mut cs = ChangeSet::new(123);
-        cs.push(RowChange::insert("users", vec![1], vec![2]));
-        cs.push(RowChange::update("users", vec![3], vec![4]));
+        cs.push(RowChange::insert(vec![1], vec![2]));
+        cs.push(RowChange::update(vec![3], vec![4]));
 
         let serialized = bincode::serialize(&cs).unwrap();
         let deserialized: ChangeSet = bincode::deserialize(&serialized).unwrap();

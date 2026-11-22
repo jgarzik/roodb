@@ -337,11 +337,7 @@ impl Executor for Insert {
                             }
                         }
                         let updated_value = encode_row(&existing_row);
-                        ctx.add_change(RowChange::update(
-                            &self.table,
-                            key.clone(),
-                            updated_value.clone(),
-                        ));
+                        ctx.add_change(RowChange::update(key.clone(), updated_value.clone()));
                         ctx.buffer_write(key, updated_value);
                         self.rows_inserted += 1;
                         continue 'row_loop;
@@ -358,9 +354,7 @@ impl Executor for Insert {
                 )));
             }
 
-            ctx.add_change(
-                RowChange::insert(&self.table, key.clone(), value.clone()).with_auto_inc(auto_next),
-            );
+            ctx.add_change(RowChange::insert(key.clone(), value.clone()).with_auto_inc(auto_next));
             // Buffer for read-your-writes within this transaction
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;

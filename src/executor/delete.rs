@@ -37,8 +37,6 @@ pub struct DeleteParams {
 
 /// Delete executor
 pub struct Delete {
-    /// Table name
-    table: String,
     table_id: crate::executor::encoding::TableId,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
@@ -65,7 +63,6 @@ impl Delete {
     /// Create a new delete executor
     pub fn new(p: DeleteParams) -> Self {
         Delete {
-            table: p.table,
             table_id: p.table_id,
             filter: p.filter,
             key_value: p.key_value,
@@ -143,7 +140,6 @@ impl Delete {
             }
             let ctx = self.txn_context.as_mut().unwrap();
             ctx.add_change(RowChange::delete_with_version(
-                &self.table,
                 storage_key.clone(),
                 row_version,
             ));
@@ -280,11 +276,7 @@ impl Delete {
             super::error::ExecutorError::Internal("DELETE requires transaction context".to_string())
         })?;
         for (key, row_version) in keys_to_delete {
-            ctx.add_change(RowChange::delete_with_version(
-                &self.table,
-                key.clone(),
-                row_version,
-            ));
+            ctx.add_change(RowChange::delete_with_version(key.clone(), row_version));
             ctx.buffer_delete(key);
             self.rows_deleted += 1;
         }

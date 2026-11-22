@@ -51,6 +51,14 @@ impl TempState {
 }
 
 impl TempState {
+    /// The name of the temporary table a key belongs to, for messages.
+    fn table_of(&self, key: &[u8]) -> &str {
+        self.tables
+            .iter()
+            .find(|(_, prefix, end)| key >= prefix.as_slice() && key < end.as_slice())
+            .map_or("?", |(name, _, _)| name.as_str())
+    }
+
     fn owns(&self, key: &[u8]) -> bool {
         self.tables
             .iter()
@@ -199,7 +207,7 @@ impl SessionStorage {
         if after > TEMP_TABLE_LIMIT_BYTES && after > temp.bytes {
             return Err(format!(
                 "The table '{}' is full: temporary tables of one session may hold {} MiB",
-                changes[0].table,
+                temp.table_of(&changes[0].key),
                 TEMP_TABLE_LIMIT_BYTES >> 20
             ));
         }
@@ -220,7 +228,7 @@ impl SessionStorage {
                     if exists {
                         return Err(format!(
                             "Duplicate key: row in '{}' already exists",
-                            change.table
+                            temp.table_of(&change.key)
                         ));
                     }
                     live.insert(change.key.as_slice(), true);
@@ -481,9 +489,9 @@ mod tests {
         assert_eq!(storage.get(&key("tmp", 1)).await.unwrap(), None);
 
         let changes = vec![
-            RowChange::insert("tmp", key("tmp", 1), b"one".to_vec()),
-            RowChange::insert("other", key("other", 1), b"shared".to_vec()),
-            RowChange::insert("tmp", key("tmp", 2), b"two".to_vec()),
+            RowChange::insert(key("tmp", 1), b"one".to_vec()),
+            RowChange::insert(key("other", 1), b"shared".to_vec()),
+            RowChange::insert(key("tmp", 2), b"two".to_vec()),
         ];
         let (temp, shared) = storage.split(changes);
         assert_eq!(temp.len(), 2);
@@ -521,11 +529,11 @@ mod tests {
         storage.add_table("tmp", tid("tmp"));
         storage.apply(
             1,
-            vec![RowChange::insert("tmp", key("tmp", 1), b"a".to_vec())],
+            vec![RowChange::insert(key("tmp", 1), b"a".to_vec())],
             false,
         );
 
-        let dup = vec![RowChange::insert("tmp", key("tmp", 1), b"b".to_vec())];
+        let dup = vec![RowChange::insert(key("tmp", 1), b"b".to_vec())];
         assert!(storage.check(&dup, false).is_err());
         assert!(storage.check(&dup, true).is_ok());
         storage.apply(2, dup, true);
@@ -535,8 +543,8 @@ mod tests {
         );
 
         let replace = vec![
-            RowChange::delete("tmp", key("tmp", 1)),
-            RowChange::insert("tmp", key("tmp", 1), b"c".to_vec()),
+            RowChange::delete(key("tmp", 1)),
+            RowChange::insert(key("tmp", 1), b"c".to_vec()),
         ];
         storage.check(&replace, false).unwrap();
         storage.apply(3, replace, false);
@@ -546,8 +554,8 @@ mod tests {
         );
 
         let twice = vec![
-            RowChange::insert("tmp", key("tmp", 9), b"x".to_vec()),
-            RowChange::insert("tmp", key("tmp", 9), b"y".to_vec()),
+            RowChange::insert(key("tmp", 9), b"x".to_vec()),
+            RowChange::insert(key("tmp", 9), b"y".to_vec()),
         ];
         assert!(storage.check(&twice, false).is_err());
     }
@@ -559,7 +567,6 @@ mod tests {
         // 64 MiB at a time: four fit, the fifth does not.
         for round in 0..5u8 {
             let big = vec![RowChange::insert(
-                "tmp",
                 key("tmp", round),
                 vec![0u8; 64 * 1024 * 1024 - 1024],
             )];
@@ -577,7 +584,7 @@ mod tests {
         storage.add_table("tmp", tid("tmp"));
         storage
             .check(
-                &[RowChange::insert("tmp", key("tmp", 9), vec![0u8; 1 << 20])],
+                &[RowChange::insert(key("tmp", 9), vec![0u8; 1 << 20])],
                 false,
             )
             .unwrap();
@@ -591,7 +598,7 @@ mod tests {
         // were counted as growth.
         let rows = |value: u8| -> Vec<RowChange> {
             (0..3u8)
-                .map(|i| RowChange::insert("tmp", key("tmp", i), vec![value; 64 << 20]))
+                .map(|i| RowChange::insert(key("tmp", i), vec![value; 64 << 20]))
                 .collect()
         };
         let inserted = rows(1);
@@ -608,9 +615,7 @@ mod tests {
         storage.apply(2, updated, false);
 
         // Deleting frees the room at once: nothing is kept for a deleted row.
-        let deleted: Vec<RowChange> = (0..3u8)
-            .map(|i| RowChange::delete("tmp", key("tmp", i)))
-            .collect();
+        let deleted: Vec<RowChange> = (0..3u8).map(|i| RowChange::delete(key("tmp", i))).collect();
         storage.check(&deleted, false).unwrap();
         storage.apply(3, deleted, false);
         assert_eq!(storage.temp.read().bytes, 0);
@@ -623,11 +628,7 @@ mod tests {
     async fn an_empty_or_inverted_range_holds_nothing() {
         let storage = SessionStorage::new(Arc::new(Untouched));
         storage.add_table("tmp", tid("tmp"));
-        storage.apply(
-            1,
-            vec![RowChange::insert("tmp", key("tmp", 5), vec![1])],
-            false,
-        );
+        storage.apply(1, vec![RowChange::insert(key("tmp", 5), vec![1])], false);
         let high = key("tmp", 9);
         let low = key("tmp", 1);
         assert!(storage
@@ -654,8 +655,8 @@ mod tests {
         storage.apply(
             1,
             vec![
-                RowChange::insert("a", key("a", 1), b"a".to_vec()),
-                RowChange::insert("b", key("b", 1), b"b".to_vec()),
+                RowChange::insert(key("a", 1), b"a".to_vec()),
+                RowChange::insert(key("b", 1), b"b".to_vec()),
             ],
             false,
         );
@@ -684,9 +685,9 @@ mod tests {
         storage.apply(
             1,
             vec![
-                RowChange::insert("a", key("a", 1), b"a".to_vec()),
-                RowChange::insert("a", key("a", 2), b"a".to_vec()),
-                RowChange::insert("b", key("b", 1), b"b".to_vec()),
+                RowChange::insert(key("a", 1), b"a".to_vec()),
+                RowChange::insert(key("a", 2), b"a".to_vec()),
+                RowChange::insert(key("b", 1), b"b".to_vec()),
             ],
             false,
         );

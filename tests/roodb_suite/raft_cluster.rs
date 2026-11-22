@@ -43,9 +43,9 @@ fn test_catalog() -> Arc<RwLock<Catalog>> {
 }
 
 /// Helper to create a ChangeSet with a single insert
-fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
+fn insert_change(key: &[u8], value: &[u8]) -> ChangeSet {
     let mut cs = ChangeSet::new(1);
-    cs.push(RowChange::insert(table, key.to_vec(), value.to_vec()));
+    cs.push(RowChange::insert(key.to_vec(), value.to_vec()));
     cs
 }
 
@@ -111,7 +111,7 @@ async fn test_single_node_bootstrap() {
     assert!(node.is_leader().await);
 
     // Propose a change
-    let changeset = insert_change("test", b"key1", b"value1");
+    let changeset = insert_change(b"key1", b"value1");
     node.propose_changes(changeset).await.unwrap();
 
     // Shutdown
@@ -137,13 +137,13 @@ async fn test_single_node_multiple_writes() {
     for i in 0..10 {
         let key = format!("key{}", i).into_bytes();
         let value = format!("value{}", i).into_bytes();
-        let changeset = insert_change("test", &key, &value);
+        let changeset = insert_change(&key, &value);
         node.propose_changes(changeset).await.unwrap();
     }
 
     // Propose a delete
     let mut delete_cs = ChangeSet::new(2);
-    delete_cs.push(RowChange::delete("test", b"key5".to_vec()));
+    delete_cs.push(RowChange::delete(b"key5".to_vec()));
     node.propose_changes(delete_cs).await.unwrap();
 
     node.shutdown().await.unwrap();
@@ -252,7 +252,7 @@ async fn test_log_replication() {
         .expect("No leader found");
 
     // Propose changes through leader
-    let changeset = insert_change("test", b"replicated_key", b"replicated_value");
+    let changeset = insert_change(b"replicated_key", b"replicated_value");
     leader.propose_changes(changeset).await.unwrap();
 
     // Wait for replication
@@ -307,15 +307,15 @@ async fn stored_row(storage: &Arc<dyn StorageEngine>, key: &[u8]) -> Option<Vec<
 async fn a_rejected_changeset_writes_nothing() {
     let (node, storage) = single_node("atomic_reject").await;
 
-    node.propose_changes(insert_change("t", b"existing", b"v1"))
+    node.propose_changes(insert_change(b"existing", b"v1"))
         .await
         .unwrap();
 
     // Two new rows, then a duplicate of the existing one.
     let mut cs = ChangeSet::new(2);
-    cs.push(RowChange::insert("t", b"new-a".to_vec(), b"a".to_vec()));
-    cs.push(RowChange::insert("t", b"new-b".to_vec(), b"b".to_vec()));
-    cs.push(RowChange::insert("t", b"existing".to_vec(), b"v2".to_vec()));
+    cs.push(RowChange::insert(b"new-a".to_vec(), b"a".to_vec()));
+    cs.push(RowChange::insert(b"new-b".to_vec(), b"b".to_vec()));
+    cs.push(RowChange::insert(b"existing".to_vec(), b"v2".to_vec()));
     let err = node.propose_changes(cs).await.unwrap_err().to_string();
     assert!(err.contains("Duplicate key"), "{err}");
 
@@ -328,9 +328,8 @@ async fn a_rejected_changeset_writes_nothing() {
 
     // A version conflict on a later change undoes the earlier ones too.
     let mut cs = ChangeSet::new(3);
-    cs.push(RowChange::insert("t", b"new-c".to_vec(), b"c".to_vec()));
+    cs.push(RowChange::insert(b"new-c".to_vec(), b"c".to_vec()));
     cs.push(RowChange::update_with_version(
-        "t",
         b"existing".to_vec(),
         b"v3".to_vec(),
         999,
@@ -340,7 +339,7 @@ async fn a_rejected_changeset_writes_nothing() {
     assert_eq!(stored_row(&storage, b"new-c").await, None, "partial write");
 
     // The node is fine: later changesets apply.
-    node.propose_changes(insert_change("t", b"after", b"ok"))
+    node.propose_changes(insert_change(b"after", b"ok"))
         .await
         .unwrap();
     assert_eq!(stored_row(&storage, b"after").await, Some(b"ok".to_vec()));
@@ -355,19 +354,19 @@ async fn a_rejected_changeset_writes_nothing() {
 async fn a_changeset_sees_its_own_earlier_changes() {
     let (node, storage) = single_node("atomic_overlay").await;
 
-    node.propose_changes(insert_change("t", b"row", b"old"))
+    node.propose_changes(insert_change(b"row", b"old"))
         .await
         .unwrap();
 
     let mut cs = ChangeSet::new(2);
-    cs.push(RowChange::delete("t", b"row".to_vec()));
-    cs.push(RowChange::insert("t", b"row".to_vec(), b"new".to_vec()));
+    cs.push(RowChange::delete(b"row".to_vec()));
+    cs.push(RowChange::insert(b"row".to_vec(), b"new".to_vec()));
     node.propose_changes(cs).await.unwrap();
     assert_eq!(stored_row(&storage, b"row").await, Some(b"new".to_vec()));
 
     let mut cs = ChangeSet::new(3);
-    cs.push(RowChange::insert("t", b"twice".to_vec(), b"1".to_vec()));
-    cs.push(RowChange::insert("t", b"twice".to_vec(), b"2".to_vec()));
+    cs.push(RowChange::insert(b"twice".to_vec(), b"1".to_vec()));
+    cs.push(RowChange::insert(b"twice".to_vec(), b"2".to_vec()));
     let err = node.propose_changes(cs).await.unwrap_err().to_string();
     assert!(err.contains("Duplicate key"), "{err}");
     assert_eq!(stored_row(&storage, b"twice").await, None);
@@ -376,12 +375,12 @@ async fn a_changeset_sees_its_own_earlier_changes() {
     let mut cs = ChangeSet::new_with_changes_ignore(
         4,
         vec![
-            RowChange::insert("t", b"row".to_vec(), b"ignored".to_vec()),
-            RowChange::insert("t", b"fresh".to_vec(), b"kept".to_vec()),
+            RowChange::insert(b"row".to_vec(), b"ignored".to_vec()),
+            RowChange::insert(b"fresh".to_vec(), b"kept".to_vec()),
         ],
         true,
     );
-    cs.push(RowChange::delete("t", b"gone".to_vec()));
+    cs.push(RowChange::delete(b"gone".to_vec()));
     node.propose_changes(cs).await.unwrap();
     assert_eq!(stored_row(&storage, b"row").await, Some(b"new".to_vec()));
     assert_eq!(stored_row(&storage, b"fresh").await, Some(b"kept".to_vec()));
@@ -442,7 +441,7 @@ async fn the_log_is_purged_only_up_to_what_is_flushed() {
     let value = vec![7u8; 2000];
     for i in 0..10_000u64 {
         let key = format!("row{i:08}").into_bytes();
-        node.propose_changes(insert_change("t", &key, &value))
+        node.propose_changes(insert_change(&key, &value))
             .await
             .unwrap();
 

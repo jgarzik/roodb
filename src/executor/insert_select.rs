@@ -240,9 +240,7 @@ impl Executor for InsertSelect {
                 )));
             }
 
-            ctx.add_change(
-                RowChange::insert(&self.table, key.clone(), value.clone()).with_auto_inc(auto_next),
-            );
+            ctx.add_change(RowChange::insert(key.clone(), value.clone()).with_auto_inc(auto_next));
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
         }

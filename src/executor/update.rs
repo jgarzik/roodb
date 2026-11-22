@@ -139,22 +139,13 @@ impl Update {
                 )));
             }
             // Delete old key, insert at new key
-            ctx.add_change(RowChange::delete_with_version(
-                &self.table,
-                old_key.clone(),
-                row_version,
-            ));
+            ctx.add_change(RowChange::delete_with_version(old_key.clone(), row_version));
             ctx.buffer_delete(old_key);
-            ctx.add_change(RowChange::insert(
-                &self.table,
-                new_key.clone(),
-                new_value.clone(),
-            ));
+            ctx.add_change(RowChange::insert(new_key.clone(), new_value.clone()));
             ctx.buffer_write(new_key, new_value);
         } else {
             // Same key: normal update
             ctx.add_change(RowChange::update_with_version(
-                &self.table,
                 old_key.clone(),
                 new_value.clone(),
                 row_version,

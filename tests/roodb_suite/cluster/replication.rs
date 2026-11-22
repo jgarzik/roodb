@@ -69,9 +69,9 @@ async fn wait_for_leader<'a>(nodes: &[&'a RaftNode], timeout_ms: u64) -> Option<
 }
 
 /// Helper to create a ChangeSet with a single insert
-fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
+fn insert_change(key: &[u8], value: &[u8]) -> ChangeSet {
     let mut cs = ChangeSet::new(1);
-    cs.push(RowChange::insert(table, key.to_vec(), value.to_vec()));
+    cs.push(RowChange::insert(key.to_vec(), value.to_vec()));
     cs
 }
 
@@ -223,7 +223,7 @@ async fn test_replication_consistency() {
     for i in 0..5 {
         let key = format!("consistency_key_{}", i).into_bytes();
         let value = format!("consistency_value_{}", i).into_bytes();
-        let changeset = insert_change("test", &key, &value);
+        let changeset = insert_change(&key, &value);
         leader.propose_changes(changeset).await.unwrap();
     }
 
@@ -297,7 +297,7 @@ async fn test_follower_read() {
     let _follower = follower.expect("No follower found");
 
     // Propose changes through leader
-    let changeset = insert_change("test", b"follower_read_key", b"follower_read_value");
+    let changeset = insert_change(b"follower_read_key", b"follower_read_value");
     leader.propose_changes(changeset).await.unwrap();
 
     // Wait for replication
@@ -359,14 +359,14 @@ async fn test_write_delete_sequence() {
         .expect("No leader found");
 
     // Propose an insert
-    let insert_cs = insert_change("test", b"delete_test_key", b"delete_test_value");
+    let insert_cs = insert_change(b"delete_test_key", b"delete_test_value");
     leader.propose_changes(insert_cs).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;
 
     // Propose a delete
     let mut delete_cs = ChangeSet::new(2);
-    delete_cs.push(RowChange::delete("test", b"delete_test_key".to_vec()));
+    delete_cs.push(RowChange::delete(b"delete_test_key".to_vec()));
     leader.propose_changes(delete_cs).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;
