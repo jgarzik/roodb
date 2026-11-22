@@ -502,6 +502,21 @@ impl LsmRaftStorage {
                     }
 
                     if is_table_record {
+                        // A replacement means the table with the record's
+                        // ID. If the name means another table by now, or
+                        // none (it was dropped, or dropped and created
+                        // again, while this change was being prepared), the
+                        // change is not for the table that is there.
+                        if change.op == ChangeOp::Update {
+                            let meant = decode_table(value).map(|record| record.def.id);
+                            let name = table_of_key(&change.key).unwrap_or_default();
+                            let there = self.catalog.read().get_table(&name).map(|def| def.id);
+                            if meant.is_none() || meant != there {
+                                return Ok(Err(format!(
+                                    "Table '{name}' was dropped or replaced by another statement"
+                                )));
+                            }
+                        }
                         match decode_table(value) {
                             // A temporary table belongs to one session on
                             // one node. Its definition is never stored.
@@ -543,9 +558,19 @@ impl LsmRaftStorage {
                     ));
                     live.insert(change.key.as_slice(), false);
                     if change.table == SYSTEM_TABLES {
-                        if let Some(name) = table_of_key(&change.key) {
-                            plan.catalog.push(CatalogOp::Unset(name));
+                        // A drop means the table with the ID it carries, as
+                        // a replacement does.
+                        let name = table_of_key(&change.key).unwrap_or_default();
+                        let meant = value
+                            .as_deref()
+                            .and_then(crate::catalog::store::dropped_table_id);
+                        let there = self.catalog.read().get_table(&name).map(|def| def.id);
+                        if meant.is_none() || meant != there {
+                            return Ok(Err(format!(
+                                "Table '{name}' was dropped or replaced by another statement"
+                            )));
                         }
+                        plan.catalog.push(CatalogOp::Unset(name));
                     } else if let Some(value) = value {
                         plan.tracked.push(TrackedChange {
                             table: change.table.clone(),

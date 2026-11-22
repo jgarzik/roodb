@@ -58,7 +58,9 @@ pub fn create_table(record: &TableRecord) -> RowChange {
     )
 }
 
-/// The change that replaces a table's record with `record`.
+/// The change that replaces a table's record with `record`. It means the
+/// table with `record`'s ID: if the name has come to mean another table by
+/// the time the change is applied, or none, it is refused.
 pub fn replace_table(record: &TableRecord) -> RowChange {
     RowChange::update(
         SYSTEM_TABLES,
@@ -67,9 +69,19 @@ pub fn replace_table(record: &TableRecord) -> RowChange {
     )
 }
 
-/// The change that removes a table's record.
-pub fn drop_table(name: &str) -> RowChange {
-    RowChange::delete(SYSTEM_TABLES, table_key(name))
+/// The change that removes a table's record. It means the table with this
+/// ID: if the name has come to mean another table by the time the change
+/// is applied, or none, it is refused.
+pub fn drop_table(name: &str, id: crate::executor::encoding::TableId) -> RowChange {
+    RowChange::delete_with_value(SYSTEM_TABLES, table_key(name), id.0.to_le_bytes().to_vec())
+}
+
+/// The ID a `drop_table` change says it means.
+pub fn dropped_table_id(value: &[u8]) -> Option<crate::executor::encoding::TableId> {
+    value
+        .try_into()
+        .ok()
+        .map(|bytes| crate::executor::encoding::TableId(u64::from_le_bytes(bytes)))
 }
 
 /// A row of a system table, as stored.

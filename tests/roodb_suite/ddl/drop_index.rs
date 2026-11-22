@@ -13,11 +13,11 @@ async fn test_drop_index_basic() {
         .await
         .expect("CREATE TABLE failed");
 
-    conn.query_drop("CREATE INDEX idx_name ON drop_idx_tbl (name)")
+    conn.query_drop("CREATE INDEX drop_idx_tbl_name ON drop_idx_tbl (name)")
         .await
         .expect("CREATE INDEX failed");
 
-    conn.query_drop("DROP INDEX idx_name")
+    conn.query_drop("DROP INDEX drop_idx_tbl_name")
         .await
         .expect("DROP INDEX failed");
 

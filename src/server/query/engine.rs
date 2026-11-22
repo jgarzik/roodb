@@ -2779,7 +2779,7 @@ impl QueryEngine {
         if old_table_name == record.def.name {
             changeset.push(store::replace_table(&record));
         } else {
-            changeset.push(store::drop_table(old_table_name));
+            changeset.push(store::drop_table(old_table_name, record.def.id));
             changeset.push(store::create_table(&record));
         }
         // The catalog is updated when the change is applied, before the

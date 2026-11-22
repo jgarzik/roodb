@@ -496,3 +496,81 @@ async fn the_log_is_purged_only_up_to_what_is_flushed() {
 
     node.shutdown().await.unwrap();
 }
+
+/// A change to a table says which table it means, by ID. If the name has
+/// come to mean another table by the time the change is applied (one
+/// session dropped and re-created it while another was preparing its
+/// change), the change is refused: it is not applied to the wrong table.
+#[tokio::test]
+async fn a_change_meant_for_another_table_of_the_name_is_refused() {
+    use roodb::catalog::store::{self, TableRecord};
+    use roodb::catalog::{ColumnDef, DataType, TableDef};
+    use roodb::executor::encoding::TableId;
+
+    let tls_config = test_raft_tls_config();
+    let addr: SocketAddr = format!("127.0.0.1:{}", test_port(15900)).parse().unwrap();
+    let storage = test_storage("stale_table_change").await;
+    let catalog = test_catalog();
+    let mut node = RaftNode::new(
+        1,
+        addr,
+        tls_config,
+        storage.0,
+        catalog.clone(),
+        storage.1,
+        true,
+    )
+    .await
+    .unwrap();
+    node.start_rpc_server().await.unwrap();
+    node.bootstrap_single_node().await.unwrap();
+
+    let record = |id: u64, columns: &[&str]| {
+        let mut def = TableDef::new("racing").with_id(TableId(id));
+        for column in columns {
+            def = def.column(ColumnDef::new(*column, DataType::Int));
+        }
+        TableRecord {
+            def,
+            indexes: Vec::new(),
+        }
+    };
+    let propose = |change| node.propose_changes(ChangeSet::new_with_changes(0, vec![change]));
+    let id_now = || catalog.read().get_table("racing").map(|def| def.id);
+
+    // The table as it is: ID 7001.
+    propose(store::create_table(&record(7001, &["a"])))
+        .await
+        .unwrap();
+    assert_eq!(id_now(), Some(TableId(7001)));
+
+    // Changes prepared against an earlier table of the name (ID 7000).
+    assert!(propose(store::drop_table("racing", TableId(7000)))
+        .await
+        .is_err());
+    assert!(propose(store::replace_table(&record(7000, &["a", "b"])))
+        .await
+        .is_err());
+    assert_eq!(id_now(), Some(TableId(7001)));
+    assert_eq!(catalog.read().get_table("racing").unwrap().columns.len(), 1);
+
+    // Changes that mean this table go through.
+    propose(store::replace_table(&record(7001, &["a", "b"])))
+        .await
+        .unwrap();
+    assert_eq!(catalog.read().get_table("racing").unwrap().columns.len(), 2);
+    propose(store::drop_table("racing", TableId(7001)))
+        .await
+        .unwrap();
+    assert_eq!(id_now(), None);
+
+    // And a change to a table that is no longer there is refused too.
+    assert!(propose(store::replace_table(&record(7001, &["a"])))
+        .await
+        .is_err());
+    assert!(propose(store::drop_table("racing", TableId(7001)))
+        .await
+        .is_err());
+
+    node.shutdown().await.unwrap();
+}

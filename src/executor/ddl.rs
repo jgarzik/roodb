@@ -258,7 +258,7 @@ impl Executor for DropTable {
             // The table's record goes; with it, its definition and its
             // indexes.
             let mut changeset = ChangeSet::new(0);
-            changeset.push(crate::catalog::store::drop_table(&self.name));
+            changeset.push(crate::catalog::store::drop_table(&self.name, table_id));
 
             // The table's triggers go with it. Their rows name the table in
             // the second column. Left behind, they would come back with the
