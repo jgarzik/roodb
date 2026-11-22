@@ -13,7 +13,7 @@ use roodb::io::{IoBackend, IoEngine};
 use roodb::raft::{Durability, LogStore, LogStoreConfig, RaftNode};
 use roodb::server::listener::RooDbServer;
 use roodb::storage::schema_version::is_initialized;
-use roodb::storage::{set_node_id, LsmConfig, LsmEngine, StorageEngine};
+use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 use roodb::tls::{RaftTlsConfig, TlsConfig};
 
 #[derive(Parser)]
@@ -252,7 +252,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raft_node.set_log_budget(log_budget_mb.max(1) << 20);
 
     // Set node ID for globally unique row ID generation
-    set_node_id(node_id);
 
     raft_node.start_rpc_server().await?;
     if raft_node.is_alone() {

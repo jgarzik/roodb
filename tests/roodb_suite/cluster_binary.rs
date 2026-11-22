@@ -388,9 +388,10 @@ async fn members_are_listed_and_a_node_can_be_removed() {
         .unwrap();
 }
 
-/// Rows of a table without a primary key get their keys from the node that
-/// inserts them. A node that becomes primary must give out keys no node
-/// gave out before: no row may be overwritten.
+/// Rows of a table without a primary key get generated keys. A node that
+/// becomes primary must give out keys no node gave out before (no row may
+/// be overwritten), and keys above all of those (rows stay in the order
+/// they were inserted).
 #[tokio::test]
 async fn generated_row_keys_stay_unique_across_a_failover() {
     let [mut first, second, third] = cluster_of_three().await;
@@ -436,11 +437,23 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
             .await
             .unwrap();
     }
-    // The old primary comes back and leads again or not; either way more
-    // rows are added, by whoever is primary then.
+    // The old primary comes back and is made primary again; it adds more
+    // rows.
     first.start();
     let all = [&first, &second, &third];
-    let leader = find_primary(&all).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let asked = find_primary(&all).await;
+        let mut on_primary = connect(all[asked]).await;
+        match on_primary.query_drop("ALTER CLUSTER SET PRIMARY 1").await {
+            Ok(()) => break,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "node 1 never became primary again: {e}"
+            ),
+        }
+    }
+    let leader = 0;
     let mut primary = connect(all[leader]).await;
     for n in 60..90 {
         primary
@@ -456,6 +469,11 @@ async fn generated_row_keys_stay_unique_across_a_failover() {
         &expected,
     )
     .await;
+    // And the rows are stored in the order they were inserted, whichever
+    // node inserted them: a table without a key reads back in insertion
+    // order, as it does in MySQL.
+    let stored: Vec<i32> = primary.query("SELECT n FROM nokey").await.unwrap();
+    assert_eq!(stored, expected, "rows are not in insertion order");
 }
 
 /// A node that needs more than the log still holds is brought up to date

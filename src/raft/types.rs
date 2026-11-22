@@ -24,10 +24,13 @@ pub enum Command {
     DataChange(ChangeSet),
     /// No-op for leader election
     Noop,
-    /// Row IDs below `upto` (the node-local counter) are reserved for
-    /// `node_id`. A node records this before handing any of them out, so that
-    /// after a restart it can resume past every ID it may have used.
-    ReserveRowIds { node_id: NodeId, upto: u64 },
+    /// Row IDs below `upto` are reserved. The primary records this before
+    /// it commits anything that uses them, so that after a restart, or on
+    /// another node that becomes primary, IDs continue past every ID that
+    /// may have been used. One counter for the cluster: the rows of a
+    /// table without a key stay in the order they were inserted, whichever
+    /// node inserted them.
+    ReserveRowIds { upto: u64 },
     /// What `roodb_init` wrote into the first node's storage before there
     /// was a log: stored keys and values, as they are. It is the first
     /// thing proposed when the cluster is formed, so that the log accounts
@@ -84,8 +87,8 @@ impl std::fmt::Display for Command {
                 changes.changes.len()
             ),
             Command::Noop => f.write_str("Noop"),
-            Command::ReserveRowIds { node_id, upto } => {
-                write!(f, "ReserveRowIds(node {node_id}, upto {upto})")
+            Command::ReserveRowIds { upto } => {
+                write!(f, "ReserveRowIds(upto {upto})")
             }
             Command::Seed(entries) => write!(f, "Seed({} entries)", entries.len()),
             Command::AllocNodeId => f.write_str("AllocNodeId"),

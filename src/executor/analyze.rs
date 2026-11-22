@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use crate::catalog::system_tables::SYSTEM_TABLE_STATISTICS;
 use crate::catalog::Catalog;
 use crate::raft::{ChangeSet, RaftNode, RowChange};
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 use crate::txn::MvccStorage;
 
 use super::datum::Datum;
@@ -136,8 +136,8 @@ impl Executor for AnalyzeTable {
             Datum::Timestamp(now),
         ]);
 
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
+        let local_id = allocate_row_id_batch(1);
+        let row_id = local_id;
         let key = encode_row_key(SYSTEM_TABLE_STATISTICS, row_id);
         let value = encode_row(&stats_row);
         changeset.push(RowChange::insert(SYSTEM_TABLE_STATISTICS, key, value));

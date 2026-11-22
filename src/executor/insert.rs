@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::sql::resolver::parse_default_value;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 use crate::txn::MvccStorage;
 
 use crate::server::session::UserVariables;
@@ -39,8 +39,8 @@ pub struct Insert {
     rows_inserted: u64,
     /// Whether execution is complete
     done: bool,
-    /// Pre-allocated row ID batch (start_local, node_id)
-    row_id_batch: Option<(u64, u64)>,
+    /// First of the row IDs allocated for this statement's rows
+    row_id_batch: Option<u64>,
     /// Next local ID to use from batch
     next_local_id: u64,
     /// Column indices that are auto_increment
@@ -108,8 +108,8 @@ impl Executor for Insert {
         // Pre-allocate row IDs for all rows (1 atomic instead of N)
         let row_count = self.values.len() as u64;
         if row_count > 0 {
-            let (start_local, node_id) = allocate_row_id_batch(row_count);
-            self.row_id_batch = Some((start_local, node_id));
+            let start_local = allocate_row_id_batch(row_count);
+            self.row_id_batch = Some(start_local);
             self.next_local_id = start_local;
         }
 
@@ -121,10 +121,12 @@ impl Executor for Insert {
             return Ok(None);
         }
 
-        // Get batch info (set in open())
-        let (_, node_id) = self.row_id_batch.ok_or_else(|| {
-            super::error::ExecutorError::Internal("Row ID batch not initialized".to_string())
-        })?;
+        // Row IDs are allocated in open()
+        if self.row_id_batch.is_none() {
+            return Err(super::error::ExecutorError::Internal(
+                "Row ID batch not initialized".to_string(),
+            ));
+        }
 
         // Insert all rows
         let empty_row = Row::empty();
@@ -171,7 +173,7 @@ impl Executor for Insert {
             }
 
             // Get next row ID from pre-allocated batch
-            let row_id = encode_row_id(self.next_local_id, node_id);
+            let row_id = self.next_local_id;
             self.next_local_id += 1;
 
             // AUTO_INCREMENT: NULL and 0 ask for the table's next value; a

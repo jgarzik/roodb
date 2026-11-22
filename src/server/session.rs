@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 
 use crate::executor::Datum;
 use crate::raft::RowChange;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 use crate::txn::{IsolationLevel, TimeoutConfig};
 
 /// Thread-safe per-session user variable storage (@var)
@@ -40,8 +40,6 @@ pub struct IdBatch {
     next_local: u64,
     /// End of the allocated range (exclusive)
     end_local: u64,
-    /// Node ID for encoding full row IDs
-    node_id: u64,
 }
 
 impl IdBatch {
@@ -50,7 +48,6 @@ impl IdBatch {
         Self {
             next_local: 0,
             end_local: 0,
-            node_id: 0,
         }
     }
 
@@ -66,7 +63,7 @@ impl IdBatch {
         if self.next_local < self.end_local {
             let local = self.next_local;
             self.next_local += 1;
-            Some(encode_row_id(local, self.node_id))
+            Some(local)
         } else {
             None
         }
@@ -74,10 +71,9 @@ impl IdBatch {
 
     /// Refill this batch from the global allocator
     fn refill(&mut self, count: u64) {
-        let (start, node_id) = allocate_row_id_batch(count);
+        let start = allocate_row_id_batch(count);
         self.next_local = start;
         self.end_local = start + count;
-        self.node_id = node_id;
     }
 }
 

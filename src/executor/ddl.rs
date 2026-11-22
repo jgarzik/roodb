@@ -18,7 +18,7 @@ use crate::catalog::system_tables::{
 };
 use crate::catalog::{Catalog, ColumnDef, Constraint, IndexDef, TableDef};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 
 use super::datum::Datum;
 use super::encoding::{encode_row, encode_row_key};
@@ -142,11 +142,11 @@ impl Executor for CreateTable {
             let column_rows = table_def_to_columns_rows(&table_def);
             let constraint_rows = table_def_to_constraints_rows(&table_def);
             let total_ids = 1 + column_rows.len() as u64 + constraint_rows.len() as u64;
-            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+            let mut next_local = allocate_row_id_batch(total_ids);
 
             // Insert into system.tables
             let table_row = table_def_to_tables_row(&table_def);
-            let row_id = encode_row_id(next_local, node_id);
+            let row_id = next_local;
             next_local += 1;
             let key = encode_row_key(SYSTEM_TABLES, row_id);
             let value = encode_row(&table_row);
@@ -156,7 +156,7 @@ impl Executor for CreateTable {
 
             // Insert into system.columns (one row per column)
             for col_row in column_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_COLUMNS, row_id);
                 let value = encode_row(&col_row);
@@ -171,7 +171,7 @@ impl Executor for CreateTable {
 
             // Insert into system.constraints (one row per constraint)
             for constraint_row in constraint_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
                 let value = encode_row(&constraint_row);
@@ -573,8 +573,8 @@ impl Executor for CreateIndex {
             let mut changeset = ChangeSet::new(0);
 
             // Allocate single row ID for system.indexes
-            let (local_id, node_id) = allocate_row_id_batch(1);
-            let row_id = encode_row_id(local_id, node_id);
+            let local_id = allocate_row_id_batch(1);
+            let row_id = local_id;
 
             // Insert into system.indexes
             let index_row = index_def_to_row(&index_def);
@@ -810,8 +810,8 @@ impl Executor for CreateDatabase {
             use crate::catalog::system_tables::SYSTEM_DATABASES;
 
             // Write to system.databases via Raft
-            let (start, node_id) = allocate_row_id_batch(1);
-            let row_id = encode_row_id(start, node_id);
+            let start = allocate_row_id_batch(1);
+            let row_id = start;
 
             let row = Row::new(vec![Datum::String(self.name.clone())]);
             let key = encode_row_key(SYSTEM_DATABASES, row_id);
@@ -1082,17 +1082,17 @@ impl CreateTableAs {
             let column_rows = table_def_to_columns_rows(&table_def);
             let constraint_rows = table_def_to_constraints_rows(&table_def);
             let total_ids = 1 + column_rows.len() as u64 + constraint_rows.len() as u64;
-            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+            let mut next_local = allocate_row_id_batch(total_ids);
 
             let table_row = table_def_to_tables_row(&table_def);
-            let row_id = encode_row_id(next_local, node_id);
+            let row_id = next_local;
             next_local += 1;
             let key = encode_row_key(SYSTEM_TABLES, row_id);
             let value = encode_row(&table_row);
             changeset.push(RowChange::insert(SYSTEM_TABLES, key, value));
 
             for col_row in column_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_COLUMNS, row_id);
                 let value = encode_row(&col_row);
@@ -1100,7 +1100,7 @@ impl CreateTableAs {
             }
 
             for constraint_row in constraint_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
                 let value = encode_row(&constraint_row);
@@ -1151,18 +1151,16 @@ impl Executor for CreateTableAs {
         // Phase 2: Stream rows from source SELECT into the new table
         // Allocate row IDs in batches for performance
         let batch_size = 1000u64;
-        let (mut next_local, node_id) = allocate_row_id_batch(batch_size);
+        let mut next_local = allocate_row_id_batch(batch_size);
         let mut batch_remaining = batch_size;
 
         while let Some(row) = self.source.next().await? {
             if batch_remaining == 0 {
-                let (new_local, new_node) = allocate_row_id_batch(batch_size);
-                next_local = new_local;
-                let _ = new_node; // Same node
+                next_local = allocate_row_id_batch(batch_size);
                 batch_remaining = batch_size;
             }
 
-            let row_id = encode_row_id(next_local, node_id);
+            let row_id = next_local;
             next_local += 1;
             batch_remaining -= 1;
 

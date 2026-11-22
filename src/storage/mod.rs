@@ -10,5 +10,4 @@ pub mod traits;
 
 pub use error::{StorageError, StorageResult};
 pub use lsm::{LsmConfig, LsmEngine};
-pub use row_id::set_node_id;
 pub use traits::StorageEngine;

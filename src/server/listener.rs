@@ -16,7 +16,7 @@ use crate::raft::RaftNode;
 use crate::server::conn_threads::ConnectionThreads;
 use crate::server::context::ServerContext;
 use crate::server::handler::handle_connection;
-use crate::storage::{set_node_id, StorageEngine};
+use crate::storage::StorageEngine;
 use crate::tls::{RaftTlsConfig, TlsConfig};
 use crate::txn::TransactionManager;
 
@@ -281,7 +281,6 @@ pub async fn start_test_server(
     .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
     // Set node ID for globally unique row ID generation
-    set_node_id(node_id);
 
     raft_node
         .start_rpc_server()

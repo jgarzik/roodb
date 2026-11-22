@@ -2767,7 +2767,7 @@ impl QueryEngine {
         };
         use crate::executor::encoding::{encode_row, encode_row_key};
         use crate::raft::RowChange;
-        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+        use crate::storage::row_id::allocate_row_id_batch;
 
         let mut changeset = ChangeSet::new(0);
 
@@ -2865,8 +2865,8 @@ impl QueryEngine {
 
             // Insert new system.tables row
             let table_row = table_def_to_tables_row(new_def);
-            let (mut next_local, node_id) = allocate_row_id_batch(1);
-            let row_id = encode_row_id(next_local, node_id);
+            let mut next_local = allocate_row_id_batch(1);
+            let row_id = next_local;
             next_local += 1;
             let _ = next_local; // suppress unused warning
             let key = encode_row_key(SYSTEM_TABLES, row_id);
@@ -2880,10 +2880,10 @@ impl QueryEngine {
         let total_ids = column_rows.len() as u64 + constraint_rows.len() as u64;
 
         if total_ids > 0 {
-            let (mut next_local, node_id) = allocate_row_id_batch(total_ids);
+            let mut next_local = allocate_row_id_batch(total_ids);
 
             for col_row in column_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_COLUMNS, row_id);
                 let value = encode_row(&col_row);
@@ -2891,7 +2891,7 @@ impl QueryEngine {
             }
 
             for constraint_row in constraint_rows {
-                let row_id = encode_row_id(next_local, node_id);
+                let row_id = next_local;
                 next_local += 1;
                 let key = encode_row_key(SYSTEM_CONSTRAINTS, row_id);
                 let value = encode_row(&constraint_row);
@@ -4184,7 +4184,7 @@ impl QueryEngine {
         use crate::catalog::ViewDef;
         use crate::executor::encoding::{encode_row, encode_row_key};
         use crate::raft::RowChange;
-        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+        use crate::storage::row_id::allocate_row_id_batch;
 
         let view_name = view_name.trim_matches('`').to_string();
 
@@ -4258,8 +4258,8 @@ impl QueryEngine {
             query_sql: query_sql.to_string(),
         };
 
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
+        let local_id = allocate_row_id_batch(1);
+        let row_id = local_id;
         let view_row = view_def_to_row(&view_def);
         let key = encode_row_key(SYSTEM_VIEWS, row_id);
         let value = encode_row(&view_row);
@@ -4383,7 +4383,7 @@ impl QueryEngine {
         use crate::catalog::system_tables::{trigger_def_to_row, SYSTEM_TRIGGERS};
         use crate::catalog::TriggerDef;
         use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+        use crate::storage::row_id::allocate_row_id_batch;
 
         let def = match TriggerDef::from_create_sql(sql) {
             Ok(def) => def,
@@ -4432,8 +4432,8 @@ impl QueryEngine {
 
         // A trigger is schema: it is stored in a system table through Raft
         // like the rest, and the catalog picks it up when that is applied.
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let key = encode_row_key(SYSTEM_TRIGGERS, encode_row_id(local_id, node_id));
+        let local_id = allocate_row_id_batch(1);
+        let key = encode_row_key(SYSTEM_TRIGGERS, local_id);
         let value = encode_row(&trigger_def_to_row(&def));
         let changeset =
             ChangeSet::new_with_changes(0, vec![RowChange::insert(SYSTEM_TRIGGERS, key, value)]);
@@ -4759,10 +4759,10 @@ impl QueryEngine {
         // Write to system.procedures via Raft
         use crate::catalog::system_tables::procedure_def_to_row;
         use crate::executor::encoding::{encode_row, encode_row_key};
-        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+        use crate::storage::row_id::allocate_row_id_batch;
 
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
+        let local_id = allocate_row_id_batch(1);
+        let row_id = local_id;
         let proc_row = procedure_def_to_row(&proc_def);
         let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
         let value = encode_row(&proc_row);
@@ -5082,10 +5082,10 @@ impl QueryEngine {
         use crate::catalog::system_tables::procedure_def_to_row;
         use crate::executor::encoding::{encode_row, encode_row_key};
         use crate::raft::RowChange;
-        use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+        use crate::storage::row_id::allocate_row_id_batch;
 
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
+        let local_id = allocate_row_id_batch(1);
+        let row_id = local_id;
         let proc_row = procedure_def_to_row(&proc_def);
         let key = encode_row_key(SYSTEM_PROCEDURES, row_id);
         let value = encode_row(&proc_row);

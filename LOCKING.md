@@ -281,18 +281,20 @@ been sent.
 
 ## Row ID Generation
 
-Row IDs are cluster-unique via node-ID-in-high-bits encoding (`src/storage/row_id.rs`):
+Row IDs come from one counter for the cluster (`src/storage/row_id.rs`). Only
+the primary hands them out:
 
-- **Format:** `[16-bit node_id][48-bit local counter]` — supports 65536 nodes, 281T rows/node
-- **`NODE_ID: AtomicU64`** — static, set once at startup from the Raft node ID (SeqCst)
-- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — single global counter (`fetch_add`) plus a `limit`: the end of the range this node has reserved
+- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — the counter (`fetch_add`) plus a `limit`: the end of the range reserved so far
 - **`next_row_id()`** / **`allocate_row_id_batch(count)`** — never block and never wait on Raft
 
-Ranges are reserved through Raft (`Command::ReserveRowIds`) ahead of use. An
-ID may be handed out beyond the recorded reservation, but a commit that uses
-one waits until a reservation covering it has been applied. After a restart
-the counter resumes above everything reserved, so an ID that reached storage
-is never issued again.
+Ranges are reserved through Raft (`Command::ReserveRowIds`) ahead of use, and
+every node follows the reserved bound as it applies the log. An ID may be
+handed out beyond the recorded reservation, but a commit that uses one waits
+until a reservation covering it has been applied. After a restart, and on a
+node that becomes primary, the counter resumes above everything reserved: an
+ID that reached storage is never issued again, and IDs ascend in the order
+rows were inserted, whichever node inserted them (a table without a primary
+key reads back in insertion order).
 
 ## Adding New Locks
 

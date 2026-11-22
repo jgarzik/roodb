@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::planner::logical::ResolvedColumn;
 use crate::raft::RowChange;
 use crate::sql::resolver::parse_default_value;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
@@ -149,8 +149,8 @@ impl Executor for InsertSelect {
             }
 
             // Allocate row ID per-row
-            let (local_id, node_id) = allocate_row_id_batch(1);
-            let row_id = encode_row_id(local_id, node_id);
+            let local_id = allocate_row_id_batch(1);
+            let row_id = local_id;
 
             // AUTO_INCREMENT, as for INSERT ... VALUES: NULL and 0 ask for
             // the table's next value; a value given moves the counter.

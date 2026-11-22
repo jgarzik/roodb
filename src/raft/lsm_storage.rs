@@ -77,15 +77,8 @@ const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 /// other key is data.
 pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
 
-/// Prefix of the keys holding each node's reserved row ID bound (u64, little
-/// endian), followed by the node ID in big endian.
-const ROW_ID_KEY_PREFIX: &[u8] = b"_raft:sm:row_id:";
-
-fn row_id_key(node_id: u64) -> Vec<u8> {
-    let mut key = ROW_ID_KEY_PREFIX.to_vec();
-    key.extend_from_slice(&node_id.to_be_bytes());
-    key
-}
+/// The reserved row ID bound of the cluster (u64, little endian).
+const ROW_ID_KEY: &[u8] = b"_raft:sm:row_id";
 
 /// The stored bound is moved this far past the ID that crosses it, so that it
 /// is rewritten once per this many transactions rather than once per entry.
@@ -132,8 +125,6 @@ pub struct LsmRaftStorage {
     auto_increment: Arc<crate::txn::AutoIncrement>,
     /// The bound as stored: never below `applied_txn_floor`.
     stored_txn_bound: Arc<AtomicU64>,
-    /// This node's ID: whose row ID reservations are its own.
-    node_id: u64,
 }
 
 /// A change to a system table, noted so the catalog can follow once the
@@ -172,7 +163,6 @@ impl LsmRaftStorage {
     pub async fn new(
         storage: Arc<dyn StorageEngine>,
         catalog: Arc<RwLock<Catalog>>,
-        node_id: u64,
     ) -> Result<Self, StorageError> {
         let this = Self {
             storage,
@@ -182,7 +172,6 @@ impl LsmRaftStorage {
             applied_txn_floor: Arc::new(AtomicU64::new(0)),
             stored_txn_bound: Arc::new(AtomicU64::new(0)),
             auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
-            node_id,
         };
 
         // Load existing state from LSM into caches
@@ -207,12 +196,7 @@ impl LsmRaftStorage {
 
         // Row IDs: resume past what was reserved, and hand none out until a
         // new range has been reserved through Raft.
-        let reserved = match self
-            .storage
-            .get(&row_id_key(self.node_id))
-            .await
-            .map_err(read_err)?
-        {
+        let reserved = match self.storage.get(ROW_ID_KEY).await.map_err(read_err)? {
             Some(data) => {
                 let bytes: [u8; 8] = data
                     .as_slice()
@@ -1123,11 +1107,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             let response = match &entry.payload {
                 EntryPayload::Blank => CommandResponse::Ok(None),
                 EntryPayload::Normal(Command::Noop) => CommandResponse::Ok(None),
-                EntryPayload::Normal(Command::ReserveRowIds { node_id, upto }) => {
+                EntryPayload::Normal(Command::ReserveRowIds { upto }) => {
                     // Reservations can be proposed out of order; the stored
                     // bound only ever grows, as the one in memory does.
-                    let key = row_id_key(*node_id);
-                    let stored = match self.storage.get(&key).await.map_err(read_err)? {
+                    let stored = match self.storage.get(ROW_ID_KEY).await.map_err(read_err)? {
                         Some(data) => data
                             .as_slice()
                             .try_into()
@@ -1136,10 +1119,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                         None => 0,
                     };
                     let bound = stored.max(*upto);
-                    batch.push((key, Some(bound.to_le_bytes().to_vec())));
-                    if *node_id == self.node_id {
-                        reserved_row_ids = Some(bound);
-                    }
+                    batch.push((ROW_ID_KEY.to_vec(), Some(bound.to_le_bytes().to_vec())));
+                    // Every node follows the bound: whichever becomes
+                    // primary goes on past it.
+                    reserved_row_ids = Some(bound);
                     CommandResponse::Ok(None)
                 }
                 EntryPayload::Normal(Command::Seed(entries)) => {

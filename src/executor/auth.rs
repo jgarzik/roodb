@@ -10,7 +10,7 @@ use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
 use crate::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 
 use super::datum::Datum;
 use super::encoding::{encode_row, encode_row_key, table_key_end, table_key_prefix};
@@ -143,8 +143,8 @@ impl Executor for CreateUser {
         ]);
 
         // Encode for storage
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
+        let local_id = allocate_row_id_batch(1);
+        let row_id = local_id;
         let key = encode_row_key(SYSTEM_USERS, row_id);
         let value = encode_row(&user_row);
 
@@ -630,9 +630,9 @@ impl Executor for Grant {
         };
 
         // Pre-allocate row IDs for all grants
-        let (mut next_local, node_id) = allocate_row_id_batch(privs.len() as u64);
+        let first_row_id = allocate_row_id_batch(privs.len() as u64);
 
-        for priv_type in &privs {
+        for (row_id, priv_type) in (first_row_id..).zip(&privs) {
             let (object_type, db_name, table_name) = match &self.object {
                 PrivilegeObject::Global => ("GLOBAL".to_string(), Datum::Null, Datum::Null),
                 PrivilegeObject::Database(db) => (
@@ -661,8 +661,6 @@ impl Executor for Grant {
                 Datum::Null,                                           // granted_at
             ]);
 
-            let row_id = encode_row_id(next_local, node_id);
-            next_local += 1;
             let key = encode_row_key(SYSTEM_GRANTS, row_id);
             let value = encode_row(&grant_row);
 

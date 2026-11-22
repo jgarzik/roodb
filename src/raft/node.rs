@@ -131,11 +131,11 @@ const ROW_ID_POLL: Duration = Duration::from_millis(20);
 
 /// Reserve `block` more row IDs for this node, past both what is reserved
 /// and what has been handed out.
-async fn reserve_row_ids(raft: &Raft, node_id: NodeId, block: u64) -> Result<(), RaftNodeError> {
+async fn reserve_row_ids(raft: &Raft, block: u64) -> Result<(), RaftNodeError> {
     let (next, limit) = crate::storage::row_id::generator().demand();
     let upto = next.max(limit.unwrap_or(0)) + block;
     let response = raft
-        .client_write(Command::ReserveRowIds { node_id, upto })
+        .client_write(Command::ReserveRowIds { upto })
         .await
         .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
     match response.data {
@@ -152,7 +152,7 @@ async fn reserve_row_ids(raft: &Raft, node_id: NodeId, block: u64) -> Result<(),
 /// load quickly gets ranges to match while an idle server wastes few IDs on
 /// a restart. Runs until the node shuts down; a failed attempt (this node is
 /// not the leader, say) is simply tried again.
-async fn row_id_task(raft: Raft, node_id: NodeId) {
+async fn row_id_task(raft: Raft) {
     let generator = crate::storage::row_id::generator();
     let mut block = ROW_ID_MIN_BLOCK;
     let mut last_next = generator.demand().0;
@@ -171,7 +171,7 @@ async fn row_id_task(raft: Raft, node_id: NodeId) {
         let used = next.saturating_sub(last_next);
         block = (used * 2).clamp(ROW_ID_MIN_BLOCK, ROW_ID_MAX_BLOCK);
         last_next = next;
-        if let Err(e) = reserve_row_ids(&raft, node_id, block).await {
+        if let Err(e) = reserve_row_ids(&raft, block).await {
             tracing::debug!(error = %e, "row ID reservation not made; will retry");
         }
     }
@@ -255,7 +255,7 @@ impl RaftNode {
 
         // The state machine applies committed entries to the LSM; the log
         // store holds the entries themselves.
-        let state_machine = LsmRaftStorage::new(storage.clone(), catalog, id)
+        let state_machine = LsmRaftStorage::new(storage.clone(), catalog)
             .await
             .map_err(|e| RaftNodeError::Raft(e.to_string()))?;
         let stored_members = state_machine.member_count();
@@ -320,7 +320,7 @@ impl RaftNode {
 
         // Runs on every node: only a leader's reservations succeed, and a
         // follower that becomes leader needs them at once.
-        let row_id_reserver = tokio::spawn(row_id_task(raft.clone(), id));
+        let row_id_reserver = tokio::spawn(row_id_task(raft.clone()));
 
         Ok(Self {
             id,
@@ -483,8 +483,7 @@ impl RaftNode {
                         // and reserve afresh before any is handed out.
                         let Some(node) = node.upgrade() else { return };
                         crate::storage::row_id::generator().skip_reserved();
-                        if let Err(e) = reserve_row_ids(&node.raft, node.id, ROW_ID_MIN_BLOCK).await
-                        {
+                        if let Err(e) = reserve_row_ids(&node.raft, ROW_ID_MIN_BLOCK).await {
                             tracing::warn!(error = %e, "Could not reserve row IDs on becoming leader");
                         }
                     }
@@ -832,7 +831,7 @@ impl RaftNode {
         // start past them, with a fresh range reserved before serving.
         if self.is_alone() {
             crate::storage::row_id::generator().skip_reserved();
-            reserve_row_ids(&self.raft, self.id, ROW_ID_MIN_BLOCK).await?;
+            reserve_row_ids(&self.raft, ROW_ID_MIN_BLOCK).await?;
         }
         Ok(())
     }
@@ -961,7 +960,7 @@ impl RaftNode {
         let _gate = self.row_id_gate.lock().await;
         // Another commit may have made the reservation while we waited.
         if generator.uncovered().is_some() {
-            reserve_row_ids(&self.raft, self.id, ROW_ID_MIN_BLOCK).await?;
+            reserve_row_ids(&self.raft, ROW_ID_MIN_BLOCK).await?;
         }
         Ok(())
     }

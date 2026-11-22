@@ -1,31 +1,13 @@
-//! Unified row ID generator
+//! Row ID generator
 //!
-//! Provides globally unique row IDs across all operations (INSERT, DDL, auth).
-//! Row IDs are unique across the cluster by encoding node_id in the high bits.
-//!
-//! Format: [16-bit node_id] [48-bit local counter]
-//! This allows 65536 nodes and 281 trillion rows per node.
+//! Row IDs for rows without a key of their own (tables without a primary
+//! key, system table rows). One counter for the cluster: only the primary
+//! hands IDs out, the ranges it may have used are recorded in the log
+//! (`Command::ReserveRowIds`), and a node that becomes primary continues
+//! past them. IDs therefore ascend in the order rows were inserted,
+//! whichever node inserted them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Node ID for this server instance (set at startup)
-///
-/// Used to ensure row IDs are globally unique across the cluster.
-/// The node_id is encoded in the high 16 bits of each row ID.
-static NODE_ID: AtomicU64 = AtomicU64::new(0);
-
-/// Set the node ID for row ID generation
-///
-/// Must be called once at startup before any row IDs are generated.
-/// The node_id should match the Raft node ID for consistency.
-pub fn set_node_id(node_id: u64) {
-    NODE_ID.store(node_id, Ordering::SeqCst);
-}
-
-/// Get the current node ID
-pub fn get_node_id() -> u64 {
-    NODE_ID.load(Ordering::SeqCst)
-}
 
 /// Hands out row IDs, in order.
 ///
@@ -142,32 +124,16 @@ pub fn generator() -> &'static RowIdGenerator {
     &GLOBAL_ROW_ID_GEN
 }
 
-/// Generate a globally unique row ID
-///
-/// Format: upper 16 bits = node_id, lower 48 bits = local counter
-/// This supports up to 65535 nodes and ~281 trillion rows per node.
+/// Generate the next row ID
 #[inline]
 pub fn next_row_id() -> u64 {
-    let local = GLOBAL_ROW_ID_GEN.next();
-    let node_id = NODE_ID.load(Ordering::SeqCst);
-    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
+    GLOBAL_ROW_ID_GEN.next()
 }
 
-/// Allocate a batch of row IDs, returning the starting local counter and node_id
-///
-/// Returns (start_local, node_id) where caller can construct IDs as:
-/// `(node_id << 48) | ((start_local + i) & 0x0000_FFFF_FFFF_FFFF)`
+/// Allocate `count` consecutive row IDs and return the first.
 #[inline]
-pub fn allocate_row_id_batch(count: u64) -> (u64, u64) {
-    let start_local = GLOBAL_ROW_ID_GEN.allocate_batch(count);
-    let node_id = NODE_ID.load(Ordering::SeqCst);
-    (start_local, node_id)
-}
-
-/// Encode a local counter and node_id into a row ID
-#[inline]
-pub fn encode_row_id(local: u64, node_id: u64) -> u64 {
-    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
+pub fn allocate_row_id_batch(count: u64) -> u64 {
+    GLOBAL_ROW_ID_GEN.allocate_batch(count)
 }
 
 /// Get current row ID without incrementing (for debugging/testing)
@@ -202,21 +168,6 @@ mod tests {
         let id1 = next_row_id();
         let id2 = next_row_id();
         assert!(id2 > id1);
-    }
-
-    #[test]
-    fn test_node_id_encoding() {
-        // Test that node_id is properly encoded in high bits
-        set_node_id(5);
-        let id = next_row_id();
-        // Extract node_id from high 16 bits
-        let extracted_node_id = id >> 48;
-        assert_eq!(extracted_node_id, 5);
-        // Local counter should be in low 48 bits
-        let local_counter = id & 0x0000_FFFF_FFFF_FFFF;
-        assert!(local_counter > 0);
-        // Reset for other tests
-        set_node_id(0);
     }
 
     #[test]
