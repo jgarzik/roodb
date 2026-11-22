@@ -780,6 +780,24 @@ supported.
   innodb_lock_wait_timeout = n`; the global form needs `root`) fails with
   error 1205. Only that statement
   fails; the transaction stays open.
+- **Tables stay as they are under a transaction.** Every statement locks
+  the tables and views it uses against change (a shared metadata lock),
+  for its transaction, or for itself if it runs in none. A statement that
+  changes the schema (`CREATE`, `ALTER`, `DROP` of a table, index, view,
+  trigger or database) waits until every transaction that has used the
+  table has ended, and while it waits, statements that come to the table
+  after it wait behind it. Such a wait is bounded by `lock_wait_timeout`
+  seconds (default 31536000, a year, as in MySQL; `SET [SESSION | GLOBAL]
+  lock_wait_timeout = n`), after which the waiting statement fails with
+  error 1205. A cycle of waits that goes through a table and a row is a
+  deadlock like any other (error 1213). In a cluster these locks are held
+  on the primary; a query on another node reads the table as that node has
+  it.
+- **A schema change commits.** A statement that changes the schema
+  (the above, and `CREATE`/`DROP` of a procedure or function) first commits
+  the session's open transaction, as in MySQL, and is not itself part of a
+  transaction: it cannot be rolled back. `TRUNCATE` does not commit yet;
+  nor does anything done to a temporary table.
 - **A conflict can still be found at `COMMIT`** when a transaction changes
   a row it did not lock at the time, which today means a row it inserted
   itself (see the next point). The commit then fails with error 1213 and
@@ -895,6 +913,7 @@ prefixes are accepted.
 | `sql_mode` | Session value; initially `ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,NO_ZERO_DATE,NO_ZERO_IN_DATE,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES` |
 | `autocommit` | Session value |
 | `innodb_lock_wait_timeout` | Session value, seconds; initially 50 |
+| `lock_wait_timeout` | Session value, seconds; initially 31536000 |
 | `transaction_isolation`, `tx_isolation` | `REPEATABLE-READ` (fixed) |
 | `max_allowed_packet` | `16777216` |
 | `character_set_client`, `character_set_connection`, `character_set_results` | `utf8mb4` |
@@ -1073,7 +1092,8 @@ unknown function, duplicate view or procedure) are reported as 1105.
   is found at `COMMIT`).
 - `UPDATE` and `DELETE` do not find rows the same transaction inserted.
 - No savepoints, no `XA`, no `COMMIT WORK` / `AND CHAIN`.
-- DDL is neither transactional nor an implicit commit.
+- DDL is not transactional (as in MySQL, it commits the open transaction).
+  `TRUNCATE` is run as a `DELETE` and does not commit.
 
 **Queries**
 
@@ -1116,6 +1136,6 @@ unknown function, duplicate view or procedure) are reported as 1105.
   only those variables.
 - `SHOW VARIABLES` and `SHOW PROCESSLIST` are empty; `SHOW STATUS` reports
   only lock counts (`Innodb_row_lock_current_waits`, `Roodb_row_locks`,
-  `Roodb_gap_locks`);
+  `Roodb_gap_locks`, `Roodb_metadata_locks`, `Roodb_metadata_lock_waits`);
   `INFORMATION_SCHEMA` is a small fixed emulation.
 - `LOAD DATA` reads server-side files into single-column tables only.

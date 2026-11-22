@@ -281,8 +281,36 @@ been sent.
 
 `MetadataLocks` is the table of locks that transactions hold on table
 names, so that a table is not changed or dropped under a statement that is
-using it. It is a module with its own tests; the server does not take
-these locks yet.
+using it.
+
+**Who takes them** (`server/query/engine.rs`). A statement's plan comes
+with the names of the stored tables and the views it uses, which the
+resolver noted as it looked them up (`Resolver::used_tables`). Once the
+statement's transaction is known, each is locked shared through the
+session's `MdlSession`, for the transaction that owns the statement's row
+locks (the open transaction, or the implicit one of an autocommit write or
+locking read), or, for a plain autocommit read, which has no transaction,
+for the session (`lock_owner`: an ID out of the way of transaction IDs).
+The catalog's version is then compared with the one the plan was made at:
+a schema change may have got in between planning and locking, and then the
+statement is planned again (a statement of a routine's body, or a side of a
+`UNION`, fails with error 1412 instead). A transaction's locks go when it
+ends (`end_session_transaction`); everything else the session holds goes at
+the end of each statement a client sent (`end_of_statement`), and all of it
+when the session does.
+
+A schema change first commits the session's open transaction, then takes
+(`begin_schema_change`, in sorted order) each table or view it creates,
+changes or drops exclusively, and that table's database, as the name
+`(database, "")`, shared; `CREATE` and `DROP DATABASE` take the database
+exclusively, and `DROP DATABASE` every table and view in it. These locks
+are the statement's and go when it ends. A session's own temporary tables
+are not locked: nobody else can name them.
+
+The locks are this node's. Statements that write, lock or change the
+schema run on the primary only; a query on another node is not held back
+by a schema change, which reaches that node through the log, and keeps the
+table layout it started with.
 
 - **What is locked** is a name, `TableName { database, table }`, not a
   table: a name nothing is stored under yet can be locked (`CREATE TABLE`,

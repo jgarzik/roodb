@@ -19,7 +19,9 @@ mod undo_log;
 pub use auto_inc::AutoIncrement;
 pub use lock::{LockError, LockManager, LockMode, DEFAULT_LOCK_WAIT_SECS};
 pub use manager::TransactionManager;
-pub use mdl::{MdlError, MdlMode, MdlSession, MdlTarget, MetadataLocks};
+pub use mdl::{
+    MdlError, MdlMode, MdlSession, MdlTarget, MetadataLocks, DEFAULT_METADATA_LOCK_WAIT_SECS,
+};
 pub use mvcc_storage::MvccStorage;
 pub use purge::PurgeTask;
 pub use read_view::ReadView;

@@ -51,6 +51,8 @@ Distributed SQL database in Rust. TLS-only networking, Raft consensus, MVCC tran
 - `TransactionManager` - MVCC coordination
 - `RaftNode` - consensus and replication
 
+**Metadata locks**: a statement locks the tables and views it uses against change until its transaction ends, and a schema change waits for those locks and commits the session's open transaction first (`txn/mdl.rs`; LOCKING.md says who takes what, and how the common case costs one atomic step). A plan is run only if the catalog is still at the version it was planned at once its tables are locked; otherwise the statement is planned again.
+
 **Statement failures**: a statement that fails is reported to the client and the session goes on (`QueryEngine::handle_statement`, the one entry both protocols use for a client's statement); only a failure of the connection itself (I/O, framing, TLS, login) ends it. `handle_query` underneath returns a statement's failure to its caller, which a procedure running the statements of its body needs.
 
 **Per-Connection State**:

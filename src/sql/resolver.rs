@@ -39,6 +39,10 @@ pub struct Resolver<'a> {
     /// other temporary table in the catalog belongs to another session and
     /// is not found.
     session_temp_tables: Option<Vec<TableName>>,
+    /// The stored tables and the views looked up so far: what the
+    /// statement being resolved uses, in whatever part of it. (A session's
+    /// temporary tables are its own and are not listed.)
+    used: std::cell::RefCell<Vec<TableName>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -52,6 +56,7 @@ impl<'a> Resolver<'a> {
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_temp_tables: None,
             database: None,
+            used: Default::default(),
         }
     }
 
@@ -65,6 +70,7 @@ impl<'a> Resolver<'a> {
             ctes: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_temp_tables: None,
             database: None,
+            used: Default::default(),
         }
     }
 
@@ -140,8 +146,23 @@ impl<'a> Resolver<'a> {
         let def = self.catalog.get_table(name)?;
         match &self.session_temp_tables {
             Some(owned) if def.is_temporary && !owned.contains(name) => None,
-            _ => Some(def),
+            _ => {
+                if !def.is_temporary {
+                    self.used.borrow_mut().push(name.clone());
+                }
+                Some(def)
+            }
         }
+    }
+
+    /// The stored tables and the views the statements resolved so far use,
+    /// each once, in order of name: what must stay as it is while the
+    /// statement runs.
+    pub fn used_tables(&self) -> Vec<TableName> {
+        let mut used = self.used.borrow().clone();
+        used.sort_unstable();
+        used.dedup();
+        used
     }
 
     /// Resolve a statement
@@ -1788,7 +1809,11 @@ impl<'a> Resolver<'a> {
                         ctes: Default::default(),
                         database: Some(view_def.name.database.clone()),
                         session_temp_tables: self.session_temp_tables.clone(),
+                        used: Default::default(),
                     };
+                    // The view is used, and through it whatever its query
+                    // uses.
+                    self.used.borrow_mut().push(table_name.clone());
 
                     let view_sql = view_def.query_sql.clone();
                     let view_stmt = crate::sql::Parser::parse_one(&view_sql).map_err(|e| {
@@ -1798,6 +1823,7 @@ impl<'a> Resolver<'a> {
                         let mut inner_select = within.resolve_select_body(query.body.as_ref())?;
                         // Apply ORDER BY and LIMIT/OFFSET from the view's query
                         within.resolve_query_order_limit(&mut inner_select, &query)?;
+                        self.used.borrow_mut().append(&mut within.used.borrow_mut());
                         let columns: Vec<(String, DataType, bool)> = inner_select
                             .columns
                             .iter()

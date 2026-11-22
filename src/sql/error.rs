@@ -26,6 +26,9 @@ pub enum SqlError {
     InvalidOperation(String),
     /// Unsupported SQL feature
     Unsupported(String),
+    /// A table the statement uses was changed between the statement's
+    /// planning and its locking (MySQL error 1412); it can be run again.
+    TableDefinitionChanged,
     /// Something MySQL does that this server does not do yet (MySQL error
     /// 1235); what it is, for the message.
     NotSupportedYet(String),
@@ -55,6 +58,9 @@ impl fmt::Display for SqlError {
             }
             SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            SqlError::TableDefinitionChanged => {
+                write!(f, "Table definition has changed, please retry transaction")
+            }
             SqlError::NotSupportedYet(what) => {
                 write!(f, "This version of RooDB doesn't yet support '{}'", what)
             }

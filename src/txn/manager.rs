@@ -49,6 +49,10 @@ pub struct TransactionManager {
     /// here, when a transaction ends, however it ends.
     locks: Arc<LockManager>,
 
+    /// The metadata locks held on this node's tables: by statements while
+    /// they use a table, by schema changes while they change one.
+    metadata_locks: Arc<crate::txn::MetadataLocks>,
+
     /// The next AUTO_INCREMENT value of each table.
     auto_increment: Arc<crate::txn::AutoIncrement>,
 }
@@ -79,6 +83,7 @@ impl TransactionManager {
     /// Create a transaction manager whose IDs stay ahead of those the Raft
     /// state machine has applied (see `applied_floor`).
     pub fn with_applied_floor(applied_floor: Arc<AtomicU64>) -> Self {
+        let locks = LockManager::new();
         Self {
             // Start at 1 so 0 can be used as "no transaction"
             next_txn_id: AtomicU64::new(1),
@@ -88,9 +93,15 @@ impl TransactionManager {
             is_leader: AtomicBool::new(true), // Default to leader for single-node
             timeout_config: RwLock::new(TimeoutConfig::default()),
             applied_floor,
-            locks: LockManager::new(),
+            metadata_locks: crate::txn::MetadataLocks::new(locks.clone()),
+            locks,
             auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
         }
+    }
+
+    /// The metadata locks of this node's sessions.
+    pub fn metadata_locks(&self) -> &Arc<crate::txn::MetadataLocks> {
+        &self.metadata_locks
     }
 
     /// The row locks of this node's transactions.

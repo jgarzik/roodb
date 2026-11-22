@@ -91,8 +91,29 @@ pub struct QueryEngine {
     /// (a trigger body nests inside its statement); rolled back if the
     /// statement fails before committing them
     implicit_txns: Vec<u64>,
+    /// The session's metadata locks: shared on the tables its statements
+    /// use, exclusive on those its schema changes change.
+    mdl: Arc<crate::txn::MdlSession>,
     /// Where results are reported
     pub(crate) out: Box<dyn ResponseSink>,
+}
+
+/// What a plan was made from: the tables and views it uses, and the
+/// catalog's version when it was made. A plan is run only with those
+/// locked and the catalog still at that version.
+#[derive(Debug, Clone, Default)]
+struct PlanUse {
+    used: Vec<TableName>,
+    planned_at: u64,
+}
+
+/// Whether a plan was run.
+enum Ran {
+    /// It was, and the client has its answer (or its error).
+    Done,
+    /// It was not: the catalog changed between planning and locking.
+    /// Nothing was done or sent; the statement is to be planned again.
+    Stale,
 }
 
 /// The locking a statement asks for with `FOR UPDATE` / `FOR SHARE`, if it
@@ -189,10 +210,10 @@ const ROLLED_BACK_BY_FAILOVER: &str =
 /// How a deadlock is recognised in an error that has been reduced to text.
 const DEADLOCK_TEXT: &str = "Deadlock found when trying to get lock";
 
-/// Parse `SET [SESSION | GLOBAL | @@...] INNODB_LOCK_WAIT_TIMEOUT = n` from
-/// upper-cased SQL: whether it is the global setting, and the seconds
-/// (MySQL allows 1 to 1073741824).
-fn parse_set_lock_wait_timeout(sql_upper: &str) -> Option<(bool, u64)> {
+/// Parse `SET [SESSION | GLOBAL | @@...] INNODB_LOCK_WAIT_TIMEOUT = n` (or
+/// `LOCK_WAIT_TIMEOUT`) from upper-cased SQL: which wait, whether it is the
+/// global setting, and the seconds.
+fn parse_set_lock_wait_timeout(sql_upper: &str) -> Option<(LockWait, bool, u64)> {
     let rest = sql_upper
         .trim_end_matches(';')
         .trim()
@@ -212,11 +233,28 @@ fn parse_set_lock_wait_timeout(sql_upper: &str) -> Option<(bool, u64)> {
     } else {
         (false, name)
     };
-    if name.trim() != "INNODB_LOCK_WAIT_TIMEOUT" {
-        return None;
-    }
+    let which = match name.trim() {
+        "INNODB_LOCK_WAIT_TIMEOUT" => LockWait::Row,
+        "LOCK_WAIT_TIMEOUT" => LockWait::Metadata,
+        _ => return None,
+    };
     let seconds: u64 = value.trim().parse().ok()?;
-    Some((global, seconds.clamp(1, 1_073_741_824)))
+    // MySQL's ranges: 1 to 1073741824 for rows, 1 to 31536000 (a year)
+    // for metadata.
+    let most = match which {
+        LockWait::Row => 1_073_741_824,
+        LockWait::Metadata => crate::txn::DEFAULT_METADATA_LOCK_WAIT_SECS,
+    };
+    Some((which, global, seconds.clamp(1, most)))
+}
+
+/// Which lock wait a `SET` changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockWait {
+    /// `innodb_lock_wait_timeout`: waiting for a row lock.
+    Row,
+    /// `lock_wait_timeout`: waiting for a metadata lock.
+    Metadata,
 }
 
 /// What is left of a DROP TABLE once temporary tables are dealt with.
@@ -244,6 +282,7 @@ impl QueryEngine {
         let mvcc = Arc::new(MvccStorage::new(temp.clone(), ctx.txn_manager.clone()));
         let mut session = Session::new(connection_id);
         session.lock_wait_timeout = ctx.txn_manager.locks().default_wait();
+        session.metadata_lock_wait = ctx.txn_manager.metadata_locks().default_wait();
         session.init_eval_flags();
         Self {
             connection_id,
@@ -261,6 +300,7 @@ impl QueryEngine {
             nested_begins: 0,
             read_lock: None,
             implicit_txns: Vec::new(),
+            mdl: ctx.txn_manager.metadata_locks().session(),
             out,
         }
     }
@@ -269,6 +309,25 @@ impl QueryEngine {
 impl QueryEngine {
     /// Execute a prepared statement with bound parameter values.
     pub(crate) async fn execute_prepared(
+        &mut self,
+        statement_id: u32,
+        params: &[Datum],
+    ) -> ProtocolResult<()> {
+        let result = match self.execute_prepared_statement(statement_id, params).await {
+            // As for a statement sent as text: its failure is reported,
+            // and the session goes on.
+            Err(e) if e.fails_statement_only() => {
+                debug!(error = %e, "Statement failed");
+                self.abandon_implicit_txn().await;
+                self.send_error_from_protocol_error(&e).await
+            }
+            result => result,
+        };
+        self.end_of_statement();
+        result
+    }
+
+    async fn execute_prepared_statement(
         &mut self,
         statement_id: u32,
         params: &[Datum],
@@ -287,9 +346,14 @@ impl QueryEngine {
         // Plan cache: reuse the cached plan unless the schema changed since.
         // Only what this execution needs is copied out of the statement.
         let cached = match &ps.cached_plan {
-            Some(cp) if cp.schema_version == self.catalog.read().schema_version() => {
-                Some((cp.physical.clone(), cp.required_privileges.clone()))
-            }
+            Some(cp) if cp.schema_version == self.catalog.read().schema_version() => Some((
+                cp.physical.clone(),
+                cp.required_privileges.clone(),
+                PlanUse {
+                    used: cp.used.clone(),
+                    planned_at: cp.schema_version,
+                },
+            )),
             _ => None,
         };
 
@@ -297,7 +361,7 @@ impl QueryEngine {
             Ok(read_lock) => read_lock,
             Err(message) => return self.send_error(3568, "HY000", &message).await,
         };
-        let Some((mut physical, required_privileges)) = cached else {
+        let Some((mut physical, required_privileges, plan_use)) = cached else {
             // Cache miss: build the plan from the AST with placeholders kept
             let parsed_stmt = ps.parsed_stmt.clone();
             return self
@@ -317,7 +381,22 @@ impl QueryEngine {
             }
         }
 
-        self.run_plan(physical).await
+        match self.run_plan(physical, plan_use).await? {
+            Ran::Done => Ok(()),
+            // The catalog moved after the cached plan was checked: plan
+            // the statement again.
+            Ran::Stale => {
+                let Some(parsed_stmt) = self
+                    .prepared_stmts
+                    .get(statement_id)
+                    .map(|ps| ps.parsed_stmt.clone())
+                else {
+                    return Ok(());
+                };
+                self.handle_prepared_query(statement_id, &parsed_stmt, params)
+                    .await
+            }
+        }
     }
 
     /// Build and cache a plan for a prepared statement, then execute it.
@@ -362,14 +441,20 @@ impl QueryEngine {
 
         // Resolve with placeholder mode (? becomes Literal::Placeholder(n))
         // Then build the plan template, cache it, substitute params, and execute.
-        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>, u64), PlanError> = (|| {
+        type Planned = (PhysicalPlan, Vec<RequiredPrivilege>, PlanUse);
+        let plan_result: Result<Planned, PlanError> = (|| {
             let catalog_guard = self.catalog.read();
             let schema_version = catalog_guard.schema_version();
 
-            let resolved = Resolver::new_with_placeholders(&catalog_guard)
-                .for_session(self.temp.table_names(), self.session.database.clone())
+            let resolver = Resolver::new_with_placeholders(&catalog_guard)
+                .for_session(self.temp.table_names(), self.session.database.clone());
+            let resolved = resolver
                 .resolve(parsed_stmt.clone())
                 .map_err(PlanError::Sql)?;
+            let plan_use = PlanUse {
+                used: resolver.used_tables(),
+                planned_at: schema_version,
+            };
 
             let required_privileges = self.extract_required_privileges(&resolved, &catalog_guard);
 
@@ -382,12 +467,11 @@ impl QueryEngine {
             let physical =
                 PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
 
-            Ok((physical, required_privileges, schema_version))
-        })(
-        );
+            Ok((physical, required_privileges, plan_use))
+        })();
 
-        let (plan_template, required_privileges, schema_version) = match plan_result {
-            Ok((p, privs, sv)) => (p, privs, sv),
+        let (plan_template, required_privileges, plan_use) = match plan_result {
+            Ok(planned) => planned,
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
@@ -397,7 +481,8 @@ impl QueryEngine {
             ps_mut.cached_plan = Some(CachedPlan {
                 physical: plan_template.clone(),
                 required_privileges: required_privileges.clone(),
-                schema_version,
+                schema_version: plan_use.planned_at,
+                used: plan_use.used.clone(),
             });
         }
 
@@ -416,7 +501,13 @@ impl QueryEngine {
             }
         }
 
-        self.run_plan(physical).await
+        match self.run_plan(physical, plan_use).await? {
+            Ran::Done => Ok(()),
+            // The catalog moved between planning and locking: once more.
+            Ran::Stale => {
+                Box::pin(self.handle_prepared_query(statement_id, parsed_stmt, params)).await
+            }
+        }
     }
 
     /// Stream an opened executor's rows to the client as one result set.
@@ -490,14 +581,23 @@ impl QueryEngine {
     /// failure to its caller, which a procedure running a statement of its
     /// body needs.)
     pub(crate) async fn handle_statement(&mut self, sql: &str) -> ProtocolResult<()> {
-        match self.handle_query(sql).await {
+        let result = match self.handle_query(sql).await {
             Err(e) if e.fails_statement_only() => {
                 debug!(error = %e, "Statement failed");
                 self.abandon_implicit_txn().await;
                 self.send_error_from_protocol_error(&e).await
             }
             result => result,
-        }
+        };
+        self.end_of_statement();
+        result
+    }
+
+    /// A statement a client sent has been carried out, or has failed: the
+    /// metadata locks taken for the statement alone go. Those of the
+    /// session's open transaction stay until it ends.
+    fn end_of_statement(&mut self) {
+        self.mdl.release_all_but(self.session.current_txn);
     }
 
     /// Inner implementation of handle_query (separated to allow boxing for recursion)
@@ -851,13 +951,17 @@ impl QueryEngine {
         // Resolve, type check, and plan while holding catalog lock
         // Use closure to return Result and ensure guard is dropped before await
         // Returns both the physical plan and required privileges for authorization
-        let plan_result: Result<(PhysicalPlan, Vec<RequiredPrivilege>), PlanError> = (|| {
+        type Planned = (PhysicalPlan, Vec<RequiredPrivilege>, PlanUse);
+        let plan_result: Result<Planned, PlanError> = (|| {
             let catalog_guard = self.catalog.read();
 
-            let resolved = Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names(), self.session.database.clone())
-                .resolve(stmt)
-                .map_err(PlanError::Sql)?;
+            let resolver = Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names(), self.session.database.clone());
+            let resolved = resolver.resolve(stmt).map_err(PlanError::Sql)?;
+            let plan_use = PlanUse {
+                used: resolver.used_tables(),
+                planned_at: catalog_guard.schema_version(),
+            };
 
             // Extract required privileges from resolved statement before consuming it
             let required_privileges = self.extract_required_privileges(&resolved, &catalog_guard);
@@ -875,12 +979,12 @@ impl QueryEngine {
             let physical =
                 PhysicalPlanner::plan(optimized, &catalog_guard).map_err(PlanError::Planner)?;
 
-            Ok((physical, required_privileges))
+            Ok((physical, required_privileges, plan_use))
         })(); // catalog_guard dropped here
 
         // Handle errors after guard is dropped
-        let (physical, required_privileges) = match plan_result {
-            Ok((p, privs)) => (p, privs),
+        let (physical, required_privileges, plan_use) = match plan_result {
+            Ok(planned) => planned,
             Err(PlanError::Sql(e)) => return self.send_sql_error(&e).await,
             Err(PlanError::Planner(e)) => return self.send_planner_error(&e).await,
         };
@@ -895,7 +999,12 @@ impl QueryEngine {
         }
 
         // Execute — catch executor errors so they don't kill the connection
-        self.run_plan(physical).await
+        match self.run_plan(physical, plan_use).await? {
+            Ran::Done => Ok(()),
+            // The catalog moved between planning and locking: the
+            // statement is taken from the top again.
+            Ran::Stale => self.handle_query(sql).await,
+        }
     }
 
     /// Roll back the implicit transactions of an autocommit statement that
@@ -910,10 +1019,10 @@ impl QueryEngine {
 
     /// Execute a plan, reporting an execution failure to the client as a
     /// statement error. The session stays usable.
-    async fn run_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+    async fn run_plan(&mut self, plan: PhysicalPlan, plan_use: PlanUse) -> ProtocolResult<Ran> {
         let start = Instant::now();
-        let result = match self.execute_plan(plan).await {
-            Ok(()) => Ok(()),
+        let result = match self.execute_plan(plan, plan_use).await {
+            Ok(ran) => Ok(ran),
             Err(e) => {
                 warn!("Query execution error: {}", e);
                 self.abandon_implicit_txn().await;
@@ -923,7 +1032,9 @@ impl QueryEngine {
                 ) {
                     self.roll_back_open_transaction().await;
                 }
-                self.send_error_from_protocol_error(&e).await
+                self.send_error_from_protocol_error(&e)
+                    .await
+                    .map(|()| Ran::Done)
             }
         };
         metrics::log_query(start);
@@ -1174,7 +1285,22 @@ impl QueryEngine {
     }
 
     /// Execute a physical plan and send results
-    async fn execute_plan(&mut self, plan: PhysicalPlan) -> ProtocolResult<()> {
+    /// Run a plan, with the tables it uses locked. `Ran::Stale` if the
+    /// catalog changed between the planning and the locking: then nothing
+    /// was done.
+    async fn execute_plan(&mut self, plan: PhysicalPlan, plan_use: PlanUse) -> ProtocolResult<Ran> {
+        let mut stale = false;
+        self.execute_plan_locked(plan, &plan_use, &mut stale)
+            .await?;
+        Ok(if stale { Ran::Stale } else { Ran::Done })
+    }
+
+    async fn execute_plan_locked(
+        &mut self,
+        plan: PhysicalPlan,
+        plan_use: &PlanUse,
+        stale: &mut bool,
+    ) -> ProtocolResult<()> {
         let plan = match self.drop_temp_tables(plan) {
             TempDrop::Plan(plan) => *plan,
             TempDrop::Done => return self.send_ok(0, 0).await,
@@ -1252,6 +1378,36 @@ impl QueryEngine {
             let read_view = self.txn_manager.create_read_view(0)?;
             (Some(TransactionContext::new(0, read_view)), None)
         };
+
+        // Metadata locks. A schema change commits the open transaction and
+        // takes the names it changes for itself. Anything else takes each
+        // table it uses shared, for its transaction (or for the statement,
+        // if it runs in none), and then makes sure the catalog is still as
+        // it was when the plan was made: a schema change may have got in
+        // between the planning and the locking.
+        if is_ddl {
+            let names = self.schema_change_names(&plan);
+            if !self.begin_schema_change(names).await? {
+                return Ok(());
+            }
+        } else {
+            let owner = match &txn_context {
+                Some(context) if context.txn_id != 0 => context.txn_id,
+                _ => self.lock_owner(),
+            };
+            self.lock_used(owner, &plan_use.used).await?;
+            if self.catalog.read().schema_version() != plan_use.planned_at {
+                if let Some(txn_id) = implicit_txn_id {
+                    self.implicit_txns.retain(|id| *id != txn_id);
+                    if let Err(e) = self.txn_manager.rollback(txn_id).await {
+                        warn!(txn_id, error = %e, "Failed to roll back implicit transaction");
+                    }
+                    self.mdl.release(txn_id);
+                }
+                *stale = true;
+                return Ok(());
+            }
+        }
 
         if returns_rows {
             // Get column definitions before building executor
@@ -1433,7 +1589,7 @@ impl QueryEngine {
         }
 
         // SET [SESSION | GLOBAL] innodb_lock_wait_timeout = seconds
-        if let Some((global, seconds)) = parse_set_lock_wait_timeout(&sql_upper) {
+        if let Some((which, global, seconds)) = parse_set_lock_wait_timeout(&sql_upper) {
             let wait = std::time::Duration::from_secs(seconds);
             if global {
                 // A server-wide setting is the administrator's to change.
@@ -1449,9 +1605,15 @@ impl QueryEngine {
                         .map(Some);
                 }
                 // For sessions that start from now on, as in MySQL.
-                self.txn_manager.locks().set_default_wait(wait);
+                match which {
+                    LockWait::Row => self.txn_manager.locks().set_default_wait(wait),
+                    LockWait::Metadata => self.txn_manager.metadata_locks().set_default_wait(wait),
+                }
             } else {
-                self.session.lock_wait_timeout = wait;
+                match which {
+                    LockWait::Row => self.session.lock_wait_timeout = wait,
+                    LockWait::Metadata => self.session.metadata_lock_wait = wait,
+                }
             }
             return self.send_ok(0, 0).await.map(Some);
         }
@@ -1844,6 +2006,167 @@ impl QueryEngine {
         }
     }
 
+    /// Who the session's metadata locks are held for when no transaction
+    /// is: the session itself. (Out of the way of transaction IDs, which
+    /// count up from one.)
+    fn lock_owner(&self) -> u64 {
+        (1 << 62) | u64::from(self.connection_id)
+    }
+
+    /// Lock, shared, each table and view a statement uses, for `owner`: a
+    /// schema change then waits until the owner has finished with them. A
+    /// statement that finds a schema change holding or waiting for one of
+    /// them waits its turn.
+    async fn lock_used(&mut self, owner: u64, used: &[TableName]) -> ProtocolResult<()> {
+        if used.is_empty() {
+            return Ok(());
+        }
+        let locks = self.txn_manager.metadata_locks().clone();
+        let wait = self.session.metadata_lock_wait;
+        for name in used {
+            let target = locks.target(name);
+            self.mdl
+                .lock_shared(owner, &target, wait)
+                .await
+                .map_err(metadata_lock_error)?;
+        }
+        Ok(())
+    }
+
+    /// As `lock_used`, for a statement run outside the planned path (a
+    /// statement of a routine's body, the sides of a UNION): for the open
+    /// transaction, or for the session. An error if the catalog changed
+    /// between the planning and the locking; the statement can be run
+    /// again.
+    async fn lock_used_now(&mut self, plan_use: &PlanUse) -> ProtocolResult<()> {
+        let owner = self
+            .session
+            .current_txn
+            .unwrap_or_else(|| self.lock_owner());
+        self.lock_used(owner, &plan_use.used).await?;
+        if self.catalog.read().schema_version() != plan_use.planned_at {
+            return Err(ProtocolError::Sql(
+                crate::sql::SqlError::TableDefinitionChanged,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The names a schema change locks, and how: the tables it creates,
+    /// changes or drops exclusively, and their databases shared, so that
+    /// a database is not dropped under it. Dropping or creating a
+    /// database takes the database itself, and dropping one every table
+    /// in it.
+    fn schema_change_names(&self, plan: &PhysicalPlan) -> Vec<(TableName, crate::txn::MdlMode)> {
+        use crate::txn::MdlMode::{Exclusive, Shared};
+        let mut names = Vec::new();
+        let table = |names: &mut Vec<(TableName, crate::txn::MdlMode)>, name: &TableName| {
+            // A temporary table is its session's own: nobody else can be
+            // using it.
+            if !self.temp.is_temp_table(name) {
+                names.push((database_lock(&name.database), Shared));
+                names.push((name.clone(), Exclusive));
+            }
+        };
+        match plan {
+            PhysicalPlan::CreateTable { name, .. } | PhysicalPlan::DropTable { name, .. } => {
+                table(&mut names, name);
+            }
+            PhysicalPlan::DropMultipleTables { names: tables, .. } => {
+                for name in tables {
+                    table(&mut names, name);
+                }
+            }
+            PhysicalPlan::CreateIndex { table: on, .. } => table(&mut names, on),
+            PhysicalPlan::DropIndex { name } => {
+                let on = self
+                    .catalog
+                    .read()
+                    .get_index(name)
+                    .map(|index| index.table.clone());
+                if let Some(on) = on {
+                    table(&mut names, &on);
+                }
+            }
+            PhysicalPlan::CreateDatabase { name, .. } => {
+                names.push((database_lock(name), Exclusive));
+            }
+            PhysicalPlan::DropDatabase { name, .. } => {
+                names.push((database_lock(name), Exclusive));
+                let catalog = self.catalog.read();
+                for table in catalog.list_tables() {
+                    let temporary = catalog.get_table(table).is_some_and(|def| def.is_temporary);
+                    if table.is_in(name) && !temporary {
+                        names.push((table.clone(), Exclusive));
+                    }
+                }
+                for view in catalog.get_view_names() {
+                    if view.is_in(name) {
+                        names.push((view, Exclusive));
+                    }
+                }
+            }
+            _ => {}
+        }
+        names
+    }
+
+    /// Begin a schema change: commit the open transaction, as MySQL does
+    /// before any statement that changes the schema, then lock `names`.
+    /// The locks are the statement's own and go when it ends. False if the
+    /// statement cannot go on; the client has been told why.
+    async fn begin_schema_change(
+        &mut self,
+        names: Vec<(TableName, crate::txn::MdlMode)>,
+    ) -> ProtocolResult<bool> {
+        if let Err(message) = self.commit_open_transaction().await {
+            self.send_error(codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR, &message)
+                .await?;
+            return Ok(false);
+        }
+        match self.lock_schema_change(&names).await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.send_error_from_protocol_error(&e).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// What changing (creating, replacing, dropping) the table or view
+    /// `name` locks: the name exclusively, its database shared.
+    fn object_change(&self, name: &TableName) -> Vec<(TableName, crate::txn::MdlMode)> {
+        vec![
+            (database_lock(&name.database), crate::txn::MdlMode::Shared),
+            (name.clone(), crate::txn::MdlMode::Exclusive),
+        ]
+    }
+
+    /// Lock the names a schema change changes, for the statement. If one
+    /// cannot be had, none is held.
+    async fn lock_schema_change(
+        &mut self,
+        names: &[(TableName, crate::txn::MdlMode)],
+    ) -> ProtocolResult<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let (owner, wait) = (self.lock_owner(), self.session.metadata_lock_wait);
+        self.mdl
+            .lock_all(owner, names, wait)
+            .await
+            .map_err(metadata_lock_error)
+    }
+
+    /// The session's transaction has ended: it is no longer the session's,
+    /// and the metadata locks it held go.
+    fn end_session_transaction(&mut self) {
+        if let Some(txn_id) = self.session.current_txn {
+            self.session.end_transaction();
+            self.mdl.release(txn_id);
+        }
+    }
+
     /// With autocommit off, a statement that finds no transaction open
     /// starts one; it stays open until COMMIT or ROLLBACK.
     fn ensure_transaction(&mut self) -> ProtocolResult<()> {
@@ -1869,7 +2192,7 @@ impl QueryEngine {
                 Ok(()) | Err(crate::txn::TransactionError::NotFound(_)) => {}
                 Err(e) => warn!(txn_id, error = %e, "Rollback failed"),
             }
-            self.session.end_transaction();
+            self.end_session_transaction();
         }
     }
 
@@ -1885,7 +2208,7 @@ impl QueryEngine {
         // even if the node leads again.
         if !self.txn_manager.is_active(txn_id) {
             self.session.clear_pending_changes();
-            self.session.end_transaction();
+            self.end_session_transaction();
             // A statement that was running when the transaction was rolled
             // back may have taken locks afterwards; let go of those too.
             self.txn_manager.locks().release_all(txn_id);
@@ -1895,7 +2218,7 @@ impl QueryEngine {
         let changes = self.session.take_pending_changes();
         if !changes.is_empty() {
             if let Err(e) = self.commit_changes(txn_id, changes, false).await {
-                self.session.end_transaction();
+                self.end_session_transaction();
                 let _ = self.txn_manager.rollback(txn_id).await;
                 return Err(e);
             }
@@ -1911,7 +2234,7 @@ impl QueryEngine {
                 "TxnManager commit failed after Raft success - data IS committed, txn bookkeeping inconsistent"
             );
         }
-        self.session.end_transaction();
+        self.end_session_transaction();
         debug!(
             connection_id = self.connection_id,
             txn_id = txn_id,
@@ -1973,7 +2296,7 @@ impl QueryEngine {
                 // Not found: it was rolled back already, when this node
                 // stopped being the primary. That is what was asked for.
                 Ok(()) | Err(crate::txn::TransactionError::NotFound(_)) => {
-                    self.session.end_transaction();
+                    self.end_session_transaction();
                     debug!(
                         connection_id = self.connection_id,
                         txn_id = txn_id,
@@ -1981,7 +2304,7 @@ impl QueryEngine {
                     );
                 }
                 Err(e) => {
-                    self.session.end_transaction();
+                    self.end_session_transaction();
                     return self
                         .send_error(
                             codes::ER_UNKNOWN_ERROR,
@@ -2085,18 +2408,24 @@ impl QueryEngine {
 
         // Execute first query to get columns and initial rows
         let first_sql = parts[0].trim();
-        let plan = {
+        let (plan, plan_use) = {
             let catalog_guard = self.catalog.read();
             let stmt = crate::sql::Parser::parse_one(first_sql).map_err(ProtocolError::Sql)?;
-            let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names(), self.session.database.clone())
-                .resolve(stmt)
-                .map_err(ProtocolError::Sql)?;
+            let resolver = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names(), self.session.database.clone());
+            let resolved = resolver.resolve(stmt).map_err(ProtocolError::Sql)?;
+            let plan_use = PlanUse {
+                used: resolver.used_tables(),
+                planned_at: catalog_guard.schema_version(),
+            };
             crate::sql::TypeChecker::check(&resolved).map_err(ProtocolError::Sql)?;
             let logical = LogicalPlanBuilder::build(resolved).map_err(ProtocolError::Planner)?;
             let optimized = Optimizer::new().optimize(logical);
-            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(ProtocolError::Planner)?
+            let plan =
+                PhysicalPlanner::plan(optimized, &catalog_guard).map_err(ProtocolError::Planner)?;
+            (plan, plan_use)
         };
+        self.lock_used_now(&plan_use).await?;
 
         let columns = plan.output_columns();
         let mvcc = self.mvcc.clone();
@@ -2137,11 +2466,14 @@ impl QueryEngine {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                match crate::sql::Resolver::new(&catalog_guard)
-                    .for_session(self.temp.table_names(), self.session.database.clone())
-                    .resolve(stmt)
-                {
+                let resolver = crate::sql::Resolver::new(&catalog_guard)
+                    .for_session(self.temp.table_names(), self.session.database.clone());
+                match resolver.resolve(stmt) {
                     Ok(resolved) => {
+                        let plan_use = PlanUse {
+                            used: resolver.used_tables(),
+                            planned_at: catalog_guard.schema_version(),
+                        };
                         let _ = crate::sql::TypeChecker::check(&resolved);
                         let logical = match LogicalPlanBuilder::build(resolved) {
                             Ok(l) => l,
@@ -2149,7 +2481,7 @@ impl QueryEngine {
                         };
                         let optimized = Optimizer::new().optimize(logical);
                         match PhysicalPlanner::plan(optimized, &catalog_guard) {
-                            Ok(p) => Ok(p),
+                            Ok(p) => Ok((p, plan_use)),
                             Err(_) => continue,
                         }
                     }
@@ -2157,7 +2489,10 @@ impl QueryEngine {
                 }
             };
             let plan = match planned {
-                Ok(plan) => plan,
+                Ok((plan, plan_use)) => {
+                    self.lock_used_now(&plan_use).await?;
+                    plan
+                }
                 Err(e) => return self.send_sql_error(&e).await.map(|_| Some(())),
             };
 
@@ -2443,6 +2778,31 @@ impl QueryEngine {
                 if self.is_foreign_temp_table(&table_name) {
                     self.send_no_such_table(&table_name).await?;
                     return Ok(Some(()));
+                }
+                // A change to a stored table is a schema change: the open
+                // transaction is committed, and the table (with its new
+                // name, if it is given one) is taken from everyone else
+                // before its definition is read. A temporary table is its
+                // session's own.
+                if !self.temp.is_temp_table(&table_name) {
+                    use crate::txn::MdlMode::{Exclusive, Shared};
+                    let mut names = vec![
+                        (database_lock(&table_name.database), Shared),
+                        (table_name.clone(), Exclusive),
+                    ];
+                    for op in &alter.operations {
+                        if let sqlparser::ast::AlterTableOperation::RenameTable { table_name } = op
+                        {
+                            let (sqlparser::ast::RenameTableNameKind::As(to)
+                            | sqlparser::ast::RenameTableNameKind::To(to)) = table_name;
+                            let to = self.object_name(to)?;
+                            names.push((database_lock(&to.database), Shared));
+                            names.push((to, Exclusive));
+                        }
+                    }
+                    if !self.begin_schema_change(names).await? {
+                        return Ok(Some(()));
+                    }
                 }
 
                 // Clone current table def from catalog
@@ -3350,10 +3710,17 @@ impl QueryEngine {
             || sql_upper.starts_with("SHOW GLOBAL STATUS")
         {
             let (record_locks, gap_locks, waiting) = self.txn_manager.locks().counts();
+            // Metadata locks in the lock table: those of schema changes,
+            // and of the statements and transactions a schema change found
+            // using its table. (A shared lock on a table nobody is changing
+            // is not there, and not counted.)
+            let (metadata_locks, metadata_waiting) = self.txn_manager.metadata_locks().counts();
             let status = [
                 ("Innodb_row_lock_current_waits", waiting),
                 ("Roodb_row_locks", record_locks),
                 ("Roodb_gap_locks", gap_locks),
+                ("Roodb_metadata_locks", metadata_locks),
+                ("Roodb_metadata_lock_waits", metadata_waiting),
             ];
             // The pattern, if any, is the quoted text after LIKE.
             let pattern = sql_upper.split_once(" LIKE ").map(|(_, p)| {
@@ -4041,6 +4408,11 @@ impl QueryEngine {
                     values.push(self.session.lock_wait_timeout.as_secs().to_string());
                     continue;
                 }
+                "lock_wait_timeout" => {
+                    col_names.push(format!("@@{}", var_lower));
+                    values.push(self.session.metadata_lock_wait.as_secs().to_string());
+                    continue;
+                }
                 "version" => "8.0.0-RooDB",
                 "version_comment" => "RooDB",
                 "default_storage_engine" | "storage_engine" => "RooDB",
@@ -4078,6 +4450,12 @@ impl QueryEngine {
         use crate::catalog::ViewDef;
 
         let view_name = self.table_name(view_name)?;
+        if !self
+            .begin_schema_change(self.object_change(&view_name))
+            .await?
+        {
+            return Ok(());
+        }
 
         // Validate the view query parses correctly
         if let Err(e) = crate::sql::Parser::parse_one(query_sql) {
@@ -4184,6 +4562,15 @@ impl QueryEngine {
     ) -> ProtocolResult<()> {
         let mut changeset = ChangeSet::new(0);
 
+        let mut locks = Vec::new();
+        for raw_name in names {
+            let view_name = self.table_name(raw_name)?;
+            locks.extend(self.object_change(&view_name));
+        }
+        if !self.begin_schema_change(locks).await? {
+            return Ok(());
+        }
+
         for raw_name in names {
             let view_name = self.table_name(raw_name)?;
 
@@ -4275,6 +4662,15 @@ impl QueryEngine {
         // The table as the catalog knows it: in the session's database
         // unless the statement names another.
         def.table_name = self.table_name(&def.table_name.table)?;
+        // A trigger changes what happens to its table's rows: the table is
+        // taken from everyone else while it is added.
+        if !self.temp.is_temp_table(&def.table_name)
+            && !self
+                .begin_schema_change(self.object_change(&def.table_name))
+                .await?
+        {
+            return Ok(());
+        }
         // A trigger on a system table would run on every schema or account
         // change, for whoever makes it.
         if crate::catalog::system_tables::is_system_table(&def.table_name) {
@@ -4365,6 +4761,28 @@ impl QueryEngine {
                     "Missing trigger name in DROP TRIGGER",
                 )
                 .await;
+        }
+
+        // The trigger's table is taken from everyone else while the
+        // trigger goes (and the open transaction is committed whether or
+        // not there is such a trigger, as for any schema change).
+        let on_table = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_TRIGGERS)
+            .await
+            .map_err(|e| ProtocolError::Internal(format!("Storage error: {}", e)))?
+            .into_iter()
+            .find_map(|stored| match stored.row.values() {
+                [Datum::String(in_database), Datum::String(name), Datum::String(table), ..]
+                    if in_database == database && name == trigger_name =>
+                {
+                    Some(TableName::new(in_database.clone(), table.clone()))
+                }
+                _ => None,
+            });
+        let locks = on_table
+            .map(|table| self.object_change(&table))
+            .unwrap_or_default();
+        if !self.begin_schema_change(locks).await? {
+            return Ok(());
         }
 
         // Find the trigger's row.
@@ -4593,6 +5011,11 @@ impl QueryEngine {
         raw_sql: &str,
     ) -> ProtocolResult<()> {
         let (database, proc_name) = self.routine_name(&name.to_string())?;
+        // Creating a routine is a schema change: the open transaction is
+        // committed first.
+        if !self.begin_schema_change(Vec::new()).await? {
+            return Ok(());
+        }
 
         // Convert sqlparser params to our ProcedureParam
         let our_params: Vec<ProcedureParam> = params
@@ -4929,6 +5352,9 @@ impl QueryEngine {
         };
 
         let (database, func_name) = self.routine_name(caps.get(1).unwrap().as_str())?;
+        if !self.begin_schema_change(Vec::new()).await? {
+            return Ok(());
+        }
         let params_str = caps.get(2).unwrap().as_str();
         let returns_type = caps.get(3).unwrap().as_str().to_string();
         let body_sql = caps.get(4).unwrap().as_str().to_string();
@@ -4989,6 +5415,9 @@ impl QueryEngine {
         if_exists: bool,
     ) -> ProtocolResult<()> {
         let (database, proc_name) = self.routine_name(proc_name)?;
+        if !self.begin_schema_change(Vec::new()).await? {
+            return Ok(());
+        }
 
         // Check if procedure exists
         let exists = {
@@ -5983,17 +6412,25 @@ impl QueryEngine {
     ) -> Result<Vec<crate::executor::row::Row>, String> {
         let stmt = crate::sql::Parser::parse_one(sql).map_err(|e| e.to_string())?;
 
-        let plan = {
+        let (plan, plan_use) = {
             let catalog_guard = self.catalog.read();
-            let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names(), self.session.database.clone())
-                .resolve(stmt)
-                .map_err(|e| e.to_string())?;
+            let resolver = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names(), self.session.database.clone());
+            let resolved = resolver.resolve(stmt).map_err(|e| e.to_string())?;
+            let plan_use = PlanUse {
+                used: resolver.used_tables(),
+                planned_at: catalog_guard.schema_version(),
+            };
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
             let logical = LogicalPlanBuilder::build(resolved).map_err(|e| e.to_string())?;
             let optimized = Optimizer::new().optimize(logical);
-            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?
+            let plan =
+                PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?;
+            (plan, plan_use)
         };
+        self.lock_used_now(&plan_use)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mvcc = self.mvcc.clone();
         let txn_context = if let Some(txn_id) = self.session.current_txn {
@@ -6064,16 +6501,21 @@ impl QueryEngine {
             Err(e) => return Err(e.to_string()),
         };
 
-        let plan = {
+        let (plan, plan_use) = {
             let catalog_guard = self.catalog.read();
-            let resolved = crate::sql::Resolver::new(&catalog_guard)
-                .for_session(self.temp.table_names(), self.session.database.clone())
-                .resolve(stmt)
-                .map_err(|e| e.to_string())?;
+            let resolver = crate::sql::Resolver::new(&catalog_guard)
+                .for_session(self.temp.table_names(), self.session.database.clone());
+            let resolved = resolver.resolve(stmt).map_err(|e| e.to_string())?;
+            let plan_use = PlanUse {
+                used: resolver.used_tables(),
+                planned_at: catalog_guard.schema_version(),
+            };
             crate::sql::TypeChecker::check(&resolved).map_err(|e| e.to_string())?;
             let logical = LogicalPlanBuilder::build(resolved).map_err(|e| e.to_string())?;
             let optimized = Optimizer::new().optimize(logical);
-            PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?
+            let plan =
+                PhysicalPlanner::plan(optimized, &catalog_guard).map_err(|e| e.to_string())?;
+            (plan, plan_use)
         };
 
         let plan = match self.drop_temp_tables(plan) {
@@ -6085,6 +6527,19 @@ impl QueryEngine {
             }
         };
         let is_ddl = plan.is_ddl();
+        // A schema change commits the open transaction and takes the names
+        // it changes; anything else takes what it uses shared.
+        if is_ddl {
+            let names = self.schema_change_names(&plan);
+            self.commit_open_transaction().await?;
+            self.lock_schema_change(&names)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.lock_used_now(&plan_use)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         if !is_ddl {
             self.ensure_transaction().map_err(|e| e.to_string())?;
         }
@@ -6181,7 +6636,7 @@ impl QueryEngine {
                 if let Err(e) = self.txn_manager.rollback(txn_id).await {
                     warn!(txn_id, error = %e, "Rollback on session reset failed");
                 }
-                self.session.end_transaction();
+                self.end_session_transaction();
             }
         }
         self.cleanup_temp_tables().await;
@@ -6190,6 +6645,7 @@ impl QueryEngine {
         // The reset cleared the session's copy of the stored functions.
         self.functions_seen = None;
         self.session.lock_wait_timeout = self.txn_manager.locks().default_wait();
+        self.session.metadata_lock_wait = self.txn_manager.metadata_locks().default_wait();
     }
 
     /// Transaction status of the session, reported with every result.
@@ -6289,6 +6745,7 @@ impl QueryEngine {
             }
             SqlError::Unsupported(_) => (codes::ER_UNKNOWN_ERROR, states::GENERAL_ERROR),
             SqlError::NotSupportedYet(_) => (1235, "42000"),
+            SqlError::TableDefinitionChanged => (1412, states::GENERAL_ERROR),
             SqlError::EmptyQuery => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
             SqlError::CommentOnly => (codes::ER_EMPTY_QUERY, states::GENERAL_ERROR),
         };
@@ -6544,6 +7001,23 @@ fn describe_table(td: &crate::catalog::TableDef) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// The name a database is locked by: itself, with no table. Schema changes
+/// to a database's tables hold it shared; creating or dropping the
+/// database holds it exclusively.
+fn database_lock(database: &str) -> TableName {
+    TableName::new(database, "")
+}
+
+/// A metadata lock that was not granted, as the client is told: as the
+/// row lock errors are, with MySQL's codes (1213, and the transaction
+/// rolled back; 1205).
+fn metadata_lock_error(e: crate::txn::MdlError) -> ProtocolError {
+    ProtocolError::Executor(match e {
+        crate::txn::MdlError::Deadlock => crate::executor::ExecutorError::LockDeadlock,
+        crate::txn::MdlError::Timeout => crate::executor::ExecutorError::LockWaitTimeout,
+    })
 }
 
 /// What an `ALTER TABLE` did that the table's indexes must follow.

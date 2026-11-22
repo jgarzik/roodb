@@ -75,6 +75,10 @@ use super::lock::LockManager;
 /// before locking.
 pub use crate::catalog::TableName;
 
+/// How long a request waits for a metadata lock unless its session says
+/// otherwise: MySQL's default for `lock_wait_timeout`, a year.
+pub const DEFAULT_METADATA_LOCK_WAIT_SECS: u64 = 31_536_000;
+
 /// The closed bit of a gate's word; the rest of the word counts the shared
 /// holders on the fast side.
 const CLOSED: u64 = 1 << 63;
@@ -258,6 +262,31 @@ impl MdlSession {
         }
         if in_table {
             self.locks.release_all(owner);
+        }
+    }
+
+    /// Release everything this session holds for every owner but `keep`:
+    /// at the end of a statement, whatever was locked for the statement
+    /// alone goes, and what the open transaction holds stays.
+    pub fn release_all_but(&self, keep: Option<u64>) {
+        let owners: Vec<u64> = {
+            let held = self.state.held.lock();
+            if held.fast.is_empty() && held.in_table.is_empty() {
+                return;
+            }
+            let mut owners: Vec<u64> = held
+                .fast
+                .iter()
+                .map(|lock| lock.owner)
+                .chain(held.in_table.iter().copied())
+                .filter(|owner| Some(*owner) != keep)
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            owners
+        };
+        for owner in owners {
+            self.release(owner);
         }
     }
 
@@ -495,6 +524,8 @@ pub struct MetadataLocks {
     gates: RwLock<HashMap<TableName, Arc<NameGate>>>,
     /// The sessions that may hold locks on the fast side.
     sessions: Mutex<Vec<Weak<SessionState>>>,
+    /// How long sessions that have not chosen otherwise wait, in seconds.
+    default_wait_secs: AtomicU64,
     /// Where waits are recorded, so that deadlocks through both kinds of
     /// lock are found.
     row_locks: Arc<LockManager>,
@@ -535,8 +566,20 @@ impl MetadataLocks {
             state: Mutex::new(State::default()),
             gates: RwLock::new(HashMap::new()),
             sessions: Mutex::new(Vec::new()),
+            default_wait_secs: AtomicU64::new(DEFAULT_METADATA_LOCK_WAIT_SECS),
             row_locks,
         })
+    }
+
+    /// How long sessions that have not chosen otherwise wait for a lock.
+    pub fn default_wait(&self) -> Duration {
+        Duration::from_secs(self.default_wait_secs.load(Ordering::Relaxed))
+    }
+
+    /// Change the wait for sessions that start from now on.
+    pub fn set_default_wait(&self, wait: Duration) {
+        self.default_wait_secs
+            .store(wait.as_secs(), Ordering::Relaxed);
     }
 
     /// The locks of a new session.

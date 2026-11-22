@@ -78,11 +78,13 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-3. Metadata locks taken by statements and DDL (the lock manager is
-   written: `txn/mdl.rs`); DDL commits implicitly; changesets of rows
-   carry the version of the table they were built against
-   (`TableDef::version`, which a change to the definition already raises
-   and checks) and are refused if it has moved.
+3. Changesets of rows carry the version of each table they were built
+   against (`TableDef::version`, which a change to the definition
+   already raises and checks) and are refused if it has moved. A
+   statement that runs another (a trigger's or a routine's body) waits
+   for it: that wait is to be in the wait-for graph, or a cycle through
+   the two is only ended by a timeout. `TRUNCATE` as a schema change
+   (commits, takes the table exclusively).
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
