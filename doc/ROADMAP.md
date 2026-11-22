@@ -25,16 +25,16 @@ multi-core machines.
 
 Needs a quiet machine for every measurement.
 
-- Point selects are level with MySQL at 16 and 64 threads (about 2x ahead
+- `oltp_read_only` (range reads, sorts, aggregates over real rows) is
+  behind MySQL at 16 threads (9.5k against 12.1k TPS) and only 1.35x ahead
+  at 1 and 64: find what its range queries cost.
+- Point selects are 1.25x to 1.4x ahead of MySQL at 16 and 64 threads (2.5x
   at one thread): find the limit on the read path.
 - Reads from table files are about half the speed of reads from memory.
 - Commit latency at one thread: the hops from session to Raft to log writer
   to I/O reactor. Registered buffers, reactor wake-up tuning; an own
   proposal batcher above Raft only if measurements call for it.
 - `--durability fsync` at 16 and 64 threads.
-- Deadlock retries in `oltp_read_write` at 16 threads ranged from 2 to 153
-  between runs of builds that should lock alike: find out what decides it,
-  and whether locks are held longer than they need be.
 - The lock manager is one mutex, and gap locks a linear list. With row
   locking, single-thread write throughput measured about the same to 10%
   lower than before it (runs alternated on a shared machine; reads
