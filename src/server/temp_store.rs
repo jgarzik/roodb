@@ -328,8 +328,9 @@ impl StorageEngine for SessionStorage {
     /// on: ranges are those of one table at a time. This session's rows in
     /// the range go in either case. The shared engine is told only when the
     /// range is not one of this session's temporary tables: a temporary
-    /// table hides a shared table of the same name, whose keys are the same,
-    /// and dropping the one must not empty the other.
+    /// table's keys are under an ID this process alone gave out, so the
+    /// shared engine holds nothing there, and nothing about a temporary
+    /// table is ever stored - a forgotten range is, in the manifest.
     async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
         if start >= end {
             return Ok(());
@@ -678,8 +679,8 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_range_of_a_temporary_table_stays_in_the_session() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a");
-        storage.add_table("b");
+        storage.add_table("a", tid("a"));
+        storage.add_table("b", tid("b"));
         storage.apply(
             1,
             vec![
@@ -692,7 +693,7 @@ mod tests {
         let before = storage.temp.read().bytes;
         // The shared engine is not told: it would panic.
         storage
-            .drop_range(&table_key_prefix("a"), &table_key_end("a"))
+            .drop_range(&table_key_prefix(tid("a")), &table_key_end(tid("a")))
             .await
             .unwrap();
         assert_eq!(storage.get(&key("a", 1)).await.unwrap(), None);
@@ -701,7 +702,7 @@ mod tests {
         assert!(storage.temp.read().bytes < before);
         // Empty and inverted ranges hold nothing.
         storage
-            .drop_range(&table_key_end("b"), &table_key_prefix("b"))
+            .drop_range(&table_key_end(tid("b")), &table_key_prefix(tid("b")))
             .await
             .unwrap();
         assert!(storage.get(&key("b", 1)).await.unwrap().is_some());
@@ -711,9 +712,12 @@ mod tests {
     #[should_panic(expected = "range dropped from shared storage")]
     async fn a_dropped_range_elsewhere_goes_to_the_shared_engine() {
         let storage = SessionStorage::new(Arc::new(Untouched));
-        storage.add_table("a");
+        storage.add_table("a", tid("a"));
         let _ = storage
-            .drop_range(&table_key_prefix("other"), &table_key_end("other"))
+            .drop_range(
+                &table_key_prefix(tid("other")),
+                &table_key_end(tid("other")),
+            )
             .await;
     }
 }

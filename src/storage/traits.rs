@@ -143,6 +143,16 @@ pub trait StorageEngine: Send + Sync {
     /// the keys took is given back in the background. Calling it again with
     /// the same or an overlapping range is harmless. A view taken earlier
     /// is unaffected: it goes on showing the keys it had.
+    ///
+    /// NOT YET FOR USE WHEN APPLYING THE LOG. The range is made durable at
+    /// once, ahead of the writes that are still only in memory - among them
+    /// the position the log has been applied to. After a crash, storage
+    /// comes back at an earlier position with the range already forgotten,
+    /// and the replay of the log from that position reads rows as absent
+    /// that were there the first time (see the ignored test
+    /// `a_forgotten_range_is_not_durable_ahead_of_its_position`). A range
+    /// must be forgotten as part of the batch of the log entry that drops
+    /// it, and become durable with that batch.
     async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()>;
 
     /// Scan a range of keys

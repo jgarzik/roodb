@@ -1677,3 +1677,60 @@ async fn a_replacement_clears_the_forgotten_ranges() {
     assert!(all.iter().all(|(_, value)| value == b"replaced"));
     engine.close().await.unwrap();
 }
+
+/// What is on disk is the result of applying the log up to the position
+/// stored with it: a restart replays the log from there. A forgotten range
+/// must therefore become durable together with the position at which it was
+/// forgotten, like every other write of that log entry - not ahead of it.
+///
+/// Here a row is written and flushed with position 1. A later entry
+/// (position 2) is applied but not flushed, and then the range is
+/// forgotten. The server dies. Storage comes back at position 1: at that
+/// position the row was there, and the replay of the log from position 1
+/// reads it (a duplicate-key check, a version check). If the range is
+/// already forgotten, those checks see no row, and a changeset can be
+/// accepted or refused differently from the first time it was applied.
+#[tokio::test]
+#[ignore = "fails: drop_range makes the range durable at once; see doc/ROADMAP.md, IDX, forgotten ranges"]
+async fn a_forgotten_range_is_not_durable_ahead_of_its_position() {
+    const POSITION: &[u8] = b"position";
+    let dir = tempfile::tempdir().unwrap();
+    let base = config(dir.path());
+    let row = tkey('b', 7);
+
+    let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+    engine
+        .write_batch(vec![
+            (row.clone(), Some(b"as of position 1".to_vec())),
+            (POSITION.to_vec(), Some(vec![1])),
+        ])
+        .await
+        .unwrap();
+    engine.flush().await.unwrap();
+    engine.close().await.unwrap();
+    drop(engine);
+
+    // Position 2 is applied and stays in memory; then the range goes, and
+    // the server dies with the range recorded and nothing flushed.
+    let armed = LsmConfig {
+        crash_point: Some(CrashPoint::DropRangeAfterRangeSaved),
+        ..base.clone()
+    };
+    let engine = LsmEngine::open(io(), armed).await.unwrap();
+    engine
+        .write_batch(vec![(POSITION.to_vec(), Some(vec![2]))])
+        .await
+        .unwrap();
+    assert!(engine.drop_range(B_START, B_END).await.is_err());
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), base).await.unwrap();
+    let position = engine.get(POSITION).await.unwrap();
+    assert_eq!(position, Some(vec![1]), "storage is back at position 1");
+    assert_eq!(
+        engine.get(&row).await.unwrap(),
+        Some(b"as of position 1".to_vec()),
+        "at position 1 the row was there, but storage has already forgotten it"
+    );
+    engine.close().await.unwrap();
+}

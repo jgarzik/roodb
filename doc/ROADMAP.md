@@ -92,8 +92,22 @@ below changes.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
-5. Key ranges the storage engine forgets; `DROP TABLE`, `TRUNCATE` (which
-   resets `AUTO_INCREMENT`) and `DROP DATABASE` in one log entry.
+5. Forgotten key ranges (`StorageEngine::drop_range` is written, and not
+   yet safe to call from the log):
+   - First: a range is forgotten as one of the writes of the log entry
+     that drops it, in that entry's batch, and becomes durable when the
+     batch does. Today it is made durable at once, ahead of the position
+     the log has been applied to; after a crash the log is replayed from
+     an earlier position against storage that has already forgotten the
+     range, and a changeset that read a row there (a duplicate-key check,
+     a version check) can be accepted or refused differently from the
+     first time. The test that shows it is in `tests/lsm_durability.rs`,
+     ignored: `a_forgotten_range_is_not_durable_ahead_of_its_position`.
+   - Then: `DROP TABLE`, `TRUNCATE` (which resets `AUTO_INCREMENT`) and
+     `DROP DATABASE` in one log entry, in place of a delete marker per
+     row.
+   - Dropping a table whose rows share level-0 files with other data
+     compacts all of level 0: measure a run of drops.
 6. Index definitions: `KEY`/`UNIQUE` in `CREATE TABLE` with MySQL's
     naming; `CREATE`/`DROP INDEX` with errors 1061 and 1091; names per
     table; `SHOW INDEX`, `SHOW CREATE TABLE`.
@@ -444,6 +458,16 @@ finds. Known already, from an audit of SQL.md against a running server:
 ## Appendix — Unordered work
 
 Not yet assigned to a phase.
+
+- Reported by a reading of the code, not verified: two inserts of the same
+  key into a memtable at once can both subtract the old entry's size, and
+  the size counter wraps below zero, which would look like a full
+  memtable. Write the test; fix if it fails.
+- `cargo clippy --all-targets` fails in test code (`tests/roodb_suite/`
+  and unit tests: an approximate constant, a clone to make a slice, and
+  others). The gate runs `cargo clippy` without `--all-targets`, so test
+  code is not held to "zero warnings". Fix them and make the gate and CI
+  lint every target.
 
 **Performance** (what the performance pass left; every measurement needs
 runs alternated on the same machine, which is shared)
