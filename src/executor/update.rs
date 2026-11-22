@@ -417,7 +417,7 @@ mod tests {
     use crate::executor::encoding::encode_pk_key;
     use crate::planner::logical::{BinaryOp, Literal};
     use crate::server::session::UserVariables;
-    use crate::storage::traits::KeyValue;
+    use crate::storage::traits::{KeyValue, WriteOp};
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
     use parking_lot::RwLock;
@@ -472,21 +472,19 @@ mod tests {
             Ok(())
         }
 
-        async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
-            let mut data = self.data.lock().unwrap();
-            data.retain(|(k, _)| k.as_slice() < start || k.as_slice() >= end);
-            Ok(())
-        }
-
         async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
             self.get(key).await
         }
 
-        async fn write_batch(&self, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> StorageResult<()> {
-            for (key, value) in batch {
-                match value {
-                    Some(value) => self.put(&key, &value).await?,
-                    None => self.delete(&key).await?,
+        async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+            for write in batch {
+                match write {
+                    WriteOp::Put(key, value) => self.put(&key, &value).await?,
+                    WriteOp::Delete(key) => self.delete(&key).await?,
+                    WriteOp::ForgetRange { start, end } => {
+                        let mut data = self.data.lock().unwrap();
+                        data.retain(|(k, _)| *k < start || *k >= end);
+                    }
                 }
             }
             Ok(())

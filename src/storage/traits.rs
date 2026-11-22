@@ -7,8 +7,29 @@ use crate::storage::error::StorageResult;
 /// A key-value pair
 pub type KeyValue = (Vec<u8>, Vec<u8>);
 
-/// One write in a batch: the key, and the value to store or `None` to delete.
-pub type WriteOp = (Vec<u8>, Option<Vec<u8>>);
+/// One write in a batch. The writes of a batch take effect in the order
+/// they are listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// Store a value under a key, replacing any it had.
+    Put(Vec<u8>, Vec<u8>),
+    /// Delete a key.
+    Delete(Vec<u8>),
+    /// Forget every key in `[start, end)`: everything written there before
+    /// this write is gone for good, earlier writes of the same batch
+    /// included. See [`StorageEngine::write_batch`].
+    ForgetRange { start: Vec<u8>, end: Vec<u8> },
+}
+
+impl WriteOp {
+    /// Forget every key in `[start, end)`.
+    pub fn forget(start: &[u8], end: &[u8]) -> Self {
+        Self::ForgetRange {
+            start: start.to_vec(),
+            end: end.to_vec(),
+        }
+    }
+}
 
 /// A view of the engine's contents as they were at one moment, unaffected
 /// by what is written afterwards. Used to copy a whole database to another
@@ -93,12 +114,12 @@ impl<E: StorageEngine + ?Sized> Ingest for BatchIngest<E> {
             .scan(None, None)
             .await?
             .into_iter()
-            .map(|(key, _)| (key, None))
+            .map(|(key, _)| WriteOp::Delete(key))
             .collect();
         batch.extend(
             self.entries
                 .into_iter()
-                .map(|(key, value)| (key, Some(value))),
+                .map(|(key, value)| WriteOp::Put(key, value)),
         );
         self.engine.write_batch(batch).await
     }
@@ -116,7 +137,8 @@ pub trait StorageEngine: Send + Sync {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
 
     /// Like `get`, but answers from what has been flushed to disk only,
-    /// ignoring writes still in memory. This is the value a restart would
+    /// ignoring writes still in memory - a range forgotten by a batch that
+    /// has not been flushed included. This is the value a restart would
     /// find.
     async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
 
@@ -130,30 +152,33 @@ pub trait StorageEngine: Send + Sync {
     /// No-op if the key does not exist.
     async fn delete(&self, key: &[u8]) -> StorageResult<()>;
 
-    /// Apply several writes as one unit: `Some` stores a value, `None`
-    /// deletes the key. Readers may see the writes arrive one by one, but
-    /// what reaches disk holds either all of a batch or none of it.
+    /// Apply several writes as one unit, in the order given. Readers may
+    /// see the writes arrive one by one, but what reaches disk holds either
+    /// all of a batch or none of it.
+    ///
+    /// [`WriteOp::ForgetRange`] forgets every key in `[start, end)` that was
+    /// written before it, for good, without a delete marker per key; the
+    /// caller guarantees that nothing will be written there again. It is a
+    /// write like the others of its batch:
+    /// - It takes effect in its place in the batch. A key of the range
+    ///   written earlier in the batch is forgotten with the rest; one written
+    ///   later in the batch is a new write and stays.
+    /// - When `write_batch` returns, no `get`, `scan`, `next_key` or
+    ///   `prev_key` finds a key of the range.
+    /// - It becomes durable when the rest of its batch does, with the flush
+    ///   that writes the batch out, and not before. Until then
+    ///   `get_durable` and `snapshot_view`, which show what has been
+    ///   flushed, still show the range's keys; after a crash before that
+    ///   flush the range is back together with everything else as it was
+    ///   before the batch, and applying the batch again forgets it again.
+    /// - The space the keys took is given back in the background, after the
+    ///   flush.
+    ///
+    /// Forgetting the same range again, or one that overlaps it, is
+    /// harmless. An empty or inverted range holds nothing. A view taken
+    /// before the range was flushed as forgotten is unaffected: it goes on
+    /// showing the keys it had.
     async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()>;
-
-    /// Forget every key in `[start, end)`, now and for good: the caller
-    /// guarantees nothing will be written there again.
-    ///
-    /// When this returns, no read finds a key of the range any more, nor
-    /// does a view taken from now on, and that survives a restart. The space
-    /// the keys took is given back in the background. Calling it again with
-    /// the same or an overlapping range is harmless. A view taken earlier
-    /// is unaffected: it goes on showing the keys it had.
-    ///
-    /// NOT YET FOR USE WHEN APPLYING THE LOG. The range is made durable at
-    /// once, ahead of the writes that are still only in memory - among them
-    /// the position the log has been applied to. After a crash, storage
-    /// comes back at an earlier position with the range already forgotten,
-    /// and the replay of the log from that position reads rows as absent
-    /// that were there the first time (see the ignored test
-    /// `a_forgotten_range_is_not_durable_ahead_of_its_position`). A range
-    /// must be forgotten as part of the batch of the log entry that drops
-    /// it, and become durable with that batch.
-    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()>;
 
     /// Scan a range of keys
     ///

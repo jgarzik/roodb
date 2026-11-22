@@ -120,11 +120,19 @@ Lock order where more than one is held: `flush_lock` or `compaction_lock` →
 
 **Critical pattern:** A write batch is atomic with respect to rotation.
 
-`write_batch()` inserts every entry of a batch while holding the `memtable`
+`write_batch()` applies every write of a batch while holding the `memtable`
 read lock; rotation needs the write lock. A batch therefore lands in one
 memtable, and a flush can never capture half of it. The Raft state machine
 relies on this: each log entry is one batch that includes the applied
 position, so what is on disk is always an exact prefix of the log.
+
+A range forgotten by a batch (`WriteOp::ForgetRange`) is one of its writes
+and stays with that memtable: the memtable's flush lists the range in the
+manifest in the same manifest change as its table, so the range is on disk
+exactly when the rest of the batch is. Each memtable guards its list of
+forgotten ranges with a lock of its own (`parking_lot::RwLock`, a leaf: held
+only while the range's entries are removed from that memtable, or while a
+scan reads the memtable together with the list).
 
 **Critical pattern:** Atomic memtable snapshots prevent rotation races:
 

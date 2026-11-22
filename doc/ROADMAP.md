@@ -89,18 +89,9 @@ below changes.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
-5. Forgotten key ranges (`StorageEngine::drop_range` is written, and not
-   yet safe to call from the log):
-   - First: a range is forgotten as one of the writes of the log entry
-     that drops it, in that entry's batch, and becomes durable when the
-     batch does. Today it is made durable at once, ahead of the position
-     the log has been applied to; after a crash the log is replayed from
-     an earlier position against storage that has already forgotten the
-     range, and a changeset that read a row there (a duplicate-key check,
-     a version check) can be accepted or refused differently from the
-     first time. The test that shows it is in `tests/lsm_durability.rs`,
-     ignored: `a_forgotten_range_is_not_durable_ahead_of_its_position`.
-   - Then: `DROP TABLE`, `TRUNCATE` (which resets `AUTO_INCREMENT`) and
+5. Forgotten key ranges (`WriteOp::ForgetRange`, a write of a
+   `StorageEngine::write_batch`, is written; nothing uses it yet):
+   - `DROP TABLE`, `TRUNCATE` (which resets `AUTO_INCREMENT`) and
      `DROP DATABASE` in one log entry, in place of a delete marker per
      row.
    - Dropping a table whose rows share level-0 files with other data

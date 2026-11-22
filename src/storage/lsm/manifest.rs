@@ -31,25 +31,29 @@ pub struct SstableInfo {
     pub max_key: Vec<u8>,
     /// File size in bytes
     pub size: u64,
-    /// The table holds no key of any forgotten range numbered up to this:
-    /// those known when it was written were left out of it. A range with a
-    /// higher number that overlaps the table may still have keys in it.
+    /// The table holds nothing that a forgotten range numbered up to this
+    /// forgets: what such a range forgot was left out when the table was
+    /// written, and any key of the range the table does hold was written
+    /// after the range was forgotten. A range with a higher number was
+    /// forgotten after everything in the table was written: the keys the
+    /// table holds in it are forgotten.
     #[serde(default)]
     pub filtered_seq: u64,
 }
 
-/// A key range `[start, end)` the engine has been told to forget: its keys
-/// are hidden from every read and left out of every table written from now
-/// on. It stays listed until no memtable and no table can still hold one of
-/// its keys.
+/// A key range `[start, end)` the engine was told to forget, by a batch
+/// that has been flushed: what the tables written before it hold there is
+/// hidden from every read and left out when those tables are compacted.
+/// What is written to the range afterwards is not affected. The range stays
+/// listed until no table can still hold a key it forgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgottenRange {
     /// First key of the range.
     pub start: Vec<u8>,
     /// The key just past the range.
     pub end: Vec<u8>,
-    /// Ranges are numbered in the order they arrive; see
-    /// [`SstableInfo::filtered_seq`].
+    /// Ranges are numbered in the order they are listed, which is the order
+    /// they were forgotten in; see [`SstableInfo::filtered_seq`].
     pub seq: u64,
 }
 
@@ -70,9 +74,15 @@ impl ForgottenRange {
         min_key >= self.start.as_slice() && max_key < self.end.as_slice()
     }
 
-    /// Whether `table` may still hold keys of the range.
+    /// Whether the range forgets what a table with this `filtered_seq`
+    /// holds in it.
+    pub fn applies_to(&self, filtered_seq: u64) -> bool {
+        filtered_seq < self.seq
+    }
+
+    /// Whether `table` may still hold keys the range forgets.
     pub fn in_table(&self, table: &SstableInfo) -> bool {
-        table.filtered_seq < self.seq && self.overlaps(&table.min_key, &table.max_key)
+        self.applies_to(table.filtered_seq) && self.overlaps(&table.min_key, &table.max_key)
     }
 }
 
@@ -83,9 +93,14 @@ pub fn forgotten_range<'a>(ranges: &'a [ForgottenRange], key: &[u8]) -> Option<&
     ranges[..after].last().filter(|range| range.contains(key))
 }
 
-/// Whether `key` is in one of `ranges`.
-pub fn is_forgotten(ranges: &[ForgottenRange], key: &[u8]) -> bool {
-    forgotten_range(ranges, key).is_some()
+/// The range of `ranges` that forgets `key` as held by a table with this
+/// `filtered_seq`, if any.
+pub fn forgetting_range<'a>(
+    ranges: &'a [ForgottenRange],
+    key: &[u8],
+    filtered_seq: u64,
+) -> Option<&'a ForgottenRange> {
+    forgotten_range(ranges, key).filter(|range| range.applies_to(filtered_seq))
 }
 
 /// Level info
@@ -107,13 +122,14 @@ pub struct ManifestData {
     pub sequence: u64,
     /// Levels
     pub levels: Vec<LevelInfo>,
-    /// Key ranges being forgotten, sorted by start, no two overlapping.
+    /// Key ranges forgotten by flushed batches, sorted by start, no two
+    /// overlapping.
     /// (Like the fields below it, absent from older layouts: defaulted so
     /// that such a manifest is refused for its version, not as unreadable.)
     #[serde(default)]
     pub forgotten: Vec<ForgottenRange>,
     /// Number given to the newest forgotten range. Never goes back, also
-    /// when ranges are retired.
+    /// when ranges are retired or the contents are replaced.
     #[serde(default)]
     pub forgotten_seq: u64,
 }
@@ -254,53 +270,53 @@ impl Manifest {
         self.data.forgotten_seq
     }
 
-    /// Whether `key` is in a forgotten range.
-    pub fn is_forgotten(&self, key: &[u8]) -> bool {
-        is_forgotten(&self.data.forgotten, key)
-    }
-
-    /// Whether one listed range already takes in all of `[start, end)`.
-    pub fn forgets_all_of(&self, start: &[u8], end: &[u8]) -> bool {
-        self.data
-            .forgotten
-            .iter()
-            .any(|range| range.start.as_slice() <= start && end <= range.end.as_slice())
-    }
-
-    /// List `[start, end)` as forgotten. Nothing changes if a listed range
-    /// already takes it all in, so repeating a call is harmless. Listed
-    /// ranges it overlaps are merged into it; the result gets a new number,
-    /// which makes every table it overlaps count as possibly holding its
-    /// keys again.
+    /// List `[start, end)` as forgotten, under the next number: everything
+    /// the tables listed so far hold in it is forgotten.
+    ///
+    /// The list stays disjoint: where the range overlaps listed ones it
+    /// takes their place, and what is left of them on either side stays
+    /// under its old number. (Nothing is lost by that: the new range forgets
+    /// all that the old one forgot there. The two are not merged into one,
+    /// because the wider range under the new number would also forget what
+    /// was written, outside the new range, after the old one was forgotten.)
+    /// Listing a range again is therefore harmless, and is what a repeated
+    /// forget does: it too forgets everything written before it.
     pub fn forget(&mut self, start: &[u8], end: &[u8]) {
-        if start >= end || self.forgets_all_of(start, end) {
+        if start >= end {
             return;
         }
         self.data.forgotten_seq += 1;
-        let mut new = ForgottenRange {
+        let new = ForgottenRange {
             start: start.to_vec(),
             end: end.to_vec(),
             seq: self.data.forgotten_seq,
         };
-        // The listed ranges are disjoint, so taking in the ones that overlap
-        // cannot make the new range reach any of the others.
-        self.data.forgotten.retain(|old| {
-            let overlap = old.start < new.end && new.start < old.end;
-            if overlap {
-                if old.start < new.start {
-                    new.start.clone_from(&old.start);
-                }
-                if old.end > new.end {
-                    new.end.clone_from(&old.end);
-                }
-            }
-            !overlap
-        });
-        let at = self
-            .data
-            .forgotten
-            .partition_point(|old| old.start < new.start);
-        self.data.forgotten.insert(at, new);
+        // The listed ranges that overlap the new one are next to each
+        // other. Of the first, a part may be left before the new range; of
+        // the last, a part after it.
+        let ranges = &mut self.data.forgotten;
+        let first = ranges.partition_point(|old| old.end <= new.start);
+        let last = ranges.partition_point(|old| old.start < new.end);
+        let mut in_their_place = Vec::with_capacity(3);
+        if let Some(old) = ranges.get(first).filter(|old| old.start < new.start) {
+            in_their_place.push(ForgottenRange {
+                start: old.start.clone(),
+                end: new.start.clone(),
+                seq: old.seq,
+            });
+        }
+        let after = last
+            .checked_sub(1)
+            .and_then(|i| ranges.get(i))
+            .filter(|old| old.end > new.end)
+            .map(|old| ForgottenRange {
+                start: new.end.clone(),
+                end: old.end.clone(),
+                seq: old.seq,
+            });
+        in_their_place.push(new);
+        in_their_place.extend(after);
+        ranges.splice(first..last.max(first), in_their_place);
     }
 
     /// Whether a forgotten range may still have keys in `table`.
@@ -311,29 +327,29 @@ impl Manifest {
             .any(|range| range.in_table(table))
     }
 
-    /// Whether `range` can come off the list: no table may still hold one of
-    /// its keys, and `in_memory` says no memtable does.
-    pub fn can_retire(
-        &self,
-        range: &ForgottenRange,
-        in_memory: impl Fn(&ForgottenRange) -> bool,
-    ) -> bool {
-        let in_tables = self
+    /// Whether `range` can come off the list: no table may still hold a key
+    /// it forgets.
+    ///
+    /// Memtables do not come into it. A range is listed by the flush of the
+    /// memtable it was forgotten in, and memtables are flushed oldest first:
+    /// by then everything written before the range is in listed tables, and
+    /// whatever a memtable holds was written after it.
+    pub fn can_retire(&self, range: &ForgottenRange) -> bool {
+        !self
             .data
             .levels
             .iter()
             .flat_map(|level| &level.files)
-            .any(|table| range.in_table(table));
-        !in_tables && !in_memory(range)
+            .any(|table| range.in_table(table))
     }
 
     /// Take every range that [`Self::can_retire`] off the list.
-    pub fn retire_forgotten(&mut self, in_memory: impl Fn(&ForgottenRange) -> bool) {
+    pub fn retire_forgotten(&mut self) {
         let keep: Vec<bool> = self
             .data
             .forgotten
             .iter()
-            .map(|range| !self.can_retire(range, &in_memory))
+            .map(|range| !self.can_retire(range))
             .collect();
         let mut keep = keep.into_iter();
         self.data
@@ -602,30 +618,69 @@ mod tests {
         m.forget(b"z", b"y");
         assert_eq!(listed(&m), [("c", "e", 2), ("m", "p", 1)]);
 
-        // Repeats, and ranges inside a listed one, change nothing.
+        // A repeat is a new forgetting of the same range: it takes the old
+        // one's place under a new number.
         m.forget(b"m", b"p");
+        assert_eq!(listed(&m), [("c", "e", 2), ("m", "p", 3)]);
+        // A range inside a listed one splits it: the parts on either side
+        // keep their number.
         m.forget(b"n", b"o");
-        assert_eq!(listed(&m), [("c", "e", 2), ("m", "p", 1)]);
+        assert_eq!(
+            listed(&m),
+            [("c", "e", 2), ("m", "n", 3), ("n", "o", 4), ("o", "p", 3)]
+        );
 
-        // A neighbour that only touches stays a range of its own.
+        // A neighbour that only touches leaves the others as they are.
         m.forget(b"e", b"g");
-        assert_eq!(listed(&m), [("c", "e", 2), ("e", "g", 3), ("m", "p", 1)]);
+        assert_eq!(listed(&m)[..2], [("c", "e", 2), ("e", "g", 5)]);
 
-        // One that overlaps takes the others in, under a new number.
-        m.forget(b"f", b"n");
-        assert_eq!(listed(&m), [("c", "e", 2), ("e", "p", 4)]);
+        // One that overlaps several takes their place where it lies and
+        // leaves the rest of them: nothing is widened.
+        m.forget(b"f", b"nz");
+        assert_eq!(
+            listed(&m),
+            [
+                ("c", "e", 2),
+                ("e", "f", 5),
+                ("f", "nz", 6),
+                ("nz", "o", 4),
+                ("o", "p", 3)
+            ]
+        );
 
-        for (key, forgotten) in [
-            ("b", false),
-            ("c", true),
-            ("d", true),
-            ("e", true),
-            ("ozzz", true),
-            ("p", false),
-            ("q", false),
+        for (key, seq) in [
+            ("b", None),
+            ("c", Some(2)),
+            ("d", Some(2)),
+            ("e", Some(5)),
+            ("f", Some(6)),
+            ("n", Some(6)),
+            ("nzz", Some(4)),
+            ("ozzz", Some(3)),
+            ("p", None),
+            ("q", None),
         ] {
-            assert_eq!(m.is_forgotten(key.as_bytes()), forgotten, "{key}");
+            let found = forgotten_range(m.forgotten(), key.as_bytes()).map(|range| range.seq);
+            assert_eq!(found, seq, "{key}");
         }
+    }
+
+    #[test]
+    fn a_range_forgets_only_what_older_tables_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::open(dir.path()).unwrap();
+        m.forget(b"c", b"e"); // number 1
+        m.forget(b"m", b"p"); // number 2
+        let ranges = m.forgotten();
+        // A table written before a range was forgotten: its keys there are
+        // forgotten. One written with or after it: they are new writes.
+        assert!(forgetting_range(ranges, b"n", 0).is_some());
+        assert!(forgetting_range(ranges, b"n", 1).is_some());
+        assert!(forgetting_range(ranges, b"n", 2).is_none());
+        assert!(forgetting_range(ranges, b"d", 0).is_some());
+        assert!(forgetting_range(ranges, b"d", 1).is_none());
+        // Outside every range nothing is forgotten.
+        assert!(forgetting_range(ranges, b"f", 0).is_none());
     }
 
     #[test]
@@ -641,13 +696,10 @@ mod tests {
         assert!(m.holds_forgotten(&m.get_level(0)[0]));
 
         // Kept while a table may hold its keys.
-        m.retire_forgotten(|_| false);
+        m.retire_forgotten();
         assert_eq!(listed(&m).len(), 1);
-        // Kept while a memtable does.
         m.remove_sstable(0, "o-q.sst");
-        m.retire_forgotten(|_| true);
-        assert_eq!(listed(&m).len(), 1);
-        m.retire_forgotten(|_| false);
+        m.retire_forgotten();
         assert!(listed(&m).is_empty());
 
         // The numbering goes on from where it was.
@@ -663,7 +715,9 @@ mod tests {
         let mut m = Manifest::open(dir.path()).unwrap();
         m.forget(b"m", b"p");
         m.forget(b"c", b"e");
-        m.retire_forgotten(|range| range.start == b"m");
+        // A table that may hold keys of the first range keeps it listed.
+        m.add_sstable(0, table("n", "o", 0));
+        m.retire_forgotten();
         persist(&io, m.dir(), &m.snapshot()).await.unwrap();
 
         let m = Manifest::open(dir.path()).unwrap();

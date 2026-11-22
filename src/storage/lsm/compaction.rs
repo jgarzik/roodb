@@ -16,14 +16,15 @@
 //!
 //! Compaction is also what removes the keys of forgotten ranges (see
 //! `Manifest::forget`) from tables that hold other keys as well: every merge
-//! leaves them out, and a table that may hold some is compacted for that
-//! reason alone, whatever its level's size.
+//! leaves out what its inputs hold of them from before they were forgotten,
+//! and a table that may hold some is compacted for that reason alone,
+//! whatever its level's size.
 
 use std::path::PathBuf;
 
 use crate::io::{IoEngine, Urgency};
 use crate::storage::error::StorageResult;
-use crate::storage::lsm::manifest::{is_forgotten, ForgottenRange, Manifest, SstableInfo};
+use crate::storage::lsm::manifest::{forgetting_range, ForgottenRange, Manifest, SstableInfo};
 use crate::storage::lsm::merge_iter::MergeIterator;
 use crate::storage::lsm::sstable::{SstableReader, SstableWriter};
 
@@ -105,8 +106,9 @@ pub struct CompactionJob {
     /// Nothing below the target level overlaps this job's key range, so
     /// tombstones have nothing left to hide and can be dropped.
     pub drop_tombstones: bool,
-    /// The forgotten ranges listed when the job was picked. Their keys are
-    /// left out of the output.
+    /// The forgotten ranges listed when the job was picked. What they
+    /// forget of each input (see [`SstableInfo::filtered_seq`]) is left out
+    /// of the output.
     pub forgotten: Vec<ForgottenRange>,
     /// The number of the newest forgotten range at that moment: what the
     /// output records as [`SstableInfo::filtered_seq`].
@@ -240,78 +242,95 @@ fn build_job(
 /// About how much of the inputs a compaction holds in memory at a time.
 const COMPACTION_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
+/// A table to read, with what tells which forgotten ranges apply to it.
+#[derive(Clone)]
+pub(crate) struct TableSource {
+    pub table: std::sync::Arc<SstableReader>,
+    /// The table's [`SstableInfo::filtered_seq`].
+    pub filtered_seq: u64,
+}
+
 /// The next stretch of the merge of `tables` (newest data first): entries
 /// with keys greater than `after` (from the start if `None`), in key order,
 /// about `max_bytes` of them, deleted keys included as `None`. Where several
 /// tables hold a key, the first of them decides. The flag says whether
 /// these were the last.
 ///
-/// Keys in one of the `forgotten` ranges are left out, as if no table held
-/// them.
+/// What one of the `forgotten` ranges forgets of a table is left out, as if
+/// the table did not hold it.
 pub(crate) async fn merged_chunk(
-    tables: &[std::sync::Arc<SstableReader>],
+    tables: &[TableSource],
     after: Option<&[u8]>,
     max_bytes: usize,
     forgotten: &[ForgottenRange],
 ) -> StorageResult<(Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)> {
-    if forgotten.is_empty() {
-        return merged_stretch(tables, after, max_bytes).await;
-    }
     let mut after = after.map(<[u8]>::to_vec);
     loop {
-        let (mut entries, done) = merged_stretch(tables, after.as_deref(), max_bytes).await?;
-        let last = entries.last().map(|(key, _)| key.clone());
-        entries.retain(|(key, _)| !is_forgotten(forgotten, key));
-        if !entries.is_empty() || done {
-            return Ok((entries, done));
+        let stretch = merged_stretch(tables, after.as_deref(), max_bytes, forgotten).await?;
+        if !stretch.entries.is_empty() || stretch.done {
+            return Ok((stretch.entries, stretch.done));
         }
         // Everything in this stretch was forgotten: go on from its end.
-        match last {
-            Some(last) => after = Some(last),
-            None => return Ok((entries, true)),
+        match stretch.reached {
+            Some(reached) => after = Some(reached),
+            None => return Ok((stretch.entries, true)),
         }
     }
 }
 
-/// [`merged_chunk`] before forgotten keys are left out.
-///
+/// One step of [`merged_chunk`].
+struct Stretch {
+    entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// The last key the stretch covers: that of the last entry, or of a
+    /// forgotten one after it. `None` if the tables hold nothing further.
+    reached: Option<Vec<u8>>,
+    /// Nothing lies beyond `reached`.
+    done: bool,
+}
+
 /// Only the tables the stretch can come from are read. Tables are mostly
 /// non-overlapping and in key order; reading every table for every stretch
 /// would read the whole of them over and over.
 async fn merged_stretch(
-    tables: &[std::sync::Arc<SstableReader>],
+    tables: &[TableSource],
     after: Option<&[u8]>,
     max_bytes: usize,
-) -> StorageResult<(Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)> {
+    forgotten: &[ForgottenRange],
+) -> StorageResult<Stretch> {
+    let nothing_left = Stretch {
+        entries: Vec::new(),
+        reached: None,
+        done: true,
+    };
     // Tables are read only once the position has reached where they start;
     // `reach` extends that to a table that starts further on when nothing
     // nearer is left.
     let mut reach: Option<Vec<u8>> = None;
     loop {
         // Tables with anything beyond the position.
-        let remaining: Vec<(usize, &std::sync::Arc<SstableReader>)> = tables
+        let remaining: Vec<(usize, &TableSource)> = tables
             .iter()
             .enumerate()
-            .filter(|(_, table)| {
-                after.is_none_or(|after| table.metadata().max_key.as_slice() > after)
+            .filter(|(_, source)| {
+                after.is_none_or(|after| source.table.metadata().max_key.as_slice() > after)
             })
             .collect();
         if remaining.is_empty() {
-            return Ok((Vec::new(), true));
+            return Ok(nothing_left);
         }
-        let started = |table: &SstableReader| {
-            let min_key = table.metadata().min_key.as_slice();
+        let started = |source: &TableSource| {
+            let min_key = source.table.metadata().min_key.as_slice();
             after.is_some_and(|after| min_key <= after)
                 || reach.as_deref().is_some_and(|reach| min_key <= reach)
         };
         let next_start: Option<Vec<u8>> = remaining
             .iter()
-            .filter(|(_, table)| !started(table))
-            .map(|(_, table)| table.metadata().min_key.clone())
+            .filter(|(_, source)| !started(source))
+            .map(|(_, source)| source.table.metadata().min_key.clone())
             .min();
-        let chosen: Vec<(usize, &std::sync::Arc<SstableReader>)> = remaining
+        let chosen: Vec<(usize, &TableSource)> = remaining
             .iter()
-            .filter(|(_, table)| started(table))
+            .filter(|(_, source)| started(source))
             .copied()
             .collect();
         if chosen.is_empty() {
@@ -326,8 +345,10 @@ async fn merged_stretch(
         // unread table starts.
         let mut merger = MergeIterator::new();
         let mut bound: Option<Vec<u8>> = None;
-        for (priority, table) in &chosen {
-            let (entries, ended) = table.scan_after(after, max_bytes).await?;
+        // Keys left out as forgotten: the stretch covers them all the same.
+        let mut left_out: Vec<Vec<u8>> = Vec::new();
+        for (priority, source) in &chosen {
+            let (mut entries, ended) = source.table.scan_after(after, max_bytes).await?;
             if !ended {
                 if let Some((last, _)) = entries.last() {
                     if bound.as_ref().is_none_or(|bound| last < bound) {
@@ -335,30 +356,52 @@ async fn merged_stretch(
                     }
                 }
             }
+            if !forgotten.is_empty() {
+                entries.retain(|(key, _)| {
+                    let gone = forgetting_range(forgotten, key, source.filtered_seq).is_some();
+                    if gone {
+                        left_out.push(key.clone());
+                    }
+                    !gone
+                });
+            }
             merger.add(entries, *priority);
         }
         let mut merged = merger.merge();
-        if let Some(bound) = &bound {
-            merged.retain(|(key, _)| key <= bound);
-        }
-        if let Some(next_start) = &next_start {
-            merged.retain(|(key, _)| key < next_start);
-        }
-        if !merged.is_empty() {
+        let covered = |key: &Vec<u8>| {
+            bound.as_ref().is_none_or(|bound| key <= bound)
+                && next_start
+                    .as_ref()
+                    .is_none_or(|next_start| key < next_start)
+        };
+        merged.retain(|(key, _)| covered(key));
+        let reached = merged
+            .last()
+            .map(|(key, _)| key)
+            .into_iter()
+            .chain(left_out.iter().filter(|key| covered(key)))
+            .max()
+            .cloned();
+        if reached.is_some() {
             let done = bound.is_none() && next_start.is_none();
-            return Ok((merged, done));
+            return Ok(Stretch {
+                entries: merged,
+                reached,
+                done,
+            });
         }
         // Nothing before the nearest unread table: read that one too.
         match next_start {
             Some(next_start) => reach = Some(next_start),
-            None => return Ok((Vec::new(), true)),
+            None => return Ok(nothing_left),
         }
     }
 }
 
-/// Merge the inputs and write the output table, leaving out the keys of the
-/// job's forgotten ranges. Returns `None` if nothing is left to write (every
-/// entry was forgotten, or a tombstone with nothing to hide).
+/// Merge the inputs and write the output table, leaving out what the job's
+/// forgotten ranges forget of each input. Returns `None` if nothing is left
+/// to write (every entry was forgotten, or a tombstone with nothing to
+/// hide).
 ///
 /// The inputs are read and the output written a stretch at a time: what a
 /// compaction holds in memory does not grow with the size of its tables.
@@ -367,9 +410,13 @@ pub async fn execute_compaction(
     job: &CompactionJob,
 ) -> StorageResult<Option<SstableInfo>> {
     let mut inputs = Vec::with_capacity(job.input_paths.len());
-    for path in &job.input_paths {
+    let files = job.source_files.iter().chain(&job.target_files);
+    for (path, file) in job.input_paths.iter().zip(files) {
         let reader = SstableReader::open(engine, path, Urgency::Background).await?;
-        inputs.push(std::sync::Arc::new(reader));
+        inputs.push(TableSource {
+            table: std::sync::Arc::new(reader),
+            filtered_seq: file.filtered_seq,
+        });
     }
 
     let mut writer: Option<SstableWriter> = None;

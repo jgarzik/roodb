@@ -309,6 +309,14 @@ impl StorageEngine for SessionStorage {
         self.shared.delete(key).await
     }
 
+    /// A forgotten range, like a scan, belongs to whichever side its start
+    /// key lives on: ranges are those of one table at a time. This session's
+    /// rows in the range go in either case. The shared engine is told only
+    /// when the range is not one of this session's temporary tables: a
+    /// temporary table's keys are under an ID this process alone gave out,
+    /// so the shared engine holds nothing there, and nothing about a
+    /// temporary table is ever stored - a forgotten range is, in the
+    /// manifest.
     async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
         if !self.has_temp.load(Ordering::Relaxed) {
             return self.shared.write_batch(batch).await;
@@ -316,14 +324,28 @@ impl StorageEngine for SessionStorage {
         let mut shared = Vec::new();
         {
             let mut temp = self.temp.write();
-            for (key, value) in batch {
-                if temp.owns(&key) {
-                    match value {
-                        Some(value) => temp.insert(key, value),
-                        None => temp.remove(&key),
+            for write in batch {
+                match write {
+                    WriteOp::Put(key, value) if temp.owns(&key) => temp.insert(key, value),
+                    WriteOp::Delete(key) if temp.owns(&key) => temp.remove(&key),
+                    WriteOp::ForgetRange { start, end } => {
+                        if start >= end {
+                            continue;
+                        }
+                        use std::ops::Bound::{Excluded, Included};
+                        let keys: Vec<Vec<u8>> = temp
+                            .rows
+                            .range::<[u8], _>((Included(&start[..]), Excluded(&end[..])))
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        for key in keys {
+                            temp.remove(&key);
+                        }
+                        if !temp.owns(&start) {
+                            shared.push(WriteOp::ForgetRange { start, end });
+                        }
                     }
-                } else {
-                    shared.push((key, value));
+                    write => shared.push(write),
                 }
             }
         }
@@ -331,35 +353,6 @@ impl StorageEngine for SessionStorage {
             return Ok(());
         }
         self.shared.write_batch(shared).await
-    }
-
-    /// Like a scan, a range belongs to whichever side its start key lives
-    /// on: ranges are those of one table at a time. This session's rows in
-    /// the range go in either case. The shared engine is told only when the
-    /// range is not one of this session's temporary tables: a temporary
-    /// table's keys are under an ID this process alone gave out, so the
-    /// shared engine holds nothing there, and nothing about a temporary
-    /// table is ever stored - a forgotten range is, in the manifest.
-    async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
-        if start >= end {
-            return Ok(());
-        }
-        if self.has_temp.load(Ordering::Relaxed) {
-            use std::ops::Bound::{Excluded, Included};
-            let mut temp = self.temp.write();
-            let keys: Vec<Vec<u8>> = temp
-                .rows
-                .range::<[u8], _>((Included(start), Excluded(end)))
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in keys {
-                temp.remove(&key);
-            }
-            if temp.owns(start) {
-                return Ok(());
-            }
-        }
-        self.shared.drop_range(start, end).await
     }
 
     /// A scan is served from wherever its start key lives: scans are made
@@ -450,10 +443,10 @@ mod tests {
             panic!("temporary row deleted from shared storage: {key:?}");
         }
         async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+            if let [WriteOp::ForgetRange { start, end }] = &batch[..] {
+                panic!("range dropped from shared storage: {start:?}..{end:?}");
+            }
             panic!("temporary rows written to shared storage: {batch:?}");
-        }
-        async fn drop_range(&self, start: &[u8], end: &[u8]) -> StorageResult<()> {
-            panic!("range dropped from shared storage: {start:?}..{end:?}");
         }
         async fn scan(
             &self,
@@ -695,7 +688,10 @@ mod tests {
         let before = storage.temp.read().bytes;
         // The shared engine is not told: it would panic.
         storage
-            .drop_range(&table_key_prefix(tid("a")), &table_key_end(tid("a")))
+            .write_batch(vec![WriteOp::forget(
+                &table_key_prefix(tid("a")),
+                &table_key_end(tid("a")),
+            )])
             .await
             .unwrap();
         assert_eq!(storage.get(&key("a", 1)).await.unwrap(), None);
@@ -704,10 +700,30 @@ mod tests {
         assert!(storage.temp.read().bytes < before);
         // Empty and inverted ranges hold nothing.
         storage
-            .drop_range(&table_key_end(tid("b")), &table_key_prefix(tid("b")))
+            .write_batch(vec![WriteOp::forget(
+                &table_key_end(tid("b")),
+                &table_key_prefix(tid("b")),
+            )])
             .await
             .unwrap();
         assert!(storage.get(&key("b", 1)).await.unwrap().is_some());
+
+        // The writes of a batch apply in order: a row written before the
+        // range is forgotten goes with it, one written after stays.
+        storage
+            .write_batch(vec![
+                WriteOp::Put(key("b", 2), b"before".to_vec()),
+                WriteOp::forget(&table_key_prefix(tid("b")), &table_key_end(tid("b"))),
+                WriteOp::Put(key("b", 3), b"after".to_vec()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(storage.get(&key("b", 1)).await.unwrap(), None);
+        assert_eq!(storage.get(&key("b", 2)).await.unwrap(), None);
+        assert_eq!(
+            storage.get(&key("b", 3)).await.unwrap(),
+            Some(b"after".to_vec())
+        );
     }
 
     #[tokio::test]
@@ -716,10 +732,10 @@ mod tests {
         let storage = SessionStorage::new(Arc::new(Untouched));
         storage.add_table(&"a".into(), tid("a"));
         let _ = storage
-            .drop_range(
+            .write_batch(vec![WriteOp::forget(
                 &table_key_prefix(tid("other")),
                 &table_key_end(tid("other")),
-            )
+            )])
             .await;
     }
 }

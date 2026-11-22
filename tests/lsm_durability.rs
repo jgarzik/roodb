@@ -12,6 +12,7 @@ use std::sync::Arc;
 use roodb::io::{IoBackend, IoEngine};
 use roodb::storage::lsm::engine::{CrashPoint, LsmConfig};
 use roodb::storage::lsm::LsmEngine;
+use roodb::storage::traits::WriteOp;
 use roodb::storage::{StorageEngine, StorageError};
 
 fn io() -> IoEngine {
@@ -117,15 +118,12 @@ async fn a_batch_is_never_split_by_a_flush() {
         };
         for i in 0..BATCHES {
             let batch = vec![
-                (format!("a{i:06}").into_bytes(), Some(vec![1u8; 100])),
-                (format!("m{i:06}").into_bytes(), Some(vec![2u8; 100])),
-                (format!("z{i:06}").into_bytes(), Some(vec![3u8; 100])),
+                WriteOp::Put(format!("a{i:06}").into_bytes(), vec![1u8; 100]),
+                WriteOp::Put(format!("m{i:06}").into_bytes(), vec![2u8; 100]),
+                WriteOp::Put(format!("z{i:06}").into_bytes(), vec![3u8; 100]),
                 // The marker written by the previous batch is removed by this one.
-                (
-                    format!("marker{:06}", i.saturating_sub(1)).into_bytes(),
-                    None,
-                ),
-                (format!("marker{i:06}").into_bytes(), Some(b"last".to_vec())),
+                WriteOp::Delete(format!("marker{:06}", i.saturating_sub(1)).into_bytes()),
+                WriteOp::Put(format!("marker{i:06}").into_bytes(), b"last".to_vec()),
             ];
             engine.write_batch(batch).await.unwrap();
             if i % 16 == 0 {
@@ -231,7 +229,7 @@ async fn oversized_keys_are_rejected_at_write_time() {
     let err = engine.put(&huge_key, b"v").await.unwrap_err();
     assert!(matches!(err, StorageError::KeyTooLarge { .. }), "{err}");
     let err = engine
-        .write_batch(vec![(huge_key.clone(), Some(b"v".to_vec()))])
+        .write_batch(vec![WriteOp::Put(huge_key.clone(), b"v".to_vec())])
         .await
         .unwrap_err();
     assert!(matches!(err, StorageError::KeyTooLarge { .. }), "{err}");
@@ -1148,6 +1146,14 @@ async fn read_view(view: &dyn roodb::storage::traits::SnapshotView) -> Vec<(Vec<
     }
 }
 
+/// Forget `[start, end)`, in a batch of its own.
+async fn forget(engine: &LsmEngine, start: &[u8], end: &[u8]) {
+    engine
+        .write_batch(vec![WriteOp::forget(start, end)])
+        .await
+        .unwrap();
+}
+
 /// A forgotten range is gone from every read at once - keys in memory and
 /// keys in tables alike - while its neighbours on both sides stay. It stays
 /// gone over a restart, forgetting it again changes nothing, and the keys
@@ -1172,7 +1178,7 @@ async fn a_forgotten_range_is_gone_and_stays_gone() {
     put_keys(&engine, &['a', 'b', 'c'], 600..700).await;
     engine.put(B_START, b"first of the range").await.unwrap();
 
-    engine.drop_range(B_START, B_END).await.unwrap();
+    forget(&engine, B_START, B_END).await;
 
     check_only_b_is_gone(&engine, 0..700, "after the drop").await;
     assert_eq!(engine.get(B_START).await.unwrap(), None);
@@ -1198,14 +1204,22 @@ async fn a_forgotten_range_is_gone_and_stays_gone() {
     );
     assert_eq!(engine.next_key(b"b9", B_END).await.unwrap(), None);
     assert_eq!(engine.prev_key(B_END, B_START).await.unwrap(), None);
+    // All of that from memory: nothing of the range is on disk yet, where
+    // the keys flushed earlier still are.
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert_eq!(manifest_on_disk(dir.path()).forgotten_seq, 0);
+    assert_eq!(
+        engine.get_durable(&tkey('b', 300)).await.unwrap(),
+        Some(tvalue('b', 300))
+    );
 
     // Again, with the same range and with ones that overlap it: harmless.
-    engine.drop_range(B_START, B_END).await.unwrap();
-    engine.drop_range(b"b:00100", b"b:00200").await.unwrap();
-    engine.drop_range(b"b:00650", B_END).await.unwrap();
+    forget(&engine, B_START, B_END).await;
+    forget(&engine, b"b:00100", b"b:00200").await;
+    forget(&engine, b"b:00650", B_END).await;
     // An empty range and an inverted one hold nothing.
-    engine.drop_range(b"a:", b"a:").await.unwrap();
-    engine.drop_range(b"c;", b"a:").await.unwrap();
+    forget(&engine, b"a:", b"a:").await;
+    forget(&engine, b"c;", b"a:").await;
     check_only_b_is_gone(&engine, 0..700, "after repeating the drop").await;
 
     // The ranges on both sides take writes as before.
@@ -1215,6 +1229,8 @@ async fn a_forgotten_range_is_gone_and_stays_gone() {
     check_only_b_is_gone(&engine, 0..800, "after writing next to it").await;
     engine.flush().await.unwrap();
     check_only_b_is_gone(&engine, 0..800, "after a flush").await;
+    assert_eq!(engine.get_durable(&tkey('b', 300)).await.unwrap(), None);
+    assert!(manifest_on_disk(dir.path()).forgotten_seq > 0);
     engine.close().await.unwrap();
     drop(engine);
 
@@ -1230,9 +1246,9 @@ async fn a_forgotten_range_is_gone_and_stays_gone() {
         engine.get(b"b;0").await.unwrap(),
         Some(b"new neighbour".to_vec())
     );
-    // The log replays the drop after a restart.
-    engine.drop_range(B_START, B_END).await.unwrap();
-    check_only_b_is_gone(&engine, 0..800, "after a replayed drop").await;
+    // Forgotten once more after the restart.
+    forget(&engine, B_START, B_END).await;
+    check_only_b_is_gone(&engine, 0..800, "after another drop").await;
     engine.close().await.unwrap();
     drop(engine);
 
@@ -1241,16 +1257,25 @@ async fn a_forgotten_range_is_gone_and_stays_gone() {
     engine.close().await.unwrap();
 }
 
-/// Stop at each point where a crash while forgetting a range leaves the
-/// directory in a distinct state - the range recorded and nothing else done;
-/// tables unlisted but their files still there; everything done - and
-/// reopen. The range is gone, its neighbours are not, the files end up
-/// deleted and the engine goes on working.
+/// The key under which these tests keep the position of the log entry that
+/// was applied last, as the Raft state machine does: every batch writes it.
+const POSITION: &[u8] = b"position";
+
+/// Stop at each point where a crash while a forgotten range is on its way
+/// to disk leaves the directory in a distinct state - the table of its
+/// batch written but nothing listed; the range and the table listed and
+/// nothing else done; tables unlisted but their files still there;
+/// everything done - and reopen. Storage is either wholly before the batch
+/// that forgot the range (the range's keys there, the earlier position) or
+/// wholly after it (the keys gone, the batch's position). Then the range
+/// goes or stays gone, its neighbours do not, the files end up deleted and
+/// the engine goes on working.
 #[tokio::test]
 async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
     for point in [
-        Some(CrashPoint::DropRangeAfterRangeSaved),
-        Some(CrashPoint::DropRangeAfterTablesUnlisted),
+        Some(CrashPoint::FlushAfterTableWritten),
+        Some(CrashPoint::FlushAfterRangesSaved),
+        Some(CrashPoint::ForgottenTablesUnlisted),
         None,
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1266,6 +1291,7 @@ async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
         let only_b = sst_files(dir.path());
         assert_eq!(only_b.len(), 2);
         put_keys(&engine, &['a', 'b', 'c'], 400..600).await;
+        engine.put(POSITION, &[1]).await.unwrap();
         engine.flush().await.unwrap();
         engine.close().await.unwrap();
         drop(engine);
@@ -1276,15 +1302,37 @@ async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
             ..base.clone()
         };
         let engine = LsmEngine::open(io(), armed).await.unwrap();
-        let dropped = engine.drop_range(B_START, B_END).await;
-        match point {
-            Some(CrashPoint::DropRangeAfterRangeSaved) => {
-                assert!(dropped.is_err(), "the crash point did not stop the drop");
-                assert_eq!(manifest_on_disk(dir.path()).forgotten.len(), 1);
+        let batch = || {
+            vec![
+                WriteOp::forget(B_START, B_END),
+                WriteOp::Put(POSITION.to_vec(), vec![2]),
+            ]
+        };
+        engine.write_batch(batch()).await.unwrap();
+        // In memory the range is gone at once, whatever happens to the
+        // flush.
+        check_only_b_is_gone(&engine, 400..600, &format!("{point:?}, in memory")).await;
+        let flushed = engine.flush().await;
+        let range_saved = match point {
+            Some(CrashPoint::FlushAfterTableWritten) => {
+                assert!(flushed.is_err(), "the crash point did not stop the flush");
+                // The batch's table is written and nothing lists it, nor
+                // the range.
+                assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
                 assert_eq!(listed_tables(dir.path()).len(), 3);
+                assert_eq!(sst_files(dir.path()).len(), 4);
+                false
+            }
+            Some(CrashPoint::FlushAfterRangesSaved) => {
+                assert!(flushed.is_err(), "the crash point did not stop the flush");
+                // One change of the manifest listed the range and the table
+                // of its batch; no table has been touched.
+                assert_eq!(manifest_on_disk(dir.path()).forgotten.len(), 1);
+                assert_eq!(listed_tables(dir.path()).len(), 4);
+                true
             }
             Some(_) => {
-                dropped.unwrap();
+                assert!(flushed.is_err(), "the crash point did not stop the flush");
                 wait_for("the tables of the range are off the manifest", || {
                     let listed = listed_tables(dir.path());
                     only_b.iter().all(|name| !listed.contains(name))
@@ -1296,15 +1344,17 @@ async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
                     only_b.iter().all(|name| on_disk.contains(name)),
                     "{point:?}"
                 );
+                true
             }
             None => {
-                dropped.unwrap();
+                flushed.unwrap();
                 wait_for("the range is retired", || {
                     manifest_on_disk(dir.path()).forgotten.is_empty()
                 })
                 .await;
+                true
             }
-        }
+        };
         // Crash: no close.
         drop(engine);
 
@@ -1312,6 +1362,24 @@ async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
             .await
             .unwrap_or_else(|e| panic!("{point:?}: reopen failed: {e}"));
         let when = format!("{point:?}, reopened");
+        if range_saved {
+            assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![2]), "{when}");
+        } else {
+            // Storage is where it was before the batch: its position, and
+            // every key of the range. The log is replayed from there.
+            assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![1]), "{when}");
+            for n in (0..600).step_by(13) {
+                assert_eq!(
+                    engine.get(&tkey('b', n)).await.unwrap(),
+                    Some(tvalue('b', n)),
+                    "{when}"
+                );
+            }
+            assert_eq!(sst_files(dir.path()), listed_tables(dir.path()), "{when}");
+            engine.write_batch(batch()).await.unwrap();
+            engine.flush().await.unwrap();
+            assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![2]), "{when}");
+        }
         for n in (0..400).step_by(13) {
             assert_eq!(engine.get(&tkey('b', n)).await.unwrap(), None, "{when}");
         }
@@ -1341,6 +1409,7 @@ async fn a_crash_while_forgetting_a_range_loses_only_the_range() {
 
         let engine = LsmEngine::open(io(), base).await.unwrap();
         check_only_b_is_gone(&engine, 400..700, &format!("{point:?}, closed")).await;
+        assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![2]));
         engine.close().await.unwrap();
     }
 }
@@ -1419,16 +1488,8 @@ async fn the_space_of_forgotten_ranges_is_given_back() {
 
     for group in MIXED.into_iter().chain(ONLY_B) {
         let (start, end) = (format!("{group:02}b:"), format!("{group:02}b;"));
-        engine
-            .drop_range(start.as_bytes(), end.as_bytes())
-            .await
-            .unwrap();
+        forget(&engine, start.as_bytes(), end.as_bytes()).await;
     }
-    assert_eq!(
-        manifest_on_disk(dir.path()).forgotten_seq,
-        12,
-        "the ranges were not all recorded"
-    );
 
     let expected: Vec<(Vec<u8>, Vec<u8>)> = MIXED
         .into_iter()
@@ -1442,6 +1503,15 @@ async fn the_space_of_forgotten_ranges_is_given_back() {
         engine.scan(None, None).await.unwrap() == expected,
         "right after the drop"
     );
+    // So far the ranges are with the memtable. Its flush records them.
+    assert_eq!(manifest_on_disk(dir.path()).forgotten_seq, 0);
+    assert_eq!(table_bytes(dir.path()), bytes_before);
+    engine.flush().await.unwrap();
+    assert_eq!(
+        manifest_on_disk(dir.path()).forgotten_seq,
+        12,
+        "the ranges were not all recorded"
+    );
 
     wait_for("every range is retired", || {
         manifest_on_disk(dir.path()).forgotten.is_empty()
@@ -1453,6 +1523,7 @@ async fn the_space_of_forgotten_ranges_is_given_back() {
         "tables of nothing but forgotten keys are still there: {on_disk:?}"
     );
     assert_eq!(on_disk, listed_tables(dir.path()));
+    // Less on disk than before, though a third of a memtable was added.
     let bytes_after = table_bytes(dir.path());
     assert!(
         bytes_after < bytes_before,
@@ -1480,10 +1551,10 @@ async fn the_space_of_forgotten_ranges_is_given_back() {
 }
 
 /// Ranges are forgotten while memtables fill, are flushed and are compacted
-/// all around them. However a drop falls among those - before a memtable is
-/// read for its flush, while its table is being written, while a compaction
-/// that took the keys in is running - no forgotten key comes back once its
-/// range has been retired, and no other key is lost.
+/// all around them. However a drop falls among those - in a memtable that is
+/// about to be frozen, while an older memtable's table is being written,
+/// while a compaction that took the keys in is running - no forgotten key
+/// comes back once its range has been retired, and no other key is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
     const GROUPS: u32 = 120;
@@ -1517,7 +1588,7 @@ async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
         for n in 0..60 {
             let batch = ['a', 'b', 'c']
                 .into_iter()
-                .map(|table| (gkey(group, table, n), Some(tvalue(table, n))))
+                .map(|table| WriteOp::Put(gkey(group, table, n), tvalue(table, n)))
                 .collect();
             engine.write_batch(batch).await.unwrap();
             if n % 16 == 0 {
@@ -1528,21 +1599,17 @@ async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
         // being written around it.
         if let Some(victim) = group.checked_sub(1) {
             let (start, end) = (format!("{victim:03}b:"), format!("{victim:03}b;"));
-            engine
-                .drop_range(start.as_bytes(), end.as_bytes())
-                .await
-                .unwrap();
+            forget(&engine, start.as_bytes(), end.as_bytes()).await;
             assert_eq!(engine.get(&gkey(victim, 'b', 30)).await.unwrap(), None);
         }
     }
     let last = GROUPS - 1;
-    engine
-        .drop_range(
-            format!("{last:03}b:").as_bytes(),
-            format!("{last:03}b;").as_bytes(),
-        )
-        .await
-        .unwrap();
+    forget(
+        &engine,
+        format!("{last:03}b:").as_bytes(),
+        format!("{last:03}b;").as_bytes(),
+    )
+    .await;
     stop.store(true, Ordering::Relaxed);
     flusher.await.unwrap();
 
@@ -1555,7 +1622,7 @@ async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
         .collect();
     assert!(
         engine.scan(None, None).await.unwrap() == expected,
-        "with the ranges still listed"
+        "with ranges still in memory or listed"
     );
     engine.flush().await.unwrap();
     wait_for("every range is retired", || {
@@ -1580,13 +1647,20 @@ async fn ranges_forgotten_among_flushes_and_compactions_stay_forgotten() {
     engine.close().await.unwrap();
 }
 
-/// A view taken after a range was forgotten does not show its keys. A view
-/// taken before goes on showing all of them, also once the engine has
-/// deleted the tables that held them.
+/// A view is of what has been flushed. One taken after a forgotten range
+/// was flushed does not show its keys. One taken before - before the range
+/// was forgotten, or before that was flushed - goes on showing all of them,
+/// also once the engine has deleted the tables that held them.
 #[tokio::test]
 async fn a_view_and_a_forgotten_range() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    // The flush that records the range stops there, so that the tables
+    // still hold the range's keys when the view after it is taken.
+    let armed = LsmConfig {
+        crash_point: Some(CrashPoint::FlushAfterRangesSaved),
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), armed).await.unwrap();
     put_keys(&engine, &['b'], 0..300).await;
     engine.flush().await.unwrap();
     put_keys(&engine, &['a', 'b', 'c'], 300..600).await;
@@ -1595,13 +1669,25 @@ async fn a_view_and_a_forgotten_range() {
     assert_eq!(everything.len(), 300 + 3 * 300);
 
     let before = engine.snapshot_view().await.unwrap();
-    engine.drop_range(B_START, B_END).await.unwrap();
-    let after = engine.snapshot_view().await.unwrap();
+    forget(&engine, B_START, B_END).await;
     let remaining = engine.scan(None, None).await.unwrap();
     assert_eq!(remaining.len(), 2 * 300);
+    // Forgotten, but not flushed: like any write still in memory, it is
+    // not in a view.
+    let unflushed = engine.snapshot_view().await.unwrap();
+    assert!(read_view(unflushed.as_ref()).await == everything);
+    assert_eq!(
+        unflushed.get(&tkey('b', 10)).await.unwrap(),
+        Some(tvalue('b', 10))
+    );
 
-    // Read the later view at once, while the tables may still hold the
-    // keys, and again when they no longer do.
+    assert!(engine.flush().await.is_err(), "the flush was not stopped");
+    assert_eq!(manifest_on_disk(dir.path()).forgotten.len(), 1);
+    let after = engine.snapshot_view().await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == remaining);
+
+    // Read the later view at once, while the tables still hold the keys,
+    // and again when they no longer do.
     assert!(read_view(after.as_ref()).await == remaining);
     assert_eq!(after.get(&tkey('b', 10)).await.unwrap(), None);
     assert_eq!(after.get(&tkey('b', 400)).await.unwrap(), None);
@@ -1609,65 +1695,108 @@ async fn a_view_and_a_forgotten_range() {
         after.get(&tkey('a', 400)).await.unwrap(),
         Some(tvalue('a', 400))
     );
+    // The engine stopped by the crash point is done for; another takes
+    // over and clears the range's keys away. The views stay as they are.
+    drop(engine);
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert!(engine.scan(None, None).await.unwrap() == remaining);
+    assert!(read_view(after.as_ref()).await == remaining);
+    assert!(read_view(engine.snapshot_view().await.unwrap().as_ref()).await == remaining);
+
+    // The earlier views are the moment before the range went, whole.
+    for view in [&before, &unflushed] {
+        assert!(read_view(view.as_ref()).await == everything);
+        assert_eq!(
+            view.get(&tkey('b', 10)).await.unwrap(),
+            Some(tvalue('b', 10))
+        );
+        assert_eq!(
+            view.get(&tkey('b', 400)).await.unwrap(),
+            Some(tvalue('b', 400))
+        );
+    }
+    drop(before);
+    drop(unflushed);
+    drop(after);
+    engine.close().await.unwrap();
+    drop(engine);
+
+    // The same with one engine throughout: the views before and after.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmEngine::open(io(), config(dir.path())).await.unwrap();
+    put_keys(&engine, &['b'], 0..300).await;
+    engine.flush().await.unwrap();
+    put_keys(&engine, &['a', 'b', 'c'], 300..600).await;
+    engine.flush().await.unwrap();
+    let before = engine.snapshot_view().await.unwrap();
+    forget(&engine, B_START, B_END).await;
+    engine.flush().await.unwrap();
+    let after = engine.snapshot_view().await.unwrap();
     wait_for("the range is retired", || {
         manifest_on_disk(dir.path()).forgotten.is_empty()
     })
     .await;
     assert!(read_view(after.as_ref()).await == remaining);
-    assert!(read_view(engine.snapshot_view().await.unwrap().as_ref()).await == remaining);
-
-    // The earlier view is the moment before the drop, whole.
     assert!(read_view(before.as_ref()).await == everything);
-    assert_eq!(
-        before.get(&tkey('b', 10)).await.unwrap(),
-        Some(tvalue('b', 10))
-    );
-    assert_eq!(
-        before.get(&tkey('b', 400)).await.unwrap(),
-        Some(tvalue('b', 400))
-    );
     drop(before);
     drop(after);
     assert_eq!(sst_files(dir.path()), listed_tables(dir.path()));
     engine.close().await.unwrap();
 }
 
-/// Replacing the whole contents starts afresh: ranges forgotten before do
-/// not hide what the replacement brings. A range forgotten afterwards is
-/// removed from the replacement's tables like any other.
+/// Replacing the whole contents starts afresh: ranges forgotten before -
+/// still in memory, or listed in the manifest - do not hide what the
+/// replacement brings. A range forgotten afterwards is removed from the
+/// replacement's tables like any other.
 #[tokio::test]
 async fn a_replacement_clears_the_forgotten_ranges() {
+    /// A snapshot from a node that had not yet forgotten the range.
+    async fn replace(engine: &Arc<LsmEngine>) {
+        let mut ingest = engine.clone().ingest().await.unwrap();
+        for table in ['a', 'b', 'c'] {
+            ingest
+                .add(
+                    (0..300)
+                        .map(|n| (tkey(table, n), b"replaced".to_vec()))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+        ingest.commit().await.unwrap();
+    }
+
+    // The range is with a memtable when the replacement comes.
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(LsmEngine::open(io(), config(dir.path())).await.unwrap());
     put_keys(&engine, &['a', 'b', 'c'], 0..300).await;
     engine.flush().await.unwrap();
-    engine.drop_range(B_START, B_END).await.unwrap();
+    forget(&engine, B_START, B_END).await;
     check_only_b_is_gone(&engine, 0..300, "after the drop").await;
 
-    // A snapshot from a node that had not yet forgotten the range.
-    let mut ingest = engine.clone().ingest().await.unwrap();
-    for table in ['a', 'b', 'c'] {
-        ingest
-            .add(
-                (0..300)
-                    .map(|n| (tkey(table, n), b"replaced".to_vec()))
-                    .collect(),
-            )
-            .await
-            .unwrap();
-    }
-    ingest.commit().await.unwrap();
+    replace(&engine).await;
     assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
     assert_eq!(
         engine.get(&tkey('b', 7)).await.unwrap(),
         Some(b"replaced".to_vec())
     );
     assert_eq!(engine.scan(None, None).await.unwrap().len(), 900);
+    // Nor does the range come with a later flush.
+    engine.put(b"d", b"later").await.unwrap();
+    engine.flush().await.unwrap();
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert_eq!(engine.scan(None, None).await.unwrap().len(), 901);
+    engine.delete(b"d").await.unwrap();
 
     // The log is replayed from the snapshot's position and forgets it again.
-    engine.drop_range(B_START, B_END).await.unwrap();
+    forget(&engine, B_START, B_END).await;
     assert_eq!(engine.get(&tkey('b', 7)).await.unwrap(), None);
     assert_eq!(engine.scan(None, None).await.unwrap().len(), 600);
+    engine.flush().await.unwrap();
     wait_for("the range is retired", || {
         manifest_on_disk(dir.path()).forgotten.is_empty()
     })
@@ -1675,6 +1804,33 @@ async fn a_replacement_clears_the_forgotten_ranges() {
     assert_eq!(engine.get(&tkey('b', 7)).await.unwrap(), None);
     let all = engine.scan(None, None).await.unwrap();
     assert_eq!(all.len(), 600);
+    assert!(all.iter().all(|(_, value)| value == b"replaced"));
+    engine.close().await.unwrap();
+    drop(engine);
+
+    // The range is listed in the manifest when the replacement comes: the
+    // flush that recorded it was stopped before anything was cleared away.
+    let dir = tempfile::tempdir().unwrap();
+    let armed = LsmConfig {
+        crash_point: Some(CrashPoint::FlushAfterRangesSaved),
+        ..config(dir.path())
+    };
+    let engine = Arc::new(LsmEngine::open(io(), armed).await.unwrap());
+    put_keys(&engine, &['a', 'b', 'c'], 0..300).await;
+    engine.flush().await.unwrap();
+    forget(&engine, B_START, B_END).await;
+    assert!(engine.flush().await.is_err(), "the flush was not stopped");
+    assert_eq!(manifest_on_disk(dir.path()).forgotten.len(), 1);
+    check_only_b_is_gone(&engine, 0..300, "with the range listed").await;
+
+    replace(&engine).await;
+    assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+    assert_eq!(
+        engine.get(&tkey('b', 7)).await.unwrap(),
+        Some(b"replaced".to_vec())
+    );
+    let all = engine.scan(None, None).await.unwrap();
+    assert_eq!(all.len(), 900);
     assert!(all.iter().all(|(_, value)| value == b"replaced"));
     engine.close().await.unwrap();
 }
@@ -1685,53 +1841,527 @@ async fn a_replacement_clears_the_forgotten_ranges() {
 /// forgotten, like every other write of that log entry - not ahead of it.
 ///
 /// Here a row is written and flushed with position 1. A later entry
-/// (position 2) is applied but not flushed, and then the range is
-/// forgotten. The server dies. Storage comes back at position 1: at that
-/// position the row was there, and the replay of the log from position 1
-/// reads it (a duplicate-key check, a version check). If the range is
-/// already forgotten, those checks see no row, and a changeset can be
-/// accepted or refused differently from the first time it was applied.
+/// (position 2) is applied but not flushed, and then the entry at position
+/// 3 forgets the range. The server dies - before any flush, or in the
+/// middle of the one that would have made the batch durable. Storage comes
+/// back at position 1: at that position the row was there, and the replay
+/// of the log from position 1 reads it (a duplicate-key check, a version
+/// check). Were the range already forgotten, those checks would see no row,
+/// and a changeset could be accepted or refused differently from the first
+/// time it was applied.
 #[tokio::test]
-#[ignore = "fails: drop_range makes the range durable at once; see doc/ROADMAP.md, IDX, forgotten ranges"]
 async fn a_forgotten_range_is_not_durable_ahead_of_its_position() {
-    const POSITION: &[u8] = b"position";
+    for point in [None, Some(CrashPoint::FlushAfterTableWritten)] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = config(dir.path());
+        let row = tkey('b', 7);
+
+        let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+        engine
+            .write_batch(vec![
+                WriteOp::Put(row.clone(), b"as of position 1".to_vec()),
+                WriteOp::Put(POSITION.to_vec(), vec![1]),
+            ])
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        engine.close().await.unwrap();
+        drop(engine);
+
+        // Position 2 is applied and stays in memory; then the range goes,
+        // with position 3.
+        let armed = LsmConfig {
+            crash_point: point,
+            ..base.clone()
+        };
+        let engine = LsmEngine::open(io(), armed).await.unwrap();
+        engine
+            .write_batch(vec![WriteOp::Put(POSITION.to_vec(), vec![2])])
+            .await
+            .unwrap();
+        engine
+            .write_batch(vec![
+                WriteOp::forget(B_START, B_END),
+                WriteOp::Put(POSITION.to_vec(), vec![3]),
+            ])
+            .await
+            .unwrap();
+        // The range is gone for every reader...
+        assert_eq!(engine.get(&row).await.unwrap(), None);
+        assert!(engine
+            .scan(Some(B_START), Some(B_END))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![3]));
+        // ...and nothing of that is durable: what a restart would find is
+        // position 1 with its row.
+        assert_eq!(engine.get_durable(POSITION).await.unwrap(), Some(vec![1]));
+        assert_eq!(
+            engine.get_durable(&row).await.unwrap(),
+            Some(b"as of position 1".to_vec())
+        );
+        assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+        if point.is_some() {
+            // The server dies while flushing: the table is written, the
+            // manifest does not list it, nor the range.
+            assert!(engine.flush().await.is_err(), "the flush was not stopped");
+            assert!(manifest_on_disk(dir.path()).forgotten.is_empty());
+        }
+        drop(engine);
+
+        let engine = LsmEngine::open(io(), base).await.unwrap();
+        let position = engine.get(POSITION).await.unwrap();
+        assert_eq!(
+            position,
+            Some(vec![1]),
+            "{point:?}: storage is back at position 1"
+        );
+        assert_eq!(
+            engine.get(&row).await.unwrap(),
+            Some(b"as of position 1".to_vec()),
+            "{point:?}: at position 1 the row was there, but storage has already forgotten it"
+        );
+        assert_eq!(
+            engine.scan(Some(B_START), Some(B_END)).await.unwrap().len(),
+            1,
+            "{point:?}"
+        );
+        engine.close().await.unwrap();
+    }
+}
+
+/// The other side of the same rule: once the batch that forgot the range
+/// has been flushed, a server that dies comes back at that batch's
+/// position with the range forgotten - whether it died as soon as the flush
+/// had recorded the range, or later.
+#[tokio::test]
+async fn a_forgotten_range_is_durable_with_its_position() {
+    for point in [Some(CrashPoint::FlushAfterRangesSaved), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = config(dir.path());
+        let row = tkey('b', 7);
+
+        let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+        engine
+            .write_batch(vec![
+                WriteOp::Put(row.clone(), b"as of position 1".to_vec()),
+                WriteOp::Put(b"b9".to_vec(), b"neighbour".to_vec()),
+                WriteOp::Put(B_END.to_vec(), b"neighbour".to_vec()),
+                WriteOp::Put(POSITION.to_vec(), vec![1]),
+            ])
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        engine.close().await.unwrap();
+        drop(engine);
+
+        let armed = LsmConfig {
+            crash_point: point,
+            ..base.clone()
+        };
+        let engine = LsmEngine::open(io(), armed).await.unwrap();
+        engine
+            .write_batch(vec![WriteOp::Put(POSITION.to_vec(), vec![2])])
+            .await
+            .unwrap();
+        engine
+            .write_batch(vec![
+                WriteOp::forget(B_START, B_END),
+                WriteOp::Put(POSITION.to_vec(), vec![3]),
+            ])
+            .await
+            .unwrap();
+        let flushed = engine.flush().await;
+        assert_eq!(flushed.is_err(), point.is_some(), "{point:?}");
+        // Durable now, the range and the position together.
+        assert_eq!(engine.get_durable(POSITION).await.unwrap(), Some(vec![3]));
+        assert_eq!(engine.get_durable(&row).await.unwrap(), None);
+        assert_eq!(manifest_on_disk(dir.path()).forgotten_seq, 1);
+        // Crash: no close.
+        drop(engine);
+
+        let engine = LsmEngine::open(io(), base).await.unwrap();
+        assert_eq!(
+            engine.get(POSITION).await.unwrap(),
+            Some(vec![3]),
+            "{point:?}: storage is at the position of the batch that was flushed"
+        );
+        assert_eq!(
+            engine.get(&row).await.unwrap(),
+            None,
+            "{point:?}: at position 3 the range is forgotten"
+        );
+        assert!(engine
+            .scan(Some(B_START), Some(B_END))
+            .await
+            .unwrap()
+            .is_empty());
+        for neighbour in [&b"b9"[..], B_END] {
+            assert_eq!(
+                engine.get(neighbour).await.unwrap(),
+                Some(b"neighbour".to_vec()),
+                "{point:?}"
+            );
+        }
+        wait_for("the range is retired", || {
+            manifest_on_disk(dir.path()).forgotten.is_empty()
+        })
+        .await;
+        assert_eq!(engine.get(&row).await.unwrap(), None, "{point:?}");
+        engine.close().await.unwrap();
+    }
+}
+
+/// A crash, and the log replayed. Entry 1 writes a row of the range and is
+/// flushed. Entry 2 writes more and entry 3 forgets the range; neither is
+/// flushed when the server dies. Storage comes back as entry 1 left it, the
+/// row included; applying entries 2 and 3 again brings back exactly the
+/// state from before the crash. Applying the last entry once more on top of
+/// its own result changes nothing.
+#[tokio::test]
+async fn replaying_the_log_forgets_the_range_again() {
     let dir = tempfile::tempdir().unwrap();
     let base = config(dir.path());
-    let row = tkey('b', 7);
+    let entry_1 = || {
+        vec![
+            WriteOp::Put(tkey('a', 1), b"a1".to_vec()),
+            WriteOp::Put(tkey('b', 1), b"b1".to_vec()),
+            WriteOp::Put(tkey('c', 1), b"c1".to_vec()),
+            WriteOp::Put(POSITION.to_vec(), vec![1]),
+        ]
+    };
+    let entry_2 = || {
+        vec![
+            WriteOp::Put(tkey('a', 2), b"a2".to_vec()),
+            WriteOp::Put(tkey('b', 2), b"b2".to_vec()),
+            WriteOp::Delete(tkey('c', 1)),
+            WriteOp::Put(POSITION.to_vec(), vec![2]),
+        ]
+    };
+    let entry_3 = || {
+        vec![
+            WriteOp::forget(B_START, B_END),
+            WriteOp::Put(tkey('c', 3), b"c3".to_vec()),
+            WriteOp::Put(POSITION.to_vec(), vec![3]),
+        ]
+    };
+    let after_1 = vec![
+        (tkey('a', 1), b"a1".to_vec()),
+        (tkey('b', 1), b"b1".to_vec()),
+        (tkey('c', 1), b"c1".to_vec()),
+        (POSITION.to_vec(), vec![1]),
+    ];
+    let after_3 = vec![
+        (tkey('a', 1), b"a1".to_vec()),
+        (tkey('a', 2), b"a2".to_vec()),
+        (tkey('c', 3), b"c3".to_vec()),
+        (POSITION.to_vec(), vec![3]),
+    ];
 
     let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
-    engine
-        .write_batch(vec![
-            (row.clone(), Some(b"as of position 1".to_vec())),
-            (POSITION.to_vec(), Some(vec![1])),
-        ])
-        .await
-        .unwrap();
+    engine.write_batch(entry_1()).await.unwrap();
     engine.flush().await.unwrap();
+    engine.write_batch(entry_2()).await.unwrap();
+    engine.write_batch(entry_3()).await.unwrap();
+    let before_crash = engine.scan(None, None).await.unwrap();
+    assert!(before_crash == after_3);
+    // Crash: no close, nothing of entries 2 and 3 flushed.
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+    assert!(
+        engine.scan(None, None).await.unwrap() == after_1,
+        "storage did not come back as entry 1 left it"
+    );
+    // The replay, from the position storage holds.
+    assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![1]));
+    engine.write_batch(entry_2()).await.unwrap();
+    assert_eq!(
+        engine.get(&tkey('b', 1)).await.unwrap(),
+        Some(b"b1".to_vec())
+    );
+    assert_eq!(
+        engine.get(&tkey('b', 2)).await.unwrap(),
+        Some(b"b2".to_vec())
+    );
+    engine.write_batch(entry_3()).await.unwrap();
+    assert!(
+        engine.scan(None, None).await.unwrap() == before_crash,
+        "the replay did not bring back the state before the crash"
+    );
+
+    // This time it is flushed; the server dies afterwards all the same.
+    engine.flush().await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == before_crash);
+    drop(engine);
+    let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+    assert!(
+        engine.scan(None, None).await.unwrap() == before_crash,
+        "the flushed state was not kept"
+    );
+    assert_eq!(engine.get(POSITION).await.unwrap(), Some(vec![3]));
+
+    // The entry that forgot the range, applied once more on top of its own
+    // result: nothing changes, in memory or once flushed.
+    engine.write_batch(entry_3()).await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == before_crash);
+    engine.flush().await.unwrap();
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert!(engine.scan(None, None).await.unwrap() == before_crash);
     engine.close().await.unwrap();
     drop(engine);
 
-    // Position 2 is applied and stays in memory; then the range goes, and
-    // the server dies with the range recorded and nothing flushed.
-    let armed = LsmConfig {
-        crash_point: Some(CrashPoint::DropRangeAfterRangeSaved),
-        ..base.clone()
-    };
-    let engine = LsmEngine::open(io(), armed).await.unwrap();
+    let engine = LsmEngine::open(io(), base).await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == before_crash);
+    engine.close().await.unwrap();
+}
+
+/// The writes of a batch take effect in the order they are listed. A key of
+/// the range written before the range is forgotten - in a table, in the
+/// memtable, or earlier in the same batch - is forgotten. One written
+/// afterwards, even in the same batch, is a new write and stays: in memory,
+/// once flushed, once the range has been retired, and over a restart.
+/// (Callers promise not to write to a forgotten range again; what happens
+/// if one does is defined all the same.)
+#[tokio::test]
+async fn a_batch_forgets_what_came_before_and_keeps_what_comes_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = config(dir.path());
+    let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+
+    // In a table, and in the memtable.
+    engine.put(b"b9", b"neighbour").await.unwrap();
+    engine.put(&tkey('b', 1), b"in a table").await.unwrap();
+    engine.put(&tkey('b', 2), b"in a table").await.unwrap();
+    engine.put(&tkey('b', 5), b"in a table").await.unwrap();
+    engine.flush().await.unwrap();
+    engine.put(&tkey('b', 3), b"in memory").await.unwrap();
+
     engine
-        .write_batch(vec![(POSITION.to_vec(), Some(vec![2]))])
+        .write_batch(vec![
+            // Put, then forgotten.
+            WriteOp::Put(tkey('b', 4), b"earlier in the batch".to_vec()),
+            WriteOp::Delete(tkey('b', 5)),
+            WriteOp::forget(B_START, B_END),
+            // Forgotten, then put: a key that was there before and a new one.
+            WriteOp::Put(tkey('b', 2), b"written again".to_vec()),
+            WriteOp::Put(tkey('b', 6), b"later in the batch".to_vec()),
+            WriteOp::Put(POSITION.to_vec(), vec![1]),
+        ])
         .await
         .unwrap();
-    assert!(engine.drop_range(B_START, B_END).await.is_err());
+
+    let in_range = vec![
+        (tkey('b', 2), b"written again".to_vec()),
+        (tkey('b', 6), b"later in the batch".to_vec()),
+    ];
+    async fn check(engine: &LsmEngine, in_range: &[(Vec<u8>, Vec<u8>)], when: &str) {
+        for n in [1, 3, 4, 5] {
+            assert_eq!(
+                engine.get(&tkey('b', n)).await.unwrap(),
+                None,
+                "{when}: {n}"
+            );
+        }
+        for (key, value) in in_range {
+            assert_eq!(
+                engine.get(key).await.unwrap().as_ref(),
+                Some(value),
+                "{when}"
+            );
+        }
+        assert!(
+            engine.scan(Some(B_START), Some(B_END)).await.unwrap() == in_range,
+            "{when}"
+        );
+        let keys: Vec<Vec<u8>> = in_range.iter().map(|(key, _)| key.clone()).collect();
+        let mut forward = vec![];
+        let mut at = b"b9".to_vec();
+        while let Some(next) = engine.next_key(&at, B_END).await.unwrap() {
+            forward.push(next.clone());
+            at = next;
+        }
+        assert_eq!(forward, keys, "{when}: forward");
+        let mut backward = vec![];
+        let mut at = B_END.to_vec();
+        while let Some(prev) = engine.prev_key(&at, B_START).await.unwrap() {
+            backward.push(prev.clone());
+            at = prev;
+        }
+        backward.reverse();
+        assert_eq!(backward, keys, "{when}: backward");
+        assert_eq!(
+            engine.get(b"b9").await.unwrap(),
+            Some(b"neighbour".to_vec()),
+            "{when}"
+        );
+    }
+    check(&engine, &in_range, "in memory").await;
+    // On disk it is all as before the batch.
+    assert_eq!(
+        engine.get_durable(&tkey('b', 2)).await.unwrap(),
+        Some(b"in a table".to_vec())
+    );
+    assert_eq!(engine.get_durable(&tkey('b', 6)).await.unwrap(), None);
+
+    engine.flush().await.unwrap();
+    check(&engine, &in_range, "flushed").await;
+    assert_eq!(
+        engine.get_durable(&tkey('b', 2)).await.unwrap(),
+        Some(b"written again".to_vec())
+    );
+    assert_eq!(engine.get_durable(&tkey('b', 1)).await.unwrap(), None);
+    let view = engine.snapshot_view().await.unwrap();
+    let in_view: Vec<_> = read_view(view.as_ref())
+        .await
+        .into_iter()
+        .filter(|(key, _)| key.as_slice() >= B_START && key.as_slice() < B_END)
+        .collect();
+    assert!(in_view == in_range, "a view after the flush");
+    drop(view);
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    check(&engine, &in_range, "retired").await;
+    // Crash: no close.
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), base.clone()).await.unwrap();
+    check(&engine, &in_range, "after a restart").await;
+
+    // Across batches it is the same: a later batch's write to the range
+    // stays, while the range is in memory, listed, and retired; and a
+    // range forgotten again takes it.
+    forget(&engine, B_START, B_END).await;
+    check(&engine, &[], "forgotten again").await;
+    let later = vec![(tkey('b', 7), b"a later batch".to_vec())];
+    engine.put(&later[0].0, &later[0].1).await.unwrap();
+    check(&engine, &later, "a later batch, in memory").await;
+    engine.flush().await.unwrap();
+    check(&engine, &later, "a later batch, flushed").await;
+    wait_for("the range is retired again", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    check(&engine, &later, "a later batch, retired").await;
+    forget(&engine, B_START, B_END).await;
+    check(&engine, &[], "forgotten a third time").await;
+    engine.close().await.unwrap();
     drop(engine);
 
     let engine = LsmEngine::open(io(), base).await.unwrap();
-    let position = engine.get(POSITION).await.unwrap();
-    assert_eq!(position, Some(vec![1]), "storage is back at position 1");
-    assert_eq!(
-        engine.get(&row).await.unwrap(),
-        Some(b"as of position 1".to_vec()),
-        "at position 1 the row was there, but storage has already forgotten it"
-    );
+    check(&engine, &[], "after the last restart").await;
+    engine.close().await.unwrap();
+}
+
+/// A range forgotten in one memtable hides what older memtables and tables
+/// hold, and nothing newer, while each of them is flushed in its turn - the
+/// flush of an older memtable must not carry the range to disk ahead of
+/// the batch that forgot it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_forgotten_between_memtables_goes_to_disk_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LsmConfig {
+        // Small memtables: every round below fills and freezes several.
+        total_cache_bytes: 128 * 1024,
+        // No compaction gets in the way of looking at the tables.
+        l0_compaction_trigger: 1000,
+        ..config(dir.path())
+    };
+    let engine = LsmEngine::open(io(), cfg.clone()).await.unwrap();
+    // Position 1: rows of all three kinds, enough for several memtables
+    // (frozen and flushed in the background as they fill).
+    for n in 0..1500 {
+        engine
+            .write_batch(vec![
+                WriteOp::Put(tkey('a', n), tvalue('a', n)),
+                WriteOp::Put(tkey('b', n), tvalue('b', n)),
+                WriteOp::Put(tkey('c', n), tvalue('c', n)),
+                WriteOp::Put(POSITION.to_vec(), vec![1]),
+            ])
+            .await
+            .unwrap();
+    }
+    // Position 2 forgets the range; position 3 goes on writing, into the
+    // range too, enough to freeze the memtable that holds the range.
+    engine
+        .write_batch(vec![
+            WriteOp::forget(B_START, B_END),
+            WriteOp::Put(POSITION.to_vec(), vec![2]),
+        ])
+        .await
+        .unwrap();
+    for n in 1500..3000 {
+        engine
+            .write_batch(vec![
+                WriteOp::Put(tkey('a', n), tvalue('a', n)),
+                WriteOp::Put(tkey('b', n), tvalue('b', n)),
+                WriteOp::Put(tkey('c', n), tvalue('c', n)),
+                WriteOp::Put(POSITION.to_vec(), vec![3]),
+            ])
+            .await
+            .unwrap();
+        // At every moment, whatever is in memory and whatever is flushed:
+        // the rows from before the range went are gone, those after it are
+        // there.
+        if n % 100 == 0 {
+            assert_eq!(engine.get(&tkey('b', 700)).await.unwrap(), None);
+            assert_eq!(
+                engine.get(&tkey('b', n)).await.unwrap(),
+                Some(tvalue('b', n))
+            );
+            let in_range = engine.scan(Some(B_START), Some(B_END)).await.unwrap();
+            assert_eq!(in_range.len(), n as usize - 1500 + 1);
+            assert_eq!(in_range[0].0, tkey('b', 1500));
+            assert_eq!(
+                engine.next_key(B_START, B_END).await.unwrap(),
+                Some(tkey('b', 1500))
+            );
+            // What is durable is a position and exactly its state: the
+            // range's old rows are there up to position 1 and gone from
+            // position 2 on. Flushes go on between these three reads, but
+            // only forwards: a row durably gone before the position is
+            // read means the position is 2 or more by then, and a position
+            // of 2 or more means the row is durably gone afterwards.
+            let old_row = tkey('b', 0);
+            let gone_before = engine.get_durable(&old_row).await.unwrap().is_none();
+            let position = engine.get_durable(POSITION).await.unwrap();
+            let gone_after = engine.get_durable(&old_row).await.unwrap().is_none();
+            let forgot = position.is_some_and(|position| position[0] >= 2);
+            assert!(
+                !gone_before || forgot,
+                "the range was durable ahead of its position"
+            );
+            assert!(
+                !forgot || gone_after,
+                "the position was durable ahead of its range"
+            );
+        }
+    }
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..3000)
+        .map(|n| (tkey('a', n), tvalue('a', n)))
+        .chain((1500..3000).map(|n| (tkey('b', n), tvalue('b', n))))
+        .chain((0..3000).map(|n| (tkey('c', n), tvalue('c', n))))
+        .chain([(POSITION.to_vec(), vec![3])])
+        .collect();
+    assert!(engine.scan(None, None).await.unwrap() == expected);
+    engine.flush().await.unwrap();
+    assert_eq!(manifest_on_disk(dir.path()).forgotten_seq, 1);
+    assert!(engine.scan(None, None).await.unwrap() == expected);
+    wait_for("the range is retired", || {
+        manifest_on_disk(dir.path()).forgotten.is_empty()
+    })
+    .await;
+    assert!(engine.scan(None, None).await.unwrap() == expected);
+    engine.close().await.unwrap();
+    drop(engine);
+
+    let engine = LsmEngine::open(io(), cfg).await.unwrap();
+    assert!(engine.scan(None, None).await.unwrap() == expected);
     engine.close().await.unwrap();
 }

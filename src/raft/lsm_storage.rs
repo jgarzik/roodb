@@ -587,9 +587,9 @@ impl LsmRaftStorage {
                         }
                     }
 
-                    plan.writes.push((
+                    plan.writes.push(WriteOp::Put(
                         change.key.clone(),
-                        Some(encode_mvcc_row(changeset.txn_id, false, value)),
+                        encode_mvcc_row(changeset.txn_id, false, value),
                     ));
                     live.insert(change.key.as_slice(), true);
                     if let (false, Some(table)) = (is_table_record, table) {
@@ -603,9 +603,9 @@ impl LsmRaftStorage {
                 // An insert or update with no value changes nothing.
                 (ChangeOp::Insert | ChangeOp::Update, None) => {}
                 (ChangeOp::Delete, value) => {
-                    plan.writes.push((
+                    plan.writes.push(WriteOp::Put(
                         change.key.clone(),
-                        Some(encode_mvcc_row(changeset.txn_id, true, &[])),
+                        encode_mvcc_row(changeset.txn_id, true, &[]),
                     ));
                     live.insert(change.key.as_slice(), false);
                     if change.table() == Some(system_table_id(SYSTEM_TABLES)) {
@@ -659,7 +659,7 @@ impl LsmRaftStorage {
         // the row carries. (A row's table is the ID its key begins with.)
         for table in &plan.dropped_tables {
             plan.writes
-                .push((crate::txn::auto_inc::storage_key(*table), None));
+                .push(WriteOp::Delete(crate::txn::auto_inc::storage_key(*table)));
             self.auto_increment.forget(*table);
         }
         let mut counters: std::collections::BTreeMap<TableId, u64> =
@@ -682,16 +682,21 @@ impl LsmRaftStorage {
                     .and_then(|stored| crate::txn::auto_inc::decode(&stored))
             };
             if stored.is_none_or(|stored| next > stored) {
-                plan.writes.push((key, Some(next.to_le_bytes().to_vec())));
+                plan.writes
+                    .push(WriteOp::Put(key, next.to_le_bytes().to_vec()));
                 self.auto_increment.raise(table, next);
             }
         }
         // An entry the storage engine cannot hold is a reason to reject the
         // changeset, never to fail the apply: a failed apply stops the state
         // machine, and the entry would fail again on every replay.
-        for (key, value) in &plan.writes {
-            let value_len = value.as_ref().map_or(0, Vec::len);
-            if let Err(e) = crate::storage::lsm::block::check_entry_size(key.len(), value_len) {
+        for write in &plan.writes {
+            let (key_len, value_len) = match write {
+                WriteOp::Put(key, value) => (key.len(), value.len()),
+                WriteOp::Delete(key) => (key.len(), 0),
+                WriteOp::ForgetRange { .. } => continue,
+            };
+            if let Err(e) = crate::storage::lsm::block::check_entry_size(key_len, value_len) {
                 return Ok(Err(e.to_string()));
             }
         }
@@ -819,7 +824,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                         None => 0,
                     };
                     let bound = stored.max(*upto);
-                    batch.push((ROW_ID_KEY.to_vec(), Some(bound.to_le_bytes().to_vec())));
+                    batch.push(WriteOp::Put(
+                        ROW_ID_KEY.to_vec(),
+                        bound.to_le_bytes().to_vec(),
+                    ));
                     // Every node follows the bound: whichever becomes
                     // primary goes on past it.
                     reserved_row_ids = Some(bound);
@@ -827,9 +835,9 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 }
                 EntryPayload::Normal(Command::Seed(entries)) => {
                     for (key, value) in entries {
-                        batch.push((key.clone(), Some(value.clone())));
+                        batch.push(WriteOp::Put(key.clone(), value.clone()));
                     }
-                    batch.push((SEEDED_KEY.to_vec(), Some(vec![1])));
+                    batch.push(WriteOp::Put(SEEDED_KEY.to_vec(), vec![1]));
                     seeded = true;
                     CommandResponse::Ok(None)
                 }
@@ -847,9 +855,9 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             .map_err(|_| read_err("stored object ID counter is malformed"))?,
                         None => crate::catalog::system_tables::FIRST_USER_TABLE_ID,
                     };
-                    batch.push((
+                    batch.push(WriteOp::Put(
                         NEXT_OBJECT_ID_KEY.to_vec(),
-                        Some(next.saturating_add(*count).to_le_bytes().to_vec()),
+                        next.saturating_add(*count).to_le_bytes().to_vec(),
                     ));
                     CommandResponse::Ok(Some(next.to_le_bytes().to_vec()))
                 }
@@ -862,9 +870,9 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             .map_err(|_| read_err("stored node ID counter is malformed"))?,
                         None => 2,
                     };
-                    batch.push((
+                    batch.push(WriteOp::Put(
                         NEXT_NODE_ID_KEY.to_vec(),
-                        Some((next + 1).to_le_bytes().to_vec()),
+                        (next + 1).to_le_bytes().to_vec(),
                     ));
                     CommandResponse::Ok(Some(next.to_le_bytes().to_vec()))
                 }
@@ -896,7 +904,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                 EntryPayload::Membership(m) => {
                     let membership = StoredMembership::new(Some(log_id), m.clone());
                     let data = bincode::serialize(&membership).map_err(write_err)?;
-                    batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+                    batch.push(WriteOp::Put(MEMBERSHIP_KEY.to_vec(), data));
                     membership_change = Some(membership);
                     CommandResponse::Ok(None)
                 }
@@ -907,13 +915,16 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             if let Some(txn_id) = new_txn_id {
                 if txn_id > self.stored_txn_bound.load(Ordering::SeqCst) {
                     let bound = txn_id + TXN_ID_STEP;
-                    batch.push((MAX_TXN_KEY.to_vec(), Some(bound.to_le_bytes().to_vec())));
+                    batch.push(WriteOp::Put(
+                        MAX_TXN_KEY.to_vec(),
+                        bound.to_le_bytes().to_vec(),
+                    ));
                     self.stored_txn_bound.store(bound, Ordering::SeqCst);
                 }
             }
 
             let position = bincode::serialize(&log_id).map_err(write_err)?;
-            batch.push((LAST_APPLIED_KEY.to_vec(), Some(position)));
+            batch.push(WriteOp::Put(LAST_APPLIED_KEY.to_vec(), position));
             self.storage.write_batch(batch).await.map_err(write_err)?;
             if let Some(txn_id) = new_txn_id {
                 self.applied_txn_floor.fetch_max(txn_id, Ordering::SeqCst);
@@ -989,10 +1000,10 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
         let mut batch: Vec<WriteOp> = Vec::new();
         if let Some(log_id) = meta.last_log_id {
             let data = bincode::serialize(&log_id).map_err(write_err)?;
-            batch.push((LAST_APPLIED_KEY.to_vec(), Some(data)));
+            batch.push(WriteOp::Put(LAST_APPLIED_KEY.to_vec(), data));
         }
         let data = bincode::serialize(&meta.last_membership).map_err(write_err)?;
-        batch.push((MEMBERSHIP_KEY.to_vec(), Some(data)));
+        batch.push(WriteOp::Put(MEMBERSHIP_KEY.to_vec(), data));
         self.storage.write_batch(batch).await.map_err(write_err)?;
 
         if let Some(log_id) = meta.last_log_id {
