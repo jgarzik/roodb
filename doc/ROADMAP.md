@@ -256,6 +256,16 @@ but may start and re-run runs of the installer workflow (`gh workflow run`,
 `gh run download`. Every push is a round trip, so every run must report
 everything needed to diagnose it.
 
+Done: `packaging/windows/roodb.wxs` builds an MSI that installs the two
+programs and LICENSE into `%ProgramFiles%\RooDB` and puts that directory
+on the system `PATH` (WiX 7.0.1, x64, per-machine, version from
+`Cargo.toml`, fixed UpgradeCode, `MajorUpgrade`, downgrade refused).
+`.github/workflows/windows-installer.yml` builds it and, on a fresh runner,
+installs it, initialises, writes and reads through the installed server
+across a (hard) restart, and uninstalls, uploading the MSI and logs. That
+smoke test is PowerShell in the workflow; it gives way to the Rust
+scenarios below.
+
 **Platform-neutral work, built and tested on Linux first**
 
 - Server start-up as a library function: move the body of `src/main.rs`
@@ -308,13 +318,7 @@ everything needed to diagnose it.
 
 **Installer**
 
-- `packaging/windows/roodb.wxs`, WiX v7 (pinned version, `-acceptEula
-  wix7`), x64, per-machine, no UI beyond the built-in minimal one. Version
-  from `Cargo.toml`. Fixed UpgradeCode; `MajorUpgrade`; a downgrade is
-  refused with a message.
-- Installs `roodb.exe`, `roodb_init.exe`, LICENSE and the Windows chapter
-  of the documentation into `%ProgramFiles%\RooDB`, and adds that
-  directory to the system `PATH`.
+- The Windows chapter of the documentation installed beside the programs.
 - Creates `%ProgramData%\RooDB` with `data`, `certs`, `logs` and
   `roodb.toml` (absolute paths, `bind = "127.0.0.1"`, the log file). All of
   it permanent and never overwritten: uninstall and upgrade leave it alone.
