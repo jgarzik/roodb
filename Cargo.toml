@@ -59,7 +59,7 @@ lru = "0.12"
 # MySQL protocol support
 sha1 = "0.10"
 subtle = "2"
-rand = "0.8"
+rand = "0.10"
 bitflags = "2"
 regex = "1"
 lazy_static = "1"
