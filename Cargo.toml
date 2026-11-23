@@ -54,7 +54,7 @@ crossbeam-skiplist = "0.1"
 sqlparser = { version = "0.61", features = ["visitor"] }
 
 # LRU cache for block cache
-lru = "0.12"
+lru = "0.18"
 
 # MySQL protocol support
 sha1 = "0.10"
