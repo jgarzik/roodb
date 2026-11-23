@@ -209,8 +209,10 @@ drivers issue by themselves are understood in addition:
   such as the SSMS object explorer, will not work.
 - Cancellation takes effect between result rows; a statement that works
   for a long time before returning its first row finishes that work first.
-- Tested with the `tiberius` client on both transports. Microsoft's ODBC,
-  .NET and JDBC drivers have not been verified yet.
+- Tested with the `tiberius` client on both transports, and in CI with
+  Microsoft ODBC Driver 18 for SQL Server through `sqlcmd` (connect,
+  batches, DDL, DML, transactions) on both transports. Microsoft's .NET and
+  JDBC drivers have not been verified yet.
 
 ### Type mapping
 

@@ -14,7 +14,6 @@ multi-core machines.
 | TXN | Transaction semantics |
 | COL | Character sets and collations |
 | FKC | Foreign keys and CHECK |
-| ODB | ODBC and sqlcmd in CI |
 | ACL | Accounts and authorization |
 | MIG | Data directory format versions and migration |
 | WIN | Windows installer and service |
@@ -161,15 +160,6 @@ Both are stored and never enforced.
   and column ID; the indexes MySQL requires on both sides;
   `foreign_key_checks`.
 - `CHECK` constraints, with MySQL's error codes.
-
-## ODB — ODBC and sqlcmd in CI
-
-A CI job on a Linux runner that drives the TDS port with Microsoft ODBC
-Driver 18 and `sqlcmd`.
-
-- The job (`odbc-sqlcmd` in `.github/workflows/ci.yml`) exists; fix the
-  driver failures it reports, then record ODBC 18 and `sqlcmd` as verified
-  in admin.md.
 
 ## ACL — Accounts and authorization
 
