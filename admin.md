@@ -210,8 +210,9 @@ drivers issue by themselves are understood in addition:
   XML and `sql_variant` parameters.
 - No SQL Server catalog views (`sys.*`), so tools that browse the catalog,
   such as the SSMS object explorer, will not work.
-- Cancellation takes effect between result rows; a statement that works
-  for a long time before returning its first row finishes that work first.
+- Cancellation takes effect between result rows, and ends a `SLEEP` at
+  once; a statement that works for a long time before returning its first
+  row otherwise finishes that work first.
 - Tested with the `tiberius` client on both transports, and in CI with
   Microsoft ODBC Driver 18 for SQL Server through `sqlcmd` (connect,
   batches, DDL, DML, transactions) on both transports. Microsoft's JDBC

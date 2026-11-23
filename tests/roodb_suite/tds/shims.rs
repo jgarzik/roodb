@@ -285,6 +285,28 @@ async fn test_attention_cancels_a_running_query() {
     server.shutdown().await;
 }
 
+/// SLEEP waits, and an attention signal cuts it short: a driver's query
+/// timeout must not wait out the sleep.
+#[tokio::test]
+async fn test_attention_interrupts_sleep() {
+    let server = TestServer::start("tds_shim_sleep").await;
+    let mut client = RawTds::login_root(&server).await;
+
+    let mut payload = all_headers();
+    payload.extend_from_slice(&ucs2("SELECT SLEEP(120)"));
+    client.send(PKT_SQL_BATCH, STATUS_EOM, &payload).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.send(PKT_ATTENTION, STATUS_EOM, &[]).await;
+
+    cancelled_response(&mut client).await;
+
+    // The session is in sync afterwards.
+    let tokens = client.batch("DROP TABLE IF EXISTS tds_sleep_none").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    assert_eq!(final_done(&tokens) & DONE_ATTN, 0);
+    server.shutdown().await;
+}
+
 /// T-SQL transactions nest: an inner BEGIN TRAN adds a level, its COMMIT
 /// takes the level away, only the outermost COMMIT commits, and a ROLLBACK
 /// at any level undoes everything.

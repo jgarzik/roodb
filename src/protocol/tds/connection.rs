@@ -167,7 +167,9 @@ pub async fn serve(
         }
     };
 
-    match conn.run().await {
+    // SLEEP and other waits inside a statement end when the client cancels.
+    let cancel = conn.cancel.clone();
+    match crate::executor::cancel::scope(cancel, conn.run()).await {
         Ok(()) | Err(TdsError::Packet(PacketError::ConnectionClosed)) => {}
         Err(e) => warn!(%peer_addr, connection_id, error = %e, "TDS connection error"),
     }
