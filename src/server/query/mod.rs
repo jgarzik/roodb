@@ -13,4 +13,4 @@ pub mod sink;
 
 pub use engine::QueryEngine;
 pub use error::QueryError;
-pub use sink::{OkInfo, ResponseSink, Status};
+pub use sink::{OkCommand, OkInfo, ResponseSink, Status};

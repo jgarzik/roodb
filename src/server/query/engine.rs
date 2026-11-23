@@ -7,7 +7,7 @@ use std::time::Instant;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
-use super::{OkInfo, QueryError, ResponseSink, Status};
+use super::{OkCommand, OkInfo, QueryError, ResponseSink, Status};
 use crate::catalog::system_tables::SYSTEM_PROCEDURES;
 use crate::catalog::TableName;
 use crate::catalog::{Catalog, ParamMode, ProcedureDef, ProcedureParam};
@@ -1473,7 +1473,14 @@ impl QueryEngine {
             // Extract trigger info from INSERT plans before building executor
             let insert_trigger_info = self.extract_insert_trigger_info(&plan);
             // DDL runs here too, but only DML counts rows
-            let counts_rows = plan.is_dml();
+            let command = match &plan {
+                PhysicalPlan::Insert { .. } | PhysicalPlan::InsertSelect { .. } => {
+                    OkCommand::Insert
+                }
+                PhysicalPlan::Update { .. } => OkCommand::Update,
+                PhysicalPlan::Delete { .. } => OkCommand::Delete,
+                _ => OkCommand::None,
+            };
 
             // DML/DDL - execute and count affected rows
             let engine = ExecutorEngine::with_raft(
@@ -1544,7 +1551,7 @@ impl QueryEngine {
                 OkInfo {
                     affected_rows: affected,
                     last_insert_id,
-                    counts_rows,
+                    command,
                 },
                 status,
             );
@@ -5245,7 +5252,8 @@ impl QueryEngine {
             }
         }
 
-        self.send_row_count(total_affected, 0).await
+        self.send_row_count(OkCommand::Insert, total_affected, 0)
+            .await
     }
 
     /// Handle LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name [CHARACTER SET cs]
@@ -5341,7 +5349,8 @@ impl QueryEngine {
             }
         }
 
-        self.send_row_count(rows_inserted, 0).await
+        self.send_row_count(OkCommand::Insert, rows_inserted, 0)
+            .await
     }
 
     /// Resolve a LOAD DATA INFILE path, trying multiple base directories.
@@ -5652,7 +5661,8 @@ impl QueryEngine {
         propagate_out_params(proc_def, call_args, &ctx, &user_vars);
 
         // Final OK; any result sets the body produced precede it
-        self.send_row_count(ctx.rows_affected, 0).await
+        self.send_row_count(OkCommand::Call, ctx.rows_affected, 0)
+            .await
     }
 
     /// Parse procedure body SQL into Vec<Statement>.
@@ -6751,6 +6761,7 @@ impl QueryEngine {
     /// Send an OK for a statement that counts rows: DML, `LOAD DATA`, `CALL`
     pub(crate) async fn send_row_count(
         &mut self,
+        command: OkCommand,
         affected_rows: u64,
         last_insert_id: u64,
     ) -> ProtocolResult<()> {
@@ -6759,7 +6770,7 @@ impl QueryEngine {
             OkInfo {
                 affected_rows,
                 last_insert_id,
-                counts_rows: true,
+                command,
             },
             status,
         );

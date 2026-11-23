@@ -34,10 +34,24 @@ pub struct OkInfo {
     pub affected_rows: u64,
     /// Last auto-generated ID, or 0
     pub last_insert_id: u64,
-    /// Whether the statement counts rows (DML, `LOAD DATA`, `CALL`), so
-    /// that `affected_rows` is a count even when it is 0. TDS reports a
-    /// count only for these; other statements carry none.
-    pub counts_rows: bool,
+    /// The kind of statement, when it counts rows: `affected_rows` is
+    /// then a count even when it is 0. TDS reports a count, and the
+    /// command, only for these.
+    pub command: OkCommand,
+}
+
+/// The kind of a statement that counts rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OkCommand {
+    /// Counts no rows: DDL, `SET`, transaction statements and the like
+    #[default]
+    None,
+    /// `INSERT`, `REPLACE`, `LOAD DATA`
+    Insert,
+    Update,
+    Delete,
+    /// `CALL`: the rows its statements changed
+    Call,
 }
 
 /// Receives the results of executing one client request.

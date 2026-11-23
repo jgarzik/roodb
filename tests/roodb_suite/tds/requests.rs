@@ -277,7 +277,8 @@ async fn test_reset_connection() {
 /// DONE carries a row count only for statements that count rows, as SQL
 /// Server sends it. ODBC reports a count of 0 as SQL_NO_DATA, which
 /// `sqlcmd` takes as failure of its connect-time `SET QUOTED_IDENTIFIER
-/// OFF`.
+/// OFF`. The JDBC driver takes the count only when DONE names the
+/// command (INSERT, UPDATE, DELETE) and otherwise reports -1.
 #[tokio::test]
 async fn test_done_count_only_for_statements_that_count_rows() {
     let server = TestServer::start("tds_done_count").await;
@@ -297,18 +298,31 @@ async fn test_done_count_only_for_statements_that_count_rows() {
         assert_eq!(final_done(&tokens) & DONE_COUNT, 0, "`{sql}`: {tokens:?}");
     }
 
-    let tokens = client
-        .batch("INSERT INTO tds_done_count VALUES (1, 1), (2, 2)")
-        .await;
-    let (status, rows) = final_done_count(&tokens);
-    assert_eq!((status & DONE_COUNT, rows), (DONE_COUNT, 2), "{tokens:?}");
-
-    // A statement that counts rows and changed none still says so.
-    let tokens = client
-        .batch("UPDATE tds_done_count SET v = 0 WHERE id = 99")
-        .await;
-    let (status, rows) = final_done_count(&tokens);
-    assert_eq!((status & DONE_COUNT, rows), (DONE_COUNT, 0), "{tokens:?}");
+    // (statement, current command, rows); a statement that counts rows
+    // and changed none still says so
+    for (sql, cmd, count) in [
+        (
+            "INSERT INTO tds_done_count VALUES (1, 1), (2, 2)",
+            CMD_INSERT,
+            2,
+        ),
+        ("REPLACE INTO tds_done_count VALUES (3, 3)", CMD_INSERT, 1),
+        (
+            "UPDATE tds_done_count SET v = 0 WHERE id = 99",
+            CMD_UPDATE,
+            0,
+        ),
+        ("UPDATE tds_done_count SET v = 5", CMD_UPDATE, 3),
+        ("DELETE FROM tds_done_count WHERE id = 1", CMD_DELETE, 1),
+    ] {
+        let tokens = client.batch(sql).await;
+        let (status, cur_cmd, rows) = final_done_count(&tokens);
+        assert_eq!(
+            (status & DONE_COUNT, cur_cmd, rows),
+            (DONE_COUNT, cmd, count),
+            "`{sql}`: {tokens:?}"
+        );
+    }
 
     client.batch("DROP TABLE tds_done_count").await;
     server.shutdown().await;

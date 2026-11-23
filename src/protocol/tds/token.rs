@@ -122,12 +122,22 @@ pub fn put_envchange_binary(buf: &mut Vec<u8>, env_type: u8, new_value: &[u8], o
 
 /// Append a DONE-family token (`TOKEN_DONE`, `TOKEN_DONEPROC` or
 /// `TOKEN_DONEINPROC`).
-pub fn put_done(buf: &mut Vec<u8>, token: u8, status: u16, row_count: u64) {
+pub fn put_done(buf: &mut Vec<u8>, token: u8, status: u16, cur_cmd: u16, row_count: u64) {
     buf.push(token);
     buf.extend_from_slice(&status.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes()); // current command
+    buf.extend_from_slice(&cur_cmd.to_le_bytes());
     buf.extend_from_slice(&row_count.to_le_bytes());
 }
+
+/// DONE current-command values. Drivers read them: the JDBC driver takes a
+/// row count only from INSERT, UPDATE or DELETE, and .NET adds rows to
+/// RecordsAffected for anything but SELECT.
+pub const CMD_NONE: u16 = 0;
+pub const CMD_SELECT: u16 = 0xC1;
+pub const CMD_INSERT: u16 = 0xC3;
+pub const CMD_DELETE: u16 = 0xC4;
+pub const CMD_UPDATE: u16 = 0xC5;
+pub const CMD_EXECUTE: u16 = 0xE0;
 
 /// Longest message text, in UTF-16 units, of an ERROR or INFO token. The
 /// token's length field is 16 bits and counts bytes, so the text must
@@ -212,7 +222,7 @@ mod tests {
     #[test]
     fn done_token_layout() {
         let mut buf = Vec::new();
-        put_done(&mut buf, TOKEN_DONE, DONE_COUNT | DONE_MORE, 5);
+        put_done(&mut buf, TOKEN_DONE, DONE_COUNT | DONE_MORE, CMD_INSERT, 5);
         assert_eq!(buf.len(), 13);
         assert_eq!(buf[0], TOKEN_DONE);
         assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 0x0011);
