@@ -14,7 +14,6 @@ multi-core machines.
 | TXN | Transaction semantics |
 | COL | Character sets and collations |
 | FKC | Foreign keys and CHECK |
-| ODB | ODBC and sqlcmd in CI |
 | ACL | Accounts and authorization |
 | MIG | Data directory format versions and migration |
 | WIN | Windows installer and service |
@@ -83,6 +82,10 @@ below changes.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
+   - Protect only the system's own tables: today every table in database
+     `mysql` counts as one, so a table a user creates there cannot be
+     dropped. A TDS login that names no database starts in `mysql`, so
+     .NET and JDBC users meet this first.
 5. The schema-change job runner (its record replicated; a new primary
    carries on; cancelled, and rolled back, when its client goes away),
    and with it the online rebuild of a table under a new ID. From here
@@ -161,11 +164,6 @@ Both are stored and never enforced.
   and column ID; the indexes MySQL requires on both sides;
   `foreign_key_checks`.
 - `CHECK` constraints, with MySQL's error codes.
-
-## ODB — ODBC and sqlcmd in CI
-
-A CI job on a Linux runner that drives the TDS port with Microsoft ODBC
-Driver 18 and `sqlcmd`.
 
 ## ACL — Accounts and authorization
 

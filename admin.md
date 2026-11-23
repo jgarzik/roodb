@@ -199,6 +199,9 @@ drivers issue by themselves are understood in addition:
   effect (double quotes still delimit strings, as in MySQL)
 - probes: `@@SPID`, `@@TRANCOUNT`, `@@VERSION`, `DB_NAME()`,
   `SUSER_SNAME()`, `SERVERPROPERTY('...')`
+- `USE [name]`, with T-SQL's bracket quoting (as .NET's
+  `SqlConnection.ChangeDatabase` sends it); brackets are not understood
+  anywhere else
 
 ### Limitations
 
@@ -209,8 +212,14 @@ drivers issue by themselves are understood in addition:
   such as the SSMS object explorer, will not work.
 - Cancellation takes effect between result rows; a statement that works
   for a long time before returning its first row finishes that work first.
-- Tested with the `tiberius` client on both transports. Microsoft's ODBC,
-  .NET and JDBC drivers have not been verified yet.
+- Tested with the `tiberius` client on both transports, and in CI with
+  Microsoft ODBC Driver 18 for SQL Server through `sqlcmd` (connect,
+  batches, DDL, DML, transactions) on both transports. Microsoft's JDBC
+  driver (13.6) and .NET `Microsoft.Data.SqlClient` (7.1) have been checked
+  by hand, not in CI, on both transports: statements and update counts,
+  typed and prepared parameters, result types, several result sets,
+  transactions, errors, pooled connection reset, and (.NET)
+  `ChangeDatabase`.
 
 ### Type mapping
 

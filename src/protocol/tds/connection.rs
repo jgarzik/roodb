@@ -50,7 +50,7 @@ use super::shims::{is_plain, split_batch, translate, Action, ShimContext};
 use super::sink::TdsSink;
 use super::token::{
     put_done, put_envchange_binary, put_envchange_string, put_error, put_featureextack_none,
-    put_info, put_loginack, DEFAULT_COLLATION, DONE_ERROR, ENV_BEGIN_TRAN, ENV_COLLATION,
+    put_info, put_loginack, CMD_NONE, DEFAULT_COLLATION, DONE_ERROR, ENV_BEGIN_TRAN, ENV_COLLATION,
     ENV_COMMIT_TRAN, ENV_DATABASE, ENV_LANGUAGE, ENV_PACKET_SIZE, ENV_RESET_CONNECTION,
     ENV_ROLLBACK_TRAN, TOKEN_DONE,
 };
@@ -262,7 +262,7 @@ async fn refuse_login<W: AsyncWrite + Unpin>(
 ) -> Result<(), TdsError> {
     let mut tokens = Vec::new();
     put_error(&mut tokens, number, 1, class, message);
-    put_done(&mut tokens, TOKEN_DONE, DONE_ERROR, 0);
+    put_done(&mut tokens, TOKEN_DONE, DONE_ERROR, CMD_NONE, 0);
     TdsWriter::new(writer)
         .write_message(PacketType::TabularResult, &tokens)
         .await?;
@@ -705,7 +705,7 @@ impl TdsConnection {
                         rolled_back = sql.trim_start().to_uppercase().starts_with("ROLLBACK");
                     }
                 }
-                Action::Accept => self.engine.send_ok(0, 0).await?,
+                Action::Accept => self.engine.send_ok().await?,
                 Action::Refuse(message) => self.refuse(codes::ER_UNKNOWN_COM_ERROR, message),
             }
             if self.sink().error_count() != errors_before {

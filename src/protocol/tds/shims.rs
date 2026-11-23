@@ -343,6 +343,10 @@ pub fn translate(statement: &str, ctx: &ShimContext<'_>) -> Action {
         text = guarded;
     }
 
+    if let Some(sql) = bracketed_use(text) {
+        return Action::Run(sql);
+    }
+
     // The leading words decide; a handful is enough for every pattern.
     let upper: Vec<String> = text
         .split_whitespace()
@@ -389,6 +393,27 @@ pub fn translate(statement: &str, ctx: &ShimContext<'_>) -> Action {
 
         _ => Action::Run(rewrite_probes(text, ctx)),
     }
+}
+
+/// `USE [name]`, T-SQL's bracket quoting as `SqlConnection.ChangeDatabase`
+/// sends it, rewritten with backquotes. Inside brackets `]]` stands for `]`;
+/// anything else is left for the engine to judge.
+fn bracketed_use(text: &str) -> Option<String> {
+    let (word, rest) = text.split_once(char::is_whitespace)?;
+    if !word.eq_ignore_ascii_case("USE") {
+        return None;
+    }
+    let inner = rest.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut name = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        // A lone `]` would have ended the name
+        if ch == ']' && chars.next() != Some(']') {
+            return None;
+        }
+        name.push(ch);
+    }
+    Some(format!("USE `{}`", name.replace('`', "``")))
 }
 
 /// Whether the shims leave `statement` alone, whatever the session state:
@@ -539,6 +564,26 @@ mod tests {
             "SET NO_SUCH_OPTION ON",
         ] {
             assert_eq!(translate(sql, &ctx(false)), run(sql), "{sql}");
+        }
+    }
+
+    /// `SqlConnection.ChangeDatabase` sends `use [name]`, with T-SQL's
+    /// bracket quoting, which RooDB's SQL does not have.
+    #[test]
+    fn use_with_a_bracketed_name() {
+        let c = ctx(false);
+        assert_eq!(translate("use [dotnet_ci]", &c), run("USE `dotnet_ci`"));
+        assert_eq!(translate("USE [my db];", &c), run("USE `my db`"));
+        assert_eq!(translate("USE [a]]b]", &c), run("USE `a]b`"));
+        assert_eq!(translate("USE [a`b]", &c), run("USE `a``b`"));
+        // Anything else goes to the engine as written
+        for sql in [
+            "USE plain",
+            "USE `quoted`",
+            "USE [unterminated",
+            "USE [a]b]",
+        ] {
+            assert_eq!(translate(sql, &c), run(sql), "{sql}");
         }
     }
 

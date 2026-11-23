@@ -73,3 +73,129 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run RooDB test suite on the posix I/O backend
         run: cargo test --release
+
+  # Drive the TDS port with Microsoft ODBC Driver 18 and sqlcmd (which runs on it)
+  odbc-sqlcmd:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ROODB_ROOT_PASSWORD: Ci-odbc-Passw0rd
+      SQLCMDPASSWORD: Ci-odbc-Passw0rd
+      ODBC_WORK: ${{ github.workspace }}/odbc-work
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      - name: Install ODBC Driver 18 and sqlcmd
+        run: |
+          set -eux
+          . /etc/os-release
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc
+          echo /opt/mssql-tools18/bin >> "$GITHUB_PATH"
+          odbcinst -j
+          odbcinst -q -d
+          cat /etc/odbcinst.ini
+          /opt/mssql-tools18/bin/sqlcmd -? | head -5 || true
+
+      - name: Turn on ODBC driver manager tracing
+        run: |
+          set -eux
+          mkdir -p "$ODBC_WORK"
+          printf '[ODBC]\nTrace=Yes\nTraceFile=%s/odbc.trace\n' "$ODBC_WORK" \
+            | sudo tee -a /etc/odbcinst.ini
+          cat /etc/odbcinst.ini
+
+      - name: Generate the server certificate and trust it
+        run: |
+          set -eux
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout "$ODBC_WORK/server.key" -out "$ODBC_WORK/server.crt" \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          openssl x509 -in "$ODBC_WORK/server.crt" -noout -text | head -40
+          sudo cp "$ODBC_WORK/server.crt" /usr/local/share/ca-certificates/roodb-ci.crt
+          sudo update-ca-certificates
+
+      - name: Initialise and start RooDB with the TDS port
+        run: |
+          set -eux
+          target/release/roodb_init --data-dir "$ODBC_WORK/data"
+          RUST_LOG=roodb=debug,info nohup target/release/roodb \
+            --data-dir "$ODBC_WORK/data" \
+            --cert-path "$ODBC_WORK/server.crt" \
+            --key-path "$ODBC_WORK/server.key" \
+            --raft-ca-cert-path "$ODBC_WORK/server.crt" \
+            --tds-port 1433 \
+            > "$ODBC_WORK/roodb.log" 2>&1 &
+          echo $! > "$ODBC_WORK/roodb.pid"
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/1433) 2>/dev/null; then
+              echo "TDS port open after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "TDS port did not open"; cat "$ODBC_WORK/roodb.log"; exit 1
+
+      - name: "sqlcmd, TDS 7.x (Encrypt=Mandatory): SELECT 1"
+        run: sqlcmd -S tcp:127.0.0.1,1433 -U root -N m -C -b -l 15 -Q "SELECT 1"
+
+      - name: "sqlcmd, TDS 7.x (Encrypt=Mandatory): batch"
+        run: |
+          set -eux
+          cat > "$ODBC_WORK/batch.sql" <<'SQL'
+          CREATE DATABASE odbc_ci
+          GO
+          USE odbc_ci
+          GO
+          CREATE TABLE odbc_t (id INT PRIMARY KEY, name VARCHAR(50))
+          GO
+          INSERT INTO odbc_t VALUES (1, 'one'), (2, 'two')
+          GO
+          SELECT id, name FROM odbc_t ORDER BY id
+          GO
+          BEGIN TRAN
+          INSERT INTO odbc_t VALUES (3, 'three')
+          ROLLBACK TRAN
+          GO
+          SELECT COUNT(*) FROM odbc_t
+          GO
+          SELECT @@VERSION
+          GO
+          SQL
+          sqlcmd -S tcp:127.0.0.1,1433 -U root -N m -C -b -l 15 -e \
+            -i "$ODBC_WORK/batch.sql" | tee "$ODBC_WORK/batch.out"
+          grep -q 'two' "$ODBC_WORK/batch.out"
+
+      - name: "sqlcmd, TDS 8.0 (Encrypt=Strict): SELECT 1"
+        run: sqlcmd -S tcp:localhost,1433 -U root -N s -b -l 15 -Q "SELECT 1"
+
+      - name: RooDB server log
+        if: always()
+        run: tail -n 500 "$ODBC_WORK/roodb.log" || true
+
+      - name: ODBC trace
+        if: always()
+        run: tail -n 500 "$ODBC_WORK/odbc.trace" || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odbc-sqlcmd-logs
+          path: |
+            ${{ github.workspace }}/odbc-work/roodb.log
+            ${{ github.workspace }}/odbc-work/odbc.trace
+            ${{ github.workspace }}/odbc-work/batch.out
+          if-no-files-found: ignore
+
+      - name: Stop RooDB
+        if: always()
+        run: kill "$(cat "$ODBC_WORK/roodb.pid")" || true

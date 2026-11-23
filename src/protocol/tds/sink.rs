@@ -10,12 +10,13 @@ use tokio::io::AsyncWrite;
 
 use crate::executor::row::Row;
 use crate::planner::logical::OutputColumn;
-use crate::server::query::{OkInfo, QueryError, ResponseSink, Status};
+use crate::server::query::{OkCommand, OkInfo, QueryError, ResponseSink, Status};
 
 use super::codec::{PacketError, PacketType, TdsWriter};
 use super::token::{
-    put_done, put_error, put_return_status, put_return_value_int, sql_server_error, DONE_ATTN,
-    DONE_COUNT, DONE_ERROR, DONE_FINAL, DONE_MORE, TOKEN_DONE, TOKEN_DONEINPROC, TOKEN_DONEPROC,
+    put_done, put_error, put_return_status, put_return_value_int, sql_server_error, CMD_DELETE,
+    CMD_EXECUTE, CMD_INSERT, CMD_NONE, CMD_SELECT, CMD_UPDATE, DONE_ATTN, DONE_COUNT, DONE_ERROR,
+    DONE_FINAL, DONE_MORE, TOKEN_DONE, TOKEN_DONEINPROC, TOKEN_DONEPROC,
 };
 use super::types::{declared_wire_types, put_colmetadata, put_row, reconcile_wire_types, WireType};
 
@@ -28,6 +29,8 @@ struct PendingDone {
     /// DONE, DONEINPROC or DONEPROC
     token: u8,
     status: u16,
+    /// The statement's kind (`CMD_*`)
+    cur_cmd: u16,
     row_count: u64,
 }
 
@@ -123,6 +126,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             } else {
                 DONE_FINAL
             },
+            cur_cmd: CMD_NONE,
             row_count: 0,
         });
     }
@@ -143,7 +147,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
     pub async fn finish(&mut self, acknowledge_attention: bool) -> io::Result<()> {
         if acknowledge_attention {
             self.emit_pending(true);
-            put_done(&mut self.buf, TOKEN_DONE, DONE_ATTN, 0);
+            put_done(&mut self.buf, TOKEN_DONE, DONE_ATTN, CMD_NONE, 0);
         } else {
             if self.pending.is_none() {
                 // Every response ends with a DONE, including one that
@@ -151,6 +155,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
                 self.pending = Some(PendingDone {
                     token: TOKEN_DONE,
                     status: DONE_FINAL,
+                    cur_cmd: CMD_NONE,
                     row_count: 0,
                 });
             }
@@ -172,7 +177,13 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             } else {
                 done.status
             };
-            put_done(&mut self.buf, done.token, status, done.row_count);
+            put_done(
+                &mut self.buf,
+                done.token,
+                status,
+                done.cur_cmd,
+                done.row_count,
+            );
         }
     }
 
@@ -239,15 +250,30 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         self.pending = Some(PendingDone {
             token: self.statement_done(),
             status,
+            cur_cmd: CMD_SELECT,
             row_count: self.rows,
         });
     }
 
     fn ok(&mut self, info: OkInfo, _status: Status) {
         self.emit_pending(true);
+        // SQL Server sends a count only for statements that count rows;
+        // ODBC turns a count of 0 into SQL_NO_DATA.
+        let cur_cmd = match info.command {
+            OkCommand::None => CMD_NONE,
+            OkCommand::Insert => CMD_INSERT,
+            OkCommand::Update => CMD_UPDATE,
+            OkCommand::Delete => CMD_DELETE,
+            OkCommand::Call => CMD_EXECUTE,
+        };
         self.pending = Some(PendingDone {
             token: self.statement_done(),
-            status: DONE_COUNT,
+            status: if info.command == OkCommand::None {
+                0
+            } else {
+                DONE_COUNT
+            },
+            cur_cmd,
             row_count: info.affected_rows,
         });
     }
@@ -263,6 +289,7 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         self.pending = Some(PendingDone {
             token: self.statement_done(),
             status: DONE_ERROR,
+            cur_cmd: CMD_NONE,
             row_count: 0,
         });
     }
@@ -330,6 +357,7 @@ mod tests {
             OkInfo {
                 affected_rows: 3,
                 last_insert_id: 0,
+                command: OkCommand::Insert,
             },
             Status::AUTOCOMMIT,
         );
@@ -355,7 +383,17 @@ mod tests {
         assert!(rows >= 2);
         let last = tokens.len() - 13;
         assert_eq!(done_at(&tokens, last - 13), (DONE_COUNT | DONE_MORE, 2));
-        assert_eq!(done_at(&tokens, last), (DONE_COUNT, 0));
+        assert_eq!(done_at(&tokens, last), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ok_without_a_row_count_has_no_count() {
+        let (mut sink, mut client, _) = sink();
+        sink.ok(OkInfo::default(), Status::AUTOCOMMIT);
+        sink.finish(false).await.unwrap();
+        let tokens = response(&mut client).await;
+        assert_eq!(tokens.len(), 13);
+        assert_eq!(done_at(&tokens, 0), (0, 0));
     }
 
     #[tokio::test]
@@ -395,6 +433,7 @@ mod tests {
             OkInfo {
                 affected_rows: 2,
                 last_insert_id: 0,
+                command: OkCommand::Insert,
             },
             Status::AUTOCOMMIT,
         );

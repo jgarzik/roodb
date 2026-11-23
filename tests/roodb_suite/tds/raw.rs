@@ -30,6 +30,12 @@ pub const STATUS_RESET_CONNECTION: u8 = 0x08;
 pub const STATUS_RESET_CONNECTION_SKIP_TRAN: u8 = 0x10;
 
 pub const DONE_ERROR: u16 = 0x0002;
+pub const DONE_COUNT: u16 = 0x0010;
+
+/// DONE current-command values
+pub const CMD_INSERT: u16 = 0xC3;
+pub const CMD_DELETE: u16 = 0xC4;
+pub const CMD_UPDATE: u16 = 0xC5;
 pub const DONE_ATTN: u16 = 0x0020;
 
 pub const ENV_BEGIN_TRAN: u8 = 8;
@@ -106,6 +112,7 @@ pub enum Token {
     FeatureExtAck,
     Done {
         status: u16,
+        cur_cmd: u16,
         row_count: u64,
     },
     ReturnStatus(i32),
@@ -192,6 +199,7 @@ pub fn parse_tokens(mut data: &[u8]) -> Vec<Token> {
             0xFD..=0xFF => {
                 tokens.push(Token::Done {
                     status: u16::from_le_bytes([data[1], data[2]]),
+                    cur_cmd: u16::from_le_bytes([data[3], data[4]]),
                     row_count: u64::from_le_bytes(data[5..13].try_into().unwrap()),
                 });
                 data = &data[13..];
@@ -225,6 +233,18 @@ pub fn env_changes(tokens: &[Token]) -> Vec<u8> {
             _ => None,
         })
         .collect()
+}
+
+/// Status, current command and row count of the last DONE token.
+pub fn final_done_count(tokens: &[Token]) -> (u16, u16, u64) {
+    match tokens.last() {
+        Some(Token::Done {
+            status,
+            cur_cmd,
+            row_count,
+        }) => (*status, *cur_cmd, *row_count),
+        other => panic!("response does not end with DONE: {other:?}"),
+    }
 }
 
 /// Status of the last DONE token.

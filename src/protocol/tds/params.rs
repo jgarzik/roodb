@@ -360,15 +360,16 @@ pub fn read_typed_value(r: &mut Reader<'_>, max_len: usize) -> Result<Datum, Par
         }
 
         TYPE_DECIMALN | TYPE_NUMERICN => {
-            let _declared = r.u8()?;
+            let declared = usize::from(r.u8()?);
             let _precision = r.u8()?;
             let scale = r.u8()?;
             let len = usize::from(r.u8()?);
             if len == 0 {
                 return Ok(Datum::Null);
             }
-            // Sign byte plus a 4, 8, 12 or 16 byte magnitude
-            if !matches!(len, 5 | 9 | 13 | 17) || scale > 38 {
+            // Sign byte plus a magnitude of up to 16 bytes. SQL Server sends
+            // 4, 8, 12 or 16; the JDBC driver sends the shortest that fits.
+            if !(2..=17).contains(&len) || len > declared || scale > 38 {
                 return Err(ParamError::Malformed);
             }
             let value = r.bytes(len)?;
@@ -571,11 +572,31 @@ mod tests {
         v.extend_from_slice(&42u32.to_le_bytes());
         assert_eq!(decode(&v), Ok(text("42")));
         assert_eq!(decode(&[TYPE_DECIMALN, 9, 10, 2, 0]), Ok(Datum::Null));
-        // Bad length and bad scale
+        // The JDBC driver sends the shortest magnitude: 3.75 as 375 in two
+        // bytes, 0 in one, -1.5 as 15 in one.
         assert_eq!(
-            decode(&[TYPE_DECIMALN, 9, 10, 2, 3, 1, 1, 0]),
+            decode(&[TYPE_DECIMALN, 17, 38, 2, 3, 1, 0x77, 0x01]),
+            Ok(text("3.75"))
+        );
+        assert_eq!(decode(&[TYPE_DECIMALN, 17, 38, 0, 2, 1, 0]), Ok(text("0")));
+        assert_eq!(
+            decode(&[TYPE_DECIMALN, 17, 38, 1, 2, 0, 15]),
+            Ok(text("-1.5"))
+        );
+        // Bad lengths: no magnitude, over 16 magnitude bytes, longer than
+        // declared
+        assert_eq!(
+            decode(&[TYPE_DECIMALN, 17, 38, 2, 1, 1]),
             Err(ParamError::Malformed)
         );
+        let mut v = vec![TYPE_DECIMALN, 18, 38, 0, 18, 1];
+        v.extend_from_slice(&[0; 17]);
+        assert_eq!(decode(&v), Err(ParamError::Malformed));
+        assert_eq!(
+            decode(&[TYPE_DECIMALN, 5, 9, 0, 9, 1, 1, 0, 0, 0, 0, 0, 0, 0]),
+            Err(ParamError::Malformed)
+        );
+        // Bad scale
         let mut v = vec![TYPE_DECIMALN, 5, 5, 255, 5, 1];
         v.extend_from_slice(&1u32.to_le_bytes());
         assert_eq!(decode(&v), Err(ParamError::Malformed));
