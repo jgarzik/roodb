@@ -143,24 +143,37 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
     }
 
     /// Complete the response message. If the client cancelled the request,
-    /// the final DONE acknowledges the attention signal.
-    pub async fn finish(&mut self, acknowledge_attention: bool) -> io::Result<()> {
-        if acknowledge_attention {
-            self.emit_pending(true);
-            put_done(&mut self.buf, TOKEN_DONE, DONE_ATTN, CMD_NONE, 0);
-        } else {
-            if self.pending.is_none() {
-                // Every response ends with a DONE, including one that
-                // carries only informational tokens.
-                self.pending = Some(PendingDone {
-                    token: TOKEN_DONE,
-                    status: DONE_FINAL,
-                    cur_cmd: CMD_NONE,
-                    row_count: 0,
-                });
-            }
-            self.emit_pending(false);
+    /// the attention acknowledgement follows as a message of its own, as
+    /// SQL Server sends it: the JDBC driver reads one more message after a
+    /// cancelled request's response, before it looks at the tokens.
+    pub async fn finish(&mut self, cancelled: bool) -> io::Result<()> {
+        if self.pending.is_none() {
+            // Every response ends with a DONE, including one that
+            // carries only informational tokens.
+            self.pending = Some(PendingDone {
+                token: TOKEN_DONE,
+                status: DONE_FINAL,
+                cur_cmd: CMD_NONE,
+                row_count: 0,
+            });
         }
+        self.emit_pending(false);
+        self.write_message().await?;
+        if cancelled {
+            self.acknowledge_attention().await?;
+        }
+        Ok(())
+    }
+
+    /// Send the attention acknowledgement, a DONE with DONE_ATTN, as a
+    /// message of its own.
+    pub async fn acknowledge_attention(&mut self) -> io::Result<()> {
+        put_done(&mut self.buf, TOKEN_DONE, DONE_ATTN, CMD_NONE, 0);
+        self.write_message().await
+    }
+
+    /// Send what is buffered as one complete message.
+    async fn write_message(&mut self) -> io::Result<()> {
         let result = self
             .writer
             .finish_message(PacketType::TabularResult, &self.buf)
@@ -477,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_request_is_acknowledged_with_done_attn() {
+    async fn cancelled_request_is_acknowledged_in_a_message_of_its_own() {
         let (mut sink, mut client, cancel) = sink();
         assert!(!sink.cancelled());
         cancel.store(true, Ordering::Relaxed);
@@ -488,10 +501,21 @@ mod tests {
         sink.end_result_set(Status::AUTOCOMMIT);
         sink.finish(true).await.unwrap();
 
+        // The response as it would have ended, then the acknowledgement
         let tokens = response(&mut client).await;
-        let last = tokens.len() - 13;
-        assert_eq!(done_at(&tokens, last - 13), (DONE_COUNT | DONE_MORE, 1));
-        assert_eq!(done_at(&tokens, last), (DONE_ATTN, 0));
+        assert_eq!(done_at(&tokens, tokens.len() - 13), (DONE_COUNT, 1));
+        let ack = response(&mut client).await;
+        assert_eq!(ack.len(), 13);
+        assert_eq!(done_at(&ack, 0), (DONE_ATTN, 0));
+    }
+
+    #[tokio::test]
+    async fn idle_attention_is_acknowledged_alone() {
+        let (mut sink, mut client, _) = sink();
+        sink.acknowledge_attention().await.unwrap();
+        let ack = response(&mut client).await;
+        assert_eq!(ack.len(), 13);
+        assert_eq!(done_at(&ack, 0), (DONE_ATTN, 0));
     }
 
     #[tokio::test]

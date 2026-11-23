@@ -620,7 +620,7 @@ impl TdsConnection {
                     // Acknowledge unless the request it interrupted
                     // already did.
                     if self.cancel.swap(false, Ordering::Relaxed) {
-                        self.sink().finish(true).await?;
+                        self.sink().acknowledge_attention().await?;
                     }
                 }
                 PacketType::SqlBatch => {
