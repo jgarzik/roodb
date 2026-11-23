@@ -4,92 +4,75 @@
 //! like any other data. The catalog is a cache rebuilt from these tables on startup.
 
 use super::{
-    ColumnDef, Constraint, DataType, IndexDef, ProcedureDef, ProcedureParam, TableDef, ViewDef,
+    ColumnDef, Constraint, DataType, ProcedureDef, ProcedureParam, TableDef, TableName, ViewDef,
 };
+use crate::executor::encoding::TableId;
 use crate::executor::{Datum, Row};
 
 /// System table names
-pub const SYSTEM_TABLES: &str = "system.tables";
-pub const SYSTEM_COLUMNS: &str = "system.columns";
-pub const SYSTEM_INDEXES: &str = "system.indexes";
-pub const SYSTEM_CONSTRAINTS: &str = "system.constraints";
+pub const SYSTEM_TABLES: &str = "tables";
 
 // Auth system tables
-pub const SYSTEM_USERS: &str = "system.users";
-pub const SYSTEM_GRANTS: &str = "system.grants";
-pub const SYSTEM_ROLES: &str = "system.roles";
-pub const SYSTEM_ROLE_GRANTS: &str = "system.role_grants";
+pub const SYSTEM_USERS: &str = "users";
+pub const SYSTEM_GRANTS: &str = "grants";
+pub const SYSTEM_ROLES: &str = "roles";
+pub const SYSTEM_ROLE_GRANTS: &str = "role_grants";
 
 // Database registry
-pub const SYSTEM_DATABASES: &str = "system.databases";
+pub const SYSTEM_DATABASES: &str = "databases";
 
 // Table statistics
-pub const SYSTEM_TABLE_STATISTICS: &str = "system.table_statistics";
+pub const SYSTEM_TABLE_STATISTICS: &str = "table_statistics";
 
 // Stored procedures
-pub const SYSTEM_PROCEDURES: &str = "system.procedures";
+pub const SYSTEM_PROCEDURES: &str = "procedures";
 
 // Views
-pub const SYSTEM_VIEWS: &str = "system.views";
+pub const SYSTEM_VIEWS: &str = "views";
+
+// Triggers
+pub const SYSTEM_TRIGGERS: &str = "triggers";
 
 /// Check if a table name is a system table
-pub fn is_system_table(name: &str) -> bool {
-    name.starts_with("system.")
+pub fn is_system_table(name: &TableName) -> bool {
+    name.is_in(SYSTEM_DATABASE)
+}
+
+/// The database the system's own tables are in, as in MySQL.
+pub const SYSTEM_DATABASE: &str = "mysql";
+
+/// The database of tables that describe the others. Nothing is stored in
+/// it.
+pub const INFORMATION_SCHEMA: &str = "information_schema";
+
+/// Whether `database` is one every server has, that cannot be created or
+/// dropped.
+pub fn is_system_database(database: &str) -> bool {
+    database == SYSTEM_DATABASE || database.eq_ignore_ascii_case(INFORMATION_SCHEMA)
+}
+
+/// The name of one of the system's tables (`SYSTEM_TABLES`, ...).
+pub fn system_name(table: &str) -> TableName {
+    TableName::new(SYSTEM_DATABASE, table)
 }
 
 /// Create the TableDef for system.tables
 pub fn tables_table_def() -> TableDef {
-    TableDef::new(SYSTEM_TABLES)
+    // One record per table: its definition and its indexes, encoded (see
+    // `catalog::store`).
+    TableDef::new(system_name(SYSTEM_TABLES))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
-        .constraint(Constraint::PrimaryKey(vec!["table_name".to_string()]))
-}
-
-/// Create the TableDef for system.columns
-pub fn columns_table_def() -> TableDef {
-    TableDef::new(SYSTEM_COLUMNS)
-        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("column_name", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("ordinal", DataType::Int).nullable(false))
-        .column(ColumnDef::new("data_type", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("nullable", DataType::Boolean).nullable(false))
-        .column(ColumnDef::new("default_value", DataType::Text).nullable(true))
-        .column(ColumnDef::new("auto_increment", DataType::Boolean).nullable(false))
+        .column(ColumnDef::new("definition", DataType::Blob).nullable(false))
         .constraint(Constraint::PrimaryKey(vec![
+            "database_name".to_string(),
             "table_name".to_string(),
-            "ordinal".to_string(),
-        ]))
-}
-
-/// Create the TableDef for system.indexes
-pub fn indexes_table_def() -> TableDef {
-    TableDef::new(SYSTEM_INDEXES)
-        .column(ColumnDef::new("index_name", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("columns", DataType::Text).nullable(false))
-        .column(ColumnDef::new("is_unique", DataType::Boolean).nullable(false))
-        .constraint(Constraint::PrimaryKey(vec!["index_name".to_string()]))
-}
-
-/// Create the TableDef for system.constraints
-pub fn constraints_table_def() -> TableDef {
-    TableDef::new(SYSTEM_CONSTRAINTS)
-        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
-        .column(ColumnDef::new("ordinal", DataType::Int).nullable(false))
-        .column(ColumnDef::new("constraint_type", DataType::Varchar(32)).nullable(false))
-        .column(ColumnDef::new("columns", DataType::Text).nullable(true)) // comma-separated, for PK/UNIQUE/FK
-        .column(ColumnDef::new("ref_table", DataType::Varchar(255)).nullable(true)) // for FK
-        .column(ColumnDef::new("ref_columns", DataType::Text).nullable(true)) // comma-separated, for FK
-        .column(ColumnDef::new("check_expr", DataType::Text).nullable(true)) // for CHECK
-        .column(ColumnDef::new("constraint_name", DataType::Varchar(255)).nullable(true)) // FK name
-        .constraint(Constraint::PrimaryKey(vec![
-            "table_name".to_string(),
-            "ordinal".to_string(),
         ]))
 }
 
 /// Create the TableDef for system.users (auth)
 pub fn users_table_def() -> TableDef {
-    TableDef::new(SYSTEM_USERS)
+    TableDef::new(system_name(SYSTEM_USERS))
         .column(ColumnDef::new("username", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("host", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("password_hash", DataType::Varchar(255)).nullable(true))
@@ -108,7 +91,7 @@ pub fn users_table_def() -> TableDef {
 
 /// Create the TableDef for system.grants (auth)
 pub fn grants_table_def() -> TableDef {
-    TableDef::new(SYSTEM_GRANTS)
+    TableDef::new(system_name(SYSTEM_GRANTS))
         .column(ColumnDef::new("grantee", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("grantee_host", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("grantee_type", DataType::Varchar(16)).nullable(false))
@@ -131,7 +114,7 @@ pub fn grants_table_def() -> TableDef {
 
 /// Create the TableDef for system.roles (auth)
 pub fn roles_table_def() -> TableDef {
-    TableDef::new(SYSTEM_ROLES)
+    TableDef::new(system_name(SYSTEM_ROLES))
         .column(ColumnDef::new("role_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("created_at", DataType::Timestamp).nullable(true))
         .constraint(Constraint::PrimaryKey(vec!["role_name".to_string()]))
@@ -139,7 +122,7 @@ pub fn roles_table_def() -> TableDef {
 
 /// Create the TableDef for system.role_grants (auth)
 pub fn role_grants_table_def() -> TableDef {
-    TableDef::new(SYSTEM_ROLE_GRANTS)
+    TableDef::new(system_name(SYSTEM_ROLE_GRANTS))
         .column(ColumnDef::new("username", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("host", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("role_name", DataType::Varchar(255)).nullable(false))
@@ -154,46 +137,95 @@ pub fn role_grants_table_def() -> TableDef {
 
 /// Create the TableDef for system.table_statistics
 pub fn table_statistics_table_def() -> TableDef {
-    TableDef::new(SYSTEM_TABLE_STATISTICS)
+    TableDef::new(system_name(SYSTEM_TABLE_STATISTICS))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("row_count", DataType::BigInt).nullable(false))
         .column(ColumnDef::new("data_size", DataType::BigInt).nullable(false))
         .column(ColumnDef::new("last_analyzed", DataType::Timestamp).nullable(true))
-        .constraint(Constraint::PrimaryKey(vec!["table_name".to_string()]))
+        .constraint(Constraint::PrimaryKey(vec![
+            "database_name".to_string(),
+            "table_name".to_string(),
+        ]))
 }
 
 /// Create the TableDef for system.databases
 pub fn databases_table_def() -> TableDef {
-    TableDef::new(SYSTEM_DATABASES)
+    TableDef::new(system_name(SYSTEM_DATABASES))
         .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
         .constraint(Constraint::PrimaryKey(vec!["database_name".to_string()]))
 }
 
 /// Create the TableDef for system.procedures
 pub fn procedures_table_def() -> TableDef {
-    TableDef::new(SYSTEM_PROCEDURES)
+    TableDef::new(system_name(SYSTEM_PROCEDURES))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("procedure_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("params_json", DataType::Text).nullable(false))
         .column(ColumnDef::new("body_sql", DataType::Text).nullable(false))
         .column(ColumnDef::new("returns_type", DataType::Varchar(255)).nullable(true))
-        .constraint(Constraint::PrimaryKey(vec!["procedure_name".to_string()]))
+        .constraint(Constraint::PrimaryKey(vec![
+            "database_name".to_string(),
+            "procedure_name".to_string(),
+        ]))
 }
 
 /// Create the TableDef for system.views
 pub fn views_table_def() -> TableDef {
-    TableDef::new(SYSTEM_VIEWS)
+    TableDef::new(system_name(SYSTEM_VIEWS))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("view_name", DataType::Varchar(255)).nullable(false))
         .column(ColumnDef::new("query_sql", DataType::Text).nullable(false))
-        .constraint(Constraint::PrimaryKey(vec!["view_name".to_string()]))
+        .constraint(Constraint::PrimaryKey(vec![
+            "database_name".to_string(),
+            "view_name".to_string(),
+        ]))
 }
 
 /// Get all system table definitions for bootstrapping
+/// Create the TableDef for system.triggers. A trigger is stored as the
+/// statement that created it.
+pub fn triggers_table_def() -> TableDef {
+    TableDef::new(system_name(SYSTEM_TRIGGERS))
+        .column(ColumnDef::new("database_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("trigger_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("table_name", DataType::Varchar(255)).nullable(false))
+        .column(ColumnDef::new("create_sql", DataType::Text).nullable(false))
+        .constraint(Constraint::PrimaryKey(vec![
+            "database_name".to_string(),
+            "trigger_name".to_string(),
+        ]))
+}
+
+/// Convert a trigger to its system.triggers row.
+pub fn trigger_def_to_row(def: &crate::catalog::TriggerDef) -> Row {
+    Row::new(vec![
+        Datum::String(def.table_name.database.clone()),
+        Datum::String(def.name.clone()),
+        Datum::String(def.table_name.table.clone()),
+        Datum::String(def.create_sql.clone()),
+    ])
+}
+
+/// Rebuild a trigger from its system.triggers row.
+pub fn row_to_trigger_def(row: &Row) -> Option<crate::catalog::TriggerDef> {
+    let [Datum::String(database), Datum::String(_), Datum::String(table), Datum::String(create_sql)] =
+        row.values()
+    else {
+        return None;
+    };
+    let mut def = crate::catalog::TriggerDef::from_create_sql(create_sql).ok()?;
+    // The statement names the table as its author wrote it; the row holds
+    // the table it meant, with its database.
+    def.table_name = TableName::new(database.clone(), table.clone());
+    Some(def)
+}
+
 pub fn bootstrap_system_tables() -> Vec<TableDef> {
-    vec![
+    // Each has a fixed table ID, by its place here: new tables go at the
+    // end, and none is ever removed from the middle.
+    [
         tables_table_def(),
-        columns_table_def(),
-        indexes_table_def(),
-        constraints_table_def(),
         users_table_def(),
         grants_table_def(),
         roles_table_def(),
@@ -202,34 +234,30 @@ pub fn bootstrap_system_tables() -> Vec<TableDef> {
         table_statistics_table_def(),
         procedures_table_def(),
         views_table_def(),
+        triggers_table_def(),
     ]
+    .into_iter()
+    .zip(1..)
+    .map(|(def, id)| def.with_id(TableId(id)))
+    .collect()
 }
 
-/// Convert a TableDef to a row for system.tables
-pub fn table_def_to_tables_row(def: &TableDef) -> Row {
-    Row::new(vec![Datum::String(def.name.clone())])
-}
+/// Table IDs below this belong to the system's own tables; the tables
+/// users create are numbered from here.
+pub const FIRST_USER_TABLE_ID: u64 = 1024;
 
-/// Convert a TableDef to rows for system.columns (one row per column)
-pub fn table_def_to_columns_rows(def: &TableDef) -> Vec<Row> {
-    def.columns
-        .iter()
-        .enumerate()
-        .map(|(ordinal, col)| {
-            Row::new(vec![
-                Datum::String(def.name.clone()),
-                Datum::String(col.name.clone()),
-                Datum::Int(ordinal as i64),
-                Datum::String(data_type_to_string(&col.data_type)),
-                Datum::Bool(col.nullable),
-                col.default
-                    .as_ref()
-                    .map(|d| Datum::String(d.clone()))
-                    .unwrap_or(Datum::Null),
-                Datum::Bool(col.auto_increment),
-            ])
-        })
-        .collect()
+/// The fixed ID of a system table.
+pub fn system_table_id(name: &str) -> TableId {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static IDS: LazyLock<HashMap<String, TableId>> = LazyLock::new(|| {
+        bootstrap_system_tables()
+            .into_iter()
+            .map(|def| (def.name.table, def.id))
+            .collect()
+    });
+    *IDS.get(name).expect("a system table")
 }
 
 /// Convert a DataType to its string representation for storage
@@ -254,244 +282,11 @@ pub fn data_type_to_string(dt: &DataType) -> String {
     }
 }
 
-/// Parse a DataType from its string representation
-pub fn string_to_data_type(s: &str) -> Option<DataType> {
-    let s = s.to_uppercase();
-    if s.starts_with("VARCHAR(") && s.ends_with(')') {
-        let len_str = &s[8..s.len() - 1];
-        return len_str.parse().ok().map(DataType::Varchar);
-    }
-    if s.starts_with("BIT(") && s.ends_with(')') {
-        let n_str = &s[4..s.len() - 1];
-        return n_str
-            .parse::<u8>()
-            .ok()
-            .map(|n| DataType::Bit(n.clamp(1, 64)));
-    }
-    if s.starts_with("DECIMAL(") && s.ends_with(')') {
-        let inner = &s[8..s.len() - 1];
-        if let Some((p_str, s_str)) = inner.split_once(',') {
-            if let (Ok(p), Ok(sc)) = (p_str.parse::<u8>(), s_str.parse::<u8>()) {
-                return Some(DataType::Decimal {
-                    precision: p,
-                    scale: sc,
-                });
-            }
-        }
-    }
-    {
-        match s.as_str() {
-            "BOOLEAN" => Some(DataType::Boolean),
-            "TINYINT" => Some(DataType::TinyInt),
-            "SMALLINT" => Some(DataType::SmallInt),
-            "INT" => Some(DataType::Int),
-            "BIGINT" => Some(DataType::BigInt),
-            "BIGINT UNSIGNED" => Some(DataType::BigIntUnsigned),
-            "FLOAT" => Some(DataType::Float),
-            "DOUBLE" => Some(DataType::Double),
-            "TEXT" => Some(DataType::Text),
-            "BLOB" => Some(DataType::Blob),
-            "GEOMETRY" => Some(DataType::Geometry),
-            "JSON" => Some(DataType::Json),
-            "TIMESTAMP" => Some(DataType::Timestamp),
-            _ => None,
-        }
-    }
-}
-
-/// Convert an IndexDef to a row for system.indexes
-pub fn index_def_to_row(def: &IndexDef) -> Row {
-    Row::new(vec![
-        Datum::String(def.name.clone()),
-        Datum::String(def.table.clone()),
-        Datum::String(def.columns.join(",")),
-        Datum::Bool(def.unique),
-    ])
-}
-
-/// Convert a TableDef's constraints to rows for system.constraints
-pub fn table_def_to_constraints_rows(def: &TableDef) -> Vec<Row> {
-    def.constraints
-        .iter()
-        .enumerate()
-        .map(|(ordinal, constraint)| {
-            let (constraint_type, columns, ref_table, ref_columns, check_expr, constraint_name) =
-                match constraint {
-                    Constraint::PrimaryKey(cols) => {
-                        ("PRIMARY_KEY", Some(cols.join(",")), None, None, None, None)
-                    }
-                    Constraint::Unique(cols) => {
-                        ("UNIQUE", Some(cols.join(",")), None, None, None, None)
-                    }
-                    Constraint::ForeignKey {
-                        name,
-                        columns,
-                        ref_table,
-                        ref_columns,
-                    } => (
-                        "FOREIGN_KEY",
-                        Some(columns.join(",")),
-                        Some(ref_table.clone()),
-                        Some(ref_columns.join(",")),
-                        None,
-                        name.clone(),
-                    ),
-                    Constraint::Check(expr) => {
-                        ("CHECK", None, None, None, Some(expr.clone()), None)
-                    }
-                };
-
-            Row::new(vec![
-                Datum::String(def.name.clone()),
-                Datum::Int(ordinal as i64),
-                Datum::String(constraint_type.to_string()),
-                columns.map(Datum::String).unwrap_or(Datum::Null),
-                ref_table.map(Datum::String).unwrap_or(Datum::Null),
-                ref_columns.map(Datum::String).unwrap_or(Datum::Null),
-                check_expr.map(Datum::String).unwrap_or(Datum::Null),
-                constraint_name.map(Datum::String).unwrap_or(Datum::Null),
-            ])
-        })
-        .collect()
-}
-
-/// Reconstruct constraints from system.constraints rows
-pub fn rows_to_constraints(constraint_rows: &[Row]) -> Vec<Constraint> {
-    // Sort by ordinal to preserve order
-    let mut sorted_rows: Vec<&Row> = constraint_rows.iter().collect();
-    sorted_rows.sort_by_key(|row| {
-        if let Datum::Int(ord) = &row.values()[1] {
-            *ord
-        } else {
-            0
-        }
-    });
-
-    sorted_rows
-        .iter()
-        .filter_map(|row| {
-            let constraint_type = match &row.values()[2] {
-                Datum::String(s) => s.as_str(),
-                _ => return None,
-            };
-
-            let columns = match &row.values()[3] {
-                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
-                Datum::Null => None,
-                _ => return None,
-            };
-
-            let ref_table = match &row.values()[4] {
-                Datum::String(s) => Some(s.clone()),
-                Datum::Null => None,
-                _ => return None,
-            };
-
-            let ref_columns = match &row.values()[5] {
-                Datum::String(s) => Some(s.split(',').map(|s| s.to_string()).collect::<Vec<_>>()),
-                Datum::Null => None,
-                _ => return None,
-            };
-
-            let check_expr = match &row.values()[6] {
-                Datum::String(s) => Some(s.clone()),
-                Datum::Null => None,
-                _ => return None,
-            };
-
-            match constraint_type {
-                "PRIMARY_KEY" => columns.map(Constraint::PrimaryKey),
-                "UNIQUE" => columns.map(Constraint::Unique),
-                "FOREIGN_KEY" => {
-                    let cols = columns?;
-                    let rt = ref_table?;
-                    let rc = ref_columns?;
-                    // Backward compat: older rows may not have column 7 (constraint_name)
-                    let fk_name = if row.values().len() > 7 {
-                        match &row.values()[7] {
-                            Datum::String(s) => Some(s.clone()),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    Some(Constraint::ForeignKey {
-                        name: fk_name,
-                        columns: cols,
-                        ref_table: rt,
-                        ref_columns: rc,
-                    })
-                }
-                "CHECK" => check_expr.map(Constraint::Check),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// Reconstruct a TableDef from system table rows
-///
-/// Takes the table_name and all column rows for that table from system.columns
-pub fn rows_to_table_def(table_name: &str, column_rows: &[Row]) -> Option<TableDef> {
-    let mut def = TableDef::new(table_name);
-
-    // Sort by ordinal to ensure correct column order
-    let mut sorted_rows: Vec<&Row> = column_rows.iter().collect();
-    sorted_rows.sort_by_key(|row| {
-        if let Datum::Int(ord) = &row.values()[2] {
-            *ord
-        } else {
-            0
-        }
-    });
-
-    for row in sorted_rows {
-        let column_name = match &row.values()[1] {
-            Datum::String(s) => s.clone(),
-            _ => return None,
-        };
-
-        let data_type_str = match &row.values()[3] {
-            Datum::String(s) => s.clone(),
-            _ => return None,
-        };
-
-        let data_type = string_to_data_type(&data_type_str)?;
-
-        let nullable = match &row.values()[4] {
-            Datum::Bool(b) => *b,
-            _ => return None,
-        };
-
-        let default = match &row.values()[5] {
-            Datum::String(s) => Some(s.clone()),
-            Datum::Null => None,
-            _ => return None,
-        };
-
-        let auto_increment = match &row.values()[6] {
-            Datum::Bool(b) => *b,
-            _ => return None,
-        };
-
-        let mut col_def = ColumnDef::new(column_name, data_type).nullable(nullable);
-        if let Some(def_val) = default {
-            col_def = col_def.default(def_val);
-        }
-        if auto_increment {
-            col_def = col_def.auto_increment();
-        }
-
-        def = def.column(col_def);
-    }
-
-    Some(def)
-}
-
 /// Convert a ProcedureDef to a row for system.procedures
 pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
     let params_json = serde_json::to_string(&def.params).unwrap_or_else(|_| "[]".to_string());
     Row::new(vec![
+        Datum::String(def.database.clone()),
         Datum::String(def.name.clone()),
         Datum::String(params_json),
         Datum::String(def.body_sql.clone()),
@@ -501,31 +296,21 @@ pub fn procedure_def_to_row(def: &ProcedureDef) -> Row {
 
 /// Reconstruct a ProcedureDef from a system.procedures row
 pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
-    let name = match &row.values()[0] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
+    let [Datum::String(database), Datum::String(name), Datum::String(params_json), Datum::String(body_sql), returns] =
+        row.values()
+    else {
+        return None;
     };
-    let params_json = match &row.values()[1] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-    let body_sql = match &row.values()[2] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-    let params: Vec<ProcedureParam> = serde_json::from_str(&params_json).ok()?;
-    let returns_type = if row.values().len() > 3 {
-        match &row.values()[3] {
-            Datum::String(s) if !s.is_empty() => Some(s.clone()),
-            _ => None,
-        }
-    } else {
-        None
+    let params: Vec<ProcedureParam> = serde_json::from_str(params_json).ok()?;
+    let returns_type = match returns {
+        Datum::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     };
     Some(ProcedureDef {
-        name,
+        database: database.clone(),
+        name: name.clone(),
         params,
-        body_sql,
+        body_sql: body_sql.clone(),
         returns_type,
     })
 }
@@ -533,54 +318,22 @@ pub fn row_to_procedure_def(row: &Row) -> Option<ProcedureDef> {
 /// Convert a ViewDef to a row for system.views
 pub fn view_def_to_row(def: &ViewDef) -> Row {
     Row::new(vec![
-        Datum::String(def.name.clone()),
+        Datum::String(def.name.database.clone()),
+        Datum::String(def.name.table.clone()),
         Datum::String(def.query_sql.clone()),
     ])
 }
 
 /// Reconstruct a ViewDef from a system.views row
 pub fn row_to_view_def(row: &Row) -> Option<ViewDef> {
-    let name = match &row.values()[0] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
+    let [Datum::String(database), Datum::String(view), Datum::String(query_sql)] = row.values()
+    else {
+        return None;
     };
-    let query_sql = match &row.values()[1] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-    Some(ViewDef { name, query_sql })
-}
-
-/// Reconstruct an IndexDef from a system.indexes row
-pub fn row_to_index_def(row: &Row) -> Option<IndexDef> {
-    let index_name = match &row.values()[0] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-
-    let table_name = match &row.values()[1] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-
-    let columns_str = match &row.values()[2] {
-        Datum::String(s) => s.clone(),
-        _ => return None,
-    };
-
-    let is_unique = match &row.values()[3] {
-        Datum::Bool(b) => *b,
-        _ => return None,
-    };
-
-    let columns: Vec<String> = columns_str.split(',').map(|s| s.to_string()).collect();
-
-    let mut def = IndexDef::new(index_name, table_name, columns);
-    if is_unique {
-        def = def.unique();
-    }
-
-    Some(def)
+    Some(ViewDef {
+        name: TableName::new(database.clone(), view.clone()),
+        query_sql: query_sql.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -588,98 +341,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_data_type_roundtrip() {
-        let types = vec![
-            DataType::Boolean,
-            DataType::TinyInt,
-            DataType::SmallInt,
-            DataType::Int,
-            DataType::BigInt,
-            DataType::Float,
-            DataType::Double,
-            DataType::Varchar(255),
-            DataType::Varchar(100),
-            DataType::Text,
-            DataType::Blob,
-            DataType::Bit(1),
-            DataType::Bit(8),
-            DataType::Bit(64),
-            DataType::Timestamp,
-        ];
-
-        for dt in types {
-            let s = data_type_to_string(&dt);
-            let parsed = string_to_data_type(&s).expect("should parse");
-            assert_eq!(dt, parsed);
-        }
-    }
-
-    #[test]
-    fn test_table_def_roundtrip() {
-        let original = TableDef::new("test_table")
-            .column(
-                ColumnDef::new("id", DataType::Int)
-                    .nullable(false)
-                    .auto_increment(),
-            )
-            .column(ColumnDef::new("name", DataType::Varchar(100)).nullable(true))
-            .column(ColumnDef::new("value", DataType::Double).default("0.0"));
-
-        // Convert to rows
-        let column_rows = table_def_to_columns_rows(&original);
-
-        // Convert back
-        let restored = rows_to_table_def("test_table", &column_rows).unwrap();
-
-        assert_eq!(original.name, restored.name);
-        assert_eq!(original.columns.len(), restored.columns.len());
-
-        for (orig_col, rest_col) in original.columns.iter().zip(restored.columns.iter()) {
-            assert_eq!(orig_col.name, rest_col.name);
-            assert_eq!(orig_col.data_type, rest_col.data_type);
-            assert_eq!(orig_col.nullable, rest_col.nullable);
-            assert_eq!(orig_col.default, rest_col.default);
-            assert_eq!(orig_col.auto_increment, rest_col.auto_increment);
-        }
-    }
-
-    #[test]
-    fn test_index_def_roundtrip() {
-        let original = IndexDef::new(
-            "idx_test",
-            "test_table",
-            vec!["col1".to_string(), "col2".to_string()],
-        )
-        .unique();
-
-        let row = index_def_to_row(&original);
-        let restored = row_to_index_def(&row).unwrap();
-
-        assert_eq!(original.name, restored.name);
-        assert_eq!(original.table, restored.table);
-        assert_eq!(original.columns, restored.columns);
-        assert_eq!(original.unique, restored.unique);
-    }
-
-    #[test]
     fn test_is_system_table() {
-        assert!(is_system_table("system.tables"));
-        assert!(is_system_table("system.columns"));
-        assert!(is_system_table("system.indexes"));
-        assert!(!is_system_table("users"));
-        assert!(!is_system_table("my_system_table"));
+        assert!(is_system_table(&system_name(SYSTEM_TABLES)));
+        assert!(is_system_table(&TableName::new("mysql", "anything")));
+        assert!(!is_system_table(&TableName::new("shop", "tables")));
+        assert!(!is_system_table(&TableName::bare("mysql")));
+        assert!(is_system_database("mysql"));
+        assert!(is_system_database("INFORMATION_SCHEMA"));
+        assert!(!is_system_database("shop"));
     }
 
     #[test]
     fn test_bootstrap_system_tables() {
         let tables = bootstrap_system_tables();
-        assert_eq!(tables.len(), 12);
+        assert_eq!(tables.len(), 10);
 
-        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.table.as_str()).collect();
         assert!(names.contains(&SYSTEM_TABLES));
-        assert!(names.contains(&SYSTEM_COLUMNS));
-        assert!(names.contains(&SYSTEM_INDEXES));
-        assert!(names.contains(&SYSTEM_CONSTRAINTS));
         assert!(names.contains(&SYSTEM_USERS));
         assert!(names.contains(&SYSTEM_GRANTS));
         assert!(names.contains(&SYSTEM_ROLES));
@@ -688,38 +366,6 @@ mod tests {
         assert!(names.contains(&SYSTEM_TABLE_STATISTICS));
         assert!(names.contains(&SYSTEM_VIEWS));
         assert!(names.contains(&SYSTEM_PROCEDURES));
-    }
-
-    #[test]
-    fn test_constraint_roundtrip() {
-        let original = TableDef::new("test_table")
-            .column(ColumnDef::new("id", DataType::Int))
-            .column(ColumnDef::new("user_id", DataType::Int))
-            .column(ColumnDef::new("status", DataType::Varchar(50)))
-            .constraint(Constraint::PrimaryKey(vec!["id".to_string()]))
-            .constraint(Constraint::Unique(vec![
-                "user_id".to_string(),
-                "status".to_string(),
-            ]))
-            .constraint(Constraint::ForeignKey {
-                name: Some("fk_user".to_string()),
-                columns: vec!["user_id".to_string()],
-                ref_table: "users".to_string(),
-                ref_columns: vec!["id".to_string()],
-            })
-            .constraint(Constraint::Check("status IN ('a', 'b')".to_string()));
-
-        // Convert to rows
-        let constraint_rows = table_def_to_constraints_rows(&original);
-        assert_eq!(constraint_rows.len(), 4);
-
-        // Convert back
-        let restored = rows_to_constraints(&constraint_rows);
-        assert_eq!(restored.len(), 4);
-
-        // Verify each constraint matches
-        for (orig, rest) in original.constraints.iter().zip(restored.iter()) {
-            assert_eq!(orig, rest);
-        }
+        assert!(names.contains(&SYSTEM_TRIGGERS));
     }
 }

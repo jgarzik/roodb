@@ -55,6 +55,30 @@ pub enum ExecutorError {
     /// Duplicate key violation (MySQL error 1062)
     DuplicateKey(String),
 
+    /// A database of this name exists already (MySQL error 1007)
+    DatabaseExists(String),
+
+    /// There is no database of this name to drop (MySQL error 1008)
+    DatabaseNotFound(String),
+
+    /// An index of this name exists already (MySQL error 1061)
+    DuplicateKeyName(String),
+
+    /// There is no index of this name to drop (MySQL error 1091)
+    CantDropKey(String),
+
+    /// Waiting for a row lock would have completed a deadlock (MySQL error
+    /// 1213). The transaction is rolled back.
+    LockDeadlock,
+
+    /// A row lock was not granted in time (MySQL error 1205). Only the
+    /// statement fails.
+    LockWaitTimeout,
+
+    /// A row was locked by another transaction and the statement said
+    /// NOWAIT (MySQL error 3572).
+    LockNoWait,
+
     /// Internal executor error
     Internal(String),
 }
@@ -89,10 +113,33 @@ impl fmt::Display for ExecutorError {
             }
             ExecutorError::NullValue(context) => write!(f, "null value in {}", context),
             ExecutorError::TableNotFound(name) => write!(f, "table not found: {}", name),
+            ExecutorError::DatabaseExists(name) => {
+                write!(f, "Can't create database '{}'; database exists", name)
+            }
+            ExecutorError::DatabaseNotFound(name) => {
+                write!(f, "Can't drop database '{}'; database doesn't exist", name)
+            }
+            ExecutorError::DuplicateKeyName(name) => write!(f, "Duplicate key name '{}'", name),
+            ExecutorError::CantDropKey(name) => write!(
+                f,
+                "Can't DROP '{}'; check that column/key exists",
+                name
+            ),
             ExecutorError::Encoding(msg) => write!(f, "encoding error: {}", msg),
             ExecutorError::InvalidArgumentForLogarithm(msg) => write!(f, "{}", msg),
             ExecutorError::TruncatedWrongValue(msg) => write!(f, "{}", msg),
             ExecutorError::DuplicateKey(msg) => write!(f, "{}", msg),
+            ExecutorError::LockDeadlock => write!(
+                f,
+                "Deadlock found when trying to get lock; try restarting transaction"
+            ),
+            ExecutorError::LockWaitTimeout => {
+                write!(f, "Lock wait timeout exceeded; try restarting transaction")
+            }
+            ExecutorError::LockNoWait => write!(
+                f,
+                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set."
+            ),
             ExecutorError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }

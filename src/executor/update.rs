@@ -2,19 +2,20 @@
 //!
 //! Updates rows in a table that match a filter with MVCC support.
 
+use super::rowcodec::TableLayout;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
-use crate::txn::MvccStorage;
+use crate::txn::{LockMode, MvccStorage};
 
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
-use super::encoding::{decode_row, encode_pk_key, encode_row, table_key_end, table_key_prefix};
+use super::encoding::{encode_pk_key, table_key_end, table_key_prefix};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -23,13 +24,15 @@ use super::Executor;
 /// Update executor
 pub struct Update {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
+    layout: TableLayout,
     /// Assignments: (column, new_value)
     assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     /// Optional filter predicate
     filter: Option<ResolvedExpr>,
     /// PK value for PointGet fast path (O(1) instead of full scan)
     key_value: Option<ResolvedExpr>,
+    key_type: Option<crate::catalog::DataType>,
     /// ORDER BY expressions for UPDATE ... ORDER BY ... LIMIT
     order_by: Vec<(ResolvedExpr, bool)>,
     /// LIMIT for UPDATE ... LIMIT n
@@ -50,10 +53,14 @@ pub struct Update {
 
 /// Parameters for creating an Update executor.
 pub struct UpdateParams {
-    pub table: String,
+    pub table: crate::catalog::TableName,
+    /// The table's ID: what its keys begin with
+    pub layout: TableLayout,
     pub assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
     pub filter: Option<ResolvedExpr>,
     pub key_value: Option<ResolvedExpr>,
+    /// The key column's type, where `key_value` is set.
+    pub key_type: Option<crate::catalog::DataType>,
     pub order_by: Vec<(ResolvedExpr, bool)>,
     pub limit: Option<usize>,
     pub pk_column_indices: Vec<usize>,
@@ -67,9 +74,11 @@ impl Update {
     pub fn new(p: UpdateParams) -> Self {
         Update {
             table: p.table,
+            layout: p.layout,
             assignments: p.assignments,
             filter: p.filter,
             key_value: p.key_value,
+            key_type: p.key_type,
             order_by: p.order_by,
             limit: p.limit,
             pk_column_indices: p.pk_column_indices,
@@ -88,13 +97,13 @@ impl Update {
     /// If a PK column was modified, the storage key changes:
     /// we must delete the old key and insert at the new key.
     /// Otherwise, emit a normal update at the same key.
-    fn emit_row_change(
+    async fn emit_row_change(
         &mut self,
         old_key: Vec<u8>,
         row: &Row,
         row_version: u64,
     ) -> ExecutorResult<()> {
-        let new_value = encode_row(row);
+        let new_value = self.layout.encode(row)?;
 
         // Compute new PK-based key from updated row values
         let new_key = if !self.pk_column_indices.is_empty() {
@@ -103,7 +112,7 @@ impl Update {
                 .iter()
                 .map(|&idx| row.get(idx).unwrap().clone())
                 .collect();
-            encode_pk_key(&self.table, &pk_values)
+            encode_pk_key(self.layout.id, &pk_values)
         } else {
             old_key.clone()
         };
@@ -113,30 +122,31 @@ impl Update {
         })?;
 
         if new_key != old_key {
-            // PK changed: check for duplicate at the new key
-            if ctx.has_buffered_key(&new_key) {
+            // PK changed: the row moves to a new key, which is an insert
+            // there. Lock the place as an insert does, then see whether it
+            // is taken.
+            let locked = ctx.locks_rows();
+            if locked {
+                ctx.lock_for_insert(&new_key, true).await?;
+            }
+            let taken = ctx.has_buffered_key(&new_key)
+                || (locked
+                    && !ctx.is_buffered_deleted(&new_key)
+                    && self.mvcc.get_current(&new_key).await?.is_some());
+            if taken {
                 return Err(super::error::ExecutorError::DuplicateKey(format!(
                     "Duplicate entry for key 'PRIMARY' in table '{}'",
                     self.table
                 )));
             }
             // Delete old key, insert at new key
-            ctx.add_change(RowChange::delete_with_version(
-                &self.table,
-                old_key.clone(),
-                row_version,
-            ));
+            ctx.add_change(RowChange::delete_with_version(old_key.clone(), row_version));
             ctx.buffer_delete(old_key);
-            ctx.add_change(RowChange::insert(
-                &self.table,
-                new_key.clone(),
-                new_value.clone(),
-            ));
+            ctx.add_change(RowChange::insert(new_key.clone(), new_value.clone()));
             ctx.buffer_write(new_key, new_value);
         } else {
             // Same key: normal update
             ctx.add_change(RowChange::update_with_version(
-                &self.table,
                 old_key.clone(),
                 new_value.clone(),
                 row_version,
@@ -152,7 +162,12 @@ impl Update {
     async fn next_point_get(&mut self) -> ExecutorResult<()> {
         let key_expr = self.key_value.as_ref().unwrap();
         let key_datum = evaluate(key_expr, &Row::empty(), &self.user_variables)?;
-        let storage_key = encode_pk_key(&self.table, &[key_datum]);
+        // In the key column's type. A value the column cannot hold is the
+        // key of no row: nothing to change, and nothing to lock.
+        let Some(key_datum) = super::key::for_point(key_datum, self.key_type.as_ref()) else {
+            return Ok(());
+        };
+        let storage_key = encode_pk_key(self.layout.id, &[key_datum]);
 
         let ctx = self.txn_context.as_ref().ok_or_else(|| {
             super::error::ExecutorError::Internal("UPDATE requires transaction context".to_string())
@@ -161,13 +176,42 @@ impl Update {
         // Always read from MVCC storage (not write buffer) to get the correct
         // OCC version. The full-scan path also reads from MVCC, not the buffer.
         // The write buffer is for SELECT read-your-writes, not DML OCC checks.
-        let result = self
-            .mvcc
-            .get_with_version(&storage_key, &ctx.read_view)
-            .await?;
+        //
+        // With row locking the row is locked first and then read as it
+        // stands now: whoever held it before has finished, and what they
+        // left is what this statement changes.
+        let result = if ctx.locks_rows() {
+            let new_lock = ctx.lock_record(&storage_key, LockMode::Exclusive).await?;
+            let current = self.mvcc.get_current(&storage_key).await?;
+            if current.is_none() && !ctx.has_buffered_key(&storage_key) {
+                // No such row. What is locked instead is its absence: the
+                // gap it would be in, against inserts (REPEATABLE READ).
+                // There is no row to hold a lock on.
+                if ctx.locks_gaps() {
+                    let (low, high) = self
+                        .mvcc
+                        .gap_around(
+                            &storage_key,
+                            &table_key_prefix(self.layout.id),
+                            &table_key_end(self.layout.id),
+                        )
+                        .await?;
+                    ctx.lock_gap(&low, &high);
+                }
+                if new_lock {
+                    ctx.unlock_record(&storage_key);
+                }
+            }
+            current
+        } else {
+            self.mvcc
+                .get_with_version(&storage_key, &ctx.read_view)
+                .await?
+        };
+        let result = ctx.with_own_change(&storage_key, result);
 
         if let Some((data, row_version)) = result {
-            let mut row = decode_row(&data)?;
+            let mut row = self.layout.decode(&data)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
@@ -182,7 +226,7 @@ impl Update {
                 new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            self.emit_row_change(storage_key, &row, row_version)?;
+            self.emit_row_change(storage_key, &row, row_version).await?;
         }
 
         Ok(())
@@ -190,13 +234,36 @@ impl Update {
 
     /// Full scan path: scan all rows in the table
     async fn next_full_scan(&mut self) -> ExecutorResult<()> {
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
-
+        let prefix = table_key_prefix(self.layout.id);
+        let end = table_key_end(self.layout.id);
+        // The scan reads the whole table, so the whole table is what must
+        // not gain rows until this transaction ends (REPEATABLE READ).
+        // Locked before reading, so that nothing slips in between.
+        if let Some(ctx) = &self.txn_context {
+            if ctx.locks_gaps() {
+                ctx.lock_gap(&prefix, &end);
+            }
+        }
         let kv_pairs = if let Some(ref ctx) = self.txn_context {
-            self.mvcc
-                .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
-                .await?
+            if ctx.locks_rows() {
+                // Which rows there are is taken as things stand now, after
+                // the gap lock: each is then locked and read again, so the
+                // values here do not matter.
+                let mut keys: Vec<Vec<u8>> = self
+                    .mvcc
+                    .inner()
+                    .scan(Some(&prefix), Some(&end))
+                    .await?
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect();
+                ctx.add_keys_being_inserted(&mut keys, &prefix, &end);
+                keys.into_iter().map(|k| (k, Vec::new(), 0u64)).collect()
+            } else {
+                self.mvcc
+                    .scan_with_versions(Some(&prefix), Some(&end), &ctx.read_view)
+                    .await?
+            }
         } else {
             self.mvcc
                 .inner()
@@ -210,10 +277,42 @@ impl Update {
         // Collect matching rows (with keys for later update)
         let mut matching: Vec<(Vec<u8>, Vec<u8>, u64, Row)> = Vec::new();
         for (key, value, row_version) in kv_pairs {
-            let row = decode_row(&value)?;
+            // Lock each row the scan passes, then look at it as it stands
+            // now (it may have changed, or gone, while we waited).
+            let mut new_lock = false;
+            let (value, row_version) = match &self.txn_context {
+                Some(ctx) => {
+                    let stored = if ctx.locks_rows() {
+                        new_lock = ctx.lock_record(&key, LockMode::Exclusive).await?;
+                        self.mvcc.get_current(&key).await?
+                    } else {
+                        Some((value, row_version))
+                    };
+                    match ctx.with_own_change(&key, stored) {
+                        Some(current) => current,
+                        None => {
+                            // Deleted: there is no row to keep a lock on.
+                            if new_lock {
+                                ctx.unlock_record(&key);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                None => (value, row_version),
+            };
+            let row = self.layout.decode(&value)?;
             if let Some(filter) = &self.filter {
                 let result = evaluate(filter, &row, &self.user_variables)?;
                 if !result.as_bool().unwrap_or(false) {
+                    // READ COMMITTED keeps locks only on the rows it
+                    // changes. (REPEATABLE READ keeps every row it read as
+                    // it was, so it keeps them all.)
+                    if let Some(ctx) = &self.txn_context {
+                        if new_lock && !ctx.locks_gaps() {
+                            ctx.unlock_record(&key);
+                        }
+                    }
                     continue;
                 }
             }
@@ -263,7 +362,7 @@ impl Update {
                 new_value = super::eval::coerce_to_column_type(new_value, &col.data_type)?;
                 row.set(col.index, new_value)?;
             }
-            self.emit_row_change(key, &row, row_version)?;
+            self.emit_row_change(key, &row, row_version).await?;
         }
 
         Ok(())
@@ -319,12 +418,34 @@ mod tests {
     use crate::executor::encoding::encode_pk_key;
     use crate::planner::logical::{BinaryOp, Literal};
     use crate::server::session::UserVariables;
-    use crate::storage::traits::KeyValue;
+    use crate::storage::traits::{KeyValue, WriteOp};
     use crate::storage::{StorageEngine, StorageResult};
     use crate::txn::TransactionManager;
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
+    /// A row of one of the tests' tables, as it is stored.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        crate::executor::rowcodec::encode(
+            &crate::executor::rowcodec::RowShape::numbered(row.len()),
+            row,
+        )
+        .unwrap()
+    }
 
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
@@ -363,6 +484,24 @@ mod tests {
         async fn delete(&self, key: &[u8]) -> StorageResult<()> {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| k != key);
+            Ok(())
+        }
+
+        async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+            self.get(key).await
+        }
+
+        async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+            for write in batch {
+                match write {
+                    WriteOp::Put(key, value) => self.put(&key, &value).await?,
+                    WriteOp::Delete(key) => self.delete(&key).await?,
+                    WriteOp::ForgetRange { start, end } => {
+                        let mut data = self.data.lock().unwrap();
+                        data.retain(|(k, _)| *k < start || *k >= end);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -414,11 +553,11 @@ mod tests {
 
         let initial = vec![
             (
-                encode_pk_key("users", &[Datum::Int(1)]),
+                encode_pk_key(tid("users"), &[Datum::Int(1)]),
                 encode_with_mvcc_header(0, &encode_row(&row1)),
             ),
             (
-                encode_pk_key("users", &[Datum::Int(2)]),
+                encode_pk_key(tid("users"), &[Datum::Int(2)]),
                 encode_with_mvcc_header(0, &encode_row(&row2)),
             ),
         ];
@@ -462,10 +601,12 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
-            table: "users".to_string(),
+            table: "users".into(),
+            layout: layout("users"),
             assignments,
             filter: Some(filter),
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             pk_column_indices: vec![0], // id is PK at index 0
@@ -497,7 +638,7 @@ mod tests {
         let row1 = Row::new(vec![Datum::Int(1), Datum::String("alice".to_string())]);
 
         let initial = vec![(
-            encode_pk_key("users", &[Datum::Int(1)]),
+            encode_pk_key(tid("users"), &[Datum::Int(1)]),
             encode_with_mvcc_header(0, &encode_row(&row1)),
         )];
 
@@ -539,10 +680,12 @@ mod tests {
 
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut update = Update::new(UpdateParams {
-            table: "users".to_string(),
+            table: "users".into(),
+            layout: layout("users"),
             assignments,
             filter: Some(filter),
             key_value: None,
+            key_type: None,
             order_by: vec![],
             limit: None,
             pk_column_indices: vec![0], // id is PK at index 0
@@ -561,8 +704,14 @@ mod tests {
         // PK changed: should produce DELETE(old_key) + INSERT(new_key) = 2 changes
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].op, ChangeOp::Delete);
-        assert_eq!(changes[0].key, encode_pk_key("users", &[Datum::Int(1)]));
+        assert_eq!(
+            changes[0].key,
+            encode_pk_key(tid("users"), &[Datum::Int(1)])
+        );
         assert_eq!(changes[1].op, ChangeOp::Insert);
-        assert_eq!(changes[1].key, encode_pk_key("users", &[Datum::Int(10)]));
+        assert_eq!(
+            changes[1].key,
+            encode_pk_key(tid("users"), &[Datum::Int(10)])
+        );
     }
 }

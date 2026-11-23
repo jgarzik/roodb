@@ -5,9 +5,11 @@
 //! - COMMIT: Mark transaction as committed, persist to WAL
 //! - ROLLBACK: Apply undo log in reverse, mark as aborted
 
+use super::lock::LockManager;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::{
     IsolationLevel, ReadView, TimeoutConfig, Transaction, TransactionError, TransactionResult,
@@ -34,11 +36,54 @@ pub struct TransactionManager {
 
     /// Timeout configuration
     timeout_config: RwLock<TimeoutConfig>,
+
+    /// The highest transaction ID the Raft state machine has applied, or a
+    /// bound above it. IDs handed out here must stay ahead of it: rows carry
+    /// the ID of the transaction that wrote them, and a row whose ID is not
+    /// below the counter looks like it has not been committed yet. The state
+    /// machine advances this as it applies entries - on a follower, and when
+    /// it replays its log after a restart.
+    applied_floor: Arc<AtomicU64>,
+
+    /// Row locks held by the transactions of this node. They are released
+    /// here, when a transaction ends, however it ends.
+    locks: Arc<LockManager>,
+
+    /// The metadata locks held on this node's tables: by statements while
+    /// they use a table, by schema changes while they change one.
+    metadata_locks: Arc<crate::txn::MetadataLocks>,
+
+    /// The next AUTO_INCREMENT value of each table.
+    auto_increment: Arc<crate::txn::AutoIncrement>,
 }
 
 impl TransactionManager {
     /// Create a new transaction manager
     pub fn new() -> Self {
+        Self::with_applied_floor(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As `with_applied_floor`, sharing the AUTO_INCREMENT counters with
+    /// the state machine, which drops a table's counter with the table.
+    pub fn with_state_machine(
+        applied_floor: Arc<AtomicU64>,
+        auto_increment: Arc<crate::txn::AutoIncrement>,
+    ) -> Self {
+        Self {
+            auto_increment,
+            ..Self::with_applied_floor(applied_floor)
+        }
+    }
+
+    /// The AUTO_INCREMENT counters of this node's tables.
+    pub fn auto_increment(&self) -> &Arc<crate::txn::AutoIncrement> {
+        &self.auto_increment
+    }
+
+    /// Create a transaction manager whose IDs stay ahead of those the Raft
+    /// state machine has applied (see `applied_floor`).
+    pub fn with_applied_floor(applied_floor: Arc<AtomicU64>) -> Self {
+        let locks = LockManager::new();
         Self {
             // Start at 1 so 0 can be used as "no transaction"
             next_txn_id: AtomicU64::new(1),
@@ -47,7 +92,27 @@ impl TransactionManager {
             undo_log: UndoLog::new(),
             is_leader: AtomicBool::new(true), // Default to leader for single-node
             timeout_config: RwLock::new(TimeoutConfig::default()),
+            applied_floor,
+            metadata_locks: crate::txn::MetadataLocks::new(locks.clone()),
+            locks,
+            auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
         }
+    }
+
+    /// The metadata locks of this node's sessions.
+    pub fn metadata_locks(&self) -> &Arc<crate::txn::MetadataLocks> {
+        &self.metadata_locks
+    }
+
+    /// The row locks of this node's transactions.
+    pub fn locks(&self) -> &Arc<LockManager> {
+        &self.locks
+    }
+
+    /// Move the ID counter past everything the state machine has applied.
+    fn stay_ahead_of_applied(&self) {
+        let floor = self.applied_floor.load(Ordering::SeqCst);
+        self.next_txn_id.fetch_max(floor + 1, Ordering::SeqCst);
     }
 
     /// Set whether this node is the Raft leader
@@ -58,6 +123,24 @@ impl TransactionManager {
     /// Check if this node is the Raft leader
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::SeqCst)
+    }
+
+    /// Roll back every open transaction and release its locks. For a node
+    /// that has stopped being the leader: what its transactions had locked
+    /// and buffered means nothing on the node that leads now. A session
+    /// finds its transaction gone when it next tries to commit.
+    pub fn abort_all(&self) -> usize {
+        let aborted: Vec<u64> = self
+            .active_transactions
+            .write()
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
+        for &txn_id in &aborted {
+            self.locks.release_all(txn_id);
+            self.undo_log.remove_transaction(txn_id);
+        }
+        aborted.len()
     }
 
     /// Update timeout configuration
@@ -98,6 +181,7 @@ impl TransactionManager {
         }
 
         // Allocate transaction ID
+        self.stay_ahead_of_applied();
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
 
         // Create transaction
@@ -115,6 +199,9 @@ impl TransactionManager {
     /// The undo log for INSERT operations can be discarded.
     /// UPDATE/DELETE undo logs are kept for MVCC until purge.
     pub async fn commit(&self, txn_id: u64) -> TransactionResult<()> {
+        // Its changes have been applied (or it made none): others may now
+        // have the rows.
+        self.locks.release_all(txn_id);
         // Get and validate transaction
         {
             let mut active = self.active_transactions.write();
@@ -145,6 +232,7 @@ impl TransactionManager {
     /// to Raft. On ROLLBACK, the session simply discards the buffered changes.
     /// This method just removes the transaction from the active set.
     pub async fn rollback(&self, txn_id: u64) -> TransactionResult<()> {
+        self.locks.release_all(txn_id);
         // Get and validate transaction
         {
             let mut active = self.active_transactions.write();
@@ -180,6 +268,9 @@ impl TransactionManager {
     /// as invisible to this read view.
     pub fn create_read_view(&self, txn_id: u64) -> TransactionResult<ReadView> {
         let active = self.active_transactions.read();
+        // Rows applied by the state machine (replicated, or replayed after a
+        // restart) are committed and must be visible to this view.
+        self.stay_ahead_of_applied();
         // Read max_txn_id while still holding active_transactions lock
         let max_txn_id = self.next_txn_id.load(Ordering::SeqCst) - 1;
         // Fast path: skip HashSet allocation when no active transactions

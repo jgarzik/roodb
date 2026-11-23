@@ -7,13 +7,24 @@ use parking_lot::RwLock;
 
 use roodb::catalog::{Catalog, ColumnDef, Constraint, DataType, TableDef};
 use roodb::executor::context::TransactionContext;
-use roodb::executor::encoding::{encode_pk_key, encode_row};
+use roodb::executor::encoding::{encode_pk_key, TableId};
+use roodb::executor::rowcodec::RowShape;
+
+/// The IDs of the tables these tests set up.
+const USERS: TableId = TableId(5001);
+const NUMS: TableId = TableId(5002);
+
+/// A row of a table as it is stored when the table has the row's columns,
+/// numbered in order.
+fn encode_row(row: &Row) -> Vec<u8> {
+    roodb::executor::rowcodec::encode(&RowShape::numbered(row.len()), row).unwrap()
+}
 use roodb::executor::{Datum, ExecutorEngine, Row};
 use roodb::planner::logical::expr::{AggregateFunc, OutputColumn};
 use roodb::planner::logical::{BinaryOp, Literal, ResolvedColumn, ResolvedExpr};
 use roodb::planner::PhysicalPlan;
 use roodb::server::session::UserVariables;
-use roodb::storage::traits::KeyValue;
+use roodb::storage::traits::{KeyValue, WriteOp};
 use roodb::storage::{StorageEngine, StorageResult};
 use roodb::txn::{MvccStorage, ReadView, TransactionManager};
 
@@ -52,6 +63,24 @@ impl StorageEngine for MockStorage {
     async fn delete(&self, key: &[u8]) -> StorageResult<()> {
         let mut data = self.data.lock().unwrap();
         data.retain(|(k, _)| k != key);
+        Ok(())
+    }
+
+    async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.get(key).await
+    }
+
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()> {
+        for write in batch {
+            match write {
+                WriteOp::Put(key, value) => self.put(&key, &value).await?,
+                WriteOp::Delete(key) => self.delete(&key).await?,
+                WriteOp::ForgetRange { start, end } => {
+                    let mut data = self.data.lock().unwrap();
+                    data.retain(|(k, _)| *k < start || *k >= end);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -96,15 +125,15 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
     // Encode with MVCC headers (txn_id=0 = committed)
     let initial = vec![
         (
-            encode_pk_key("users", &[Datum::Int(1)]),
+            encode_pk_key(USERS, &[Datum::Int(1)]),
             encode_with_mvcc_header(0, &encode_row(&row1)),
         ),
         (
-            encode_pk_key("users", &[Datum::Int(2)]),
+            encode_pk_key(USERS, &[Datum::Int(2)]),
             encode_with_mvcc_header(0, &encode_row(&row2)),
         ),
         (
-            encode_pk_key("users", &[Datum::Int(3)]),
+            encode_pk_key(USERS, &[Datum::Int(3)]),
             encode_with_mvcc_header(0, &encode_row(&row3)),
         ),
     ];
@@ -121,6 +150,7 @@ fn setup_test_env() -> (ExecutorEngine, Arc<MockStorage>) {
         let mut cat = catalog.write();
         cat.create_table(
             TableDef::new("users")
+                .with_id(USERS)
                 .column(ColumnDef::new("id", DataType::Int).nullable(false))
                 .column(ColumnDef::new("name", DataType::Varchar(100)))
                 .constraint(Constraint::PrimaryKey(vec!["id".to_string()])),
@@ -141,7 +171,7 @@ async fn test_table_scan_all_rows() {
     let (engine, _) = setup_test_env();
 
     let plan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,
@@ -177,7 +207,7 @@ async fn test_table_scan_with_filter() {
 
     // SELECT * FROM users WHERE id > 1
     let plan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -219,7 +249,7 @@ async fn test_project_single_column() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,
@@ -274,7 +304,7 @@ async fn test_sort_descending() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -320,7 +350,7 @@ async fn test_limit_offset() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -356,7 +386,7 @@ async fn test_count_aggregate() {
     let (engine, _) = setup_test_env();
 
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "id".to_string(),
@@ -400,7 +430,7 @@ async fn test_insert() {
 
     // INSERT INTO users (id, name) VALUES (10, 'dave')
     let plan = PhysicalPlan::Insert {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             ResolvedColumn {
                 table: "users".to_string(),
@@ -456,7 +486,7 @@ async fn test_delete_with_filter() {
 
     // DELETE FROM users WHERE id = 2
     let plan = PhysicalPlan::Delete {
-        table: "users".to_string(),
+        table: "users".into(),
         filter: Some(ResolvedExpr::BinaryOp {
             left: Box::new(ResolvedExpr::Column(ResolvedColumn {
                 table: "users".to_string(),
@@ -472,6 +502,7 @@ async fn test_delete_with_filter() {
             result_type: DataType::Boolean,
         }),
         key_value: None,
+        key_type: None,
         order_by: vec![],
         limit: None,
     };
@@ -504,7 +535,7 @@ async fn test_create_and_drop_table() {
 
     // CREATE TABLE test (id INT)
     let create_plan = PhysicalPlan::CreateTable {
-        name: "test".to_string(),
+        name: "test".into(),
         columns: vec![ColumnDef::new("id", DataType::Int)],
         constraints: vec![],
         if_not_exists: false,
@@ -518,12 +549,12 @@ async fn test_create_and_drop_table() {
     // Verify table exists
     {
         let cat = catalog.read();
-        assert!(cat.get_table("test").is_some());
+        assert!(cat.get_table(&"test".into()).is_some());
     }
 
     // DROP TABLE test
     let drop_plan = PhysicalPlan::DropTable {
-        name: "test".to_string(),
+        name: "test".into(),
         if_exists: false,
     };
 
@@ -535,7 +566,7 @@ async fn test_create_and_drop_table() {
     // Verify table is gone
     {
         let cat = catalog.read();
-        assert!(cat.get_table("test").is_none());
+        assert!(cat.get_table(&"test".into()).is_none());
     }
 }
 
@@ -548,9 +579,9 @@ async fn test_distinct() {
     let row3 = Row::new(vec![Datum::Int(2)]);
 
     let initial = vec![
-        (encode_pk_key("nums", &[Datum::Int(1)]), encode_row(&row1)),
-        (encode_pk_key("nums", &[Datum::Int(2)]), encode_row(&row2)),
-        (encode_pk_key("nums", &[Datum::Int(3)]), encode_row(&row3)),
+        (encode_pk_key(NUMS, &[Datum::Int(1)]), encode_row(&row1)),
+        (encode_pk_key(NUMS, &[Datum::Int(2)]), encode_row(&row2)),
+        (encode_pk_key(NUMS, &[Datum::Int(3)]), encode_row(&row3)),
     ];
 
     let storage = Arc::new(MockStorage::new(initial));
@@ -563,14 +594,18 @@ async fn test_distinct() {
 
     {
         let mut cat = catalog.write();
-        cat.create_table(TableDef::new("nums").column(ColumnDef::new("n", DataType::Int)))
-            .unwrap();
+        cat.create_table(
+            TableDef::new("nums")
+                .with_id(NUMS)
+                .column(ColumnDef::new("n", DataType::Int)),
+        )
+        .unwrap();
     }
 
     let engine = ExecutorEngine::new(mvcc, catalog, None, UserVariables::default());
 
     let scan = PhysicalPlan::TableScan {
-        table: "nums".to_string(),
+        table: "nums".into(),
         columns: vec![OutputColumn {
             id: 0,
             name: "n".to_string(),
@@ -604,7 +639,7 @@ async fn test_full_query_pipeline() {
 
     // SELECT name FROM users WHERE id > 1 ORDER BY id DESC LIMIT 1
     let scan = PhysicalPlan::TableScan {
-        table: "users".to_string(),
+        table: "users".into(),
         columns: vec![
             OutputColumn {
                 id: 0,

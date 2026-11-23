@@ -14,7 +14,6 @@ use subtle::ConstantTimeEq;
 use tracing::warn;
 
 use crate::catalog::system_tables::SYSTEM_USERS;
-use crate::executor::encoding::{decode_row, table_key_end, table_key_prefix};
 use crate::executor::Datum;
 use crate::sql::privileges::HostPattern;
 use crate::storage::StorageEngine;
@@ -115,20 +114,14 @@ pub async fn lookup_user(
     username: &str,
     client_host: &str,
 ) -> Result<Option<UserRecord>, String> {
-    let prefix = table_key_prefix(SYSTEM_USERS);
-    let end = table_key_end(SYSTEM_USERS);
-
-    let rows = storage
-        .scan(Some(&prefix), Some(&end))
+    let rows = crate::catalog::store::scan_rows(storage.as_ref(), SYSTEM_USERS)
         .await
         .map_err(|e| format!("Storage error: {}", e))?;
 
     // system.users schema: username, host, password_hash, auth_plugin,
     //   ssl_subject, ssl_issuer, account_locked, password_expired, created_at, updated_at
-    for (_key, value) in rows {
-        let Ok(row) = decode_row(&value) else {
-            continue;
-        };
+    for stored in rows {
+        let row = stored.row;
 
         match row.get_opt(0) {
             Some(Datum::String(s)) if s == username => {}

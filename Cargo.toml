@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time", "process", "signal"] }
 
 # Error handling
 thiserror = "1"
@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive", "env"] }
 cfg-if = "1"
 
 # Raft consensus
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "0.10", features = ["serde", "type-alias"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -42,6 +42,7 @@ rustls-pemfile = "2"
 
 # Bytes handling
 bytes = "1"
+futures-util = "0.3"
 
 # Synchronization primitives
 parking_lot = "0.12"
@@ -76,6 +77,9 @@ aes = "0.8"
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+# Unix-only dependencies
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

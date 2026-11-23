@@ -281,8 +281,25 @@ pub fn all_headers() -> Vec<u8> {
     h
 }
 
-/// Build a LOGIN7 message for SQL authentication.
+/// Build a LOGIN7 message for SQL authentication, into the tests'
+/// database.
 pub fn login7(user: &str, password: &str, tds_version: u32) -> Vec<u8> {
+    login7_into(
+        user,
+        password,
+        tds_version,
+        Some(crate::test_utils::TEST_DATABASE),
+    )
+}
+
+/// Build a LOGIN7 message for SQL authentication that names `database`,
+/// or none.
+pub fn login7_into(
+    user: &str,
+    password: &str,
+    tds_version: u32,
+    database: Option<&str>,
+) -> Vec<u8> {
     let mut msg = vec![0u8; 94];
     msg[4..8].copy_from_slice(&tds_version.to_le_bytes());
     msg[8..12].copy_from_slice(&4096u32.to_le_bytes());
@@ -292,9 +309,11 @@ pub fn login7(user: &str, password: &str, tds_version: u32) -> Vec<u8> {
         .map(|b| b.rotate_left(4) ^ 0xA5)
         .collect();
     // (offset/length pair index, bytes, length in characters)
+    let database = database.unwrap_or("");
     let fields = [
         (1usize, ucs2(user), user.encode_utf16().count()),
         (2, obfuscated, password.encode_utf16().count()),
+        (8, ucs2(database), database.encode_utf16().count()),
     ];
     for (index, bytes, chars) in fields {
         let pair = 36 + index * 4;
@@ -352,8 +371,13 @@ impl RawTds {
 
     /// Send LOGIN7 and return the response tokens.
     pub async fn login(&mut self, user: &str, password: &str, tds_version: u32) -> Vec<Token> {
-        self.send(PKT_LOGIN7, STATUS_EOM, &login7(user, password, tds_version))
-            .await;
+        self.login_with(&login7(user, password, tds_version)).await
+    }
+
+    /// Send a LOGIN7 message built by the caller and return the response
+    /// tokens.
+    pub async fn login_with(&mut self, login: &[u8]) -> Vec<Token> {
+        self.send(PKT_LOGIN7, STATUS_EOM, login).await;
         let (_, payload) = self.recv().await.expect("login response");
         parse_tokens(&payload)
     }

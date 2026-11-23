@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 
 use crate::executor::Datum;
 use crate::raft::RowChange;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 use crate::txn::{IsolationLevel, TimeoutConfig};
 
 /// Thread-safe per-session user variable storage (@var)
@@ -40,8 +40,6 @@ pub struct IdBatch {
     next_local: u64,
     /// End of the allocated range (exclusive)
     end_local: u64,
-    /// Node ID for encoding full row IDs
-    node_id: u64,
 }
 
 impl IdBatch {
@@ -50,7 +48,6 @@ impl IdBatch {
         Self {
             next_local: 0,
             end_local: 0,
-            node_id: 0,
         }
     }
 
@@ -66,7 +63,7 @@ impl IdBatch {
         if self.next_local < self.end_local {
             let local = self.next_local;
             self.next_local += 1;
-            Some(encode_row_id(local, self.node_id))
+            Some(local)
         } else {
             None
         }
@@ -74,10 +71,9 @@ impl IdBatch {
 
     /// Refill this batch from the global allocator
     fn refill(&mut self, count: u64) {
-        let (start, node_id) = allocate_row_id_batch(count);
+        let start = allocate_row_id_batch(count);
         self.next_local = start;
         self.end_local = start + count;
-        self.node_id = node_id;
     }
 }
 
@@ -109,6 +105,13 @@ pub struct Session {
     pub autocommit: bool,
     /// Transaction isolation level for this session
     pub isolation_level: IsolationLevel,
+    /// How long a statement waits for a row lock another transaction holds
+    /// (`innodb_lock_wait_timeout`).
+    pub lock_wait_timeout: std::time::Duration,
+    /// How long a statement waits for a metadata lock: for a schema change
+    /// to finish with a table, or, as a schema change, for the statements
+    /// and transactions that use it (`lock_wait_timeout`).
+    pub metadata_lock_wait: std::time::Duration,
     /// Whether this is a read-only connection (connected to replica)
     pub is_read_only: bool,
     /// Per-session timeout configuration
@@ -133,9 +136,6 @@ pub struct Session {
 
     /// Active SQL modes (e.g., NO_UNSIGNED_SUBTRACTION, STRICT_TRANS_TABLES)
     sql_modes: HashSet<String>,
-
-    /// Temporary table names owned by this session (cleaned up on disconnect)
-    temp_table_names: Vec<String>,
 }
 
 impl Session {
@@ -149,6 +149,10 @@ impl Session {
             current_txn: None,
             autocommit: true,
             isolation_level: IsolationLevel::default(),
+            lock_wait_timeout: std::time::Duration::from_secs(crate::txn::DEFAULT_LOCK_WAIT_SECS),
+            metadata_lock_wait: std::time::Duration::from_secs(
+                crate::txn::DEFAULT_METADATA_LOCK_WAIT_SECS,
+            ),
             is_read_only: false,
             timeout_config: TimeoutConfig::default(),
             pending_changes: Vec::new(),
@@ -163,7 +167,6 @@ impl Session {
             // SQL modes — MySQL 8.0 defaults
             sql_modes: default_sql_modes(),
             // Temporary tables
-            temp_table_names: Vec::new(),
         }
     }
 
@@ -208,6 +211,9 @@ impl Session {
     pub fn reset(&mut self) {
         self.autocommit = true;
         self.isolation_level = IsolationLevel::default();
+        self.lock_wait_timeout = std::time::Duration::from_secs(crate::txn::DEFAULT_LOCK_WAIT_SECS);
+        self.metadata_lock_wait =
+            std::time::Duration::from_secs(crate::txn::DEFAULT_METADATA_LOCK_WAIT_SECS);
         self.warnings.clear();
         self.sql_prepared_stmts.clear();
         self.sql_modes = default_sql_modes();
@@ -269,6 +275,11 @@ impl Session {
     /// Add changes to the pending transaction (for explicit transactions)
     pub fn add_pending_changes(&mut self, changes: Vec<RowChange>) {
         self.pending_changes.extend(changes);
+    }
+
+    /// Keep only the pending changes that `keep` accepts.
+    pub fn retain_pending_changes(&mut self, keep: impl FnMut(&RowChange) -> bool) {
+        self.pending_changes.retain(keep);
     }
 
     /// Take all pending changes (called on COMMIT)
@@ -387,17 +398,5 @@ impl Session {
         let mut modes: Vec<&str> = self.sql_modes.iter().map(|s| s.as_str()).collect();
         modes.sort();
         modes.join(",")
-    }
-
-    // ============ Temporary Tables ============
-
-    /// Register a temporary table name for cleanup on disconnect
-    pub fn register_temp_table(&mut self, name: String) {
-        self.temp_table_names.push(name);
-    }
-
-    /// Take all temporary table names (called on disconnect for cleanup)
-    pub fn take_temp_tables(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.temp_table_names)
     }
 }

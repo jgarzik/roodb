@@ -3,6 +3,7 @@
 //! Physical plans represent how a query will actually be executed,
 //! including specific algorithm choices (e.g., nested loop vs hash join).
 
+use crate::catalog::TableName;
 use crate::catalog::{Catalog, ColumnDef, Constraint, DataType};
 use crate::executor::datum::Datum;
 use crate::planner::error::{PlannerError, PlannerResult};
@@ -16,7 +17,7 @@ use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
 pub enum PhysicalPlan {
     /// Full table scan
     TableScan {
-        table: String,
+        table: TableName,
         columns: Vec<OutputColumn>,
         /// Optional filter to apply during scan
         filter: Option<ResolvedExpr>,
@@ -24,15 +25,18 @@ pub enum PhysicalPlan {
 
     /// Point lookup by primary key (O(log n) instead of O(n) scan)
     PointGet {
-        table: String,
+        table: TableName,
         columns: Vec<OutputColumn>,
         /// Primary key value to look up
         key_value: ResolvedExpr,
+        /// The key column's type: the value is put in it before it is
+        /// looked up.
+        key_type: DataType,
     },
 
     /// Range scan by primary key bounds (scans only matching PK range instead of full table)
     RangeScan {
-        table: String,
+        table: TableName,
         columns: Vec<OutputColumn>,
         /// Start PK bound (None = unbounded start)
         start_key: Option<ResolvedExpr>,
@@ -44,6 +48,8 @@ pub enum PhysicalPlan {
         inclusive_end: bool,
         /// Any remaining filter predicates that couldn't be pushed to storage bounds
         remaining_filter: Option<ResolvedExpr>,
+        /// The key column's type: the bounds are put in it.
+        key_type: DataType,
     },
 
     /// Filter rows based on a predicate
@@ -124,7 +130,7 @@ pub enum PhysicalPlan {
     // ============ DML Operations ============
     /// INSERT rows into a table
     Insert {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         /// Column indices that are auto_increment (value generated if NULL)
@@ -139,7 +145,7 @@ pub enum PhysicalPlan {
 
     /// INSERT ... SELECT — insert rows from a source query
     InsertSelect {
-        table: String,
+        table: TableName,
         columns: Vec<ResolvedColumn>,
         source: Box<PhysicalPlan>,
         /// Column indices that are auto_increment (value generated if NULL)
@@ -155,12 +161,14 @@ pub enum PhysicalPlan {
 
     /// UPDATE rows in a table
     Update {
-        table: String,
+        table: TableName,
         /// (column, new value)
         assignments: Vec<(ResolvedColumn, ResolvedExpr)>,
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        /// The key column's type, where `key_value` is set.
+        key_type: Option<DataType>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
         /// Primary key column indices (positions in the full table row)
@@ -169,10 +177,12 @@ pub enum PhysicalPlan {
 
     /// DELETE rows from a table
     Delete {
-        table: String,
+        table: TableName,
         filter: Option<ResolvedExpr>,
         /// PK value for PointGet fast path (O(1) instead of full scan)
         key_value: Option<ResolvedExpr>,
+        /// The key column's type, where `key_value` is set.
+        key_type: Option<DataType>,
         order_by: Vec<(ResolvedExpr, bool)>,
         limit: Option<usize>,
     },
@@ -180,7 +190,7 @@ pub enum PhysicalPlan {
     // ============ DDL Operations ============
     /// CREATE TABLE
     CreateTable {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -188,7 +198,7 @@ pub enum PhysicalPlan {
 
     /// CREATE TABLE ... SELECT
     CreateTableAs {
-        name: String,
+        name: TableName,
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
         if_not_exists: bool,
@@ -196,28 +206,31 @@ pub enum PhysicalPlan {
     },
 
     /// DROP TABLE
-    DropTable { name: String, if_exists: bool },
+    DropTable { name: TableName, if_exists: bool },
 
     /// DROP TABLE t1, t2, t3 (multiple tables)
-    DropMultipleTables { names: Vec<String>, if_exists: bool },
+    DropMultipleTables {
+        names: Vec<TableName>,
+        if_exists: bool,
+    },
 
     /// Materialized derived table (subquery in FROM)
     Materialize { input: Box<PhysicalPlan> },
 
     /// CREATE VIEW
     CreateView {
-        name: String,
+        name: TableName,
         query_sql: String,
         or_replace: bool,
     },
 
     /// DROP VIEW
-    DropView { name: String, if_exists: bool },
+    DropView { name: TableName, if_exists: bool },
 
     /// CREATE INDEX
     CreateIndex {
         name: String,
-        table: String,
+        table: TableName,
         columns: Vec<(String, usize)>,
         unique: bool,
     },
@@ -284,7 +297,7 @@ pub enum PhysicalPlan {
     },
 
     /// ANALYZE TABLE
-    AnalyzeTable { table: String },
+    AnalyzeTable { table: TableName },
 
     /// EXPLAIN — wraps the inner plan for MySQL-format EXPLAIN output
     Explain { inner: Box<PhysicalPlan> },
@@ -864,7 +877,7 @@ pub struct PhysicalPlanner;
 impl PhysicalPlanner {
     /// Look up auto_increment and primary key column indices from the catalog.
     fn lookup_insert_metadata(
-        table: &str,
+        table: &TableName,
         columns: &[ResolvedColumn],
         catalog: &Catalog,
     ) -> (Vec<usize>, Vec<usize>) {
@@ -902,10 +915,23 @@ impl PhysicalPlanner {
         Self::plan_node(logical, catalog)
     }
 
+    /// The type of the table's primary key column, if the key is a single
+    /// column.
+    fn single_key_type(table_name: &TableName, catalog: &Catalog) -> Option<DataType> {
+        let table_def = catalog.get_table(table_name)?;
+        let pk_cols = table_def.primary_key()?;
+        if pk_cols.len() != 1 {
+            return None;
+        }
+        table_def
+            .get_column(&pk_cols[0])
+            .map(|column| column.data_type.clone())
+    }
+
     /// Check if a filter expression is a point lookup on the primary key.
     /// Returns the key value expression if it is.
     pub fn extract_point_get(
-        table_name: &str,
+        table_name: &TableName,
         filter: &ResolvedExpr,
         catalog: &Catalog,
     ) -> Option<ResolvedExpr> {
@@ -945,7 +971,7 @@ impl PhysicalPlanner {
 
     /// Check if a filter expression is a range scan on the primary key.
     pub fn extract_range_scan(
-        table_name: &str,
+        table_name: &TableName,
         filter: &ResolvedExpr,
         catalog: &Catalog,
     ) -> Option<RangeBounds> {
@@ -1142,16 +1168,24 @@ impl PhysicalPlanner {
             } => {
                 // Try to convert to PointGet if filter is PK equality lookup
                 if let Some(ref f) = filter {
-                    if let Some(key_value) = Self::extract_point_get(&table, f, catalog) {
+                    let key_type = Self::single_key_type(&table, catalog);
+                    if let (Some(key_value), Some(key_type)) = (
+                        Self::extract_point_get(&table, f, catalog),
+                        key_type.clone(),
+                    ) {
                         return Ok(PhysicalPlan::PointGet {
                             table,
                             columns,
                             key_value,
+                            key_type,
                         });
                     }
                     // Try to convert to RangeScan if filter is PK range
-                    if let Some(rb) = Self::extract_range_scan(&table, f, catalog) {
+                    if let (Some(rb), Some(key_type)) =
+                        (Self::extract_range_scan(&table, f, catalog), key_type)
+                    {
                         return Ok(PhysicalPlan::RangeScan {
+                            key_type,
                             table,
                             columns,
                             start_key: rb.start_key,
@@ -1337,11 +1371,15 @@ impl PhysicalPlanner {
                 } else {
                     vec![]
                 };
+                let key_type = key_value
+                    .as_ref()
+                    .and_then(|_| Self::single_key_type(&table, catalog));
                 Ok(PhysicalPlan::Update {
                     table,
                     assignments,
                     filter,
                     key_value,
+                    key_type,
                     order_by,
                     limit,
                     pk_column_indices,
@@ -1361,10 +1399,14 @@ impl PhysicalPlanner {
                 } else {
                     None
                 };
+                let key_type = key_value
+                    .as_ref()
+                    .and_then(|_| Self::single_key_type(&table, catalog));
                 Ok(PhysicalPlan::Delete {
                     table,
                     filter,
                     key_value,
+                    key_type,
                     order_by,
                     limit,
                 })
@@ -1593,7 +1635,7 @@ mod tests {
                     ref remaining_filter,
                     ..
                 } => {
-                    assert_eq!(table, "users");
+                    assert_eq!(table.table, "users");
                     assert!(inclusive_start);
                     assert!(inclusive_end);
                     assert!(remaining_filter.is_none());

@@ -82,6 +82,28 @@ pub enum ProtocolError {
     Internal(String),
 }
 
+impl ProtocolError {
+    /// Whether this is the failure of one statement, which the client is
+    /// told and after which the session goes on, as opposed to a failure
+    /// of the connection itself.
+    pub fn fails_statement_only(&self) -> bool {
+        match self {
+            ProtocolError::Unsupported(_)
+            | ProtocolError::Sql(_)
+            | ProtocolError::Planner(_)
+            | ProtocolError::Executor(_)
+            | ProtocolError::Transaction(_)
+            | ProtocolError::Raft(_)
+            | ProtocolError::Internal(_) => true,
+            ProtocolError::Io(_)
+            | ProtocolError::InvalidPacket(_)
+            | ProtocolError::AuthFailed(_)
+            | ProtocolError::ConnectionClosed
+            | ProtocolError::Tls(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -160,6 +182,8 @@ pub mod codes {
     pub const ER_BAD_FIELD_ERROR: u16 = 1054;
     pub const ER_BAD_NULL_ERROR: u16 = 1048;
     pub const ER_DUP_ENTRY: u16 = 1062;
+    pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+    pub const ER_LOCK_DEADLOCK: u16 = 1213;
     pub const ER_EMPTY_QUERY: u16 = 1065;
     pub const ER_WRONG_FIELD_SPEC: u16 = 1063;
     pub const ER_BLOB_CANT_HAVE_DEFAULT: u16 = 1101;

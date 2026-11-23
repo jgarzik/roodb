@@ -2,6 +2,7 @@
 //!
 //! Inserts rows into a table.
 
+use super::rowcodec::TableLayout;
 use async_trait::async_trait;
 
 use std::sync::Arc;
@@ -9,13 +10,13 @@ use std::sync::Arc;
 use crate::planner::logical::{ResolvedColumn, ResolvedExpr};
 use crate::raft::RowChange;
 use crate::sql::resolver::parse_default_value;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 use crate::txn::MvccStorage;
 
 use crate::server::session::UserVariables;
 
 use super::context::TransactionContext;
-use super::encoding::{encode_pk_key, encode_row, encode_row_key};
+use super::encoding::{encode_pk_key, encode_row_key};
 use super::error::ExecutorResult;
 use super::eval::evaluate;
 use super::row::Row;
@@ -28,7 +29,9 @@ use super::Executor;
 /// all IDs at once in open() (1 atomic per INSERT statement).
 pub struct Insert {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
+    /// The table's ID: what its keys begin with
+    layout: TableLayout,
     /// Target columns
     columns: Vec<ResolvedColumn>,
     /// Values to insert (each inner vec is one row)
@@ -39,8 +42,8 @@ pub struct Insert {
     rows_inserted: u64,
     /// Whether execution is complete
     done: bool,
-    /// Pre-allocated row ID batch (start_local, node_id)
-    row_id_batch: Option<(u64, u64)>,
+    /// First of the row IDs allocated for this statement's rows
+    row_id_batch: Option<u64>,
     /// Next local ID to use from batch
     next_local_id: u64,
     /// Column indices that are auto_increment
@@ -63,7 +66,8 @@ impl Insert {
     /// Create a new insert executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
+        layout: TableLayout,
         columns: Vec<ResolvedColumn>,
         values: Vec<Vec<ResolvedExpr>>,
         txn_context: Option<TransactionContext>,
@@ -76,6 +80,7 @@ impl Insert {
     ) -> Self {
         Insert {
             table,
+            layout,
             columns,
             values,
             txn_context,
@@ -108,8 +113,8 @@ impl Executor for Insert {
         // Pre-allocate row IDs for all rows (1 atomic instead of N)
         let row_count = self.values.len() as u64;
         if row_count > 0 {
-            let (start_local, node_id) = allocate_row_id_batch(row_count);
-            self.row_id_batch = Some((start_local, node_id));
+            let start_local = allocate_row_id_batch(row_count);
+            self.row_id_batch = Some(start_local);
             self.next_local_id = start_local;
         }
 
@@ -121,10 +126,12 @@ impl Executor for Insert {
             return Ok(None);
         }
 
-        // Get batch info (set in open())
-        let (_, node_id) = self.row_id_batch.ok_or_else(|| {
-            super::error::ExecutorError::Internal("Row ID batch not initialized".to_string())
-        })?;
+        // Row IDs are allocated in open()
+        if self.row_id_batch.is_none() {
+            return Err(super::error::ExecutorError::Internal(
+                "Row ID batch not initialized".to_string(),
+            ));
+        }
 
         // Insert all rows
         let empty_row = Row::empty();
@@ -171,20 +178,41 @@ impl Executor for Insert {
             }
 
             // Get next row ID from pre-allocated batch
-            let row_id = encode_row_id(self.next_local_id, node_id);
+            let row_id = self.next_local_id;
             self.next_local_id += 1;
 
-            // Replace NULL values in auto_increment columns with generated ID
-            // Use the low 48 bits (local counter) as the auto_increment value
-            let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
+            // AUTO_INCREMENT: NULL and 0 ask for the table's next value; a
+            // value given explicitly moves the table's counter past it.
+            // `auto_next` is the counter after this row, recorded with the
+            // row so that the stored counter follows.
+            let mut auto_next: Option<u64> = None;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() {
-                    // MySQL: both NULL and 0 trigger auto_increment
-                    let should_generate =
-                        datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
-                    if should_generate {
-                        datums[idx] = super::datum::Datum::Int(auto_id as i64);
-                        self.last_insert_id = auto_id;
+                if idx >= datums.len() {
+                    continue;
+                }
+                let generate =
+                    datums[idx].is_null() || matches!(datums[idx], super::datum::Datum::Int(0));
+                if generate {
+                    let value = match &self.mvcc {
+                        Some(mvcc) => mvcc.take_auto_increment(self.layout.id).await?,
+                        // Run without storage (unit tests): there is no
+                        // table counter; the row ID's counter stands in.
+                        None => row_id & 0x0000_FFFF_FFFF_FFFF,
+                    };
+                    datums[idx] = super::datum::Datum::Int(value as i64);
+                    // LAST_INSERT_ID() is the first value the statement
+                    // generated.
+                    if self.last_insert_id == 0 {
+                        self.last_insert_id = value;
+                    }
+                    auto_next = Some(value + 1);
+                } else if let super::datum::Datum::Int(given) = datums[idx] {
+                    if given > 0 {
+                        if let Some(mvcc) = &self.mvcc {
+                            mvcc.observe_auto_increment(self.layout.id, given as u64)
+                                .await?;
+                        }
+                        auto_next = Some(given as u64 + 1);
                     }
                 }
             }
@@ -225,12 +253,12 @@ impl Executor for Insert {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(&self.table, &pk_values)
+                encode_pk_key(self.layout.id, &pk_values)
             } else {
-                encode_row_key(&self.table, row_id)
+                encode_row_key(self.layout.id, row_id)
             };
 
-            let value = encode_row(&row);
+            let value = self.layout.encode(&row)?;
 
             // Collect the change for Raft replication.
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
@@ -239,10 +267,32 @@ impl Executor for Insert {
                 )
             })?;
 
+            // A row with a primary key can collide with another
+            // transaction's. Wait for anyone who has locked the place it
+            // goes or the row itself; then whether the key is taken is a
+            // settled fact, and a duplicate is reported by this statement,
+            // not at commit. (A row without a primary key gets a key no one
+            // else can have, so there is nothing to wait for.)
+            let locked = !self.pk_column_indices.is_empty() && ctx.locks_rows();
+            // Every insert waits for gap locks that cover its key: a table
+            // another transaction has read must not gain rows, whatever
+            // their keys are made of.
+            if ctx.locks_rows() {
+                ctx.lock_for_insert(&key, locked).await?;
+            }
+
             // Check for duplicate: intra-batch buffer or existing storage
             let is_duplicate = if !self.pk_column_indices.is_empty() {
                 if ctx.has_buffered_key(&key) {
                     true
+                } else if ctx.is_buffered_deleted(&key) {
+                    // Deleted earlier in this transaction: free to reuse.
+                    false
+                } else if locked {
+                    match &self.mvcc {
+                        Some(mvcc) => mvcc.get_current(&key).await?.is_some(),
+                        None => false,
+                    }
                 } else if !self.on_duplicate.is_empty() {
                     // Check storage for existing row (needed for ODKU)
                     if let Some(ref mvcc) = self.mvcc {
@@ -279,7 +329,7 @@ impl Executor for Insert {
                     }
                 };
                 if let Some(data) = existing_data {
-                    if let Ok(mut existing_row) = super::encoding::decode_row(&data) {
+                    if let Ok(mut existing_row) = self.layout.decode(&data) {
                         // Apply each ON DUPLICATE KEY UPDATE assignment
                         for (col_idx, expr) in &self.on_duplicate {
                             let new_val = evaluate(expr, &existing_row, &self.user_variables)?;
@@ -287,12 +337,8 @@ impl Executor for Insert {
                                 existing_row.set(*col_idx, new_val)?;
                             }
                         }
-                        let updated_value = encode_row(&existing_row);
-                        ctx.add_change(RowChange::update(
-                            &self.table,
-                            key.clone(),
-                            updated_value.clone(),
-                        ));
+                        let updated_value = self.layout.encode(&existing_row)?;
+                        ctx.add_change(RowChange::update(key.clone(), updated_value.clone()));
                         ctx.buffer_write(key, updated_value);
                         self.rows_inserted += 1;
                         continue 'row_loop;
@@ -309,7 +355,7 @@ impl Executor for Insert {
                 )));
             }
 
-            ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+            ctx.add_change(RowChange::insert(key.clone(), value.clone()).with_auto_inc(auto_next));
             // Buffer for read-your-writes within this transaction
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
@@ -350,6 +396,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// A table ID for a test's table, from its name.
+    fn tid(name: &str) -> crate::executor::encoding::TableId {
+        crate::executor::encoding::TableId(
+            name.bytes()
+                .fold(5000, |id, byte| id * 31 + u64::from(byte)),
+        )
+    }
+
+    /// How the tests' tables are stored: two columns, as created.
+    fn layout(name: &str) -> crate::executor::rowcodec::TableLayout {
+        crate::executor::rowcodec::TableLayout::numbered(tid(name), 2)
+    }
+
     fn empty_vars() -> UserVariables {
         Arc::new(RwLock::new(HashMap::new()))
     }
@@ -388,7 +447,8 @@ mod tests {
         // Provide transaction context (required for Raft-as-WAL)
         let txn_context = TransactionContext::new(1, ReadView::default());
         let mut insert = Insert::new(
-            "users".to_string(),
+            "users".into(),
+            layout("users"),
             columns,
             values,
             Some(txn_context),

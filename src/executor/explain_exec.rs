@@ -119,7 +119,7 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
             rows.push(make_explain_row([
                 "1",
                 "SIMPLE",
-                table,
+                &table.table,
                 "NULL",
                 "ALL",
                 "NULL",
@@ -136,7 +136,7 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
             rows.push(make_explain_row([
                 "1",
                 "SIMPLE",
-                table,
+                &table.table,
                 "NULL",
                 "const",
                 "PRIMARY",
@@ -169,8 +169,18 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
                 "100.00"
             };
             rows.push(make_explain_row([
-                "1", "SIMPLE", table, "NULL", "range", "PRIMARY", "PRIMARY", "NULL", "NULL", "100",
-                filtered, &es,
+                "1",
+                "SIMPLE",
+                &table.table,
+                "NULL",
+                "range",
+                "PRIMARY",
+                "PRIMARY",
+                "NULL",
+                "NULL",
+                "100",
+                filtered,
+                &es,
             ]));
         }
 
@@ -234,8 +244,18 @@ fn collect_explain_rows(plan: &PhysicalPlan, rows: &mut Vec<Row>, extra: &mut Ve
         | PhysicalPlan::Update { table, .. }
         | PhysicalPlan::Delete { table, .. } => {
             rows.push(make_explain_row([
-                "1", "SIMPLE", table, "NULL", "ALL", "NULL", "NULL", "NULL", "NULL", "NULL",
-                "100.00", "NULL",
+                "1",
+                "SIMPLE",
+                &table.table,
+                "NULL",
+                "ALL",
+                "NULL",
+                "NULL",
+                "NULL",
+                "NULL",
+                "NULL",
+                "100.00",
+                "NULL",
             ]));
         }
 

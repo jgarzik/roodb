@@ -10,10 +10,8 @@ use crate::catalog::system_tables::{SYSTEM_GRANTS, SYSTEM_USERS};
 use crate::init::{hash_password, AUTH_PLUGIN_NATIVE, DEFAULT_HOST};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
 use crate::sql::privileges::{HostPattern, Privilege, PrivilegeObject};
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
 
 use super::datum::Datum;
-use super::encoding::{encode_row, encode_row_key, table_key_end, table_key_prefix};
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
@@ -50,8 +48,6 @@ pub struct CreateUser {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl CreateUser {
@@ -72,7 +68,6 @@ impl CreateUser {
             raft_node,
             storage,
             done: false,
-            changes: Vec::new(),
         }
     }
 }
@@ -81,7 +76,6 @@ impl CreateUser {
 impl Executor for CreateUser {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -91,17 +85,12 @@ impl Executor for CreateUser {
         }
 
         // Check if user already exists
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_USERS)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
-        for (_key, value) in rows {
-            let row = super::encoding::decode_row(&value)?;
+        for stored in rows {
+            let row = stored.row;
             let uname = get_string(row.get_opt(0));
             let host = get_string(row.get_opt(1));
 
@@ -142,24 +131,16 @@ impl Executor for CreateUser {
             Datum::Null,                                   // updated_at
         ]);
 
-        // Encode for storage
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
-        let key = encode_row_key(SYSTEM_USERS, row_id);
-        let value = encode_row(&user_row);
-
-        // Create changeset and apply via Raft
+        // The account's row, under its name and host. Two sessions that
+        // create the same account at once: the second is refused when its
+        // change is applied.
         let mut changeset = ChangeSet::new(0);
-        changeset.push(RowChange::insert(SYSTEM_USERS, key.clone(), value.clone()));
+        changeset.push(crate::catalog::store::insert_row(SYSTEM_USERS, &user_row));
 
         self.raft_node
             .propose_changes(changeset)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
-
-        // Store change for take_changes
-        self.changes
-            .push(RowChange::insert(SYSTEM_USERS, key, value));
 
         self.done = true;
         Ok(Some(Row::new(vec![Datum::Int(0)])))
@@ -167,10 +148,6 @@ impl Executor for CreateUser {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -188,8 +165,6 @@ pub struct DropUser {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl DropUser {
@@ -208,7 +183,6 @@ impl DropUser {
             raft_node,
             storage,
             done: false,
-            changes: Vec::new(),
         }
     }
 }
@@ -217,7 +191,6 @@ impl DropUser {
 impl Executor for DropUser {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -227,29 +200,23 @@ impl Executor for DropUser {
         }
 
         // Find user rows to delete
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_USERS)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
         let mut found = false;
         let mut changeset = ChangeSet::new(0);
 
-        for (key, value) in rows {
-            // Decode row and check username/host
-            let row = super::encoding::decode_row(&value)?;
+        for stored in rows {
+            let key = stored.key;
+            let row = stored.row;
             let uname = get_string(row.get_opt(0));
             let host = get_string(row.get_opt(1));
 
             if uname.as_ref() == Some(&self.username) && host.as_deref() == Some(self.host.as_str())
             {
                 // Mark for deletion
-                changeset.push(RowChange::delete(SYSTEM_USERS, key.clone()));
-                self.changes.push(RowChange::delete(SYSTEM_USERS, key));
+                changeset.push(RowChange::delete(key.clone()));
                 found = true;
                 break;
             }
@@ -265,25 +232,20 @@ impl Executor for DropUser {
 
         if found {
             // Also delete any grants for this user
-            let grant_prefix = table_key_prefix(SYSTEM_GRANTS);
-            let grant_end = table_key_end(SYSTEM_GRANTS);
-
-            let grant_rows = self
-                .storage
-                .scan(Some(&grant_prefix), Some(&grant_end))
+            let grant_rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_GRANTS)
                 .await
                 .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
-            for (key, value) in grant_rows {
-                let row = super::encoding::decode_row(&value)?;
+            for stored in grant_rows {
+                let key = stored.key;
+                let row = stored.row;
                 let grantee = get_string(row.get_opt(0));
                 let grantee_host = get_string(row.get_opt(1));
 
                 if grantee.as_ref() == Some(&self.username)
                     && grantee_host.as_deref() == Some(self.host.as_str())
                 {
-                    changeset.push(RowChange::delete(SYSTEM_GRANTS, key.clone()));
-                    self.changes.push(RowChange::delete(SYSTEM_GRANTS, key));
+                    changeset.push(RowChange::delete(key.clone()));
                 }
             }
 
@@ -299,10 +261,6 @@ impl Executor for DropUser {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -320,8 +278,6 @@ pub struct AlterUser {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl AlterUser {
@@ -340,7 +296,6 @@ impl AlterUser {
             raft_node,
             storage,
             done: false,
-            changes: Vec::new(),
         }
     }
 }
@@ -349,7 +304,6 @@ impl AlterUser {
 impl Executor for AlterUser {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -359,20 +313,16 @@ impl Executor for AlterUser {
         }
 
         // Find the user row
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_USERS)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
         let mut found_key = None;
         let mut found_row = None;
 
-        for (key, value) in rows {
-            let row = super::encoding::decode_row(&value)?;
+        for stored in rows {
+            let key = stored.key;
+            let row = stored.row;
             let uname = get_string(row.get_opt(0));
             let host = get_string(row.get_opt(1));
 
@@ -407,16 +357,10 @@ impl Executor for AlterUser {
             new_values[2] = password_hash;
         }
         let new_row = Row::new(new_values);
-        let encoded = encode_row(&new_row);
+        let encoded = crate::catalog::store::encode(SYSTEM_USERS, &new_row);
 
         let mut changeset = ChangeSet::new(0);
-        changeset.push(RowChange::update(
-            SYSTEM_USERS,
-            key.clone(),
-            encoded.clone(),
-        ));
-        self.changes
-            .push(RowChange::update(SYSTEM_USERS, key, encoded));
+        changeset.push(RowChange::update(key.clone(), encoded.clone()));
 
         self.raft_node
             .propose_changes(changeset)
@@ -429,10 +373,6 @@ impl Executor for AlterUser {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -450,8 +390,6 @@ pub struct SetPassword {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl SetPassword {
@@ -470,7 +408,6 @@ impl SetPassword {
             raft_node,
             storage,
             done: false,
-            changes: Vec::new(),
         }
     }
 }
@@ -479,7 +416,6 @@ impl SetPassword {
 impl Executor for SetPassword {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -489,20 +425,16 @@ impl Executor for SetPassword {
         }
 
         // Find the user row
-        let prefix = table_key_prefix(SYSTEM_USERS);
-        let end = table_key_end(SYSTEM_USERS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_USERS)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
         let mut found_key = None;
         let mut found_row = None;
 
-        for (key, value) in rows {
-            let row = super::encoding::decode_row(&value)?;
+        for stored in rows {
+            let key = stored.key;
+            let row = stored.row;
             let uname = get_string(row.get_opt(0));
             let host = get_string(row.get_opt(1));
 
@@ -534,16 +466,10 @@ impl Executor for SetPassword {
             new_values[2] = password_hash;
         }
         let new_row = Row::new(new_values);
-        let encoded = encode_row(&new_row);
+        let encoded = crate::catalog::store::encode(SYSTEM_USERS, &new_row);
 
         let mut changeset = ChangeSet::new(0);
-        changeset.push(RowChange::update(
-            SYSTEM_USERS,
-            key.clone(),
-            encoded.clone(),
-        ));
-        self.changes
-            .push(RowChange::update(SYSTEM_USERS, key, encoded));
+        changeset.push(RowChange::update(key.clone(), encoded.clone()));
 
         self.raft_node
             .propose_changes(changeset)
@@ -556,10 +482,6 @@ impl Executor for SetPassword {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -579,8 +501,6 @@ pub struct Grant {
     raft_node: Arc<RaftNode>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl Grant {
@@ -601,7 +521,6 @@ impl Grant {
             with_grant_option,
             raft_node,
             done: false,
-            changes: Vec::new(),
         }
     }
 }
@@ -610,7 +529,6 @@ impl Grant {
 impl Executor for Grant {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -628,9 +546,6 @@ impl Executor for Grant {
         } else {
             self.privileges.clone()
         };
-
-        // Pre-allocate row IDs for all grants
-        let (mut next_local, node_id) = allocate_row_id_batch(privs.len() as u64);
 
         for priv_type in &privs {
             let (object_type, db_name, table_name) = match &self.object {
@@ -661,14 +576,10 @@ impl Executor for Grant {
                 Datum::Null,                                           // granted_at
             ]);
 
-            let row_id = encode_row_id(next_local, node_id);
-            next_local += 1;
-            let key = encode_row_key(SYSTEM_GRANTS, row_id);
-            let value = encode_row(&grant_row);
-
-            changeset.push(RowChange::insert(SYSTEM_GRANTS, key.clone(), value.clone()));
-            self.changes
-                .push(RowChange::insert(SYSTEM_GRANTS, key, value));
+            // A grant is keyed by what it grants to whom: granting it
+            // again stores the same row (with the grant option as now
+            // given).
+            changeset.push(crate::catalog::store::put_row(SYSTEM_GRANTS, &grant_row));
             count += 1;
         }
 
@@ -683,10 +594,6 @@ impl Executor for Grant {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -706,8 +613,6 @@ pub struct Revoke {
     storage: Arc<dyn crate::storage::StorageEngine>,
     /// Whether execution is complete
     done: bool,
-    /// Collected row changes
-    changes: Vec<RowChange>,
 }
 
 impl Revoke {
@@ -728,7 +633,6 @@ impl Revoke {
             raft_node,
             storage,
             done: false,
-            changes: Vec::new(),
         }
     }
 
@@ -756,7 +660,6 @@ impl Revoke {
 impl Executor for Revoke {
     async fn open(&mut self) -> ExecutorResult<()> {
         self.done = false;
-        self.changes.clear();
         Ok(())
     }
 
@@ -779,20 +682,16 @@ impl Executor for Revoke {
         };
 
         // Find matching grant rows
-        let prefix = table_key_prefix(SYSTEM_GRANTS);
-        let end = table_key_end(SYSTEM_GRANTS);
-
-        let rows = self
-            .storage
-            .scan(Some(&prefix), Some(&end))
+        let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_GRANTS)
             .await
             .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
         let mut changeset = ChangeSet::new(0);
         let mut count = 0;
 
-        for (key, value) in rows {
-            let row = super::encoding::decode_row(&value)?;
+        for stored in rows {
+            let key = stored.key;
+            let row = stored.row;
 
             // Check grantee
             let grantee = get_string(row.get_opt(0));
@@ -813,8 +712,7 @@ impl Executor for Revoke {
                     .map(|p| privs_to_revoke.contains(p))
                     .unwrap_or(false)
             {
-                changeset.push(RowChange::delete(SYSTEM_GRANTS, key.clone()));
-                self.changes.push(RowChange::delete(SYSTEM_GRANTS, key));
+                changeset.push(RowChange::delete(key.clone()));
                 count += 1;
             }
         }
@@ -832,10 +730,6 @@ impl Executor for Revoke {
 
     async fn close(&mut self) -> ExecutorResult<()> {
         Ok(())
-    }
-
-    fn take_changes(&mut self) -> Vec<RowChange> {
-        std::mem::take(&mut self.changes)
     }
 }
 
@@ -881,17 +775,12 @@ impl Executor for ShowGrants {
     async fn next(&mut self) -> ExecutorResult<Option<Row>> {
         if !self.scanned {
             // Scan grants table
-            let prefix = table_key_prefix(SYSTEM_GRANTS);
-            let end = table_key_end(SYSTEM_GRANTS);
-
-            let rows = self
-                .storage
-                .scan(Some(&prefix), Some(&end))
+            let rows = crate::catalog::store::scan_rows(self.storage.as_ref(), SYSTEM_GRANTS)
                 .await
                 .map_err(|e| ExecutorError::Internal(format!("Storage error: {}", e)))?;
 
-            for (_key, value) in rows {
-                let row = super::encoding::decode_row(&value)?;
+            for stored in rows {
+                let row = stored.row;
 
                 let grantee = get_string(row.get_opt(0));
                 let grantee_host = get_string(row.get_opt(1));

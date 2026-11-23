@@ -208,15 +208,37 @@ where
         self.engine.session.set_user(response.username.clone());
         self.reader.set_max_payload(MAX_TOTAL_PAYLOAD_SIZE);
 
-        if let Some(ref db) = response.database {
+        // A session may begin in a database, which must be there (an empty
+        // name is none).
+        if let Some(db) = response.database.as_ref().filter(|db| !db.is_empty()) {
+            if !self.engine.catalog.read().database_exists(db) {
+                let message = format!("Unknown database '{db}'");
+                self.out().set_sequence(3);
+                self.out().packet(&encode_err_packet(
+                    codes::ER_BAD_DB_ERROR,
+                    "42000",
+                    &message,
+                ));
+                self.out().flush().await?;
+                return Err(ProtocolError::AuthFailed(message));
+            }
             self.engine.session.set_database(Some(db.clone()));
         }
 
         Ok(())
     }
 
-    /// Run the command loop
+    /// Run the command loop until the client leaves or the connection
+    /// fails. Either way the session ends here: an open transaction is
+    /// rolled back and its temporary tables are dropped. (They are named in
+    /// the shared catalog; a name left behind could never be used again.)
     pub async fn run(&mut self) -> ProtocolResult<()> {
+        let result = self.command_loop().await;
+        self.engine.reset_session(false).await;
+        result
+    }
+
+    async fn command_loop(&mut self) -> ProtocolResult<()> {
         let mut last_cmd_end = Instant::now();
         loop {
             // Reset sequence for each command
@@ -232,7 +254,6 @@ where
                 Ok(p) => p,
                 Err(ProtocolError::ConnectionClosed) => {
                     debug!(connection_id = self.connection_id, "Client disconnected");
-                    self.engine.cleanup_temp_tables().await;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -263,7 +284,6 @@ where
                     continue;
                 }
                 Ok(false) => {
-                    self.engine.cleanup_temp_tables().await;
                     return Ok(()); // Client quit
                 }
                 Err(e) => {
@@ -305,7 +325,7 @@ where
                     self.engine
                         .send_error(
                             codes::ER_BAD_DB_ERROR,
-                            states::GENERAL_ERROR,
+                            "42000",
                             &format!("Unknown database '{}'", db),
                         )
                         .await?;
@@ -315,7 +335,7 @@ where
 
             ParsedCommand::Query(sql) => {
                 debug!(connection_id = self.connection_id, sql = %sql, "COM_QUERY");
-                self.engine.handle_query(&sql).await?;
+                self.engine.handle_statement(&sql).await?;
                 debug!(connection_id = self.connection_id, "Query completed");
                 Ok(true)
             }
@@ -361,8 +381,11 @@ where
 
             ParsedCommand::ResetConnection => {
                 debug!(connection_id = self.connection_id, "COM_RESET_CONNECTION");
-                // Session state is reset; the selected database is kept.
-                self.engine.prepared_stmts.clear();
+                // Session state is reset as if the client had reconnected:
+                // an open transaction is rolled back, temporary tables and
+                // prepared statements go, variables return to their defaults.
+                // The selected database is kept.
+                self.engine.reset_session(false).await;
                 self.param_types.clear();
                 self.engine.send_ok(0, 0).await?;
                 Ok(true)
@@ -406,12 +429,7 @@ where
 
         // Send parameter column definitions (type=VARCHAR as placeholder)
         if num_params > 0 {
-            let schema = self
-                .engine
-                .session
-                .database
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let schema = self.engine.session.database.clone().unwrap_or_default();
             for i in 0..num_params {
                 let col = crate::planner::logical::OutputColumn {
                     id: i as usize,
@@ -432,12 +450,7 @@ where
 
         // Send result column definitions (placeholder types for SELECT)
         if num_columns > 0 {
-            let schema = self
-                .engine
-                .session
-                .database
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let schema = self.engine.session.database.clone().unwrap_or_default();
             for (i, name) in col_names.iter().enumerate() {
                 let col = crate::planner::logical::OutputColumn {
                     id: i,

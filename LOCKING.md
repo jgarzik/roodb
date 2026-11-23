@@ -6,9 +6,15 @@ This document describes the synchronization primitives and locking conventions u
 
 RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contention:
 - Writes are buffered in session memory until COMMIT
-- On COMMIT, changes are proposed to Raft
-- Storage writes only occur in `apply()` after Raft consensus
+- On COMMIT, changes are proposed to Raft and appended to the on-disk Raft log
+- Storage writes only occur in `apply()` after Raft consensus, one atomic batch per log entry
 - This means DML operations (INSERT/UPDATE/DELETE) don't hold database locks during execution
+
+Transactions lock the rows they change, so that writers wait for each other
+instead of colliding at commit (see Row locks below). Those are logical
+locks between transactions, held across statements; everything else in this
+document is about short-lived synchronization inside the server. Rows of
+temporary tables never leave the session that owns them.
 
 ## Synchronization Primitives
 
@@ -16,9 +22,10 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 
 | Type | Library | Use Case |
 |------|---------|----------|
-| `RwLock` | parking_lot | Sync contexts (catalog, txn state, raft caches) |
-| `Mutex` | tokio::sync | Async contexts where lock is held across await (compaction, Raft log) |
-| `Mutex` | parking_lot | Short sync critical sections (I/O handles) |
+| `RwLock` | parking_lot | Sync contexts (catalog, txn state, raft caches, memtables, manifest) |
+| `Mutex` | tokio::sync | Async contexts where lock is held across await (flush, compaction, manifest write) |
+| `Mutex` | parking_lot | Short sync critical sections (block cache shards, Raft log index) |
+| `Notify`, channels | tokio::sync | Waking background tasks; handing work to the log writer |
 | `Atomic*` | std::sync::atomic | Counters and flags |
 
 ### Why parking_lot?
@@ -27,9 +34,9 @@ RooDB uses a **Raft-as-WAL** architecture that naturally minimizes lock contenti
 - Better performance than std::sync
 - Simpler API (no `.unwrap()` needed)
 
-### Why tokio::sync::Mutex for compaction/log?
+### Why tokio::sync::Mutex for flush, compaction and the manifest?
 
-The compaction mutexes (`l0_compaction_mutex`, `level_compaction_mutex`) and Raft `log_mutex` are held across `await` points. Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
+`flush_lock`, `compaction_lock` and `manifest_io` are held across `await` points (file I/O). Using `parking_lot::Mutex` would block the async runtime. `tokio::sync::Mutex` is designed for this use case.
 
 ## Module Locking Inventory
 
@@ -41,11 +48,17 @@ The compaction mutexes (`l0_compaction_mutex`, `level_compaction_mutex`) and Raf
 
 No locks held during connection spawn.
 
-### Protocol (`src/protocol/roodb/`)
+### Query engine (`src/server/query/`, `src/server/temp_store.rs`)
 
 | Component | Type | Purpose |
 |-----------|------|---------|
 | `catalog` | parking_lot::RwLock | Schema access for planning |
+| `SessionStorage::temp` | parking_lot::RwLock | One session's temporary tables and their rows |
+| `SessionStorage::has_temp` | AtomicBool | Lets sessions without temporary tables skip the lock |
+| session user variables | parking_lot::RwLock | `@variables`, and the session's copy of the stored functions |
+
+`SessionStorage::temp` is never held across an `await`: reads of shared
+storage happen before or after it is taken.
 
 **Critical pattern:** Catalog lock is acquired in a closure and dropped before any `await`:
 ```rust
@@ -76,29 +89,60 @@ Always acquired alone (never nested with other locks).
 | `undo_log.records` | parking_lot::RwLock | Undo records |
 | `undo_log.roll_ptr_index` | parking_lot::RwLock | Roll pointer lookup |
 | `next_roll_ptr` | AtomicU64 | Roll pointer generation |
+| `LockManager::state` | parking_lot::Mutex | Row lock table, and the wait-for graph of both lock tables |
+| `MetadataLocks::state` | parking_lot::Mutex | Metadata lock table |
+| `MetadataLocks::gates` | parking_lot::RwLock | Each name's gate (fast side); read to find one, written to add or drop one |
+| `MetadataLocks::sessions` | parking_lot::Mutex | The sessions that may hold fast-side locks |
+| `SessionState::held` | parking_lot::Mutex | One session's fast-side locks; taken by the session, and by whoever closes a gate |
 
 Multiple RwLocks but NEVER nested - each acquired/released independently.
+The two lock tables are the exception, in one fixed order (see Metadata
+locks below).
 
 ### Storage (`src/storage/lsm/`)
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `memtable.data` | parking_lot::RwLock | In-memory KV store |
-| `memtable.size` | AtomicUsize | Approximate size tracking |
-| `imm_memtables` | parking_lot::RwLock | Pending flush memtables |
-| `manifest` | parking_lot::RwLock | SSTable metadata (readers concurrent, writers exclusive) |
-| `l0_compaction_mutex` | tokio::sync::Mutex | Serializes L0→L1 compactions |
-| `level_compaction_mutex` | tokio::sync::Mutex | Serializes L1+→L2+ compactions |
-| `reader_cache` | parking_lot::RwLock | Cached open SSTable readers (avoids re-opening per scan) |
-| `block_cache.inner` | parking_lot::Mutex | LRU cache of SSTable data blocks (Mutex: all ops mutate LRU order) |
-| `closed` | AtomicBool | Engine shutdown flag |
+| `memtable` | parking_lot::RwLock | The active memtable. Writers insert under the read lock; rotation takes the write lock |
+| memtable contents | lock-free skip list + AtomicUsize size | In-memory KV store |
+| `imm_memtables` | parking_lot::RwLock | Frozen memtables waiting to be written out, oldest first |
+| `manifest` | parking_lot::RwLock | Which tables exist at which level (in memory) |
+| `manifest_io` | tokio::sync::Mutex | Held while the manifest is changed and written, so changes reach disk in order |
+| `flush_lock` | tokio::sync::Mutex | Memtables reach disk one at a time, oldest first |
+| `compaction_lock` | tokio::sync::Mutex | One compaction at a time |
+| `reader_cache` | parking_lot::RwLock | An open reader for every table in the manifest |
+| block cache shards | parking_lot::Mutex each | LRU of SSTable blocks, split into shards to spread contention |
+| `work`, `compact_work`, `flushed` | tokio::sync::Notify | Wake the flush task, the compaction task, and stalled writers |
+| `background_error` | parking_lot::Mutex | Last failure of a background task, reported to stalled writers |
+| `dir_lock` | parking_lot::Mutex over a locked file | Exclusive lock on the data directory |
+| `stopping`, `closed` | AtomicBool | Shutdown flags |
+
+Lock order where more than one is held: `flush_lock` or `compaction_lock` →
+`manifest_io` → `manifest` (briefly). `memtable` is taken before
+`imm_memtables`.
+
+**Critical pattern:** A write batch is atomic with respect to rotation.
+
+`write_batch()` applies every write of a batch while holding the `memtable`
+read lock; rotation needs the write lock. A batch therefore lands in one
+memtable, and a flush can never capture half of it. The Raft state machine
+relies on this: each log entry is one batch that includes the applied
+position, so what is on disk is always an exact prefix of the log.
+
+A range forgotten by a batch (`WriteOp::ForgetRange`) is one of its writes
+and stays with that memtable: the memtable's flush lists the range in the
+manifest in the same manifest change as its table, so the range is on disk
+exactly when the rest of the batch is. Each memtable guards its list of
+forgotten ranges with a lock of its own (`parking_lot::RwLock`, a leaf: held
+only while the range's entries are removed from that memtable, or while a
+scan reads the memtable together with the list).
 
 **Critical pattern:** Atomic memtable snapshots prevent rotation races:
 
-Both `read_all()` and `scan()` must read the active memtable and immutable memtables atomically
-to prevent entries from becoming temporarily invisible during memtable rotation:
+Both `get()` and `scan()` must read the active memtable and the frozen
+memtables under the memtable lock, so an entry cannot be missed while it moves
+from one to the other:
 ```rust
-// CRITICAL: Both must be read while holding memtable lock
 let (memtable_snapshot, imm_snapshot) = {
     let mem_guard = self.memtable.read();
     let memtable_snapshot = Arc::clone(&*mem_guard);
@@ -108,104 +152,70 @@ let (memtable_snapshot, imm_snapshot) = {
 // Use snapshots outside lock for actual reads
 ```
 
-Without this, a concurrent `put()` could rotate the memtable between reading the two
-structures, causing an entry to be missed (moved from memtable to imm_memtables
-between our reads).
+**Critical pattern:** A frozen memtable leaves `imm_memtables` only after its
+table is on disk and in the manifest. Until then its entries stay readable
+from memory; there is no moment when they are in neither place.
 
-**Critical pattern:** Flush removes from imm_memtables only AFTER disk write:
+**Critical pattern:** Replacing everything (installing a snapshot) holds
+`flush_lock` and `compaction_lock` for its whole length, so that no flush or
+compaction adds tables of the old contents to the new manifest, and empties
+the memtables inside the same manifest change that swaps the tables, under
+the manifest write lock: a reader takes its view under that lock too, and
+sees the old tables with the old memory or the new tables with none.
 
-When flushing memtables to disk, entries must remain visible in `imm_memtables`
-until the disk write completes. Otherwise there's a visibility gap:
-```rust
-// WRONG: Entries invisible during flush
-let imm_mems = std::mem::take(&mut *imm_memtables);  // Entries gone!
-for mem in imm_mems {
-    flush_to_disk(mem).await;  // Not on disk yet - entries invisible
-}
+**Critical pattern:** Flush and compaction do their I/O without the manifest lock.
 
-// CORRECT: Entries visible until disk write completes
-loop {
-    let mem = imm_memtables.first().cloned();  // Peek, don't remove
-    flush_to_disk(mem).await;  // Now on disk
-    imm_memtables.remove(0);  // Safe to remove
-}
-```
+Each picks its work under a brief `manifest` read lock, reads and writes files
+with only its own tokio mutex held, and then makes one manifest change under
+`manifest_io`: the new manifest is written and synced first, the in-memory
+manifest is swapped second, and input files are deleted last. A crash at any
+point leaves either the old state or the new one; leftovers are removed when
+the directory is next opened.
 
-**Critical pattern:** Compaction uses split-phase locking:
-```rust
-// Phase 1: Brief write-lock to prepare job
-let job = {
-    let mut manifest = self.manifest.write();
-    prepare_l0_compaction(&mut manifest)
-    // Lock released here
-};
-// Phase 2: I/O without lock
-let new_file = execute_l0_compaction(&*self.factory, &job).await?;
-// Phase 3: Re-acquire write-lock to finalize
-{
-    let mut manifest = self.manifest.write();
-    finalize_l0_compaction(&mut manifest, &job, new_file)?;
-}
-```
-
-L0 and level compactions use separate tokio Mutexes, allowing concurrent L0→L1
-and L1+→L2+ compaction. Within each path, the manifest RwLock is held only briefly
-(prepare and finalize phases), while the expensive I/O phase runs without any lock.
+Flush and compaction run in separate background tasks with separate locks, so
+a long compaction never holds up a flush that writers are waiting for. Writers
+stall (without holding any lock) while four frozen memtables are waiting.
 
 ### I/O (`src/io/`)
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `UringIO::ring` | parking_lot::Mutex | io_uring queue |
-| `PosixIO::file` | parking_lot::Mutex | POSIX file handle |
+| uring reactor channel | std::sync::mpsc | Requests from tasks to a reactor thread; no lock held across I/O |
+| posix `Shared::queues` | parking_lot::Mutex + Condvar | Worker pool request queues |
 
-Single lock per I/O instance; never nested.
-
-### I/O Scheduler (`src/io/scheduler/`)
-
-| Component | Type | Purpose |
-|-----------|------|---------|
-| `IoScheduler::files` | parking_lot::RwLock | Open files registry |
-| `IoEngine::rings` | parking_lot::RwLock | Hot/cold ring allocation |
-| `AdaptiveLimiter::bucket` | parking_lot::Mutex | Token bucket for background I/O rate limiting |
+Each io_uring ring is owned by one reactor thread and is never shared, so it
+needs no lock. Neither backend holds a lock while a request is in the kernel.
 
 ### Raft (`src/raft/`)
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `log_mutex` | tokio::sync::Mutex | Serializes log operations |
-| `cached_vote` | parking_lot::RwLock | Vote state cache |
+| `LogStore` `mem` | parking_lot::Mutex | Index of log entries, recent entries, vote, purge and commit points |
+| `LogStore` command channel | tokio mpsc (unbounded) | Appends and other log changes, handed to the single writer task |
+| `WriterShared::files` | parking_lot::Mutex | Open segment files, for reading entries back |
+| `WriterShared::written` | parking_lot::Mutex | How far the log has reached disk (segment, offset) |
+| `WriterShared::failed` | parking_lot::Mutex | First write error; once set the log refuses further work |
+| `preparing_spare` | AtomicBool | Only one task prepares the spare segment |
 | `cached_last_applied` | parking_lot::RwLock | Last applied log ID |
 | `cached_membership` | parking_lot::RwLock | Cluster membership |
-| `cached_last_log_id` | parking_lot::RwLock | Last log entry |
-| `cached_last_purged` | parking_lot::RwLock | Last purged log ID |
+| `applied_txn_floor`, `stored_txn_bound` | AtomicU64 | Highest applied transaction ID and the bound stored for restart |
 | `catalog` | parking_lot::RwLock | Schema updates in apply() |
 | `nodes` | parking_lot::RwLock | Peer addresses |
 
-**Critical pattern:** Log mutex serializes log operations to establish memory barrier ordering:
+**Critical pattern:** One task writes the log.
 
-`LsmRaftStorage` is `Clone` with shared `Arc` fields. OpenRaft's `&mut self` methods imply
-serialized access, but clones can call methods concurrently. The `log_mutex` ensures that
-when `get_log_state()` reports log entry N exists, `try_get_log_entries()` will find it.
+Appends do not write. They record the entry in `mem`, send it to the writer
+task, and return; the writer drains everything queued, writes it with one
+request (plus a flush with `--durability fsync`) and then reports each append
+as complete. No lock is held while the write is in the kernel, and commits
+that arrive together share the write. Nothing in the log store is locked
+across an `await`.
 
-Without the mutex, the separate locks for storage (memtable) and cache (cached_last_log_id)
-don't establish happens-before ordering across operations:
-```rust
-// Thread A: append()
-storage.put(entry_49).await;    // Acquires memtable lock
-cached_last_log_id = 49;        // Acquires cache lock
+**Critical pattern:** The state machine is driven by one task.
 
-// Thread B: get_log_state() then try_get_log_entries()
-// Without log_mutex, Thread B could see cache=49 but miss the memtable entry
-```
-
-**Critical pattern:** Only `applied_state()` acquires `log_mutex`:
-
-Of the state machine methods, only `applied_state()` acquires `log_mutex` — it must see
-a consistent view of cached state alongside log operations. `get_current_snapshot()` and
-`build_snapshot()` do NOT hold `log_mutex`; they read only non-Raft-prefixed keys (user data)
-while OpenRaft serializes all state machine operations, so no concurrent apply() can
-modify user data. This avoids write stalls under snapshot load.
+OpenRaft applies entries, builds snapshots and installs them from a single
+task, so the state machine needs no lock of its own for ordering. The cached
+position is updated after the storage batch that carries it has been written.
 
 **Critical pattern:** Async work (storage scans) done before catalog lock:
 ```rust
@@ -217,12 +227,183 @@ let mut catalog = self.catalog.write();
 // ... update catalog ...
 ```
 
+### Row locks (`src/txn/lock.rs`)
+
+`LockManager` is the table of row locks that transactions hold on each
+other's behalf: shared and exclusive record locks on row keys, gap locks on
+open key intervals, and insert intentions that wait for gap locks. Requests
+on a record are granted in arrival order; a request that would close a cycle
+of waiting transactions is refused (deadlock), and a wait can time out.
+Everything a transaction holds is released together when it ends.
+
+The whole table is guarded by one `parking_lot::Mutex`, held only to inspect
+or change the table, never while a requester waits: a waiter parks on a
+oneshot channel outside the mutex. No other lock is taken while it is held.
+The locks exist only in memory on the node that granted them; they are not
+replicated. Only the primary of a cluster grants any: a secondary refuses
+statements that would lock. When a node stops being the primary, every open
+transaction on it is rolled back and its locks released
+(`TransactionManager::abort_all`); a session finds out when it next commits.
+
+The lock manager belongs to the `TransactionManager`, which releases a
+transaction's locks when it commits or rolls back, whichever path ends it.
+`UPDATE`, `DELETE` and `INSERT` take record locks through the executor's
+`TransactionContext` and then read the row as it stands (`get_current`),
+not through the statement's snapshot. A deadlock is reported as error 1213
+and the transaction rolled back; a timed-out wait (`innodb_lock_wait_timeout`)
+as error 1205, failing the statement only.
+
+Under REPEATABLE READ a statement also locks the gaps it read: a table scan
+takes one gap lock over the table's whole key range before it reads; a
+primary-key lookup that finds no row locks the gap between the neighbouring
+rows (`MvccStorage::gap_around`, built on the storage engine's `next_key` /
+`prev_key`) and gives back the record lock it took to look. Under READ
+COMMITTED there are no gap locks, and a scanned row that does not match is
+unlocked at once (`unlock_record`).
+
+A statement that locks a range also locks the keys in it that other
+transactions hold record locks on (`LockManager::others_locked_in`): a row
+being inserted is not stored yet, and waiting on its key is how the reader
+waits for it. An insert (or an `UPDATE` that changes the primary key) locks
+its key, then checks the gap, and if the gap is locked gives the key back
+before it waits (`TransactionContext::lock_for_insert`): the gap's holder
+may want that key, and comes first.
+
+`SELECT ... FOR UPDATE` / `FOR SHARE` lock in the scan executors
+(`TableScan`, `RangeScan`, `PointGet`) through
+`TransactionContext::locking_scan` / `locked_read`: gap first, then each row,
+each read as it stands after it is locked. `NOWAIT` and `SKIP LOCKED` use
+`try_lock_record`, which never waits. A locking read outside a transaction
+runs in an implicit one that ends, releasing its locks, when the result has
+been sent.
+
+### Metadata locks (`src/txn/mdl.rs`)
+
+`MetadataLocks` is the table of locks that transactions hold on table
+names, so that a table is not changed or dropped under a statement that is
+using it.
+
+**Who takes them** (`server/query/engine.rs`). A statement's plan comes
+with the names of the stored tables and the views it uses, which the
+resolver noted as it looked them up (`Resolver::used_tables`). Once the
+statement's transaction is known, each is locked shared through the
+session's `MdlSession`, for the transaction that owns the statement's row
+locks (the open transaction, or the implicit one of an autocommit write or
+locking read), or, for a plain autocommit read, which has no transaction,
+for the session (`lock_owner`: an ID out of the way of transaction IDs).
+Each is then compared with what it was when the plan was made
+(`Catalog::object_stamp`: a table's ID and the version of its definition, a
+digest of a view's query): a schema change may have got in between planning
+and locking, and then the statement is planned again, keeping the locks it
+has, so that the same schema change cannot get in twice (a statement of a
+routine's body, or a side of a `UNION`, fails with error 1412 instead, as
+does a statement planned again `MAX_REPLANS` times). A transaction's locks go when it
+ends (`end_session_transaction`); everything else the session holds goes at
+the end of each statement a client sent (`end_of_statement`), and all of it
+when the session does.
+
+A schema change first commits the session's open transaction, then takes
+(`begin_schema_change`, in sorted order) each table or view it creates,
+changes or drops exclusively, and that table's database, as the name
+`(database, "")`, shared; `CREATE` and `DROP DATABASE` take the database
+exclusively, and `DROP DATABASE` every table and view in it. These locks
+are the statement's and go when it ends. A session's own temporary tables
+are not locked: nobody else can name them.
+
+The locks are this node's. Statements that write, lock or change the
+schema run on the primary only; a query on another node is not held back
+by a schema change, which reaches that node through the log, and keeps the
+table layout it started with.
+
+- **What is locked** is a name, `TableName { database, table }`, not a
+  table: a name nothing is stored under yet can be locked (`CREATE TABLE`,
+  the new name of a `RENAME`). The same table name in two databases is two
+  locks. Names are compared exactly as given.
+- **Modes.** `Shared`, for a statement that uses the table, held until its
+  transaction ends; `Exclusive`, for a schema change. Shared is compatible
+  with shared; exclusive with nothing held by another owner. The owner is a
+  transaction ID, the same one that owns row locks.
+- **Re-entrant.** An owner that holds a name in a mode that covers the
+  request is not made to wait. An owner that holds it shared and asks for
+  exclusive is upgrading: it waits for the other holders only, not for
+  requests queued before its own (they are waiting for it).
+- **Fair to writers.** Requests on a name are granted in arrival order, and
+  a request is not let past an earlier one it conflicts with. A waiting
+  exclusive request therefore holds back shared requests that arrive after
+  it, although they are compatible with what is held: a stream of readers
+  cannot starve a schema change.
+- **Several names at once** (`lock_all`, for `RENAME a TO b`, `DROP TABLE
+  a, b`) are taken in sorted order whatever order they are given in, so two
+  such statements cannot each hold what the other waits for. If one name
+  cannot be had, what the call took is given back and an upgrade it made is
+  undone; what the owner held before is untouched.
+- **The fast side.** A shared lock on a name nobody is changing does not
+  go through the lock table. Each name has a gate (`NameGate`): one atomic
+  word, a count of shared holders and a closed bit. A session takes its
+  shared locks through its `MdlSession`: while the gate is open, the count
+  goes up by one and the lock is noted in the session's own list, under the
+  session's own mutex; no shared mutex is taken. A session remembers the
+  gates of the names it has locked (a bounded number), so locking a table
+  again needs no lookup and touches nothing shared but the gate's word. The first request for an exclusive lock on a name closes its
+  gate, asks every session what it holds on that gate, and enters those
+  locks in the lock table under their owners, where they stay until they
+  are released. From then on shared requests for the name queue in the
+  table like any other, behind the exclusive one. So whenever a request
+  waits, the table names everyone it waits for, and the wait-for graph
+  below is complete. When the table has nothing left on the name, the gate
+  opens. Gates nobody uses are dropped when a schema change releases its
+  locks.
+- **One session, several owners.** A session can hold locks for more than
+  one owner at a time: a statement and the statement it runs (a trigger's
+  body, a routine's), or a statement planned a second time under a new
+  implicit transaction. A session that holds a name for one of its owners
+  is given it shared for another at once (`lock_shared_beside`), without
+  queueing behind a schema change that is itself waiting for the session.
+- **Ending.** `release_all(owner)` releases everything the owner holds and
+  abandons a request it is waiting for. A wait can time out
+  (`MdlError::Timeout`), and a request whose future is dropped while it
+  waits leaves the queue; either lets through those that waited behind it.
+
+**Deadlocks across both lock tables.** A transaction can hold a row lock and
+wait for a metadata lock while another holds the metadata lock and waits
+for the row. There is one wait-for graph for both kinds of lock, and it
+lives in the row lock manager: before a metadata request joins its queue,
+the wait is recorded there (`LockManager::begin_outside_wait`: owner, and
+the owners it waits for), and whenever the metadata lock table changes, the
+waits of the requests still queued on the names that changed are brought up
+to date in one step (`LockManager::update_outside_waits`). The search for a
+cycle (`closes_cycle`) follows row waits and these recorded waits alike, and
+runs under the row lock mutex whichever kind of lock is being asked for. The
+request that would close the cycle is the one refused: `MdlError::Deadlock`
+if it is a metadata request, `LockError::Deadlock` if it is a row request.
+
+**Mutex order.** The metadata lock table is guarded by one
+`parking_lot::Mutex`, the row lock table by another. The order is metadata
+lock mutex first, then row lock mutex: `MetadataLocks` calls the two hooks
+above with its own mutex held, so that the recorded waits change in the same
+order as the table they describe, and a granted requester is told only after
+the row lock manager has heard. The row lock manager never calls into
+`MetadataLocks`, so the reverse order does not occur. Neither mutex is held
+while a requester waits (it parks on a oneshot channel), and no other lock
+is taken under either.
+
+Closing a gate happens under the metadata lock mutex and takes, in turn,
+`gates` (to find the gate), `sessions`, and each session's `held`. A session
+takes its own `held` only to change its fast-side list and takes nothing
+else while it holds it; it comes to the lock table (to queue, or to release
+what was moved there) only after letting go of it. What the list of sessions
+holds of a session is its lock list alone (`SessionState`), which has no
+destructor: a session's release (`MdlSession`'s drop) is run only by the
+session's owner, never by a closer that happens to hold the last reference
+while it has the lock table.
+
 ## Lock Ordering Rules
 
 1. **Never hold sync locks across await** (except tokio::sync::Mutex)
-2. **Catalog acquired alone** - no other locks held when catalog is locked
+2. **Catalog acquired alone** - no other locks held when catalog is locked, and never the catalog itself a second time: a second read lock behind a waiting writer is never granted. A function called while the catalog is held for reading is given the guard's catalog (`&Catalog`), not the lock
 3. **Independent subsystem locks** - txn, storage, raft don't hold each other's locks
 4. **No circular dependencies** - call graph naturally orders acquisitions
+5. **Metadata lock mutex before row lock mutex** - the one place two locks nest inside `src/txn/`; never the reverse
 
 ## Atomic Ordering Guidelines
 
@@ -236,21 +417,20 @@ let mut catalog = self.catalog.write();
 
 ## Row ID Generation
 
-Row IDs are cluster-unique via node-ID-in-high-bits encoding (`src/storage/row_id.rs`):
+Row IDs come from one counter for the cluster (`src/storage/row_id.rs`). Only
+the primary hands them out:
 
-- **Format:** `[16-bit node_id][48-bit local counter]` — supports 65536 nodes, 281T rows/node
-- **`NODE_ID: AtomicU64`** — static, set once at startup from the Raft node ID (SeqCst)
-- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — single global counter (SeqCst `fetch_add`)
-- **`next_row_id()`** — allocates one ID, encodes with node_id
-- **`allocate_row_id_batch(count)`** — batch allocation reducing atomic contention for bulk INSERTs
+- **`GLOBAL_ROW_ID_GEN: RowIdGenerator`** — the counter (`fetch_add`) plus a `limit`: the end of the range reserved so far
+- **`next_row_id()`** / **`allocate_row_id_batch(count)`** — never block and never wait on Raft
 
-```rust
-pub fn next_row_id() -> u64 {
-    let local = GLOBAL_ROW_ID_GEN.next();
-    let node_id = NODE_ID.load(Ordering::SeqCst);
-    (node_id << 48) | (local & 0x0000_FFFF_FFFF_FFFF)
-}
-```
+Ranges are reserved through Raft (`Command::ReserveRowIds`) ahead of use, and
+every node follows the reserved bound as it applies the log. An ID may be
+handed out beyond the recorded reservation, but a commit that uses one waits
+until a reservation covering it has been applied. After a restart, and on a
+node that becomes primary, the counter resumes above everything reserved: an
+ID that reached storage is never issued again, and IDs ascend in the order
+rows were inserted, whichever node inserted them (a table without a primary
+key reads back in insertion order).
 
 ## Adding New Locks
 

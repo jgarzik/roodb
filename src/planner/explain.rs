@@ -44,6 +44,7 @@ impl ExplainOutput {
                 table,
                 columns,
                 key_value,
+                key_type: _,
             } => {
                 let col_names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
                 writeln!(
@@ -65,6 +66,7 @@ impl ExplainOutput {
                 inclusive_start,
                 inclusive_end,
                 remaining_filter,
+                key_type: _,
             } => {
                 let col_names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
                 let start_bound = if *inclusive_start { "[" } else { "(" };
@@ -238,6 +240,7 @@ impl ExplainOutput {
             }
 
             PhysicalPlan::DropMultipleTables { names, .. } => {
+                let names: Vec<String> = names.iter().map(ToString::to_string).collect();
                 writeln!(out, "{}DropMultipleTables: {}", prefix, names.join(", ")).unwrap();
             }
 

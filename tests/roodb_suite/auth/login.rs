@@ -25,6 +25,7 @@ async fn test_login_with_password() {
     // Build client with correct password
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(server.port())
         .user(Some("root"))
@@ -56,6 +57,7 @@ async fn test_login_wrong_password() {
     // Build client with wrong password
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(server.port())
         .user(Some("root"))
@@ -85,6 +87,7 @@ async fn test_login_unknown_user() {
     // Build client with unknown user
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(server.port())
         .user(Some("unknownuser"))

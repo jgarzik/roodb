@@ -11,6 +11,11 @@ pub enum SqlError {
     Parse(String),
     /// Table not found during resolution
     TableNotFound(String),
+    /// A table was named without a database, and the session has selected
+    /// none (MySQL error 1046)
+    NoDatabaseSelected,
+    /// A statement names a database that does not exist (MySQL error 1049)
+    UnknownDatabase(String),
     /// Column not found during resolution
     ColumnNotFound(String),
     /// Column is ambiguous (exists in multiple tables)
@@ -21,6 +26,12 @@ pub enum SqlError {
     InvalidOperation(String),
     /// Unsupported SQL feature
     Unsupported(String),
+    /// A table the statement uses was changed between the statement's
+    /// planning and its locking (MySQL error 1412); it can be run again.
+    TableDefinitionChanged,
+    /// Something MySQL does that this server does not do yet (MySQL error
+    /// 1235); what it is, for the message.
+    NotSupportedYet(String),
     /// Empty query (no SQL statement)
     EmptyQuery,
     /// Comment-only query (should return OK, not error)
@@ -32,6 +43,8 @@ impl fmt::Display for SqlError {
         match self {
             SqlError::Parse(msg) => write!(f, "Parse error: {}", msg),
             SqlError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
+            SqlError::NoDatabaseSelected => write!(f, "No database selected"),
+            SqlError::UnknownDatabase(name) => write!(f, "Unknown database '{}'", name),
             SqlError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
             SqlError::AmbiguousColumn(name) => {
                 write!(f, "Column '{}' is ambiguous", name)
@@ -45,6 +58,12 @@ impl fmt::Display for SqlError {
             }
             SqlError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             SqlError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            SqlError::TableDefinitionChanged => {
+                write!(f, "Table definition has changed, please retry transaction")
+            }
+            SqlError::NotSupportedYet(what) => {
+                write!(f, "This version of RooDB doesn't yet support '{}'", what)
+            }
             SqlError::EmptyQuery => write!(f, "Query was empty"),
             SqlError::CommentOnly => write!(f, "Comment-only query"),
         }

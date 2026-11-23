@@ -1,51 +1,68 @@
-//! SSTable block format
+//! SSTable data blocks.
 //!
-//! Block layout (4KB aligned):
-//! ```text
-//! +------------------+
-//! | Num Entries (4B) |
-//! | Entry 1          |
-//! | Entry 2          |
-//! | ...              |
-//! | Padding          |
-//! | CRC32 (4B)       |
-//! +------------------+
-//! ```
+//! A block is a whole number of 4 KiB pages. Most are exactly one page; a
+//! block grows to as many pages as it needs when it holds an entry that does
+//! not fit in one.
 //!
-//! Entry format:
 //! ```text
-//! | Key Len (2B) | Value Len (2B) | Key | Value |
+//! +----------------------------+
+//! | Block length (4B)          |  bytes, including padding and checksum
+//! | Num entries (4B)           |
+//! +----------------------------+
+//! | Entry: key len (2B)        |
+//! |        value len (4B)      |  0xFFFFFFFF = tombstone
+//! |        key, value          |
+//! | ...                        |
+//! +----------------------------+
+//! | Padding (zeros)            |
+//! | CRC32 (4B)                 |  over everything before it
+//! +----------------------------+
 //! ```
-//! Value Len = 0xFFFF indicates a tombstone (deleted key).
 
 use crate::io::PAGE_SIZE;
 use crate::storage::error::{StorageError, StorageResult};
 
-/// Block size (4KB, page-aligned)
+/// Target block size. Blocks are multiples of this.
 pub const BLOCK_SIZE: usize = PAGE_SIZE;
 
-/// Header size: num_entries (4 bytes)
-pub const BLOCK_HEADER_SIZE: usize = 4;
+/// Block header: length + entry count.
+pub const BLOCK_HEADER_SIZE: usize = 8;
 
-/// Footer size: CRC32 (4 bytes)
+/// Block footer: CRC32.
 pub const BLOCK_FOOTER_SIZE: usize = 4;
 
-/// Maximum usable space in a block
-pub const BLOCK_DATA_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE - BLOCK_FOOTER_SIZE;
+/// Entry header: key length (2) + value length (4).
+pub const ENTRY_HEADER_SIZE: usize = 6;
 
-/// Entry header size: key_len (2) + value_len (2)
-pub const ENTRY_HEADER_SIZE: usize = 4;
+/// Largest key the format can hold.
+pub const MAX_KEY_SIZE: usize = u16::MAX as usize;
 
-/// Maximum key size (64KB - 1)
-pub const MAX_KEY_SIZE: usize = 65534;
+/// Largest value accepted: 1 GiB, the most a MySQL client can send in one
+/// packet. The format's 32-bit lengths have room to spare above this, so a
+/// block holding the largest key and value still has a length that fits.
+pub const MAX_VALUE_SIZE: usize = 1 << 30;
 
-/// Maximum value size (64KB - 2, 0xFFFF reserved for tombstone)
-pub const MAX_VALUE_SIZE: usize = 65534;
+/// Value length that marks a deleted key.
+pub const TOMBSTONE_MARKER: u32 = u32::MAX;
 
-/// Tombstone marker for deleted keys
-pub const TOMBSTONE_MARKER: u16 = 0xFFFF;
+/// Check that a key and value fit the on-disk format.
+pub fn check_entry_size(key_len: usize, value_len: usize) -> StorageResult<()> {
+    if key_len > MAX_KEY_SIZE {
+        return Err(StorageError::KeyTooLarge {
+            size: key_len,
+            max: MAX_KEY_SIZE,
+        });
+    }
+    if value_len > MAX_VALUE_SIZE {
+        return Err(StorageError::ValueTooLarge {
+            size: value_len,
+            max: MAX_VALUE_SIZE,
+        });
+    }
+    Ok(())
+}
 
-/// A single key-value entry
+/// A key-value entry in a block
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub key: Vec<u8>,
@@ -71,37 +88,45 @@ impl Entry {
         self.value.is_none()
     }
 
-    /// Get encoded size of this entry
+    /// Encoded size of this entry
     pub fn encoded_size(&self) -> usize {
-        ENTRY_HEADER_SIZE + self.key.len() + self.value.as_ref().map(|v| v.len()).unwrap_or(0)
+        ENTRY_HEADER_SIZE + self.key.len() + self.value.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Append the encoded entry to `out`. The sizes must have been checked
+    /// with [`check_entry_size`].
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert!(self.key.len() <= MAX_KEY_SIZE);
+        let value_len = match &self.value {
+            Some(v) => {
+                debug_assert!(v.len() <= MAX_VALUE_SIZE);
+                v.len() as u32
+            }
+            None => TOMBSTONE_MARKER,
+        };
+        out.extend_from_slice(&(self.key.len() as u16).to_be_bytes());
+        out.extend_from_slice(&value_len.to_be_bytes());
+        out.extend_from_slice(&self.key);
+        if let Some(v) = &self.value {
+            out.extend_from_slice(v);
+        }
     }
 
     /// Encode entry to bytes
     pub fn encode(&self) -> Vec<u8> {
-        let key_len = self.key.len() as u16;
-        let value_len = match &self.value {
-            Some(v) => v.len() as u16,
-            None => TOMBSTONE_MARKER,
-        };
-
         let mut buf = Vec::with_capacity(self.encoded_size());
-        buf.extend_from_slice(&key_len.to_be_bytes());
-        buf.extend_from_slice(&value_len.to_be_bytes());
-        buf.extend_from_slice(&self.key);
-        if let Some(v) = &self.value {
-            buf.extend_from_slice(v);
-        }
+        self.encode_into(&mut buf);
         buf
     }
 
-    /// Decode entry from bytes
+    /// Decode entry from bytes, returns (entry, bytes_consumed)
     pub fn decode(buf: &[u8]) -> StorageResult<(Self, usize)> {
         if buf.len() < ENTRY_HEADER_SIZE {
             return Err(StorageError::InvalidSstable("entry too short".to_string()));
         }
 
         let key_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        let value_len_raw = u16::from_be_bytes([buf[2], buf[3]]);
+        let value_len_raw = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
 
         let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
         let value_len = if is_tombstone {
@@ -110,7 +135,10 @@ impl Entry {
             value_len_raw as usize
         };
 
-        let total_len = ENTRY_HEADER_SIZE + key_len + value_len;
+        let total_len = ENTRY_HEADER_SIZE
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(value_len))
+            .ok_or_else(|| StorageError::InvalidSstable("entry length overflow".to_string()))?;
         if buf.len() < total_len {
             return Err(StorageError::InvalidSstable("entry truncated".to_string()));
         }
@@ -126,7 +154,7 @@ impl Entry {
     }
 }
 
-/// A block builder for writing entries
+/// Block builder for creating data blocks
 pub struct BlockBuilder {
     entries: Vec<Entry>,
     size: usize,
@@ -141,25 +169,25 @@ impl BlockBuilder {
         }
     }
 
-    /// Check if an entry can fit in this block
+    /// Whether the entry should go in this block. An empty block takes any
+    /// entry, growing past one page if it must; otherwise the block is kept to
+    /// one page.
     pub fn can_fit(&self, entry: &Entry) -> bool {
-        self.size + entry.encoded_size() <= BLOCK_SIZE
+        self.entries.is_empty() || self.size + entry.encoded_size() <= BLOCK_SIZE
     }
 
-    /// Add an entry to the block
-    ///
-    /// Returns false if the entry doesn't fit.
+    /// Add an entry. Returns false, leaving the block unchanged, if
+    /// [`Self::can_fit`] says it belongs in the next block.
     pub fn add(&mut self, entry: Entry) -> bool {
-        let entry_size = entry.encoded_size();
-        if self.size + entry_size > BLOCK_SIZE {
+        if !self.can_fit(&entry) {
             return false;
         }
-        self.size += entry_size;
+        self.size += entry.encoded_size();
         self.entries.push(entry);
         true
     }
 
-    /// Check if the block is empty
+    /// Check if block is empty
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -174,26 +202,19 @@ impl BlockBuilder {
         self.entries.last().map(|e| e.key.as_slice())
     }
 
-    /// Build the block into a page-aligned buffer
+    /// Build the block: a whole number of pages.
     pub fn build(self) -> Vec<u8> {
-        let mut buf = vec![0u8; BLOCK_SIZE];
-
-        // Write header: num entries
-        let num_entries = self.entries.len() as u32;
-        buf[0..4].copy_from_slice(&num_entries.to_be_bytes());
-
-        // Write entries
-        let mut offset = BLOCK_HEADER_SIZE;
+        let len = self.size.next_multiple_of(BLOCK_SIZE);
+        let len_field = u32::try_from(len).expect("entry sizes are capped well below 4 GiB");
+        let mut buf = Vec::with_capacity(len);
+        buf.extend_from_slice(&len_field.to_be_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         for entry in &self.entries {
-            let encoded = entry.encode();
-            buf[offset..offset + encoded.len()].copy_from_slice(&encoded);
-            offset += encoded.len();
+            entry.encode_into(&mut buf);
         }
-
-        // Calculate and write CRC32 (over header + entries, excluding footer)
-        let crc = crc32fast::hash(&buf[..BLOCK_SIZE - BLOCK_FOOTER_SIZE]);
-        buf[BLOCK_SIZE - BLOCK_FOOTER_SIZE..].copy_from_slice(&crc.to_be_bytes());
-
+        buf.resize(len - BLOCK_FOOTER_SIZE, 0);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_be_bytes());
         buf
     }
 }
@@ -204,44 +225,106 @@ impl Default for BlockBuilder {
     }
 }
 
-/// A block reader for iterating entries
+/// Block reader for parsing data blocks
 pub struct BlockReader {
     entries: Vec<Entry>,
 }
 
+/// Check a block read from disk: its length and its checksum. `offset` is
+/// where it sits in the file, for error messages.
+///
+/// Blocks are verified once, when they are read, and trusted afterwards;
+/// lookups in a cached block do not pay for the checksum again.
+pub fn verify_block(buf: &[u8], offset: u64) -> StorageResult<()> {
+    if buf.len() < BLOCK_SIZE || !buf.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(StorageError::InvalidSstable(format!(
+            "block at offset {offset} has length {}",
+            buf.len()
+        )));
+    }
+    let body = buf.len() - BLOCK_FOOTER_SIZE;
+    let stored_crc = u32::from_be_bytes([buf[body], buf[body + 1], buf[body + 2], buf[body + 3]]);
+    let computed_crc = crc32fast::hash(&buf[..body]);
+    if stored_crc != computed_crc {
+        return Err(StorageError::CorruptedBlock {
+            offset,
+            expected: stored_crc,
+            actual: computed_crc,
+        });
+    }
+    let declared_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if declared_len != buf.len() {
+        return Err(StorageError::InvalidSstable(format!(
+            "block at offset {offset} says it is {declared_len} bytes, index says {}",
+            buf.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Look a key up in a verified block without decoding the other entries.
+/// `Some(None)` is a tombstone.
+pub fn find_in_block(buf: &[u8], key: &[u8]) -> StorageResult<Option<Option<Vec<u8>>>> {
+    let truncated = || StorageError::InvalidSstable("entry truncated".to_string());
+    if buf.len() < BLOCK_HEADER_SIZE + BLOCK_FOOTER_SIZE {
+        return Err(truncated());
+    }
+    let body = buf.len() - BLOCK_FOOTER_SIZE;
+    let num_entries = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let mut pos = BLOCK_HEADER_SIZE;
+    for _ in 0..num_entries {
+        let header = buf
+            .get(pos..pos + ENTRY_HEADER_SIZE)
+            .ok_or_else(truncated)?;
+        let key_len = u16::from_be_bytes([header[0], header[1]]) as usize;
+        let value_len_raw = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+        let value_len = if value_len_raw == TOMBSTONE_MARKER {
+            0
+        } else {
+            value_len_raw as usize
+        };
+        let key_at = pos + ENTRY_HEADER_SIZE;
+        let value_at = key_at + key_len;
+        let end = value_at.checked_add(value_len).ok_or_else(truncated)?;
+        if end > body {
+            return Err(truncated());
+        }
+        match buf[key_at..value_at].cmp(key) {
+            std::cmp::Ordering::Less => pos = end,
+            std::cmp::Ordering::Equal => {
+                return Ok(Some(if value_len_raw == TOMBSTONE_MARKER {
+                    None
+                } else {
+                    Some(buf[value_at..end].to_vec())
+                }));
+            }
+            // Entries are sorted: the key is not here.
+            std::cmp::Ordering::Greater => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 impl BlockReader {
-    /// Parse a block from bytes
+    /// Verify and parse a block. `buf` must be exactly the block; `offset` is
+    /// where it sits in the file, for error messages.
     pub fn parse(buf: &[u8], offset: u64) -> StorageResult<Self> {
-        if buf.len() < BLOCK_SIZE {
+        verify_block(buf, offset)?;
+        Self::parse_verified(buf)
+    }
+
+    /// Parse a block that [`verify_block`] has already accepted.
+    pub fn parse_verified(buf: &[u8]) -> StorageResult<Self> {
+        if buf.len() < BLOCK_HEADER_SIZE + BLOCK_FOOTER_SIZE {
             return Err(StorageError::InvalidSstable("block too small".to_string()));
         }
+        let body = buf.len() - BLOCK_FOOTER_SIZE;
+        let num_entries = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
 
-        // Verify CRC32
-        let stored_crc = u32::from_be_bytes([
-            buf[BLOCK_SIZE - 4],
-            buf[BLOCK_SIZE - 3],
-            buf[BLOCK_SIZE - 2],
-            buf[BLOCK_SIZE - 1],
-        ]);
-        let computed_crc = crc32fast::hash(&buf[..BLOCK_SIZE - BLOCK_FOOTER_SIZE]);
-
-        if stored_crc != computed_crc {
-            return Err(StorageError::CorruptedBlock {
-                offset,
-                expected: stored_crc,
-                actual: computed_crc,
-            });
-        }
-
-        // Read header
-        let num_entries = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-
-        // Read entries
-        let mut entries = Vec::with_capacity(num_entries);
+        let mut entries = Vec::with_capacity(num_entries.min(body / ENTRY_HEADER_SIZE));
         let mut pos = BLOCK_HEADER_SIZE;
-
         for _ in 0..num_entries {
-            let (entry, len) = Entry::decode(&buf[pos..])?;
+            let (entry, len) = Entry::decode(&buf[pos..body])?;
             entries.push(entry);
             pos += len;
         }
@@ -254,12 +337,12 @@ impl BlockReader {
         &self.entries
     }
 
-    /// Take ownership of entries (zero-copy for scan paths)
+    /// Take ownership of all entries (avoids clones)
     pub fn into_entries(self) -> Vec<Entry> {
         self.entries
     }
 
-    /// Find an entry by key using binary search
+    /// Search for a key (binary search)
     pub fn get(&self, key: &[u8]) -> Option<&Entry> {
         self.entries
             .binary_search_by(|e| e.key.as_slice().cmp(key))
@@ -267,12 +350,12 @@ impl BlockReader {
             .map(|i| &self.entries[i])
     }
 
-    /// Get the first key in the block
+    /// Get first key
     pub fn first_key(&self) -> Option<&[u8]> {
         self.entries.first().map(|e| e.key.as_slice())
     }
 
-    /// Get the last key in the block
+    /// Get last key
     pub fn last_key(&self) -> Option<&[u8]> {
         self.entries.last().map(|e| e.key.as_slice())
     }
@@ -301,43 +384,72 @@ mod tests {
 
         assert_eq!(decoded.key, b"deleted");
         assert!(decoded.is_tombstone());
-        assert_eq!(decoded.value, None);
     }
 
     #[test]
-    fn test_block_builder() {
+    fn empty_value_is_not_a_tombstone() {
+        let entry = Entry::new(b"k".to_vec(), Vec::new());
+        let (decoded, _) = Entry::decode(&entry.encode()).unwrap();
+        assert_eq!(decoded.value, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_block_build_parse() {
         let mut builder = BlockBuilder::new();
-
-        assert!(builder.add(Entry::new(b"a".to_vec(), b"1".to_vec())));
-        assert!(builder.add(Entry::new(b"b".to_vec(), b"2".to_vec())));
-        assert!(builder.add(Entry::tombstone(b"c".to_vec())));
-
-        assert_eq!(builder.first_key(), Some(b"a".as_slice()));
-        assert_eq!(builder.last_key(), Some(b"c".as_slice()));
+        builder.add(Entry::new(b"a".to_vec(), b"1".to_vec()));
+        builder.add(Entry::new(b"b".to_vec(), b"2".to_vec()));
+        builder.add(Entry::tombstone(b"c".to_vec()));
 
         let block = builder.build();
         assert_eq!(block.len(), BLOCK_SIZE);
+
+        let reader = BlockReader::parse(&block, 0).unwrap();
+        assert_eq!(reader.entries().len(), 3);
+        assert_eq!(reader.get(b"a").unwrap().value, Some(b"1".to_vec()));
+        assert_eq!(reader.get(b"b").unwrap().value, Some(b"2".to_vec()));
+        assert!(reader.get(b"c").unwrap().is_tombstone());
+        assert!(reader.get(b"d").is_none());
     }
 
     #[test]
-    fn test_block_reader() {
+    fn small_entries_fill_exactly_one_page() {
         let mut builder = BlockBuilder::new();
-        builder.add(Entry::new(b"apple".to_vec(), b"red".to_vec()));
-        builder.add(Entry::new(b"banana".to_vec(), b"yellow".to_vec()));
-        builder.add(Entry::tombstone(b"cherry".to_vec()));
-
+        let mut added = 0;
+        loop {
+            let entry = Entry::new(format!("key{added:05}").into_bytes(), vec![1u8; 90]);
+            if !builder.add(entry) {
+                break;
+            }
+            added += 1;
+        }
+        assert!(added > 30);
         let block = builder.build();
-        let reader = BlockReader::parse(&block, 0).unwrap();
+        assert_eq!(block.len(), BLOCK_SIZE);
+        assert_eq!(
+            BlockReader::parse(&block, 0).unwrap().entries().len(),
+            added
+        );
+    }
 
-        assert_eq!(reader.entries().len(), 3);
+    #[test]
+    fn an_entry_larger_than_a_page_gets_a_larger_block() {
+        for value_len in [4085usize, 4096, 65_534, 65_535, 70_000, 1_000_000] {
+            let value: Vec<u8> = (0..value_len).map(|i| (i % 251) as u8).collect();
+            let mut builder = BlockBuilder::new();
+            assert!(builder.add(Entry::new(b"big".to_vec(), value.clone())));
+            // The block is full now: the next entry starts a new one.
+            assert!(!builder.add(Entry::new(b"next".to_vec(), b"v".to_vec())));
 
-        let found = reader.get(b"banana").unwrap();
-        assert_eq!(found.value, Some(b"yellow".to_vec()));
-
-        let tombstone = reader.get(b"cherry").unwrap();
-        assert!(tombstone.is_tombstone());
-
-        assert!(reader.get(b"notfound").is_none());
+            let block = builder.build();
+            assert!(block.len().is_multiple_of(BLOCK_SIZE));
+            assert!(block.len() >= value_len);
+            let reader = BlockReader::parse(&block, 0).unwrap();
+            assert_eq!(reader.entries().len(), 1);
+            assert_eq!(
+                reader.get(b"big").unwrap().value.as_deref(),
+                Some(&value[..])
+            );
+        }
     }
 
     #[test]
@@ -346,10 +458,72 @@ mod tests {
         builder.add(Entry::new(b"key".to_vec(), b"value".to_vec()));
         let mut block = builder.build();
 
-        // Corrupt a byte
-        block[BLOCK_HEADER_SIZE] ^= 0xFF;
+        // Corrupt data
+        block[10] ^= 0xFF;
 
         let result = BlockReader::parse(&block, 0);
         assert!(matches!(result, Err(StorageError::CorruptedBlock { .. })));
+    }
+
+    #[test]
+    fn a_block_cut_short_is_rejected() {
+        let mut builder = BlockBuilder::new();
+        builder.add(Entry::new(b"big".to_vec(), vec![3u8; 10_000]));
+        let block = builder.build();
+        assert!(BlockReader::parse(&block[..BLOCK_SIZE], 0).is_err());
+        assert!(BlockReader::parse(&block[..100], 0).is_err());
+    }
+
+    #[test]
+    fn find_in_block_matches_full_parse() {
+        let mut builder = BlockBuilder::new();
+        builder.add(Entry::new(b"b".to_vec(), b"1".to_vec()));
+        builder.add(Entry::tombstone(b"d".to_vec()));
+        builder.add(Entry::new(b"f".to_vec(), Vec::new()));
+        builder.add(Entry::new(b"h".to_vec(), vec![7u8; 500]));
+        let block = builder.build();
+        verify_block(&block, 0).unwrap();
+
+        assert_eq!(
+            find_in_block(&block, b"b").unwrap(),
+            Some(Some(b"1".to_vec()))
+        );
+        assert_eq!(find_in_block(&block, b"d").unwrap(), Some(None));
+        assert_eq!(find_in_block(&block, b"f").unwrap(), Some(Some(Vec::new())));
+        assert_eq!(
+            find_in_block(&block, b"h").unwrap(),
+            Some(Some(vec![7u8; 500]))
+        );
+        for missing in [&b"a"[..], b"c", b"e", b"g", b"z"] {
+            assert_eq!(find_in_block(&block, missing).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn size_limits() {
+        assert!(check_entry_size(MAX_KEY_SIZE, 0).is_ok());
+        assert!(matches!(
+            check_entry_size(MAX_KEY_SIZE + 1, 0),
+            Err(StorageError::KeyTooLarge { .. })
+        ));
+        assert!(check_entry_size(1, 100_000_000).is_ok());
+        assert!(check_entry_size(MAX_KEY_SIZE, MAX_VALUE_SIZE).is_ok());
+        assert!(matches!(
+            check_entry_size(1, MAX_VALUE_SIZE + 1),
+            Err(StorageError::ValueTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_largest_accepted_entry_fits_the_block_length_field() {
+        // Every entry that passes the size check must produce a block whose
+        // length fits in 32 bits; otherwise it could be written to the
+        // memtable and then never flushed.
+        let largest = BLOCK_HEADER_SIZE
+            + BLOCK_FOOTER_SIZE
+            + ENTRY_HEADER_SIZE
+            + MAX_KEY_SIZE
+            + MAX_VALUE_SIZE;
+        assert!(u32::try_from(largest.next_multiple_of(BLOCK_SIZE)).is_ok());
     }
 }

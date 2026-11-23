@@ -341,7 +341,7 @@ fn test_view_order_by_limit_preserved() {
     // Create a view with ORDER BY and LIMIT
     catalog
         .create_view(ViewDef {
-            name: "v_top_users".to_string(),
+            name: "v_top_users".into(),
             query_sql: "SELECT id, name FROM users ORDER BY id DESC LIMIT 2".to_string(),
         })
         .unwrap();

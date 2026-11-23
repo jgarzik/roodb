@@ -2,6 +2,7 @@
 //!
 //! Tests for INSERT, UPDATE, DELETE.
 
+mod auto_increment;
 mod delete;
 mod insert;
 mod update;

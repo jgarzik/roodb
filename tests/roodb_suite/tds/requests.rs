@@ -28,6 +28,38 @@ async fn test_raw_login_and_batch() {
     server.shutdown().await;
 }
 
+/// A login that names no database starts in the system's (TDS has no
+/// session without one); a login to a database that does not exist is
+/// refused.
+#[tokio::test]
+async fn test_login_database() {
+    let server = TestServer::start("tds_raw_db").await;
+    let mut client = RawTds::connect(&server).await;
+    let tokens = client
+        .login_with(&login7_into("root", "", 0x7400_0004, None))
+        .await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    // A system table is found by its bare name, and a table of the tests'
+    // database is not.
+    let tokens = client
+        .batch("SELECT username FROM users WHERE username = 'root'")
+        .await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("CREATE TABLE test.tds_raw_db (id INT)").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("SELECT id FROM tds_raw_db").await;
+    assert!(!errors(&tokens).is_empty(), "{tokens:?}");
+    let tokens = client.batch("DROP TABLE test.tds_raw_db").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+
+    let mut client = RawTds::connect(&server).await;
+    let tokens = client
+        .login_with(&login7_into("root", "", 0x7400_0004, Some("no_such_db")))
+        .await;
+    assert!(!errors(&tokens).is_empty(), "{tokens:?}");
+    server.shutdown().await;
+}
+
 /// Drivers on a strict connection send TDS version 8.0 in LOGIN7 and
 /// still get LOGINACK 7.4.
 #[tokio::test]
@@ -216,12 +248,17 @@ async fn test_reset_connection() {
     let tokens = client.batch("BEGIN").await;
     assert_eq!(env_changes(&tokens), vec![ENV_BEGIN_TRAN], "{tokens:?}");
 
-    // Reset keeping the transaction: BEGIN fails, a transaction is open.
+    // Reset keeping the transaction: it is still open, so this BEGIN only
+    // opens a nested level; no transaction begins or ends.
     let tokens = client
         .batch_with_status("BEGIN", STATUS_RESET_CONNECTION_SKIP_TRAN)
         .await;
-    assert_eq!(env_changes(&tokens)[0], ENV_RESET_CONNECTION, "{tokens:?}");
-    assert_eq!(errors(&tokens).len(), 1, "{tokens:?}");
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    assert_eq!(
+        env_changes(&tokens),
+        vec![ENV_RESET_CONNECTION],
+        "{tokens:?}"
+    );
 
     // Full reset: the open transaction is rolled back first, so BEGIN
     // succeeds, and the reset is acknowledged before anything else.

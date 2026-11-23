@@ -48,6 +48,8 @@ const ACCEPTED_SET_OPTIONS: &[&str] = &[
 pub struct ShimContext<'a> {
     pub connection_id: u32,
     pub in_transaction: bool,
+    /// How many BEGIN TRANs are open (`@@TRANCOUNT`).
+    pub transaction_depth: u32,
     pub database: &'a str,
     pub user: &'a str,
     /// Product version, "major.minor.build"
@@ -265,7 +267,7 @@ fn rewrite_probes(sql: &str, ctx: &ShimContext<'_>) -> String {
 
     let probes: [(&str, String); 11] = [
         ("@@SPID", ctx.connection_id.to_string()),
-        ("@@TRANCOUNT", u8::from(ctx.in_transaction).to_string()),
+        ("@@TRANCOUNT", ctx.transaction_depth.to_string()),
         ("@@MAX_PRECISION", "38".to_string()),
         ("@@SERVERNAME", literal("RooDB")),
         ("@@LANGUAGE", literal("us_english")),
@@ -405,6 +407,7 @@ mod tests {
         ShimContext {
             connection_id: 42,
             in_transaction,
+            transaction_depth: u32::from(in_transaction),
             database: "test",
             user: "root",
             product_version: "16.0.1000",
@@ -608,6 +611,7 @@ mod tests {
         let c = ShimContext {
             connection_id: 1,
             in_transaction: false,
+            transaction_depth: 0,
             database: "we'ird\\db",
             user: "o'brien",
             product_version: "16.0.1000",

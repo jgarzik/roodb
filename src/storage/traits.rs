@@ -7,6 +7,124 @@ use crate::storage::error::StorageResult;
 /// A key-value pair
 pub type KeyValue = (Vec<u8>, Vec<u8>);
 
+/// One write in a batch. The writes of a batch take effect in the order
+/// they are listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// Store a value under a key, replacing any it had.
+    Put(Vec<u8>, Vec<u8>),
+    /// Delete a key.
+    Delete(Vec<u8>),
+    /// Forget every key in `[start, end)`: everything written there before
+    /// this write is gone for good, earlier writes of the same batch
+    /// included. See [`StorageEngine::write_batch`].
+    ForgetRange { start: Vec<u8>, end: Vec<u8> },
+}
+
+impl WriteOp {
+    /// Forget every key in `[start, end)`.
+    pub fn forget(start: &[u8], end: &[u8]) -> Self {
+        Self::ForgetRange {
+            start: start.to_vec(),
+            end: end.to_vec(),
+        }
+    }
+}
+
+/// A view of the engine's contents as they were at one moment, unaffected
+/// by what is written afterwards. Used to copy a whole database to another
+/// node while this one goes on working.
+#[async_trait]
+pub trait SnapshotView: Send + Sync {
+    /// The value of `key` in the view.
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
+
+    /// Entries with keys greater than `after` (from the start if `None`),
+    /// in key order, about `max_bytes` of them. The flag says whether these
+    /// were the last.
+    async fn next_chunk(
+        &self,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> StorageResult<(Vec<KeyValue>, bool)>;
+}
+
+/// A complete replacement for the engine's contents, being written.
+/// Nothing changes until `commit`; dropped before that, it leaves no trace.
+#[async_trait]
+pub trait Ingest: Send {
+    /// Add entries. Across all calls they must come in ascending key order.
+    async fn add(&mut self, entries: Vec<KeyValue>) -> StorageResult<()>;
+
+    /// Replace everything the engine holds with what was added, atomically:
+    /// readers see all of the old contents or all of the new, and so does a
+    /// restart after a crash.
+    async fn commit(self: Box<Self>) -> StorageResult<()>;
+}
+
+/// A view that is simply a copy of everything, for engines without a
+/// cheaper way to hold a moment still.
+struct CopiedView(Vec<KeyValue>);
+
+#[async_trait]
+impl SnapshotView for CopiedView {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        Ok(self
+            .0
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+            .ok()
+            .map(|i| self.0[i].1.clone()))
+    }
+
+    async fn next_chunk(
+        &self,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> StorageResult<(Vec<KeyValue>, bool)> {
+        let start = after.map_or(0, |after| {
+            self.0.partition_point(|(k, _)| k.as_slice() <= after)
+        });
+        let mut bytes = 0;
+        let mut end = start;
+        while end < self.0.len() && bytes < max_bytes {
+            bytes += self.0[end].0.len() + self.0[end].1.len();
+            end += 1;
+        }
+        Ok((self.0[start..end].to_vec(), end == self.0.len()))
+    }
+}
+
+/// A replacement collected in memory and applied as one batch, for engines
+/// without a cheaper way.
+struct BatchIngest<E: StorageEngine + ?Sized> {
+    engine: std::sync::Arc<E>,
+    entries: Vec<KeyValue>,
+}
+
+#[async_trait]
+impl<E: StorageEngine + ?Sized> Ingest for BatchIngest<E> {
+    async fn add(&mut self, mut entries: Vec<KeyValue>) -> StorageResult<()> {
+        self.entries.append(&mut entries);
+        Ok(())
+    }
+
+    async fn commit(self: Box<Self>) -> StorageResult<()> {
+        let mut batch: Vec<WriteOp> = self
+            .engine
+            .scan(None, None)
+            .await?
+            .into_iter()
+            .map(|(key, _)| WriteOp::Delete(key))
+            .collect();
+        batch.extend(
+            self.entries
+                .into_iter()
+                .map(|(key, value)| WriteOp::Put(key, value)),
+        );
+        self.engine.write_batch(batch).await
+    }
+}
+
 /// Abstract storage engine interface
 ///
 /// Provides ordered key-value storage with point lookups, range scans,
@@ -18,6 +136,12 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `None` if the key does not exist or was deleted.
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
 
+    /// Like `get`, but answers from what has been flushed to disk only,
+    /// ignoring writes still in memory - a range forgotten by a batch that
+    /// has not been flushed included. This is the value a restart would
+    /// find.
+    async fn get_durable(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
+
     /// Put a key-value pair
     ///
     /// Overwrites any existing value for the key.
@@ -28,12 +152,87 @@ pub trait StorageEngine: Send + Sync {
     /// No-op if the key does not exist.
     async fn delete(&self, key: &[u8]) -> StorageResult<()>;
 
+    /// Apply several writes as one unit, in the order given. Readers may
+    /// see the writes arrive one by one, but what reaches disk holds either
+    /// all of a batch or none of it.
+    ///
+    /// [`WriteOp::ForgetRange`] forgets every key in `[start, end)` that was
+    /// written before it, for good, without a delete marker per key; the
+    /// caller guarantees that nothing will be written there again. It is a
+    /// write like the others of its batch:
+    /// - It takes effect in its place in the batch. A key of the range
+    ///   written earlier in the batch is forgotten with the rest; one written
+    ///   later in the batch is a new write and stays.
+    /// - When `write_batch` returns, no `get`, `scan`, `next_key` or
+    ///   `prev_key` finds a key of the range.
+    /// - It becomes durable when the rest of its batch does, with the flush
+    ///   that writes the batch out, and not before. Until then
+    ///   `get_durable` and `snapshot_view`, which show what has been
+    ///   flushed, still show the range's keys; after a crash before that
+    ///   flush the range is back together with everything else as it was
+    ///   before the batch, and applying the batch again forgets it again.
+    /// - The space the keys took is given back in the background, after the
+    ///   flush.
+    ///
+    /// Forgetting the same range again, or one that overlaps it, is
+    /// harmless. An empty or inverted range holds nothing. A view taken
+    /// before the range was flushed as forgotten is unaffected: it goes on
+    /// showing the keys it had.
+    async fn write_batch(&self, batch: Vec<WriteOp>) -> StorageResult<()>;
+
     /// Scan a range of keys
     ///
     /// Returns key-value pairs in sorted order where `start <= key < end`.
     /// If `start` is `None`, scan from the beginning.
     /// If `end` is `None`, scan to the end.
     async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> StorageResult<Vec<KeyValue>>;
+
+    /// The smallest key greater than `key` and less than `high`, if any.
+    ///
+    /// The default reads the whole range; an engine that can seek should
+    /// override it.
+    async fn next_key(&self, key: &[u8], high: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        let mut after = key.to_vec();
+        after.push(0);
+        Ok(self
+            .scan(Some(&after), Some(high))
+            .await?
+            .into_iter()
+            .next()
+            .map(|(k, _)| k))
+    }
+
+    /// The greatest key less than `key` and not less than `low`, if any.
+    ///
+    /// The default reads the whole range; an engine that can seek should
+    /// override it.
+    async fn prev_key(&self, key: &[u8], low: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        Ok(self.scan(Some(low), Some(key)).await?.pop().map(|(k, _)| k))
+    }
+
+    /// A view of what the engine has flushed to disk, as of now. What is
+    /// still in memory is not in it: flush first to have everything.
+    ///
+    /// The default copies everything; an engine with immutable files should
+    /// hold on to those instead.
+    async fn snapshot_view(&self) -> StorageResult<std::sync::Arc<dyn SnapshotView>> {
+        Ok(std::sync::Arc::new(CopiedView(
+            self.scan(None, None).await?,
+        )))
+    }
+
+    /// Start writing a complete replacement for the engine's contents.
+    ///
+    /// The default collects it in memory.
+    async fn ingest(self: std::sync::Arc<Self>) -> StorageResult<Box<dyn Ingest>>
+    where
+        Self: 'static,
+    {
+        Ok(Box::new(BatchIngest {
+            engine: self,
+            entries: Vec::new(),
+        }))
+    }
 
     /// Flush all pending writes to disk
     async fn flush(&self) -> StorageResult<()>;

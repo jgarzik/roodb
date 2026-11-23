@@ -128,6 +128,27 @@ impl Parser {
         // Process conditional comments first, before any other normalization
         let sql = Self::normalize_conditional_comments(sql);
 
+        // LOCK IN SHARE MODE is the older spelling of FOR SHARE.
+        let re_share = Regex::new(r"(?i)\bLOCK\s+IN\s+SHARE\s+MODE\s*;?\s*$").unwrap();
+        let sql = re_share.replace(&sql, "FOR SHARE").to_string();
+
+        // `FOR UPDATE OF a, b` names several tables in one locking clause.
+        // The parser takes one name per clause, and MySQL also accepts the
+        // clause repeated, so the list is written out that way.
+        let re_of = Regex::new(
+            r"(?i)\bFOR\s+(UPDATE|SHARE)\s+OF\s+([`\w.]+(?:\s*,\s*[`\w.]+)+)((?:\s+NOWAIT|\s+SKIP\s+LOCKED)?)\s*;?\s*$",
+        )
+        .unwrap();
+        let sql = re_of
+            .replace(&sql, |caps: &regex::Captures| {
+                caps[2]
+                    .split(',')
+                    .map(|name| format!("FOR {} OF {}{}", &caps[1], name.trim(), &caps[3]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .to_string();
+
         // DO expr → SELECT expr (evaluate and discard result)
         let re_do = Regex::new(r"(?i)^\s*DO\s+").unwrap();
         let sql = re_do.replace(&sql, "SELECT ");

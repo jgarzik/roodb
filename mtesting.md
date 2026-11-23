@@ -233,7 +233,7 @@ python3 tests/mysql_compat/run_mtr_tests.py --list             # list available 
 | CAST signed overflow | CAST(float AS SIGNED) returns ER_DATA_OUT_OF_RANGE when value >= 2^63 |
 | Scalar-wrapping aggregates | `CRC32(SUM(a))`, `FUNC(AGG(...))` in SELECT, HAVING, ORDER BY |
 | HAVING with non-SELECT aggregates | HAVING clause can reference aggregates not in SELECT list |
-| CREATE VIEW / DROP VIEW | Raft-persisted views via system.views; survive restart; SHOW CREATE TABLE; SHOW TABLES includes views; JOIN with views; circular view guard (depth 32); query validation at CREATE time |
+| CREATE VIEW / DROP VIEW | Raft-persisted views via mysql.views; survive restart; SHOW CREATE TABLE; SHOW TABLES includes views; JOIN with views; circular view guard (depth 32); query validation at CREATE time |
 | Boolean negation | `-(TRUE)` returns -1; `-(1 NOT IN (0))` works correctly |
 | CREATE TRIGGER / DROP TRIGGER | BEFORE/AFTER INSERT triggers; body stored as parsed AST; NEW.col substitution; fires via full SQL pipeline |
 | Geometry types | POINT, LINESTRING, POLYGON, MULTILINESTRING, MULTIPOLYGON column types; stored as WKB binary |

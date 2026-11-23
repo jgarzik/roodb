@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use roodb::catalog::{Catalog, DataType};
 use roodb::executor::datum::Datum;
 use roodb::executor::row::Row;
-use roodb::io::PosixIOFactory;
+use roodb::io::{IoBackend, IoEngine};
 use roodb::planner::logical::OutputColumn;
 use roodb::protocol::roodb::auth::{verify_native_password, HandshakeResponse41};
 use roodb::protocol::roodb::command::{parse_command, Command, ParsedCommand};
@@ -29,6 +29,7 @@ use roodb::protocol::roodb::resultset::{
     ColumnDefinition41,
 };
 use roodb::protocol::roodb::types::{datatype_to_protocol, datum_to_text_bytes, ColumnType};
+use roodb::raft::{Durability, LogStore, LogStoreConfig};
 use roodb::server::listener::start_test_server;
 use roodb::storage::lsm::{LsmConfig, LsmEngine};
 use roodb::storage::StorageEngine;
@@ -396,11 +397,17 @@ async fn test_server_integration_e2e() {
     cleanup_dir(&data_dir);
 
     // Create storage and catalog
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -420,18 +427,23 @@ async fn test_server_integration_e2e() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     // Build client with TLS (accept invalid certs for self-signed)
     // Set max_allowed_packet and wait_timeout to avoid init queries for @@variables
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
 
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -475,7 +487,7 @@ async fn test_server_integration_e2e() {
     // Cleanup
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
 
     // Give server time to shutdown
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -500,11 +512,17 @@ async fn test_transaction_begin_commit() {
     let data_dir = test_dir("txn_commit");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -524,15 +542,20 @@ async fn test_transaction_begin_commit() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -583,7 +606,7 @@ async fn test_transaction_begin_commit() {
 
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);
@@ -604,11 +627,17 @@ async fn test_transaction_rollback() {
     let data_dir = test_dir("txn_rollback");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -628,15 +657,20 @@ async fn test_transaction_rollback() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -689,7 +723,7 @@ async fn test_transaction_rollback() {
 
     drop(conn);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);
@@ -710,11 +744,17 @@ async fn test_autocommit() {
     let data_dir = test_dir("autocommit");
     cleanup_dir(&data_dir);
 
-    let factory = Arc::new(PosixIOFactory);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let config = LsmConfig {
         dir: data_dir.clone(),
         ..Default::default()
     };
+    let log_store = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&data_dir, Durability::Os),
+    )
+    .await
+    .unwrap();
     let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::new()));
 
@@ -734,15 +774,20 @@ async fn test_autocommit() {
         raft_tls_config,
         storage.clone(),
         catalog.clone(),
+        log_store,
     )
     .await
     .expect("Failed to start test server");
 
     // Give server time to start accepting connections
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    crate::test_utils::create_test_database_on(port)
+        .await
+        .expect("create the test database");
 
     let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
     let opts: Opts = OptsBuilder::default()
+        .db_name(Some("test"))
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
@@ -785,7 +830,7 @@ async fn test_autocommit() {
     drop(conn1);
     drop(conn2);
     pool.disconnect().await.unwrap();
-    handle.shutdown();
+    handle.shutdown().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     storage.close().await.unwrap();
     cleanup_dir(&data_dir);

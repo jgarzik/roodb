@@ -14,8 +14,9 @@ ROODB_ROOT_PASSWORD=changeme ./roodb_init --data-dir ./data
 # 3. Start server
 ./roodb
 
-# 4. Connect via MySQL client
-mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
+# 4. Connect via MySQL client, and create a database to work in
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED -e "CREATE DATABASE app"
+mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED app
 ```
 
 ## Server Configuration
@@ -26,15 +27,23 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ./roodb --port PORT --data-dir PATH --cert-path PATH --key-path PATH --raft-ca-cert-path PATH
 ```
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| bind | 0.0.0.0 | Address to listen on (client, TDS and Raft ports) |
-| port | 3307 | Client connection port |
-| tds_port | (off) | Also accept SQL Server protocol (TDS) clients on this port |
-| data_dir | ./data | Data directory path |
-| cert_path | ./certs/server.crt | TLS certificate |
-| key_path | ./certs/server.key | TLS private key |
-| ca_cert_path | ./certs/ca.crt | CA certificate for Raft mTLS |
+| Argument | Environment | Default | Description |
+|----------|-------------|---------|-------------|
+| `--bind` | `ROODB_BIND` | 0.0.0.0 | Address to listen on (client, TDS and Raft ports) |
+| `--port` | `ROODB_PORT` | 3307 | Client connection port |
+| `--tds-port` | `ROODB_TDS_PORT` | (off) | Also accept SQL Server protocol (TDS) clients on this port |
+| `--data-dir` | `ROODB_DATA_DIR` | ./data | Data directory path |
+| `--io-backend` | `ROODB_IO_BACKEND` | auto | File I/O backend: `auto`, `uring` or `posix` (see I/O Backend) |
+| `--durability` | `ROODB_DURABILITY` | os | When a commit is acknowledged: `os` or `fsync` (see Durability) |
+| `--cert-path` | `ROODB_CERT_PATH` | ./certs/server.crt | TLS certificate |
+| `--key-path` | `ROODB_KEY_PATH` | ./certs/server.key | TLS private key |
+| `--raft-ca-cert-path` | `ROODB_CA_CERT_PATH` | ./certs/ca.crt | CA certificate for Raft mTLS |
+| `--raft-port` | `ROODB_RAFT_PORT` | port + 1000 | Port for traffic between the nodes of a cluster |
+| `--advertise-host` | `ROODB_ADVERTISE_HOST` | the bind address | Host name or address at which other nodes reach this one. Needed when binding to 0.0.0.0 |
+| `--log-budget-mb` | `ROODB_LOG_BUDGET_MB` | 256 | How much log may accumulate before memory is written out to table files and the log shortened. Bounds the log's disk use and the replay work of a restart |
+| `--connection-threads` | `ROODB_CONNECTION_THREADS` | 0 | Threads that serve client connections; 0 means one per core. Each connection is served on one of them, the least busy when it connects |
+| `--log-segment-mb` | `ROODB_LOG_SEGMENT_MB` | 64 | Size of the files the log is kept in; the log is shortened a whole file at a time. Applies to files created from then on |
+| `--join` | `ROODB_JOIN` | (none) | `host:raft-port` of a member of the cluster to join (several, comma-separated). For a node starting on an empty data directory |
 
 ### TLS Requirements
 
@@ -104,9 +113,38 @@ A node with a certificate signed by a different CA will be rejected by the clust
 | `ROODB_ROOT_PASSWORD` | Set root password on first boot |
 | `ROODB_ROOT_PASSWORD_FILE` | Read password from file (Docker secrets) |
 | `ROODB_BIND` | Listen address (same as `--bind`) |
+| `ROODB_PORT`, `ROODB_DATA_DIR` | Same as `--port`, `--data-dir` |
+| `ROODB_CERT_PATH`, `ROODB_KEY_PATH`, `ROODB_CA_CERT_PATH` | Same as `--cert-path`, `--key-path`, `--raft-ca-cert-path` |
 | `ROODB_TDS_PORT` | Enable the TDS listener on this port (same as `--tds-port`) |
+| `ROODB_IO_BACKEND` | File I/O backend: `auto` (default), `uring` or `posix` (same as `--io-backend`) |
+| `ROODB_DURABILITY` | When a commit is acknowledged: `os` (default) or `fsync` (same as `--durability`) |
 
 Priority: `ROODB_ROOT_PASSWORD` takes precedence over `ROODB_ROOT_PASSWORD_FILE`.
+
+### I/O Backend
+
+RooDB does its own file I/O with direct I/O and picks a backend when it starts:
+
+| `--io-backend` | Behaviour |
+|----------------|-----------|
+| `auto` (default) | io_uring if the kernel allows it, otherwise `posix` (a warning is logged) |
+| `uring` | io_uring; startup fails if the kernel refuses it |
+| `posix` | Worker threads doing positional reads and writes; works everywhere |
+
+io_uring is unavailable on non-Linux hosts, on old kernels, and in containers
+whose seccomp profile blocks it (recent Docker releases block it by default). `roodb_init`
+accepts the same flag. The backend in use is logged at startup.
+
+### Durability
+
+Every commit is appended to the Raft log before it is acknowledged. `--durability` chooses how far that append must have got:
+
+| `--durability` | A commit is acknowledged when... | Survives |
+|----------------|----------------------------------|----------|
+| `os` (default) | its log write has completed | the server crashing or being killed |
+| `fsync` | its log write has been flushed to stable storage | that, and power loss or a kernel crash |
+
+With `os`, a power failure can lose the last commits that were still in the drive's volatile cache. With `fsync`, commits that arrive together share one flush, so the cost per commit falls as load rises. Raft votes are flushed in both modes.
 
 ## SQL Server Protocol (TDS)
 
@@ -118,7 +156,8 @@ a second port. It is off unless `--tds-port` (or `ROODB_TDS_PORT`) is set:
 ```
 
 The TDS port must differ from the client port and the Raft port. Accounts,
-databases and data are the same as on the main port.
+databases and data are the same as on the main port. A TDS login that names
+no database starts in `mysql`.
 
 ### Transports and encryption
 
@@ -152,7 +191,8 @@ The SQL accepted is RooDB's own (MySQL dialect), exactly as on the main
 port; see [SQL.md](SQL.md). T-SQL is not translated. Only the statements
 drivers issue by themselves are understood in addition:
 
-- `BEGIN TRAN`, `COMMIT TRAN`, `ROLLBACK TRAN`, `IF @@TRANCOUNT > 0 ...`,
+- `BEGIN TRAN`, `COMMIT TRAN`, `ROLLBACK TRAN`, nested as in T-SQL (only
+  the outermost `COMMIT` commits), `IF @@TRANCOUNT > 0 ...`,
   `SET IMPLICIT_TRANSACTIONS ON|OFF`
 - connect-time session options such as `SET ANSI_NULLS ON`,
   `SET QUOTED_IDENTIFIER ON`, `SET NOCOUNT ON`, which are accepted without
@@ -196,13 +236,16 @@ listed here.
 
 ```
 data/
-├── sstables/          # LSM SSTable files
-│   └── *.sst          # Individual SSTable files
-├── manifest.json      # SSTable metadata (critical for recovery)
-└── [raft state]       # Raft log entries and vote state (LSM-backed)
+├── *.sst              # LSM table files
+├── MANIFEST           # Which table files exist, by level
+├── LOCK               # Held while a server has the directory open
+├── NODE_ID            # This node's ID in its cluster
+└── raft/
+    ├── log-*.seg      # The Raft log (the write-ahead log), in fixed-size segments
+    └── spare.seg      # A prepared segment waiting to be used
 ```
 
-**Important:** The `manifest.json` file tracks all SSTables. Losing it while keeping SSTables results in data loss. Always backup the entire data directory as a unit.
+**Important:** Back up the entire data directory as a unit. `MANIFEST` says which table files are live; the server refuses to start if it is missing while table files are present, or if a file it lists is missing or damaged. The log in `raft/` holds every commit that has not yet been flushed into a table file.
 
 ## Deployment Modes
 
@@ -223,51 +266,90 @@ The server automatically bootstraps as a single-node Raft cluster, electing itse
 
 ### Multi-Node Cluster
 
-Multi-node clusters provide high availability through Raft consensus. Currently, cluster deployment requires programmatic setup (CLI support planned).
+A cluster is a first node, started as above, and further nodes that join it.
+A joining node starts with an **empty data directory** (no `roodb_init`) and
+the address of the Raft port of any member:
 
-**Cluster requirements:**
-- 3 nodes minimum (tolerates 1 failure)
-- 5 nodes for higher availability (tolerates 2 failures)
-- All nodes need TLS certificates signed by the same CA (mTLS)
-- Shared CA certificate on all nodes for peer verification
-- Network connectivity between all nodes on Raft RPC port
+```bash
+# first node: initialised with roodb_init, then started as a single node
+./roodb --bind 10.0.0.1 --port 3307 --data-dir ./data ...
 
-**Bootstrap procedure (programmatic):**
-
-```rust
-// 1. Create RaftNode for each member
-let mut node1 = RaftNode::new(1, addr1, tls_config.clone(), storage1, catalog1).await?;
-let mut node2 = RaftNode::new(2, addr2, tls_config.clone(), storage2, catalog2).await?;
-let mut node3 = RaftNode::new(3, addr3, tls_config.clone(), storage3, catalog3).await?;
-
-// 2. Register all peers on all nodes
-node1.add_peer(2, addr2);
-node1.add_peer(3, addr3);
-node2.add_peer(1, addr1);
-node2.add_peer(3, addr3);
-node3.add_peer(1, addr1);
-node3.add_peer(2, addr2);
-
-// 3. Start RPC servers on all nodes
-node1.start_rpc_server().await?;
-node2.start_rpc_server().await?;
-node3.start_rpc_server().await?;
-
-// 4. Bootstrap from ONE node with full membership
-let members = vec![(1, addr1), (2, addr2), (3, addr3)];
-node1.bootstrap_cluster(members).await?;
-
-// 5. Wait for leader election (~500-1000ms)
-tokio::time::sleep(Duration::from_millis(1000)).await;
+# second and third node, each on its own machine and empty data directory
+./roodb --bind 10.0.0.2 --port 3307 --data-dir ./data --join 10.0.0.1:4307 ...
+./roodb --bind 10.0.0.3 --port 3307 --data-dir ./data --join 10.0.0.1:4307 ...
 ```
 
-See `tests/roodb_suite/raft_cluster.rs` for complete working example.
+The cluster gives the new node its node ID (kept in `NODE_ID` in the data
+directory), sends it the data, and makes it a voting member once it has
+caught up. From then on the node knows its cluster: on a restart it needs
+no `--join`, and the option is ignored if given.
 
-**Cluster behavior:**
-- Writes must go to leader (followers return "not leader" error)
-- Reads served from any node (local LSM)
-- Leader election: 150-300ms timeout, 50ms heartbeat
-- Automatic failover when leader fails (if quorum remains)
+**Requirements:**
+- 3 nodes tolerate the loss of 1; 5 tolerate 2.
+- Every node needs a certificate signed by the same CA, and that CA's
+  certificate (`--raft-ca-cert-path`): nodes authenticate each other with
+  mutual TLS.
+- Every node must be able to reach every other node's Raft port
+  (`--raft-port`, by default the client port + 1000) at the address the node
+  advertises: its `--bind` address, or `--advertise-host` when it binds to
+  `0.0.0.0` or sits behind another name. A node that would advertise
+  `0.0.0.0` is not allowed to join, and a first node that does is told to be
+  restarted with `--advertise-host` before it admits anyone (while it is
+  alone, restarting it with the option is all it takes).
+
+**Primary and secondaries:**
+- The node that leads the cluster is the **primary**: it takes all writes.
+  The others are **secondaries**: they apply what the primary commits and
+  answer reads from their own state, which can be slightly behind. A
+  secondary refuses anything that writes or locks with error 1290, the
+  error of a read-only MySQL server. This is the single-primary model of
+  MySQL Group Replication; point writers at the primary.
+- When the primary fails or is cut off, the remaining nodes elect a new one
+  (150-300 ms election timeout, 50 ms heartbeat), provided a majority of the
+  nodes is still up. Nothing that was acknowledged is lost. Transactions
+  that were open on the old primary are rolled back.
+- A node that was down restarts on its data directory with no special
+  options, follows the current primary and catches up.
+- A node that has been away for longer than the log reaches back, or that
+  joins late, is sent a copy of the data instead: read from the sender's
+  table files a piece at a time while the sender goes on working, and
+  switched to on the receiver in one step once it has all arrived.
+
+**Operating a cluster:**
+
+```sql
+-- on any node: who is in the cluster, and which node is the primary
+SHOW CLUSTER MEMBERS;
+-- Node_id  Address         Role
+-- 1        10.0.0.1:4307   PRIMARY
+-- 2        10.0.0.2:4307   SECONDARY
+-- 3        10.0.0.3:4307   SECONDARY
+
+-- on the primary, as root: take node 3 out of the cluster
+ALTER CLUSTER REMOVE NODE 3;
+
+-- on the primary, as root: make node 2 the primary (before maintenance on
+-- this node, say)
+ALTER CLUSTER SET PRIMARY 2;
+```
+
+`ALTER CLUSTER SET PRIMARY` returns when the named node is the primary (it
+accepts writes a moment later, once it has taken the role up: until then a
+write gets error 1290, as on any secondary). The
+role is handed over by asking that node to stand for election; if the request
+reaches it late, another node may be elected instead. The statement then
+fails and names the node that leads now: repeat it on that node.
+
+A node that has lost its data directory must be removed (`ALTER CLUSTER
+REMOVE NODE`) before a new node may join at its address: the cluster will not
+hand the old node's place to a node that has none of what the old one had.
+
+A removed node is told, and stops; one that was down at the time finds out
+when it is started, and refuses to run. Its data directory is of no further use
+to the cluster: to bring the machine back, empty the directory and start
+the node with `--join` again (it gets a new node ID). Remove a failed node
+that is not coming back, so that it no longer counts towards the majority
+the cluster needs.
 
 ## First-Time Initialization
 
@@ -331,9 +413,18 @@ When `roodb_init` runs on an empty data directory:
 2. Grants `ALL PRIVILEGES ON *.*` with `GRANT OPTION` to root
 3. Writes schema version marker
 
-System tables (`system.tables`, `system.columns`, etc.) are created by the catalog at server startup, not by initialization.
+System tables (`mysql.tables`, `mysql.users`, etc.) are created by the catalog at server startup, not by initialization.
+
+No databases are created. A new server has `mysql` (the system tables) and `information_schema`; create the ones you need (`CREATE DATABASE app`) before clients log in to them: a login that names a database that does not exist is refused (error 1049).
 
 ## User Management
+
+> **Status:** account management through SQL does not work yet. `CREATE USER`,
+> `ALTER USER`, `DROP USER`, `SET PASSWORD` and `SHOW GRANTS` are not
+> functional, and an account created any other way cannot log in; `root`, set
+> up by `roodb_init`, is the only usable account. This section describes the
+> intended interface. [SQL.md](SQL.md#users-and-privileges) states what is
+> accepted today.
 
 ### Creating Users
 
@@ -378,6 +469,11 @@ DROP USER IF EXISTS 'username'@'host';
 ```
 
 ## Privilege System
+
+> **Status:** see the note under User Management. `GRANT` and `REVOKE` accept
+> only `ALL`, `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE`, and since
+> only `root` can log in, and `root` bypasses the checks, they have no
+> practical effect yet.
 
 RooDB implements MySQL-compatible privileges at multiple levels.
 
@@ -490,16 +586,20 @@ Query system tables for metadata (read-only, managed by SQL commands):
 
 | Table | Contents |
 |-------|----------|
-| `system.tables` | Table definitions |
-| `system.columns` | Column definitions |
-| `system.indexes` | Index definitions |
-| `system.constraints` | Table constraints |
-| `system.users` | User accounts |
-| `system.grants` | Privileges |
-| `system.roles` | Role definitions |
-| `system.role_grants` | Role-to-user assignments |
+| `mysql.tables` | Table definitions: one encoded record per table (columns, constraints, indexes). Read them with `DESCRIBE`, `SHOW CREATE TABLE`, `SHOW INDEX` |
+| `mysql.databases` | Databases |
+| `mysql.views` | View definitions |
+| `mysql.procedures` | Stored procedures and functions |
+| `mysql.triggers` | Trigger definitions |
+| `mysql.table_statistics` | Optimizer statistics |
+| `mysql.users` | User accounts |
+| `mysql.grants` | Privileges |
+| `mysql.roles` | Role definitions |
+| `mysql.role_grants` | Role-to-user assignments |
 
-**Note:** SHOW STATUS and SHOW PROCESSLIST are not yet implemented.
+**Lock monitoring:** `SHOW STATUS LIKE 'Innodb_row_lock_current_waits'` reports how many statements are waiting for a row lock right now; `Roodb_row_locks` and `Roodb_gap_locks` report how many locks are held. `innodb_lock_wait_timeout` (seconds, default 50) bounds a wait; set it per session, or with `SET GLOBAL` for sessions that connect afterwards. A schema change (`ALTER TABLE`, `DROP TABLE`, ...) waits for every transaction that has used its table, and holds back statements that come to the table after it: a transaction left open keeps a schema change, and then everyone behind it, waiting. `Roodb_metadata_lock_waits` reports how many statements wait for such a lock, `Roodb_metadata_locks` how many are held around a schema change (the ordinary lock of a statement on a table nobody is changing is not counted). `lock_wait_timeout` (seconds, default a year) bounds that wait, set the same two ways.
+
+**Note:** `SHOW STATUS` reports nothing else yet, and `SHOW PROCESSLIST` is empty.
 
 ## Backup and Recovery
 
@@ -508,22 +608,33 @@ Query system tables for metadata (read-only, managed by SQL commands):
 RooDB uses filesystem-level backups. The data directory contains all state:
 
 ```bash
-# Stop server for consistent backup
-pkill roodb
+# Stop the server: SIGTERM shuts it down in order (stop accepting, flush, close)
+pkill -TERM roodb
 
 # Copy entire data directory
 cp -r ./data ./backup/data-$(date +%Y%m%d)
 
-# Restart server
+# Restart server on the same directory
 ./roodb
 ```
 
-For minimal downtime, you can snapshot while running (point-in-time consistency via LSM design), but stopping ensures full consistency.
+Copy the directory only while the server is stopped. A copy taken from a
+running server is not a consistent backup: table files, `MANIFEST` and the log
+change independently while it runs.
 
-**Critical files:**
-- `manifest.json` - SSTable registry; must match SSTable files
-- `sstables/*.sst` - Actual data
-- Raft state - Cluster membership and log position
+**Critical files** (see the data directory layout above):
+- `MANIFEST` - which table files are live; must match the `*.sst` files
+- `*.sst` - flushed data
+- `raft/` - the log: every commit not yet flushed into a table file, plus the Raft vote and log position
+
+### Restart and crash recovery
+
+The server restarts on an existing data directory without `roodb_init`. After
+a clean stop, a crash or `kill -9`, it replays the part of the log that had
+not yet been flushed and then starts accepting connections; nothing that was
+acknowledged to a client is lost (subject to the `--durability` mode for power
+loss). A second server cannot open a directory that is in use: `LOCK` is held
+while one is running.
 
 ### Single Node Recovery
 
@@ -601,17 +712,24 @@ mysql -h 127.0.0.1 -P 3307 -u root -p -e "SELECT COUNT(*) FROM mydb.mytable"
 
 ### Cluster Issues
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| "Not leader" | Write sent to follower | Redirect write to leader node |
-| Election not completing | Network partition or <quorum nodes | Check network connectivity, verify quorum |
-| Node won't rejoin | Stale state | Clear data directory, rejoin as new node |
+| Symptom | Cause | Solution |
+|---------|-------|----------|
+| Error 1290 on a write | The statement was sent to a secondary | Send writes to the primary: `SHOW CLUSTER MEMBERS` on any node names it |
+| Error 3101 on `COMMIT` | The primary changed while the transaction was open | Run the transaction again on the current primary |
+| Every node refuses writes; `SHOW CLUSTER MEMBERS` shows no `PRIMARY` | Fewer than a majority of the members are up or can reach each other, so none can be elected | Bring nodes back or restore the network. If nodes are gone for good, the cluster cannot recover by itself: restore from a backup |
+| A node started with `--join` waits and then fails with "could not join the cluster" | The member it was pointed at is unreachable, or the cluster has no primary to admit it | Check the address (the member's Raft port, not its client port), the firewall, and that the cluster has a primary |
+| A node joins but never leaves `LEARNER`, or the others log that it is unreachable | The others cannot reach it at the address it advertises (shown by `SHOW CLUSTER MEMBERS`) | Start it with `--advertise-host` set to a name or address the other nodes can reach |
+| Nodes log TLS errors about each other's certificates | The nodes' certificates are not all signed by the CA given with `--raft-ca-cert-path` | Issue every node's certificate from the same CA |
+| The primary died right after nodes joined, and no node takes over | The joiners were still `LEARNER`: a node is given a vote only once it has received the data, and until then the cluster has no more voters than before | Wait for a joiner to show as `SECONDARY` before counting on it; here, restart the old primary |
+| A node refuses to start: "this node has been removed from its cluster" | It was removed with `ALTER CLUSTER REMOVE NODE` | Empty its data directory and start it with `--join` |
+| A node that was away for long takes a while to accept reads again | It is being sent a copy of the data, because the log no longer reaches back far enough | Wait; `SHOW CLUSTER MEMBERS` shows it as a member throughout |
 
 ### Data Issues
 
 | Symptom | Cause | Solution |
 |---------|-------|----------|
-| Missing tables after restart | Corrupted manifest.json | Restore from backup |
+| Server refuses to start: table file or `MANIFEST` missing or damaged | Files removed or corrupted outside the server | Restore the whole data directory from backup |
+| Server refuses to start: data directory in use | Another server holds `LOCK` | Stop the other server |
 | Slow queries | Pending compaction | Wait for background compaction |
 
 ## Connection Examples

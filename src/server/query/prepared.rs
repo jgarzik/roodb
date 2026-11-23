@@ -27,6 +27,9 @@ pub struct CachedPlan {
     pub required_privileges: Vec<RequiredPrivilege>,
     /// Schema version when this plan was cached (invalidate on DDL)
     pub schema_version: u64,
+    /// The stored tables and the views the statement uses, each as it was
+    /// when the plan was made: what it locks before it runs, and checks.
+    pub used: Vec<(crate::catalog::TableName, crate::catalog::ObjectStamp)>,
 }
 
 // ── PreparedStatement ───────────────────────────────────────────────

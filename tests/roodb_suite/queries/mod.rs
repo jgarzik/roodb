@@ -7,6 +7,7 @@ mod aggregates;
 mod date_functions;
 mod grouping;
 mod joins;
+mod key_order;
 mod ordering;
 mod procedures;
 mod select_basic;

@@ -2,7 +2,10 @@
 //!
 //! Tests for CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX.
 
+mod alter_table;
 mod create_index;
 mod create_table;
+mod databases;
 mod drop_index;
 mod drop_table;
+mod temp_table;

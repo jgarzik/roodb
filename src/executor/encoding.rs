@@ -1,126 +1,114 @@
 //! Row encoding/decoding for storage
 //!
-//! Key format: `t:{table_name}:r:{row_id}`
-//! Value format: null_bitmap + packed columns
+//! Key format: `t`, table ID, index ID, then the key values (see `key`)
+//! Value format: column count, then tagged values
+
+use serde::{Deserialize, Serialize};
 
 use super::datum::Datum;
 use super::error::{ExecutorError, ExecutorResult};
-use super::row::Row;
 
-/// Encode a table row key using primary key value(s)
-///
-/// Format: `t:{table_name}:r:{pk_bytes}` where pk_bytes is order-preserving encoding
-/// of the PK column values. For integer PKs, uses big-endian with sign bit flipped
-/// for correct sort order. For string PKs, uses null-terminated encoding.
-pub fn encode_pk_key(table: &str, pk_values: &[Datum]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(table.len() + 16);
-    key.extend_from_slice(b"t:");
-    key.extend_from_slice(table.as_bytes());
-    key.extend_from_slice(b":r:");
+/// A table's number: what its rows are stored under. Given once, when the
+/// table is created, and never to another table: a table that is renamed
+/// keeps its rows, and a table created under a dropped table's name has
+/// none of the old one's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TableId(pub u64);
+
+impl std::fmt::Display for TableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// An ID for a table that this process alone knows: a session's temporary
+/// table, or a table of a catalog run without a log. From a range the
+/// cluster's counter never reaches.
+pub fn local_table_id() -> TableId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 63);
+    TableId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Which of a table's key ranges: its rows (index 0), or one of its
+/// secondary indexes.
+pub type IndexId = u32;
+
+/// The index every table has: the rows themselves, in key order.
+pub const ROWS: IndexId = 0;
+
+/// The first byte of every key that belongs to a table.
+const TABLE_KEYS: u8 = b't';
+
+/// Where the keys of one index of a table begin: `t`, the table's ID, the
+/// index's ID (both big-endian, so that a table's keys are together and in
+/// index order).
+pub fn index_key_prefix(table: TableId, index: IndexId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13 + 16);
+    key.push(TABLE_KEYS);
+    key.extend_from_slice(&table.0.to_be_bytes());
+    key.extend_from_slice(&index.to_be_bytes());
+    key
+}
+
+/// The first key after those of one index of a table.
+pub fn index_key_end(table: TableId, index: IndexId) -> Vec<u8> {
+    match index.checked_add(1) {
+        Some(next) => index_key_prefix(table, next),
+        None => table_range(table).1,
+    }
+}
+
+/// Every key of a table, rows and indexes: `[start, end)`.
+pub fn table_range(table: TableId) -> (Vec<u8>, Vec<u8>) {
+    let mut start = vec![TABLE_KEYS];
+    start.extend_from_slice(&table.0.to_be_bytes());
+    let mut end = vec![TABLE_KEYS];
+    match table.0.checked_add(1) {
+        Some(next) => end.extend_from_slice(&next.to_be_bytes()),
+        None => end[0] = TABLE_KEYS + 1,
+    }
+    (start, end)
+}
+
+/// The table a key belongs to, if it is a table's key.
+pub fn table_of_row_key(key: &[u8]) -> Option<TableId> {
+    match key {
+        [TABLE_KEYS, id @ ..] if id.len() >= 8 => Some(TableId(u64::from_be_bytes(
+            id[..8].try_into().expect("eight bytes"),
+        ))),
+        _ => None,
+    }
+}
+
+/// The key of a row: the table's row prefix and the primary key values as
+/// key parts (see `key`): bytes that sort as the values do. The values
+/// must be in the key columns' types (a stored row's are; a looked-up value
+/// goes through `key::for_lookup` first).
+pub fn encode_pk_key(table: TableId, pk_values: &[Datum]) -> Vec<u8> {
+    let mut key = index_key_prefix(table, ROWS);
     for val in pk_values {
-        encode_comparable_datum(&mut key, val);
+        super::key::encode_part(&mut key, val, &super::key::KeyPart::PLAIN);
     }
     key
 }
 
-/// Encode a datum in order-preserving binary format for use as storage key.
-///
-/// Integer: flip sign bit of big-endian i64 so negative < positive in byte order.
-/// String: append 0x00 0x01 terminator (0x00 bytes in string escaped as 0x00 0xFF).
-/// Other types: fall back to tag + raw encoding.
-fn encode_comparable_datum(buf: &mut Vec<u8>, datum: &Datum) {
-    match datum {
-        Datum::Int(i) => {
-            // Flip sign bit for correct byte-order comparison
-            let v = (*i as u64) ^ (1u64 << 63);
-            buf.extend_from_slice(&v.to_be_bytes());
-        }
-        Datum::UnsignedInt(u) => {
-            // Big-endian for order-preserving comparison.
-            // Unsigned values are always >= 0, so no sign-bit flip needed —
-            // just straight BE gives correct byte ordering.
-            buf.extend_from_slice(&u.to_be_bytes());
-        }
-        Datum::String(s) => {
-            // Null-terminated encoding: escape 0x00 bytes
-            for &b in s.as_bytes() {
-                if b == 0x00 {
-                    buf.push(0x00);
-                    buf.push(0xFF);
-                } else {
-                    buf.push(b);
-                }
-            }
-            buf.push(0x00);
-            buf.push(0x01); // terminator
-        }
-        _ => {
-            // For other types, use a simple tag+value encoding
-            encode_datum(buf, datum);
-        }
-    }
-}
-
-/// Encode a table row key (legacy format with auto-generated row ID)
-///
-/// Format: `t:{table_name}:r:{row_id}` where row_id is big-endian u64
-pub fn encode_row_key(table: &str, row_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(table.len() + 16);
-    key.extend_from_slice(b"t:");
-    key.extend_from_slice(table.as_bytes());
-    key.extend_from_slice(b":r:");
+/// The key of a row of a table without a primary key: the table's row
+/// prefix and the row's generated ID, big-endian.
+pub fn encode_row_key(table: TableId, row_id: u64) -> Vec<u8> {
+    let mut key = index_key_prefix(table, ROWS);
     key.extend_from_slice(&row_id.to_be_bytes());
     key
 }
 
-/// Decode a table row key
-///
-/// Returns (table_name, row_id)
-pub fn decode_row_key(key: &[u8]) -> ExecutorResult<(String, u64)> {
-    // Parse "t:{table}:r:{row_id}"
-    if key.len() < 12 || !key.starts_with(b"t:") {
-        return Err(ExecutorError::Encoding("invalid key prefix".to_string()));
-    }
-
-    // Find ":r:" separator
-    let sep = b":r:";
-    let sep_pos = key
-        .windows(3)
-        .position(|w| w == sep)
-        .ok_or_else(|| ExecutorError::Encoding("missing :r: separator".to_string()))?;
-
-    let table = String::from_utf8(key[2..sep_pos].to_vec())
-        .map_err(|_| ExecutorError::Encoding("invalid table name encoding".to_string()))?;
-
-    let row_id_start = sep_pos + 3;
-    if key.len() < row_id_start + 8 {
-        return Err(ExecutorError::Encoding("row_id too short".to_string()));
-    }
-
-    let row_id_bytes: [u8; 8] = key[row_id_start..row_id_start + 8]
-        .try_into()
-        .map_err(|_| ExecutorError::Encoding("invalid row_id".to_string()))?;
-    let row_id = u64::from_be_bytes(row_id_bytes);
-
-    Ok((table, row_id))
+/// Where a table's rows begin.
+pub fn table_key_prefix(table: TableId) -> Vec<u8> {
+    index_key_prefix(table, ROWS)
 }
 
-/// Get the key prefix for scanning all rows in a table
-pub fn table_key_prefix(table: &str) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(table.len() + 5);
-    prefix.extend_from_slice(b"t:");
-    prefix.extend_from_slice(table.as_bytes());
-    prefix.extend_from_slice(b":r:");
-    prefix
-}
-
-/// Get the end key for scanning all rows in a table (exclusive)
-pub fn table_key_end(table: &str) -> Vec<u8> {
-    let mut end = Vec::with_capacity(table.len() + 5);
-    end.extend_from_slice(b"t:");
-    end.extend_from_slice(table.as_bytes());
-    end.extend_from_slice(b":s"); // 's' > 'r' for exclusive end
-    end
+/// The first key after a table's rows.
+pub fn table_key_end(table: TableId) -> Vec<u8> {
+    index_key_end(table, ROWS)
 }
 
 // Datum type tags
@@ -135,26 +123,9 @@ const TAG_BIT: u8 = 7;
 const TAG_UINT: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
 const TAG_JSON: u8 = 10;
-
-/// Encode a row value
-///
-/// Format: [num_cols:u16][datum...]
-/// Each datum: [tag:u8][data...]
-pub fn encode_row(row: &Row) -> Vec<u8> {
-    // Estimate capacity: 2 bytes header + ~10 bytes per datum average
-    let mut buf = Vec::with_capacity(2 + row.len() * 10);
-
-    // Number of columns
-    let num_cols = row.len() as u16;
-    buf.extend_from_slice(&num_cols.to_le_bytes());
-
-    // Encode each datum
-    for datum in row.iter() {
-        encode_datum(&mut buf, datum);
-    }
-
-    buf
-}
+/// Written only by `encode_value`: `encode_datum`
+/// writes a geometry as `TAG_BYTES`.
+const TAG_GEOMETRY: u8 = 11;
 
 /// Encode a single datum
 fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
@@ -213,27 +184,63 @@ fn encode_datum(buf: &mut Vec<u8>, datum: &Datum) {
     }
 }
 
-/// Decode a row value
-pub fn decode_row(data: &[u8]) -> ExecutorResult<Row> {
-    if data.len() < 2 {
-        return Err(ExecutorError::Encoding("row data too short".to_string()));
+/// Encode a single datum such that `decode_datum` gives back the same
+/// variant: as `encode_datum`, except that a geometry keeps its own tag
+/// instead of being written as bytes.
+pub(crate) fn encode_value(buf: &mut Vec<u8>, datum: &Datum) {
+    match datum {
+        Datum::Geometry(b) => {
+            buf.push(TAG_GEOMETRY);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        other => encode_datum(buf, other),
     }
+}
 
-    let num_cols = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let mut offset = 2;
-    let mut values = Vec::with_capacity(num_cols);
-
-    for _ in 0..num_cols {
-        let (datum, consumed) = decode_datum(&data[offset..])?;
-        values.push(datum);
-        offset += consumed;
+/// The number of bytes the datum at the start of `data` occupies, without
+/// building it. The tag and the length are checked; what a string or a JSON
+/// document holds is not.
+pub(crate) fn skip_datum(data: &[u8]) -> ExecutorResult<usize> {
+    let Some(&tag) = data.first() else {
+        return Err(ExecutorError::Encoding(
+            "unexpected end of datum".to_string(),
+        ));
+    };
+    let size = match tag {
+        TAG_NULL => 1,
+        TAG_BOOL => 2,
+        TAG_INT | TAG_FLOAT | TAG_UINT | TAG_TIMESTAMP => 9,
+        TAG_BIT => 10,
+        TAG_DECIMAL => 18,
+        TAG_STRING | TAG_BYTES | TAG_JSON | TAG_GEOMETRY => {
+            let Some(header) = data.get(1..5) else {
+                return Err(ExecutorError::Encoding(
+                    "length header too short".to_string(),
+                ));
+            };
+            let len = u32::from_le_bytes(header.try_into().expect("slice is 4 bytes")) as usize;
+            // Compared this way round so that the sum cannot overflow.
+            if data.len() - 5 < len {
+                return Err(ExecutorError::Encoding("datum data too short".to_string()));
+            }
+            return Ok(5 + len);
+        }
+        _ => {
+            return Err(ExecutorError::Encoding(format!(
+                "unknown datum tag: {}",
+                tag
+            )))
+        }
+    };
+    if data.len() < size {
+        return Err(ExecutorError::Encoding("datum data too short".to_string()));
     }
-
-    Ok(Row::new(values))
+    Ok(size)
 }
 
 /// Decode a single datum, returns (datum, bytes_consumed)
-fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
+pub(crate) fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
     if data.is_empty() {
         return Err(ExecutorError::Encoding(
             "unexpected end of datum".to_string(),
@@ -313,6 +320,11 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
                 return Err(ExecutorError::Encoding("bytes data too short".to_string()));
             }
             Ok((Datum::Bytes(data[5..5 + len].to_vec()), 5 + len))
+        }
+
+        TAG_GEOMETRY => {
+            let len = skip_datum(data)?;
+            Ok((Datum::Geometry(data[5..len].to_vec()), len))
         }
 
         TAG_UINT => {
@@ -399,21 +411,50 @@ fn decode_datum(data: &[u8]) -> ExecutorResult<(Datum, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::row::Row;
 
-    #[test]
-    fn test_encode_decode_row_key() {
-        let table = "users";
-        let row_id = 12345u64;
-        let key = encode_row_key(table, row_id);
-        let (decoded_table, decoded_row_id) = decode_row_key(&key).unwrap();
-        assert_eq!(decoded_table, table);
-        assert_eq!(decoded_row_id, row_id);
+    /// The values of a row one after another, each as `encode_datum`
+    /// writes it.
+    fn encode_row(row: &Row) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for datum in row.iter() {
+            encode_datum(&mut bytes, datum);
+        }
+        bytes
+    }
+
+    /// The values `encode_row` wrote, read back until the bytes end.
+    fn decode_row(mut bytes: &[u8]) -> ExecutorResult<Row> {
+        let mut values = Vec::new();
+        while !bytes.is_empty() {
+            let (datum, used) = decode_datum(bytes)?;
+            assert_eq!(skip_datum(bytes)?, used);
+            values.push(datum);
+            bytes = &bytes[used..];
+        }
+        Ok(Row::new(values))
     }
 
     #[test]
-    fn test_table_key_prefix() {
-        let prefix = table_key_prefix("users");
-        assert_eq!(prefix, b"t:users:r:");
+    fn a_tables_keys_are_together_and_apart_from_other_tables() {
+        let table = TableId(1024);
+        let (start, end) = table_range(table);
+        let rows = (table_key_prefix(table), table_key_end(table));
+        let index = (index_key_prefix(table, 3), index_key_end(table, 3));
+        // Rows, then indexes in order, all within the table's range.
+        assert!(start <= rows.0 && rows.0 < rows.1);
+        assert!(rows.1 <= index.0 && index.0 < index.1 && index.1 <= end);
+        let row = encode_row_key(table, 12345);
+        assert!(rows.0 < row && row < rows.1);
+        let keyed = encode_pk_key(table, &[Datum::Int(-7)]);
+        assert!(rows.0 < keyed && keyed < rows.1);
+        // The next table's keys begin where this one's end, and a table
+        // whose number is a prefix of another's in decimal is no neighbour.
+        assert_eq!(end, table_range(TableId(1025)).0);
+        assert!(table_range(TableId(10)).1 <= table_range(TableId(102)).0);
+        // The last index and the last table still have an end.
+        assert_eq!(index_key_end(table, u32::MAX), end);
+        assert!(table_range(TableId(u64::MAX)).0 < table_range(TableId(u64::MAX)).1);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use roodb::catalog::Catalog;
-use roodb::io::default_io_factory;
-use roodb::raft::{ChangeSet, RaftNode, RowChange};
+use roodb::io::{IoBackend, IoEngine};
+use roodb::raft::{ChangeSet, Durability, LogStore, LogStoreConfig, RaftNode, RowChange};
 use roodb::storage::{LsmConfig, LsmEngine, StorageEngine};
 
 use crate::test_utils::certs::write_raft_cluster_certs;
@@ -31,25 +31,22 @@ fn test_port(base: u16) -> u16 {
     base + (std::process::id() as u16 % 1000)
 }
 
-/// Create a temporary storage engine for testing
-async fn test_storage(name: &str) -> Arc<dyn StorageEngine> {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "roodb_test_{}_{}_{:?}",
-        name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::create_dir_all(&path);
-    let factory = Arc::new(default_io_factory());
+/// Create a temporary storage engine and Raft log for testing
+async fn test_storage(name: &str) -> (Arc<dyn StorageEngine>, LogStore) {
+    let path = crate::test_utils::cleanup::scratch_dir(name);
+    let factory = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
+    let log = LogStore::open(
+        factory.clone(),
+        LogStoreConfig::for_data_dir(&path, Durability::Os),
+    )
+    .await
+    .unwrap();
     let config = LsmConfig {
         dir: path,
         ..Default::default()
     };
-    Arc::new(LsmEngine::open(factory, config).await.unwrap())
+    let storage: Arc<dyn StorageEngine> = Arc::new(LsmEngine::open(factory, config).await.unwrap());
+    (storage, log)
 }
 
 /// Create a test catalog for Raft tests
@@ -72,9 +69,9 @@ async fn wait_for_leader<'a>(nodes: &[&'a RaftNode], timeout_ms: u64) -> Option<
 }
 
 /// Helper to create a ChangeSet with a single insert
-fn insert_change(table: &str, key: &[u8], value: &[u8]) -> ChangeSet {
+fn insert_change(key: &[u8], value: &[u8]) -> ChangeSet {
     let mut cs = ChangeSet::new(1);
-    cs.push(RowChange::insert(table, key.to_vec(), value.to_vec()));
+    cs.push(RowChange::insert(key.to_vec(), value.to_vec()));
     cs
 }
 
@@ -119,13 +116,13 @@ async fn test_leader_election_timing() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -192,13 +189,13 @@ async fn test_replication_consistency() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -226,7 +223,7 @@ async fn test_replication_consistency() {
     for i in 0..5 {
         let key = format!("consistency_key_{}", i).into_bytes();
         let value = format!("consistency_value_{}", i).into_bytes();
-        let changeset = insert_change("test", &key, &value);
+        let changeset = insert_change(&key, &value);
         leader.propose_changes(changeset).await.unwrap();
     }
 
@@ -259,13 +256,13 @@ async fn test_follower_read() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -300,7 +297,7 @@ async fn test_follower_read() {
     let _follower = follower.expect("No follower found");
 
     // Propose changes through leader
-    let changeset = insert_change("test", b"follower_read_key", b"follower_read_value");
+    let changeset = insert_change(b"follower_read_key", b"follower_read_value");
     leader.propose_changes(changeset).await.unwrap();
 
     // Wait for replication
@@ -331,13 +328,13 @@ async fn test_write_delete_sequence() {
     let catalog2 = test_catalog();
     let catalog3 = test_catalog();
 
-    let mut node1 = RaftNode::new(1, addr1, tls1, storage1, catalog1, false)
+    let mut node1 = RaftNode::new(1, addr1, tls1, storage1.0, catalog1, storage1.1, false)
         .await
         .unwrap();
-    let mut node2 = RaftNode::new(2, addr2, tls2, storage2, catalog2, false)
+    let mut node2 = RaftNode::new(2, addr2, tls2, storage2.0, catalog2, storage2.1, false)
         .await
         .unwrap();
-    let mut node3 = RaftNode::new(3, addr3, tls3, storage3, catalog3, false)
+    let mut node3 = RaftNode::new(3, addr3, tls3, storage3.0, catalog3, storage3.1, false)
         .await
         .unwrap();
 
@@ -362,14 +359,14 @@ async fn test_write_delete_sequence() {
         .expect("No leader found");
 
     // Propose an insert
-    let insert_cs = insert_change("test", b"delete_test_key", b"delete_test_value");
+    let insert_cs = insert_change(b"delete_test_key", b"delete_test_value");
     leader.propose_changes(insert_cs).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;
 
     // Propose a delete
     let mut delete_cs = ChangeSet::new(2);
-    delete_cs.push(RowChange::delete("test", b"delete_test_key".to_vec()));
+    delete_cs.push(RowChange::delete(b"delete_test_key".to_vec()));
     leader.propose_changes(delete_cs).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(OPERATION_WAIT_MS)).await;

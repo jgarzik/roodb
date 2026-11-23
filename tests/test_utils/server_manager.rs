@@ -155,6 +155,7 @@ impl ServerManager {
         // Build connection options
         let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
         let opts: Opts = OptsBuilder::default()
+            .db_name(Some("test"))
             .ip_or_hostname("127.0.0.1")
             .tcp_port(state.port)
             .user(Some("root"))
@@ -177,6 +178,11 @@ impl ServerManager {
             }
         }
 
+        // The database the tests connect to.
+        if let Err(e) = super::create_test_database(state.port, STARTUP_TIMEOUT) {
+            panic!("could not create the test database: {e}");
+        }
+
         state.server_process = Some(server_process);
         state.data_dir = Some(data_dir);
         state.cert_files = Some(cert_files);
@@ -193,7 +199,10 @@ impl ServerManager {
                 let _ = child.wait();
             }
             state.server_process = None;
-            // TempDirs are cleaned up automatically when dropped
+            // This manager lives in a static, which is never dropped, so the
+            // directories are released here or not at all.
+            state.data_dir = None;
+            state.cert_files = None;
         }
     }
 

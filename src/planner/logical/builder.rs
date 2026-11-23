@@ -498,7 +498,13 @@ impl LogicalPlanBuilder {
             .collect();
 
         LogicalPlan::Scan {
-            table: table.name.clone(),
+            // A stored table by its catalog name; anything else (there is
+            // nothing else that is scanned by name today) by the name the
+            // query gave it.
+            table: table
+                .table
+                .clone()
+                .unwrap_or_else(|| crate::catalog::TableName::bare(table.name.clone())),
             columns,
             filter: None,
         }

@@ -5478,7 +5478,7 @@ pub fn eval_function(
 
         // Check for user-defined functions via __udf_NAME in user variables
         _ => {
-            if let Some(udf_result) = try_eval_udf(&name_upper, args, vars) {
+            if let Some(udf_result) = try_eval_udf(name, args, vars) {
                 return udf_result;
             }
             Err(ExecutorError::InvalidOperation(format!(
@@ -6296,7 +6296,16 @@ fn try_eval_udf(
     vars: Option<&UserVariables>,
 ) -> Option<ExecutorResult<Datum>> {
     let vars = vars?;
-    let udf_key = format!("__udf_{}", name.to_lowercase());
+    // `name` or `database.name`: a function's name does not distinguish
+    // case, a database's does.
+    let udf_key = match name.rsplit_once('.') {
+        Some((database, function)) => format!(
+            "__udf_{}.{}",
+            database.trim_matches('`'),
+            function.trim_matches('`').to_lowercase()
+        ),
+        None => format!("__udf_{}", name.to_lowercase()),
+    };
 
     // Look up UDF body and params from user variables
     let (body_sql, param_names) = {

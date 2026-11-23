@@ -2,16 +2,17 @@
 //!
 //! Reads rows from a source query executor and inserts them into a table.
 
+use super::rowcodec::TableLayout;
 use async_trait::async_trait;
 
 use crate::planner::logical::ResolvedColumn;
 use crate::raft::RowChange;
 use crate::sql::resolver::parse_default_value;
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::storage::row_id::allocate_row_id_batch;
 
 use super::context::TransactionContext;
 use super::datum::Datum;
-use super::encoding::{encode_pk_key, encode_row, encode_row_key};
+use super::encoding::{encode_pk_key, encode_row_key};
 use super::error::ExecutorResult;
 use super::row::Row;
 use super::Executor;
@@ -19,7 +20,9 @@ use super::Executor;
 /// INSERT ... SELECT executor
 pub struct InsertSelect {
     /// Table name
-    table: String,
+    table: crate::catalog::TableName,
+    /// The table's ID: what its keys begin with
+    layout: TableLayout,
     /// Target columns (always ALL table columns)
     columns: Vec<ResolvedColumn>,
     /// Source query executor
@@ -44,13 +47,17 @@ pub struct InsertSelect {
     mapped_targets: std::collections::HashSet<usize>,
     /// IGNORE modifier — suppress errors, skip bad rows
     ignore: bool,
+    /// Storage, for the table's AUTO_INCREMENT counter (None when run
+    /// without a server).
+    mvcc: Option<std::sync::Arc<crate::txn::MvccStorage>>,
 }
 
 impl InsertSelect {
     /// Create a new INSERT ... SELECT executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
+        layout: TableLayout,
         columns: Vec<ResolvedColumn>,
         source: Box<dyn Executor>,
         txn_context: Option<TransactionContext>,
@@ -58,6 +65,7 @@ impl InsertSelect {
         pk_column_indices: Vec<usize>,
         column_map: Option<Vec<usize>>,
         ignore: bool,
+        mvcc: Option<std::sync::Arc<crate::txn::MvccStorage>>,
     ) -> Self {
         let mapped_targets: std::collections::HashSet<usize> = column_map
             .as_ref()
@@ -65,6 +73,7 @@ impl InsertSelect {
             .unwrap_or_default();
         InsertSelect {
             table,
+            layout,
             columns,
             source,
             txn_context,
@@ -76,6 +85,7 @@ impl InsertSelect {
             column_map,
             mapped_targets,
             ignore,
+            mvcc,
         }
     }
 }
@@ -144,15 +154,34 @@ impl Executor for InsertSelect {
             }
 
             // Allocate row ID per-row
-            let (local_id, node_id) = allocate_row_id_batch(1);
-            let row_id = encode_row_id(local_id, node_id);
+            let local_id = allocate_row_id_batch(1);
+            let row_id = local_id;
 
-            // Replace NULL values in auto_increment columns with generated ID
-            let auto_id = row_id & 0x0000_FFFF_FFFF_FFFF;
+            // AUTO_INCREMENT, as for INSERT ... VALUES: NULL and 0 ask for
+            // the table's next value; a value given moves the counter.
+            let mut auto_next: Option<u64> = None;
             for &idx in &self.auto_increment_indices {
-                if idx < datums.len() && datums[idx].is_null() {
-                    datums[idx] = Datum::Int(auto_id as i64);
-                    self.last_insert_id = auto_id;
+                if idx >= datums.len() {
+                    continue;
+                }
+                if datums[idx].is_null() || matches!(datums[idx], Datum::Int(0)) {
+                    let value = match &self.mvcc {
+                        Some(mvcc) => mvcc.take_auto_increment(self.layout.id).await?,
+                        None => row_id & 0x0000_FFFF_FFFF_FFFF,
+                    };
+                    datums[idx] = Datum::Int(value as i64);
+                    if self.last_insert_id == 0 {
+                        self.last_insert_id = value;
+                    }
+                    auto_next = Some(value + 1);
+                } else if let Datum::Int(given) = datums[idx] {
+                    if given > 0 {
+                        if let Some(mvcc) = &self.mvcc {
+                            mvcc.observe_auto_increment(self.layout.id, given as u64)
+                                .await?;
+                        }
+                        auto_next = Some(given as u64 + 1);
+                    }
                 }
             }
 
@@ -188,11 +217,11 @@ impl Executor for InsertSelect {
                     .iter()
                     .map(|&idx| row.get(idx).unwrap().clone())
                     .collect();
-                encode_pk_key(&self.table, &pk_values)
+                encode_pk_key(self.layout.id, &pk_values)
             } else {
-                encode_row_key(&self.table, row_id)
+                encode_row_key(self.layout.id, row_id)
             };
-            let value = encode_row(&row);
+            let value = self.layout.encode(&row)?;
 
             let ctx = self.txn_context.as_mut().ok_or_else(|| {
                 super::error::ExecutorError::Internal(
@@ -212,7 +241,7 @@ impl Executor for InsertSelect {
                 )));
             }
 
-            ctx.add_change(RowChange::insert(&self.table, key.clone(), value.clone()));
+            ctx.add_change(RowChange::insert(key.clone(), value.clone()).with_auto_inc(auto_next));
             ctx.buffer_write(key, value);
             self.rows_inserted += 1;
         }

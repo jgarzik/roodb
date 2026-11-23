@@ -10,19 +10,18 @@ use parking_lot::RwLock;
 
 use crate::catalog::system_tables::SYSTEM_TABLE_STATISTICS;
 use crate::catalog::Catalog;
-use crate::raft::{ChangeSet, RaftNode, RowChange};
-use crate::storage::row_id::{allocate_row_id_batch, encode_row_id};
+use crate::raft::{ChangeSet, RaftNode};
 use crate::txn::MvccStorage;
 
 use super::datum::Datum;
-use super::encoding::{decode_row, encode_row, encode_row_key, table_key_end, table_key_prefix};
+use super::encoding::{table_key_end, table_key_prefix};
 use super::error::{ExecutorError, ExecutorResult};
 use super::row::Row;
 use super::Executor;
 
 /// ANALYZE TABLE executor
 pub struct AnalyzeTable {
-    table: String,
+    table: crate::catalog::TableName,
     mvcc: Arc<MvccStorage>,
     catalog: Arc<RwLock<Catalog>>,
     raft_node: Arc<RaftNode>,
@@ -32,7 +31,7 @@ pub struct AnalyzeTable {
 
 impl AnalyzeTable {
     pub fn new(
-        table: String,
+        table: crate::catalog::TableName,
         mvcc: Arc<MvccStorage>,
         catalog: Arc<RwLock<Catalog>>,
         raft_node: Arc<RaftNode>,
@@ -57,13 +56,19 @@ impl Executor for AnalyzeTable {
         {
             let catalog = self.catalog.read();
             if catalog.get_table(&self.table).is_none() {
-                return Err(ExecutorError::TableNotFound(self.table.clone()));
+                return Err(ExecutorError::TableNotFound(self.table.to_string()));
             }
         }
 
         // Scan table data to count rows and sum sizes
-        let prefix = table_key_prefix(&self.table);
-        let end = table_key_end(&self.table);
+        let table_id = self
+            .catalog
+            .read()
+            .get_table(&self.table)
+            .map(|def| def.id)
+            .ok_or_else(|| ExecutorError::TableNotFound(self.table.to_string()))?;
+        let prefix = table_key_prefix(table_id);
+        let end = table_key_end(table_id);
 
         let rows = self
             .mvcc
@@ -95,52 +100,20 @@ impl Executor for AnalyzeTable {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Upsert into system.table_statistics:
-        // Scan for existing row, delete if found, then insert new
-        let stats_prefix = table_key_prefix(SYSTEM_TABLE_STATISTICS);
-        let stats_end = table_key_end(SYSTEM_TABLE_STATISTICS);
-
-        let existing = self
-            .mvcc
-            .scan_raw(&stats_prefix, &stats_end)
-            .await
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-
-        let mut changeset = ChangeSet::new(0);
-
-        // Delete existing row for this table if found
-        for (key, value) in existing {
-            let row_data = if value.len() > 17 {
-                &value[17..]
-            } else {
-                &value
-            };
-            if let Ok(row) = decode_row(row_data) {
-                if let Some(Datum::String(name)) = row.get_opt(0) {
-                    if name == &self.table {
-                        changeset.push(RowChange::delete_with_value(
-                            SYSTEM_TABLE_STATISTICS,
-                            key,
-                            row_data.to_vec(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Insert new statistics row
+        // The table's statistics row, keyed by the table's name: this one
+        // takes the place of the last.
         let stats_row = Row::new(vec![
-            Datum::String(self.table.clone()),
+            Datum::String(self.table.database.clone()),
+            Datum::String(self.table.table.clone()),
             Datum::Int(row_count),
             Datum::Int(data_size),
             Datum::Timestamp(now),
         ]);
-
-        let (local_id, node_id) = allocate_row_id_batch(1);
-        let row_id = encode_row_id(local_id, node_id);
-        let key = encode_row_key(SYSTEM_TABLE_STATISTICS, row_id);
-        let value = encode_row(&stats_row);
-        changeset.push(RowChange::insert(SYSTEM_TABLE_STATISTICS, key, value));
+        let mut changeset = ChangeSet::new(0);
+        changeset.push(crate::catalog::store::put_row(
+            SYSTEM_TABLE_STATISTICS,
+            &stats_row,
+        ));
 
         // Propose changes via Raft
         self.raft_node
@@ -149,8 +122,9 @@ impl Executor for AnalyzeTable {
             .map_err(|e| ExecutorError::Internal(format!("Raft error: {}", e)))?;
 
         // Build MySQL-format result row: (Table, Op, Msg_type, Msg_text)
+        // (MySQL shows the table as `database.table` here.)
         self.result_row = Some(Row::new(vec![
-            Datum::String(self.table.clone()),
+            Datum::String(self.table.to_string()),
             Datum::String("analyze".to_string()),
             Datum::String("status".to_string()),
             Datum::String("OK".to_string()),

@@ -41,6 +41,30 @@ pub struct MvccStorage {
 }
 
 impl MvccStorage {
+    /// Take the next AUTO_INCREMENT value of `table`.
+    pub async fn take_auto_increment(
+        &self,
+        table: crate::executor::encoding::TableId,
+    ) -> StorageResult<u64> {
+        self.txn_manager
+            .auto_increment()
+            .take(self.inner.as_ref(), table)
+            .await
+    }
+
+    /// A row of `table` was given `value` for its AUTO_INCREMENT column
+    /// explicitly: later generated values are greater.
+    pub async fn observe_auto_increment(
+        &self,
+        table: crate::executor::encoding::TableId,
+        value: u64,
+    ) -> StorageResult<()> {
+        self.txn_manager
+            .auto_increment()
+            .observe(self.inner.as_ref(), table, value)
+            .await
+    }
+
     /// Create a new MVCC storage wrapper
     pub fn new(inner: Arc<dyn StorageEngine>, txn_manager: Arc<TransactionManager>) -> Self {
         Self { inner, txn_manager }
@@ -49,6 +73,54 @@ impl MvccStorage {
     /// Get the underlying storage engine
     pub fn inner(&self) -> &Arc<dyn StorageEngine> {
         &self.inner
+    }
+
+    /// The row locks of this node's transactions.
+    pub fn locks(&self) -> &Arc<super::LockManager> {
+        self.txn_manager.locks()
+    }
+
+    /// The gap `key` lies in: the nearest stored keys on either side of it,
+    /// or `low` / `high` (the ends of its table's key range) where there is
+    /// none. A statement that looked for `key` and found nothing locks this
+    /// gap, so that nothing appears there.
+    ///
+    /// A deleted row counts as a boundary for as long as its marker is
+    /// stored, as a delete-marked record does in InnoDB until it is purged.
+    /// The gap is then narrower than the distance between live rows, which
+    /// is all right: it still surrounds `key`, and any narrower gap blocks
+    /// fewer inserts. It also keeps this to one step each way however many
+    /// deleted rows lie around.
+    pub async fn gap_around(
+        &self,
+        key: &[u8],
+        low: &[u8],
+        high: &[u8],
+    ) -> StorageResult<(Vec<u8>, Vec<u8>)> {
+        let before = self.inner.prev_key(key, low).await?;
+        let after = self.inner.next_key(key, high).await?;
+        Ok((
+            before.unwrap_or_else(|| low.to_vec()),
+            after.unwrap_or_else(|| high.to_vec()),
+        ))
+    }
+
+    /// The row as it stands now: the latest committed version, with the ID
+    /// of the transaction that wrote it, or `None` if the row does not exist
+    /// or has been deleted. Storage holds committed rows only (changes reach
+    /// it when they are applied), so this is simply what is stored. A
+    /// statement that has locked a row reads it this way, not through its
+    /// snapshot: the lock is what makes the latest version the right one.
+    pub async fn get_current(&self, key: &[u8]) -> StorageResult<Option<(Vec<u8>, u64)>> {
+        let Some(encoded) = self.inner.get(key).await? else {
+            return Ok(None);
+        };
+        match Self::decode_row(&encoded) {
+            Some((_, _, true, _)) => Ok(None),
+            Some((txn_id, _, false, data)) => Ok(Some((data.to_vec(), txn_id))),
+            // A row without a header: always there, written by no one.
+            None => Ok(Some((encoded, 0))),
+        }
     }
 
     /// Encode a row with MVCC header
