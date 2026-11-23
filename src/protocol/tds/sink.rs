@@ -2,8 +2,6 @@
 
 use std::any::Any;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::AsyncWrite;
@@ -60,8 +58,6 @@ pub struct TdsSink<W> {
     procedure_failed: bool,
     /// Errors reported since the sink was created
     errors: u64,
-    /// Set by the connection's reader when the client cancels the request
-    cancel: Arc<AtomicBool>,
 }
 
 fn io_error(e: PacketError) -> io::Error {
@@ -72,9 +68,8 @@ fn io_error(e: PacketError) -> io::Error {
 }
 
 impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
-    /// Create a sink writing to `writer`. `cancel` is raised by the
-    /// connection when the client sends an attention signal.
-    pub fn new(writer: W, cancel: Arc<AtomicBool>) -> Self {
+    /// Create a sink writing to `writer`.
+    pub fn new(writer: W) -> Self {
         Self {
             writer: TdsWriter::new(writer),
             buf: Vec::with_capacity(8192),
@@ -87,7 +82,6 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> TdsSink<W> {
             in_procedure: false,
             procedure_failed: false,
             errors: 0,
-            cancel,
         }
     }
 
@@ -216,10 +210,6 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
         true
     }
 
-    fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
-
     fn begin_result_set(&mut self, columns: &[OutputColumn], _schema: &str) {
         self.emit_pending(true);
         self.columns.clear();
@@ -333,10 +323,9 @@ mod tests {
 
     type TestSink = TdsSink<tokio::io::DuplexStream>;
 
-    fn sink() -> (TestSink, tokio::io::DuplexStream, Arc<AtomicBool>) {
+    fn sink() -> (TestSink, tokio::io::DuplexStream) {
         let (server, client) = tokio::io::duplex(1 << 20);
-        let cancel = Arc::new(AtomicBool::new(false));
-        (TdsSink::new(server, cancel.clone()), client, cancel)
+        (TdsSink::new(server), client)
     }
 
     async fn response(client: &mut tokio::io::DuplexStream) -> Vec<u8> {
@@ -365,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn ok_is_a_single_final_done_with_count() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.ok(
             OkInfo {
                 affected_rows: 3,
@@ -382,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn result_set_then_ok_sets_more_on_the_first_done() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.begin_result_set(&int_column(), "");
         sink.row(&Row::new(vec![Datum::Int(7)]));
         sink.row(&Row::new(vec![Datum::Null]));
@@ -401,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn ok_without_a_row_count_has_no_count() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.ok(OkInfo::default(), Status::AUTOCOMMIT);
         sink.finish(false).await.unwrap();
         let tokens = response(&mut client).await;
@@ -411,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_is_followed_by_done_error() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.error(&QueryError::new(1146, "42S02", "Table 't' doesn't exist"));
         sink.finish(false).await.unwrap();
         let tokens = response(&mut client).await;
@@ -422,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn unencodable_value_ends_the_result_set_with_an_error() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.begin_result_set(&int_column(), "");
         sink.row(&Row::new(vec![Datum::Int(1)]));
         sink.row(&Row::new(vec![Datum::String("not a number".into())]));
@@ -440,7 +429,7 @@ mod tests {
     async fn procedure_results_use_doneinproc_and_doneproc() {
         use crate::protocol::tds::token::{TOKEN_RETURNSTATUS, TOKEN_RETURNVALUE};
 
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.begin_procedure();
         sink.ok(
             OkInfo {
@@ -482,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_response_still_ends_with_done() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         assert!(!sink.has_result());
         sink.finish(false).await.unwrap();
         let tokens = response(&mut client).await;
@@ -491,10 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_request_is_acknowledged_in_a_message_of_its_own() {
-        let (mut sink, mut client, cancel) = sink();
-        assert!(!sink.cancelled());
-        cancel.store(true, Ordering::Relaxed);
-        assert!(sink.cancelled());
+        let (mut sink, mut client) = sink();
 
         sink.begin_result_set(&int_column(), "");
         sink.row(&Row::new(vec![Datum::Int(1)]));
@@ -511,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_attention_is_acknowledged_alone() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.acknowledge_attention().await.unwrap();
         let ack = response(&mut client).await;
         assert_eq!(ack.len(), 13);
@@ -520,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_streams_whole_packets_of_one_message() {
-        let (mut sink, mut client, _) = sink();
+        let (mut sink, mut client) = sink();
         sink.begin_result_set(&int_column(), "");
         for i in 0..2000 {
             sink.row(&Row::new(vec![Datum::Int(i)]));

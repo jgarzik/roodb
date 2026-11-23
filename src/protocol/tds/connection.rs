@@ -14,9 +14,9 @@
 //! both transports carry the same TDS 7.4 token stream; statement
 //! execution is delegated to [`QueryEngine`].
 
+use crate::executor::cancel::{reason, Interrupt};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
@@ -168,8 +168,8 @@ pub async fn serve(
     };
 
     // SLEEP and other waits inside a statement end when the client cancels.
-    let cancel = conn.cancel.clone();
-    match crate::executor::cancel::scope(cancel, conn.run()).await {
+    let interrupt = conn.interrupt.clone();
+    match crate::executor::cancel::scope(interrupt, conn.run()).await {
         Ok(()) | Err(TdsError::Packet(PacketError::ConnectionClosed)) => {}
         Err(e) => warn!(%peer_addr, connection_id, error = %e, "TDS connection error"),
     }
@@ -343,12 +343,11 @@ async fn establish(
     }
 
     let (read_half, write_half) = tokio::io::split(tls);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let sink: Sink = TdsSink::new(write_half, cancel.clone());
+    let sink: Sink = TdsSink::new(write_half);
     let mut engine = QueryEngine::new(connection_id, client_ip, ctx, Box::new(sink));
     // T-SQL transactions nest; see `QueryEngine::handle_begin`.
     engine.begin_commits_open = false;
-    engine.session.set_user(login.username.clone());
+    engine.set_user(&login.username);
     // A TDS session is always in some database: the one the login asks
     // for, or the server's default one.
     if login.database.is_empty() {
@@ -360,11 +359,12 @@ async fn establish(
     }
 
     let login_database = engine.session.database.clone();
-    let (requests, reader) = spawn_reader(read_half, cancel.clone());
+    let interrupt = engine.interrupt();
+    let (requests, reader) = spawn_reader(read_half, interrupt.clone());
     let mut conn = TdsConnection {
         connection_id,
         engine,
-        cancel,
+        interrupt,
         requests,
         reader,
         login_database,
@@ -384,7 +384,7 @@ async fn establish(
 /// a statement is still executing.
 fn spawn_reader(
     read_half: ReadHalf<BoxedStream>,
-    cancel: Arc<AtomicBool>,
+    interrupt: Arc<Interrupt>,
 ) -> (mpsc::Receiver<Result<Message, PacketError>>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
     let task = tokio::spawn(async move {
@@ -392,8 +392,14 @@ fn spawn_reader(
         loop {
             let result = reader.read_message(MAX_REQUEST).await;
             let last = result.is_err();
-            if matches!(&result, Ok(m) if m.packet_type == PacketType::Attention) {
-                cancel.store(true, Ordering::Relaxed);
+            match &result {
+                Ok(m) if m.packet_type == PacketType::Attention => {
+                    interrupt.raise(reason::CLIENT_CANCEL);
+                }
+                Ok(_) => {}
+                // The running statement need not go on for a client that
+                // has gone
+                Err(_) => interrupt.raise(reason::CLIENT_GONE),
             }
             if tx.send(result).await.is_err() || last {
                 break;
@@ -407,8 +413,10 @@ fn spawn_reader(
 struct TdsConnection {
     connection_id: u32,
     engine: QueryEngine,
-    /// Raised by the reader when the client cancels the running request
-    cancel: Arc<AtomicBool>,
+    /// Whether the session's work is interrupted: the reader raises the
+    /// client's cancel (attention) and its going away; another session's
+    /// KILL raises its own reasons.
+    interrupt: Arc<Interrupt>,
     requests: mpsc::Receiver<Result<Message, PacketError>>,
     /// The task reading from the socket. It owns the read half, so the
     /// socket only closes once it has stopped.
@@ -598,8 +606,22 @@ impl TdsConnection {
 
     /// Serve requests until the client disconnects.
     async fn run(&mut self) -> Result<(), TdsError> {
-        while let Some(message) = self.requests.recv().await {
+        loop {
+            // A KILL CONNECTION ends the session even while it is idle.
+            let interrupt = self.interrupt.clone();
+            let message = tokio::select! {
+                biased;
+                () = interrupt.killed() => None,
+                message = self.requests.recv() => message,
+            };
+            let Some(message) = message else { break };
             let message = message?;
+            // A KILL QUERY that came between requests has nothing to
+            // interrupt; one that comes during this request stops the rest
+            // of it.
+            if message.packet_type != PacketType::Attention {
+                self.interrupt.take(reason::KILL_QUERY);
+            }
             // A pooled connection's next user asks for a clean session
             // before its first request runs.
             let reset = message.packet_type != PacketType::Attention && message.resets_connection();
@@ -621,7 +643,7 @@ impl TdsConnection {
                 PacketType::Attention => {
                     // Acknowledge unless the request it interrupted
                     // already did.
-                    if self.cancel.swap(false, Ordering::Relaxed) {
+                    if self.interrupt.take(reason::CLIENT_CANCEL) {
                         self.sink().acknowledge_attention().await?;
                     }
                 }
@@ -694,7 +716,7 @@ impl TdsConnection {
     ) -> Result<bool, TdsError> {
         let mut rolled_back = false;
         for statement in split_batch(sql) {
-            if self.cancel.load(Ordering::Relaxed) {
+            if self.interrupt.is_raised() {
                 break;
             }
             let errors_before = self.sink().error_count();
@@ -784,7 +806,7 @@ impl TdsConnection {
         };
         let mut rolled_back = false;
         for call in calls {
-            if self.cancel.load(Ordering::Relaxed) {
+            if self.interrupt.is_raised() {
                 break;
             }
             self.sink().begin_procedure();
@@ -1134,8 +1156,14 @@ impl TdsConnection {
         before: Environment,
         rolled_back: bool,
     ) -> Result<(), TdsError> {
+        // A killed connection ends without the request's response; the
+        // loop then closes it.
+        if self.interrupt.has(reason::KILL_CONNECTION) {
+            return Ok(());
+        }
         let after = self.environment();
-        let cancelled = self.cancel.swap(false, Ordering::Relaxed);
+        // Only a cancel the client asked for is acknowledged.
+        let cancelled = self.interrupt.take(reason::CLIENT_CANCEL);
         let sink = self.sink();
         let tokens = sink.tokens();
 

@@ -174,6 +174,8 @@ Only `root` can log in, and `root` bypasses every check.
 - The privilege model: database-level grants that do not depend on the
   session's current database, the full set of MySQL privileges, `SUPER` in
   place of the name `root`.
+  - `KILL` of another user's connection: `CONNECTION_ADMIN` or `SUPER`
+    (now the name `root`).
 - Enforcement at one choke point for planned statements, and in every
   statement handled outside the planner (ALTER, views, procedures,
   functions, triggers, databases, `LOAD DATA`, `SET GLOBAL`).
@@ -445,12 +447,21 @@ finds. Known already, from an audit of SQL.md against a running server:
 
 **Session and metadata**
 - `SHOW WARNINGS` is always empty; `SHOW VARIABLES` and `SHOW PROCESSLIST`
-  are empty.
+  are empty: the ID `KILL` takes comes only from that session's
+  `CONNECTION_ID()` or `@@SPID` (the registry of open connections,
+  `server/connections.rs`, has what PROCESSLIST lists).
 - `USER()` and `CURRENT_USER()` return an empty user name.
 - `COUNT(*)` is labelled `COUNT(NULL)` in result headers.
-- `SLEEP()` returns at once.
 - Errors raised while rows are being returned come back as 1690.
 - `SET` of an unknown variable is accepted silently.
+
+**Protocol and interruption**
+- `COM_STMT_SEND_LONG_DATA` is answered with an error, which breaks the
+  exchange (it takes no reply); `COM_CHANGE_USER` is refused.
+- An unknown command byte closes the connection without an error packet.
+- `KILL` and a client that goes away stop a statement only between result
+  rows and inside `SLEEP`: DML, lock waits, and work before the first row
+  run to their end.
 
 ---
 

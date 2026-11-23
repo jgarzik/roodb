@@ -6,7 +6,7 @@
 
 mod login;
 mod query;
-mod raw;
+pub mod raw;
 mod requests;
 mod rpc;
 mod shims;

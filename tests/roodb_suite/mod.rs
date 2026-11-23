@@ -17,6 +17,7 @@ pub mod ddl;
 pub mod dml;
 pub mod edge_cases;
 pub mod errors;
+pub mod kill;
 pub mod locking;
 pub mod metadata_locks;
 pub mod prepared;

@@ -19,11 +19,15 @@ pub use handshake::status_flags;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::executor::cancel::{self, reason, Interrupt};
 use crate::server::auth::AuthError;
 use crate::server::context::ServerContext;
 use crate::server::limits::MAX_PREAUTH_MESSAGE;
@@ -47,8 +51,9 @@ pub struct RooDbConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
-    /// Packet reader (buffered to reduce syscalls)
-    reader: PacketReader<BufReader<ReadHalf<S>>>,
+    /// Packet reader (buffered to reduce syscalls), until the login is
+    /// done; then it moves to the reader task (`spawn_reader`).
+    reader: Option<PacketReader<BufReader<ReadHalf<S>>>>,
     /// Connection ID
     connection_id: u32,
     /// Scramble from handshake
@@ -81,7 +86,7 @@ where
         let mut reader = PacketReader::new(BufReader::with_capacity(8192, read_half));
         reader.set_max_payload(MAX_PREAUTH_MESSAGE);
         RooDbConnection {
-            reader,
+            reader: Some(reader),
             connection_id,
             scramble,
             client_capabilities: 0,
@@ -116,8 +121,9 @@ where
 
         // Read client's handshake response (sent over TLS)
         // After SSL upgrade, client re-sends with sequence 2
-        self.reader.set_sequence(2);
-        let response_packet = self.reader.read_packet().await?;
+        let reader = self.login_reader();
+        reader.set_sequence(2);
+        let response_packet = reader.read_packet().await?;
 
         let response = HandshakeResponse41::parse(&response_packet)?;
         self.client_capabilities = response.capability_flags;
@@ -205,8 +211,8 @@ where
         }
 
         // Set authenticated user in session
-        self.engine.session.set_user(response.username.clone());
-        self.reader.set_max_payload(MAX_TOTAL_PAYLOAD_SIZE);
+        self.engine.set_user(&response.username);
+        self.login_reader().set_max_payload(MAX_TOTAL_PAYLOAD_SIZE);
 
         // A session may begin in a database, which must be there (an empty
         // name is none).
@@ -232,31 +238,60 @@ where
     /// fails. Either way the session ends here: an open transaction is
     /// rolled back and its temporary tables are dropped. (They are named in
     /// the shared catalog; a name left behind could never be used again.)
+    ///
+    /// Commands are read on a task of their own, so that a client that
+    /// goes away is noticed while a statement runs; the connection runs
+    /// inside its engine's interruption scope, so that the statement can
+    /// stop.
     pub async fn run(&mut self) -> ProtocolResult<()> {
-        let result = self.command_loop().await;
+        let interrupt = self.engine.interrupt();
+        let reader = self
+            .reader
+            .take()
+            .expect("a connection runs once, after its login");
+        let (requests, reader_task) = spawn_reader(reader, interrupt.clone());
+        let result =
+            cancel::scope(interrupt.clone(), self.command_loop(requests, &interrupt)).await;
+        reader_task.abort();
         self.engine.reset_session(false).await;
         result
     }
 
-    async fn command_loop(&mut self) -> ProtocolResult<()> {
+    /// The packet reader, during the login.
+    fn login_reader(&mut self) -> &mut PacketReader<BufReader<ReadHalf<S>>> {
+        self.reader
+            .as_mut()
+            .expect("the login reads before the connection runs")
+    }
+
+    async fn command_loop(
+        &mut self,
+        mut requests: mpsc::Receiver<ProtocolResult<Vec<u8>>>,
+        interrupt: &Interrupt,
+    ) -> ProtocolResult<()> {
         let mut last_cmd_end = Instant::now();
         loop {
-            // Reset sequence for each command
-            self.reader.reset_sequence();
-
             debug!(
                 connection_id = self.connection_id,
                 "Waiting for next command"
             );
 
-            // Read command packet
-            let packet = match self.reader.read_packet().await {
-                Ok(p) => p,
-                Err(ProtocolError::ConnectionClosed) => {
+            // The next command, unless the connection is killed first
+            let packet = tokio::select! {
+                biased;
+                () = interrupt.killed() => {
+                    debug!(connection_id = self.connection_id, "Connection killed");
+                    return Ok(());
+                }
+                packet = requests.recv() => packet,
+            };
+            let packet = match packet {
+                Some(Ok(p)) => p,
+                Some(Err(ProtocolError::ConnectionClosed)) | None => {
                     debug!(connection_id = self.connection_id, "Client disconnected");
                     return Ok(());
                 }
-                Err(e) => return Err(e),
+                Some(Err(e)) => return Err(e),
             };
 
             let read_wait_ns = metrics::elapsed_ns(last_cmd_end);
@@ -270,7 +305,14 @@ where
             };
             self.out().start_command(format);
 
-            match self.handle_command(cmd).await {
+            let handled = self.handle_command(cmd).await;
+            // A killed connection ends without its statement's result, as
+            // in MySQL: the client sees the connection lost.
+            if interrupt.has(reason::KILL_CONNECTION) {
+                debug!(connection_id = self.connection_id, "Connection killed");
+                return Ok(());
+            }
+            match handled {
                 Ok(true) => {
                     self.out().finish().await?;
                     let cmd_ns = metrics::elapsed_ns(cmd_start);
@@ -388,6 +430,15 @@ where
                 self.engine.reset_session(false).await;
                 self.param_types.clear();
                 self.engine.send_ok().await?;
+                Ok(true)
+            }
+
+            ParsedCommand::ProcessKill(id) => {
+                // As KILL CONNECTION id
+                match self.engine.kill(u64::from(id), false) {
+                    Ok(()) => self.engine.send_ok().await?,
+                    Err(e) => self.engine.out.error(&e),
+                }
                 Ok(true)
             }
 
@@ -514,6 +565,35 @@ where
 
         self.engine.execute_prepared(statement_id, &params).await
     }
+}
+
+/// Read the client's commands on a task of their own, handing them over
+/// one at a time. A read that fails, the client having gone, interrupts
+/// the statement then running: nothing would read its result.
+fn spawn_reader<R>(
+    mut reader: PacketReader<R>,
+    interrupt: Arc<Interrupt>,
+) -> (mpsc::Receiver<ProtocolResult<Vec<u8>>>, JoinHandle<()>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        loop {
+            // After the login every client message is a command, and a
+            // command starts a new packet sequence.
+            reader.reset_sequence();
+            let result = reader.read_packet().await;
+            let last = result.is_err();
+            if last {
+                interrupt.raise(reason::CLIENT_GONE);
+            }
+            if tx.send(result).await.is_err() || last {
+                break;
+            }
+        }
+    });
+    (rx, task)
 }
 
 #[cfg(test)]

@@ -138,6 +138,9 @@ cargo test --release test_name                       # one test, any binary
   catching up by log and by snapshot, removing a node.
 - `locking.rs`: row locking between connections, each test on a server of
   its own.
+- `kill.rs`: `KILL`, `COM_PROCESS_KILL` (through a small hand-written
+  RooDB-protocol client over TLS) and clients that disconnect in the middle
+  of a statement, on both protocols, against the shared server.
 - `raft_cluster.rs`, `cluster/`: Raft behaviour (bootstrap, election, log
   replication, follower reads), using `RaftNode` instances inside the test
   process, including three-node clusters.
