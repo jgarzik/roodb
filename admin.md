@@ -214,8 +214,12 @@ drivers issue by themselves are understood in addition:
   for a long time before returning its first row finishes that work first.
 - Tested with the `tiberius` client on both transports, and in CI with
   Microsoft ODBC Driver 18 for SQL Server through `sqlcmd` (connect,
-  batches, DDL, DML, transactions) on both transports. Microsoft's .NET and
-  JDBC drivers have not been verified yet.
+  batches, DDL, DML, transactions) on both transports. Microsoft's JDBC
+  driver (13.6) and .NET `Microsoft.Data.SqlClient` (7.1) have been checked
+  by hand, not in CI, on both transports: statements and update counts,
+  typed and prepared parameters, result types, several result sets,
+  transactions, errors, pooled connection reset, and (.NET)
+  `ChangeDatabase`.
 
 ### Type mapping
 

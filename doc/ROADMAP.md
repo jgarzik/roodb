@@ -82,6 +82,10 @@ below changes.
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
+   - Protect only the system's own tables: today every table in database
+     `mysql` counts as one, so a table a user creates there cannot be
+     dropped. A TDS login that names no database starts in `mysql`, so
+     .NET and JDBC users meet this first.
 5. The schema-change job runner (its record replicated; a new primary
    carries on; cancelled, and rolled back, when its client goes away),
    and with it the online rebuild of a table under a new ID. From here
