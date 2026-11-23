@@ -1045,7 +1045,7 @@ impl Executor for Materialize {
 
 // ============ CREATE VIEW / DROP VIEW ============
 
-/// CREATE VIEW executor
+// CREATE VIEW executor
 // CreateView and DropView executors removed — views are now handled
 // at the protocol level with Raft persistence (handle_create_view_raft/handle_drop_view_raft).
 

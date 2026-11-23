@@ -8111,53 +8111,53 @@ mod tests {
     fn test_extraction_functions() {
         let dt = Datum::String("2024-03-23 14:30:45".to_string());
         assert_eq!(
-            eval_function("HOUR", &[dt.clone()], None).unwrap(),
+            eval_function("HOUR", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(14)
         );
         assert_eq!(
-            eval_function("MINUTE", &[dt.clone()], None).unwrap(),
+            eval_function("MINUTE", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(30)
         );
         assert_eq!(
-            eval_function("SECOND", &[dt.clone()], None).unwrap(),
+            eval_function("SECOND", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(45)
         );
         assert_eq!(
-            eval_function("YEAR", &[dt.clone()], None).unwrap(),
+            eval_function("YEAR", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(2024)
         );
         assert_eq!(
-            eval_function("MONTH", &[dt.clone()], None).unwrap(),
+            eval_function("MONTH", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(3)
         );
         assert_eq!(
-            eval_function("DAY", &[dt.clone()], None).unwrap(),
+            eval_function("DAY", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(23)
         );
         assert_eq!(
-            eval_function("DAYOFMONTH", &[dt.clone()], None).unwrap(),
+            eval_function("DAYOFMONTH", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(23)
         );
         // 2024-03-23 is Saturday
         assert_eq!(
-            eval_function("DAYOFWEEK", &[dt.clone()], None).unwrap(),
+            eval_function("DAYOFWEEK", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(7)
         ); // 7=Sat
         assert_eq!(
-            eval_function("WEEKDAY", &[dt.clone()], None).unwrap(),
+            eval_function("WEEKDAY", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(5)
         ); // 5=Sat
         assert_eq!(
-            eval_function("DAYNAME", &[dt.clone()], None).unwrap(),
+            eval_function("DAYNAME", std::slice::from_ref(&dt), None).unwrap(),
             Datum::String("Saturday".to_string())
         );
         assert_eq!(
-            eval_function("MONTHNAME", &[dt.clone()], None).unwrap(),
+            eval_function("MONTHNAME", std::slice::from_ref(&dt), None).unwrap(),
             Datum::String("March".to_string())
         );
         // Day 83 of 2024 (leap year)
         assert_eq!(
-            eval_function("DAYOFYEAR", &[dt.clone()], None).unwrap(),
+            eval_function("DAYOFYEAR", std::slice::from_ref(&dt), None).unwrap(),
             Datum::Int(83)
         );
         assert_eq!(
@@ -8247,7 +8247,7 @@ mod tests {
     fn test_date_and_time_extract() {
         let dt = Datum::String("2024-03-23 14:30:45".to_string());
         assert_eq!(
-            eval_function("DATE", &[dt.clone()], None).unwrap(),
+            eval_function("DATE", std::slice::from_ref(&dt), None).unwrap(),
             Datum::String("2024-03-23".to_string())
         );
         assert_eq!(

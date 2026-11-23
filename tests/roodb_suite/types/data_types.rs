@@ -746,8 +746,8 @@ async fn test_bool_alias_type() {
         .await
         .expect("SELECT failed");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, false);
-    assert_eq!(rows[1].0, true);
+    assert!(!rows[0].0);
+    assert!(rows[1].0);
 
     conn.query_drop("DROP TABLE type_bool_alias_tbl")
         .await
@@ -850,7 +850,7 @@ async fn test_double_unsigned_type() {
         .await
         .expect("CREATE TABLE failed");
 
-    conn.query_drop("INSERT INTO type_dbl_uns_tbl (val) VALUES (3.14), (2.71)")
+    conn.query_drop("INSERT INTO type_dbl_uns_tbl (val) VALUES (3.25), (2.71)")
         .await
         .expect("INSERT failed");
 
@@ -860,7 +860,7 @@ async fn test_double_unsigned_type() {
         .expect("SELECT failed");
     assert_eq!(rows.len(), 2);
     assert!((rows[0].0 - 2.71).abs() < 1e-10);
-    assert!((rows[1].0 - 3.14).abs() < 1e-10);
+    assert!((rows[1].0 - 3.25).abs() < 1e-10);
 
     conn.query_drop("DROP TABLE type_dbl_uns_tbl")
         .await
