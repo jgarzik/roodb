@@ -21,6 +21,15 @@ default, so CI runs the tests once more there with `ROODB_IO_BACKEND=posix`.
 A further Linux job starts the server with a TDS port and connects to it with
 `sqlcmd` over Microsoft ODBC Driver 18, on both TDS transports.
 
+`.github/workflows/windows-installer.yml` builds the Windows MSI from
+`packaging/windows/roodb.wxs` with WiX (pinned version), then on a clean
+Windows runner installs it, initialises a data directory, writes and reads
+rows through the installed server with the runner's `mysql.exe` (over TLS),
+restarts it and reads them again, and uninstalls. Every run uploads the MSI
+(`roodb-msi`) and the msiexec and server logs (`smoke-logs`); read them with
+`gh run download`. Locally, check the `.wxs` is well-formed XML; the MSI is
+only built on the runner.
+
 Every commit also updates the documentation it affects, so that no document
 goes stale.
 
@@ -138,6 +147,9 @@ cargo test --release test_name                       # one test, any binary
   catching up by log and by snapshot, removing a node.
 - `locking.rs`: row locking between connections, each test on a server of
   its own.
+- `kill.rs`: `KILL`, `COM_PROCESS_KILL` (through a small hand-written
+  RooDB-protocol client over TLS) and clients that disconnect in the middle
+  of a statement, on both protocols, against the shared server.
 - `raft_cluster.rs`, `cluster/`: Raft behaviour (bootstrap, election, log
   replication, follower reads), using `RaftNode` instances inside the test
   process, including three-node clusters.

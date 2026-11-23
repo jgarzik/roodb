@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod conn_threads;
+pub mod connections;
 pub mod context;
 pub mod handler;
 pub mod limits;

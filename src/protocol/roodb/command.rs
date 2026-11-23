@@ -144,6 +144,8 @@ pub enum ParsedCommand {
     StmtReset(u32),
     /// COM_RESET_CONNECTION
     ResetConnection,
+    /// COM_PROCESS_KILL with the connection ID to end
+    ProcessKill(u32),
     /// Unsupported command
     Unsupported(Command),
 }
@@ -219,6 +221,16 @@ pub fn parse_command(packet: &[u8]) -> ProtocolResult<ParsedCommand> {
         }
 
         Command::ResetConnection => Ok(ParsedCommand::ResetConnection),
+
+        Command::ProcessKill => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::InvalidPacket(
+                    "PROCESS_KILL too short".to_string(),
+                ));
+            }
+            let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Ok(ParsedCommand::ProcessKill(id))
+        }
 
         _ => Ok(ParsedCommand::Unsupported(cmd)),
     }

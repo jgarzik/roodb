@@ -342,6 +342,18 @@ MySQL-compatible wire protocol (branded as RooDB, version `8.0.0-RooDB`).
 - `COM_INIT_DB` (0x02): USE database
 - `COM_RESET_CONNECTION` (0x1f): Reset session
 - `COM_STMT_PREPARE` / `COM_STMT_EXECUTE` / `COM_STMT_CLOSE`: Prepared statements
+- `COM_PROCESS_KILL` (0x0c): `KILL CONNECTION id`
+
+**Interruption**: each connection has an `Interrupt`
+(`executor/cancel.rs`): reasons raised by the client's cancel (TDS
+attention), by `KILL QUERY` / `KILL CONNECTION` from any session (through
+the registry of open connections, `server/connections.rs`, keyed by the
+connection ID both protocols share), and by the client going away. Both
+protocols read requests on a task of their own, so a disconnect is seen
+while a statement runs. The engine checks the interrupt between result
+rows; `SLEEP` waits in slices and checks it through a task-local set for
+the connection (`cancel::scope`); a killed connection's idle loop wakes on
+it and closes without sending the statement's result.
 
 **Additional Files**:
 - `prepared.rs` — Prepared statement lifecycle (prepare, execute, close)

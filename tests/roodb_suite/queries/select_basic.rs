@@ -345,3 +345,40 @@ async fn test_in_list_with_null() {
     drop(conn);
     server.shutdown().await;
 }
+
+fn error_code(e: &mysql_async::Error) -> u16 {
+    match e {
+        mysql_async::Error::Server(e) => e.code,
+        other => panic!("expected a server error, got {other:?}"),
+    }
+}
+
+/// SLEEP(n) waits at least n seconds and returns 0; a NULL or negative
+/// argument is refused (MySQL's strict mode).
+#[tokio::test]
+async fn test_sleep() {
+    let server = TestServer::start("select_sleep").await;
+    let mut conn = server.connect().await;
+
+    let started = std::time::Instant::now();
+    let slept: Option<i64> = conn.query_first("SELECT SLEEP(0.3)").await.unwrap();
+    assert_eq!(slept, Some(0));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "returned after {:?}",
+        started.elapsed()
+    );
+
+    let slept: Option<i64> = conn.query_first("SELECT SLEEP(0)").await.unwrap();
+    assert_eq!(slept, Some(0));
+    let slept: Option<i64> = conn.query_first("SELECT SLEEP('0.01')").await.unwrap();
+    assert_eq!(slept, Some(0));
+
+    for sql in ["SELECT SLEEP(NULL)", "SELECT SLEEP(-1)"] {
+        let e = conn.query_drop(sql).await.unwrap_err();
+        assert_eq!(error_code(&e), 1210, "{sql}: {e}");
+    }
+
+    drop(conn);
+    server.shutdown().await;
+}

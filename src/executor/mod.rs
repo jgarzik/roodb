@@ -6,6 +6,7 @@
 pub mod aggregate;
 pub mod analyze;
 pub mod auth;
+pub mod cancel;
 pub mod context;
 pub mod datum;
 pub mod ddl;

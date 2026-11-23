@@ -3228,8 +3228,23 @@ pub fn eval_function(
         }
 
         "SLEEP" => {
-            // SLEEP(seconds) — for compatibility, return 0 immediately
-            Ok(Datum::Int(0))
+            // SLEEP(seconds): 0 after the wait, 1 if the request was
+            // cancelled first. NULL or negative is refused, as in strict
+            // mode.
+            let bad = || ExecutorError::InvalidOperation("Incorrect arguments to sleep".into());
+            if args.len() != 1 {
+                return Err(bad());
+            }
+            let seconds = match &args[0] {
+                Datum::String(s) => s.trim().parse::<f64>().map_err(|_| bad())?,
+                other => other.as_float().ok_or_else(bad)?,
+            };
+            if seconds.is_nan() || seconds < 0.0 {
+                return Err(bad());
+            }
+            // Too long to represent is as good as forever
+            let duration = std::time::Duration::try_from_secs_f64(seconds).ok();
+            Ok(Datum::Int(i64::from(super::cancel::wait(duration))))
         }
 
         "CONNECTION_ID" => Ok(Datum::Int(get_connection_id(vars) as i64)),

@@ -11,12 +11,14 @@ use super::{OkCommand, OkInfo, QueryError, ResponseSink, Status};
 use crate::catalog::system_tables::SYSTEM_PROCEDURES;
 use crate::catalog::TableName;
 use crate::catalog::{Catalog, ParamMode, ProcedureDef, ProcedureParam};
+use crate::executor::cancel::{reason, Interrupt};
 use crate::executor::engine::ExecutorEngine;
 use crate::executor::{Datum, Executor, TransactionContext};
 use crate::planner::logical::builder::LogicalPlanBuilder;
 use crate::planner::optimizer::Optimizer;
 use crate::planner::physical::{PhysicalPlan, PhysicalPlanner};
 use crate::raft::{ChangeSet, RaftNode, RowChange};
+use crate::server::connections::{Connections, Registration};
 use crate::server::context::ServerContext;
 use crate::server::session::Session;
 use crate::server::temp_store::SessionStorage;
@@ -101,6 +103,12 @@ pub struct QueryEngine {
     catalog_version: Arc<std::sync::atomic::AtomicU64>,
     /// Where results are reported
     pub(crate) out: Box<dyn ResponseSink>,
+    /// Whether this connection's work is interrupted, and why
+    interrupt: Arc<Interrupt>,
+    /// Every open connection, for `KILL`
+    connections: Arc<Connections>,
+    /// This connection's place among them
+    registration: Registration,
 }
 
 /// What a plan was made from: the stored tables and the views it uses,
@@ -317,7 +325,12 @@ impl QueryEngine {
         session.lock_wait_timeout = ctx.txn_manager.locks().default_wait();
         session.metadata_lock_wait = ctx.txn_manager.metadata_locks().default_wait();
         session.init_eval_flags();
+        let interrupt = Interrupt::new();
+        let registration = ctx.connections.register(connection_id, interrupt.clone());
         Self {
+            interrupt,
+            connections: ctx.connections.clone(),
+            registration,
             connection_id,
             client_ip,
             storage: ctx.storage.clone(),
@@ -339,6 +352,65 @@ impl QueryEngine {
             out,
         }
     }
+
+    /// This connection's interruption state: its protocol raises the
+    /// client's cancel and the client's going away on it, and runs the
+    /// connection inside its scope (`executor::cancel::scope`).
+    pub fn interrupt(&self) -> Arc<Interrupt> {
+        self.interrupt.clone()
+    }
+
+    /// The user the session logged in as.
+    pub fn set_user(&mut self, user: &str) {
+        self.session.set_user(user.to_string());
+        self.registration.set_user(user);
+    }
+
+    /// `KILL [CONNECTION | QUERY] id`, also `COM_PROCESS_KILL`: interrupt
+    /// another connection's statement, or end the connection. A user may
+    /// kill their own connections; `root` (in place of MySQL's
+    /// CONNECTION_ADMIN or SUPER) any.
+    pub fn kill(&mut self, id: u64, query_only: bool) -> Result<(), QueryError> {
+        let Some(target) = self.connections.get(id) else {
+            return Err(QueryError::new(
+                codes::ER_NO_SUCH_THREAD,
+                states::GENERAL_ERROR,
+                format!("Unknown thread id: {id}"),
+            ));
+        };
+        if target.user != self.session.user && self.session.user != "root" {
+            return Err(QueryError::new(
+                codes::ER_KILL_DENIED_ERROR,
+                states::GENERAL_ERROR,
+                format!("You are not owner of thread {id}"),
+            ));
+        }
+        target.interrupt.raise(if query_only {
+            reason::KILL_QUERY
+        } else {
+            reason::KILL_CONNECTION
+        });
+        if u64::from(self.connection_id) == id {
+            // The statement interrupted is this one
+            return Err(interrupted());
+        }
+        Ok(())
+    }
+
+    /// A statement a client sent is starting: a `KILL QUERY` that came
+    /// while none was running has nothing to interrupt.
+    fn start_statement(&mut self) {
+        self.interrupt.take(reason::KILL_QUERY);
+    }
+}
+
+/// MySQL's error for a statement a `KILL` interrupted.
+fn interrupted() -> QueryError {
+    QueryError::new(
+        codes::ER_QUERY_INTERRUPTED,
+        "70100",
+        "Query execution was interrupted",
+    )
 }
 
 impl QueryEngine {
@@ -348,6 +420,7 @@ impl QueryEngine {
         statement_id: u32,
         params: &[Datum],
     ) -> ProtocolResult<()> {
+        self.start_statement();
         let result = match self.execute_prepared_statement(statement_id, params).await {
             // As for a statement sent as text: its failure is reported,
             // and the session goes on.
@@ -556,9 +629,30 @@ impl QueryEngine {
 
         let mut row_error = None;
         let mut row_count = 0u64;
+        let mut killed = false;
         loop {
-            if self.out.cancelled() {
-                break;
+            if self.interrupt.is_raised() {
+                // A client's own cancel, or a client that went away, just
+                // stops the statement.
+                if !self.interrupt.has(reason::KILLED) {
+                    break;
+                }
+                // A KILL fails it with ER_QUERY_INTERRUPTED, as in MySQL,
+                // unless it has no rows left, or the next row came from a
+                // SLEEP the KILL cut short (which returns 1 instead).
+                self.interrupt.take_sleep_interrupted();
+                match executor.next().await {
+                    Ok(None) => break,
+                    Ok(Some(row)) if self.interrupt.take_sleep_interrupted() => {
+                        row_count += 1;
+                        self.out.row(&row);
+                        continue;
+                    }
+                    Ok(Some(_)) | Err(_) => {
+                        killed = true;
+                        break;
+                    }
+                }
             }
             match executor.next().await {
                 Ok(Some(row)) => {
@@ -579,7 +673,9 @@ impl QueryEngine {
         self.session
             .set_user_variable("__sys_found_rows", Datum::Int(row_count as i64));
 
-        if let Some(e) = row_error {
+        if killed {
+            self.out.error(&interrupted());
+        } else if let Some(e) = row_error {
             let msg = e.to_string();
             let (code, state) =
                 if msg.contains("Incorrect arguments") || msg.contains("Wrong arguments") {
@@ -613,6 +709,7 @@ impl QueryEngine {
     /// failure to its caller, which a procedure running a statement of its
     /// body needs.)
     pub(crate) async fn handle_statement(&mut self, sql: &str) -> ProtocolResult<()> {
+        self.start_statement();
         let result = match self.handle_query(sql).await {
             Err(e) if e.fails_statement_only() => {
                 debug!(error = %e, "Statement failed");
@@ -866,6 +963,10 @@ impl QueryEngine {
             },
             // CreateFunc handled via text intercept
             Call(sqlparser::ast::Function),
+            Kill {
+                id: u64,
+                query_only: bool,
+            },
             Continue(Box<sqlparser::ast::Statement>),
         }
 
@@ -914,12 +1015,25 @@ impl QueryEngine {
                 }
                 // CREATE FUNCTION handled via text intercept above
                 S::Call(func) => Intercept::Call(func),
+                S::Kill { modifier, id } => Intercept::Kill {
+                    id,
+                    query_only: matches!(modifier, Some(sqlparser::ast::KillType::Query)),
+                },
                 other => Intercept::Continue(Box::new(other)),
             }
         };
 
         let stmt = match action {
             Intercept::NoOp => return self.send_ok().await,
+            Intercept::Kill { id, query_only } => {
+                return match self.kill(id, query_only) {
+                    Ok(()) => self.send_ok().await,
+                    Err(e) => {
+                        self.out.error(&e);
+                        Ok(())
+                    }
+                };
+            }
             Intercept::CreateProc {
                 name,
                 params,

@@ -210,8 +210,9 @@ drivers issue by themselves are understood in addition:
   XML and `sql_variant` parameters.
 - No SQL Server catalog views (`sys.*`), so tools that browse the catalog,
   such as the SSMS object explorer, will not work.
-- Cancellation takes effect between result rows; a statement that works
-  for a long time before returning its first row finishes that work first.
+- Cancellation takes effect between result rows, and ends a `SLEEP` at
+  once; a statement that works for a long time before returning its first
+  row otherwise finishes that work first.
 - Tested with the `tiberius` client on both transports, and in CI with
   Microsoft ODBC Driver 18 for SQL Server through `sqlcmd` (connect,
   batches, DDL, DML, transactions) on both transports. Microsoft's JDBC
@@ -606,7 +607,7 @@ Query system tables for metadata (read-only, managed by SQL commands):
 | `mysql.roles` | Role definitions |
 | `mysql.role_grants` | Role-to-user assignments |
 
-**Lock monitoring:** `SHOW STATUS LIKE 'Innodb_row_lock_current_waits'` reports how many statements are waiting for a row lock right now; `Roodb_row_locks` and `Roodb_gap_locks` report how many locks are held. `innodb_lock_wait_timeout` (seconds, default 50) bounds a wait; set it per session, or with `SET GLOBAL` for sessions that connect afterwards. A schema change (`ALTER TABLE`, `DROP TABLE`, ...) waits for every transaction that has used its table, and holds back statements that come to the table after it: a transaction left open keeps a schema change, and then everyone behind it, waiting. `Roodb_metadata_lock_waits` reports how many statements wait for such a lock, `Roodb_metadata_locks` how many are held around a schema change (the ordinary lock of a statement on a table nobody is changing is not counted). `lock_wait_timeout` (seconds, default a year) bounds that wait, set the same two ways.
+**Lock monitoring:** `SHOW STATUS LIKE 'Innodb_row_lock_current_waits'` reports how many statements are waiting for a row lock right now; `Roodb_row_locks` and `Roodb_gap_locks` report how many locks are held. `innodb_lock_wait_timeout` (seconds, default 50) bounds a wait; set it per session, or with `SET GLOBAL` for sessions that connect afterwards. A schema change (`ALTER TABLE`, `DROP TABLE`, ...) waits for every transaction that has used its table, and holds back statements that come to the table after it: a transaction left open keeps a schema change, and then everyone behind it, waiting. `Roodb_metadata_lock_waits` reports how many statements wait for such a lock, `Roodb_metadata_locks` how many are held around a schema change (the ordinary lock of a statement on a table nobody is changing is not counted). `lock_wait_timeout` (seconds, default a year) bounds that wait, set the same two ways. A session that holds others up can be ended with `KILL id`, which rolls back its transaction and releases its locks (`id` from that session's `CONNECTION_ID()`, or `@@SPID` over TDS; `SHOW PROCESSLIST` does not list sessions yet).
 
 **Note:** `SHOW STATUS` reports nothing else yet, and `SHOW PROCESSLIST` is empty.
 

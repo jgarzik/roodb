@@ -189,6 +189,9 @@ pub mod codes {
     pub const ER_BLOB_CANT_HAVE_DEFAULT: u16 = 1101;
     pub const ER_TOO_BIG_FIELDLENGTH: u16 = 1074;
     pub const ER_WRONG_ARGUMENTS: u16 = 1210;
+    pub const ER_NO_SUCH_THREAD: u16 = 1094;
+    pub const ER_KILL_DENIED_ERROR: u16 = 1095;
+    pub const ER_QUERY_INTERRUPTED: u16 = 1317;
     pub const ER_TOO_BIG_DISPLAYWIDTH: u16 = 1425;
     pub const ER_TOO_BIG_SCALE: u16 = 1427;
     pub const ER_WARN_DATA_OUT_OF_RANGE: u16 = 1264;

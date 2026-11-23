@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RooDB Windows installer (WiX v4+ schema; built with WiX 7, see
+  .github/workflows/windows-installer.yml).
+
+  Installs roodb.exe and roodb_init.exe into %ProgramFiles%\RooDB and adds
+  that directory to the system PATH. It creates no database, configuration,
+  certificate or service: those belong to the operator, and nothing the
+  installer does touches them, so uninstalling leaves them in place.
+
+  Build variables (wix build -d Name=value):
+    Version  the product version, from Cargo.toml (major.minor.patch)
+    BinDir   the directory holding the release binaries
+    RepoDir  the repository root (for LICENSE)
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="RooDB"
+      Manufacturer="RooDB"
+      Version="$(var.Version)"
+      UpgradeCode="20708637-E322-467B-85BA-646D5D5209FD"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <!-- Every version replaces the one installed; an older one is refused. -->
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of RooDB is already installed. Uninstall it first to install this one." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RooDB" />
+    </StandardDirectory>
+
+    <Feature Id="Server" Title="RooDB server">
+      <ComponentGroupRef Id="ServerFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="ServerFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Id="roodb.exe" Source="$(var.BinDir)\roodb.exe" KeyPath="yes" />
+        <!-- The install directory on the system PATH, removed on uninstall -->
+        <Environment
+            Id="PATH"
+            Name="PATH"
+            Value="[INSTALLFOLDER]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+      </Component>
+      <Component>
+        <File Id="roodb_init.exe" Source="$(var.BinDir)\roodb_init.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Id="LICENSE.txt" Source="$(var.RepoDir)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

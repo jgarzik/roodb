@@ -1,0 +1,231 @@
+name: Windows installer
+
+# Build the Windows MSI (packaging/windows/roodb.wxs) and check the installed
+# product on a clean runner: install, initialise, serve an authenticated
+# write and read across a restart, uninstall. Every run uploads the MSI and
+# its logs, pass or fail.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  WIX_VERSION: 7.0.1
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bins
+
+      - name: Product version
+        id: version
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'roodb').version
+          if (-not $version) { throw 'no version in Cargo.toml' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "RooDB $version"
+
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix --version
+
+      - name: Build the MSI
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $msi = "roodb-$version-x64.msi"
+          wix build -acceptEula wix7 -arch x64 `
+            -d "Version=$version" `
+            -d "BinDir=$PWD\target\release" `
+            -d "RepoDir=$PWD" `
+            -o $msi packaging\windows\roodb.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item $msi | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roodb-msi
+          path: roodb-*-x64.msi
+          if-no-files-found: error
+
+  smoke:
+    needs: msi
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ROODB_ROOT_PASSWORD: Ci-win-Passw0rd
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: roodb-msi
+          path: msi
+
+      - name: Set up
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'roodb-smoke'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          "WORK=$work" >> $env:GITHUB_ENV
+          "MSI=$((Get-ChildItem msi\*.msi | Select-Object -First 1).FullName)" >> $env:GITHUB_ENV
+          "INSTALL_DIR=$(Join-Path $env:ProgramFiles 'RooDB')" >> $env:GITHUB_ENV
+
+          # The MySQL client that comes with the runner image
+          $mysql = (Get-Command mysql.exe -ErrorAction SilentlyContinue).Source
+          if (-not $mysql) {
+            $mysql = Get-ChildItem 'C:\Program Files\MySQL' -Recurse -Filter mysql.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mysql) { throw 'mysql.exe not found on the runner' }
+          & $mysql --version
+          "MYSQL=$mysql" >> $env:GITHUB_ENV
+          openssl version
+
+      - name: Install the MSI
+        run: |
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$env:MSI`"", '/qn', '/l*v', "`"$env:WORK\install.log`"")
+          Write-Host "msiexec /i exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+          Get-ChildItem $env:INSTALL_DIR | Format-Table Name, Length
+          foreach ($file in 'roodb.exe', 'roodb_init.exe', 'LICENSE.txt') {
+            if (-not (Test-Path (Join-Path $env:INSTALL_DIR $file))) { throw "not installed: $file" }
+          }
+          $path = [Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' |
+            ForEach-Object { $_.TrimEnd('\') }
+          if ($path -notcontains $env:INSTALL_DIR) { throw "the system PATH lacks $env:INSTALL_DIR" }
+          Write-Host "PASS: files installed, $env:INSTALL_DIR on the system PATH"
+
+          $entry = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+            Where-Object DisplayName -eq 'RooDB'
+          if (-not $entry) { throw 'RooDB is not in the installed programs' }
+          $entry | Format-List DisplayName, DisplayVersion, Publisher, InstallLocation
+          Write-Host 'PASS: listed in installed programs'
+
+      - name: Initialise
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 `
+            -keyout "$env:WORK\server.key" -out "$env:WORK\server.crt" `
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:INSTALL_DIR\roodb_init.exe" --data-dir "$env:WORK\data"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host 'PASS: initialised'
+
+      # One step: a process started in a step may not outlive it.
+      - name: Write, restart, read
+        run: |
+          function Start-RooDB([string]$tag) {
+            $env:RUST_LOG = 'roodb=debug,info'
+            $p = Start-Process -FilePath "$env:INSTALL_DIR\roodb.exe" -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$env:WORK\roodb-$tag.out.log" `
+              -RedirectStandardError "$env:WORK\roodb-$tag.err.log" `
+              -ArgumentList @(
+                '--bind', '127.0.0.1',
+                '--data-dir', "`"$env:WORK\data`"",
+                '--cert-path', "`"$env:WORK\server.crt`"",
+                '--key-path', "`"$env:WORK\server.key`"",
+                '--raft-ca-cert-path', "`"$env:WORK\server.crt`"")
+            for ($i = 0; $i -lt 60; $i++) {
+              if ($p.HasExited) {
+                Get-Content "$env:WORK\roodb-$tag.out.log", "$env:WORK\roodb-$tag.err.log" -Tail 100
+                throw "roodb ($tag) exited with code $($p.ExitCode)"
+              }
+              try {
+                [System.Net.Sockets.TcpClient]::new('127.0.0.1', 3307).Close()
+                Write-Host "RooDB ($tag) listening after $($i / 2) s"
+                return $p
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            Get-Content "$env:WORK\roodb-$tag.out.log", "$env:WORK\roodb-$tag.err.log" -Tail 100
+            throw "RooDB ($tag) did not open port 3307"
+          }
+          function Stop-RooDB($p) {
+            # A hard stop: a graceful one is not wired up on Windows yet,
+            # and the next start then replays the log.
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $p.WaitForExit(30000) | Out-Null
+          }
+          function Invoke-Sql([string]$sql) {
+            $out = & $env:MYSQL -h 127.0.0.1 -P 3307 -u root "-p$env:ROODB_ROOT_PASSWORD" `
+              --ssl-mode=REQUIRED --batch --skip-column-names -e $sql 2>&1
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Write-Host "  | $_" }
+            if ($code -ne 0) { throw "mysql exit code $code for: $sql" }
+            ($out | Where-Object { $_ -is [string] -and $_ -notmatch '^mysql: \[Warning\]' }) -join "`n"
+          }
+
+          $server = Start-RooDB 'first'
+          try {
+            Invoke-Sql 'CREATE DATABASE smoke; CREATE TABLE smoke.t (id INT PRIMARY KEY, name VARCHAR(20)); INSERT INTO smoke.t VALUES (1, ''one''), (2, ''two'')' | Out-Null
+            $rows = Invoke-Sql 'SELECT name FROM smoke.t ORDER BY id'
+            if ($rows -ne "one`ntwo") { throw "read back '$rows'" }
+            Write-Host 'PASS: authenticated write and read over TLS'
+          } finally { Stop-RooDB $server }
+
+          $server = Start-RooDB 'second'
+          try {
+            $rows = Invoke-Sql 'SELECT name FROM smoke.t ORDER BY id'
+            if ($rows -ne "one`ntwo") { throw "after the restart, read back '$rows'" }
+            Write-Host 'PASS: the rows survive a restart'
+          } finally { Stop-RooDB $server }
+
+      - name: Uninstall
+        run: |
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', "`"$env:MSI`"", '/qn', '/l*v', "`"$env:WORK\uninstall.log`"")
+          Write-Host "msiexec /x exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+          if (Test-Path $env:INSTALL_DIR) {
+            Get-ChildItem $env:INSTALL_DIR -Recurse
+            throw "left behind: $env:INSTALL_DIR"
+          }
+          $path = [Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' |
+            ForEach-Object { $_.TrimEnd('\') }
+          if ($path -contains $env:INSTALL_DIR) { throw "the system PATH still has $env:INSTALL_DIR" }
+          $entry = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+            Where-Object DisplayName -eq 'RooDB'
+          if ($entry) { throw 'RooDB is still in the installed programs' }
+          if (-not (Test-Path "$env:WORK\data")) { throw 'the data directory is gone' }
+          Write-Host 'PASS: program files, PATH entry and product entry removed; data kept'
+
+      - name: Logs
+        if: always()
+        run: |
+          Get-ChildItem $env:WORK -Recurse -ErrorAction SilentlyContinue |
+            Format-Table FullName, Length -AutoSize | Out-String -Width 300
+          foreach ($log in Get-ChildItem $env:WORK -Filter *.log -ErrorAction SilentlyContinue) {
+            Write-Host "===== $($log.Name) (last 80 lines)"
+            Get-Content $log.FullName -Tail 80
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-logs
+          path: ${{ runner.temp }}/roodb-smoke/*.log
+          if-no-files-found: ignore

@@ -351,16 +351,22 @@ pub struct RawTds {
     stream: TlsStream<TcpStream>,
 }
 
+/// A TLS client configuration that accepts the test server's self-signed
+/// certificate.
+pub fn accept_any_cert_config() -> ClientConfig {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth()
+}
+
 impl RawTds {
     /// Open a TDS 8.0 connection: TLS first, then PRELOGIN.
     pub async fn connect(server: &TestServer) -> Self {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut config = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
+        let mut config = accept_any_cert_config();
         config.alpn_protocols = vec![b"tds/8.0".to_vec()];
 
         let tcp = TcpStream::connect(("127.0.0.1", server.tds_port()))

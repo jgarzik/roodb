@@ -216,6 +216,34 @@ async fn test_session_options_and_probes() {
     server.shutdown().await;
 }
 
+/// Read the response to a request the client cancelled while it ran, as
+/// SQL Server sends it: the interrupted response, then the attention
+/// acknowledgement, a DONE with DONE_ATTN, as a message of its own. The
+/// JDBC driver looks for that second message once the first one ends.
+/// Returns the first message's tokens.
+async fn cancelled_response(client: &mut RawTds) -> Vec<u8> {
+    let mut next = async || {
+        let (kind, tokens) = tokio::time::timeout(Duration::from_secs(30), client.recv())
+            .await
+            .expect("a cancelled request must end promptly")
+            .expect("connection stays open");
+        assert_eq!(kind, PKT_TABULAR_RESULT);
+        tokens
+    };
+    let response = next().await;
+    let done = &response[response.len() - 13..];
+    assert_eq!(done[0], 0xFD, "the response ends with DONE");
+    let status = u16::from_le_bytes([done[1], done[2]]);
+    assert_eq!(status & DONE_ATTN, 0, "acknowledged inside the response");
+
+    let ack = next().await;
+    assert_eq!(ack.len(), 13, "the acknowledgement is one DONE: {ack:?}");
+    assert_eq!(ack[0], 0xFD);
+    let status = u16::from_le_bytes([ack[1], ack[2]]);
+    assert_eq!(status & DONE_ATTN, DONE_ATTN, "status {status:#06x}");
+    response
+}
+
 /// The client cancels a query that is still producing rows: the response
 /// ends with DONE(attention) and the session carries on.
 #[tokio::test]
@@ -246,22 +274,34 @@ async fn test_attention_cancels_a_running_query() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     client.send(PKT_ATTENTION, STATUS_EOM, &[]).await;
 
-    let received = tokio::time::timeout(Duration::from_secs(30), client.recv())
-        .await
-        .expect("cancelled query must end promptly")
-        .expect("connection stays open");
-    let (kind, tokens) = received;
-    assert_eq!(kind, PKT_TABULAR_RESULT);
-    // The response ends with DONE carrying the attention acknowledgement.
-    let done = &tokens[tokens.len() - 13..];
-    assert_eq!(done[0], 0xFD, "last token is DONE");
-    let status = u16::from_le_bytes([done[1], done[2]]);
-    assert_eq!(status & DONE_ATTN, DONE_ATTN, "status {status:#06x}");
+    let tokens = cancelled_response(&mut client).await;
     // Far fewer than 27 million 5-byte rows were sent.
     assert!(tokens.len() < 100 * 1024 * 1024, "{} bytes", tokens.len());
 
     // The session is in sync afterwards.
     let tokens = client.batch("DROP TABLE tds_cancel_t").await;
+    assert!(errors(&tokens).is_empty(), "{tokens:?}");
+    assert_eq!(final_done(&tokens) & DONE_ATTN, 0);
+    server.shutdown().await;
+}
+
+/// SLEEP waits, and an attention signal cuts it short: a driver's query
+/// timeout must not wait out the sleep.
+#[tokio::test]
+async fn test_attention_interrupts_sleep() {
+    let server = TestServer::start("tds_shim_sleep").await;
+    let mut client = RawTds::login_root(&server).await;
+
+    let mut payload = all_headers();
+    payload.extend_from_slice(&ucs2("SELECT SLEEP(120)"));
+    client.send(PKT_SQL_BATCH, STATUS_EOM, &payload).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.send(PKT_ATTENTION, STATUS_EOM, &[]).await;
+
+    cancelled_response(&mut client).await;
+
+    // The session is in sync afterwards.
+    let tokens = client.batch("DROP TABLE IF EXISTS tds_sleep_none").await;
     assert!(errors(&tokens).is_empty(), "{tokens:?}");
     assert_eq!(final_done(&tokens) & DONE_ATTN, 0);
     server.shutdown().await;

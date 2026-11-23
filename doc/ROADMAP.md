@@ -174,6 +174,8 @@ Only `root` can log in, and `root` bypasses every check.
 - The privilege model: database-level grants that do not depend on the
   session's current database, the full set of MySQL privileges, `SUPER` in
   place of the name `root`.
+  - `KILL` of another user's connection: `CONNECTION_ADMIN` or `SUPER`
+    (now the name `root`).
 - Enforcement at one choke point for planned statements, and in every
   statement handled outside the planner (ALTER, views, procedures,
   functions, triggers, databases, `LOAD DATA`, `SET GLOBAL`).
@@ -254,6 +256,16 @@ but may start and re-run runs of the installer workflow (`gh workflow run`,
 `gh run download`. Every push is a round trip, so every run must report
 everything needed to diagnose it.
 
+Done: `packaging/windows/roodb.wxs` builds an MSI that installs the two
+programs and LICENSE into `%ProgramFiles%\RooDB` and puts that directory
+on the system `PATH` (WiX 7.0.1, x64, per-machine, version from
+`Cargo.toml`, fixed UpgradeCode, `MajorUpgrade`, downgrade refused).
+`.github/workflows/windows-installer.yml` builds it and, on a fresh runner,
+installs it, initialises, writes and reads through the installed server
+across a (hard) restart, and uninstalls, uploading the MSI and logs. That
+smoke test is PowerShell in the workflow; it gives way to the Rust
+scenarios below.
+
 **Platform-neutral work, built and tested on Linux first**
 
 - Server start-up as a library function: move the body of `src/main.rs`
@@ -306,13 +318,7 @@ everything needed to diagnose it.
 
 **Installer**
 
-- `packaging/windows/roodb.wxs`, WiX v7 (pinned version, `-acceptEula
-  wix7`), x64, per-machine, no UI beyond the built-in minimal one. Version
-  from `Cargo.toml`. Fixed UpgradeCode; `MajorUpgrade`; a downgrade is
-  refused with a message.
-- Installs `roodb.exe`, `roodb_init.exe`, LICENSE and the Windows chapter
-  of the documentation into `%ProgramFiles%\RooDB`, and adds that
-  directory to the system `PATH`.
+- The Windows chapter of the documentation installed beside the programs.
 - Creates `%ProgramData%\RooDB` with `data`, `certs`, `logs` and
   `roodb.toml` (absolute paths, `bind = "127.0.0.1"`, the log file). All of
   it permanent and never overwritten: uninstall and upgrade leave it alone.
@@ -445,12 +451,21 @@ finds. Known already, from an audit of SQL.md against a running server:
 
 **Session and metadata**
 - `SHOW WARNINGS` is always empty; `SHOW VARIABLES` and `SHOW PROCESSLIST`
-  are empty.
+  are empty: the ID `KILL` takes comes only from that session's
+  `CONNECTION_ID()` or `@@SPID` (the registry of open connections,
+  `server/connections.rs`, has what PROCESSLIST lists).
 - `USER()` and `CURRENT_USER()` return an empty user name.
 - `COUNT(*)` is labelled `COUNT(NULL)` in result headers.
-- `SLEEP()` returns at once.
 - Errors raised while rows are being returned come back as 1690.
 - `SET` of an unknown variable is accepted silently.
+
+**Protocol and interruption**
+- `COM_STMT_SEND_LONG_DATA` is answered with an error, which breaks the
+  exchange (it takes no reply); `COM_CHANGE_USER` is refused.
+- An unknown command byte closes the connection without an error packet.
+- `KILL` and a client that goes away stop a statement only between result
+  rows and inside `SLEEP`: DML, lock waits, and work before the first row
+  run to their end.
 
 ---
 

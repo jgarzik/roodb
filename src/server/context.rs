@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 
 use crate::catalog::Catalog;
 use crate::raft::RaftNode;
+use crate::server::connections::Connections;
 use crate::storage::StorageEngine;
 use crate::txn::TransactionManager;
 
@@ -27,6 +28,8 @@ pub struct ServerContext {
     pub raft_node: Arc<RaftNode>,
     /// Next connection ID
     next_conn_id: Arc<AtomicU32>,
+    /// The open connections, for `KILL`
+    pub connections: Arc<Connections>,
 }
 
 impl ServerContext {
@@ -43,6 +46,7 @@ impl ServerContext {
             txn_manager,
             raft_node,
             next_conn_id: Arc::new(AtomicU32::new(1)),
+            connections: Arc::new(Connections::default()),
         }
     }
 

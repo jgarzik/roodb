@@ -241,10 +241,10 @@ async fn a_value_the_key_cannot_hold_is_not_rounded_to_one_it_can() {
     }
 
     // An integer key, and a number written as a string.
-    conn.query_drop("CREATE TABLE ko_int (k INT PRIMARY KEY, v INT)")
+    conn.query_drop("CREATE TABLE ko_int_text (k INT PRIMARY KEY, v INT)")
         .await
         .unwrap();
-    conn.query_drop("INSERT INTO ko_int VALUES (2, 2), (3, 3), (4, 4)")
+    conn.query_drop("INSERT INTO ko_int_text VALUES (2, 2), (3, 3), (4, 4)")
         .await
         .unwrap();
     for (filter, expected) in [
@@ -256,10 +256,19 @@ async fn a_value_the_key_cannot_hold_is_not_rounded_to_one_it_can() {
         ("k >= '3'", vec!["3", "4"]),
     ] {
         assert_eq!(
-            keys(&mut conn, &format!("SELECT v FROM ko_int WHERE {filter}")).await,
+            keys(
+                &mut conn,
+                &format!("SELECT v FROM ko_int_text WHERE {filter}")
+            )
+            .await,
             expected,
             "INT: {filter}"
         );
+    }
+    for table in ["ko_dec0", "ko_dec1", "ko_int_text"] {
+        conn.query_drop(format!("DROP TABLE {table}"))
+            .await
+            .unwrap();
     }
     server.shutdown().await;
 }
