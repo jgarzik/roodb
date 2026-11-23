@@ -138,7 +138,9 @@ pub fn parse_tokens(mut data: &[u8]) -> Vec<Token> {
                         let number = i32::from_le_bytes(body[0..4].try_into().unwrap());
                         let chars = u16::from_le_bytes([body[6], body[7]]) as usize;
                         let units: Vec<u16> = body[8..8 + chars * 2]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .collect();
                         let message = String::from_utf16_lossy(&units);
@@ -185,7 +187,9 @@ pub fn parse_tokens(mut data: &[u8]) -> Vec<Token> {
                 // ordinal, name, status, user type, flags, INTN(4), value
                 let chars = data[3] as usize;
                 let units: Vec<u16> = data[4..4 + chars * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let rest = &data[4 + chars * 2..];

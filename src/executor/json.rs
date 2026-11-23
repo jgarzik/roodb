@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(json_type(&serde_json::json!(null)), "NULL");
         assert_eq!(json_type(&serde_json::json!(true)), "TRUE");
         assert_eq!(json_type(&serde_json::json!(42)), "INTEGER");
-        assert_eq!(json_type(&serde_json::json!(3.14)), "DOUBLE");
+        assert_eq!(json_type(&serde_json::json!(3.25)), "DOUBLE");
         assert_eq!(json_type(&serde_json::json!("hello")), "STRING");
         assert_eq!(json_type(&serde_json::json!([1, 2])), "ARRAY");
         assert_eq!(json_type(&serde_json::json!({"a": 1})), "OBJECT");

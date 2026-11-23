@@ -1,7 +1,7 @@
 //! Data written before a server restart must be fully usable after it,
 //! including from inside explicit transactions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mysql_async::prelude::*;
@@ -27,7 +27,7 @@ fn data_dir(name: &str) -> PathBuf {
 }
 
 /// Open the data directory and serve it on a fresh port.
-async fn start(dir: &PathBuf, first_boot: bool) -> (ServerHandle, Arc<dyn StorageEngine>, u16) {
+async fn start(dir: &Path, first_boot: bool) -> (ServerHandle, Arc<dyn StorageEngine>, u16) {
     let io = IoEngine::new(IoBackend::from_env().unwrap()).unwrap();
     let log_store = LogStore::open(
         io.clone(),
@@ -36,7 +36,7 @@ async fn start(dir: &PathBuf, first_boot: bool) -> (ServerHandle, Arc<dyn Storag
     .await
     .expect("open log");
     let config = LsmConfig {
-        dir: dir.clone(),
+        dir: dir.to_path_buf(),
         ..Default::default()
     };
     let storage: Arc<dyn StorageEngine> =

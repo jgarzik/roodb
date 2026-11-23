@@ -2,8 +2,6 @@
 //!
 //! Implements the initial handshake sequence (server greeting).
 
-use rand::Rng;
-
 use super::packet::encode_null_terminated_string;
 use super::types::charset;
 
@@ -83,13 +81,11 @@ pub struct HandshakeV10 {
 impl HandshakeV10 {
     /// Create a new handshake packet with random scramble
     pub fn new(connection_id: u32) -> Self {
-        let mut rng = rand::thread_rng();
-
         // Generate 20-byte scramble (split into two parts)
         let mut auth_plugin_data_part1 = [0u8; 8];
         let mut auth_plugin_data_part2 = [0u8; 12];
-        rng.fill(&mut auth_plugin_data_part1);
-        rng.fill(&mut auth_plugin_data_part2);
+        rand::fill(&mut auth_plugin_data_part1);
+        rand::fill(&mut auth_plugin_data_part2);
 
         // Capabilities we support
         let capabilities = capabilities::CLIENT_LONG_PASSWORD

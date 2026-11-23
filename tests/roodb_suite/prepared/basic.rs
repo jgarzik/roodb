@@ -264,7 +264,7 @@ async fn test_prepare_types() {
 
     conn.exec_drop(
         "INSERT INTO prep_types_tbl (i, f, s, b) VALUES (?, ?, ?, ?)",
-        (42, 3.14f64, "hello", true),
+        (42, 3.25f64, "hello", true),
     )
     .await
     .expect("prep insert with types failed");
@@ -275,7 +275,7 @@ async fn test_prepare_types() {
         .expect("prep select failed");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, 42);
-    assert!((rows[0].1 - 3.14).abs() < 0.001);
+    assert!((rows[0].1 - 3.25).abs() < 0.001);
     assert_eq!(rows[0].2, "hello");
     assert!(rows[0].3);
 
