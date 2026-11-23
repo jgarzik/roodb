@@ -199,6 +199,9 @@ drivers issue by themselves are understood in addition:
   effect (double quotes still delimit strings, as in MySQL)
 - probes: `@@SPID`, `@@TRANCOUNT`, `@@VERSION`, `DB_NAME()`,
   `SUSER_SNAME()`, `SERVERPROPERTY('...')`
+- `USE [name]`, with T-SQL's bracket quoting (as .NET's
+  `SqlConnection.ChangeDatabase` sends it); brackets are not understood
+  anywhere else
 
 ### Limitations
 
