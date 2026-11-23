@@ -138,22 +138,24 @@ pub struct MdlTarget {
     gate: Arc<NameGate>,
 }
 
-/// A shared lock one session holds on the fast side.
-struct FastLock {
-    owner: u64,
-    name: TableName,
-    gate: Arc<NameGate>,
-}
-
 #[derive(Default)]
 struct SessionLocks {
-    /// Shared locks held on the fast side, known nowhere else.
-    fast: Vec<FastLock>,
+    /// The names this session has locked, with their gates: kept so that
+    /// locking a table again touches nothing the sessions share but the
+    /// gate's word itself.
+    known: Vec<MdlTarget>,
+    /// Shared locks held on the fast side, known nowhere else: the owner,
+    /// and the name's place in `known`.
+    fast: Vec<(u64, usize)>,
     /// Owners of this session that hold (or wait for) something in the
     /// lock table: locks taken there, and fast ones moved there when a
     /// gate was closed.
     in_table: Vec<u64>,
 }
+
+/// How many names a session remembers the gates of before it starts over
+/// (when it holds none of them).
+const KNOWN_NAMES: usize = 256;
 
 /// What one session holds, where a schema change that closes a gate can
 /// look at it. It is only a list: letting go of it runs nothing, so it
@@ -185,38 +187,51 @@ impl MdlSession {
     /// Lock `target` shared for `owner` (a transaction of this session),
     /// waiting up to `timeout` if a schema change holds the name or waits
     /// for it. Held until `release(owner)`.
+    ///
+    /// A name the session already holds for another of its owners is
+    /// given at once, even with a schema change waiting for it: the
+    /// session is still using the table, and a statement it runs within
+    /// another (or runs again) must not be made to wait for a schema
+    /// change that is waiting for the session.
     pub async fn lock_shared(
         &self,
         owner: u64,
-        target: &MdlTarget,
+        name: &TableName,
         timeout: Duration,
     ) -> Result<(), MdlError> {
+        let beside: Vec<u64>;
         {
             let mut held = self.state.held.lock();
-            let has = held
-                .fast
-                .iter()
-                .any(|lock| lock.owner == owner && Arc::ptr_eq(&lock.gate, &target.gate));
-            if has {
+            let slot = match held.known.iter().position(|known| known.name == *name) {
+                Some(slot) => slot,
+                None => {
+                    if held.fast.is_empty() && held.known.len() >= KNOWN_NAMES {
+                        held.known.clear();
+                    }
+                    held.known.push(self.locks.target(name));
+                    held.known.len() - 1
+                }
+            };
+            if held.fast.contains(&(owner, slot)) {
                 return Ok(());
             }
             // Counted and noted under the session's mutex, so that whoever
             // closes the gate and then asks this session what it holds
             // sees either both or neither.
-            if target.gate.enter() {
-                held.fast.push(FastLock {
-                    owner,
-                    name: target.name.clone(),
-                    gate: target.gate.clone(),
-                });
+            if held.known[slot].gate.enter() {
+                held.fast.push((owner, slot));
                 return Ok(());
             }
+            // The session's other owners that have locks in the table: if
+            // one of them holds this name, this owner is given it beside
+            // them, without waiting its turn.
+            beside = held.in_table.clone();
             if !held.in_table.contains(&owner) {
                 held.in_table.push(owner);
             }
         }
         self.locks
-            .lock(owner, &target.name, MdlMode::Shared, timeout)
+            .lock_shared_beside(owner, name, &beside, timeout)
             .await
     }
 
@@ -242,51 +257,42 @@ impl MdlSession {
     /// for. Called when the transaction (or the statement, for one that
     /// runs in none) ends.
     pub fn release(&self, owner: u64) {
-        let (fast, in_table) = {
-            let mut held = self.state.held.lock();
-            let mut fast = Vec::new();
-            let mut index = 0;
-            while index < held.fast.len() {
-                if held.fast[index].owner == owner {
-                    fast.push(held.fast.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            let before = held.in_table.len();
-            held.in_table.retain(|o| *o != owner);
-            (fast, before != held.in_table.len())
-        };
-        for lock in fast {
-            lock.gate.leave();
-        }
-        if in_table {
-            self.locks.release_all(owner);
-        }
+        self.release_where(|held| held == owner);
     }
 
     /// Release everything this session holds for every owner but `keep`:
     /// at the end of a statement, whatever was locked for the statement
     /// alone goes, and what the open transaction holds stays.
     pub fn release_all_but(&self, keep: Option<u64>) {
-        let owners: Vec<u64> = {
-            let held = self.state.held.lock();
-            if held.fast.is_empty() && held.in_table.is_empty() {
-                return;
+        self.release_where(|held| Some(held) != keep);
+    }
+
+    /// Release what the owners that `goes` picks hold.
+    fn release_where(&self, goes: impl Fn(u64) -> bool) {
+        let in_table: Vec<u64> = {
+            let mut held = self.state.held.lock();
+            let SessionLocks {
+                known,
+                fast,
+                in_table,
+            } = &mut *held;
+            fast.retain(|&(owner, slot)| {
+                if goes(owner) {
+                    known[slot].gate.leave();
+                }
+                !goes(owner)
+            });
+            // Nearly always none: nothing is allocated then.
+            if in_table.iter().any(|owner| goes(*owner)) {
+                let gone = in_table.iter().copied().filter(|o| goes(*o)).collect();
+                in_table.retain(|owner| !goes(*owner));
+                gone
+            } else {
+                Vec::new()
             }
-            let mut owners: Vec<u64> = held
-                .fast
-                .iter()
-                .map(|lock| lock.owner)
-                .chain(held.in_table.iter().copied())
-                .filter(|owner| Some(*owner) != keep)
-                .collect();
-            owners.sort_unstable();
-            owners.dedup();
-            owners
         };
-        for owner in owners {
-            self.release(owner);
+        for owner in in_table {
+            self.locks.release_all(owner);
         }
     }
 
@@ -303,8 +309,8 @@ impl Drop for MdlSession {
         // session's owner drops this, never whoever looks through the
         // sessions: they hold the list, not the session.)
         let held = std::mem::take(&mut *self.state.held.lock());
-        for lock in held.fast {
-            lock.gate.leave();
+        for (_, slot) in held.fast {
+            held.known[slot].gate.leave();
         }
         for owner in held.in_table {
             self.locks.release_all(owner);
@@ -644,17 +650,25 @@ impl MetadataLocks {
         };
         for session in sessions {
             let mut held = session.held.lock();
+            let Some(slot) = held
+                .known
+                .iter()
+                .position(|known| Arc::ptr_eq(&known.gate, &gate))
+            else {
+                continue;
+            };
             let mut index = 0;
             while index < held.fast.len() {
-                if !Arc::ptr_eq(&held.fast[index].gate, &gate) {
+                let (owner, at) = held.fast[index];
+                if at != slot {
                     index += 1;
                     continue;
                 }
-                let lock = held.fast.swap_remove(index);
-                lock.gate.leave();
-                state.grant(lock.owner, &lock.name, MdlMode::Shared);
-                if !held.in_table.contains(&lock.owner) {
-                    held.in_table.push(lock.owner);
+                held.fast.swap_remove(index);
+                gate.leave();
+                state.grant(owner, name, MdlMode::Shared);
+                if !held.in_table.contains(&owner) {
+                    held.in_table.push(owner);
                 }
             }
         }
@@ -682,6 +696,38 @@ impl MetadataLocks {
         timeout: Duration,
     ) -> Result<(), MdlError> {
         self.acquire(owner, name, mode, timeout).await.map(|_| ())
+    }
+
+    /// Lock `name` shared for `owner`, one of several owners of one
+    /// session, `beside` being the others: if one of them holds the name,
+    /// `owner` is given it too without waiting behind requests made since.
+    /// Otherwise as `lock`.
+    async fn lock_shared_beside(
+        &self,
+        owner: u64,
+        name: &TableName,
+        beside: &[u64],
+        timeout: Duration,
+    ) -> Result<(), MdlError> {
+        {
+            let mut state = self.state.lock();
+            let beside_one = state.tables.get(name).is_some_and(|table| {
+                table.held_by(owner).is_none()
+                    && table
+                        .holders
+                        .iter()
+                        .any(|(holder, _)| *holder != owner && beside.contains(holder))
+            });
+            if beside_one {
+                state.grant(owner, name, MdlMode::Shared);
+                // Those who wait for the name now wait for this owner too.
+                let mut changes = Changes::default();
+                state.settle(name, &mut changes);
+                self.apply(changes);
+                return Ok(());
+            }
+        }
+        self.lock(owner, name, MdlMode::Shared, timeout).await
     }
 
     /// Lock several names for `owner`, each in the mode given with it, all
@@ -1350,10 +1396,10 @@ mod tests {
         let (_, m) = locks();
         let (a, b) = (m.session(), m.session());
         let t = target(&m, "t");
-        a.lock_shared(1, &t, LONG).await.unwrap();
-        b.lock_shared(2, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
+        b.lock_shared(2, &t.name, LONG).await.unwrap();
         // The same owner again: nothing more is counted.
-        a.lock_shared(1, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
         assert_eq!(m.counts(), (0, 0));
         assert_eq!(t.gate.holders(), 2);
 
@@ -1383,7 +1429,7 @@ mod tests {
 
         let reader = {
             let (a, t) = (a.clone(), t.clone());
-            tokio::spawn(async move { a.lock_shared(1, &t, LONG).await })
+            tokio::spawn(async move { a.lock_shared(1, &t.name, LONG).await })
         };
         until_waiting(&m, 1).await;
         assert_eq!(t.gate.holders(), 0);
@@ -1395,7 +1441,7 @@ mod tests {
         assert_eq!(m.counts(), (0, 0));
 
         // Nothing is left on the name: the next shared lock is fast again.
-        a.lock_shared(2, &t, LONG).await.unwrap();
+        a.lock_shared(2, &t.name, LONG).await.unwrap();
         assert_eq!(m.counts(), (0, 0));
         assert_eq!(t.gate.holders(), 1);
         a.release(2);
@@ -1409,7 +1455,7 @@ mod tests {
         let (_, m) = locks();
         let a = m.session();
         let t = target(&m, "t");
-        a.lock_shared(1, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
         assert_eq!(
             m.lock(2, &name("t"), Exclusive, SHORT).await,
             Err(MdlError::Timeout)
@@ -1418,7 +1464,7 @@ mod tests {
         assert_eq!(m.counts(), (1, 0));
         a.release(1);
         assert_eq!(m.counts(), (0, 0));
-        a.lock_shared(3, &t, LONG).await.unwrap();
+        a.lock_shared(3, &t.name, LONG).await.unwrap();
         assert_eq!(t.gate.holders(), 1);
         a.release(3);
     }
@@ -1430,8 +1476,8 @@ mod tests {
         let (_, m) = locks();
         let (a, b) = (m.session(), m.session());
         let t = target(&m, "t");
-        a.lock_shared(1, &t, LONG).await.unwrap();
-        b.lock_shared(2, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
+        b.lock_shared(2, &t.name, LONG).await.unwrap();
 
         let upgrade = {
             let a = a.clone();
@@ -1455,7 +1501,7 @@ mod tests {
         let a = m.session();
         let t = target(&m, "t");
         // Owner 1: the table, on the fast side. Owner 2: the row.
-        a.lock_shared(1, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
         rows.lock_record(2, b"k", LockMode::Exclusive, LONG)
             .await
             .unwrap();
@@ -1482,7 +1528,7 @@ mod tests {
         let t = target(&m, "t");
         let u = target(&m, "u");
         let a = m.session();
-        a.lock_shared(1, &t, LONG).await.unwrap();
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
         a.lock_all(1, &[(name("u"), Exclusive)], LONG)
             .await
             .unwrap();
@@ -1510,11 +1556,13 @@ mod tests {
             m.release_all(1);
             // Read once.
             let t = target(&m, &table);
-            a.lock_shared(2, &t, LONG).await.unwrap();
+            a.lock_shared(2, &t.name, LONG).await.unwrap();
             a.release(2);
         }
-        // The gates made for reading are dropped when a schema change
-        // next releases its locks.
+        // A session keeps the gates of the names it has used (a bounded
+        // number), to lock them again cheaply. Once it has gone, they are
+        // dropped when a schema change next releases its locks.
+        drop(a);
         m.lock(1, &name("last"), Exclusive, LONG).await.unwrap();
         m.release_all(1);
         assert_eq!(m.gates(), 0);
@@ -1538,7 +1586,7 @@ mod tests {
                 for round in 0..300u64 {
                     let owner = 1000 + reader * 1000 + round;
                     let t = m.target(&name("t"));
-                    session.lock_shared(owner, &t, LONG).await.unwrap();
+                    session.lock_shared(owner, &t.name, LONG).await.unwrap();
                     assert!(
                         inside.fetch_add(1, Ordering::SeqCst) >= 0,
                         "a writer is inside"
@@ -1594,7 +1642,7 @@ mod tests {
                     let session = m.session();
                     let t = m.target(&name("t"));
                     // Whether fast or through the table: dropped holding it.
-                    session.lock_shared(owner, &t, SHORT).await.ok();
+                    session.lock_shared(owner, &t.name, SHORT).await.ok();
                     // Long enough alive to be found by someone looking
                     // through the sessions, then gone under their hands.
                     tokio::task::yield_now().await;
@@ -1617,5 +1665,38 @@ mod tests {
         }
         assert_eq!(m.counts(), (0, 0));
         assert_eq!(m.target(&name("t")).gate.holders(), 0);
+    }
+
+    /// A session that holds a name for one of its owners is given it for
+    /// another at once, though a schema change is waiting for the name:
+    /// the schema change then waits for both.
+    #[tokio::test]
+    async fn a_session_is_given_again_what_it_holds_for_another_owner() {
+        let (_, m) = locks();
+        let (a, b) = (m.session(), m.session());
+        let t = target(&m, "t");
+        a.lock_shared(1, &t.name, LONG).await.unwrap();
+        let writer = spawn_lock(&m, 9, "t", Exclusive);
+        until_waiting(&m, 1).await;
+
+        // Another session waits its turn behind the schema change...
+        let other = {
+            let (b, t) = (b.clone(), t.clone());
+            tokio::spawn(async move { b.lock_shared(3, &t.name, LONG).await })
+        };
+        until_waiting(&m, 2).await;
+        // ...the session that holds the name does not.
+        a.lock_shared(2, &t.name, LONG).await.unwrap();
+        assert_eq!(m.counts(), (2, 2));
+
+        // The schema change waits until both owners have let go.
+        a.release(1);
+        assert!(!writer.is_finished());
+        a.release(2);
+        writer.await.unwrap().unwrap();
+        m.release_all(9);
+        other.await.unwrap().unwrap();
+        b.release(3);
+        assert_eq!(m.counts(), (0, 0));
     }
 }

@@ -291,10 +291,13 @@ session's `MdlSession`, for the transaction that owns the statement's row
 locks (the open transaction, or the implicit one of an autocommit write or
 locking read), or, for a plain autocommit read, which has no transaction,
 for the session (`lock_owner`: an ID out of the way of transaction IDs).
-The catalog's version is then compared with the one the plan was made at:
-a schema change may have got in between planning and locking, and then the
-statement is planned again (a statement of a routine's body, or a side of a
-`UNION`, fails with error 1412 instead). A transaction's locks go when it
+Each is then compared with what it was when the plan was made
+(`Catalog::object_stamp`: a table's ID and the version of its definition, a
+digest of a view's query): a schema change may have got in between planning
+and locking, and then the statement is planned again, keeping the locks it
+has, so that the same schema change cannot get in twice (a statement of a
+routine's body, or a side of a `UNION`, fails with error 1412 instead, as
+does a statement planned again `MAX_REPLANS` times). A transaction's locks go when it
 ends (`end_session_transaction`); everything else the session holds goes at
 the end of each statement a client sent (`end_of_statement`), and all of it
 when the session does.
@@ -339,9 +342,9 @@ table layout it started with.
   word, a count of shared holders and a closed bit. A session takes its
   shared locks through its `MdlSession`: while the gate is open, the count
   goes up by one and the lock is noted in the session's own list, under the
-  session's own mutex; no shared mutex is taken. A statement keeps the
-  name with its gate (`MdlTarget`), so locking a table again needs no
-  lookup. The first request for an exclusive lock on a name closes its
+  session's own mutex; no shared mutex is taken. A session remembers the
+  gates of the names it has locked (a bounded number), so locking a table
+  again needs no lookup and touches nothing shared but the gate's word. The first request for an exclusive lock on a name closes its
   gate, asks every session what it holds on that gate, and enters those
   locks in the lock table under their owners, where they stay until they
   are released. From then on shared requests for the name queue in the
@@ -350,6 +353,12 @@ table layout it started with.
   below is complete. When the table has nothing left on the name, the gate
   opens. Gates nobody uses are dropped when a schema change releases its
   locks.
+- **One session, several owners.** A session can hold locks for more than
+  one owner at a time: a statement and the statement it runs (a trigger's
+  body, a routine's), or a statement planned a second time under a new
+  implicit transaction. A session that holds a name for one of its owners
+  is given it shared for another at once (`lock_shared_beside`), without
+  queueing behind a schema change that is itself waiting for the session.
 - **Ending.** `release_all(owner)` releases everything the owner holds and
   abandons a request it is waiting for. A wait can time out
   (`MdlError::Timeout`), and a request whose future is dropped while it

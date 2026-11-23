@@ -78,13 +78,8 @@ below changes.
 
 **Steps, in order** (each is deleted when done)
 
-3. Changesets of rows carry the version of each table they were built
-   against (`TableDef::version`, which a change to the definition
-   already raises and checks) and are refused if it has moved. A
-   statement that runs another (a trigger's or a routine's body) waits
-   for it: that wait is to be in the wait-for graph, or a cycle through
-   the two is only ended by a timeout. `TRUNCATE` as a schema change
-   (commits, takes the table exclusively).
+3. `TRUNCATE` as a schema change (commits, takes the table
+   exclusively).
 4. `ALTER TABLE` and `RENAME TABLE` through resolver, planner and
    executor, with MySQL's error codes, privileges, and system tables
    protected.
@@ -190,6 +185,10 @@ Only `root` can log in, and `root` bypasses every check.
   - `DROP INDEX` of an index that does not exist is checked against the
     session's database; with index names per table (IDX) it names its
     table.
+  - A statement handled outside the planner that changes the schema
+    takes its metadata locks before anything checks who is asking:
+    privileges are to be checked first, so that an account without them
+    cannot hold a table against others.
   - System tables are written through SQL statements only.
   - `LOAD DATA INFILE` needs the `FILE` privilege.
   - Locking reads need `SELECT` and one of `UPDATE`, `DELETE`,

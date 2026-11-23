@@ -152,6 +152,23 @@ impl DataType {
     }
 }
 
+/// What a name stood for when it was looked at: see
+/// `Catalog::object_stamp`. Two stamps of a name are equal as long as
+/// nothing has changed the table or view between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectStamp {
+    /// A table: its ID (another table under the name has another) and the
+    /// version of its definition.
+    Table {
+        id: crate::executor::encoding::TableId,
+        version: u64,
+    },
+    /// A view: a digest of its query.
+    View(u64),
+    /// Neither.
+    Missing,
+}
+
 /// Where a column goes among a table's columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnPlace {
@@ -755,10 +772,14 @@ pub struct Catalog {
     /// How each table of `tables` is stored, kept beside its definition so
     /// that it is worked out once per definition, not once per statement.
     layouts: HashMap<TableName, TableLayout>,
+    /// The name of each table of `tables`, by its ID.
+    names: HashMap<crate::executor::encoding::TableId, TableName>,
     /// Indexes by name
     indexes: HashMap<String, IndexDef>,
     /// Schema version counter (incremented on DDL operations)
     schema_version: u64,
+    /// `schema_version` again, for those who do not hold the catalog.
+    version_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Known databases
     databases: HashSet<String>,
     /// Stored procedures by name
@@ -780,8 +801,10 @@ impl Catalog {
         Self {
             tables: HashMap::new(),
             layouts: HashMap::new(),
+            names: HashMap::new(),
             indexes: HashMap::new(),
             schema_version: 0,
+            version_cell: Default::default(),
             databases,
             procedures: HashMap::new(),
             views: HashMap::new(),
@@ -828,6 +851,8 @@ impl Catalog {
             .retain(|name, _| system_tables::is_system_table(name));
         self.layouts
             .retain(|name, _| system_tables::is_system_table(name));
+        self.names
+            .retain(|_, name| system_tables::is_system_table(name));
         self.indexes.clear();
     }
 
@@ -839,7 +864,7 @@ impl Catalog {
             return Err(DatabaseError::DatabaseExists(name.to_string()));
         }
         self.databases.insert(name.to_string());
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -848,7 +873,7 @@ impl Catalog {
         if !self.databases.remove(name) {
             return Err(DatabaseError::DatabaseNotFound(name.to_string()));
         }
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -985,19 +1010,19 @@ impl Catalog {
             self.indexes.insert(index.name.clone(), index);
         }
         self.put_table(def);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// The table with this ID, if the catalog has it.
     pub fn table_by_id(&self, id: crate::executor::encoding::TableId) -> Option<&TableDef> {
-        self.tables.values().find(|def| def.id == id)
+        self.tables.get(self.names.get(&id)?)
     }
 
     /// Take a table and its indexes out of the catalog, if it is there.
     pub fn unset_table(&mut self, name: &TableName) {
         self.take_table(name);
         self.indexes.retain(|_, index| index.table != *name);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// The indexes of a table, by name.
@@ -1019,7 +1044,7 @@ impl Catalog {
             return Err(CatalogError::TableExists(def.name.to_string()));
         }
         self.put_table(def);
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1033,7 +1058,7 @@ impl Catalog {
             self.take_table(old_name);
         }
         self.put_table(def);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// Drop a table
@@ -1043,13 +1068,47 @@ impl Catalog {
         }
         // Also drop all indexes for this table
         self.indexes.retain(|_, idx| idx.table != *name);
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
     /// Get a table definition
     pub fn get_table(&self, name: &TableName) -> Option<&TableDef> {
         self.tables.get(name)
+    }
+
+    /// What `name` is now, to tell later whether it is still that: a
+    /// statement is planned against tables and views as it finds them, and
+    /// run only if they are still as it found them.
+    pub fn object_stamp(&self, name: &TableName) -> ObjectStamp {
+        use std::hash::{Hash, Hasher};
+        if let Some(table) = self.tables.get(name) {
+            return ObjectStamp::Table {
+                id: table.id,
+                version: table.version,
+            };
+        }
+        match self.views.get(name) {
+            Some(view) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                view.query_sql.hash(&mut hasher);
+                ObjectStamp::View(hasher.finish())
+            }
+            None => ObjectStamp::Missing,
+        }
+    }
+
+    /// The catalog has changed.
+    fn bump_version(&mut self) {
+        self.schema_version += 1;
+        self.version_cell
+            .store(self.schema_version, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The catalog's version, where it can be read without holding the
+    /// catalog: it changes whenever anything in the catalog does.
+    pub fn version_cell(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.version_cell.clone()
     }
 
     /// How a table is stored: its ID and the shape of its rows.
@@ -1074,13 +1133,24 @@ impl Catalog {
                 self.layouts.remove(&def.name);
             }
         }
-        self.tables.insert(def.name.clone(), def);
+        // (A table that takes over a name another had: the other's ID no
+        // longer leads anywhere.)
+        if let Some(replaced) = self.tables.insert(def.name.clone(), def.clone()) {
+            if replaced.id != def.id {
+                self.names.remove(&replaced.id);
+            }
+        }
+        self.names.insert(def.id, def.name);
     }
 
     /// Take a table's definition and layout out of the catalog.
     fn take_table(&mut self, name: &TableName) -> Option<TableDef> {
         self.layouts.remove(name);
-        self.tables.remove(name)
+        let def = self.tables.remove(name)?;
+        if self.names.get(&def.id) == Some(name) {
+            self.names.remove(&def.id);
+        }
+        Some(def)
     }
 
     /// Check if a table exists
@@ -1123,7 +1193,7 @@ impl Catalog {
             return Err(CatalogError::IndexExists(def.name.clone()));
         }
         self.indexes.insert(def.name.clone(), def);
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1132,7 +1202,7 @@ impl Catalog {
         if self.indexes.remove(name).is_none() {
             return Err(CatalogError::IndexNotFound(name.to_string()));
         }
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1163,7 +1233,7 @@ impl Catalog {
             return Err(CatalogError::ProcedureExists(def.name.clone()));
         }
         self.procedures.insert(key, def);
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1173,7 +1243,7 @@ impl Catalog {
         if self.procedures.remove(&key).is_none() {
             return Err(CatalogError::ProcedureNotFound(name.to_string()));
         }
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1187,7 +1257,7 @@ impl Catalog {
     pub fn register_procedure(&mut self, def: ProcedureDef) {
         self.procedures
             .insert((def.database.clone(), def.name.clone()), def);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// The stored functions: procedures that return a value.
@@ -1220,21 +1290,21 @@ impl Catalog {
             return Err(CatalogError::ViewExists(def.name.to_string()));
         }
         self.views.insert(def.name.clone(), def);
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
     /// Create or replace a view
     pub fn replace_view(&mut self, def: ViewDef) {
         self.views.insert(def.name.clone(), def);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// Drop a view
     pub fn drop_view(&mut self, name: &TableName, if_exists: bool) -> CatalogResult<()> {
         match self.views.remove(name) {
             Some(_) => {
-                self.schema_version += 1;
+                self.bump_version();
                 Ok(())
             }
             None if if_exists => Ok(()),
@@ -1274,7 +1344,7 @@ impl Catalog {
     pub fn create_trigger(&mut self, def: TriggerDef) {
         self.triggers
             .insert((def.table_name.database.clone(), def.name.clone()), def);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// Drop a trigger
@@ -1286,7 +1356,7 @@ impl Catalog {
                 name
             )));
         }
-        self.schema_version += 1;
+        self.bump_version();
         Ok(())
     }
 
@@ -1299,13 +1369,13 @@ impl Catalog {
     /// Forget every trigger (before rebuilding them from the system tables).
     pub fn clear_triggers(&mut self) {
         self.triggers.clear();
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// Forget the triggers of one table (when it is dropped).
     pub fn drop_triggers_of_table(&mut self, table_name: &TableName) {
         self.triggers.retain(|_, t| t.table_name != *table_name);
-        self.schema_version += 1;
+        self.bump_version();
     }
 
     /// Get triggers for a specific table, timing, and event

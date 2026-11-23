@@ -600,10 +600,35 @@ async fn a_change_meant_for_another_table_of_the_name_is_refused() {
     propose(store::replace_table(&other)).await.unwrap();
     assert_eq!(columns(), ["a", "b", "c", "d"]);
 
+    // Rows are made for a table as it is at the time, and say so: they
+    // are applied only if the table is still at that version.
+    let version = catalog.read().get_table(&"racing".into()).unwrap().version;
+    let rows_for = |row: u64, version: u64| {
+        let change = RowChange::insert(
+            roodb::executor::encoding::encode_row_key(TableId(7001), row),
+            vec![1],
+        );
+        node.propose_changes(
+            ChangeSet::new_with_changes(0, vec![change]).for_tables(vec![(TableId(7001), version)]),
+        )
+    };
+    rows_for(1, version).await.unwrap();
+    assert!(rows_for(2, version - 1).await.is_err());
+    assert!(rows_for(2, version + 1).await.is_err());
+    // The table changes: rows made before the change are refused, rows
+    // made after it are taken.
+    let mut wider = read();
+    wider.def = wider.def.column(ColumnDef::new("e", DataType::Int));
+    propose(store::replace_table(&wider)).await.unwrap();
+    assert!(rows_for(2, version).await.is_err());
+    rows_for(2, version + 1).await.unwrap();
+
     propose(store::drop_table(&"racing".into(), TableId(7001)))
         .await
         .unwrap();
     assert_eq!(id_now(), None);
+    // Rows for a table that is gone are refused, whatever they say.
+    assert!(rows_for(3, version + 1).await.is_err());
 
     // And a change to a table that is no longer there is refused too.
     assert!(propose(store::replace_table(&record(7001, &["a"])))

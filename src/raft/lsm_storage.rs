@@ -61,6 +61,10 @@ const NEXT_NODE_ID_KEY: &[u8] = b"_raft:sm:next_node_id";
 /// other key is data.
 pub const RAFT_KEY_PREFIX: &[u8] = b"_raft:";
 
+/// Why a changeset is refused whose tables are no longer as they were
+/// when its rows were made (MySQL's words for error 1412).
+pub const TABLE_CHANGED: &str = "Table definition has changed, please retry transaction";
+
 /// The table a record's key names, for a message.
 fn record_label(key: &[u8]) -> String {
     table_of_key(key)
@@ -119,6 +123,12 @@ pub struct LsmRaftStorage {
     applied_txn_floor: Arc<AtomicU64>,
     /// The next AUTO_INCREMENT value of each table, as held in memory.
     auto_increment: Arc<crate::txn::AutoIncrement>,
+    /// The version of each stored table's definition, by the table's ID,
+    /// as the log applied so far leaves it. Kept from the table records
+    /// alone (not from the catalog, which also holds each node's sessions'
+    /// temporary tables under the same names), so that every node judges
+    /// a changeset's tables alike.
+    table_versions: Arc<parking_lot::Mutex<std::collections::HashMap<TableId, u64>>>,
     /// The bound as stored: never below `applied_txn_floor`.
     stored_txn_bound: Arc<AtomicU64>,
 }
@@ -178,6 +188,7 @@ impl LsmRaftStorage {
             applied_txn_floor: Arc::new(AtomicU64::new(0)),
             stored_txn_bound: Arc::new(AtomicU64::new(0)),
             auto_increment: Arc::new(crate::txn::AutoIncrement::new()),
+            table_versions: Default::default(),
         };
 
         // Load existing state from LSM into caches
@@ -386,6 +397,10 @@ impl LsmRaftStorage {
         }
 
         // Tables and their indexes, as stored
+        *self.table_versions.lock() = records
+            .iter()
+            .map(|record| (record.def.id, record.def.version))
+            .collect();
         for record in records {
             tracing::debug!(table = %record.def.name, "Rebuilding table from storage");
             catalog.set_table(record.def, record.indexes);
@@ -458,6 +473,18 @@ impl LsmRaftStorage {
         &self,
         changeset: &ChangeSet,
     ) -> Result<Result<ChangesetPlan, String>, StorageError> {
+        // Rows are for tables as they were when the rows were made: a
+        // table whose definition has changed since, or that is gone, takes
+        // none of them.
+        if !changeset.tables.is_empty() {
+            let versions = self.table_versions.lock();
+            for (table, version) in &changeset.tables {
+                if versions.get(table) != Some(version) {
+                    return Ok(Err(TABLE_CHANGED.to_string()));
+                }
+            }
+        }
+
         // Version checks see storage as it was before this changeset, which
         // is what the executors saw when they read the rows.
         for change in &changeset.changes {
@@ -804,6 +831,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             let mut batch: Vec<WriteOp> = Vec::new();
             let mut tracked: Vec<TrackedChange> = Vec::new();
             let mut catalog_ops: Vec<CatalogOp> = Vec::new();
+            let mut dropped_tables: Vec<TableId> = Vec::new();
             let mut membership_change = None;
             let mut new_txn_id = None;
             let mut reserved_row_ids = None;
@@ -889,6 +917,7 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
                             batch = plan.writes;
                             tracked = plan.tracked;
                             catalog_ops = plan.catalog;
+                            dropped_tables = plan.dropped_tables;
                             CommandResponse::Ok(None)
                         }
                         Err(message) => {
@@ -946,7 +975,18 @@ impl RaftStateMachine<TypeConfig> for LsmRaftStorage {
             }
             // The catalog follows each entry as it is written: the next
             // entry is checked against the catalog this one leaves.
-            if !catalog_ops.is_empty() {
+            if !catalog_ops.is_empty() || !dropped_tables.is_empty() {
+                {
+                    let mut versions = self.table_versions.lock();
+                    for table in &dropped_tables {
+                        versions.remove(table);
+                    }
+                    for op in &catalog_ops {
+                        if let CatalogOp::Set(record) = op {
+                            versions.insert(record.def.id, record.def.version);
+                        }
+                    }
+                }
                 let mut catalog = self.catalog.write();
                 for op in catalog_ops {
                     match op {

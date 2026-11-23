@@ -140,6 +140,13 @@ pub struct ChangeSet {
     /// Rows that conflict with existing keys are silently skipped.
     #[serde(default)]
     pub ignore_duplicates: bool,
+    /// The tables whose rows these are, each with the version of its
+    /// definition the rows were made against. The changes are applied
+    /// only if every one of them is still at that version: rows made for
+    /// columns a table no longer has, or a table that is gone, are refused.
+    /// Empty for a change of the schema itself.
+    #[serde(default)]
+    pub tables: Vec<(crate::executor::encoding::TableId, u64)>,
 }
 
 impl ChangeSet {
@@ -149,6 +156,7 @@ impl ChangeSet {
             txn_id,
             changes: Vec::new(),
             ignore_duplicates: false,
+            tables: Vec::new(),
         }
     }
 
@@ -158,6 +166,7 @@ impl ChangeSet {
             txn_id,
             changes,
             ignore_duplicates: false,
+            tables: Vec::new(),
         }
     }
 
@@ -171,7 +180,15 @@ impl ChangeSet {
             txn_id,
             changes,
             ignore_duplicates,
+            tables: Vec::new(),
         }
+    }
+
+    /// Say which version of each table's definition the changes were made
+    /// against.
+    pub fn for_tables(mut self, tables: Vec<(crate::executor::encoding::TableId, u64)>) -> Self {
+        self.tables = tables;
+        self
     }
 
     /// Add a change to the set
