@@ -107,6 +107,8 @@ libraries: `mysql_async` for the RooDB (MySQL-compatible) protocol and
 input. Other tests kill and restart the server to check durability, and run
 three-node Raft clusters inside the test process. CI runs the tests on Linux,
 macOS and Windows, and on Linux with both I/O backends (io_uring and posix).
+A Linux CI job also connects to the TDS port with `sqlcmd` over Microsoft
+ODBC Driver 18.
 See [CONTRIBUTING.md](CONTRIBUTING.md#tests).
 
 ## Dependencies

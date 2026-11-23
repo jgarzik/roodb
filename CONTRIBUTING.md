@@ -18,6 +18,8 @@ A change is ready when all four pass with no warnings. CI
 `cargo clippy -- -D warnings` on Linux, then builds and runs
 `cargo test --release` on Linux, macOS and Windows. Linux uses io_uring by
 default, so CI runs the tests once more there with `ROODB_IO_BACKEND=posix`.
+A further Linux job starts the server with a TDS port and connects to it with
+`sqlcmd` over Microsoft ODBC Driver 18, on both TDS transports.
 
 Every commit also updates the documentation it affects, so that no document
 goes stale.
