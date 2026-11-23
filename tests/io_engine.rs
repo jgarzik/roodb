@@ -336,9 +336,20 @@ async fn abandoned_request_still_completes() {
 
         let file = engine.open(&path, OpenOptions::existing()).await.unwrap();
         file.sync_data(Urgency::Critical).await.unwrap();
+        // The writes complete in any order: the file has its full size as
+        // soon as the last page is written, with earlier pages still on
+        // their way. So wait for every page, not for the size. (The
+        // deadline only keeps a broken engine from hanging the test.)
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if file.size().unwrap() == 64 * PAGE_SIZE as u64 {
+            let landed = file.size().unwrap() == 64 * PAGE_SIZE as u64 && {
+                let read = file
+                    .read_at(AlignedBuffer::pages(64).unwrap(), 0, Urgency::Foreground)
+                    .await
+                    .unwrap();
+                read.iter().all(|b| *b == 0x5A)
+            };
+            if landed {
                 break;
             }
             assert!(
@@ -347,11 +358,6 @@ async fn abandoned_request_still_completes() {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let read = file
-            .read_at(AlignedBuffer::pages(64).unwrap(), 0, Urgency::Foreground)
-            .await
-            .unwrap();
-        assert!(read.iter().all(|b| *b == 0x5A), "{backend}");
     }
 }
 
