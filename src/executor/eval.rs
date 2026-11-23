@@ -4671,8 +4671,7 @@ pub fn eval_function(
                 ));
             }
             let mut buf = vec![0u8; len as usize];
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::fill(&mut buf[..]);
             Ok(Datum::Bytes(buf))
         }
 
@@ -4884,8 +4883,7 @@ pub fn eval_function(
         "UUID" => {
             // UUID v4: 16 random bytes with version/variant bits set
             let mut bytes = [0u8; 16];
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut bytes);
+            rand::fill(&mut bytes);
             bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
             bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
             Ok(Datum::String(format!(

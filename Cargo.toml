@@ -59,7 +59,7 @@ lru = "0.12"
 # MySQL protocol support
 sha1 = "0.10"
 subtle = "2"
-rand = "0.8"
+rand = "0.10"
 bitflags = "2"
 regex = "1"
 lazy_static = "1"
@@ -87,7 +87,7 @@ tempfile = "3"
 serial_test = "3"
 libc = "0.2"
 # MySQL client for integration tests (uses rustls with aws-lc-rs)
-mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
 # TDS (SQL Server protocol) client for integration tests
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73", "tds80"] }
 tokio-util = { version = "0.7", features = ["compat"] }
