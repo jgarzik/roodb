@@ -245,9 +245,11 @@ impl<W: AsyncWrite + Unpin + Send + Sync + 'static> ResponseSink for TdsSink<W> 
 
     fn ok(&mut self, info: OkInfo, _status: Status) {
         self.emit_pending(true);
+        // SQL Server sends a count only for statements that count rows;
+        // ODBC turns a count of 0 into SQL_NO_DATA.
         self.pending = Some(PendingDone {
             token: self.statement_done(),
-            status: DONE_COUNT,
+            status: if info.counts_rows { DONE_COUNT } else { 0 },
             row_count: info.affected_rows,
         });
     }
@@ -330,6 +332,7 @@ mod tests {
             OkInfo {
                 affected_rows: 3,
                 last_insert_id: 0,
+                counts_rows: true,
             },
             Status::AUTOCOMMIT,
         );
@@ -355,7 +358,17 @@ mod tests {
         assert!(rows >= 2);
         let last = tokens.len() - 13;
         assert_eq!(done_at(&tokens, last - 13), (DONE_COUNT | DONE_MORE, 2));
-        assert_eq!(done_at(&tokens, last), (DONE_COUNT, 0));
+        assert_eq!(done_at(&tokens, last), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ok_without_a_row_count_has_no_count() {
+        let (mut sink, mut client, _) = sink();
+        sink.ok(OkInfo::default(), Status::AUTOCOMMIT);
+        sink.finish(false).await.unwrap();
+        let tokens = response(&mut client).await;
+        assert_eq!(tokens.len(), 13);
+        assert_eq!(done_at(&tokens, 0), (0, 0));
     }
 
     #[tokio::test]
@@ -395,6 +408,7 @@ mod tests {
             OkInfo {
                 affected_rows: 2,
                 last_insert_id: 0,
+                counts_rows: true,
             },
             Status::AUTOCOMMIT,
         );

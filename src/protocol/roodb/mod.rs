@@ -307,7 +307,7 @@ where
 
             ParsedCommand::Ping => {
                 debug!(connection_id = self.connection_id, "COM_PING");
-                self.engine.send_ok(0, 0).await?;
+                self.engine.send_ok().await?;
                 Ok(true)
             }
 
@@ -320,7 +320,7 @@ where
                 };
                 if exists {
                     self.engine.session.set_database(Some(db));
-                    self.engine.send_ok(0, 0).await?;
+                    self.engine.send_ok().await?;
                 } else {
                     self.engine
                         .send_error(
@@ -375,7 +375,7 @@ where
                     statement_id, "COM_STMT_RESET"
                 );
                 // No cursor state to reset; just return OK
-                self.engine.send_ok(0, 0).await?;
+                self.engine.send_ok().await?;
                 Ok(true)
             }
 
@@ -387,7 +387,7 @@ where
                 // The selected database is kept.
                 self.engine.reset_session(false).await;
                 self.param_types.clear();
-                self.engine.send_ok(0, 0).await?;
+                self.engine.send_ok().await?;
                 Ok(true)
             }
 

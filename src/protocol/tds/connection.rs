@@ -705,7 +705,7 @@ impl TdsConnection {
                         rolled_back = sql.trim_start().to_uppercase().starts_with("ROLLBACK");
                     }
                 }
-                Action::Accept => self.engine.send_ok(0, 0).await?,
+                Action::Accept => self.engine.send_ok().await?,
                 Action::Refuse(message) => self.refuse(codes::ER_UNKNOWN_COM_ERROR, message),
             }
             if self.sink().error_count() != errors_before {

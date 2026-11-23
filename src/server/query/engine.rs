@@ -668,7 +668,7 @@ impl QueryEngine {
                 let expr_sql = sql.trim()[3..].trim().trim_end_matches(';');
                 let select_sql = format!("SELECT {}", expr_sql);
                 match self.execute_sql_silent(&select_sql).await {
-                    Ok(_) => return self.send_ok(0, 0).await,
+                    Ok(_) => return self.send_ok().await,
                     Err(e) => {
                         return self
                             .send_error(codes::ER_DATA_OUT_OF_RANGE, states::GENERAL_ERROR, &e)
@@ -753,7 +753,7 @@ impl QueryEngine {
                 &self.session.user_variables(),
                 self.session.has_sql_mode("STRICT_TRANS_TABLES"),
             );
-            return self.send_ok(0, 0).await;
+            return self.send_ok().await;
         }
 
         // Handle statements as no-ops for MySQL compatibility
@@ -767,7 +767,7 @@ impl QueryEngine {
                 || upper.starts_with("SET SESSION ")
                 || upper.starts_with("SET GLOBAL ")
             {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             // LOCK/UNLOCK TABLES — no-op (MVCC provides isolation)
             if upper.starts_with("LOCK TABLE")
@@ -775,15 +775,15 @@ impl QueryEngine {
                 || upper.starts_with("UNLOCK TABLE")
                 || upper.starts_with("UNLOCK TABLES")
             {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             // FLUSH — no-op
             if upper.starts_with("FLUSH ") {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             // DROP FUNCTION IF EXISTS — no-op (functions not yet implemented)
             if upper.starts_with("DROP FUNCTION") && upper.contains("IF EXISTS") {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             // CREATE TRIGGER — parsed and stored via normal pipeline
             if upper.starts_with("CREATE TRIGGER ") {
@@ -834,7 +834,7 @@ impl QueryEngine {
             Ok(s) => s,
             Err(crate::sql::SqlError::CommentOnly) => {
                 // Comment-only SQL: return OK with no result (MySQL behavior)
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             Err(e) => {
                 return self.send_sql_error(&e).await;
@@ -919,7 +919,7 @@ impl QueryEngine {
         };
 
         let stmt = match action {
-            Intercept::NoOp => return self.send_ok(0, 0).await,
+            Intercept::NoOp => return self.send_ok().await,
             Intercept::CreateProc {
                 name,
                 params,
@@ -1333,7 +1333,7 @@ impl QueryEngine {
     ) -> ProtocolResult<()> {
         let plan = match self.drop_temp_tables(plan) {
             TempDrop::Plan(plan) => *plan,
-            TempDrop::Done => return self.send_ok(0, 0).await,
+            TempDrop::Done => return self.send_ok().await,
             TempDrop::NoSuchTable(name) => return self.send_no_such_table(&name).await,
             TempDrop::NoSuchIndex(name) => {
                 let message = crate::executor::ExecutorError::CantDropKey(name).to_string();
@@ -1472,6 +1472,8 @@ impl QueryEngine {
         } else {
             // Extract trigger info from INSERT plans before building executor
             let insert_trigger_info = self.extract_insert_trigger_info(&plan);
+            // DDL runs here too, but only DML counts rows
+            let counts_rows = plan.is_dml();
 
             // DML/DDL - execute and count affected rows
             let engine = ExecutorEngine::with_raft(
@@ -1537,7 +1539,16 @@ impl QueryEngine {
             self.session
                 .set_user_variable("__sys_row_count", Datum::Int(affected as i64));
 
-            self.send_ok(affected, last_insert_id).await
+            let status = self.status();
+            self.out.ok(
+                OkInfo {
+                    affected_rows: affected,
+                    last_insert_id,
+                    counts_rows,
+                },
+                status,
+            );
+            Ok(())
         }
     }
 
@@ -1655,7 +1666,7 @@ impl QueryEngine {
                     LockWait::Metadata => self.session.metadata_lock_wait = wait,
                 }
             }
-            return self.send_ok(0, 0).await.map(Some);
+            return self.send_ok().await.map(Some);
         }
 
         // Catch-all: silently accept any other SET statement (SET NAMES, SET charset, etc.)
@@ -1666,7 +1677,7 @@ impl QueryEngine {
                 return Ok(None);
             }
             debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET statement");
-            return self.send_ok(0, 0).await.map(Some);
+            return self.send_ok().await.map(Some);
         }
         // Also accept SET @@system_var as no-op (except @@sql_mode)
         if sql_upper.starts_with("SET @@") {
@@ -1674,7 +1685,7 @@ impl QueryEngine {
                 return Ok(None);
             }
             debug!(connection_id = self.connection_id, sql = %sql, "Accepting SET @@var statement");
-            return self.send_ok(0, 0).await.map(Some);
+            return self.send_ok().await.map(Some);
         }
 
         // Not a transaction command
@@ -1690,7 +1701,7 @@ impl QueryEngine {
             // a ROLLBACK at any level undoes everything.
             if !self.begin_commits_open {
                 self.nested_begins = self.transaction_depth() + 1;
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             // In MySQL, starting a transaction ends the one that is open
             // by committing it. Clients rely on it: after a statement fails
@@ -1727,7 +1738,7 @@ impl QueryEngine {
             }
         }
 
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     /// Bring this session's copy of the stored functions up to date.
@@ -2040,7 +2051,7 @@ impl QueryEngine {
             Change::SetPrimary(id) => self.raft_node.transfer_primary(id).await,
         };
         match result {
-            Ok(()) => self.send_ok(0, 0).await.map(Some),
+            Ok(()) => self.send_ok().await.map(Some),
             Err(e) => self
                 .send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -2363,11 +2374,11 @@ impl QueryEngine {
         // The COMMIT of an inner level only closes that level.
         if !self.begin_commits_open && self.transaction_depth() > 1 {
             self.nested_begins = self.transaction_depth() - 1;
-            return self.send_ok(0, 0).await;
+            return self.send_ok().await;
         }
         // COMMIT without BEGIN is a no-op
         match self.commit_open_transaction().await {
-            Ok(()) => self.send_ok(0, 0).await,
+            Ok(()) => self.send_ok().await,
             Err(e) => self.send_commit_error(&e).await,
         }
     }
@@ -2402,7 +2413,7 @@ impl QueryEngine {
             }
         }
         // ROLLBACK without BEGIN is a no-op
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     /// Handle SET autocommit = value
@@ -2422,7 +2433,7 @@ impl QueryEngine {
             autocommit = value,
             "Set autocommit"
         );
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     /// Handle SET TRANSACTION ISOLATION LEVEL
@@ -2444,7 +2455,7 @@ impl QueryEngine {
             isolation_level = ?level,
             "Set isolation level"
         );
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     /// Handle UNION queries by parsing with sqlparser, executing each side,
@@ -2797,7 +2808,7 @@ impl QueryEngine {
         };
 
         match create_result {
-            Ok(true) => return self.send_ok(0, 0).await.map(|_| Some(())),
+            Ok(true) => return self.send_ok().await.map(|_| Some(())),
             Err(msg) => {
                 return self.send_error(1050, "42S01", &msg).await.map(|_| Some(()));
             }
@@ -2807,7 +2818,7 @@ impl QueryEngine {
         // Its rows are kept in this session from here on.
         self.temp.add_table(&name, table_id);
 
-        self.send_ok(0, 0).await.map(|_| Some(()))
+        self.send_ok().await.map(|_| Some(()))
     }
 
     /// Handle ALTER TABLE statements.
@@ -2849,7 +2860,7 @@ impl QueryEngine {
             .map_err(|e| ProtocolError::Sql(crate::sql::SqlError::Parse(e.to_string())))?;
 
         if ast.is_empty() {
-            return self.send_ok(0, 0).await.map(|_| Some(()));
+            return self.send_ok().await.map(|_| Some(()));
         }
 
         match &ast[0] {
@@ -2917,7 +2928,7 @@ impl QueryEngine {
                     }
                     new_def.is_temporary = true;
                     self.catalog.write().replace_table(&old_table_name, new_def);
-                    return self.send_ok(0, 0).await.map(|_| Some(()));
+                    return self.send_ok().await.map(|_| Some(()));
                 }
 
                 // The new definition is checked here, before it is proposed:
@@ -2948,7 +2959,7 @@ impl QueryEngine {
                 self.persist_alter_table(&old_table_name, new_def, indexes)
                     .await?;
 
-                self.send_ok(0, 0).await.map(|_| Some(()))
+                self.send_ok().await.map(|_| Some(()))
             }
             _ => Ok(None),
         }
@@ -3276,7 +3287,7 @@ impl QueryEngine {
                 self.session
                     .sql_prepared_stmts
                     .insert(stmt_name, sql_text.to_string());
-                self.send_ok(0, 0).await?;
+                self.send_ok().await?;
                 return Ok(Some(()));
             }
         } else if upper.starts_with("EXECUTE ") {
@@ -3335,7 +3346,7 @@ impl QueryEngine {
                 .trim_end_matches(';')
                 .to_string();
             self.session.sql_prepared_stmts.remove(&stmt_name);
-            self.send_ok(0, 0).await?;
+            self.send_ok().await?;
             return Ok(Some(()));
         }
 
@@ -3389,7 +3400,7 @@ impl QueryEngine {
         }
 
         self.session.set_database(Some(db_name));
-        self.send_ok(0, 0).await.map(Some)
+        self.send_ok().await.map(Some)
     }
 
     /// Send a result set from in-memory column names and rows
@@ -4222,7 +4233,7 @@ impl QueryEngine {
             .or_else(|| trimmed.strip_prefix("set "))
         {
             Some(r) => r.trim(),
-            None => return self.send_ok(0, 0).await,
+            None => return self.send_ok().await,
         };
 
         // Split into individual assignments at top-level commas
@@ -4275,7 +4286,7 @@ impl QueryEngine {
             let value = datum.unwrap_or(Datum::String(val_str.to_string()));
             self.session.set_user_variable(&var_name, value);
         }
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     /// Handle SET @var = expr silently (no client response packets).
@@ -4622,7 +4633,7 @@ impl QueryEngine {
 
         let changeset = ChangeSet::new_with_changes(0, changes);
         match self.raft_node.propose_changes(changeset).await {
-            Ok(()) => self.send_ok(0, 0).await,
+            Ok(()) => self.send_ok().await,
             Err(e) => {
                 self.send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -4679,7 +4690,7 @@ impl QueryEngine {
 
         if !changeset.changes.is_empty() {
             match self.raft_node.propose_changes(changeset).await {
-                Ok(()) => self.send_ok(0, 0).await,
+                Ok(()) => self.send_ok().await,
                 Err(e) => {
                     self.send_error(
                         codes::ER_UNKNOWN_ERROR,
@@ -4690,7 +4701,7 @@ impl QueryEngine {
                 }
             }
         } else {
-            self.send_ok(0, 0).await
+            self.send_ok().await
         }
     }
 
@@ -4803,7 +4814,7 @@ impl QueryEngine {
             )],
         );
         match self.raft_node.propose_changes(changeset).await {
-            Ok(()) => self.send_ok(0, 0).await,
+            Ok(()) => self.send_ok().await,
             Err(e) => {
                 self.send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -4883,7 +4894,7 @@ impl QueryEngine {
 
         if changes.is_empty() {
             if if_exists {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             return self
                 .send_error(
@@ -4898,7 +4909,7 @@ impl QueryEngine {
             .propose_changes(ChangeSet::new_with_changes(0, changes))
             .await
         {
-            Ok(()) => self.send_ok(0, 0).await,
+            Ok(()) => self.send_ok().await,
             Err(e) => {
                 self.send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -5151,7 +5162,7 @@ impl QueryEngine {
         let changeset = ChangeSet::new_with_changes(0, vec![change]);
 
         match self.raft_node.propose_changes(changeset).await {
-            Ok(()) => self.send_ok(0, 0).await,
+            Ok(()) => self.send_ok().await,
             Err(e) => {
                 self.send_error(
                     codes::ER_UNKNOWN_ERROR,
@@ -5234,7 +5245,7 @@ impl QueryEngine {
             }
         }
 
-        self.send_ok(total_affected, 0).await
+        self.send_row_count(total_affected, 0).await
     }
 
     /// Handle LOAD DATA [LOCAL] INFILE 'path' INTO TABLE table_name [CHARACTER SET cs]
@@ -5330,7 +5341,7 @@ impl QueryEngine {
             }
         }
 
-        self.send_ok(rows_inserted, 0).await
+        self.send_row_count(rows_inserted, 0).await
     }
 
     /// Resolve a LOAD DATA INFILE path, trying multiple base directories.
@@ -5486,7 +5497,7 @@ impl QueryEngine {
         // every session, this one included, gets it from there.
         self.sync_functions();
 
-        self.send_ok(0, 0).await
+        self.send_ok().await
     }
 
     async fn handle_drop_procedure(
@@ -5506,7 +5517,7 @@ impl QueryEngine {
         };
         if !exists {
             if if_exists {
-                return self.send_ok(0, 0).await;
+                return self.send_ok().await;
             }
             return self
                 .send_error(
@@ -5535,7 +5546,7 @@ impl QueryEngine {
 
         if !changeset.changes.is_empty() {
             match self.raft_node.propose_changes(changeset).await {
-                Ok(()) => self.send_ok(0, 0).await,
+                Ok(()) => self.send_ok().await,
                 Err(e) => {
                     self.send_error(
                         codes::ER_UNKNOWN_ERROR,
@@ -5546,7 +5557,7 @@ impl QueryEngine {
                 }
             }
         } else {
-            self.send_ok(0, 0).await
+            self.send_ok().await
         }
     }
 
@@ -5641,7 +5652,7 @@ impl QueryEngine {
         propagate_out_params(proc_def, call_args, &ctx, &user_vars);
 
         // Final OK; any result sets the body produced precede it
-        self.send_ok(ctx.rows_affected, 0).await
+        self.send_row_count(ctx.rows_affected, 0).await
     }
 
     /// Parse procedure body SQL into Vec<Statement>.
@@ -6730,8 +6741,15 @@ impl QueryEngine {
         }
     }
 
-    /// Send an OK
-    pub(crate) async fn send_ok(
+    /// Send an OK for a statement that does not count rows
+    pub(crate) async fn send_ok(&mut self) -> ProtocolResult<()> {
+        let status = self.status();
+        self.out.ok(OkInfo::default(), status);
+        Ok(())
+    }
+
+    /// Send an OK for a statement that counts rows: DML, `LOAD DATA`, `CALL`
+    pub(crate) async fn send_row_count(
         &mut self,
         affected_rows: u64,
         last_insert_id: u64,
@@ -6741,6 +6759,7 @@ impl QueryEngine {
             OkInfo {
                 affected_rows,
                 last_insert_id,
+                counts_rows: true,
             },
             status,
         );

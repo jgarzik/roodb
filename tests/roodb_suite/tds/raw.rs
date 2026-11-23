@@ -30,6 +30,7 @@ pub const STATUS_RESET_CONNECTION: u8 = 0x08;
 pub const STATUS_RESET_CONNECTION_SKIP_TRAN: u8 = 0x10;
 
 pub const DONE_ERROR: u16 = 0x0002;
+pub const DONE_COUNT: u16 = 0x0010;
 pub const DONE_ATTN: u16 = 0x0020;
 
 pub const ENV_BEGIN_TRAN: u8 = 8;
@@ -225,6 +226,14 @@ pub fn env_changes(tokens: &[Token]) -> Vec<u8> {
             _ => None,
         })
         .collect()
+}
+
+/// Status and row count of the last DONE token.
+pub fn final_done_count(tokens: &[Token]) -> (u16, u64) {
+    match tokens.last() {
+        Some(Token::Done { status, row_count }) => (*status, *row_count),
+        other => panic!("response does not end with DONE: {other:?}"),
+    }
 }
 
 /// Status of the last DONE token.

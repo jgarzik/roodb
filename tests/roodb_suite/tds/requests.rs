@@ -273,3 +273,43 @@ async fn test_reset_connection() {
     client.batch("ROLLBACK").await;
     server.shutdown().await;
 }
+
+/// DONE carries a row count only for statements that count rows, as SQL
+/// Server sends it. ODBC reports a count of 0 as SQL_NO_DATA, which
+/// `sqlcmd` takes as failure of its connect-time `SET QUOTED_IDENTIFIER
+/// OFF`.
+#[tokio::test]
+async fn test_done_count_only_for_statements_that_count_rows() {
+    let server = TestServer::start("tds_done_count").await;
+    let mut client = RawTds::login_root(&server).await;
+
+    for sql in [
+        "SET QUOTED_IDENTIFIER OFF",
+        "SET NOCOUNT ON",
+        "DROP TABLE IF EXISTS tds_done_count",
+        "CREATE TABLE tds_done_count (id INT PRIMARY KEY, v INT)",
+        "SET autocommit = 1",
+        "BEGIN TRAN",
+        "ROLLBACK TRAN",
+    ] {
+        let tokens = client.batch(sql).await;
+        assert!(errors(&tokens).is_empty(), "`{sql}`: {tokens:?}");
+        assert_eq!(final_done(&tokens) & DONE_COUNT, 0, "`{sql}`: {tokens:?}");
+    }
+
+    let tokens = client
+        .batch("INSERT INTO tds_done_count VALUES (1, 1), (2, 2)")
+        .await;
+    let (status, rows) = final_done_count(&tokens);
+    assert_eq!((status & DONE_COUNT, rows), (DONE_COUNT, 2), "{tokens:?}");
+
+    // A statement that counts rows and changed none still says so.
+    let tokens = client
+        .batch("UPDATE tds_done_count SET v = 0 WHERE id = 99")
+        .await;
+    let (status, rows) = final_done_count(&tokens);
+    assert_eq!((status & DONE_COUNT, rows), (DONE_COUNT, 0), "{tokens:?}");
+
+    client.batch("DROP TABLE tds_done_count").await;
+    server.shutdown().await;
+}
